@@ -864,17 +864,34 @@ storyId: "code-intelligence:AGENT-MEMORY"
 - [ ] Implement `cmd/consolidator/main.go` with a polling loop
       that wakes every K minutes (§7.7) or after N new Episodes
       (configurable).
-- [ ] Read Episodes since the last
-      `ConsolidatorRun.episode_high_water_mark`; group by
-      `(repo_id, signature_hash_of_observation_set)`.
+- [ ] **Open the `ConsolidatorRun` lifecycle FIRST** — at the
+      start of each tick, INSERT `ConsolidatorRun(run_id=<new
+      uuid>, started_at=now(), status='running')` per
+      architecture.md §5.6 line 645. This row MUST exist before
+      any `ConceptVersion(producer_run_id=...)` references it,
+      because architecture.md §5.5.2 line 620 makes
+      `ConceptVersion.producer_run_id` an FK → `ConsolidatorRun`
+      when `producer='consolidator'`. `ConsolidatorRun` is
+      UPDATE-grantable per tech-spec §8.7.4 (and the Stage 1.4
+      grant at line 189 already includes it), so the open row
+      will be finalised by UPDATE at the end of this tick.
+- [ ] Read Episodes since the latest
+      `ConsolidatorRun.episode_high_water_mark` (from the most
+      recent `status='done'` run, not the row just opened);
+      group by `(repo_id, signature_hash_of_observation_set)`.
 - [ ] For each group crossing the threshold, append a `Concept`
       row (only if fingerprint not seen) and a `ConceptVersion`
       row with `producer='consolidator'`,
-      `producer_run_id=<this run>`, and the new confidence /
-      support / negative counts (G4). Attach `ConceptSupport`
-      rows per contributing Node/Episode/repo.
-- [ ] Persist a `ConsolidatorRun` row at the end with the new
-      high-water mark.
+      `producer_run_id=<run_id from the row opened above>`, and
+      the new confidence / support / negative counts (G4).
+      Attach `ConceptSupport` rows per contributing
+      Node/Episode/repo.
+- [ ] **Finalise the `ConsolidatorRun` lifecycle** — at the end
+      of the tick, UPDATE the same `ConsolidatorRun.run_id` row
+      SET `finished_at=now()`,
+      `episode_high_water_mark=<new mark>`, `status='done'`
+      (or `'failed'` on error). The row stays in place; only
+      the four mutable fields transition per §8.7.4.
 - [ ] Emit metric `consolidator_episode_lag` =
       max(Episode.created_at) − high-water-mark.
 
@@ -902,6 +919,18 @@ storyId: "code-intelligence:AGENT-MEMORY"
 ### Implementation Steps
 - [ ] Implement `cmd/concept-promoter/main.go` that runs after
       each `ConsolidatorRun` finishes.
+- [ ] **Open the `PromoterRun` lifecycle FIRST** — at the start
+      of each promoter tick, INSERT `PromoterRun(run_id=<new
+      uuid>, started_at=now(), concepts_promoted=0,
+      status='running')` per architecture.md §5.6 line 646.
+      This row MUST exist before any
+      `ConceptVersion(producer='promoter', producer_run_id=...)`
+      references it, because architecture.md §5.5.2 line 620
+      makes `ConceptVersion.producer_run_id` an FK →
+      `PromoterRun` when `producer='promoter'`. `PromoterRun`
+      is UPDATE-grantable per tech-spec §8.7.4 (and the Stage
+      1.4 grant at line 190 already includes it), so the open
+      row is finalised by UPDATE at the end of this tick.
 - [ ] Select Concepts whose latest `ConceptVersion` crosses the
       §7.8 threshold (`confidence ≥ 0.7` AND
       `support_count ≥ 5`).
@@ -911,16 +940,17 @@ storyId: "code-intelligence:AGENT-MEMORY"
       (the new `concept_version_id` UUID primary key,
       `concept_id`, `version_index`, `confidence`,
       `confidence_band`, `support_count`, `negative_count`,
-      `producer='promoter'`, `producer_run_id` → the new
-      `PromoterRun.run_id`, `promoted=true`, `created_at`).
-      The `ConceptVersion` row does **NOT** carry an
-      `embedding_model_version` column — that field lives
-      exclusively on the `EmbeddingPublish` row per
-      tech-spec.md §8.7 lines 807-809. The `ConceptVersion`
-      table also has **no physical `embedding_vec` column**
-      (per tech-spec.md §8.7.1 line 569) — the vector body
-      lives in Qdrant only. This row MUST exist before any
-      `EmbeddingPublish` row can reference it, because
+      `producer='promoter'`, `producer_run_id` → the `run_id`
+      of the **already-opened** `PromoterRun` row above,
+      `promoted=true`, `created_at`). The `ConceptVersion` row
+      does **NOT** carry an `embedding_model_version` column —
+      that field lives exclusively on the `EmbeddingPublish`
+      row per tech-spec.md §8.7 lines 807-809. The
+      `ConceptVersion` table also has **no physical
+      `embedding_vec` column** (per tech-spec.md §8.7.1 line
+      569) — the vector body lives in Qdrant only. This row
+      MUST exist before any `EmbeddingPublish` row can
+      reference it, because
       `EmbeddingPublish.concept_version_id` is a foreign-key
       reference to `ConceptVersion.concept_version_id`
       (architecture.md §5.5.2 line 612).
@@ -955,11 +985,15 @@ storyId: "code-intelligence:AGENT-MEMORY"
       `EmbeddingPublishEvent` with `event_kind='published'`.
       Recall (Stage 5.1) only surfaces this vector once that
       final `'published'` event exists.
-- [ ] Persist a `PromoterRun` row with `concepts_promoted`
-      count, recording one promoted Concept per
-      successfully-`'published'` chain above (a Concept whose
-      chain stalled at `'queued'` or `'failed'` is not counted
-      until a later tick drives it to `'published'`).
+- [ ] **Finalise the `PromoterRun` lifecycle** — at the end of
+      the tick, UPDATE the same `PromoterRun.run_id` row SET
+      `finished_at=now()`,
+      `concepts_promoted=<count of Concepts whose chain reached
+      'published' in this tick>`, `status='done'` (or
+      `'failed'` on error). A Concept whose chain stalled at
+      `'queued'` or `'failed'` is **not** counted in
+      `concepts_promoted` until a later tick drives it to
+      `'published'`.
 
 ### Dependencies
 - phase-learning-loop/stage-consolidator-worker
@@ -982,6 +1016,17 @@ storyId: "code-intelligence:AGENT-MEMORY"
       vector is fetchable from the Qdrant
       `agent_memory_concept` collection under the same
       `point_id`.
+- [ ] Scenario: PromoterRun precedes ConceptVersion FK
+      reference -- Given the Promoter starts a tick, When the
+      `PromoterRun` row and any `ConceptVersion(producer=
+      'promoter')` rows produced in that tick are inspected,
+      Then the `PromoterRun.started_at` is strictly earlier
+      than every referencing
+      `ConceptVersion.created_at`, the `PromoterRun.run_id`
+      already exists in the table at the moment each
+      `ConceptVersion.producer_run_id` insert occurs, and the
+      same `PromoterRun.run_id` row is later UPDATE'd with
+      `status='done'` and a non-null `finished_at`.
 - [ ] Scenario: ConceptVersion precedes EmbeddingPublish -- Given
       the Promoter starts a promotion, When the run is
       inspected, Then for every `EmbeddingPublish` row produced
@@ -1038,7 +1083,8 @@ storyId: "code-intelligence:AGENT-MEMORY"
       concepts as the parent's.
 - [ ] Scenario: restart does not duplicate -- Given the
       Consolidator crashes after writing the synthetic positive
-      but before persisting `ConsolidatorRun`, When it restarts
+      but before finalising the open `ConsolidatorRun` row (the
+      row exists with `status='running'`), When it restarts
       and reprocesses the same `EpisodeUpdate`, Then the partial
       UNIQUE index rejects the duplicate and no second synthetic
       positive row exists.

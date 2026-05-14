@@ -52,7 +52,9 @@ These are the contract bedrocks every later section must respect. Where you see
 
   Two ingests of the same commit always produce the same fingerprints; a
   renamed or moved member produces a *new* fingerprint linked to the old one
-  by a `renamed_to`/`renamed_from` Edge.
+  by a single stored `renamed_to` Edge (the inverse `renamed_from` is a
+  derived view over the same row, not a separately-stored edge kind — see
+  §5.2.2).
 - **G3 — Append-only event log.** The `EpisodicLog` is a strict append-only
   table. Per operator decision, retention is **forever** (no rotation, no
   rewrite). Status transitions on an Episode are recorded as new
@@ -117,7 +119,7 @@ These are the contract bedrocks every later section must respect. Where you see
 │   ┌──────────────────────────────────────────────────────────────┐    │
 │   │              Hybrid Graph Store (read/write)                 │    │
 │   │  • Structural Graph (Repo→Pkg→File→Class→Method→Block)       │    │
-│   │  • Call/Data/Concept Edges                                   │    │
+│   │  • Call/Data Edges (no Concept edges — see §5.2.2)             │    │
 │   │  • EpisodicLog + Observations                                │    │
 │   │  • ConceptStore (global) + ConceptVersion + ConceptSupport   │    │
 │   │  • Embedding index (semantic recall)                         │    │
@@ -209,8 +211,14 @@ The single durable store. Internally split into:
 - **GraphReader** — read-only API used by recall, expand, summarize, and all
   Management read endpoints (§6.2).
 - **EmbeddingIndex** — vector index over Method nodes, Block nodes, and
-  Concepts. Vectors are written by Repo Indexer and Consolidator; queried by
-  GraphReader during recall.
+  Concepts. Writer set (matched to the §7.7/§7.8 flows): the **Repo
+  Indexer** writes Method and Block vectors at ingest time; the **Concept
+  Promoter** is the sole writer of Concept entries (it embeds and indexes
+  a Concept on the run that flips `ConceptVersion.promoted=true`, per
+  §7.8). The Consolidator does **not** write EmbeddingIndex entries — it
+  only writes `Concept` and `ConceptVersion` rows (§7.7) and leaves the
+  vector publication to the Promoter. Queries are served by GraphReader
+  during recall.
 
 ### 3.6 Reranker Trainer
 
@@ -226,7 +234,9 @@ versioned model artifacts; no online graph mutation is involved.
 Per operator decision, the smallest code-level Node is **method-level**, with
 **basic-block-level** subdivision for any method whose static body exceeds a
 size threshold (default 80 logical lines; tunable in `tech-spec.md`). Blocks
-are stored as `Block` nodes with `parent_method_id` and a `block_kind`
+are stored as `Block` nodes whose `parent_node_id` (§5.2.1) points to the
+enclosing Method node (Block parentage uses the generic `parent_node_id`
+column — there is no separate `parent_method_id`), with a `block_kind`
 discriminator (`entry`, `branch`, `loop_body`, `exception`, `exit`). Call edges
 and observation rows can target either a Method or a Block; if a Block is
 retired in a future commit but its parent Method survives, the Block is closed
@@ -280,8 +290,11 @@ For the full request/response shapes see §6.
 ### 4.2 Recall-only (read path used by the agent reasoning loop)
 
 1. Agent calls `agent.recall(repo_id, query, k, filters?)`.
-2. GraphReader resolves the query against the EmbeddingIndex to get top-K
-   seed Nodes.
+2. GraphReader resolves the query against the EmbeddingIndex to get a
+   top-K **mixed** seed set covering both Node entries (Method/Block) and
+   promoted Concept entries (per §7.8). Concepts are first-class results
+   alongside Nodes from the very first hop; recall does **not** treat them
+   as a separate post-step.
 3. GraphReader expands the seed set by structural neighbors (1-2 hops) and
    ranks via the latest reranker model.
 4. GraphReader assembles a `RecallContext` envelope containing
@@ -432,7 +445,7 @@ is deferred to `tech-spec.md`.
 | `edge_id` | uuid | Primary key. |
 | `fingerprint` | bytes(32) | **G2**: `sha256(repo_id ‖ kind ‖ src_fingerprint ‖ dst_fingerprint ‖ from_sha)`. Unique within `(repo_id, fingerprint)`. |
 | `repo_id` | uuid | FK → `Repo` (Edges remain repo-scoped per **G6**). |
-| `kind` | enum | `contains`, `imports`, `static_calls`, `observed_calls`, `extends`, `implements`, `reads`, `writes`, `renamed_to`. **There is no `concept_attaches` edge kind** — Concepts are *not* graph Nodes (the Node `kind` enum is closed at `repo`/`package`/`file`/`class`/`method`/`block`), so links from code Nodes to Concepts are carried exclusively by `ConceptSupport` rows (§5.5.3), not by Edges. |
+| `kind` | enum | `contains`, `imports`, `static_calls`, `observed_calls`, `extends`, `implements`, `reads`, `writes`, `renamed_to`. **There is no `concept_attaches` edge kind** — Concepts are *not* graph Nodes (the Node `kind` enum is closed at `repo`/`package`/`file`/`class`/`method`/`block`), so links from code Nodes to Concepts are carried exclusively by `ConceptSupport` rows (§5.5.3), not by Edges. **There is also no `renamed_from` edge kind** — the inverse of a `renamed_to` row is a derived view (just `SELECT … WHERE kind='renamed_to' AND dst_node_id=?`); G2's `renamed_from` term refers to that derived inverse, not a separately-stored kind. |
 | `src_node_id` | uuid | FK → `Node`. |
 | `dst_node_id` | uuid | FK → `Node`. |
 | `from_sha` | text | First SHA at which this edge appeared. |

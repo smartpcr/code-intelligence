@@ -466,11 +466,17 @@ storyId: "code-intelligence:AGENT-MEMORY"
 - [ ] Implement `internal/embedding/publisher.go` that wraps a
       configurable embedding-model client (HTTP / SDK) and a Qdrant
       upsert call.
-- [ ] Wire the §9.6a write protocol: insert `EmbeddingPublish`
-      row, then `EmbeddingPublishEvent(queued)`, then call the
-      embedder, then Qdrant upsert, then `vector_written`, then
-      read-after-write confirm, then `published`. On failure
-      append `failed` and let the background retry pick up.
+- [ ] Wire the §9.6a write protocol per tech-spec.md §8.7.1
+      lines 818-833 — **prerequisite**: the architecture-owned
+      `Node` row (Method or Block) is already committed by the
+      AST emitter's Stage 3.2 transaction (Step 1 of the
+      protocol); this publisher does not insert Node rows.
+      Then: insert `EmbeddingPublish` row referencing that
+      `Node.id`, then `EmbeddingPublishEvent(queued)`, then call
+      the embedder, then Qdrant upsert, then `vector_written`,
+      then read-after-write confirm, then `published`. On
+      failure append `failed` and let the background retry
+      pick up.
 - [ ] Carry `embedding_model_version` on each `EmbeddingPublish`
       row per risk §9.6.
 - [ ] Have the full-mode handler (Stage 3.1) call the publisher
@@ -898,35 +904,81 @@ storyId: "code-intelligence:AGENT-MEMORY"
 - [ ] Select Concepts whose latest `ConceptVersion` crosses the
       §7.8 threshold (`confidence ≥ 0.7` AND
       `support_count ≥ 5`).
-- [ ] For each, compute the Concept embedding (description +
-      canonical-feature-signature) and publish to Qdrant via the
-      §9.6a protocol (Concept Promoter is the sole writer of
-      Concept entries to the EmbeddingIndex per C12).
-- [ ] Append a `ConceptVersion` row with
-      `producer='promoter'`, `promoted=true`, and the
-      `embedding_model_version` carried on the matching
-      `EmbeddingPublish` row (per §9.6a). The `ConceptVersion`
-      table has **no physical `embedding_vec` column** — per
-      tech-spec.md §8.7.1 line 569, vectors are materialised in
-      Qdrant and dereferenced through `EmbeddingPublish`; the
-      Promoter therefore writes the vector into Qdrant via the
-      §9.6a publish protocol in the previous step and never
-      writes a vector value onto the `ConceptVersion` row.
-- [ ] Persist a `PromoterRun` row with `concepts_promoted` count.
+- [ ] **Step 1 of §8.7.1 lines 818-833 write protocol** —
+      append the architecture-owned `ConceptVersion` row first,
+      with `producer='promoter'`, `promoted=true`, and the
+      planned `embedding_model_version` that the subsequent
+      `EmbeddingPublish` row will carry. The `ConceptVersion`
+      table has **no physical `embedding_vec` column** (per
+      tech-spec.md §8.7.1 line 569) — the vector body lives in
+      Qdrant only. This row MUST exist before any
+      `EmbeddingPublish` row can reference it, because
+      `EmbeddingPublish.concept_version_id` is a foreign-key
+      reference to `ConceptVersion.id`.
+- [ ] Compute the Concept embedding vector for the row just
+      appended (description + canonical-feature-signature) and
+      reserve a Qdrant `point_id` for it. No Qdrant write
+      happens in this step — only the vector + `point_id`
+      computation needed by the next step's `EmbeddingPublish`
+      row.
+- [ ] **Step 2 of §8.7.1 lines 818-833 write protocol** —
+      insert an `EmbeddingPublish` row that references the
+      `ConceptVersion.id` from the row appended above, the
+      reserved Qdrant `point_id`, and the
+      `embedding_model_version`. Immediately insert the matching
+      `EmbeddingPublishEvent` with `event_kind='queued'` (Step 3
+      of the protocol).
+- [ ] **Steps 4-5 of §8.7.1 lines 818-833 write protocol** —
+      upsert the vector into the Qdrant
+      `agent_memory_concept` collection under the reserved
+      `point_id`; on success append an `EmbeddingPublishEvent`
+      with `event_kind='vector_written'`, on failure append one
+      with `event_kind='failed'` and exit (the next promoter
+      tick produces a new `'queued'` event, never an UPDATE).
+      Concept Promoter is the sole writer of Concept entries to
+      the EmbeddingIndex per architecture.md C12.
+- [ ] **Step 5 (read-after-write) of §8.7.1 lines 818-833 write
+      protocol** — issue a confirming Qdrant fetch for the
+      `point_id`; on success append a final
+      `EmbeddingPublishEvent` with `event_kind='published'`.
+      Recall (Stage 5.1) only surfaces this vector once that
+      final `'published'` event exists.
+- [ ] Persist a `PromoterRun` row with `concepts_promoted`
+      count, recording one promoted Concept per
+      successfully-`'published'` chain above (a Concept whose
+      chain stalled at `'queued'` or `'failed'` is not counted
+      until a later tick drives it to `'published'`).
 
 ### Dependencies
 - phase-learning-loop/stage-consolidator-worker
 
 ### Test Scenarios
-- [ ] Scenario: threshold flips promoted=true -- Given a Concept
-      whose latest `ConceptVersion` has `confidence=0.72` and
-      `support_count=5`, When the Promoter runs, Then a new
+- [ ] Scenario: threshold flips promoted=true with §8.7.1
+      ordering -- Given a Concept whose latest `ConceptVersion`
+      has `confidence=0.72` and `support_count=5`, When the
+      Promoter runs, Then in row-insertion order: (1) a new
       `ConceptVersion(promoted=true, producer='promoter')` row
-      exists and the Concept's vector is upserted into Qdrant.
+      exists, (2) an `EmbeddingPublish` row whose
+      `concept_version_id` foreign-keys to that
+      `ConceptVersion.id` exists with `created_at >=` the
+      `ConceptVersion.created_at`, (3) the
+      `EmbeddingPublishEvent` chain for that `publish_id`
+      reaches `event_kind='published'`, and (4) the Concept's
+      vector is fetchable from the Qdrant
+      `agent_memory_concept` collection under the same
+      `point_id`.
+- [ ] Scenario: ConceptVersion precedes EmbeddingPublish -- Given
+      the Promoter starts a promotion, When the run is
+      inspected, Then for every `EmbeddingPublish` row produced
+      in that run the referenced `ConceptVersion.created_at`
+      is strictly earlier than that `EmbeddingPublish.created_at`
+      (enforces §8.7.1 lines 818-824 ordering: architecture-owned
+      row first, then index-state log).
 - [ ] Scenario: below threshold stays unpromoted -- Given a
       Concept whose latest version has `confidence=0.65`, When
       the Promoter runs, Then no new `ConceptVersion` row is
-      written and the Concept has no Qdrant entry.
+      written, no `EmbeddingPublish` row is written for that
+      Concept, and the Concept has no Qdrant entry.
 - [ ] Scenario: Consolidator never writes EmbeddingIndex --
       Given the Consolidator just emitted a ConceptVersion,
       When the Qdrant `agent_memory_concept` collection is

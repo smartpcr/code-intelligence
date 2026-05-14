@@ -471,12 +471,13 @@ storyId: "code-intelligence:AGENT-MEMORY"
       `Node` row (Method or Block) is already committed by the
       AST emitter's Stage 3.2 transaction (Step 1 of the
       protocol); this publisher does not insert Node rows.
-      Then: insert `EmbeddingPublish` row referencing that
-      `Node.id`, then `EmbeddingPublishEvent(queued)`, then call
-      the embedder, then Qdrant upsert, then `vector_written`,
-      then read-after-write confirm, then `published`. On
-      failure append `failed` and let the background retry
-      pick up.
+      Then: insert `EmbeddingPublish` row whose `node_id`
+      foreign-keys to that `Node.node_id` (architecture.md
+      §5.2.1 — `Node` primary key is `node_id`), then
+      `EmbeddingPublishEvent(queued)`, then call the embedder,
+      then Qdrant upsert, then `vector_written`, then
+      read-after-write confirm, then `published`. On failure
+      append `failed` and let the background retry pick up.
 - [ ] Carry `embedding_model_version` on each `EmbeddingPublish`
       row per risk §9.6.
 - [ ] Have the full-mode handler (Stage 3.1) call the publisher
@@ -906,15 +907,23 @@ storyId: "code-intelligence:AGENT-MEMORY"
       `support_count ≥ 5`).
 - [ ] **Step 1 of §8.7.1 lines 818-833 write protocol** —
       append the architecture-owned `ConceptVersion` row first,
-      with `producer='promoter'`, `promoted=true`, and the
-      planned `embedding_model_version` that the subsequent
-      `EmbeddingPublish` row will carry. The `ConceptVersion`
-      table has **no physical `embedding_vec` column** (per
-      tech-spec.md §8.7.1 line 569) — the vector body lives in
-      Qdrant only. This row MUST exist before any
+      carrying only architecture.md §5.5.2 lines 612-623 fields
+      (the new `concept_version_id` UUID primary key,
+      `concept_id`, `version_index`, `confidence`,
+      `confidence_band`, `support_count`, `negative_count`,
+      `producer='promoter'`, `producer_run_id` → the new
+      `PromoterRun.run_id`, `promoted=true`, `created_at`).
+      The `ConceptVersion` row does **NOT** carry an
+      `embedding_model_version` column — that field lives
+      exclusively on the `EmbeddingPublish` row per
+      tech-spec.md §8.7 lines 807-809. The `ConceptVersion`
+      table also has **no physical `embedding_vec` column**
+      (per tech-spec.md §8.7.1 line 569) — the vector body
+      lives in Qdrant only. This row MUST exist before any
       `EmbeddingPublish` row can reference it, because
       `EmbeddingPublish.concept_version_id` is a foreign-key
-      reference to `ConceptVersion.id`.
+      reference to `ConceptVersion.concept_version_id`
+      (architecture.md §5.5.2 line 612).
 - [ ] Compute the Concept embedding vector for the row just
       appended (description + canonical-feature-signature) and
       reserve a Qdrant `point_id` for it. No Qdrant write
@@ -922,12 +931,15 @@ storyId: "code-intelligence:AGENT-MEMORY"
       computation needed by the next step's `EmbeddingPublish`
       row.
 - [ ] **Step 2 of §8.7.1 lines 818-833 write protocol** —
-      insert an `EmbeddingPublish` row that references the
-      `ConceptVersion.id` from the row appended above, the
-      reserved Qdrant `point_id`, and the
-      `embedding_model_version`. Immediately insert the matching
-      `EmbeddingPublishEvent` with `event_kind='queued'` (Step 3
-      of the protocol).
+      insert an `EmbeddingPublish` row whose
+      `concept_version_id` foreign-keys to the
+      `ConceptVersion.concept_version_id` of the row appended
+      above, with the reserved Qdrant `point_id` and the
+      `embedding_model_version` (the model-version field lives
+      on this row per tech-spec.md §8.7 lines 807-809, not on
+      the `ConceptVersion` row). Immediately insert the
+      matching `EmbeddingPublishEvent` with
+      `event_kind='queued'` (Step 3 of the protocol).
 - [ ] **Steps 4-5 of §8.7.1 lines 818-833 write protocol** —
       upsert the vector into the Qdrant
       `agent_memory_concept` collection under the reserved
@@ -958,10 +970,13 @@ storyId: "code-intelligence:AGENT-MEMORY"
       has `confidence=0.72` and `support_count=5`, When the
       Promoter runs, Then in row-insertion order: (1) a new
       `ConceptVersion(promoted=true, producer='promoter')` row
-      exists, (2) an `EmbeddingPublish` row whose
-      `concept_version_id` foreign-keys to that
-      `ConceptVersion.id` exists with `created_at >=` the
-      `ConceptVersion.created_at`, (3) the
+      exists with a fresh `concept_version_id` UUID, (2) an
+      `EmbeddingPublish` row whose `concept_version_id`
+      foreign-keys to that
+      `ConceptVersion.concept_version_id` exists with
+      `created_at >=` the `ConceptVersion.created_at` AND
+      carries the `embedding_model_version` value (which is
+      absent from the `ConceptVersion` row), (3) the
       `EmbeddingPublishEvent` chain for that `publish_id`
       reaches `event_kind='published'`, and (4) the Concept's
       vector is fetchable from the Qdrant

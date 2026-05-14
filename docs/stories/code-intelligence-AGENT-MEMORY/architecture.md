@@ -207,7 +207,9 @@ and emits:
 The single durable store. Internally split into:
 
 - **GraphWriter** — transactional writer used by Repo Indexer, Span Ingestor,
-  Consolidator, and the observe/feedback verbs of the public surfaces.
+  Consolidator, **Concept Promoter** (appends `ConceptVersion` rows with
+  `producer='promoter'` and writes Concept entries to the EmbeddingIndex —
+  §7.8), and the observe/feedback verbs of the public surfaces.
 - **GraphReader** — read-only API used by recall, expand, summarize, and all
   Management read endpoints (§6.2).
 - **EmbeddingIndex** — vector index over Method nodes, Block nodes, and
@@ -352,9 +354,10 @@ For the full request/response shapes see §6.
 3. Result includes, per edge, the latest `TraceObservation` aggregate
    (count, p50, p95 latency, last-seen `trace_id`) so the agent can rank by
    *actually observed* hot paths, not just static structure.
-4. No write occurs. Identical to §4.2 wrt RecallContextLog — `expand` writes
-   one RecallContextLog row keyed by the new `context_id` so a subsequent
-   `observe` can pin to this expansion.
+4. No graph mutation occurs other than the `RecallContextLog` append —
+   identical to §4.2 in that respect. `expand` writes one RecallContextLog
+   row keyed by the new `context_id` so a subsequent `observe` can pin to
+   this expansion.
 
 ### 4.6 Delta re-index on git push
 
@@ -455,6 +458,29 @@ is deferred to `tech-spec.md`.
 > initial insert. Retirement is recorded by appending an `EdgeRetirement`
 > row (§5.2.4); there is **no** `to_sha` column on `Edge`.
 
+#### 5.2.3 TraceObservation (child of Edge, only for `observed_calls`)
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `edge_id` | uuid | FK → `Edge` (Edge row is append-only per **G5**). |
+| `observation_count` | int | **Mutable aggregate** — incremented on each new span batch. |
+| `p50_latency_ms` | float | Mutable aggregate. |
+| `p95_latency_ms` | float | Mutable aggregate. |
+| `latest_span_ref` | text | Mutable; last `(trace_id, span_id)` that touched this edge. |
+| `last_observed_at` | timestamp | Mutable. |
+
+> **Mutability note.** Per **G5**, the parent `Edge` row stays append-only.
+> The mutable counters live in `TraceObservation`, which is conceptually a
+> *materialised view* over the append-only `TraceObservationLog` (one row per
+> ingested span, never updated). The rebuild guarantee is narrowed to the
+> configured `TraceObservationLog` retention window (§8.1): if a
+> `TraceObservation` row is lost, it can be rebuilt deterministically *only*
+> from log rows still inside the retention window. Aggregates older than the
+> window are authoritative on the `TraceObservation` row alone — they cannot
+> be recomputed from the log because the contributing log rows have been
+> pruned. The Edge row's own `attrs_json` is **not** updated by dynamic
+> ingest.
+
 #### 5.2.4 NodeRetirement and EdgeRetirement (tombstones for G5)
 
 Both tables are append-only. A Node or Edge is "current" iff no row exists
@@ -479,29 +505,6 @@ unique index on `(node_id)` / `(edge_id)`.
 | `edge_id` | uuid | FK → `Edge`. Unique. |
 | `retired_at_sha` | text | Parent commit of the new HEAD at which the Edge disappeared (per **G5**). |
 | `retired_at` | timestamp | When the tombstone was written. |
-
-#### 5.2.3 TraceObservation (child of Edge, only for `observed_calls`)
-
-| Field | Type | Notes |
-| --- | --- | --- |
-| `edge_id` | uuid | FK → `Edge` (Edge row is append-only per **G5**). |
-| `observation_count` | int | **Mutable aggregate** — incremented on each new span batch. |
-| `p50_latency_ms` | float | Mutable aggregate. |
-| `p95_latency_ms` | float | Mutable aggregate. |
-| `latest_span_ref` | text | Mutable; last `(trace_id, span_id)` that touched this edge. |
-| `last_observed_at` | timestamp | Mutable. |
-
-> **Mutability note.** Per **G5**, the parent `Edge` row stays append-only.
-> The mutable counters live in `TraceObservation`, which is conceptually a
-> *materialised view* over the append-only `TraceObservationLog` (one row per
-> ingested span, never updated). The rebuild guarantee is narrowed to the
-> configured `TraceObservationLog` retention window (§8.1): if a
-> `TraceObservation` row is lost, it can be rebuilt deterministically *only*
-> from log rows still inside the retention window. Aggregates older than the
-> window are authoritative on the `TraceObservation` row alone — they cannot
-> be recomputed from the log because the contributing log rows have been
-> pruned. The Edge row's own `attrs_json` is **not** updated by dynamic
-> ingest.
 
 ### 5.3 Episodic Layer
 
@@ -988,8 +991,8 @@ When an `observe` or `expand` references a Node:
 | Agent | `expand` | Graph | `RecallContextLog` (append) |
 | Agent | `summarize` | Graph + RecallContextLog | `RecallContextLog` (append; may reference existing context) |
 | Management | `register` | Repo | `Repo` |
-| Management | `ingest` | — | `Commit`, `Node`, `Edge`, `EmbeddingIndex` |
-| Management | `ingest_delta` | — | `Commit`, `Node`, `Edge`, `EmbeddingIndex` |
+| Management | `ingest` | — | `Commit`, `Node`, `Edge`, `NodeRetirement`, `EdgeRetirement`, `EmbeddingIndex` |
+| Management | `ingest_delta` | — | `Commit`, `Node`, `Edge`, `NodeRetirement`, `EdgeRetirement`, `EmbeddingIndex` |
 | Management | `ingest_spans` | Graph (lookup) | `TraceObservation`, `TraceObservationLog`, occasionally new `Edge` |
 | Management | `feedback` | Episode | `Episode` (feedback kind), `EpisodeUpdate`; *Consolidator later writes* `Episode` (synthetic_positive) + `Observation[]` |
 | Management | `snapshot` | — | `EmbeddingIndex` |

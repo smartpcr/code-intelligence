@@ -1,19 +1,38 @@
 # Agent Memory — Tech Spec
 
 > Story: `code-intelligence:AGENT-MEMORY` · 21 points
-> Companion docs: `architecture.md`, `implementation-plan.md`, `e2e-scenarios.md`
-> This file owns: **problem framing, scope, non-goals, hard constraints,
-> risks, and the numeric/policy parameters that downstream architecture
-> and implementation must respect.** Component-level contracts and data
-> models live in `architecture.md`; rollout sequencing lives in
-> `implementation-plan.md`.
+> Sibling planning artifacts: `architecture.md`, `implementation-plan.md`, `e2e-scenarios.md`
+> This file owns: **problem statement, in-/out-of-scope items,
+> non-goals, hard constraints, identified risks, and the
+> numeric/policy parameter pins this story needs.** Component-level
+> contracts and data models are owned by `architecture.md`; rollout
+> sequencing is owned by `implementation-plan.md`; numbered
+> end-to-end scenarios are owned by `e2e-scenarios.md`. Where this
+> document and `architecture.md` describe the same concept,
+> `architecture.md` is the source of truth for the component/data
+> contract and this file is the source of truth for scope and
+> parameter pins.
 
 ---
 
 ## 1. Document Scope
 
-This document is the upstream framing layer for the **Agent Memory**
-subsystem requested by the story. It is normative for:
+This document is a **sibling planning artifact** to `architecture.md`,
+`implementation-plan.md`, and `e2e-scenarios.md`. It is the source of
+truth for the brief assigned to this file: **problem statement,
+in-/out-of-scope items, non-goals, hard constraints, identified
+risks, and the numeric/policy parameter pins** the Agent Memory
+subsystem needs.
+
+It is **not** an upstream layer that `architecture.md` derives from.
+`architecture.md` is the merged source of truth for components,
+interfaces, and data models, and it explicitly defers a fixed set of
+numeric and vendor decisions to this file (see `architecture.md` §10:
+storage engine, schema DDL, exact OTel-span attribute mapping, and
+SLO numbers). Those deferred decisions are pinned in §8 of this
+document.
+
+This document is normative for:
 
 - The **problem statement** the subsystem must solve (§2).
 - The **strategy survey** that narrows the design from the
@@ -21,13 +40,15 @@ subsystem requested by the story. It is normative for:
   and the rationale for the choice (§3).
 - **Scope boundaries** (§4 in scope · §5 out of scope · §6 non-goals).
 - **Hard constraints** — operator-authored or directly implied by the
-  story — that downstream docs must respect verbatim (§7).
-- **Numeric and policy parameters** that `architecture.md` defers to
-  this file: storage-engine choice slots, retention windows,
-  threshold defaults, SLO targets (§8).
+  story — that must be respected verbatim across all sibling docs
+  (§7).
+- **Numeric and policy parameter pins** that `architecture.md` §10
+  defers to this file: storage engine, vector index, retention
+  windows, threshold defaults, SLO targets, reranker class/cadence,
+  transport, authN, OTel attribute mapping (§8). Each pin is a
+  **locked decision** for v1; §10 lists the locks for single-glance
+  reference.
 - **Identified risks and their mitigations** (§9).
-- **Open questions** that block iteration convergence until the
-  operator pins a decision (§10).
 
 This document is **not** the place to specify component interfaces
 (see `architecture.md` §6), data-model field tables (see
@@ -247,37 +268,35 @@ before reaching this service (`architecture.md` §3.3).
 
 Items the operator may eventually want but that v1 does not ship.
 Each line is paired to the architecture / story decision that put
-it on this list.
+it on this list. Numeric / vendor parameter pins are **not** on
+this list — they are *in* scope of this document and pinned in §8
+(see also §10 Locked Decisions).
 
 1. **Operator UI implementation.** The read contract is in scope
    (§4 item 14); the actual web/desktop UI build, theming, and
    accessibility audit are out of scope (`architecture.md` §1.2
    row "UI design for the operator console").
-2. **Vector-DB vendor selection.** `architecture.md` §1.2 defers
-   it; §8.1 below carries it as an open parameter slot.
-3. **Per-tenant Concept isolation.** Single-tenant in v1 (G6;
+2. **Per-tenant Concept isolation.** Single-tenant in v1 (G6;
    `architecture.md` §1.2 row "Per-tenant Concept isolation").
-4. **Episode purge / GDPR delete tooling.** EpisodicLog is
+3. **Episode purge / GDPR delete tooling.** EpisodicLog is
    append-only forever per operator decision (G3;
    `architecture.md` §1.2 row "Episode purge / GDPR delete
    tooling").
-5. **PII anonymisation inside trace payloads.** Out of scope;
+4. **PII anonymisation inside trace payloads.** Out of scope;
    callers are responsible for OTel hygiene before ingest
    (`architecture.md` §1.2 row "Anonymising third-party PII inside
    trace payloads").
-6. **Whole-line / statement-level static analysis.** Smallest
+5. **Whole-line / statement-level static analysis.** Smallest
    structural node is `block` (`architecture.md` §1.2 row
    "Whole-line/statement-level static analysis", §3.7).
-7. **Vendor-specific profilers as first-class sources** (py-spy,
+6. **Vendor-specific profilers as first-class sources** (py-spy,
    perf, etc.). Must be normalised to OTel upstream
    (`architecture.md` §1.2 row "py-spy / perf / vendor-specific
    profilers").
-8. **Storage-engine choice.** `architecture.md` §5 defers the
-   physical store; §8.1 below carries it as an open parameter
-   slot.
-9. **Reranker model architecture.** §8.4 carries it as an open
-   parameter slot; the *training-data shape* is fixed
-   (`architecture.md` §3.6), the *model class* is not.
+7. **Online learning / live weight updates of the reranker.**
+   Reranker training is offline only; the *model class* is pinned
+   in §8.4 (cross-encoder, BERT-class), the training-data shape is
+   fixed by `architecture.md` §3.6.
 
 ---
 
@@ -320,7 +339,8 @@ story.
 
 These are non-negotiable. Each constraint cites the operator
 decision (or directly-implied story commitment) that backs it.
-Downstream docs that contradict any of these are out of compliance.
+Any sibling plan doc that contradicts a constraint here is out of
+compliance and must be revised.
 
 ### 7.1 Identity and integrity
 
@@ -388,30 +408,36 @@ Downstream docs that contradict any of these are out of compliance.
 
 ---
 
-## 8. Parameter Slots (numeric / policy decisions this tech spec must pin)
+## 8. Parameter Pins (numeric / policy decisions locked by this tech spec)
 
-`architecture.md` defers a fixed set of numeric and vendor decisions
-to this file. Each slot is listed with: (a) the default this tech
-spec proposes, (b) the upper/lower bounds the slot may take without
-violating §7, (c) the open question that pins the final value if the
-operator wants a different one.
+`architecture.md` §10 defers a fixed set of numeric and vendor
+decisions to this file. **This section pins each one as a locked
+decision for v1.** A locked decision is normative; an operator
+override would require a new story (or a follow-up that explicitly
+reopens the relevant subsection of this document). The single-glance
+roll-up of every lock is in §10.
+
+Each entry below lists: (a) the **locked value** for v1, (b) the
+upper/lower bounds the slot may take *without* violating §7
+(useful when a follow-up story considers an override), and (c) the
+**override route** — the story / approval needed to change the lock.
 
 ### 8.1 Storage and indexing
 
-| Slot | Default | Bounds | Pin-question id |
+| Slot | Locked value (v1) | Bounds | Override route |
 | --- | --- | --- | --- |
-| Primary durable store for Nodes / Edges / Episodes / Concepts | **PostgreSQL 16+** (single physical store, schema split by namespace). | Any ACID engine that supports composite UNIQUE indexes on `(repo_id, fingerprint)` and append-only INSERT-only workloads. KV-only stores rejected because of the `EpisodeUpdate ← Episode` join used by `mgmt.read.episodes`. | `storage-engine` |
-| Vector index | **pgvector extension on the same PostgreSQL instance** for v1 (keeps the EmbeddingIndex transactionally consistent with Concept / Node writes per C12). | Any vector index with k-NN cosine ≥ 1k-vector throughput and online insert; if extracted to a separate service, the Repo Indexer and Concept Promoter become its sole writers (C12). | `vector-index` |
-| `TraceObservationLog` retention window | **30 days** rolling. | Lower bound: 7 days (debugging hot-path regressions across a sprint). Upper bound: unbounded if storage budget allows. Aggregate `TraceObservation` row is preserved regardless (C8). | `traceobs-retention` |
-| EpisodicLog physical retention | **Forever** (C5). Sized at §8.3 throughput × planning horizon; partition by `created_at` month. | Lower bound: forever is non-negotiable. Upper bound: N/A. | (none) |
+| Primary durable store for Nodes / Edges / Episodes / Concepts | **PostgreSQL 16+** (single physical store, schema split by namespace). | Any ACID engine that supports composite UNIQUE indexes on `(repo_id, fingerprint)` and append-only INSERT-only workloads. KV-only stores rejected because of the `EpisodeUpdate ← Episode` join used by `mgmt.read.episodes`. | New story; revisit §8.1. |
+| Vector index | **pgvector extension on the same PostgreSQL instance** for v1 (keeps the EmbeddingIndex transactionally consistent with Concept / Node writes per C12). | Any vector index with k-NN cosine ≥ 1k-vector throughput and online insert; if extracted to a separate service, the Repo Indexer and Concept Promoter become its sole writers (C12). | New story; revisit §8.1. |
+| `TraceObservationLog` retention window | **30 days** rolling. | Lower bound: 7 days (debugging hot-path regressions across a sprint). Upper bound: unbounded if storage budget allows. Aggregate `TraceObservation` row is preserved regardless (C8). | New story; revisit §8.1. |
+| EpisodicLog physical retention | **Forever** (C5). Sized at §8.3 throughput × planning horizon; partition by `created_at` month. | Lower bound: forever is non-negotiable. Upper bound: N/A. | Locked by operator decision; not overridable inside this story line. |
 
 ### 8.2 Granularity thresholds
 
-| Slot | Default | Bounds | Pin-question id |
+| Slot | Locked value (v1) | Bounds | Override route |
 | --- | --- | --- | --- |
-| Method-to-Block split threshold | **80 logical lines** (matches `architecture.md` §3.7 default). A method exceeding this is decomposed into Blocks per §3.7. | Lower bound: 40 (very fine-grained, larger graph, higher embed cost). Upper bound: 200 (coarser, fewer Blocks, weaker localisation in Episodes). | `block-threshold` |
-| Block kinds | **Closed set `{entry, branch, loop_body, exception, exit}`** per `architecture.md` §3.7. | The set is closed; extension requires reopening §3 of this doc. | (none) |
-| Embedded Node kinds | **`method`, `block`** at ingest time; **`concept`** at promotion time. `file` / `class` are not embedded in v1. | Bounds: embedding `file` / `class` is a deferred optimisation; it cannot precede method/block coverage. | `embed-kinds` |
+| Method-to-Block split threshold | **80 logical lines** (matches `architecture.md` §3.7 default). A method exceeding this is decomposed into Blocks per §3.7. | Lower bound: 40 (very fine-grained, larger graph, higher embed cost). Upper bound: 200 (coarser, fewer Blocks, weaker localisation in Episodes). | New story; revisit §8.2. |
+| Block kinds | **Closed set `{entry, branch, loop_body, exception, exit}`** per `architecture.md` §3.7. | The set is closed; extension requires reopening §3 of this doc. | Reopen §3 of this doc. |
+| Embedded Node kinds | **`method`, `block`** at ingest time; **`concept`** at promotion time. `file` / `class` are not embedded in v1. | Bounds: embedding `file` / `class` is a deferred optimisation; it cannot precede method/block coverage. | New story; revisit §8.2. |
 
 ### 8.3 SLO targets and throughput envelopes
 
@@ -419,7 +445,7 @@ These are the contract numbers `architecture.md` §3.10 defers ("a
 request/response round-trip of single-digit seconds for recall and
 observe at p95 under nominal load"). They are normative for v1.
 
-| Slot | Default p95 target | Default p99 target | Nominal-load envelope |
+| Slot | Locked p95 target | Locked p99 target | Nominal-load envelope |
 | --- | --- | --- | --- |
 | `agent.recall` round-trip | **≤ 1.5 s** | ≤ 4 s | 50 RPS sustained, 200 RPS burst (1 min) |
 | `agent.observe` round-trip | **≤ 400 ms** | ≤ 1.5 s | 50 RPS sustained, 200 RPS burst |
@@ -431,29 +457,29 @@ observe at p95 under nominal load"). They are normative for v1.
 
 Two **learning-quality** SLO targets that fall out of §2.4:
 
-| Slot | Default | Notes |
+| Slot | Locked value (v1) | Notes |
 | --- | --- | --- |
 | Rank-of-correct-node @ k=20 (median over labelled positive Episodes, last 7 days) | **≤ 5** | Measured by joining `Observation` rows on positive-outcome Episodes against the originating `RecallContextLog.node_ids` order. |
 | Concept-hit fraction @ k=20 on `agent.recall` (last 7 days) | **≥ 25 %** | Measured by the share of `RecallContextLog.concept_ids` that lead to at least one positive-outcome Episode within the next 24 h. |
 
-Pin-question id for these numbers: `slo-targets`.
+Override route for any of the §8.3 numbers: new story; revisit §8.3.
 
 ### 8.4 Reranker and training cadence
 
-| Slot | Default | Bounds | Pin-question id |
+| Slot | Locked value (v1) | Bounds | Override route |
 | --- | --- | --- | --- |
-| Reranker model class | **Cross-encoder, BERT-class, ≤ 200M params** | Lower bound: any pairwise-scoring model with ≤ 50 ms / 100-candidate latency. Upper bound: anything that satisfies p95 SLO in §8.3. Online learning is explicitly out (§6 non-goal 7). | `reranker-class` |
-| Training cadence | **Nightly**, plus on-demand if labelled-Episode count grows by ≥ 5 % since the last run. | Lower bound: hourly (cost). Upper bound: weekly (signal staleness). | `reranker-cadence` |
-| Training data window | **Trailing 90 days** of Episodes + all synthetic positives ever. | Lower bound: 30 days. Upper bound: all-time (cost). | `reranker-window` |
-| Model registry | Same PostgreSQL instance, `reranker_model` table with `version`, `artifact_uri`, `trained_at`, `metrics_json`. GraphReader reads the latest published version on every request. | — | (none) |
+| Reranker model class | **Cross-encoder, BERT-class, ≤ 200M params** | Lower bound: any pairwise-scoring model with ≤ 50 ms / 100-candidate latency. Upper bound: anything that satisfies p95 SLO in §8.3. Online learning is explicitly out (§6 non-goal 7). | New story; revisit §8.4. |
+| Training cadence | **Nightly**, plus on-demand if labelled-Episode count grows by ≥ 5 % since the last run. | Lower bound: hourly (cost). Upper bound: weekly (signal staleness). | New story; revisit §8.4. |
+| Training data window | **Trailing 90 days** of Episodes + all synthetic positives ever. | Lower bound: 30 days. Upper bound: all-time (cost). | New story; revisit §8.4. |
+| Model registry | Same PostgreSQL instance, `reranker_model` table with `version`, `artifact_uri`, `trained_at`, `metrics_json`. GraphReader reads the latest published version on every request. | — | Locked. |
 
 ### 8.5 Transport and authentication
 
-| Slot | Default | Bounds | Pin-question id |
+| Slot | Locked value (v1) | Bounds | Override route |
 | --- | --- | --- | --- |
-| Transport | **gRPC over HTTP/2** for Agent Surface, **REST + JSON** for Management Surface. | Bounds: either may be served on the other protocol if both `RecallResponse` and `ExpandResponse` envelopes carry identical fields. | `transport` |
-| AuthN | **mTLS** for Agent Surface (caller is a service), **OIDC bearer token** for Management Surface (caller is a human via the UI). | Bounds: any mutual-cryptographic scheme on Agent; any human-IdP scheme on Management. | `authn` |
-| AuthZ | **Single-tenant v1**: all callers have access to all repos. Per-tenant ACL is out of scope (§5 item 3). | — | (none) |
+| Transport | **gRPC over HTTP/2** for Agent Surface, **REST + JSON** for Management Surface. | Bounds: either may be served on the other protocol if both `RecallResponse` and `ExpandResponse` envelopes carry identical fields. | New story; revisit §8.5. |
+| AuthN | **mTLS** for Agent Surface (caller is a service), **OIDC bearer token** for Management Surface (caller is a human via the UI). | Bounds: any mutual-cryptographic scheme on Agent; any human-IdP scheme on Management. | New story; revisit §8.5. |
+| AuthZ | **Single-tenant v1**: all callers have access to all repos. Per-tenant ACL is out of scope (§5 item 2). | — | Out of scope for v1; covered by a future multi-tenant story. |
 
 ### 8.6 OTel attribute mapping
 
@@ -468,9 +494,8 @@ spec pins the mapping:
 | Caller side of an `observed_calls` Edge | OTel `parent_span_id`, recursively resolved through the same mapping above. | If the parent span is missing (root span), drop the edge contribution but record the latency on the destination Method's solo aggregate. |
 | Trace correlation id | `trace_id` (OTel-native). | — |
 
-The mapping is closed for v1; extension requires reopening §3 of
-this doc. Pin-question id (if the operator wants a different
-mapping): `otel-mapping`.
+The mapping is closed for v1. Override route: reopen §8.6 of this
+doc.
 
 ---
 
@@ -519,8 +544,11 @@ Each risk lists: **trigger** → **impact** → **mitigation** →
 - **Mitigation.** Concept fingerprint includes the
   observed-feature-signature, not just the human-readable name
   (`architecture.md` §5.5.1). The Concept Promoter only flips
-  `promoted=true` when support spans at least one repo with ≥ 5
-  positive supports (§8.4 trained on the same labelled data).
+  `promoted=true` when the latest `ConceptVersion` satisfies
+  `confidence ≥ 0.7` and `support_count ≥ 5`
+  (`architecture.md` §7.8). Cross-repo recall therefore only
+  surfaces Concepts whose support is both deep (≥ 5) and well-
+  calibrated (≥ 0.7).
 - **Residual.** A novel cross-repo pattern with thin support may
   still mis-cluster on early ingests; the reranker absorbs the
   signal once corrections accumulate (G7).
@@ -677,26 +705,46 @@ Each risk lists: **trigger** → **impact** → **mitigation** →
 
 ---
 
-## 10. Open Questions
+## 10. Locked Decisions (single-glance roll-up)
 
-The following items are unresolved and the operator must pin them
-before convergence. Each is mirrored in the JSON block after the
-Iteration Summary.
+This section is the single-glance roll-up of every parameter pin made
+elsewhere in this document. **All entries are locked decisions for
+v1.** Each row gives the pinned value and the section where the
+rationale, bounds, and override route are documented. There are no
+open questions blocking this story; an operator override of any
+locked decision requires a new story that reopens the cited section.
 
-| id | Question | Why it blocks |
-| --- | --- | --- |
-| `storage-engine` | Confirm PostgreSQL 16+ as the single durable store, or pick an alternative (multi-store mixed, distributed SQL, KV+secondary index). | Schema DDL and §8.3 SLO numbers are written against the chosen engine; switching cost is high after `architecture.md` §5 is locked. |
-| `vector-index` | Confirm pgvector on the same PostgreSQL instance, or pick a separate vector service (Qdrant, Weaviate, FAISS-on-disk, Milvus). | C12 sole-writer rule is unaffected, but degraded-mode shape and §8.3 latency change materially. |
-| `traceobs-retention` | Lock the `TraceObservationLog` retention window. Default proposed: 30 days. | Affects disk sizing and how far back §5.2.3 deterministic rebuild is possible. |
-| `block-threshold` | Lock the method-to-Block split threshold. Default proposed: 80 logical lines. | Affects graph cardinality, embed cost, and Episode locality. |
-| `embed-kinds` | Confirm method + block + concept as the only embedded kinds in v1, or extend to file/class. | Affects Repo Indexer responsibilities and EmbeddingIndex sizing. |
-| `slo-targets` | Confirm §8.3 p95/p99 numbers, or supply tighter/looser targets. | These are the contract numbers downstream load tests will assert against. |
-| `reranker-class` | Confirm cross-encoder BERT-class as the v1 reranker, or pick another class (LTR, lightweight LLM scorer, dual-encoder). | Affects §8.3 latency and §8.4 training pipeline shape. |
-| `reranker-cadence` | Confirm nightly training cadence, plus the 5 %-growth on-demand trigger. | Affects compute cost and `reranker_model_stale` degraded surface. |
-| `reranker-window` | Confirm 90-day trailing training window (plus all-time synthetic positives). | Affects training set size and bias toward recent code. |
-| `transport` | Confirm gRPC for Agent Surface and REST for Management Surface. | Affects client SDK shape and degraded-mode envelope wire format. |
-| `authn` | Confirm mTLS (Agent) and OIDC (Management). | Affects deployment topology and operator UI integration. |
-| `otel-mapping` | Confirm §8.6 OTel attribute mapping, including the "drop and count" fallback. | Affects Span Ingestor implementation and `span_unresolved_total` baseline. |
+| Decision | Locked value (v1) | Defined in | Override route |
+| --- | --- | --- | --- |
+| Primary durable store | PostgreSQL 16+ (schema split by namespace) | §8.1 | New story; revisit §8.1 |
+| Vector index | pgvector on the same PostgreSQL instance | §8.1 | New story; revisit §8.1 |
+| `TraceObservationLog` retention window | 30 days rolling | §8.1 | New story; revisit §8.1 |
+| `EpisodicLog` physical retention | Forever (append-only, partition by month) | §8.1, C5 | Not overridable inside this story line |
+| Method-to-Block split threshold | 80 logical lines | §8.2 | New story; revisit §8.2 |
+| Block kinds | Closed set `{entry, branch, loop_body, exception, exit}` | §8.2 | Reopen §3 of this doc |
+| Embedded Node kinds (v1) | `method`, `block`, `concept` | §8.2 | New story; revisit §8.2 |
+| `agent.recall` p95 / p99 | ≤ 1.5 s / ≤ 4 s @ 50 RPS sustained | §8.3 | New story; revisit §8.3 |
+| `agent.observe` p95 / p99 | ≤ 400 ms / ≤ 1.5 s @ 50 RPS sustained | §8.3 | New story; revisit §8.3 |
+| `agent.expand` (depth ≤ 3) p95 / p99 | ≤ 1.5 s / ≤ 4 s @ 20 RPS sustained | §8.3 | New story; revisit §8.3 |
+| `agent.summarize` p95 / p99 | ≤ 4 s / ≤ 10 s @ 5 RPS sustained | §8.3 | New story; revisit §8.3 |
+| `mgmt.ingest_spans` batch (≤ 1k spans) p95 / p99 | ≤ 2 s / ≤ 5 s @ 50 batches/min | §8.3 | New story; revisit §8.3 |
+| Webhook → first Node row visible | ≤ 30 s (delta ≤ 100 files) / ≤ 2 min p99 | §8.3 | New story; revisit §8.3 |
+| Full ingest, 200 k LOC repo | ≤ 30 min wall-clock @ 4 workers | §8.3 | New story; revisit §8.3 |
+| Rank-of-correct-node @ k=20 (median, 7-day) | ≤ 5 | §8.3 | New story; revisit §8.3 |
+| Concept-hit fraction @ k=20 (7-day) | ≥ 25 % | §8.3 | New story; revisit §8.3 |
+| Reranker model class | Cross-encoder, BERT-class, ≤ 200M params | §8.4 | New story; revisit §8.4 |
+| Reranker training cadence | Nightly + on-demand on ≥ 5 % labelled-Episode growth | §8.4 | New story; revisit §8.4 |
+| Reranker training data window | Trailing 90 days + all-time synthetic positives | §8.4 | New story; revisit §8.4 |
+| Reranker model registry | Same PostgreSQL instance, `reranker_model` table | §8.4 | Locked |
+| Agent Surface transport | gRPC over HTTP/2 | §8.5 | New story; revisit §8.5 |
+| Management Surface transport | REST + JSON | §8.5 | New story; revisit §8.5 |
+| Agent Surface authN | mTLS | §8.5 | New story; revisit §8.5 |
+| Management Surface authN | OIDC bearer token | §8.5 | New story; revisit §8.5 |
+| AuthZ scope (v1) | Single-tenant, no per-repo ACL | §8.5, §4.1 | Future multi-tenant story |
+| OTel span → Method resolution | `code.namespace` + `code.function`, fallback `code.filepath` + `code.lineno`, then drop and count | §8.6 | Reopen §8.6 of this doc |
+| OTel span → Block resolution | `code.lineno` against ingested Block boundaries; fallback to parent Method | §8.6 | Reopen §8.6 of this doc |
+| Caller side of `observed_calls` edge | OTel `parent_span_id`, recursively resolved; root → solo aggregate | §8.6 | Reopen §8.6 of this doc |
+| Trace correlation id | OTel-native `trace_id` | §8.6 | Locked |
 
 ---
 

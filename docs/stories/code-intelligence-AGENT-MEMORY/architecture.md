@@ -591,9 +591,19 @@ unique index on `(node_id)` / `(edge_id)`.
 > **Concept row is fully immutable.** Per **G4**, no column on `Concept` is
 > ever updated. Confidence, support counts, *and* the embedding live on the
 > versioned `ConceptVersion` row (§5.5.2) so the Concept Promoter and any
-> future re-embedder can publish new vectors without rewriting Concept. The
-> "current" embedding for a Concept is the `embedding_vec` of its most
-> recent `ConceptVersion` row.
+> future re-embedder can publish new vectors without rewriting Concept.
+>
+> **Single canonical "current embedding" rule (shared with §5.5.2).** Because
+> Consolidator-emitted ConceptVersion rows may carry a null `embedding_vec`
+> (they advance confidence/support without re-embedding), the current
+> embedding for a Concept is defined as the `embedding_vec` of the
+> *most recent ConceptVersion row whose `embedding_vec` is non-null*, ordered
+> by `version_index` descending. If no such row exists (e.g. a Concept that
+> has never been re-embedded post-creation), the Concept has no current
+> embedding and is excluded from vector recall until the Concept Promoter
+> writes one. This is the only rule; §5.5.2 restates it on the
+> `embedding_vec` field for locality, and §3.5 EmbeddingIndex reads use the
+> same definition.
 
 #### 5.5.2 ConceptVersion (G4)
 
@@ -608,7 +618,7 @@ unique index on `(node_id)` / `(edge_id)`.
 | `negative_count` | int | Number of supporting negative Episodes. |
 | `producer` | enum | `consolidator` or `promoter`. Identifies which worker emitted the version. |
 | `producer_run_id` | uuid | FK → `ConsolidatorRun` when `producer=consolidator`; FK → `PromoterRun` (§5.6) when `producer=promoter`. The pair `(producer, producer_run_id)` is the full attribution. |
-| `embedding_vec` | vector? | Set on versions emitted by the Concept Promoter (§7.8); null on Consolidator-emitted versions that did not re-embed. The current embedding for a Concept is the most recent non-null `embedding_vec` across its ConceptVersion rows. |
+| `embedding_vec` | vector? | Set on versions emitted by the Concept Promoter (§7.8); null on Consolidator-emitted versions that did not re-embed. The Concept's current embedding is resolved per the single canonical rule in §5.5.1 (most-recent ConceptVersion with non-null `embedding_vec`, ordered by `version_index` desc); this field is the per-row input to that rule, never an authoritative "current" value on its own. |
 | `promoted` | bool | Set true by the Concept Promoter when the Concept first crosses the publishable threshold (§7.8). Subsequent versions inherit/refresh this flag. |
 | `created_at` | timestamp | Append-only. |
 

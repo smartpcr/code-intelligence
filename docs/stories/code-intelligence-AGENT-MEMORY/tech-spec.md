@@ -28,15 +28,14 @@ It is **not** an upstream layer that `architecture.md` derives from.
 `architecture.md` is the merged source of truth for components,
 interfaces, and data models, and it explicitly defers a fixed set of
 numeric and vendor decisions to this file (see `architecture.md` §10:
-storage engine, exact OTel-span attribute mapping, and SLO numbers).
-Those deferred decisions are pinned in §8 of this document.
-`architecture.md` §10 also lists "schema DDL" as living in this
-file; this tech spec narrows that claim — **engine-level and
-policy-level storage decisions are pinned here (§8.1), but the
-table-by-table DDL (CREATE TABLE statements, indices, constraints)
-is owned by `implementation-plan.md`** because DDL is build-order
-material, not framing material. The data model itself is normative
-in `architecture.md` §5; this tech spec does not redefine it.
+storage engine, **schema DDL**, exact OTel-span attribute mapping,
+and SLO numbers). Those deferred decisions are pinned in §8 of this
+document. Schema-DDL ownership is honoured by §8.7, which pins the
+engine-specific DDL conventions (types, indices, partitioning,
+extension prerequisites) that translate the architecture.md §5
+field tables into a PostgreSQL 16+ schema; the data-model field
+tables themselves remain normative in `architecture.md` §5 and are
+not re-defined here.
 
 This document is normative for:
 
@@ -49,11 +48,11 @@ This document is normative for:
   story — that must be respected verbatim across all sibling docs
   (§7).
 - **Numeric and policy parameter pins** that `architecture.md` §10
-  defers to this file: storage engine, vector index, retention
-  windows, threshold defaults, SLO targets, reranker class/cadence,
-  transport, authN, OTel attribute mapping (§8). Each pin is a
-  **locked decision** for v1; §10 lists the locks for single-glance
-  reference.
+  defers to this file: storage engine, **schema DDL**, vector
+  index, retention windows, threshold defaults, SLO targets,
+  reranker class/cadence, transport, authN, OTel attribute mapping
+  (§8). Each pin is a **locked decision** for v1; §10 lists the
+  locks for single-glance reference.
 - **Identified risks and their mitigations** (§9).
 
 This document is **not** the place to specify component interfaces
@@ -431,7 +430,7 @@ roll-up of every lock is in §10.
 > decisions in §8.1, §8.2, §8.4, and §8.5 verbatim (most as the
 > proposed defaults). The notable substantive change is the
 > **vector index → Qdrant** (a separate service, not pgvector on
-> the same PostgreSQL instance); see §8.1, §9.6, and the §7.8
+> the same PostgreSQL instance); see §8.1, §9.6a, and the §7.8
 > degraded-mode contract for the implications. Two pins were
 > answered non-decisively: **`slo-targets` ("don't know")** — the
 > §8.3 numbers stand as the v1 contract but are explicitly
@@ -451,7 +450,7 @@ upper/lower bounds the slot may take *without* violating §7
 | Slot | Locked value (v1) | Bounds | Override route |
 | --- | --- | --- | --- |
 | Primary durable store for Nodes / Edges / Episodes / Concepts | **PostgreSQL 16+** (single physical store, schema split by namespace). | Any ACID engine that supports composite UNIQUE indexes on `(repo_id, fingerprint)` and append-only INSERT-only workloads. KV-only stores rejected because of the `EpisodeUpdate ← Episode` join used by `mgmt.read.episodes`. | New story; revisit §8.1. |
-| Vector index | **Qdrant** (separate service; per operator pin in iter 3). Repo Indexer writes Method/Block vectors; Concept Promoter writes Concept vectors. The EmbeddingIndex is therefore **not transactionally consistent** with the PostgreSQL store — see §7.8 / C22 (`embedding_index_unavailable` is a closed `degraded_reason`) and risk §9.6 for the staleness / outage handling. C12's sole-writer rule is unaffected: Repo Indexer and Concept Promoter remain the only writers. | Any vector index with k-NN cosine ≥ 1k-vector throughput, online insert, payload-filtering by `repo_id` / `kind`, and snapshot/restore. Single-process pgvector remains a viable lower-bound if separation cost is too high. | New story; revisit §8.1. |
+| Vector index | **Qdrant** (separate service; per operator pin in iter 3). Repo Indexer writes Method/Block vectors; Concept Promoter writes Concept vectors. The EmbeddingIndex is therefore **not transactionally consistent** with the PostgreSQL store — see §7.8 / C22 (`embedding_index_unavailable` is a closed `degraded_reason`) and risk §9.6a for the staleness / outage handling. C12's sole-writer rule is unaffected: Repo Indexer and Concept Promoter remain the only writers. | Any vector index with k-NN cosine ≥ 1k-vector throughput, online insert, payload-filtering by `repo_id` / `kind`, and snapshot/restore. Single-process pgvector remains a viable lower-bound if separation cost is too high. | New story; revisit §8.1. |
 | `TraceObservationLog` retention window | **30 days** rolling. | Lower bound: 7 days (debugging hot-path regressions across a sprint). Upper bound: unbounded if storage budget allows. Aggregate `TraceObservation` row is preserved regardless (C8). | New story; revisit §8.1. |
 | EpisodicLog physical retention | **Forever** (C5). Sized at §8.3 throughput × planning horizon; partition by `created_at` month. | Lower bound: forever is non-negotiable. Upper bound: N/A. | Locked by operator decision; not overridable inside this story line. |
 
@@ -541,6 +540,95 @@ doc.
 > iteration of §8.6 pins refinements (e.g. additional fallback
 > attributes for language runtimes with weaker OTel auto-instr)
 > without re-opening the rest of §8.
+
+### 8.7 Schema DDL conventions
+
+`architecture.md` §10 expressly defers **schema DDL** to this tech
+spec. The architecture-owned field tables in `architecture.md` §5
+remain normative for the **logical model** (what columns exist on
+each entity and which are append-only); this subsection pins the
+**physical-schema decisions** that translate those tables into a
+PostgreSQL 16+ schema. Full `CREATE TABLE` statements are a
+mechanical translation of the field tables under these conventions
+and are produced as a generated artifact during build; this section
+is the source of truth for *how* the translation is performed.
+
+#### 8.7.1 Type mapping (architecture.md §5 logical type → PostgreSQL type)
+
+| Logical (`architecture.md` §5) | PostgreSQL 16+ type | Notes |
+| --- | --- | --- |
+| `uuid` | `uuid` | Uses `pgcrypto`'s `gen_random_uuid()` as default where the writer does not generate the id explicitly. |
+| `bytes(32)` | `bytea` with CHECK `(octet_length(col) = 32)` | Used for every G2 `fingerprint` column. |
+| `text` | `text` | No fixed-width `varchar(n)`. |
+| `enum` | Named PostgreSQL `ENUM` type | One ENUM per architecture.md enum (`node_kind`, `edge_kind`, `episode_kind`, `outcome`, `block_kind`, `concept_band`, `producer`, `polarity`, `actor`, `observation_role`, `repo_event_kind`, `verb`, `degraded_reason`). Members are exactly the closed sets in `architecture.md`. |
+| `int` | `bigint` for counters and `int` for bounded values (e.g. `version_index`). | Counters that can grow without bound (e.g. `observation_count`) use `bigint`. |
+| `float` | `double precision` | |
+| `bool` | `boolean` | |
+| `timestamp` | `timestamptz` | All timestamps are stored in UTC. |
+| `json` | `jsonb` | All architecture.md `*_json` columns. |
+| `vector?` | **Not stored in PostgreSQL.** | Per §8.1 the Qdrant point id is captured in `EmbeddingPublish` (§9.6a); the architecture.md `embedding_vec` field is therefore a logical view served by the GraphReader from Qdrant, not a physical column on `Node` / `ConceptVersion`. |
+| `uuid[]` | `uuid[]` | Used for `RecallContextLog.node_ids` etc. Ordering preserved. |
+
+#### 8.7.2 Index policy
+
+| Index family | Where | DDL shape |
+| --- | --- | --- |
+| Fingerprint uniqueness (G2) | `Node`, `Edge`, `Concept` | `CREATE UNIQUE INDEX … ON <table> (repo_id, fingerprint);` for `Node` / `Edge`; `CREATE UNIQUE INDEX … ON Concept (fingerprint);` (no `repo_id` per G6). |
+| Tombstone single-row enforcement (G5) | `NodeRetirement`, `EdgeRetirement` | `CREATE UNIQUE INDEX … ON NodeRetirement (node_id);` and same on `EdgeRetirement (edge_id)`. |
+| Hot-path lookups | `Episode`, `Observation`, `EpisodeUpdate`, `RecallContextLog` | B-tree indices on `(repo_id, created_at DESC)` for partition-aware reads; partial index on `EpisodeUpdate (episode_id)` for the `current_status` join. |
+| ConceptVersion ordering | `ConceptVersion` | B-tree on `(concept_id, version_index DESC)` for the "most recent ConceptVersion" rule in `architecture.md` §5.5.1. |
+| Synthetic-positive uniqueness (per risk §9.8) | `Episode` | Partial unique index `WHERE kind='synthetic_positive'` on `synthesized_from_feedback_episode_id`. |
+| TraceObservationLog scan | `TraceObservationLog` | B-tree on `(edge_id, started_at DESC)`. |
+| `EmbeddingPublish` event lookup | `EmbeddingPublishEvent` | B-tree on `(publish_id, created_at DESC)` for the "latest event" read in §9.6a. |
+
+#### 8.7.3 Partitioning policy
+
+| Table | Partition scheme | Rationale |
+| --- | --- | --- |
+| `Episode`, `EpisodeUpdate`, `Observation` | Monthly RANGE on `created_at` | Risk §9.2 — forever-retention without partitioning becomes unqueryable. Partition pruning is engaged by the `since` filter on `mgmt.read.episodes` (`architecture.md` §6.2.3). |
+| `RecallContextLog` | Monthly RANGE on `created_at` | Same retention shape as Episode; cheap (ids only). |
+| `TraceObservationLog` | Weekly RANGE on `started_at` | Aligns with the §8.1 30-day retention so the Span Ingestor pruner drops whole partitions, not row-by-row. |
+| `EmbeddingPublish`, `EmbeddingPublishEvent` | Monthly RANGE on `created_at` | Same shape as RecallContextLog; cheap, id-only rows. |
+| Other tables (`Repo`, `Commit`, `Node`, `Edge`, `Concept`, `ConceptVersion`, `ConceptSupport`, `NodeRetirement`, `EdgeRetirement`, `TraceObservation`, `RepoEvent`, `ConsolidatorRun`, `PromoterRun`, `reranker_model`) | Single table (no partitioning) | These tables either grow with the structural graph (bounded by repo size) or are bounded by promotion/run cardinality. |
+
+#### 8.7.4 Constraint policy
+
+- Every `enum` column has a `NOT NULL` constraint unless the
+  architecture.md field table explicitly marks it nullable (`enum?`).
+- Every `fingerprint` column has the `bytea` length CHECK noted
+  above plus `NOT NULL`.
+- The Observation CHECK from `architecture.md` §5.3.3 ("exactly
+  one of `node_id`, `edge_id`, `concept_id`,
+  `degraded_recall_context_id` is non-null") is implemented as a
+  table-level `CHECK ( (node_id IS NOT NULL)::int +
+  (edge_id IS NOT NULL)::int + (concept_id IS NOT NULL)::int +
+  (degraded_recall_context_id IS NOT NULL)::int = 1 )`.
+- `EpisodicLog` / `EpisodeUpdate` / `Observation` /
+  `RecallContextLog` / `NodeRetirement` / `EdgeRetirement` /
+  `TraceObservationLog` / `Concept` / `ConceptVersion` /
+  `ConceptSupport` / `EmbeddingPublish` /
+  `EmbeddingPublishEvent` have **no `UPDATE`-granting role**;
+  application roles are granted `INSERT` and `SELECT` only,
+  enforcing G3 / G4 / G5 at the database layer.
+
+#### 8.7.5 Extension prerequisites
+
+- `pgcrypto` for `gen_random_uuid()`.
+- `pg_partman` (or equivalent automation) for the monthly /
+  weekly RANGE partition rotation listed in §8.7.3.
+- No `pgvector` (vectors live in Qdrant per §8.1).
+
+#### 8.7.6 Materialisation responsibility
+
+The mechanical translation of `architecture.md` §5 field tables
+into runnable `CREATE TABLE … ;` statements under the conventions
+above is **build-order material** and is owned by
+`implementation-plan.md` (it ships the migration files in the
+order required by FK dependencies). The *decisions* about which
+PostgreSQL types, indices, partition schemes, and constraints to
+use are owned **here** in §8.7 and are normative for that
+materialisation. If a migration file in `implementation-plan.md`
+diverges from §8.7, it is out of compliance.
 
 ---
 
@@ -649,29 +737,83 @@ Each risk lists: **trigger** → **impact** → **mitigation** →
 ### 9.6a Cross-store staleness between PostgreSQL and Qdrant
 
 - **Trigger.** §8.1 pins Qdrant as a **separate service** from the
-  PostgreSQL store. Writes to Node / ConceptVersion rows in
-  PostgreSQL and writes to the EmbeddingIndex in Qdrant are
-  therefore **not in a single transaction**; a crash between the
-  two can leave a Node row with no vector, or a vector with no
-  row.
+  PostgreSQL store. Writes to Node rows in PostgreSQL and writes
+  to the Qdrant EmbeddingIndex are therefore **not in a single
+  transaction**; a crash between the two can leave a Node with no
+  Qdrant vector, or a Qdrant vector with no PostgreSQL row.
 - **Impact.** Recall returns vectors that dereference to missing
-  Node ids (or, on the inverse path, a Node with no vector that is
-  invisible to recall until re-embedded).
-- **Mitigation.** Each writer (Repo Indexer for Method/Block,
-  Concept Promoter for Concept) follows a fixed two-phase order:
-  (1) write the PostgreSQL row first with a sentinel
-  `embedding_state='pending'`; (2) write the Qdrant vector with
-  the row's primary key as the Qdrant point id; (3) update the
-  PostgreSQL row's `embedding_state='ready'`. GraphReader filters
-  recall hits whose `embedding_state != 'ready'`. On crash
-  recovery, both writers re-scan rows where `embedding_state IN
-  ('pending', 'ready')` against the current Qdrant snapshot and
-  reconcile. Qdrant outages surface through C22 as
-  `embedding_index_unavailable`.
+  Node ids (or, on the inverse path, a fresh Node with no vector
+  that is invisible to recall until the publish completes).
+- **Mitigation.** Because `architecture.md` §5.2.1 makes Node rows
+  immutable post-insert (G5) and §5.5.1/§5.5.2 make Concept and
+  ConceptVersion rows append-only (G4), the mitigation **does
+  not add any column to Node or ConceptVersion** and does **not**
+  update an existing row. Instead, this tech spec pins two new
+  **operational, append-only index-state tables** that live
+  alongside (not inside) the architecture-owned schema:
+
+  | Table | Purpose | Mutability |
+  | --- | --- | --- |
+  | `EmbeddingPublish` | One row per intended vector publish; carries the target (`node_id` or `concept_version_id`), `embedding_model_version`, the Qdrant `point_id`, and `created_at`. | Append-only (immutable after insert). |
+  | `EmbeddingPublishEvent` | One row per status transition of an `EmbeddingPublish` row. Carries `publish_id`, `event_kind ∈ {queued, vector_written, published, failed, superseded}`, `attempt_index`, `details_json?`, `created_at`. | Append-only. |
+
+  Both tables are owned by this tech spec (§8.7 carries the DDL
+  conventions). They are NOT additions to `architecture.md` §5;
+  they are an index-state log that the GraphReader and the two
+  EmbeddingIndex writers consult on top of the architecture-owned
+  data model.
+
+  Write protocol — strictly append-only, no row mutation:
+
+  1. The writer (Repo Indexer for Method/Block, Concept Promoter
+     for Concept) inserts the architecture-owned row first
+     (Node or ConceptVersion) per its normal §3.2 / §7.8 flow.
+  2. The writer inserts an `EmbeddingPublish` row referencing
+     that row's id and the planned `point_id`.
+  3. The writer inserts an `EmbeddingPublishEvent` with
+     `event_kind='queued'`.
+  4. The writer upserts the vector into Qdrant with the same
+     `point_id`. On success it inserts an `EmbeddingPublishEvent`
+     with `event_kind='vector_written'`; on failure it inserts
+     one with `event_kind='failed'` (and the next attempt produces
+     a new `'queued'` event row, never an update).
+  5. After a confirming Qdrant fetch (read-after-write check), it
+     inserts a final `event_kind='published'` event.
+
+  Read protocol (GraphReader during `agent.recall`):
+  - A vector hit from Qdrant is dereferenced through the most
+    recent `EmbeddingPublishEvent` for that `publish_id`. The hit
+    is surfaced **iff** the latest event is `'published'`. Hits
+    whose latest event is anything else are filtered out and
+    counted (`recall_filter_unpublished_total`).
+  - On the inverse path, a Node or ConceptVersion that has no
+    `EmbeddingPublish` row, or whose latest event is not
+    `'published'`, is **not embedded yet** and is therefore not
+    a vector recall candidate (the structural-prior fallback in
+    §9.5 still works).
+
+  Re-embedding (§9.6) follows the same protocol: the new
+  embedding-model run inserts a fresh `EmbeddingPublish` row with
+  a new `embedding_model_version`; once it reaches `'published'`,
+  the writer emits one final `EmbeddingPublishEvent(
+  event_kind='superseded')` on the *prior* `publish_id` so the
+  reader picks the new vector deterministically. No prior row,
+  no prior event, no Node column is ever rewritten — full G3 /
+  G4 / G5 compliance.
+
+  Qdrant outages surface through C22 as
+  `embedding_index_unavailable`; the writer queues the publish by
+  leaving the latest event at `'queued'` or `'failed'` and a
+  background flusher retries.
+
 - **Residual.** A long Qdrant outage during a heavy delta ingest
-  leaves a backlog of `pending` rows; recall degrades smoothly
-  because those rows are filtered out. Re-embedding throughput is
-  bounded by §8.3 ingest envelope.
+  leaves a backlog of `'queued'` / `'failed'` `EmbeddingPublish`
+  rows; recall degrades smoothly because the GraphReader filter
+  excludes them and the structural-prior fallback covers the gap.
+  `EmbeddingPublishEvent` rows are append-only and grow with
+  publish volume; retention for these two tables is the same as
+  `RecallContextLog` (append-only forever, partition by
+  `created_at` month) — they are cheap, id-only rows.
 
 ### 9.7 Tombstone churn from automated refactors
 
@@ -818,6 +960,12 @@ locked decision requires a new story that reopens the cited section.
 | OTel span → Block resolution | `code.lineno` against ingested Block boundaries; fallback to parent Method | §8.6 | Reopen §8.6 of this doc |
 | Caller side of `observed_calls` edge | OTel `parent_span_id`, recursively resolved; root → solo aggregate | §8.6 | Reopen §8.6 of this doc |
 | Trace correlation id | OTel-native `trace_id` | §8.6 | Locked |
+| Schema DDL — type mapping | `uuid`/`bytea(32)`/`jsonb`/named `ENUM`/`timestamptz`/`bigint`; vectors live in Qdrant, not PostgreSQL | §8.7.1 | New story; revisit §8.7 |
+| Schema DDL — index policy | UNIQUE `(repo_id, fingerprint)` on Node/Edge; UNIQUE `(fingerprint)` on Concept; partial UNIQUE on `Episode.synthesized_from_feedback_episode_id WHERE kind='synthetic_positive'`; ordering / lookup indices per §8.7.2 | §8.7.2 | New story; revisit §8.7 |
+| Schema DDL — partitioning | Monthly RANGE on `Episode` / `EpisodeUpdate` / `Observation` / `RecallContextLog` / `EmbeddingPublish` / `EmbeddingPublishEvent`; weekly RANGE on `TraceObservationLog` | §8.7.3 | New story; revisit §8.7 |
+| Schema DDL — constraint policy | Observation single-target CHECK; `bytea(32)` length CHECK on fingerprint; append-only roles (no UPDATE grant) on Episode/EpisodeUpdate/Observation/RecallContextLog/NodeRetirement/EdgeRetirement/TraceObservationLog/Concept/ConceptVersion/ConceptSupport/EmbeddingPublish/EmbeddingPublishEvent | §8.7.4 | New story; revisit §8.7 |
+| Schema DDL — extensions | `pgcrypto`, `pg_partman`; no `pgvector` | §8.7.5 | New story; revisit §8.7 |
+| Embedding publish state model | Append-only `EmbeddingPublish` + `EmbeddingPublishEvent` log pair; no column added or mutated on Node / ConceptVersion (G3/G4/G5 preserved) | §9.6a, §8.7 | New story; revisit §9.6a |
 
 ---
 

@@ -187,7 +187,19 @@ storyId: "code-intelligence:AGENT-MEMORY"
       `EmbeddingPublish`, `EmbeddingPublishEvent`). Grant
       `INSERT, SELECT, UPDATE` on the UPDATE-grantable tables from
       §8.7.4 (`TraceObservation`, `Repo`, `ConsolidatorRun`,
-      `PromoterRun`, `RepoEvent`, `reranker_model`).
+      `PromoterRun`, `RepoEvent`, `reranker_model`). Additionally
+      grant `INSERT, SELECT, UPDATE` on the durable job-queue
+      table `ingest_jobs` (from migration `0006a` in Stage 1.2)
+      so the Repo Indexer can `SELECT … FOR UPDATE SKIP LOCKED`,
+      flip `status` from `pending → claimed → running → done /
+      failed`, and bump `attempt_index` under the
+      `agent_memory_app` role. The Management onboarding verbs
+      (Stage 7.1) hold the same role and use it to `INSERT` new
+      job rows on `mgmt.ingest` / `mgmt.ingest_delta`. The
+      `ingest_jobs` table is **not** in the §8.7.4 append-only
+      set — it is a working queue, not an audit log — so the
+      UPDATE grant is consistent with the §8.7.4 mutability
+      classification.
 - [ ] Add a Qdrant collection bootstrap script that creates the
       `agent_memory_method`, `agent_memory_block`, and
       `agent_memory_concept` collections with `cosine` distance,
@@ -425,8 +437,12 @@ storyId: "code-intelligence:AGENT-MEMORY"
 - [ ] Normalise whitespace before canonical signature computation
       per risk §9.7 so formatter-only commits do not churn
       fingerprints.
-- [ ] Add a fixture-driven parser test that asserts a known Java /
-      Python / Go file produces the expected Node + Edge set.
+- [ ] Add a fixture-driven parser test that asserts a known
+      TypeScript / JavaScript file and a known Python file (the
+      v1 language set pinned in the step above) each produce the
+      expected Node + Edge set. Additional-language fixtures
+      (Go, Java, etc.) are explicitly out of scope for v1 and
+      land in the follow-up stories that drop in their grammars.
 
 ### Dependencies
 - phase-static-ingestion-pipeline/stage-repo-indexer-worker-scaffold-full-mode
@@ -886,8 +902,16 @@ storyId: "code-intelligence:AGENT-MEMORY"
       canonical-feature-signature) and publish to Qdrant via the
       §9.6a protocol (Concept Promoter is the sole writer of
       Concept entries to the EmbeddingIndex per C12).
-- [ ] Append a `ConceptVersion(producer='promoter', promoted=true,
-      embedding_vec=...)` row carrying the new vector reference.
+- [ ] Append a `ConceptVersion` row with
+      `producer='promoter'`, `promoted=true`, and the
+      `embedding_model_version` carried on the matching
+      `EmbeddingPublish` row (per §9.6a). The `ConceptVersion`
+      table has **no physical `embedding_vec` column** — per
+      tech-spec.md §8.7.1 line 569, vectors are materialised in
+      Qdrant and dereferenced through `EmbeddingPublish`; the
+      Promoter therefore writes the vector into Qdrant via the
+      §9.6a publish protocol in the previous step and never
+      writes a vector value onto the `ConceptVersion` row.
 - [ ] Persist a `PromoterRun` row with `concepts_promoted` count.
 
 ### Dependencies
@@ -905,9 +929,9 @@ storyId: "code-intelligence:AGENT-MEMORY"
       written and the Concept has no Qdrant entry.
 - [ ] Scenario: Consolidator never writes EmbeddingIndex --
       Given the Consolidator just emitted a ConceptVersion,
-      When the Qdrant `concept` collection is queried, Then no
-      new point appears until the Promoter runs (C12 — sole
-      writer rule).
+      When the Qdrant `agent_memory_concept` collection is
+      queried, Then no new point appears until the Promoter
+      runs (C12 — sole writer rule).
 
 ## Stage 6.3: Operator-correction auto-promotion
 

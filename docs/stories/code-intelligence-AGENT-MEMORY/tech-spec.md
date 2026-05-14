@@ -626,17 +626,22 @@ is the source of truth for *how* the translation is performed.
   | `Concept` | §5.5.1 (line 591 "fully immutable" per G4) | G4 — Concept append-only |
   | `ConceptVersion` | §5.5.2 (lines 621-623 append-only) | G4 — ConceptVersion append-only |
   | `ConceptSupport` | §5.5 (one row per supporting Episode, append-only) | G4 — support evidence append-only |
+  | `Commit` | §5.1 (line 410 "Immutable") | Snapshot identity — no row rewrite |
   | `EmbeddingPublish` | §9.6a (this tech spec) | Cross-store immutability (no row rewrite) |
   | `EmbeddingPublishEvent` | §9.6a (this tech spec) | Cross-store immutability (no row rewrite) |
 
-  Two architecture-owned tables are **explicitly excluded** from
-  the no-UPDATE grant because `architecture.md` itself classifies
-  them as mutable:
+  Architecture-owned tables that **remain UPDATE-grantable** because
+  `architecture.md` itself classifies them as mutable or as
+  progress-tracked bookkeeping:
 
   | Concrete table | Architecture.md anchor | Mutability shape |
   | --- | --- | --- |
-  | `TraceObservation` | §5.2.3 (line 415 "Mutable counters; provenance is append-only `TraceObservationLog` rows") | Counter row; UPDATE permitted |
-  | `Repo`, `Commit`, `RepoEvent`, `ConsolidatorRun`, `PromoterRun`, `reranker_model` | §5.1, §5.4, §5.6 | Bookkeeping tables; not classified as append-only by `architecture.md` |
+  | `TraceObservation` | §5.2.3 (line 415 "Mutable counters; provenance is append-only `TraceObservationLog` rows") | Counter row; UPDATE permitted (provenance is the append-only `TraceObservationLog`) |
+  | `Repo` | §5.1 (line 409 "Mutable settings only") | Settings row; UPDATE permitted |
+  | `ConsolidatorRun` | §5.6 (line 645: `started_at`, `finished_at`, `status` progressed through the run) | Run-progress row; UPDATE permitted |
+  | `PromoterRun` | §5.6 (line 646: `started_at`, `finished_at`, `concepts_promoted`, `status` progressed through the run) | Run-progress row; UPDATE permitted |
+  | `RepoEvent` | §5.6 (line 644 — event-log row, written once by the Webhook Receiver but **not classified as immutable** by `architecture.md`) | Not pinned as immutable upstream; UPDATE permitted by default. If `architecture.md` later pins it as immutable, this row moves to the no-UPDATE table above without a tech-spec edit. |
+  | `reranker_model` | §5.6 (registry row that the Reranker Trainer mutates as model lifecycle progresses) | Registry row; UPDATE permitted |
 
   Partition-drop is achieved by `DROP TABLE <partition>;`
   executed by an administrative role that is **not** any
@@ -756,12 +761,26 @@ Each risk lists: **trigger** → **impact** → **mitigation** →
   Block, and Concept vectors are no longer in the same vector
   space.
 - **Impact.** Recall mixes incompatible vectors; rank collapses.
-- **Mitigation.** Embedding model version is stored on every Node
-  row (`attrs_json.embedding_model_version`) and on every
-  ConceptVersion row. GraphReader's `EmbeddingIndex` queries are
-  pinned to the currently-active version; an upgrade requires a
-  bulk re-embed driven by the Repo Indexer (Method/Block) and the
-  Concept Promoter (Concept). `mgmt.snapshot` (`architecture.md`
+- **Mitigation.** The embedding model version is **not** carried
+  on `Node` rows or on `ConceptVersion` rows — `architecture.md`
+  §5.2.1 / §5.5.2 do not define such a field, and adding one
+  would also violate the G5 / G4 immutability contracts. Instead,
+  the version is carried by the `EmbeddingPublish` log row that
+  this tech spec introduces in §9.6a — every `EmbeddingPublish`
+  has `embedding_model_version` (see the §9.6a table, the row
+  for `EmbeddingPublish`). The `EmbeddingIndex` writer (Repo
+  Indexer for Method/Block, Concept Promoter for Concept) tags
+  the current model version on each publish; the GraphReader
+  filters Qdrant hits through the §9.6a "latest event is
+  `'published'`" check **and** through an
+  `EmbeddingPublish.embedding_model_version = <active version>`
+  predicate. An upgrade flips the active version and triggers
+  bulk re-embed: each affected target gets a fresh
+  `EmbeddingPublish` row at the new version, and once the new
+  row reaches `'published'` the writer appends an
+  `EmbeddingPublishEvent(event_kind='superseded')` on the
+  prior publish so the reader picks the new vector
+  deterministically. `mgmt.snapshot` (`architecture.md`
   §6.2.1) is the operator's lever to force this.
 - **Residual.** Re-embed of a 200 k LOC repo costs ~30 min wall
   clock (§8.3); during that window recall serves degraded
@@ -996,7 +1015,7 @@ locked decision requires a new story that reopens the cited section.
 | Schema DDL — type mapping | `uuid`/`bytea(32)`/`jsonb`/named `ENUM`/`timestamptz`/`bigint`; vectors live in Qdrant, not PostgreSQL | §8.7.1 | New story; revisit §8.7 |
 | Schema DDL — index policy | UNIQUE `(repo_id, fingerprint)` on Node/Edge; UNIQUE `(fingerprint)` on Concept; partial UNIQUE on `Episode.synthesized_from_feedback_episode_id WHERE kind='synthetic_positive'`; ordering / lookup indices per §8.7.2 | §8.7.2 | New story; revisit §8.7 |
 | Schema DDL — partitioning | Monthly RANGE on `Episode` / `EpisodeUpdate` / `Observation` / `RecallContextLog` / `EmbeddingPublish` / `EmbeddingPublishEvent`; weekly RANGE on `TraceObservationLog` | §8.7.3 | New story; revisit §8.7 |
-| Schema DDL — constraint policy | Observation single-target CHECK; `bytea(32)` length CHECK on fingerprint; append-only roles (no UPDATE grant) on Node/Edge/Episode/EpisodeUpdate/Observation/RecallContextLog/NodeRetirement/EdgeRetirement/TraceObservationLog/Concept/ConceptVersion/ConceptSupport/EmbeddingPublish/EmbeddingPublishEvent (TraceObservation excluded: arch.md §5.2.3 classifies it as a mutable counter) | §8.7.4 | New story; revisit §8.7 |
+| Schema DDL — constraint policy | Observation single-target CHECK; `bytea(32)` length CHECK on fingerprint; append-only roles (no UPDATE grant) on Node/Edge/Commit/Episode/EpisodeUpdate/Observation/RecallContextLog/NodeRetirement/EdgeRetirement/TraceObservationLog/Concept/ConceptVersion/ConceptSupport/EmbeddingPublish/EmbeddingPublishEvent (TraceObservation/Repo/ConsolidatorRun/PromoterRun/RepoEvent/reranker_model remain UPDATE-grantable per arch.md §5.1, §5.2.3, §5.6) | §8.7.4 | New story; revisit §8.7 |
 | Schema DDL — extensions | `pgcrypto`, `pg_partman`; no `pgvector` | §8.7.5 | New story; revisit §8.7 |
 | Embedding publish state model | Append-only `EmbeddingPublish` + `EmbeddingPublishEvent` log pair; no column added or mutated on Node / ConceptVersion (G3/G4/G5 preserved) | §9.6a, §8.7 | New story; revisit §9.6a |
 

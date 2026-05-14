@@ -63,12 +63,18 @@ These are the contract bedrocks every later section must respect. Where you see
   carry the current confidence band and support count. The "current" confidence
   for a Concept is always the most recent ConceptVersion row — Concept never
   stores a writable `confidence` column.
-- **G5 — Structural edges are append-only with retirement, not mutation.**
-  When a commit retires an edge or node, the writer sets the retiring entity's
-  `to_sha` to the parent commit of the new HEAD; the row itself is never
-  rewritten. Dynamic-call edges aggregate provenance into a per-edge
-  `TraceObservation` child table (mutable count), not into the edge row
-  itself (see §5.2.3).
+- **G5 — Structural Nodes and Edges are strictly append-only; retirement is
+  a separate tombstone row, not a column rewrite.** Node and Edge rows are
+  **immutable after insert** — no column on either row is ever updated. When
+  a commit retires a Node or Edge, the writer appends a new row to a
+  dedicated tombstone table (`NodeRetirement` for Nodes, `EdgeRetirement`
+  for Edges; §5.2.4) keyed by the retired entity's `node_id`/`edge_id` and
+  carrying the retirement SHA (`retired_at_sha` = parent commit of the new
+  HEAD). The "current" version of a Node or Edge is therefore defined as
+  "no matching tombstone row exists"; this is enforced by a unique index on
+  `(node_id)` / `(edge_id)` in the tombstone tables. Dynamic-call edges
+  aggregate provenance into the `TraceObservation` child table (§5.2.3),
+  not into the Edge row.
 - **G6 — Cross-repo Concepts, repo-scoped Nodes/Edges.** Per operator decision,
   Concepts live in a global namespace from day one. Structural Nodes and Edges
   remain scoped to `repo_id`. Cross-repo Concepts attach to per-repo Nodes via
@@ -78,7 +84,8 @@ These are the contract bedrocks every later section must respect. Where you see
   the Consolidator immediately writes a synthetic *positive* Episode in
   addition to the negative original. The synthetic positive Episode reuses the
   parent Episode's `context_id` so the positive signal attaches to the same
-  recall snapshot that produced the wrong answer (§4.8, §7.6).
+  recall snapshot that produced the wrong answer (normative flows: §4.4,
+  §7.3, §7.7).
 
 ---
 
@@ -151,7 +158,9 @@ Stateless worker pool that consumes ingest jobs. For each job it:
 4. Computes fingerprints per G2 and writes Nodes/Edges through the Hybrid
    Graph Store writer (§3.5).
 5. Closes (retires) any node or edge no longer present in the new commit by
-   setting `to_sha` to the parent SHA of the new HEAD (G5).
+   appending a `NodeRetirement` or `EdgeRetirement` row (§5.2.4) with
+   `retired_at_sha` = parent commit of the new HEAD (G5). The Node/Edge row
+   itself is never rewritten.
 
 The Repo Indexer runs in three modes: `full` (cold registration), `delta` (push
 hook), `manual` (operator-triggered re-index).
@@ -340,7 +349,8 @@ For the full request/response shapes see §6.
    from_sha, to_sha)`, enqueues a `delta-ingest` job.
 2. Repo Indexer diffs the two SHAs, re-parses changed files only, emits new
    Nodes/Edges (G2 fingerprints from the new SHA), and retires any Node/Edge
-   no longer present by setting `to_sha = parent(new_HEAD)` (G5).
+   no longer present by appending a `NodeRetirement` or `EdgeRetirement` row
+   with `retired_at_sha = parent(to_sha)` (G5, §5.2.4).
 3. EmbeddingIndex is updated for any Node whose canonical signature changed.
 4. A `repo.delta_ingested` event is published.
 
@@ -382,15 +392,17 @@ is deferred to `tech-spec.md`.
 | --- | --- | --- |
 | `Repo` | Registered code repository | Mutable settings only |
 | `Commit` | Snapshot of a repo at a SHA | Immutable |
-| `Node` | Structural code element (Repo→Block) | Append-only with `to_sha` retirement |
-| `Edge` | Relation between two Nodes | Append-only with `to_sha` retirement |
+| `Node` | Structural code element (Repo→Block) | Immutable row; retirement via append-only `NodeRetirement` tombstone (G5) |
+| `Edge` | Relation between two Nodes | Immutable row; retirement via append-only `EdgeRetirement` tombstone (G5) |
+| `NodeRetirement` | Tombstone for a retired Node | Append-only |
+| `EdgeRetirement` | Tombstone for a retired Edge | Append-only |
 | `TraceObservation` | Per-`observed_calls`-edge aggregate | Mutable counters; provenance is append-only `TraceObservationLog` rows |
 | `Episode` | One agent reasoning attempt | Immutable row (status read via `EpisodeUpdate`) |
 | `EpisodeUpdate` | Status change on an Episode | Append-only |
 | `Observation` | Which RecallContext element was used in an Episode | Immutable |
 | `RecallContextLog` | Durable snapshot of a recall/expand response | Immutable |
-| `Concept` | Learned cross-repo pattern | Immutable |
-| `ConceptVersion` | Current confidence band for a Concept | Append-only |
+| `Concept` | Learned cross-repo pattern (name + description only) | Immutable |
+| `ConceptVersion` | Versioned confidence/support/embedding for a Concept | Append-only |
 | `ConceptSupport` | Attaches a Concept to specific Nodes / repos | Append-only |
 
 ### 5.2 Structural Graph
@@ -406,9 +418,12 @@ is deferred to `tech-spec.md`.
 | `canonical_signature` | text | Stable name (e.g. `pkg.Foo#bar(int)#block_3`). |
 | `parent_node_id` | uuid? | FK → `Node` (containment hierarchy). |
 | `from_sha` | text | First SHA at which this exact fingerprint appeared. |
-| `to_sha` | text? | Null = current; non-null = retired at the listed parent SHA per **G5**. |
-| `embedding_vec` | vector? | Optional; written by Repo Indexer for Method/Block nodes. |
-| `attrs_json` | json | Language-specific attributes (visibility, return type, etc.). |
+| `embedding_vec` | vector? | Optional; written by Repo Indexer for Method/Block nodes at insert time only. |
+| `attrs_json` | json | Language-specific attributes (visibility, return type, etc.). Set at insert time only. |
+
+> **Row immutability (G5).** No column on `Node` is ever updated after the
+> initial insert. Retirement is recorded by appending a `NodeRetirement` row
+> (§5.2.4); there is **no** `to_sha` column on `Node`.
 
 #### 5.2.2 Edge
 
@@ -421,8 +436,36 @@ is deferred to `tech-spec.md`.
 | `src_node_id` | uuid | FK → `Node`. |
 | `dst_node_id` | uuid | FK → `Node`. |
 | `from_sha` | text | First SHA at which this edge appeared. |
-| `to_sha` | text? | Null = current; non-null = retired per **G5**. |
-| `attrs_json` | json | Edge-kind-specific attributes (e.g. argument-count, branch label). |
+| `attrs_json` | json | Edge-kind-specific attributes (e.g. argument-count, branch label). Set at insert time only. |
+
+> **Row immutability (G5).** No column on `Edge` is ever updated after the
+> initial insert. Retirement is recorded by appending an `EdgeRetirement`
+> row (§5.2.4); there is **no** `to_sha` column on `Edge`.
+
+#### 5.2.4 NodeRetirement and EdgeRetirement (tombstones for G5)
+
+Both tables are append-only. A Node or Edge is "current" iff no row exists
+with its id in the corresponding tombstone table; this is enforced by a
+unique index on `(node_id)` / `(edge_id)`.
+
+`NodeRetirement`:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `retirement_id` | uuid | Primary key. |
+| `node_id` | uuid | FK → `Node`. Unique. |
+| `retired_at_sha` | text | Parent commit of the new HEAD at which the Node disappeared (per **G5**). |
+| `retired_at` | timestamp | When the tombstone was written. |
+| `superseded_by_node_id` | uuid? | Set when the Node was retired because it was renamed/moved to a different fingerprint; links to the new Node. |
+
+`EdgeRetirement`:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `retirement_id` | uuid | Primary key. |
+| `edge_id` | uuid | FK → `Edge`. Unique. |
+| `retired_at_sha` | text | Parent commit of the new HEAD at which the Edge disappeared (per **G5**). |
+| `retired_at` | timestamp | When the tombstone was written. |
 
 #### 5.2.3 TraceObservation (child of Edge, only for `observed_calls`)
 
@@ -525,16 +568,16 @@ is deferred to `tech-spec.md`.
 | --- | --- | --- |
 | `concept_id` | uuid | Primary key. |
 | `fingerprint` | bytes(32) | Deterministic over the canonical concept name + observed-feature-signature. Cross-repo per **G6** — no `repo_id` here. |
-| `name` | text | Human-readable label (e.g. "double-checked-locking"). |
-| `description_md` | text | Markdown description. |
-| `embedding_vec` | vector | Written by the Concept Promoter. |
+| `name` | text | Human-readable label (e.g. "double-checked-locking"). Set at insert time. |
+| `description_md` | text | Markdown description. Set at insert time. |
 | `created_at` | timestamp | Append-only. |
 
-> **Concept has no `confidence` column.** Per **G4**, confidence is always
-> the most recent `ConceptVersion` row for a given `concept_id`. Treat
-> `SELECT … FROM ConceptVersion WHERE concept_id=? ORDER BY version_index DESC
-> LIMIT 1` as the canonical "current" lookup. The Consolidator never updates
-> Concept in place; it always inserts a new ConceptVersion row.
+> **Concept row is fully immutable.** Per **G4**, no column on `Concept` is
+> ever updated. Confidence, support counts, *and* the embedding live on the
+> versioned `ConceptVersion` row (§5.5.2) so the Concept Promoter and any
+> future re-embedder can publish new vectors without rewriting Concept. The
+> "current" embedding for a Concept is the `embedding_vec` of its most
+> recent `ConceptVersion` row.
 
 #### 5.5.2 ConceptVersion (G4)
 
@@ -547,7 +590,9 @@ is deferred to `tech-spec.md`.
 | `confidence_band` | enum | `low`, `medium`, `high`. Derived from `confidence` at write time. |
 | `support_count` | int | Number of supporting positive Episodes. |
 | `negative_count` | int | Number of supporting negative Episodes. |
-| `consolidator_run_id` | uuid | Pointer to the run that produced this version. |
+| `producer` | enum | `consolidator` or `promoter`. Identifies which worker emitted the version. |
+| `producer_run_id` | uuid | FK → `ConsolidatorRun` when `producer=consolidator`; FK → `PromoterRun` (§5.6) when `producer=promoter`. The pair `(producer, producer_run_id)` is the full attribution. |
+| `embedding_vec` | vector? | Set on versions emitted by the Concept Promoter (§7.8); null on Consolidator-emitted versions that did not re-embed. The current embedding for a Concept is the most recent non-null `embedding_vec` across its ConceptVersion rows. |
 | `promoted` | bool | Set true by the Concept Promoter when the Concept first crosses the publishable threshold (§7.8). Subsequent versions inherit/refresh this flag. |
 | `created_at` | timestamp | Append-only. |
 
@@ -572,7 +617,8 @@ is deferred to `tech-spec.md`.
 | `Commit` | `repo_id`, `sha`, `parent_sha`, `committed_at`, `index_status`. |
 | `RepoEvent` | `event_id`, `repo_id`, `kind in (push|merge|register|manual)`, `from_sha?`, `to_sha`, `received_at`. |
 | `ConsolidatorRun` | `run_id`, `started_at`, `finished_at`, `episode_high_water_mark`, `status`. |
-| `TraceObservationLog` | `span_log_id`, `edge_id`, `trace_id`, `span_id`, `started_at`, `duration_ms`. Immutable. Source of truth for `TraceObservation` aggregates. |
+| `PromoterRun` | `run_id`, `started_at`, `finished_at`, `concepts_promoted`, `status`. Referenced by `ConceptVersion.producer_run_id` when `producer='promoter'`. |
+| `TraceObservationLog` | `span_log_id`, `edge_id`, `trace_id`, `span_id`, `started_at`, `duration_ms`. Append-only; **source of truth for `TraceObservation` aggregates only within the configured retention window (§8.1).** Once a log row is pruned the `TraceObservation` aggregate row alone is authoritative for that span. |
 
 ---
 
@@ -777,7 +823,8 @@ Webhook Receiver → write RepoEvent + enqueue delta job
    - diff(from_sha, to_sha)
    - for each changed file: re-parse, emit new Node/Edge rows with fresh
      fingerprints per G2
-   - retire stale Nodes/Edges by setting to_sha = parent(to_sha) per G5
+   - retire stale Nodes/Edges by appending NodeRetirement/EdgeRetirement
+     rows with retired_at_sha = parent(to_sha) per G5
    - update EmbeddingIndex for changed Method/Block nodes)
 ```
 
@@ -870,8 +917,10 @@ Specifically:
   point on the aggregated `TraceObservation` row is authoritative and cannot
   be recomputed. The `TraceObservation` row itself is **always** preserved —
   it is never pruned by retention.
-- Structural `Node` and `Edge`: append-only with retirement (G5). Retired
-  rows are kept forever so historic Episodes resolve their node/edge ids.
+- Structural `Node` and `Edge`: immutable rows kept forever; retirement is
+  recorded by append-only `NodeRetirement` / `EdgeRetirement` tombstone rows
+  (G5, §5.2.4). Tombstones are likewise kept forever so historic Episodes
+  can resolve retired node/edge ids.
 
 ### 8.2 Degraded-mode flag conventions
 

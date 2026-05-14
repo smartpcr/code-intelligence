@@ -3,27 +3,7 @@ title: "agent memory"
 storyId: "code-intelligence:AGENT-MEMORY"
 ---
 
-> Story: `code-intelligence:AGENT-MEMORY` · 21 points
-> Sibling docs: `architecture.md` (component / data / interface contracts),
-> `tech-spec.md` (locked parameter pins, schema-DDL conventions, risks),
-> `e2e-scenarios.md` (numbered acceptance scenarios).
-> This file is a **livedoc** — operators tick the boxes below as work lands;
-> ordering, dependencies, and step sizes are normative.
-
-The plan materialises the design in `architecture.md` and the locks in
-`tech-spec.md` §10 (PostgreSQL 16 + Qdrant + closed parameter set). It does
-not redefine any contract; where this file uses a symbolic name (e.g.
-`G2`, `C16`, §3.7) it is the same anchor as in the sibling docs. The phase
-ordering is dictated by FK dependencies: nothing that writes a row can ship
-before the schema that holds it.
-
 # Phase 1: Foundation and schema
-
-This phase delivers a runnable empty service plus the PostgreSQL 16 schema
-that satisfies the §8.7 DDL conventions and the `EmbeddingPublish` /
-`EmbeddingPublishEvent` log pair from §9.6a. No business logic ships here —
-only types, tables, indices, partitions, roles, and migration tooling. Until
-this phase is done, no other write path can be exercised.
 
 ## Dependencies
 - _none -- start phase_
@@ -35,11 +15,11 @@ this phase is done, no other write path can be exercised.
       with `cmd/`, `internal/`, `migrations/`, `pkg/`, `proto/`, `web/`, and
       `deploy/` subtrees; commit a project-level `README.md` that points to
       the four sibling docs.
-- [ ] Add the language toolchain manifest (`go.mod` / `pyproject.toml` /
-      `package.json` — operator pin needed; see open question
-      `service-language`) and a single `make` (or `task`) target `make lint`
-      that runs the static checker for the chosen language with zero
-      findings on the empty tree.
+- [ ] Add the language toolchain manifest `go.mod` (the service is
+      built in Go for v1: single static binary, native gRPC for the
+      §8.5 Agent transport, mature OTel SDK for §3.3 / §8.6) and a
+      single `make` target `make lint` that runs `golangci-lint` with
+      zero findings on the empty tree.
 - [ ] Add `make test` and `make build` targets that succeed on the empty
       tree; both must be invoked by CI on every PR opened against this
       story's branch.
@@ -93,7 +73,22 @@ this phase is done, no other write path can be exercised.
       `TraceObservationLog` (weekly RANGE on `started_at` per §8.7.3)
       with the B-tree index on `(edge_id, started_at DESC)`.
 - [ ] Add migration `0006_repo_event.sql` that creates `RepoEvent` per
-      §5.6.
+      §5.6 with `kind` restricted to the closed upstream set
+      `(push|merge|register|manual)` (architecture.md §5.6 line
+      644). No other `kind` value may be inserted.
+- [ ] Add migration `0006a_ingest_jobs.sql` that creates the
+      durable job-queue table `ingest_jobs` used by the Repo
+      Indexer (Stage 3.1) and the Management onboarding verbs
+      (Stage 7.1): columns `job_id uuid PK`, `repo_id uuid FK`,
+      `mode` ENUM `(full|delta|manual)`, `from_sha text?`,
+      `to_sha text`, `status` ENUM
+      `(pending|claimed|running|done|failed)`, `attempt_index int`,
+      `claimed_by text?`, `created_at timestamptz`,
+      `updated_at timestamptz`. UNIQUE on
+      `(repo_id, mode, COALESCE(from_sha,''), to_sha)` for
+      idempotent enqueue, plus a partial B-tree on
+      `(status, created_at)` where `status='pending'` to make
+      `SELECT … FOR UPDATE SKIP LOCKED` fast.
 - [ ] Add a `migrations/test_migrate.go` (or equivalent) that runs every
       migration up and then down on a fresh database, verifying that
       down/up is idempotent.
@@ -103,9 +98,14 @@ this phase is done, no other write path can be exercised.
 
 ### Test Scenarios
 - [ ] Scenario: structural schema applies cleanly -- Given an empty
-      PostgreSQL 16 database, When migrations `0001`-`0006` are applied,
-      Then every expected table, ENUM, and UNIQUE index exists per
-      `\d+` inspection.
+      PostgreSQL 16 database, When migrations `0001`-`0006a` are
+      applied, Then every expected table (including `ingest_jobs`),
+      ENUM, and UNIQUE index exists per `\d+` inspection.
+- [ ] Scenario: ingest_jobs accepts only valid mode/status -- Given
+      the `ingest_jobs` table exists, When `INSERT INTO ingest_jobs
+      (mode) VALUES ('rebuild')` is attempted, Then the insert is
+      rejected as an ENUM violation (closed set is
+      `full|delta|manual`).
 - [ ] Scenario: fingerprint CHECK rejects wrong length -- Given the
       `Node` table exists, When `INSERT INTO node (..., fingerprint)
       VALUES (..., '\x00')` is attempted, Then the insert is rejected
@@ -212,15 +212,11 @@ this phase is done, no other write path can be exercised.
       affects exactly one row.
 - [ ] Scenario: Qdrant collections exist -- Given the bootstrap script
       has run, When `GET /collections` is issued against Qdrant, Then
-      all three collections (`method`, `block`, `concept`) are
-      present with `distance: cosine`.
+      all three collections (`agent_memory_method`,
+      `agent_memory_block`, `agent_memory_concept`) are present
+      with `distance: cosine`.
 
 # Phase 2: Hybrid Graph Store core
-
-This phase delivers the GraphWriter and GraphReader libraries plus the
-fingerprint utility and tombstone helpers from `architecture.md` §3.5 /
-§5.2. No worker writes a row directly to PostgreSQL — they go through
-these libraries so G1/G2/G5 invariants are enforced in one place.
 
 ## Dependencies
 - phase-foundation-and-schema
@@ -368,11 +364,6 @@ these libraries so G1/G2/G5 invariants are enforced in one place.
 
 # Phase 3: Static ingestion pipeline
 
-This phase delivers the Repo Indexer worker family (`full`, `delta`,
-`manual` per §3.2), the AST → Node/Edge emitter, the Method/Block
-embedding publisher, and the Webhook Receiver. All writes go through
-the libraries from Phase 2.
-
 ## Dependencies
 - phase-hybrid-graph-store-core
 
@@ -391,9 +382,10 @@ the libraries from Phase 2.
       writes Repo→Package→File ancestry through `GraphWriter`.
 - [ ] Add a worker-pool config so 4 workers run in parallel against
       the §8.3 "200 k LOC in ≤ 30 min" target.
-- [ ] Publish a `repo.registered` / `repo.full_ingested` event
-      (Kafka topic or NATS subject — operator pin needed; see open
-      question `event-bus`) once the job completes.
+- [ ] Publish a `repo.registered` / `repo.full_ingested` event over
+      PostgreSQL `LISTEN/NOTIFY` (the event-bus pin for v1 — keeps the
+      service single-store; downstream workers `LISTEN` on the
+      `agent_memory_events` channel) once the job completes.
 
 ### Dependencies
 - _none -- start stage_
@@ -418,11 +410,13 @@ the libraries from Phase 2.
 - [ ] Implement `internal/repoindexer/ast/dispatcher.go` that picks
       a language-specific parser based on file extension and the
       `Repo.language_hints[]` setting.
-- [ ] Implement the first-language parser (operator pin needed for
-      v1 language priority; see open question `v1-languages`) that
-      emits Class / Method nodes with canonical signatures and the
-      static edges `contains`, `imports`, `static_calls`,
-      `extends`, `implements`, `reads`, `writes`.
+- [ ] Implement the polyglot parser core on top of `tree-sitter`
+      with grammars for the v1 language set — TypeScript / JavaScript
+      and Python — that emits Class / Method nodes with canonical
+      signatures and the static edges `contains`, `imports`,
+      `static_calls`, `extends`, `implements`, `reads`, `writes`.
+      Additional grammars (Go, Java, etc.) are added by dropping in
+      a new grammar binding without re-architecting the dispatcher.
 - [ ] Implement the Block subdivision pass: any Method whose
       normalised logical-line count exceeds the §8.2 threshold (80)
       is decomposed into Blocks with `block_kind ∈ {entry, branch,
@@ -556,10 +550,6 @@ the libraries from Phase 2.
 
 # Phase 4: Dynamic ingestion pipeline
 
-This phase delivers the Span Ingestor (`architecture.md` §3.3) plus
-the `TraceObservationLog` retention pruner. It depends on Phase 3
-because span resolution needs Method / Block nodes to attach to.
-
 ## Dependencies
 - phase-static-ingestion-pipeline
 
@@ -662,11 +652,6 @@ because span resolution needs Method / Block nodes to attach to.
 
 # Phase 5: Agent Surface
 
-This phase delivers the four Agent verbs from `architecture.md` §6.1
-plus the `RecallContext` envelope assembly. The reranker is wired
-with a v0 structural-prior model so cold-start (risk §9.5) is handled
-before Phase 6 supplies a real trained model.
-
 ## Dependencies
 - phase-dynamic-ingestion-pipeline
 
@@ -675,17 +660,28 @@ before Phase 6 supplies a real trained model.
 ### Implementation Steps
 - [ ] Implement the gRPC service skeleton in `proto/agent.proto`
       and `cmd/agent-api/main.go` (mTLS per §8.5).
-- [ ] Implement `internal/agentapi/recall.go` that:
-      1. embeds the `query` via the same embedding-model client,
-      2. issues a mixed k-NN search against Qdrant collections
-         `method`, `block`, **and** `concept`, filtered by
-         `repo_id` (§7.8 mixed seed),
-      3. filters out hits whose latest `EmbeddingPublishEvent`
-         is not `published` (§9.6a),
-      4. expands the seed by 1-2 structural hops via GraphReader,
-      5. invokes the reranker (v0 model from Stage 6.4 fallback),
-      6. appends a `RecallContextLog` row and returns the
-         `RecallResponse`.
+- [ ] Implement `internal/agentapi/recall.go` step 1 — embed the
+      `query` via the same embedding-model client used by the Repo
+      Indexer (Stage 3.3) so query and corpus share a vector space.
+- [ ] Implement `internal/agentapi/recall.go` step 2 — issue a mixed
+      k-NN search against the Qdrant collections
+      `agent_memory_method`, `agent_memory_block`, **and**
+      `agent_memory_concept`, filtered by `repo_id` (§7.8 mixed
+      seed).
+- [ ] Implement `internal/agentapi/recall.go` step 3 — filter out
+      Qdrant hits whose latest `EmbeddingPublishEvent` is not
+      `published` (§9.6a); increment
+      `recall_filter_unpublished_total` per filtered hit.
+- [ ] Implement `internal/agentapi/recall.go` step 4 — expand the
+      seed set by 1-2 structural hops through `GraphReader` (Stage
+      2.2) and assemble the candidate set.
+- [ ] Implement `internal/agentapi/recall.go` step 5 — invoke the
+      reranker (v0 cold-start model from this stage's step below if
+      no published `reranker_model` row exists; Phase 6.4's trained
+      model otherwise).
+- [ ] Implement `internal/agentapi/recall.go` step 6 — append a
+      `RecallContextLog` row via `recallcontext.Append` and return
+      the `RecallResponse` envelope.
 - [ ] Implement the v0 cold-start reranker: pure cosine +
       structural distance fallback per risk §9.5; loaded if no
       published `reranker_model` row exists.
@@ -807,9 +803,12 @@ before Phase 6 supplies a real trained model.
 - [ ] Implement `internal/agentapi/summarize.go` that takes
       either a `node_id` or a `concept_id`, fetches the
       neighborhood card, builds a prompt for the configured
-      summariser (LLM client; vendor pin needed; see open
-      question `summariser-vendor`), and returns
-      `summary_md` plus a citation list.
+      summariser, and returns `summary_md` plus a citation list.
+      The summariser is reached through a **pluggable
+      `Summariser` client interface** (vendor pin for v1: any
+      OpenAI-API-compatible HTTPS endpoint is supported via
+      config — self-hosted vLLM or external API — so deployments
+      pick the vendor at deploy time without code changes).
 - [ ] Append a `RecallContextLog(verb='summarize')` row keyed by
       the returned `context_id`.
 - [ ] On summariser timeout, fall back to a templated summary
@@ -832,9 +831,6 @@ before Phase 6 supplies a real trained model.
       templated fallback (not the partial LLM output).
 
 # Phase 6: Learning loop
-
-This phase delivers the Consolidator, Concept Promoter, operator-
-correction auto-promotion (G7), and offline Reranker Trainer.
 
 ## Dependencies
 - phase-agent-surface
@@ -999,11 +995,6 @@ correction auto-promotion (G7), and offline Reranker Trainer.
 
 # Phase 7: Management Surface
 
-This phase delivers every Management verb from `architecture.md`
-§6.2: onboarding writes, span ingest endpoint, feedback,
-snapshot, and the read endpoints used by the operator UI. AuthN is
-OIDC bearer per §8.5.
-
 ## Dependencies
 - phase-learning-loop
 
@@ -1036,8 +1027,10 @@ OIDC bearer per §8.5.
 - [ ] Scenario: ingest_delta is idempotent -- Given two
       identical `POST /v1/repos/{id}/ingest_delta` calls with
       the same SHA pair, When both have completed, Then exactly
-      one `RepoEvent(kind=manual_delta)` row and one
-      `ingest_jobs` row exist.
+      one `RepoEvent(kind=manual)` row (the closed set on
+      `RepoEvent.kind` per architecture.md §5.6 line 644 is
+      `(push|merge|register|manual)`) and one `ingest_jobs`
+      row exist.
 - [ ] Scenario: missing OIDC token rejected -- Given a request
       without a `Authorization: Bearer …` header, When the
       Management API processes it, Then the response is 401 and
@@ -1174,11 +1167,6 @@ OIDC bearer per §8.5.
       badge field and the call succeeds (risk §9.13).
 
 # Phase 8: Reliability and operations
-
-This final phase locks down degraded-mode behaviour for every verb,
-sets up partition rotation under `pg_partman`, ships the
-observability surface, and runs the load-test calibration that the
-§8.3 provisional pin requires.
 
 ## Dependencies
 - phase-management-surface
@@ -1319,20 +1307,3 @@ observability surface, and runs the load-test calibration that the
       `rank_of_correct_node_at_k20` and
       `concept_hit_fraction_at_k20` are both reported with a
       numeric value.
-
----
-
-## Cross-references
-
-- Components, data model, public-interface contracts, end-to-end
-  flows: `architecture.md`.
-- Locked parameter pins (storage, Qdrant, retention, SLO numbers,
-  reranker class, transport, authN, OTel mapping, schema-DDL
-  conventions): `tech-spec.md` §8 / §10.
-- Risk register (graph drift, storage blow-up, concept collision,
-  correction poisoning, embedding drift, cross-store staleness,
-  tombstone churn, synthetic-positive double-count, formatter
-  churn, model staleness, OTel gaps, webhook spoofing, stale
-  context replay): `tech-spec.md` §9.
-- Numbered end-to-end test scenarios: `e2e-scenarios.md` (not yet
-  drafted at iter 1 — see open question `e2e-handoff`).

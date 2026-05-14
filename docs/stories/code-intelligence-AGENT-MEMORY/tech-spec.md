@@ -566,7 +566,7 @@ is the source of truth for *how* the translation is performed.
 | `bool` | `boolean` | |
 | `timestamp` | `timestamptz` | All timestamps are stored in UTC. |
 | `json` | `jsonb` | All architecture.md `*_json` columns. |
-| `vector?` | **Not stored in PostgreSQL.** | Per §8.1 the Qdrant point id is captured in `EmbeddingPublish` (§9.6a); the architecture.md `embedding_vec` field is therefore a logical view served by the GraphReader from Qdrant, not a physical column on `Node` / `ConceptVersion`. |
+| `vector?` | **Not a physical column in PostgreSQL** — materialised via the Qdrant join. | The `architecture.md` §5.2.1 `Node.embedding_vec` and `architecture.md` §5.5.2 `ConceptVersion.embedding_vec` *logical fields* are honoured: the architecture's invariant ("written at insert time only", "set on versions emitted by the Concept Promoter") is preserved because the writer (Repo Indexer for `Node`, Concept Promoter for `ConceptVersion`) emits the vector body into Qdrant in the same write transaction-boundary as the row insert, via the `EmbeddingPublish` log pair (§9.6a). The join from a `Node` row (or `ConceptVersion` row) to its vector body is `EmbeddingPublish.target_id = <row>.id ∧ latest EmbeddingPublishEvent.event_kind = 'published'`, dereferenced through `EmbeddingPublish.qdrant_point_id`. Downstream DDL therefore **does not** include an `embedding_vec` column on `Node` or `ConceptVersion` — the field's value is exposed by the GraphReader (`agent.recall`, `agent.expand`) by joining to `EmbeddingPublish` and issuing a Qdrant point fetch, never by reading a PostgreSQL column. The G5 / G4 immutability invariants are stronger this way: there is no `embedding_vec` column to mutate. |
 | `uuid[]` | `uuid[]` | Used for `RecallContextLog.node_ids` etc. Ordering preserved. |
 
 #### 8.7.2 Index policy
@@ -603,13 +603,46 @@ is the source of truth for *how* the translation is performed.
   table-level `CHECK ( (node_id IS NOT NULL)::int +
   (edge_id IS NOT NULL)::int + (concept_id IS NOT NULL)::int +
   (degraded_recall_context_id IS NOT NULL)::int = 1 )`.
-- `EpisodicLog` / `EpisodeUpdate` / `Observation` /
-  `RecallContextLog` / `NodeRetirement` / `EdgeRetirement` /
-  `TraceObservationLog` / `Concept` / `ConceptVersion` /
-  `ConceptSupport` / `EmbeddingPublish` /
-  `EmbeddingPublishEvent` have **no `UPDATE`-granting role**;
-  application roles are granted `INSERT` and `SELECT` only,
-  enforcing G3 / G4 / G5 at the database layer.
+- **Append-only role grants (no `UPDATE`).** Application roles
+  are granted `INSERT` and `SELECT` only — never `UPDATE` and
+  never `DELETE` — on every table whose `architecture.md`
+  contract is append-only or immutable-after-insert. Each row
+  below names the **concrete PostgreSQL table** (using
+  `architecture.md` §5's table-name spellings, not the
+  conceptual surface name) and the guiding principle it
+  enforces at the database layer:
+
+  | Concrete table | Architecture.md anchor | Guiding principle enforced |
+  | --- | --- | --- |
+  | `Node` | §5.2.1 (line 411 "Immutable row"; lines 437-442) | C2 / G5 — structural append-only |
+  | `Edge` | §5.2.2 (line 412 "Immutable row"; §5.2.2 field table) | C2 / G5 — structural append-only |
+  | `NodeRetirement` | §5.2.4 (line 486 "append-only") | G5 — tombstone append-only |
+  | `EdgeRetirement` | §5.2.4 (line 486 "append-only") | G5 — tombstone append-only |
+  | `Episode` | §5.3.1 (line 511); concept-surface name in G3 is `EpisodicLog` | G3 — EpisodicLog append-only forever |
+  | `EpisodeUpdate` | §5.3.2 (line 533) | G3 — append-only forever |
+  | `Observation` | §5.3.3 | G3 — append-only forever |
+  | `RecallContextLog` | §5.3 (cheap-id append-only log) | G3 — append-only forever |
+  | `TraceObservationLog` | §5.2.3 (line 474 "append-only `TraceObservationLog`") | G3 / C8 — append-only with retention pruning by whole-partition drop only |
+  | `Concept` | §5.5.1 (line 591 "fully immutable" per G4) | G4 — Concept append-only |
+  | `ConceptVersion` | §5.5.2 (lines 621-623 append-only) | G4 — ConceptVersion append-only |
+  | `ConceptSupport` | §5.5 (one row per supporting Episode, append-only) | G4 — support evidence append-only |
+  | `EmbeddingPublish` | §9.6a (this tech spec) | Cross-store immutability (no row rewrite) |
+  | `EmbeddingPublishEvent` | §9.6a (this tech spec) | Cross-store immutability (no row rewrite) |
+
+  Two architecture-owned tables are **explicitly excluded** from
+  the no-UPDATE grant because `architecture.md` itself classifies
+  them as mutable:
+
+  | Concrete table | Architecture.md anchor | Mutability shape |
+  | --- | --- | --- |
+  | `TraceObservation` | §5.2.3 (line 415 "Mutable counters; provenance is append-only `TraceObservationLog` rows") | Counter row; UPDATE permitted |
+  | `Repo`, `Commit`, `RepoEvent`, `ConsolidatorRun`, `PromoterRun`, `reranker_model` | §5.1, §5.4, §5.6 | Bookkeeping tables; not classified as append-only by `architecture.md` |
+
+  Partition-drop is achieved by `DROP TABLE <partition>;`
+  executed by an administrative role that is **not** any
+  application role — partition rotation is a privileged
+  operation, not a row-level `DELETE`, and so does not
+  violate the append-only grants above.
 
 #### 8.7.5 Extension prerequisites
 
@@ -963,7 +996,7 @@ locked decision requires a new story that reopens the cited section.
 | Schema DDL — type mapping | `uuid`/`bytea(32)`/`jsonb`/named `ENUM`/`timestamptz`/`bigint`; vectors live in Qdrant, not PostgreSQL | §8.7.1 | New story; revisit §8.7 |
 | Schema DDL — index policy | UNIQUE `(repo_id, fingerprint)` on Node/Edge; UNIQUE `(fingerprint)` on Concept; partial UNIQUE on `Episode.synthesized_from_feedback_episode_id WHERE kind='synthetic_positive'`; ordering / lookup indices per §8.7.2 | §8.7.2 | New story; revisit §8.7 |
 | Schema DDL — partitioning | Monthly RANGE on `Episode` / `EpisodeUpdate` / `Observation` / `RecallContextLog` / `EmbeddingPublish` / `EmbeddingPublishEvent`; weekly RANGE on `TraceObservationLog` | §8.7.3 | New story; revisit §8.7 |
-| Schema DDL — constraint policy | Observation single-target CHECK; `bytea(32)` length CHECK on fingerprint; append-only roles (no UPDATE grant) on Episode/EpisodeUpdate/Observation/RecallContextLog/NodeRetirement/EdgeRetirement/TraceObservationLog/Concept/ConceptVersion/ConceptSupport/EmbeddingPublish/EmbeddingPublishEvent | §8.7.4 | New story; revisit §8.7 |
+| Schema DDL — constraint policy | Observation single-target CHECK; `bytea(32)` length CHECK on fingerprint; append-only roles (no UPDATE grant) on Node/Edge/Episode/EpisodeUpdate/Observation/RecallContextLog/NodeRetirement/EdgeRetirement/TraceObservationLog/Concept/ConceptVersion/ConceptSupport/EmbeddingPublish/EmbeddingPublishEvent (TraceObservation excluded: arch.md §5.2.3 classifies it as a mutable counter) | §8.7.4 | New story; revisit §8.7 |
 | Schema DDL — extensions | `pgcrypto`, `pg_partman`; no `pgvector` | §8.7.5 | New story; revisit §8.7 |
 | Embedding publish state model | Append-only `EmbeddingPublish` + `EmbeddingPublishEvent` log pair; no column added or mutated on Node / ConceptVersion (G3/G4/G5 preserved) | §9.6a, §8.7 | New story; revisit §9.6a |
 

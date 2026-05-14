@@ -28,9 +28,15 @@ It is **not** an upstream layer that `architecture.md` derives from.
 `architecture.md` is the merged source of truth for components,
 interfaces, and data models, and it explicitly defers a fixed set of
 numeric and vendor decisions to this file (see `architecture.md` §10:
-storage engine, schema DDL, exact OTel-span attribute mapping, and
-SLO numbers). Those deferred decisions are pinned in §8 of this
-document.
+storage engine, exact OTel-span attribute mapping, and SLO numbers).
+Those deferred decisions are pinned in §8 of this document.
+`architecture.md` §10 also lists "schema DDL" as living in this
+file; this tech spec narrows that claim — **engine-level and
+policy-level storage decisions are pinned here (§8.1), but the
+table-by-table DDL (CREATE TABLE statements, indices, constraints)
+is owned by `implementation-plan.md`** because DDL is build-order
+material, not framing material. The data model itself is normative
+in `architecture.md` §5; this tech spec does not redefine it.
 
 This document is normative for:
 
@@ -201,7 +207,7 @@ document is allowed to negotiate without re-opening this section:
    the supervision source (e.g. to LLM-judged labels only) is a
    different story.
 
-Everything else — vendor choice, transport, schema DDL, embedding
+Everything else — vendor choice, transport, embedding
 model — is in the parameter-slot list in §8 and can be pinned per
 iteration.
 
@@ -286,9 +292,13 @@ this list — they are *in* scope of this document and pinned in §8
    callers are responsible for OTel hygiene before ingest
    (`architecture.md` §1.2 row "Anonymising third-party PII inside
    trace payloads").
-5. **Whole-line / statement-level static analysis.** Smallest
-   structural node is `block` (`architecture.md` §1.2 row
-   "Whole-line/statement-level static analysis", §3.7).
+5. **Whole-line / statement-level static analysis.** The base
+   structural granularity is `method`; `block` is the smallest
+   *optional* subdivision, used only for methods that exceed the
+   size threshold per §7.7 / C20 and `architecture.md` §3.7. Going
+   finer than `block` (per-statement or per-line nodes) is out of
+   scope (`architecture.md` §1.2 row
+   "Whole-line/statement-level static analysis").
 6. **Vendor-specific profilers as first-class sources** (py-spy,
    perf, etc.). Must be normalised to OTel upstream
    (`architecture.md` §1.2 row "py-spy / perf / vendor-specific
@@ -358,7 +368,7 @@ compliance and must be revised.
 | C5 | `EpisodicLog` and `EpisodeUpdate` are append-only **forever**. No rotation, no rewrite, no GDPR-delete tooling in v1. | `architecture.md` §1.3 G3, §1.2, §8.1 |
 | C6 | The original Episode row is never mutated. Status transitions on an Episode are recorded as new `EpisodeUpdate` rows. | `architecture.md` §1.3 G3, §4.4 |
 | C7 | `RecallContextLog` is append-only forever and stores only ids (not payloads), so any past recall is replayable. | `architecture.md` §5.4.1, §8.1 |
-| C8 | `TraceObservationLog` is append-only inside a configurable retention window (§8.2 carries the default). The `TraceObservation` aggregate row is **always** preserved — never pruned. | `architecture.md` §5.2.3, §5.6, §8.1 |
+| C8 | `TraceObservationLog` is append-only inside a configurable retention window (§8.1 carries the default). The `TraceObservation` aggregate row is **always** preserved — never pruned. | `architecture.md` §5.2.3, §5.6, §8.1 |
 
 ### 7.3 Concept layer
 
@@ -417,6 +427,20 @@ override would require a new story (or a follow-up that explicitly
 reopens the relevant subsection of this document). The single-glance
 roll-up of every lock is in §10.
 
+> **Iter-3 operator pin update.** The operator has pinned the
+> decisions in §8.1, §8.2, §8.4, and §8.5 verbatim (most as the
+> proposed defaults). The notable substantive change is the
+> **vector index → Qdrant** (a separate service, not pgvector on
+> the same PostgreSQL instance); see §8.1, §9.6, and the §7.8
+> degraded-mode contract for the implications. Two pins were
+> answered non-decisively: **`slo-targets` ("don't know")** — the
+> §8.3 numbers stand as the v1 contract but are explicitly
+> **provisional, subject to load-test calibration** in the first
+> release cycle (see §8.3 note); and **`otel-mapping`
+> ("unresolved")** — the §8.6 mapping stands as pinned with its
+> drop-and-count fallback but is **pending field-validation** as
+> the first real OTel-instrumented repo onboards (see §8.6 note).
+
 Each entry below lists: (a) the **locked value** for v1, (b) the
 upper/lower bounds the slot may take *without* violating §7
 (useful when a follow-up story considers an override), and (c) the
@@ -427,7 +451,7 @@ upper/lower bounds the slot may take *without* violating §7
 | Slot | Locked value (v1) | Bounds | Override route |
 | --- | --- | --- | --- |
 | Primary durable store for Nodes / Edges / Episodes / Concepts | **PostgreSQL 16+** (single physical store, schema split by namespace). | Any ACID engine that supports composite UNIQUE indexes on `(repo_id, fingerprint)` and append-only INSERT-only workloads. KV-only stores rejected because of the `EpisodeUpdate ← Episode` join used by `mgmt.read.episodes`. | New story; revisit §8.1. |
-| Vector index | **pgvector extension on the same PostgreSQL instance** for v1 (keeps the EmbeddingIndex transactionally consistent with Concept / Node writes per C12). | Any vector index with k-NN cosine ≥ 1k-vector throughput and online insert; if extracted to a separate service, the Repo Indexer and Concept Promoter become its sole writers (C12). | New story; revisit §8.1. |
+| Vector index | **Qdrant** (separate service; per operator pin in iter 3). Repo Indexer writes Method/Block vectors; Concept Promoter writes Concept vectors. The EmbeddingIndex is therefore **not transactionally consistent** with the PostgreSQL store — see §7.8 / C22 (`embedding_index_unavailable` is a closed `degraded_reason`) and risk §9.6 for the staleness / outage handling. C12's sole-writer rule is unaffected: Repo Indexer and Concept Promoter remain the only writers. | Any vector index with k-NN cosine ≥ 1k-vector throughput, online insert, payload-filtering by `repo_id` / `kind`, and snapshot/restore. Single-process pgvector remains a viable lower-bound if separation cost is too high. | New story; revisit §8.1. |
 | `TraceObservationLog` retention window | **30 days** rolling. | Lower bound: 7 days (debugging hot-path regressions across a sprint). Upper bound: unbounded if storage budget allows. Aggregate `TraceObservation` row is preserved regardless (C8). | New story; revisit §8.1. |
 | EpisodicLog physical retention | **Forever** (C5). Sized at §8.3 throughput × planning horizon; partition by `created_at` month. | Lower bound: forever is non-negotiable. Upper bound: N/A. | Locked by operator decision; not overridable inside this story line. |
 
@@ -437,7 +461,8 @@ upper/lower bounds the slot may take *without* violating §7
 | --- | --- | --- | --- |
 | Method-to-Block split threshold | **80 logical lines** (matches `architecture.md` §3.7 default). A method exceeding this is decomposed into Blocks per §3.7. | Lower bound: 40 (very fine-grained, larger graph, higher embed cost). Upper bound: 200 (coarser, fewer Blocks, weaker localisation in Episodes). | New story; revisit §8.2. |
 | Block kinds | **Closed set `{entry, branch, loop_body, exception, exit}`** per `architecture.md` §3.7. | The set is closed; extension requires reopening §3 of this doc. | Reopen §3 of this doc. |
-| Embedded Node kinds | **`method`, `block`** at ingest time; **`concept`** at promotion time. `file` / `class` are not embedded in v1. | Bounds: embedding `file` / `class` is a deferred optimisation; it cannot precede method/block coverage. | New story; revisit §8.2. |
+| Embedded entry kinds (Node entries) | **`method`, `block`** — written at ingest time by the Repo Indexer (per `architecture.md` §3.5 EmbeddingIndex writer set). `file` / `class` Nodes are not embedded in v1. | Bounds: embedding `file` / `class` is a deferred optimisation; it cannot precede method/block coverage. | New story; revisit §8.2. |
+| Embedded entry kinds (Concept entries) | **`concept`** — written at promotion time by the Concept Promoter (per `architecture.md` §3.5, §7.8). Concepts are **not Nodes** (C4); they are a separate entry class on the EmbeddingIndex. | Bounds: Concepts only become EmbeddingIndex entries after they cross the §7.8 promotion threshold (`confidence ≥ 0.7`, `support_count ≥ 5`). | New story; revisit §8.2. |
 
 ### 8.3 SLO targets and throughput envelopes
 
@@ -463,6 +488,15 @@ Two **learning-quality** SLO targets that fall out of §2.4:
 | Concept-hit fraction @ k=20 on `agent.recall` (last 7 days) | **≥ 25 %** | Measured by the share of `RecallContextLog.concept_ids` that lead to at least one positive-outcome Episode within the next 24 h. |
 
 Override route for any of the §8.3 numbers: new story; revisit §8.3.
+
+> **Provisional flag (iter-3 operator answer `slo-targets`).** The
+> operator answered "don't know" on the §8.3 numbers. The values
+> above stand as the v1 contract — they are what downstream load
+> tests and the `reranker_model_stale` degraded flag will be
+> measured against — but they are explicitly **provisional**: the
+> first release cycle calibrates them against real traffic, and a
+> follow-up iteration of this section pins the post-calibration
+> values without re-opening the rest of §8.
 
 ### 8.4 Reranker and training cadence
 
@@ -496,6 +530,17 @@ spec pins the mapping:
 
 The mapping is closed for v1. Override route: reopen §8.6 of this
 doc.
+
+> **Provisional flag (iter-3 operator answer `otel-mapping`).** The
+> operator answered "unresolved" on §8.6. The mapping above stands
+> as pinned (the drop-and-count fallback is normative; no
+> synthetic Node is created on resolution miss). It is explicitly
+> **pending field-validation** as the first real OTel-instrumented
+> repo onboards — the `span_unresolved_total` counter from risk
+> §9.1 / §9.11 is the calibration signal, and a follow-up
+> iteration of §8.6 pins refinements (e.g. additional fallback
+> attributes for language runtimes with weaker OTel auto-instr)
+> without re-opening the rest of §8.
 
 ---
 
@@ -600,6 +645,33 @@ Each risk lists: **trigger** → **impact** → **mitigation** →
 - **Residual.** Re-embed of a 200 k LOC repo costs ~30 min wall
   clock (§8.3); during that window recall serves degraded
   (C22, `embedding_index_unavailable`).
+
+### 9.6a Cross-store staleness between PostgreSQL and Qdrant
+
+- **Trigger.** §8.1 pins Qdrant as a **separate service** from the
+  PostgreSQL store. Writes to Node / ConceptVersion rows in
+  PostgreSQL and writes to the EmbeddingIndex in Qdrant are
+  therefore **not in a single transaction**; a crash between the
+  two can leave a Node row with no vector, or a vector with no
+  row.
+- **Impact.** Recall returns vectors that dereference to missing
+  Node ids (or, on the inverse path, a Node with no vector that is
+  invisible to recall until re-embedded).
+- **Mitigation.** Each writer (Repo Indexer for Method/Block,
+  Concept Promoter for Concept) follows a fixed two-phase order:
+  (1) write the PostgreSQL row first with a sentinel
+  `embedding_state='pending'`; (2) write the Qdrant vector with
+  the row's primary key as the Qdrant point id; (3) update the
+  PostgreSQL row's `embedding_state='ready'`. GraphReader filters
+  recall hits whose `embedding_state != 'ready'`. On crash
+  recovery, both writers re-scan rows where `embedding_state IN
+  ('pending', 'ready')` against the current Qdrant snapshot and
+  reconcile. Qdrant outages surface through C22 as
+  `embedding_index_unavailable`.
+- **Residual.** A long Qdrant outage during a heavy delta ingest
+  leaves a backlog of `pending` rows; recall degrades smoothly
+  because those rows are filtered out. Re-embedding throughput is
+  bounded by §8.3 ingest envelope.
 
 ### 9.7 Tombstone churn from automated refactors
 
@@ -717,12 +789,13 @@ locked decision requires a new story that reopens the cited section.
 | Decision | Locked value (v1) | Defined in | Override route |
 | --- | --- | --- | --- |
 | Primary durable store | PostgreSQL 16+ (schema split by namespace) | §8.1 | New story; revisit §8.1 |
-| Vector index | pgvector on the same PostgreSQL instance | §8.1 | New story; revisit §8.1 |
+| Vector index | Qdrant (separate service) | §8.1 | New story; revisit §8.1 |
 | `TraceObservationLog` retention window | 30 days rolling | §8.1 | New story; revisit §8.1 |
 | `EpisodicLog` physical retention | Forever (append-only, partition by month) | §8.1, C5 | Not overridable inside this story line |
 | Method-to-Block split threshold | 80 logical lines | §8.2 | New story; revisit §8.2 |
 | Block kinds | Closed set `{entry, branch, loop_body, exception, exit}` | §8.2 | Reopen §3 of this doc |
-| Embedded Node kinds (v1) | `method`, `block`, `concept` | §8.2 | New story; revisit §8.2 |
+| Embedded entry kinds — Node entries (v1) | `method`, `block` (written at ingest by Repo Indexer) | §8.2 | New story; revisit §8.2 |
+| Embedded entry kinds — Concept entries (v1) | `concept` (written at promotion by Concept Promoter; Concepts are not Nodes per C4) | §8.2, §7.8 | New story; revisit §8.2 |
 | `agent.recall` p95 / p99 | ≤ 1.5 s / ≤ 4 s @ 50 RPS sustained | §8.3 | New story; revisit §8.3 |
 | `agent.observe` p95 / p99 | ≤ 400 ms / ≤ 1.5 s @ 50 RPS sustained | §8.3 | New story; revisit §8.3 |
 | `agent.expand` (depth ≤ 3) p95 / p99 | ≤ 1.5 s / ≤ 4 s @ 20 RPS sustained | §8.3 | New story; revisit §8.3 |

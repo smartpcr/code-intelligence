@@ -43,11 +43,16 @@ These are the contract bedrocks every later section must respect. Where you see
   mutate the graph. Writes (observe, ingest, feedback) never block on read
   latency.
 - **G2 — Identity by fingerprint.** Every Node and every Edge is keyed by a
-  deterministic `fingerprint` derived from
-  `(repo_id, kind, canonical_signature, first_seen_sha)`. Two ingests of the
-  same commit always produce the same fingerprints; a renamed/moved member
-  produces a *new* fingerprint linked to the old one by a `renamed_to`/
-  `renamed_from` edge.
+  deterministic 32-byte `fingerprint` whose pre-image always includes the SHA
+  of first appearance. The pre-image differs by entity type because an Edge
+  has no canonical_signature of its own — its identity is the ordered pair of
+  its endpoints' fingerprints:
+  - **Node fingerprint**: `sha256(repo_id ‖ kind ‖ canonical_signature ‖ first_seen_sha)`, where `canonical_signature` is the language-stable identifier (e.g. `pkg.Foo#bar(int)`) and `first_seen_sha` is materialised in the data model as the `from_sha` column (§5.2.1).
+  - **Edge fingerprint**: `sha256(repo_id ‖ kind ‖ src_fingerprint ‖ dst_fingerprint ‖ first_seen_sha)`, where `first_seen_sha` is materialised as the `from_sha` column (§5.2.2).
+
+  Two ingests of the same commit always produce the same fingerprints; a
+  renamed or moved member produces a *new* fingerprint linked to the old one
+  by a `renamed_to`/`renamed_from` Edge.
 - **G3 — Append-only event log.** The `EpisodicLog` is a strict append-only
   table. Per operator decision, retention is **forever** (no rotation, no
   rewrite). Status transitions on an Episode are recorded as new
@@ -179,9 +184,12 @@ and emits:
   Nodes/Episodes/repos.
 - A synthetic *positive* Episode for every Episode that has just been labelled
   `human_corrected` by the operator (G7). The synthetic Episode reuses the
-  parent Episode's `context_id` and stores the operator's `corrected_action` as
-  its `action` field; its `outcome` is `success` and its
-  `synthesized_from_episode_id` points back to the parent.
+  *original* (parent) Episode's `context_id`, stores the operator's
+  `corrected_action` as its `action` field, and sets its `outcome` to
+  `success`. Provenance is captured by **two distinct fields**:
+  `synthesized_from_parent_episode_id` points to the original failing Episode,
+  and `synthesized_from_feedback_episode_id` points to the operator's
+  `feedback` Episode. Both are required on every `synthetic_positive` row.
 
 ### 3.5 Hybrid Graph Store (writer + reader)
 
@@ -304,12 +312,14 @@ For the full request/response shapes see §6.
    preserved per G3 — the status is read by joining to `EpisodeUpdate`).
 4. Consolidator (G7) immediately emits a **synthetic positive Episode**.
    This synthetic Episode is *not* the feedback Episode — it is a third
-   Episode whose `context_id` is **copied from the parent Episode**, whose
-   `action` is `corrected_action`, whose `outcome` is `success`, and whose
-   `synthesized_from_episode_id` points to the feedback Episode. The
-   synthetic Episode also gets new Observation rows that mirror the parent
-   Episode's Observation rows so the positive signal attaches to the same
-   recall elements.
+   Episode whose `context_id` is **copied from the parent (original)
+   Episode**, whose `action` is `corrected_action`, whose `outcome` is
+   `success`. Its provenance is captured by **two** fields:
+   `synthesized_from_parent_episode_id` = the original failing Episode, and
+   `synthesized_from_feedback_episode_id` = the operator's feedback Episode.
+   The synthetic Episode also gets new Observation rows that mirror the
+   parent Episode's Observation rows so the positive signal attaches to the
+   same recall elements.
 5. The next Reranker Trainer cycle uses both the negative parent and the
    synthetic positive in its training pairs.
 
@@ -407,7 +417,7 @@ is deferred to `tech-spec.md`.
 | `edge_id` | uuid | Primary key. |
 | `fingerprint` | bytes(32) | **G2**: `sha256(repo_id ‖ kind ‖ src_fingerprint ‖ dst_fingerprint ‖ from_sha)`. Unique within `(repo_id, fingerprint)`. |
 | `repo_id` | uuid | FK → `Repo` (Edges remain repo-scoped per **G6**). |
-| `kind` | enum | `contains`, `imports`, `static_calls`, `observed_calls`, `extends`, `implements`, `reads`, `writes`, `renamed_to`, `concept_attaches`. |
+| `kind` | enum | `contains`, `imports`, `static_calls`, `observed_calls`, `extends`, `implements`, `reads`, `writes`, `renamed_to`. **There is no `concept_attaches` edge kind** — Concepts are *not* graph Nodes (the Node `kind` enum is closed at `repo`/`package`/`file`/`class`/`method`/`block`), so links from code Nodes to Concepts are carried exclusively by `ConceptSupport` rows (§5.5.3), not by Edges. |
 | `src_node_id` | uuid | FK → `Node`. |
 | `dst_node_id` | uuid | FK → `Node`. |
 | `from_sha` | text | First SHA at which this edge appeared. |
@@ -426,11 +436,16 @@ is deferred to `tech-spec.md`.
 | `last_observed_at` | timestamp | Mutable. |
 
 > **Mutability note.** Per **G5**, the parent `Edge` row stays append-only.
-> The mutable counters live in `TraceObservation`, which is conceptually
-> a *materialised view* over the immutable `TraceObservationLog` (one row per
-> ingested span, never updated). `TraceObservation` can therefore be rebuilt
-> deterministically from the log if it is ever lost. The Edge row's own
-> `attrs_json` is **not** updated by dynamic ingest.
+> The mutable counters live in `TraceObservation`, which is conceptually a
+> *materialised view* over the append-only `TraceObservationLog` (one row per
+> ingested span, never updated). The rebuild guarantee is narrowed to the
+> configured `TraceObservationLog` retention window (§8.1): if a
+> `TraceObservation` row is lost, it can be rebuilt deterministically *only*
+> from log rows still inside the retention window. Aggregates older than the
+> window are authoritative on the `TraceObservation` row alone — they cannot
+> be recomputed from the log because the contributing log rows have been
+> pruned. The Edge row's own `attrs_json` is **not** updated by dynamic
+> ingest.
 
 ### 5.3 Episodic Layer
 
@@ -444,8 +459,9 @@ is deferred to `tech-spec.md`.
 | `session_id` | text | Agent-side session identifier. |
 | `trace_id` | text | Caller-side correlation id. |
 | `kind` | enum | `agent`, `feedback`, `synthetic_positive`. |
-| `parent_episode_id` | uuid? | Set on `feedback` and `synthetic_positive` rows. |
-| `synthesized_from_episode_id` | uuid? | Set on `synthetic_positive` rows only. |
+| `parent_episode_id` | uuid? | Set on `feedback` rows (points to the original failing Episode). Not set on `synthetic_positive` rows — those use the two `synthesized_from_*` fields below. |
+| `synthesized_from_parent_episode_id` | uuid? | Set on `synthetic_positive` rows only. Points to the original failing Episode (the row that was labelled `human_corrected`). |
+| `synthesized_from_feedback_episode_id` | uuid? | Set on `synthetic_positive` rows only. Points to the `feedback` Episode (the row the operator wrote when submitting `mgmt.feedback`). |
 | `context_id` | uuid? | FK → `RecallContextLog`. NULL is legal **only** for `feedback` Episodes (operator did not run a new recall — see §4.4 step 2). For `synthetic_positive` Episodes this field is **copied from the parent Episode's `context_id`** per **G7**. |
 | `action` | json | The proposed/chosen action. |
 | `outcome` | enum | `success`, `failure`, `refused`, `degraded`, `human_corrected`. Note that on the *original* Episode this column is always the initial value; subsequent transitions are reflected via `EpisodeUpdate`. |
@@ -532,6 +548,7 @@ is deferred to `tech-spec.md`.
 | `support_count` | int | Number of supporting positive Episodes. |
 | `negative_count` | int | Number of supporting negative Episodes. |
 | `consolidator_run_id` | uuid | Pointer to the run that produced this version. |
+| `promoted` | bool | Set true by the Concept Promoter when the Concept first crosses the publishable threshold (§7.8). Subsequent versions inherit/refresh this flag. |
 | `created_at` | timestamp | Append-only. |
 
 #### 5.5.3 ConceptSupport
@@ -590,9 +607,16 @@ RecallResponse {
   `mgmt.feedback` (§6.2.2). This keeps the §6.2.2 `corrected_action`
   requirement scoped to the operator path.
 - `observation_refs[]` is an array of `{role, node_id?, edge_id?, concept_id?}`
-  rows that map exactly onto Observation rows (§5.3.3). `role` must be one of
-  the Observation roles; `edge_hit` and `call_edge_hit` reference entries
-  from `RecallResponse.edges`.
+  rows that map onto Observation rows (§5.3.3). `role` must be one of
+  `node_hit`, `edge_hit`, `call_edge_hit`, `concept_hit`; `edge_hit` and
+  `call_edge_hit` reference entries from `RecallResponse.edges`. The caller
+  **never** supplies a `degraded_recall_context` ref — that role is reserved
+  for the server. When `context_id` points to a `RecallContextLog` row whose
+  `served_under_degraded=true`, the writer automatically appends one extra
+  Observation row with `role='degraded_recall_context'` and
+  `degraded_recall_context_id=context_id` (this is the only path that writes
+  that role). Callers that pass a `role='degraded_recall_context'` entry are
+  rejected with a validation error.
 
 ```
 ObserveResponse {
@@ -734,7 +758,8 @@ Operator UI → mgmt.feedback(parent_episode_id, outcome='human_corrected',
       context_id := parent.context_id,                ← G7
       action     := corrected_action,
       outcome    := 'success',
-      synthesized_from_episode_id := feedback_episode_id.
+      synthesized_from_parent_episode_id   := <parent>,
+      synthesized_from_feedback_episode_id := feedback_episode_id.
    4. Append Observation rows that mirror the parent's Observation rows,
       attached to the synthetic positive Episode.)
 ```
@@ -813,14 +838,19 @@ Specifically:
    confidence threshold (e.g. confidence ≥ 0.7 and support_count ≥ 5).
 2. Compute embedding for each promoted Concept (description + canonical
    feature signature) and write to EmbeddingIndex.
-3. Append a 'concept_attaches' Edge from each ConceptSupport.node_id to a
-   Concept-anchor Node (a special synthetic Node-of-kind 'concept' that
-   serves as the graph-side handle for the Concept).
+3. Mark the Concept as "promoted" by appending a `ConceptVersion` row whose
+   `promoted=true` flag is set (this row carries the same confidence/support
+   counts as the prior version but flips the flag; the flag is read by
+   `mgmt.read.concepts` and by GraphReader during recall). No graph Edge is
+   written — Concepts are not Nodes (§5.2.1), and links from code Nodes to
+   Concepts are carried by `ConceptSupport` rows (§5.5.3), which the
+   Consolidator has already written in §7.7 step 3.
 ```
 
-> Promotion does **not** rewrite the Concept row. The publishable signal is
-> derived from `ConceptVersion` per **G4**; an un-promoted Concept simply does
-> not have a `concept_attaches` Edge yet.
+> Promotion does **not** rewrite the Concept row, and it does **not** create
+> a synthetic graph Node or Edge. The publishable signal is derived from
+> `ConceptVersion` per **G4**; an un-promoted Concept simply has no
+> `ConceptVersion` row with `promoted=true` yet.
 
 ---
 
@@ -833,9 +863,13 @@ Specifically:
   `tech-spec.md`.
 - `RecallContextLog`: append-only forever (cheap because it stores ids, not
   payloads).
-- `TraceObservationLog`: append-only; the operator may configure a
-  retention-window for *replay* purposes, but the aggregated
-  `TraceObservation` row is always preserved.
+- `TraceObservationLog`: append-only with a configurable retention window
+  (default in `tech-spec.md`). Inside the window, `TraceObservation`
+  aggregates can be rebuilt deterministically from the log (§5.2.3). Once a
+  log row falls outside the window the Span Ingestor prunes it; from that
+  point on the aggregated `TraceObservation` row is authoritative and cannot
+  be recomputed. The `TraceObservation` row itself is **always** preserved —
+  it is never pruned by retention.
 - Structural `Node` and `Edge`: append-only with retirement (G5). Retired
   rows are kept forever so historic Episodes resolve their node/edge ids.
 

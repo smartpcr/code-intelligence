@@ -30,6 +30,24 @@
 -- context_id` and `episode_id` reference partitioned parents
 -- (RecallContextLog, Episode), so they follow the no-DB-FK
 -- pattern documented at the head of 0007_episode.sql.
+--
+-- Weight column (no range CHECK -- intentional)
+-- ---------------------------------------------
+-- arch §5.3.3 defines `weight` as the caller-supplied "how much
+-- did this element contribute to the action" measure and does
+-- not pin a range. tech-spec §8.7.4 enumerates the schema-level
+-- CHECK constraints required on this table (single-target plus
+-- role/target pairing); a weight range CHECK is intentionally
+-- not in that list. The reranker's positive-vs-negative training
+-- signal lives on `Episode.outcome` (arch §3.6, §4.3) -- failure
+-- / degraded / pre-correction `human_corrected` Episodes feed
+-- the negative side, success / synthetic_positive Episodes feed
+-- the positive side. Observation `weight` only expresses
+-- contribution magnitude *within* a given Episode, so the schema
+-- does not constrain its sign or scale. Contrast with
+-- `concept_version_confidence_range_chk` in 0011 where the
+-- [0.0, 1.0] bound is part of the confidence-band definition in
+-- arch §5.5.2 and is therefore a schema-level invariant.
 
 -- migrate:up
 BEGIN;

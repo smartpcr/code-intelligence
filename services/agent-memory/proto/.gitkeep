@@ -1,0 +1,3 @@
+# Placeholder so the empty `proto/` directory survives in git.
+# The Agent transport gRPC IDL (§8.5) lands here once the agent-api
+# stage begins.

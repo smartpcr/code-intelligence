@@ -1,0 +1,93 @@
+# pre-commit hooks for the code-intelligence repo.
+#
+# Wired into CI via the `pre-commit` job in
+# .github/workflows/agent-memory-ci.yml; developers install the
+# git hooks locally with:
+#
+#     pip install pre-commit
+#     pre-commit install
+#
+# The hook set is intentionally minimal at Stage 1.1 -- just enough
+# to enforce the .editorconfig conventions and the Go formatter that
+# `make lint` would otherwise catch one step later in the CI
+# pipeline. New hooks are added in their own PR with a clean
+# `pre-commit run --all-files` pass.
+
+# Repo-wide exclude. `docs/stories/**` is plan-managed (authored
+# by upstream architecture / tech-spec / implementation-plan /
+# e2e-scenarios iterations) and committed with the line endings
+# the plan workflow produced. It is tagged `-text` in
+# `.gitattributes` so git won't normalise it, and we skip it for
+# every pre-commit hook so engineer iterations don't churn those
+# files as a side effect of running the suite.
+exclude: |
+  (?x)^(
+    docs/stories/.*|
+    .*\.bak$|
+    .*\.iter-snapshot\.bak$
+  )$
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+      - id: check-yaml
+        args: ["--allow-multiple-documents"]
+        # docker-compose files use !reset / similar tags; let the
+        # dedicated yamllint hook handle compose-style files.
+        exclude: ^services/agent-memory/deploy/local/docker-compose\.yml$
+      - id: check-json
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: check-case-conflict
+      - id: check-executables-have-shebangs
+
+  - repo: https://github.com/editorconfig-checker/editorconfig-checker.python
+    rev: 3.0.3
+    hooks:
+      - id: editorconfig-checker
+        # editorconfig-checker recurses into vendor / generated dirs;
+        # exclude the obvious offenders so the hook stays fast and
+        # focused on real source. `docs/stories/**` is owned by the
+        # plan iterations upstream and committed with whatever line
+        # endings the plan workflow produced -- it is also tagged
+        # `-text` in `.gitattributes` so git won't normalise it, and
+        # the editor-config policy is intentionally not applied here.
+        exclude: |
+          (?x)^(
+            services/agent-memory/vendor/.*|
+            docs/stories/.*|
+            .*\.bak$|
+            .*\.iter-snapshot\.bak$
+          )$
+
+  # Go hooks are wired as local `repo: local` entries because the
+  # community `dnephin/pre-commit-golang` repo (v0.5.1, 2021) is
+  # stale and its hook IDs have drifted. Local hooks invoke the
+  # toolchain we already require (`go fmt`, `go vet`) scoped to the
+  # service module, which matches what `make lint` / `make vet` do.
+  - repo: local
+    hooks:
+      - id: agent-memory-gofmt
+        name: gofmt agent-memory
+        entry: bash -c 'cd services/agent-memory && gofmt -l -d $(git ls-files "*.go") | tee /dev/stderr | (! read)'
+        language: system
+        pass_filenames: false
+        files: ^services/agent-memory/.*\.go$
+      - id: agent-memory-govet
+        name: go vet agent-memory
+        entry: bash -c 'cd services/agent-memory && go vet ./...'
+        language: system
+        pass_filenames: false
+        files: ^services/agent-memory/.*\.go$
+
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.35.1
+    hooks:
+      - id: yamllint
+        args: ["-c=.yamllint.yaml", "--strict"]

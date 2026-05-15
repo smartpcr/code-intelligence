@@ -1,0 +1,49 @@
+# OpenTelemetry Collector config for the local-dev / CI stack.
+#
+# Stage 1.1 only needs the collector to *exist* with a healthy
+# `:13133` probe so the CI compose-up step has a third row to wait
+# on. We wire an OTLP receiver (both gRPC and HTTP) into a debug
+# exporter so that downstream stages (e.g. Stage 8.6 instrumentation)
+# can already point at this collector and see their traces / metrics
+# in container logs without further config churn.
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+    path: /
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+exporters:
+  debug:
+    verbosity: basic
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+  telemetry:
+    logs:
+      level: info

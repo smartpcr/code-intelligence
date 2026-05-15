@@ -1,13 +1,19 @@
 -- 0002_repo_commit.sql
 --
 -- Stage 1.2 step 2 (implementation-plan.md): create the `repo` and
--- `commit` tables per architecture.md §5.6 with the timestamptz /
--- uuid / text typing of tech-spec §8.7.1.
+-- `repo_commit` tables per architecture.md §5.6 with the timestamptz
+-- / uuid / text typing of tech-spec §8.7.1.
 --
 -- `repo` is mutable (settings-only per architecture.md §5.1).
--- `commit` is the immutable snapshot identity row per
--- architecture.md §5.1 "Commit | Immutable" and §8.7.4
--- (append-only, no UPDATE grant for the application role).
+-- `repo_commit` is the immutable snapshot identity row for the
+-- architecture-level "Commit" concept (architecture.md §5.1
+-- "Commit | Immutable" and §8.7.4 -- append-only, no UPDATE grant
+-- for the application role). The table is named `repo_commit`
+-- rather than `commit` because `COMMIT` is a PostgreSQL
+-- transaction-control keyword: leaving it unquoted in DML produced
+-- by ORMs / query builders is a recurring footgun. The `repo_`
+-- prefix also matches the migration filename and the sibling
+-- `repo_event` table (0006_repo_event.sql).
 --
 -- `language_hints` is stored as `text[]` so the Repo Indexer can
 -- pass a closed list of language hints without a separate join
@@ -31,7 +37,7 @@ CREATE TABLE repo (
 -- This UNIQUE is what makes `mgmt.register` idempotent in Stage 7.1.
 CREATE UNIQUE INDEX repo_url_uidx ON repo (url);
 
-CREATE TABLE commit (
+CREATE TABLE repo_commit (
     -- (repo_id, sha) is the natural key for a Commit row per
     -- architecture.md §5.6 "Commit | repo_id, sha, ...". The
     -- composite PK avoids needing a synthetic surrogate column
@@ -49,15 +55,15 @@ CREATE TABLE commit (
     PRIMARY KEY (repo_id, sha)
 );
 
-CREATE INDEX commit_repo_committed_at_idx
-    ON commit (repo_id, committed_at DESC);
+CREATE INDEX repo_commit_committed_at_idx
+    ON repo_commit (repo_id, committed_at DESC);
 
 COMMIT;
 
 -- migrate:down
 BEGIN;
 
-DROP TABLE IF EXISTS commit;
+DROP TABLE IF EXISTS repo_commit;
 DROP TABLE IF EXISTS repo;
 
 COMMIT;

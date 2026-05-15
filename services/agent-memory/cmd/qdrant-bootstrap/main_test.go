@@ -419,6 +419,54 @@ func TestBootstrap_rejectsBadInput(t *testing.T) {
 	}
 }
 
+// TestBootstrap_collectionsFieldOverridesPackageDefault pins
+// the contract the live test (and any future cross-environment
+// caller) relies on: setting Bootstrapper.Collections drives
+// Bootstrap (and the snapshot scheduler) at the configured
+// list, NOT the package-level defaultCollections. Without this
+// guarantee the Collections field is theatre.
+//
+// This test also doubles as a regression guard: a future
+// refactor that re-introduces a `for _, name := range
+// defaultCollections` in Bootstrap would be caught by the
+// "production names must NOT have been provisioned" assertion
+// at the bottom of the test.
+func TestBootstrap_collectionsFieldOverridesPackageDefault(t *testing.T) {
+	fake := newFakeQdrant()
+	srv := httptest.NewServer(fake.handler(t))
+	defer srv.Close()
+
+	custom := []string{"override_alpha", "override_beta"}
+
+	b := newBootstrapperForTest(t, srv.URL)
+	b.Collections = custom
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := b.Bootstrap(ctx); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	for _, name := range custom {
+		if _, ok := fake.collections[name]; !ok {
+			t.Errorf("custom collection %s not provisioned; "+
+				"Collections override is not wired into Bootstrap",
+				name)
+		}
+	}
+	for _, name := range defaultCollections {
+		if _, ok := fake.collections[name]; ok {
+			t.Errorf("package-default collection %s was "+
+				"provisioned even though Collections override "+
+				"was set; Bootstrap is still iterating the "+
+				"global default", name)
+		}
+	}
+}
+
 // TestBootstrap_listCollectionsReportsAllThreeWithCosine
 // exercises the implementation-plan.md Stage 1.4 acceptance
 // scenario verbatim: "When `GET /collections` is issued
@@ -655,20 +703,21 @@ func TestBootstrap_againstLiveQdrant(t *testing.T) {
 		t.Skip("AGENT_MEMORY_QDRANT_URL not set; skipping live Qdrant test")
 	}
 
-	// Override the default collection list with a unique
-	// per-run set so we don't disturb a shared Qdrant. The
-	// global `defaultCollections` is a var, so we swap and
-	// restore it.
+	// Use a unique per-run collection set so we don't disturb
+	// a shared Qdrant. Setting Bootstrapper.Collections scopes
+	// the override to this Bootstrapper instance -- no global
+	// mutation, no save/restore ceremony, no data race risk if
+	// a future contributor adds t.Parallel() to a sibling test
+	// (rubber-duck #4).
 	suffix := time.Now().UTC().Format("20060102_150405")
-	prior := append([]string(nil), defaultCollections...)
-	defaultCollections = []string{
+	testCollections := []string{
 		"am_test_method_" + suffix,
 		"am_test_block_" + suffix,
 		"am_test_concept_" + suffix,
 	}
-	defer func() { defaultCollections = prior }()
 
 	b := NewBootstrapper(url, 8) // tiny vector size for speed
+	b.Collections = testCollections
 	b.Logger = log.New(testWriter{t: t}, "[live] ", 0)
 	b.HTTPClient = &http.Client{Timeout: 15 * time.Second}
 
@@ -686,6 +735,10 @@ func TestBootstrap_againstLiveQdrant(t *testing.T) {
 	// implementation-plan.md Stage 1.4 acceptance scenario:
 	// "When `GET /collections` is issued against Qdrant, Then
 	// all three collections are present with distance: cosine".
+	// We verify against testCollections (the set THIS run
+	// provisioned), not defaultCollections, because a shared
+	// Qdrant may legitimately host the production names from
+	// other deploys -- we only own the suffixed names.
 	got, err := b.ListCollections(ctx)
 	if err != nil {
 		t.Fatalf("live ListCollections: %v", err)
@@ -694,7 +747,7 @@ func TestBootstrap_againstLiveQdrant(t *testing.T) {
 	for _, n := range got {
 		present[n] = true
 	}
-	for _, want := range defaultCollections {
+	for _, want := range testCollections {
 		if !present[want] {
 			t.Errorf("live: collection %s missing from "+
 				"GET /collections (got %v)", want, got)
@@ -712,7 +765,7 @@ func TestBootstrap_againstLiveQdrant(t *testing.T) {
 
 	// Best-effort cleanup so subsequent runs don't accumulate
 	// leftovers in a shared instance.
-	for _, name := range defaultCollections {
+	for _, name := range testCollections {
 		req, err := http.NewRequestWithContext(ctx,
 			http.MethodDelete, url+"/collections/"+name, nil)
 		if err != nil {

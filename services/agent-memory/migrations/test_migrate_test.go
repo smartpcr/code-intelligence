@@ -168,6 +168,8 @@ func TestUp_appliesEntireStage12_andEveryExpectedObjectExists(t *testing.T) {
 		"recall_context_log",
 		"concept", "concept_version", "concept_support",
 		"consolidator_run", "promoter_run", "reranker_model",
+		// Stage 1.4 embedding-publish state-log pair.
+		"embedding_publish", "embedding_publish_event",
 	}
 	for _, tbl := range wantTables {
 		if !relationExists(t, db, schema, tbl) {
@@ -193,6 +195,8 @@ func TestUp_appliesEntireStage12_andEveryExpectedObjectExists(t *testing.T) {
 		// ingest_jobs locals (defined in 0006a).
 		"ingest_mode":   {"full", "delta", "manual"},
 		"ingest_status": {"pending", "claimed", "running", "done", "failed"},
+		// Stage 1.4 EmbeddingPublishEvent state machine (§9.6a).
+		"embedding_publish_event_kind": {"queued", "vector_written", "published", "failed", "superseded"},
 	}
 	for name, want := range wantEnums {
 		got := enumLabels(t, db, schema, name)
@@ -259,6 +263,9 @@ func TestUp_appliesEntireStage12_andEveryExpectedObjectExists(t *testing.T) {
 		{"episode_synthetic_positive_feedback_uidx", "UNIQUE INDEX episode_synthetic_positive_feedback_uidx ON"},
 		{"episode_synthetic_positive_feedback_uidx", "(synthesized_from_feedback_episode_id, created_at)"},
 		{"episode_synthetic_positive_feedback_uidx", "WHERE (kind = 'synthetic_positive'"},
+		// Stage 1.4: EmbeddingPublishEvent "latest event" lookup
+		// per tech-spec §8.7.2 / §9.6a read protocol.
+		{"embedding_publish_event_publish_created_idx", "(publish_id, created_at DESC)"},
 	}
 	for _, w := range wantIdxDef {
 		def := indexDef(t, db, schema, w.index)
@@ -1168,14 +1175,19 @@ func TestPgPartman_provisionsForwardPartitions(t *testing.T) {
 	defer cancel()
 
 	// 1. partman.part_config carries an entry for every
-	//    partitioned parent we registered in 0014 -- AND ONLY
-	//    those parents, in this test schema.
+	//    partitioned parent we registered in 0014 + 0015 -- AND
+	//    ONLY those parents, in this test schema.
 	expectedParents := []string{
 		schema + ".trace_observation_log",
 		schema + ".episode",
 		schema + ".episode_update",
 		schema + ".observation",
 		schema + ".recall_context_log",
+		// Stage 1.4: EmbeddingPublish state-log pair (§9.6a),
+		// registered in 0015 (not 0014 -- 0014 predates these
+		// tables and migrations are append-only on disk).
+		schema + ".embedding_publish",
+		schema + ".embedding_publish_event",
 	}
 	registered := map[string]bool{}
 	// Escape `_` in the schema name: it's a LIKE wildcard

@@ -213,7 +213,23 @@ COMMIT;
 -- migrate:down
 BEGIN;
 
+-- The explicit `DROP TABLE IF EXISTS episode_default` below is
+-- redundant on its own (PostgreSQL drops partitions together
+-- with their partitioned parent), but we keep it so that a
+-- partial rollback that already removed the parent still has
+-- a no-op safety net, and so the partition-of-parent
+-- relationship is documented in the down path.
+--
+-- CASCADE on the parent drop is explicit: any future cross-
+-- table dependent (a view onto `episode`, a FK from a sibling
+-- table, a child partition added by a later migration that
+-- forgets to add its own DROP line here) is removed with the
+-- parent rather than failing the rollback with a dependency
+-- error. The schema deliberately avoids real FKs to this
+-- partitioned table (see file header), so CASCADE is a forward-
+-- looking defense, not a load-bearing piece of the current
+-- dependency graph.
 DROP TABLE IF EXISTS episode_default;
-DROP TABLE IF EXISTS episode;
+DROP TABLE IF EXISTS episode CASCADE;
 
 COMMIT;

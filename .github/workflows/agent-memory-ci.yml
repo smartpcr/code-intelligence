@@ -61,10 +61,12 @@ jobs:
         with:
           version: v1.61.0
           working-directory: services/agent-memory
-          args: --timeout=5m
-          # The action runs `golangci-lint run` itself; we still
-          # invoke `make lint` below so local dev and CI exercise
-          # the exact same Makefile path.
+          # `install-only: true` makes the action install the binary
+          # and prime its cache without invoking `golangci-lint run`.
+          # The actual lint pass is driven by `make lint` below so
+          # local dev and CI exercise the exact same Makefile path
+          # exactly once per build.
+          install-only: true
           install-mode: binary
           skip-cache: false
 

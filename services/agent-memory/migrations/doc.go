@@ -24,6 +24,13 @@
 //	0013_synthetic_positive_unique.sql   -- composite partial UNIQUE on (synthesized_from_feedback_episode_id, created_at) for synthetic_positive rows
 //	0014_pg_partman_setup.sql            -- partman.create_parent for the 5 partitioned parents
 //
+// Stage 1.4 ships migrations 0015..0016, the cross-store
+// embedding state-log pair plus the application + admin role
+// grants:
+//
+//	0015_embedding_publish.sql -- embedding_publish, embedding_publish_event (partitioned monthly, append-only; tech-spec §9.6a state machine)
+//	0016_roles_grants.sql      -- agent_memory_app (INSERT/SELECT on the §8.7.4 append-only set; INSERT/SELECT/UPDATE on the UPDATE-grantable set) + agent_memory_admin (ALL PRIVILEGES)
+//
 // Later stages append more files; the migrator picks them up by
 // sorted filename so the lexicographic order matches the apply
 // order.

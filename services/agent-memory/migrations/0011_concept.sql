@@ -68,7 +68,16 @@ CREATE TABLE concept_version (
     CONSTRAINT concept_version_confidence_range_chk
         CHECK (confidence >= 0.0 AND confidence <= 1.0),
     CONSTRAINT concept_version_version_index_positive_chk
-        CHECK (version_index >= 0)
+        CHECK (version_index >= 0),
+    -- support_count / negative_count are append-only counters
+    -- incremented by the Consolidator (Stage 5.2) and Concept
+    -- Promoter (Stage 7.8). They must never go negative; the
+    -- CHECK turns a decrement bug into a constraint violation
+    -- at the DB instead of corrupt counter state.
+    CONSTRAINT concept_version_support_count_nonneg_chk
+        CHECK (support_count >= 0),
+    CONSTRAINT concept_version_negative_count_nonneg_chk
+        CHECK (negative_count >= 0)
 );
 
 -- arch §5.5.2 + tech-spec §8.7.2: "most recent ConceptVersion"

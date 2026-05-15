@@ -95,6 +95,23 @@ func openTestDB(t *testing.T) (*sql.DB, string, func()) {
 	cleanup := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), testDBTimeout)
 		defer cancel()
+		// pg_partman.part_config rows referencing tables in this
+		// schema must be removed before the schema drops, because
+		// the partman BGW will otherwise try to maintain a
+		// dangling parent_table reference. Tests that never call
+		// Up() leave part_config empty -- DELETE on no rows is a
+		// no-op.
+		//
+		// The schema prefix is escaped (ESCAPE '#') because
+		// `amtest_<hex>` contains a `_` which is a LIKE wildcard
+		// matching any single character; without escaping, this
+		// cleanup could erroneously delete part_config rows
+		// belonging to a sibling test schema (or another tenant).
+		schemaPrefix := strings.ReplaceAll(schema, "_", "#_") + ".%"
+		_, _ = db.ExecContext(ctx, `
+			DELETE FROM partman.part_config
+			WHERE parent_table LIKE $1 ESCAPE '#'
+		`, schemaPrefix)
 		// CASCADE drops every table, type, index, and partition
 		// created during the test, including the migration journal.
 		_, _ = db.ExecContext(ctx, `DROP SCHEMA `+quoteIdent(schema)+` CASCADE`)
@@ -123,9 +140,10 @@ func quoteIdent(name string) string {
 
 // TestUp_appliesEntireStage12_andEveryExpectedObjectExists is the
 // "structural schema applies cleanly" scenario from
-// implementation-plan.md Stage 1.2. After Up() every expected
-// ENUM, table, and UNIQUE index must be present in the per-test
-// schema.
+// implementation-plan.md Stage 1.2, extended by Stage 1.3 to
+// cover the episodic + concept tables added by 0007 .. 0014.
+// After Up() every expected ENUM, table, and UNIQUE index must
+// be present in the per-test schema.
 func TestUp_appliesEntireStage12_andEveryExpectedObjectExists(t *testing.T) {
 	db, schema, cleanup := openTestDB(t)
 	defer cleanup()
@@ -138,12 +156,19 @@ func TestUp_appliesEntireStage12_andEveryExpectedObjectExists(t *testing.T) {
 	}
 
 	wantTables := []string{
-		"repo", "commit",
+		// Stage 1.2 structural set.
+		"repo", "repo_commit",
 		"node", "edge",
 		"node_retirement", "edge_retirement",
 		"trace_observation", "trace_observation_log",
 		"repo_event",
 		"ingest_jobs",
+		// Stage 1.3 episodic + concept set.
+		"episode", "episode_update", "observation",
+		"recall_context_log",
+		"concept", "concept_version", "concept_support",
+		"consolidator_run", "promoter_run", "reranker_model",
+		"synthetic_positive_emission",
 	}
 	for _, tbl := range wantTables {
 		if !relationExists(t, db, schema, tbl) {
@@ -204,6 +229,25 @@ func TestUp_appliesEntireStage12_andEveryExpectedObjectExists(t *testing.T) {
 		{"ingest_jobs_pending_idx", "WHERE (status = 'pending'"},
 		// TraceObservationLog scan per tech-spec §8.7.2.
 		{"trace_observation_log_edge_started_idx", "(edge_id, started_at DESC)"},
+		// Stage 1.3: concept fingerprint uniqueness (G6 -- no
+		// repo_id, cross-repo per arch §5.5.1).
+		{"concept_fingerprint_uidx", "UNIQUE INDEX concept_fingerprint_uidx ON"},
+		{"concept_fingerprint_uidx", "(fingerprint)"},
+		// Stage 1.3: most-recent ConceptVersion read per tech-spec
+		// §8.7.2 / arch §5.5.1.
+		{"concept_version_concept_version_idx", "(concept_id, version_index DESC)"},
+		// Stage 1.3: (concept_id, version_index) monotonicity
+		// guard (arch §5.5.2: "Monotonic per concept_id").
+		{"concept_version_concept_version_uidx", "UNIQUE INDEX concept_version_concept_version_uidx ON"},
+		// Stage 1.3: Episode hot-path read for mgmt.read.episodes.
+		{"episode_repo_created_idx", "(repo_id, created_at DESC)"},
+		// Stage 1.3: EpisodeUpdate current_status join hot path.
+		{"episode_update_episode_created_idx", "(episode_id, created_at DESC)"},
+		// Stage 1.3: Observation gather-by-episode hot path.
+		{"observation_episode_created_idx", "(episode_id, created_at DESC)"},
+		// Stage 1.3: RecallContextLog hot-path read for
+		// mgmt.read.recall_contexts.
+		{"recall_context_log_repo_created_idx", "(repo_id, created_at DESC)"},
 	}
 	for _, w := range wantIdxDef {
 		def := indexDef(t, db, schema, w.index)
@@ -452,6 +496,270 @@ func TestDown_isIdempotent(t *testing.T) {
 	}
 }
 
+// TestObservation_checkRejectsMultiTarget exercises Stage 1.3
+// scenario "Observation CHECK rejects multi-target" -- the table
+// CHECK constraints on `observation` reject any row with more
+// than one target column populated AND any row whose `role` does
+// not match its target column.
+func TestObservation_checkRejectsMultiTarget(t *testing.T) {
+	db, _, cleanup := openTestDB(t)
+	defer cleanup()
+	mustUp(t, db)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testDBTimeout)
+	defer cancel()
+
+	var repoID string
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO repo (url, default_branch, current_head_sha)
+		VALUES ('https://example.test/observation', 'main', 'cccc3333')
+		RETURNING repo_id
+	`).Scan(&repoID); err != nil {
+		t.Fatalf("seed repo: %v", err)
+	}
+	var nodeID string
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO node (fingerprint, repo_id, kind, canonical_signature, from_sha)
+		VALUES (decode('0101010101010101010101010101010101010101010101010101010101010101', 'hex'),
+		        $1, 'method', 'pkg.Obs#hit()', 'cccc3333')
+		RETURNING node_id
+	`, repoID).Scan(&nodeID); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	// A synthetic episode_id -- Observation does NOT carry a real
+	// FK to Episode (partitioned parent, see 0007 header), so we
+	// can fabricate one without inserting the Episode row first.
+	episodeID := "11111111-1111-1111-1111-111111111111"
+	conceptIDStub := "22222222-2222-2222-2222-222222222222"
+
+	// Case 1: BOTH node_id and concept_id set. Should trip the
+	// exactly-one-target CHECK, regardless of `role`.
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO observation (episode_id, role, node_id, concept_id)
+		VALUES ($1, 'node_hit', $2, $3)
+	`, episodeID, nodeID, conceptIDStub)
+	if err == nil {
+		t.Fatal("expected CHECK violation for multi-target observation; got nil")
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "observation_exactly_one_target_chk") {
+		t.Errorf("multi-target CHECK error should reference observation_exactly_one_target_chk: %v", err)
+	}
+
+	// Case 2: role/target mismatch -- role='node_hit' but target
+	// is `concept_id`. exactly_one passes (count=1), but the
+	// role-target pairing CHECK rejects.
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO observation (episode_id, role, concept_id)
+		VALUES ($1, 'node_hit', $2)
+	`, episodeID, conceptIDStub)
+	if err == nil {
+		t.Fatal("expected CHECK violation for role/target mismatch; got nil")
+	}
+	msg = strings.ToLower(err.Error())
+	if !strings.Contains(msg, "observation_role_target_chk") {
+		t.Errorf("role-target CHECK error should reference observation_role_target_chk: %v", err)
+	}
+
+	// Sanity: a well-formed row (role='node_hit', node_id set,
+	// nothing else) succeeds. Guards against the CHECKs over-
+	// rejecting and the table looking dead.
+	var obsID string
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO observation (episode_id, role, node_id, weight)
+		VALUES ($1, 'node_hit', $2, 0.75)
+		RETURNING observation_id
+	`, episodeID, nodeID).Scan(&obsID); err != nil {
+		t.Fatalf("well-formed observation insert should succeed: %v", err)
+	}
+	if obsID == "" {
+		t.Fatal("expected returned observation_id to be non-empty")
+	}
+}
+
+// TestSyntheticPositive_uniquenessAcrossRestarts exercises Stage
+// 1.3 scenario "synthetic-positive uniqueness" -- the §9.8 risk
+// mitigation. Two synthetic_positive Episode rows that share a
+// `synthesized_from_feedback_episode_id` must collide on the
+// `synthetic_positive_emission` sentinel PK, rolling back the
+// second insert. This holds cross-partition (i.e., across
+// "restarts" in the architecture's wording).
+func TestSyntheticPositive_uniquenessAcrossRestarts(t *testing.T) {
+	db, _, cleanup := openTestDB(t)
+	defer cleanup()
+	mustUp(t, db)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testDBTimeout)
+	defer cancel()
+
+	var repoID string
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO repo (url, default_branch, current_head_sha)
+		VALUES ('https://example.test/synth-positive', 'main', 'dddd4444')
+		RETURNING repo_id
+	`).Scan(&repoID); err != nil {
+		t.Fatalf("seed repo: %v", err)
+	}
+
+	// The shared key the sentinel PK must reject. The
+	// implementation-plan scenario phrasing is "two
+	// Consolidator runs emit synthetic positives for the SAME
+	// feedback episode".
+	feedbackEpisodeID := "33333333-3333-3333-3333-333333333333"
+	parentEpisodeID := "44444444-4444-4444-4444-444444444444"
+
+	// First synthetic_positive: succeeds, drops a sentinel row.
+	var firstEpisodeID string
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO episode (
+			episode_group_id, repo_id, session_id, trace_id, kind,
+			synthesized_from_parent_episode_id,
+			synthesized_from_feedback_episode_id,
+			action, outcome
+		)
+		VALUES (
+			gen_random_uuid(), $1, 'sess-a', 'trace-a', 'synthetic_positive',
+			$2, $3, '{"op":"replay"}'::jsonb, 'success'
+		)
+		RETURNING episode_id
+	`, repoID, parentEpisodeID, feedbackEpisodeID).Scan(&firstEpisodeID); err != nil {
+		t.Fatalf("first synthetic_positive Episode insert should succeed: %v", err)
+	}
+
+	// The sentinel row exists with the shared key.
+	var sentinelCount int
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM synthetic_positive_emission
+		WHERE synthesized_from_feedback_episode_id = $1
+	`, feedbackEpisodeID).Scan(&sentinelCount); err != nil {
+		t.Fatalf("sentinel count query: %v", err)
+	}
+	if sentinelCount != 1 {
+		t.Fatalf("expected exactly 1 sentinel row after first insert; got %d", sentinelCount)
+	}
+
+	// Second synthetic_positive: same feedback_episode_id, fresh
+	// trace + session (so writer-side dedup keys differ). The
+	// trigger fires, hits the sentinel PK, rolls back the
+	// Episode insert.
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO episode (
+			episode_group_id, repo_id, session_id, trace_id, kind,
+			synthesized_from_parent_episode_id,
+			synthesized_from_feedback_episode_id,
+			action, outcome
+		)
+		VALUES (
+			gen_random_uuid(), $1, 'sess-b', 'trace-b', 'synthetic_positive',
+			$2, $3, '{"op":"replay"}'::jsonb, 'success'
+		)
+	`, repoID, parentEpisodeID, feedbackEpisodeID)
+	if err == nil {
+		t.Fatal("expected PK violation on second synthetic_positive insert; got nil")
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "synthetic_positive_emission_pkey") &&
+		!strings.Contains(msg, "synthesized_from_feedback_episode_id") {
+		t.Errorf("duplicate sentinel error should reference synthetic_positive_emission_pkey or synthesized_from_feedback_episode_id: %v", err)
+	}
+
+	// The Episode INSERT was rolled back atomically with the
+	// trigger's failed sentinel INSERT -- there should still be
+	// exactly one Episode row carrying this feedback key.
+	var episodeCount int
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM episode
+		WHERE synthesized_from_feedback_episode_id = $1
+	`, feedbackEpisodeID).Scan(&episodeCount); err != nil {
+		t.Fatalf("episode count query: %v", err)
+	}
+	if episodeCount != 1 {
+		t.Errorf("Episode row count should still be 1 after rejected duplicate; got %d", episodeCount)
+	}
+}
+
+// TestPgPartman_provisionsForwardPartitions exercises Stage 1.3
+// scenario "monthly partitions auto-provision" -- after 0014
+// runs, each of the 5 partitioned tables is registered with
+// pg_partman and carries at least `p_premake` (3) forward
+// partitions beyond the user-created default partition.
+func TestPgPartman_provisionsForwardPartitions(t *testing.T) {
+	db, schema, cleanup := openTestDB(t)
+	defer cleanup()
+	mustUp(t, db)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testDBTimeout)
+	defer cancel()
+
+	// 1. partman.part_config carries an entry for every
+	//    partitioned parent we registered in 0014 -- AND ONLY
+	//    those parents, in this test schema.
+	expectedParents := []string{
+		schema + ".trace_observation_log",
+		schema + ".episode",
+		schema + ".episode_update",
+		schema + ".observation",
+		schema + ".recall_context_log",
+	}
+	registered := map[string]bool{}
+	// Escape `_` in the schema name: it's a LIKE wildcard
+	// matching any single character, which would otherwise let
+	// us see sibling-test schemas' rows. Same pattern as the
+	// per-test cleanup DELETE.
+	schemaPrefix := strings.ReplaceAll(schema, "_", "#_") + ".%"
+	rows, err := db.QueryContext(ctx, `
+		SELECT parent_table FROM partman.part_config
+		WHERE parent_table LIKE $1 ESCAPE '#'
+		ORDER BY parent_table
+	`, schemaPrefix)
+	if err != nil {
+		t.Fatalf("part_config query: %v", err)
+	}
+	for rows.Next() {
+		var pt string
+		if err := rows.Scan(&pt); err != nil {
+			rows.Close()
+			t.Fatalf("scan part_config: %v", err)
+		}
+		registered[pt] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("part_config iter: %v", err)
+	}
+	rows.Close()
+	for _, want := range expectedParents {
+		if !registered[want] {
+			t.Errorf("partman.part_config missing entry for %s", want)
+		}
+	}
+	if got, want := len(registered), len(expectedParents); got != want {
+		t.Errorf("part_config row count: got %d want %d (rows=%v)", got, want, registered)
+	}
+
+	// 2. Every registered parent has at least 4 children: 1
+	//    current-period partition + 3 forward (p_premake := 3),
+	//    plus the user-created default partition retained via
+	//    `p_default_table := false`. Lower bound of 4 tolerates
+	//    timezone/boundary edge-cases at month and week
+	//    transitions; the architectural contract is the 3
+	//    forward partitions.
+	for _, parent := range expectedParents {
+		var childCount int
+		if err := db.QueryRowContext(ctx, `
+			SELECT count(*)
+			FROM pg_inherits i
+			JOIN pg_class c ON c.oid = i.inhparent
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname || '.' || c.relname = $1
+		`, parent).Scan(&childCount); err != nil {
+			t.Fatalf("child-partition count for %s: %v", parent, err)
+		}
+		if childCount < 4 {
+			t.Errorf("pg_partman should provision >= 4 child partitions for %s (current + 3 premake + default); got %d", parent, childCount)
+		}
+	}
+}
+
 // ------------------------------------------------------------------
 // Helpers
 // ------------------------------------------------------------------
@@ -526,6 +834,12 @@ func enumLabels(t *testing.T, db *sql.DB, schema, name string) []string {
 // given index name in the target schema, or "" if not found.
 // Used to assert that an index's columns / predicate / uniqueness
 // haven't quietly drifted -- name-only assertions miss that.
+//
+// `relkind IN ('i', 'I')` covers both ordinary indices (`i`) and
+// indices on partitioned parents (`I`). The Stage 1.3 episodic
+// tables are partitioned, so several of the contractual indices
+// live on partitioned parents and would be invisible if we
+// filtered on `i` alone.
 func indexDef(t *testing.T, db *sql.DB, schema, name string) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), testDBTimeout)
@@ -535,7 +849,7 @@ func indexDef(t *testing.T, db *sql.DB, schema, name string) string {
 		SELECT pg_get_indexdef(c.oid)
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'i'
+		WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('i', 'I')
 	`, schema, name).Scan(&def)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ""

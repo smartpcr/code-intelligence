@@ -8,7 +8,8 @@ import (
 // TestAll_parsesEveryEmbeddedFile confirms every .sql file
 // embedded under //go:embed is parseable and emits a non-empty
 // up body. It also asserts the lexicographic sort produces the
-// implementation-plan.md Stage 1.2 order (0001 .. 0006a).
+// implementation-plan.md Stage 1.2 + 1.3 order
+// (0001 .. 0006a then 0007 .. 0014).
 func TestAll_parsesEveryEmbeddedFile(t *testing.T) {
 	t.Parallel()
 	all, err := All()
@@ -16,11 +17,16 @@ func TestAll_parsesEveryEmbeddedFile(t *testing.T) {
 		t.Fatalf("All() returned error: %v", err)
 	}
 	if len(all) == 0 {
-		t.Fatal("All() returned zero migrations -- expected the Stage 1.2 set")
+		t.Fatal("All() returned zero migrations -- expected the Stage 1.2 + 1.3 set")
 	}
-	wantVersions := []string{"0001", "0002", "0003", "0004", "0005", "0006", "0006a"}
+	wantVersions := []string{
+		// Stage 1.2 structural set.
+		"0001", "0002", "0003", "0004", "0005", "0006", "0006a",
+		// Stage 1.3 episodic + concept set.
+		"0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014",
+	}
 	if len(all) != len(wantVersions) {
-		t.Fatalf("All() returned %d migrations, want %d (Stage 1.2 set)",
+		t.Fatalf("All() returned %d migrations, want %d (Stage 1.2 + 1.3 set)",
 			len(all), len(wantVersions))
 	}
 	for i, w := range wantVersions {
@@ -158,12 +164,13 @@ func TestParse_rejectsMissingUpBlock(t *testing.T) {
 }
 
 // TestAll_filenamesMatchPlannedSet pins the literal filenames
-// implementation-plan.md Stage 1.2 calls out. If a future stage
-// renames any of these (e.g. drops the "0006a" letter suffix),
-// this test fails loudly so the rename is intentional.
+// implementation-plan.md Stages 1.2 + 1.3 call out. If a future
+// stage renames any of these (e.g. drops the "0006a" letter
+// suffix), this test fails loudly so the rename is intentional.
 func TestAll_filenamesMatchPlannedSet(t *testing.T) {
 	t.Parallel()
 	want := map[string]bool{
+		// Stage 1.2 structural set.
 		"0001_enums.sql":             true,
 		"0002_repo_commit.sql":       true,
 		"0003_node_edge.sql":         true,
@@ -171,6 +178,15 @@ func TestAll_filenamesMatchPlannedSet(t *testing.T) {
 		"0005_trace_observation.sql": true,
 		"0006_repo_event.sql":        true,
 		"0006a_ingest_jobs.sql":      true,
+		// Stage 1.3 episodic + concept set.
+		"0007_episode.sql":                   true,
+		"0008_episode_update.sql":            true,
+		"0009_observation.sql":               true,
+		"0010_recall_context_log.sql":        true,
+		"0011_concept.sql":                   true,
+		"0012_run_tables.sql":                true,
+		"0013_synthetic_positive_unique.sql": true,
+		"0014_pg_partman_setup.sql":          true,
 	}
 	all, err := All()
 	if err != nil {

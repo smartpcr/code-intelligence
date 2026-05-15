@@ -1,0 +1,80 @@
+# EditorConfig is awesome: https://editorconfig.org
+#
+# Enforces line endings, indentation, and trailing-whitespace
+# conventions across every editor / IDE that supports the standard.
+# Per implementation-plan.md Stage 1.1, this file is the single
+# source of truth for the formatting choices the agent-memory
+# service follows. `gofmt` (run via `make lint`) handles the rest
+# of the Go-specific conventions.
+
+root = true
+
+# Universal baseline: charset, line endings, final newline, and
+# trailing-whitespace policy are uniform across the repo.
+# `max_line_length` is intentionally NOT set globally -- editorconfig
+# -checker enforces it whenever present, so we declare a realistic
+# per-file-type limit below instead. Long lines are legitimate in
+# Markdown tables, YAML curl invocations, and Make shell recipes,
+# and force-wrapping them harms readability.
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Go uses hard tabs; gofmt enforces it, so we tell editors to
+# render them but never insert spaces in their place. Go community
+# standard is 120 cols for tab-indented source.
+[*.go]
+indent_style = tab
+indent_size = 4
+max_line_length = 120
+
+# Make recipes are shell one-liners that frequently exceed 100
+# cols (awk help generators, multi-flag tool invocations). 140
+# matches our yamllint cap so all "config-ish" files share a limit.
+[Makefile]
+indent_style = tab
+indent_size = 4
+max_line_length = 140
+
+[*.{sh,bash}]
+indent_style = space
+indent_size = 2
+max_line_length = 140
+
+[Dockerfile]
+indent_style = space
+indent_size = 2
+max_line_length = 140
+
+# YAML / JSON / TOML prefer 2-space indentation by community
+# convention. yamllint is wired into pre-commit at level=warning
+# for line-length, and editorconfig-checker enforces 140 here.
+# 140 is enough room for CI `run:` scripts, `env:` URLs, and
+# pre-commit `entry:` shell expressions without wrapping.
+[*.{yml,yaml,json,toml}]
+indent_style = space
+indent_size = 2
+max_line_length = 140
+
+# Markdown uses trailing 2-space sequences as hard line breaks, so
+# we don't auto-strip whitespace on .md files. Tables and link
+# references are inherently long; do not enforce a line cap (the
+# absence of `max_line_length` means editorconfig-checker skips it).
+# `indent_size = unset` disables the "indent must be a multiple of N"
+# check so design-doc ASCII diagrams (§3 architecture flow boxes,
+# §5 data-model column alignments) are not flagged as violations.
+[*.md]
+trim_trailing_whitespace = false
+indent_style = space
+indent_size = unset
+
+# SQL / protobuf prefer 2-space indentation; 120 leaves room for
+# typical column-list DDL without contortions.
+[*.{sql,proto}]
+indent_style = space
+indent_size = 2
+max_line_length = 120

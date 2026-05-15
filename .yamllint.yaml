@@ -1,0 +1,32 @@
+# yamllint config for the code-intelligence repo.
+#
+# Picked up by the pre-commit `yamllint` hook in
+# .pre-commit-config.yaml. We extend the `default` ruleset and
+# loosen line-length so multi-line URLs in CI config stay readable.
+
+extends: default
+
+rules:
+  line-length:
+    max: 140
+    level: warning
+  truthy:
+    # GitHub Actions uses `on:` which yamllint flags as truthy.
+    check-keys: false
+  comments:
+    require-starting-space: true
+    min-spaces-from-content: 1
+  document-start: disable
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
+    check-multi-line-strings: false
+  empty-lines:
+    max: 2
+    max-end: 1
+
+ignore: |
+  **/vendor/
+  **/node_modules/
+  **/*.bak
+  **/*.iter-snapshot.bak

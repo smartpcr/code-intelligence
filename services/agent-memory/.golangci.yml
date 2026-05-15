@@ -1,0 +1,73 @@
+# golangci-lint config for services/agent-memory.
+#
+# Stage 1.1 goal: `make lint` must exit 0 with zero findings on the
+# empty tree, so we keep this config conservative -- enable the
+# default linter set plus a small, opinionated extension. New
+# linters MUST be added in their own PR with a clean-tree run.
+#
+# Tested against golangci-lint v1.61.x. CI pins the binary in
+# .github/workflows/agent-memory-ci.yml.
+
+run:
+  timeout: 5m
+  tests: true
+  modules-download-mode: readonly
+
+output:
+  formats:
+    - format: colored-line-number
+  sort-results: true
+  print-issued-lines: true
+  print-linter-name: true
+
+linters:
+  disable-all: true
+  enable:
+    # built-in golangci-lint default set
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    # opinionated extensions (low-noise, high-signal)
+    - gofmt
+    - goimports
+    - misspell
+    - revive
+
+linters-settings:
+  gofmt:
+    simplify: true
+  goimports:
+    local-prefixes: github.com/smartpcr/code-intelligence/services/agent-memory
+  revive:
+    severity: warning
+    rules:
+      - name: blank-imports
+      - name: context-as-argument
+      - name: context-keys-type
+      - name: dot-imports
+      - name: error-return
+      - name: error-strings
+      - name: error-naming
+      - name: exported
+      - name: increment-decrement
+      - name: var-naming
+      - name: var-declaration
+      - name: package-comments
+      - name: range
+      - name: receiver-naming
+      - name: time-naming
+      - name: unexported-return
+      - name: indent-error-flow
+      - name: errorf
+      - name: empty-block
+      - name: superfluous-else
+      - name: unused-parameter
+      - name: unreachable-code
+      - name: redefines-builtin-id
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0

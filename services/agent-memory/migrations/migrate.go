@@ -273,19 +273,22 @@ func (m *Migrator) applyOne(ctx context.Context, mg Migration) error {
 	if err != nil {
 		return err
 	}
+	// Deferred rollback is a safety net: if Commit() succeeds it
+	// returns sql.ErrTxDone (which we discard); if a panic or an
+	// early return slips out between here and the commit, the
+	// transaction is still released instead of leaking.
+	defer tx.Rollback() //nolint:errcheck // best-effort cleanup; commit path makes this a no-op
 	// Strip the in-file BEGIN/COMMIT (which we keep in the .sql
 	// for readability + manual psql replay) so the SQL body
 	// runs inside the Migrator-managed transaction.
 	body := stripTopLevelTxn(mg.Up)
 	if _, err := tx.ExecContext(ctx, body); err != nil {
-		_ = tx.Rollback()
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
 		"INSERT INTO "+JournalTable+" (version, name) VALUES ($1, $2)",
 		mg.Version, mg.Name,
 	); err != nil {
-		_ = tx.Rollback()
 		return err
 	}
 	return tx.Commit()
@@ -299,15 +302,15 @@ func (m *Migrator) revertOne(ctx context.Context, mg Migration) error {
 	if err != nil {
 		return err
 	}
+	// See applyOne for the rationale on the deferred rollback.
+	defer tx.Rollback() //nolint:errcheck // best-effort cleanup; commit path makes this a no-op
 	body := stripTopLevelTxn(mg.Down)
 	if _, err := tx.ExecContext(ctx, body); err != nil {
-		_ = tx.Rollback()
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
 		"DELETE FROM "+JournalTable+" WHERE version = $1", mg.Version,
 	); err != nil {
-		_ = tx.Rollback()
 		return err
 	}
 	return tx.Commit()

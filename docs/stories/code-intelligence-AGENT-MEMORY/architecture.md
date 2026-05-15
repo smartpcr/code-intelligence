@@ -678,6 +678,22 @@ RecallResponse {
 - `outcome = human_corrected` is **not** accepted on `agent.observe` — only on
   `mgmt.feedback` (§6.2.2). This keeps the §6.2.2 `corrected_action`
   requirement scoped to the operator path.
+- `context_id?` is syntactically optional on the wire but the
+  **persisted Episode requires a non-null `context_id`** for every
+  non-`feedback` row (§5.3.1: "NULL is legal **only** for
+  `feedback` Episodes"). The canonical agent flow (§7.3) always
+  pairs `agent.observe` with a preceding `agent.recall` that
+  returns a `context_id` — including under degradation, where the
+  id references a `RecallContextLog` row with
+  `served_under_degraded=true`. The writer (Stage 5.1
+  GraphWriter) is therefore responsible for the §6.1.2 → §5.3.1
+  translation: if a caller submits `agent.observe` without a
+  `context_id`, the writer MUST either materialise a degraded
+  `RecallContextLog` row and use its id, or reject the call with
+  a validation error. The DB-level CHECK
+  (`episode_context_id_required_unless_feedback_chk` in
+  migration `0007_episode.sql`) is the schema-side belt-and-
+  suspenders on this contract.
 - `observation_refs[]` is an array of `{role, node_id?, edge_id?, concept_id?}`
   rows that map onto Observation rows (§5.3.3). `role` must be one of
   `node_hit`, `edge_hit`, `call_edge_hit`, `concept_hit`; `edge_hit` and

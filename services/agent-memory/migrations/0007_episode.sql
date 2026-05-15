@@ -48,11 +48,53 @@
 --     (arch §5.3.1: "NULL is legal **only** for `feedback`
 --     Episodes"). `agent` carries the recall context it consumed;
 --     `synthetic_positive` copies the parent's `context_id` per G7.
+--     The wording is one-directional: `feedback` rows MAY still
+--     carry a non-null `context_id` (operator re-ran recall
+--     before filing feedback). We encode the actively-checkable
+--     contrapositive (`kind = 'feedback' OR context_id IS NOT NULL`)
+--     rather than an iff.
 --   * `degraded = true` IFF `degraded_reason IS NOT NULL`
 --     (arch §5.3.1: "Set iff degraded=true").
 --   * `outcome='human_corrected'` IFF `corrected_action IS NOT NULL`
 --     (arch §5.3.1 / §6.2.2: "Required when outcome=human_corrected;
 --     otherwise null").
+--
+-- context_id contract vs. arch §6.1.2 (`agent.observe`)
+-- -----------------------------------------------------
+-- Arch §6.1.2 declares `agent.observe(repo_id, session_id,
+-- trace_id, action, outcome, signal?, context_id?,
+-- observation_refs?)` with `context_id?` syntactically optional
+-- on the wire. The schema does NOT honour that optionality for
+-- non-`feedback` rows: the CHECK above rejects
+-- `context_id IS NULL` whenever `kind <> 'feedback'`. This is
+-- intentional and consistent with the field-table prose in
+-- arch §5.3.1.
+--
+-- The contract is reconciled at the writer layer (Stage 5.1
+-- GraphWriter), which owns the §6.1.2 → §5.3.1 translation:
+--   * The canonical agent flow (arch §6.1.2 step 3 and the §7.3
+--     sequence diagram) ALWAYS pairs `agent.observe` with a
+--     preceding `agent.recall`. Recall always returns a
+--     `context_id` -- including under degradation, where the id
+--     references a `RecallContextLog` row with
+--     `served_under_degraded=true` (arch §6.1.4). Stage 5.1
+--     therefore never sees an `agent.observe` without a
+--     `context_id` on the canonical path.
+--   * `feedback` Episodes (arch §7.4) are written with
+--     `context_id=NULL, parent_episode_id=<parent>`; the
+--     `feedback` branch of the CHECK lets that row through.
+--   * `synthetic_positive` Episodes (arch §7.7 step 4) COPY the
+--     parent agent Episode's `context_id` per G7; the parent is
+--     by construction non-null.
+--
+-- If a future flow legitimately produces a context-less non-
+-- feedback Episode (e.g. a span-ingestor synthesised observation
+-- with no recall), the writer MUST either (a) materialise a
+-- degraded `RecallContextLog` row and supply its id, or (b)
+-- relax this CHECK to a one-directional form in a follow-up
+-- migration. The closed-set posture is by design: a context-less
+-- agent Episode is at risk of dangling provenance for the
+-- Consolidator and Reranker Trainer.
 --
 -- Default partition
 -- -----------------
@@ -142,9 +184,20 @@ CREATE INDEX episode_repo_created_idx
 
 -- Synthetic-positive provenance lookups (used by the Reranker
 -- Trainer to walk back to the originating feedback Episode).
--- The 0013 sentinel table enforces uniqueness; this index just
--- makes the join cheap. Partial: only synthetic_positive rows
--- carry a non-null synthesized_from_feedback_episode_id.
+-- Partial: only synthetic_positive rows carry a non-null
+-- synthesized_from_feedback_episode_id (enforced by
+-- episode_synthesized_from_feedback_provenance_chk above).
+--
+-- This non-unique index complements the COMPOSITE PARTIAL UNIQUE
+-- introduced by 0013 (`episode_synthetic_positive_feedback_uidx`
+-- on `(synthesized_from_feedback_episode_id, created_at) WHERE
+-- kind='synthetic_positive'`). Queries that filter only by
+-- `synthesized_from_feedback_episode_id = $1` use this single-
+-- column partial; queries that pin both the feedback id and a
+-- created_at range use the 0013 composite. Keeping both is
+-- intentional: dropping this index would force the planner to
+-- treat the 0013 unique's `(col1, col2)` as a `col1`-prefix scan,
+-- which is correct but defeats the partial-index pruning.
 CREATE INDEX episode_synthesized_from_feedback_idx
     ON episode (synthesized_from_feedback_episode_id)
     WHERE synthesized_from_feedback_episode_id IS NOT NULL;

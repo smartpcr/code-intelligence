@@ -21,7 +21,7 @@
 //	0010_recall_context_log.sql          -- recall_context_log (partitioned monthly, uuid[] arrays)
 //	0011_concept.sql                     -- concept, concept_version, concept_support (G6 cross-repo)
 //	0012_run_tables.sql                  -- consolidator_run, promoter_run, reranker_model
-//	0013_synthetic_positive_unique.sql   -- synthetic_positive_emission sentinel + AFTER INSERT trigger
+//	0013_synthetic_positive_unique.sql   -- composite partial UNIQUE on (synthesized_from_feedback_episode_id, created_at) for synthetic_positive rows
 //	0014_pg_partman_setup.sql            -- partman.create_parent for the 5 partitioned parents
 //
 // Later stages append more files; the migrator picks them up by

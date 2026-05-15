@@ -76,17 +76,58 @@ CREATE INDEX ingest_jobs_pending_idx
     WHERE status = 'pending';
 
 -- Operator visibility: "show me the most recent attempts per
--- repo, regardless of status".
+-- repo, regardless of status". This index ORDERs BY updated_at
+-- DESC, which is only meaningful if updated_at is actually kept
+-- fresh on every status transition -- see the BEFORE UPDATE
+-- trigger below.
 CREATE INDEX ingest_jobs_repo_updated_idx
     ON ingest_jobs (repo_id, updated_at DESC);
+
+-- updated_at freshness invariant.
+--
+-- DEFAULT now() on the column above fires only on INSERT. Without
+-- a trigger, every UPDATE the Repo Indexer (Stage 3.1) issues to
+-- flip status pending -> claimed -> running -> done/failed (and
+-- bump attempt_index) would leave updated_at frozen at the
+-- creation timestamp. That would silently:
+--   1. break the ingest_jobs_repo_updated_idx ordering above
+--      (every "most recent attempts" query would return rows in
+--      INSERT order, not UPDATE order), and
+--   2. force every Stage 3.1 / Stage 7.1 UPDATE call site to
+--      remember to write `updated_at = now()` explicitly -- a
+--      convention that is easy to forget and impossible to
+--      enforce at the type-system layer.
+--
+-- We enforce the invariant at the database instead. The trigger
+-- function is namespaced to this table (ingest_jobs_set_updated_at,
+-- not a shared set_updated_at()) so the migrate:down path can
+-- drop it cleanly without worrying about other tables binding to
+-- the same function later.
+CREATE FUNCTION ingest_jobs_set_updated_at()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER ingest_jobs_set_updated_at
+    BEFORE UPDATE ON ingest_jobs
+    FOR EACH ROW
+    EXECUTE FUNCTION ingest_jobs_set_updated_at();
 
 COMMIT;
 
 -- migrate:down
 BEGIN;
 
-DROP TABLE IF EXISTS ingest_jobs;
-DROP TYPE  IF EXISTS ingest_status;
-DROP TYPE  IF EXISTS ingest_mode;
+-- DROP TABLE cascades the trigger; the function is then orphan
+-- and must be dropped explicitly.
+DROP TABLE    IF EXISTS ingest_jobs;
+DROP FUNCTION IF EXISTS ingest_jobs_set_updated_at();
+DROP TYPE     IF EXISTS ingest_status;
+DROP TYPE     IF EXISTS ingest_mode;
 
 COMMIT;

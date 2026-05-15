@@ -12,6 +12,18 @@
 //	0006_repo_event.sql      -- repo_event (closed ENUM kind)
 //	0006a_ingest_jobs.sql    -- durable job-queue with ingest_mode/status ENUMs
 //
+// Stage 1.3 ships migrations 0007..0014, the episodic + concept
+// layer plus pg_partman registration:
+//
+//	0007_episode.sql                     -- episode (partitioned monthly, provenance CHECKs)
+//	0008_episode_update.sql              -- episode_update (partitioned monthly)
+//	0009_observation.sql                 -- observation (partitioned monthly, exactly-one-target + role CHECKs)
+//	0010_recall_context_log.sql          -- recall_context_log (partitioned monthly, uuid[] arrays)
+//	0011_concept.sql                     -- concept, concept_version, concept_support (G6 cross-repo)
+//	0012_run_tables.sql                  -- consolidator_run, promoter_run, reranker_model
+//	0013_synthetic_positive_unique.sql   -- composite partial UNIQUE on (synthesized_from_feedback_episode_id, created_at) for synthetic_positive rows
+//	0014_pg_partman_setup.sql            -- partman.create_parent for the 5 partitioned parents
+//
 // Later stages append more files; the migrator picks them up by
 // sorted filename so the lexicographic order matches the apply
 // order.

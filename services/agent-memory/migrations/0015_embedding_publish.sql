@@ -43,6 +43,18 @@
 -- side is intentionally absent (same rationale as the 0007 header
 -- "no DB-level FK against partitioned parents").
 --
+-- Because both FKs use ON DELETE RESTRICT, every DELETE on a
+-- parent row in `node` or `concept_version` forces PostgreSQL to
+-- prove that no referencing row exists in `embedding_publish`.
+-- Without an index on the FK column on the child side, that proof
+-- is a sequential scan over every partition -- which becomes a
+-- multi-second lock-holding scan once monthly partitions
+-- accumulate. Partial indexes on the two FK columns (defined
+-- below, after the parent table) back the FKs cheaply: the
+-- `WHERE ... IS NOT NULL` predicate exploits the exactly-one-target
+-- CHECK so each index only stores the ~50% of rows that actually
+-- reference its parent.
+--
 -- pg_partman registration owned here, not 0014
 -- --------------------------------------------
 -- 0014_pg_partman_setup.sql registered the five partitioned
@@ -83,7 +95,10 @@ CREATE TABLE embedding_publish (
     -- non-partitioned tables, so a real DB-level FK with
     -- ON DELETE RESTRICT is honoured here (compare with
     -- 0007/0008/0010 which point at partitioned parents and
-    -- carry no DB-level FK -- see the 0007 header).
+    -- carry no DB-level FK -- see the 0007 header). The FK
+    -- columns are backed by the partial indexes defined below
+    -- so the RESTRICT lookup on parent DELETE is an index
+    -- probe instead of a per-partition sequential scan.
     node_id                 uuid        REFERENCES node            (node_id)            ON DELETE RESTRICT,
     concept_version_id      uuid        REFERENCES concept_version (concept_version_id) ON DELETE RESTRICT,
     embedding_model_version text        NOT NULL,
@@ -110,6 +125,29 @@ CREATE TABLE embedding_publish (
         ) = 1
     )
 ) PARTITION BY RANGE (created_at);
+
+-- FK-backing indexes on the two target discriminator columns.
+-- Both FKs are ON DELETE RESTRICT, so a DELETE on `node` or
+-- `concept_version` triggers a referential-integrity probe
+-- against `embedding_publish`. Without these indexes the probe
+-- degrades into a sequential scan across every monthly partition,
+-- holding row-level locks on the parent table for the duration.
+--
+-- The `WHERE ... IS NOT NULL` predicate is safe and tight: the
+-- `embedding_publish_exactly_one_target_chk` CHECK guarantees
+-- exactly one of the two columns is non-null per row, so each
+-- partial index covers ~50% of rows -- exactly the rows the
+-- FK probe needs to find. Defined on the partitioned parent so
+-- PostgreSQL propagates a matching index onto every existing
+-- partition and pg_partman onto every future partition (same
+-- propagation pattern as the §8.7.2 latest-event index below).
+CREATE INDEX embedding_publish_node_id_idx
+    ON embedding_publish (node_id)
+    WHERE node_id IS NOT NULL;
+
+CREATE INDEX embedding_publish_concept_version_id_idx
+    ON embedding_publish (concept_version_id)
+    WHERE concept_version_id IS NOT NULL;
 
 -- Bootstrap default partition. pg_partman (registered below)
 -- keeps the rolling window of dated partitions ahead of the
@@ -195,6 +233,11 @@ BEGIN;
 -- for the parents we own, DELETE the exact part_config rows,
 -- then drop the relations themselves. Children (dated
 -- partitions) cascade with the partitioned parent on DROP TABLE.
+-- The FK-backing indexes added on the partitioned parent are
+-- propagated to every partition; they are dropped implicitly
+-- by the DROP TABLE on the parent below, so no explicit DROP
+-- INDEX is required (and would in fact fail on the partition
+-- copies if attempted directly).
 --
 -- The two-step partman cleanup matters because:
 --   1. If `part_config` still references this schema's parents

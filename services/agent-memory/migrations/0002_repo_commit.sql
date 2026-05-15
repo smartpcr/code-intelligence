@@ -1,19 +1,23 @@
 -- 0002_repo_commit.sql
 --
 -- Stage 1.2 step 2 (implementation-plan.md): create the `repo` and
--- `repo_commit` tables per architecture.md §5.6 with the timestamptz
--- / uuid / text typing of tech-spec §8.7.1.
+-- `repo_commit` tables per architecture.md §5.6 with the timestamptz /
+-- uuid / text typing of tech-spec §8.7.1.
 --
 -- `repo` is mutable (settings-only per architecture.md §5.1).
--- `repo_commit` is the immutable snapshot identity row for the
--- architecture-level "Commit" concept (architecture.md §5.1
--- "Commit | Immutable" and §8.7.4 -- append-only, no UPDATE grant
--- for the application role). The table is named `repo_commit`
--- rather than `commit` because `COMMIT` is a PostgreSQL
--- transaction-control keyword: leaving it unquoted in DML produced
--- by ORMs / query builders is a recurring footgun. The `repo_`
--- prefix also matches the migration filename and the sibling
--- `repo_event` table (0006_repo_event.sql).
+-- `repo_commit` is the immutable snapshot identity row per
+-- architecture.md §5.1 "Commit | Immutable" and §8.7.4
+-- (append-only, no UPDATE grant for the application role).
+--
+-- Naming note: the SQL table is `repo_commit`, not `commit`. The
+-- architectural entity is still "Commit" (architecture.md §5.6),
+-- but `COMMIT` is a PostgreSQL key word (non-reserved, recognized
+-- by the parser in transaction-control contexts). Using it as an
+-- unquoted identifier is legal but trips ORMs, query builders,
+-- and hand-written SQL that don't quote it -- e.g. `DELETE FROM
+-- commit WHERE ...` reads ambiguously next to `COMMIT;`. The
+-- `repo_` prefix also matches the migration filename and the
+-- `repo_event` naming used in 0006_repo_event.sql.
 --
 -- `language_hints` is stored as `text[]` so the Repo Indexer can
 -- pass a closed list of language hints without a separate join

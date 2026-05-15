@@ -120,13 +120,16 @@ BEGIN
     -- 1. Drop any partman-created template tables. We look them up
     --    in part_config so the names are authoritative; pg_partman
     --    versions differ in their template-naming convention.
+    --    pg_partman stores fully-qualified, already-quoted
+    --    identifiers in template_table, so format(%s,...) is the
+    --    correct splice -- %I would double-quote the whole string.
     FOR tpl IN
         SELECT template_table
         FROM partman.part_config
         WHERE parent_table = ANY(qualified)
           AND template_table IS NOT NULL
     LOOP
-        EXECUTE 'DROP TABLE IF EXISTS ' || tpl || ' CASCADE';
+        EXECUTE format('DROP TABLE IF EXISTS %s CASCADE', tpl);
     END LOOP;
 
     -- 2. Delete exactly our parent rows. Other parent_table rows

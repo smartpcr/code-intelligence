@@ -89,6 +89,33 @@
 -- `public.node` could siphon privileges. The DO-loop pattern
 -- pins every grant to `current_schema().<table>` and removes
 -- that surface.
+--
+-- Admin grant covers BOTH existing and future tables
+-- --------------------------------------------------
+-- `GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA` is a
+-- point-in-time grant: it only covers tables that already exist
+-- when 0016 runs. Any table created by a later migration
+-- (Stage 2+ adds episodic/concept follow-ups, Stage 3+ adds new
+-- log tables, etc.) would silently fall outside the admin role's
+-- ACL, contradicting the "admin owns the full DML surface"
+-- contract above and forcing every future migration author to
+-- remember to re-issue the admin grant.
+--
+-- We close that gap with `ALTER DEFAULT PRIVILEGES IN SCHEMA`,
+-- which writes a row into `pg_default_acl` so that any *future*
+-- table created in this schema by the role that ran the ALTER
+-- (i.e. the migration runner -- the same role that runs every
+-- subsequent CREATE TABLE) automatically receives the admin
+-- grant at creation time. There is no `FOR ROLE` clause: we
+-- want the trigger keyed on whoever runs migrations, not on a
+-- specific named role -- this keeps the per-tenant test pattern
+-- (each test schema has its own current_user) working
+-- identically.
+--
+-- The matching `ALTER DEFAULT PRIVILEGES ... REVOKE` in the
+-- down block removes the pg_default_acl row so a Down/Up
+-- round-trip leaves byte-identical catalog state (which the
+-- round-trip schema fingerprint test in this package asserts).
 
 -- migrate:up
 BEGIN;
@@ -178,12 +205,26 @@ END$$;
 -- Sequences are unused in this schema (every PK defaults to
 -- gen_random_uuid()), so ALL TABLES is sufficient -- no sequence
 -- grants needed.
+--
+-- Two-step grant: the first EXECUTE covers tables that already
+-- exist (every CREATE TABLE in 0001..0015), and the second
+-- EXECUTE installs a default-privileges rule so any table
+-- created in this schema by the migration runner from this
+-- point onward (Stage 2+ migrations, etc.) is automatically
+-- granted to the admin role at creation time. See the file
+-- header "Admin grant covers BOTH existing and future tables"
+-- block for the full rationale.
 DO $$
 DECLARE
     cs text := current_schema();
 BEGIN
     EXECUTE format(
         'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I TO agent_memory_admin',
+        cs
+    );
+    EXECUTE format(
+        'ALTER DEFAULT PRIVILEGES IN SCHEMA %I '
+        || 'GRANT ALL PRIVILEGES ON TABLES TO agent_memory_admin',
         cs
     );
 END$$;
@@ -241,10 +282,20 @@ BEGIN
     END LOOP;
 END$$;
 
+-- Symmetric admin revoke: drop the default-privileges row first
+-- (so a future Up re-installs it cleanly and the round-trip
+-- fingerprint test sees byte-identical pg_default_acl state),
+-- then revoke from existing tables, then drop USAGE on the
+-- schema for both roles.
 DO $$
 DECLARE
     cs text := current_schema();
 BEGIN
+    EXECUTE format(
+        'ALTER DEFAULT PRIVILEGES IN SCHEMA %I '
+        || 'REVOKE ALL PRIVILEGES ON TABLES FROM agent_memory_admin',
+        cs
+    );
     EXECUTE format(
         'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM agent_memory_admin',
         cs

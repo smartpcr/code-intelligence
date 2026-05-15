@@ -26,18 +26,33 @@
 --
 -- Provenance CHECK constraints
 -- ----------------------------
--- The architecture's field-table prose carries several "X iff Y"
--- invariants that the schema can enforce cheaply:
---   * `kind='synthetic_positive'` ⇒ both `synthesized_from_*`
---     fields are non-null (arch §5.3.1, G7).
---   * `kind='feedback'` ⇒ `parent_episode_id` is non-null
---     (arch §5.3.1: "Set on feedback rows").
---   * `degraded = true` ⇔ `degraded_reason IS NOT NULL`
+-- The architecture's field-table prose (§5.3.1) carries several
+-- bidirectional ("iff") invariants. We encode them at the schema
+-- level so a malformed row is rejected at insert time and the
+-- downstream readers (Consolidator, mgmt.read.episodes) can rely
+-- on a known-good row shape.
+--
+--   * `synthesized_from_parent_episode_id IS NOT NULL`
+--     IFF `kind='synthetic_positive'`
+--     (arch §5.3.1: "Set on `synthetic_positive` rows only", G7).
+--   * `synthesized_from_feedback_episode_id IS NOT NULL`
+--     IFF `kind='synthetic_positive'`
+--     (arch §5.3.1: "Set on `synthetic_positive` rows only", G7).
+--   * `parent_episode_id IS NOT NULL`
+--     IFF `kind='feedback'`
+--     (arch §5.3.1: "Set on `feedback` rows ... Not set on
+--      `synthetic_positive` rows"). `agent` rows do not carry a
+--     parent_episode_id either; the architectural reference for
+--     `agent` lineage is via `episode_group_id`.
+--   * `context_id IS NULL` is LEGAL ONLY when `kind='feedback'`
+--     (arch §5.3.1: "NULL is legal **only** for `feedback`
+--     Episodes"). `agent` carries the recall context it consumed;
+--     `synthetic_positive` copies the parent's `context_id` per G7.
+--   * `degraded = true` IFF `degraded_reason IS NOT NULL`
 --     (arch §5.3.1: "Set iff degraded=true").
---   * `outcome='human_corrected'` ⇒ `corrected_action` is
---     non-null (arch §5.3.1 / §6.2.2).
--- These CHECKs raise a hard error at insert time and let the
--- writer rely on a known-good row shape.
+--   * `outcome='human_corrected'` IFF `corrected_action IS NOT NULL`
+--     (arch §5.3.1 / §6.2.2: "Required when outcome=human_corrected;
+--     otherwise null").
 --
 -- Default partition
 -- -----------------
@@ -81,17 +96,33 @@ CREATE TABLE episode (
     -- architectural identity; the trailing column is the
     -- partition key required by PostgreSQL.
     PRIMARY KEY (episode_id, created_at),
-    -- Provenance invariants (see header).
-    CONSTRAINT episode_synthetic_positive_provenance_chk CHECK (
-        kind <> 'synthetic_positive'
-        OR (
-            synthesized_from_parent_episode_id   IS NOT NULL
-            AND synthesized_from_feedback_episode_id IS NOT NULL
-        )
+    -- Provenance invariants (see header). All four
+    -- synthesized_from_* / parent_episode_id checks are
+    -- bidirectional: the architectural wording is "set on X rows
+    -- only", and the corresponding NULL/NOT-NULL relationship is
+    -- enforced in both directions so a malformed (kind, field)
+    -- combination is rejected regardless of which side of the
+    -- equation is wrong.
+    CONSTRAINT episode_synthesized_from_parent_provenance_chk CHECK (
+        (kind  = 'synthetic_positive' AND synthesized_from_parent_episode_id IS NOT NULL)
+        OR (kind <> 'synthetic_positive' AND synthesized_from_parent_episode_id IS NULL)
     ),
-    CONSTRAINT episode_feedback_provenance_chk CHECK (
-        kind <> 'feedback'
-        OR parent_episode_id IS NOT NULL
+    CONSTRAINT episode_synthesized_from_feedback_provenance_chk CHECK (
+        (kind  = 'synthetic_positive' AND synthesized_from_feedback_episode_id IS NOT NULL)
+        OR (kind <> 'synthetic_positive' AND synthesized_from_feedback_episode_id IS NULL)
+    ),
+    CONSTRAINT episode_parent_episode_id_provenance_chk CHECK (
+        (kind  = 'feedback' AND parent_episode_id IS NOT NULL)
+        OR (kind <> 'feedback' AND parent_episode_id IS NULL)
+    ),
+    -- context_id IS NULL is LEGAL ONLY when kind='feedback'. The
+    -- spec phrasing is one-directional ("NULL is legal only for
+    -- feedback"); we encode the contrapositive as a CHECK because
+    -- it is the actively-checkable form. feedback rows MAY still
+    -- have a non-null context_id (e.g. operator re-ran recall
+    -- before submitting feedback), so this is NOT iff.
+    CONSTRAINT episode_context_id_required_unless_feedback_chk CHECK (
+        kind = 'feedback' OR context_id IS NOT NULL
     ),
     CONSTRAINT episode_degraded_reason_chk CHECK (
         (degraded =  true  AND degraded_reason IS NOT NULL)

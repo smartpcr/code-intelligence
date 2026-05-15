@@ -78,7 +78,7 @@ AS $$
 BEGIN
     IF NEW.kind = 'synthetic_positive' THEN
         -- The CHECK in 0007
-        -- (episode_synthetic_positive_provenance_chk) already
+        -- (episode_synthesized_from_feedback_provenance_chk) already
         -- guarantees synthesized_from_feedback_episode_id is
         -- non-null for synthetic_positive rows, so this insert
         -- is always well-formed.

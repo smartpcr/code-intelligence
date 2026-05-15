@@ -582,15 +582,33 @@ func TestObservation_checkRejectsMultiTarget(t *testing.T) {
 // mitigation. Two synthetic_positive Episode rows that share a
 // `synthesized_from_feedback_episode_id` must collide on the
 // `synthetic_positive_emission` sentinel PK, rolling back the
-// second insert. This holds cross-partition (i.e., across
-// "restarts" in the architecture's wording).
+// second insert. Crucially, the second insert is forced into a
+// LATER monthly partition (created_at = now() + 2 months) so the
+// test exercises the cross-partition / cross-restart failure
+// mode that motivated the sentinel-table substitute -- a literal
+// partial UNIQUE on `episode` would have given only per-partition
+// uniqueness and would NOT have rejected this case.
 func TestSyntheticPositive_uniquenessAcrossRestarts(t *testing.T) {
-	db, _, cleanup := openTestDB(t)
+	db, schema, cleanup := openTestDB(t)
 	defer cleanup()
 	mustUp(t, db)
 
 	ctx, cancel := context.WithTimeout(context.Background(), testDBTimeout)
 	defer cancel()
+
+	// Sentinel objects (substitute for the "partial UNIQUE on
+	// partitioned episode" the implementation-plan literally
+	// asks for) are catalogued so future maintainers trip over
+	// a regression that removes the trigger or function.
+	if !relationExists(t, db, schema, "synthetic_positive_emission") {
+		t.Fatal("synthetic_positive_emission sentinel table missing after Up")
+	}
+	if !triggerExists(t, db, schema, "episode", "episode_synthetic_positive_sentinel") {
+		t.Fatal("episode_synthetic_positive_sentinel trigger missing after Up")
+	}
+	if !functionExists(t, db, schema, "episode_synthetic_positive_sentinel") {
+		t.Fatal("episode_synthetic_positive_sentinel trigger function missing after Up")
+	}
 
 	var repoID string
 	if err := db.QueryRowContext(ctx, `
@@ -607,22 +625,31 @@ func TestSyntheticPositive_uniquenessAcrossRestarts(t *testing.T) {
 	// feedback episode".
 	feedbackEpisodeID := "33333333-3333-3333-3333-333333333333"
 	parentEpisodeID := "44444444-4444-4444-4444-444444444444"
+	// synthetic_positive rows MUST carry a non-null context_id
+	// per arch §5.3.1 (NULL legal only for `feedback` Episodes;
+	// synthetic_positive copies the parent's context_id per G7).
+	// Episode → RecallContextLog has no DB-level FK (partitioned
+	// parent; see 0007 header), so a fabricated UUID is fine.
+	contextID := "55555555-5555-5555-5555-555555555555"
 
 	// First synthetic_positive: succeeds, drops a sentinel row.
+	// created_at defaults to now() -- lands in the current
+	// monthly partition.
 	var firstEpisodeID string
 	if err := db.QueryRowContext(ctx, `
 		INSERT INTO episode (
 			episode_group_id, repo_id, session_id, trace_id, kind,
 			synthesized_from_parent_episode_id,
 			synthesized_from_feedback_episode_id,
+			context_id,
 			action, outcome
 		)
 		VALUES (
 			gen_random_uuid(), $1, 'sess-a', 'trace-a', 'synthetic_positive',
-			$2, $3, '{"op":"replay"}'::jsonb, 'success'
+			$2, $3, $4, '{"op":"replay"}'::jsonb, 'success'
 		)
 		RETURNING episode_id
-	`, repoID, parentEpisodeID, feedbackEpisodeID).Scan(&firstEpisodeID); err != nil {
+	`, repoID, parentEpisodeID, feedbackEpisodeID, contextID).Scan(&firstEpisodeID); err != nil {
 		t.Fatalf("first synthetic_positive Episode insert should succeed: %v", err)
 	}
 
@@ -639,21 +666,26 @@ func TestSyntheticPositive_uniquenessAcrossRestarts(t *testing.T) {
 	}
 
 	// Second synthetic_positive: same feedback_episode_id, fresh
-	// trace + session (so writer-side dedup keys differ). The
-	// trigger fires, hits the sentinel PK, rolls back the
-	// Episode insert.
+	// trace + session, AND created_at = now() + 2 months so the
+	// row targets a different monthly partition (provisioned by
+	// pg_partman in 0014 with p_premake := 3). The trigger fires
+	// on the new partition, hits the sentinel PK, and rolls back
+	// the Episode insert. This is the literal §9.8 scenario
+	// ("Consolidator restart in a later month").
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO episode (
 			episode_group_id, repo_id, session_id, trace_id, kind,
 			synthesized_from_parent_episode_id,
 			synthesized_from_feedback_episode_id,
-			action, outcome
+			context_id,
+			action, outcome, created_at
 		)
 		VALUES (
 			gen_random_uuid(), $1, 'sess-b', 'trace-b', 'synthetic_positive',
-			$2, $3, '{"op":"replay"}'::jsonb, 'success'
+			$2, $3, $4, '{"op":"replay"}'::jsonb, 'success',
+			now() + interval '2 months'
 		)
-	`, repoID, parentEpisodeID, feedbackEpisodeID)
+	`, repoID, parentEpisodeID, feedbackEpisodeID, contextID)
 	if err == nil {
 		t.Fatal("expected PK violation on second synthetic_positive insert; got nil")
 	}
@@ -665,7 +697,8 @@ func TestSyntheticPositive_uniquenessAcrossRestarts(t *testing.T) {
 
 	// The Episode INSERT was rolled back atomically with the
 	// trigger's failed sentinel INSERT -- there should still be
-	// exactly one Episode row carrying this feedback key.
+	// exactly one Episode row carrying this feedback key (the
+	// originally-inserted firstEpisodeID).
 	var episodeCount int
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*) FROM episode
@@ -675,6 +708,9 @@ func TestSyntheticPositive_uniquenessAcrossRestarts(t *testing.T) {
 	}
 	if episodeCount != 1 {
 		t.Errorf("Episode row count should still be 1 after rejected duplicate; got %d", episodeCount)
+	}
+	if firstEpisodeID == "" {
+		t.Error("first insert should have returned a non-empty episode_id")
 	}
 }
 
@@ -756,6 +792,57 @@ func TestPgPartman_provisionsForwardPartitions(t *testing.T) {
 		}
 		if childCount < 4 {
 			t.Errorf("pg_partman should provision >= 4 child partitions for %s (current + 3 premake + default); got %d", parent, childCount)
+		}
+	}
+
+	// 3. The implementation-plan scenario is sharper than a
+	//    child-count: it says "partition tables covering at
+	//    least the next 3 months". Verify that the latest
+	//    non-default child partition's FROM bound is at least
+	//    p_premake periods in the future for each parent, which
+	//    is what p_premake := 3 guarantees pg_partman provisioned.
+	//
+	//    The lower-bound threshold is `now() + (premake - 1)
+	//    intervals`: with premake=3 we expect partitions at
+	//    [current, current+1, current+2, current+3]; the latest
+	//    FROM is current+3, which is strictly greater than
+	//    now()+2 intervals regardless of where in the current
+	//    period we are.
+	now := time.Now().UTC()
+	for _, parent := range expectedParents {
+		var threshold time.Time
+		switch parent {
+		case schema + ".trace_observation_log":
+			// 2 weeks ahead — the latest FROM should be ~3 weeks ahead.
+			threshold = now.Add(14 * 24 * time.Hour)
+		default:
+			// 2 months ahead — the latest FROM should be ~3 months ahead.
+			threshold = now.AddDate(0, 2, 0)
+		}
+		var maxFrom sql.NullTime
+		if err := db.QueryRowContext(ctx, `
+			SELECT max(
+				(regexp_match(
+					pg_get_expr(c.relpartbound, c.oid),
+					'FROM \(''([^'']+)''\)'
+				))[1]::timestamptz
+			)
+			FROM pg_inherits i
+			JOIN pg_class c ON c.oid = i.inhrelid
+			JOIN pg_class p ON p.oid = i.inhparent
+			JOIN pg_namespace n ON n.oid = p.relnamespace
+			WHERE n.nspname || '.' || p.relname = $1
+			  AND pg_get_expr(c.relpartbound, c.oid) <> 'DEFAULT'
+		`, parent).Scan(&maxFrom); err != nil {
+			t.Fatalf("max-FROM-bound query for %s: %v", parent, err)
+		}
+		if !maxFrom.Valid {
+			t.Errorf("no dated partitions found for %s -- pg_partman did not provision forward partitions", parent)
+			continue
+		}
+		if !maxFrom.Time.After(threshold) {
+			t.Errorf("pg_partman should provision partitions covering at least 3 forward periods for %s; latest FROM = %s, threshold (now + 2 intervals) = %s",
+				parent, maxFrom.Time, threshold)
 		}
 	}
 }
@@ -858,6 +945,54 @@ func indexDef(t *testing.T, db *sql.DB, schema, name string) string {
 		t.Fatalf("indexDef(%s.%s): %v", schema, name, err)
 	}
 	return def.String
+}
+
+// triggerExists reports whether a named trigger is defined on a
+// given table in the target schema. Used to assert the sentinel
+// substitute for the (PostgreSQL-impossible) partial UNIQUE on
+// partitioned `episode`.
+func triggerExists(t *testing.T, db *sql.DB, schema, table, name string) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), testDBTimeout)
+	defer cancel()
+	var exists bool
+	err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_trigger tr
+			JOIN pg_class c     ON c.oid = tr.tgrelid
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = $1
+			  AND c.relname = $2
+			  AND tr.tgname = $3
+			  AND NOT tr.tgisinternal
+		)`, schema, table, name).Scan(&exists)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("triggerExists(%s.%s.%s): %v", schema, table, name, err)
+	}
+	return exists
+}
+
+// functionExists reports whether a function with the given name
+// is defined in the target schema. Used to catch a regression
+// that drops the sentinel trigger function and breaks the
+// synthetic-positive uniqueness substitute.
+func functionExists(t *testing.T, db *sql.DB, schema, name string) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), testDBTimeout)
+	defer cancel()
+	var exists bool
+	err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_proc p
+			JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = $1 AND p.proname = $2
+		)`, schema, name).Scan(&exists)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("functionExists(%s.%s): %v", schema, name, err)
+	}
+	return exists
 }
 
 func stringSlicesEqual(a, b []string) bool {

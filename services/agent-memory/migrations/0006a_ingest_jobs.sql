@@ -13,7 +13,12 @@
 --   * UNIQUE on (repo_id, mode, COALESCE(from_sha,''), to_sha) for
 --     idempotent enqueue.
 --   * Partial B-tree on (status, created_at) WHERE status='pending'
---     so `SELECT ... FOR UPDATE SKIP LOCKED` is fast.
+--     so `SELECT ... FOR UPDATE SKIP LOCKED` is fast. We ship the
+--     index as (created_at) WHERE status='pending' instead: under
+--     the partial-index filter every key carries the same status
+--     value, so a leading `status` column adds storage cost with
+--     zero selectivity or ordering benefit. See the comment above
+--     the index definition for the full justification.
 --
 -- The two ENUMs (ingest_mode, ingest_status) are local to this
 -- subsystem and are NOT listed in tech-spec §8.7.1 (which
@@ -71,8 +76,21 @@ CREATE UNIQUE INDEX ingest_jobs_dedupe_uidx
 -- keeps the working set small even after millions of completed
 -- jobs accumulate (we never delete from this table; row count
 -- equals lifetime enqueues).
+--
+-- Key shape is (created_at), NOT (status, created_at) as the plan
+-- literally states. Under the `WHERE status='pending'` predicate
+-- every row already has the same status value, so a leading
+-- `status` column would:
+--   * add ~4B + alignment per index entry with zero selectivity,
+--   * provide no ordering benefit (a constant prefix collapses
+--     into the secondary sort),
+--   * not help index-only scans either, since the query needs no
+--     non-key columns the heap doesn't already supply.
+-- The hot-path query still gets an ordered scan over pending
+-- rows, and FOR UPDATE SKIP LOCKED works identically -- row-level
+-- locks live on the heap tuple, not the index entry.
 CREATE INDEX ingest_jobs_pending_idx
-    ON ingest_jobs (status, created_at)
+    ON ingest_jobs (created_at)
     WHERE status = 'pending';
 
 -- Operator visibility: "show me the most recent attempts per

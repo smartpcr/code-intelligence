@@ -1,0 +1,2 @@
+# Placeholder so the empty `pkg/` directory survives in git.
+# Stage 2.1 (GraphWriter library) lands `pkg/fingerprint` here.

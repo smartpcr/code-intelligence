@@ -1,0 +1,45 @@
+# .gitattributes for code-intelligence.
+#
+# Normalise every text file to LF line endings on commit, regardless
+# of the developer's OS. The `.editorconfig` setting `end_of_line = lf`
+# is a directive for editors / checkers; this file is what git itself
+# enforces when files are staged. Without it the editorconfig-checker
+# pre-commit hook fails on Windows-authored files with CRLF endings.
+#
+# Binary files (none today, but reserved for future protobuf wire
+# fixtures, image assets, etc.) should be tagged `-text` here.
+
+# Text auto-detection + LF normalisation.
+* text=auto eol=lf
+
+# Source / config files we always want LF, even if git's text
+# heuristic somehow guesses wrong.
+*.go         text eol=lf
+*.sql        text eol=lf
+*.proto      text eol=lf
+*.md         text eol=lf
+*.yml        text eol=lf
+*.yaml       text eol=lf
+*.json       text eol=lf
+*.toml       text eol=lf
+*.sh         text eol=lf
+*.bash       text eol=lf
+Dockerfile   text eol=lf
+Makefile     text eol=lf
+*.mk         text eol=lf
+.editorconfig text eol=lf
+.gitignore    text eol=lf
+.gitattributes text eol=lf
+
+# Go fixture / golden files are checked byte-for-byte; keep them
+# exactly as written without normalising line endings.
+*.golden    -text
+
+# Plan / story docs under `docs/stories/` are authored and
+# maintained by upstream plan iterations (architecture, tech-spec,
+# implementation-plan, e2e-scenarios). They are checked into the
+# repo with whatever line endings the plan workflow produced and
+# MUST be left byte-for-byte untouched by engineer iterations.
+# `-text` disables line-ending normalisation entirely for the
+# match (git treats the path as binary for diff/commit purposes).
+docs/stories/**     -text

@@ -1,0 +1,120 @@
+# Local-dev / CI dependency stack for the agent-memory service.
+#
+# Stage 1.1 (implementation-plan.md) requires three containers on a
+# private docker network with healthchecks: PostgreSQL 16 + pgcrypto +
+# pg_partman, Qdrant, and an OpenTelemetry Collector. All three must
+# come up healthy before `make test` runs in CI.
+#
+# Image versions are pinned. Bump them in their own PR with a clean
+# `docker compose up -d` + integration-test pass.
+
+name: agent-memory-local
+
+networks:
+  agent_memory:
+    driver: bridge
+
+volumes:
+  pgdata:
+  qdrantdata:
+
+services:
+  postgres:
+    container_name: agent_memory_postgres
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+    image: agent-memory/postgres:16-partman
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: agent_memory
+      POSTGRES_PASSWORD: agent_memory
+      POSTGRES_DB: agent_memory
+      # pg_partman BGW config (read by the init SQL on first boot
+      # and by the postgresql.conf snippet baked into the image).
+      PG_PARTMAN_BGW_DBNAME: agent_memory
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=pg_partman_bgw"
+      - "-c"
+      - "pg_partman_bgw.dbname=agent_memory"
+      - "-c"
+      - "pg_partman_bgw.interval=3600"
+      - "-c"
+      - "pg_partman_bgw.role=agent_memory"
+    networks:
+      - agent_memory
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_memory -d agent_memory"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  qdrant:
+    container_name: agent_memory_qdrant
+    # v1.12.x is the latest LTS line at the time of scaffold; bump
+    # via a dedicated PR that also re-runs the Stage 1.4 collection
+    # bootstrap integration test.
+    build:
+      context: ./qdrant
+      dockerfile: Dockerfile
+    image: agent-memory/qdrant:v1.12.4-busybox
+    restart: unless-stopped
+    networks:
+      - agent_memory
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrantdata:/qdrant/storage
+    healthcheck:
+      # Qdrant exposes both /healthz and /readyz; /healthz is the
+      # liveness probe per upstream docs and is sufficient for CI.
+      # The base qdrant/qdrant image is debian:12-slim with no
+      # wget/curl, so we invoke a baked-in static busybox binary
+      # (see ./qdrant/Dockerfile) via its applet syntax.
+      test: ["CMD", "/busybox", "wget", "-q", "--spider", "http://127.0.0.1:6333/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  otel:
+    container_name: agent_memory_otel
+    build:
+      context: ./otel
+      dockerfile: Dockerfile
+    image: agent-memory/otel-collector-contrib:0.112.0-busybox
+    restart: unless-stopped
+    command: ["--config=/etc/otel/config.yaml"]
+    networks:
+      - agent_memory
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "13133:13133" # health_check extension
+    volumes:
+      - ./otel/config.yaml:/etc/otel/config.yaml:ro
+    healthcheck:
+      # The health_check extension responds 200 on / when the
+      # collector is up and all pipelines are healthy. The base
+      # image is distroless (no shell, no wget); we ship a static
+      # busybox binary (see ./otel/Dockerfile) for HEALTHCHECK use
+      # only -- the running collector itself never invokes it.
+      test: ["CMD", "/busybox", "wget", "-q", "--spider", "http://127.0.0.1:13133/"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy

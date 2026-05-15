@@ -1,0 +1,3 @@
+# Placeholder so the empty `cmd/` directory survives in git.
+# Removed once the first binary (Stage 3.1 repo-indexer or Stage 4.x
+# agent-api) lands its main package here.

@@ -1,0 +1,3 @@
+# Placeholder so the empty `migrations/` directory survives in git.
+# Stage 1.2 (structural schema migrations) is the first stage that
+# actually writes files here.

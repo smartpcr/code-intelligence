@@ -71,6 +71,44 @@ var buildOnce sync.Once
 var buildErr error
 var binaryPath string
 
+// lockedBuffer is a minimal goroutine-safe wrapper around
+// bytes.Buffer. We need it because os/exec spawns an internal
+// goroutine to copy the child's stdout/stderr pipes into any
+// non-*os.File writer we hand it. The test goroutine then reads
+// the captured output via String() in failure-diagnostic paths
+// (e.g., when /healthz times out or a request fails) WHILE the
+// child process is still running and the copy goroutine is still
+// writing. bytes.Buffer is documented as not safe for concurrent
+// use, so without this wrapper `go test -race` flags the access
+// as a data race.
+//
+// We only need Write (to satisfy io.Writer for cmd.Stdout /
+// cmd.Stderr) and String (for diagnostic snapshots); Bytes,
+// Len, Reset, etc. are intentionally omitted to keep the
+// concurrency surface narrow.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+// Write appends p to the underlying buffer under the mutex. It
+// is safe to call concurrently with String and with other Writes.
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// String returns a snapshot copy of the buffer contents under
+// the mutex. The returned string is independent of the buffer
+// and safe to use after the lock is released because Go's
+// []byte->string conversion copies.
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // buildBinary compiles cmd/webhook-receiver once per test
 // process and returns the absolute path to the produced
 // executable. The output goes into a tempdir that lives for the
@@ -191,7 +229,7 @@ type runningReceiver struct {
 	addr   string // "127.0.0.1:<port>"
 	client *http.Client
 	stop   func()
-	output *bytes.Buffer
+	output *lockedBuffer
 }
 
 func startReceiver(t *testing.T, dsn, certFile, keyFile string, caPEM []byte) *runningReceiver {
@@ -230,9 +268,16 @@ func startReceiver(t *testing.T, dsn, certFile, keyFile string, caPEM []byte) *r
 		"AGENT_MEMORY_WRITE_TIMEOUT=10s",
 		"AGENT_MEMORY_SHUTDOWN_TIMEOUT=10s",
 	)
-	var combined bytes.Buffer
-	cmd.Stdout = &combined
-	cmd.Stderr = &combined
+	// combined captures stdout+stderr from the child. It MUST
+	// be the mutex-guarded lockedBuffer (not a bare
+	// bytes.Buffer) because os/exec spawns a goroutine that
+	// writes here while the test goroutine may concurrently
+	// read via String() in failure paths below and in the
+	// subtests via rr.output.String(). bytes.Buffer is not
+	// safe for concurrent use; -race would flag it.
+	combined := &lockedBuffer{}
+	cmd.Stdout = combined
+	cmd.Stderr = combined
 	if err := cmd.Start(); err != nil {
 		procCancel()
 		t.Fatalf("start webhook-receiver: %v", err)
@@ -295,7 +340,7 @@ func startReceiver(t *testing.T, dsn, certFile, keyFile string, caPEM []byte) *r
 		addr:   addr,
 		client: client,
 		stop:   stop,
-		output: &combined,
+		output: combined,
 	}
 }
 

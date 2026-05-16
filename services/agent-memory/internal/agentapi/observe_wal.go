@@ -39,6 +39,19 @@
 // corrupt the offset accounting.  A process-exclusivity lock
 // file lives next to the data file to make a misconfiguration
 // fail loudly rather than silently corrupt history.
+//
+// Stale-lock handling
+// -------------------
+// The lock file is created with `O_CREATE|O_EXCL` and records
+// the holder's PID.  If a previous process was killed by
+// SIGKILL / OOM / panic-without-defer the file persists on
+// disk after the holder is gone.  In Kubernetes this happens
+// routinely (OOM kills, node evictions, SIGKILL on hung
+// rollouts).  On EEXIST we therefore read the recorded PID
+// and probe whether it is still alive; if the holder is gone
+// the stale lock is removed and the open is retried once.  A
+// live holder still produces `ErrWALAlreadyOpen` exactly as
+// before so a real misconfiguration continues to fail loudly.
 package agentapi
 
 import (
@@ -55,6 +68,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -78,12 +92,20 @@ const (
 	// drain cycle consumes so the flusher does not starve
 	// other work when the WAL holds a large backlog.
 	defaultDrainBatch = 256
+	// lockAcquireMaxAttempts bounds the lock-acquire retry
+	// loop so a pathological flap (e.g. another process
+	// constantly racing into the just-cleared lock file)
+	// cannot spin NewFileWAL forever.  We only need one
+	// extra attempt after reclaiming a stale lock.
+	lockAcquireMaxAttempts = 2
 )
 
 // ErrWALAlreadyOpen is returned by NewFileWAL when another
-// process already holds the WAL lock.  A misconfigured second
-// agent-api binary fails loudly here at startup rather than
-// silently corrupting the offset accounting.
+// LIVE process already holds the WAL lock.  A misconfigured
+// second agent-api binary fails loudly here at startup rather
+// than silently corrupting the offset accounting.  Stale lock
+// files left by a crashed predecessor are reclaimed
+// automatically and do NOT produce this error.
 var ErrWALAlreadyOpen = errors.New(
 	"agentapi: observe WAL: another process already owns this directory")
 
@@ -96,22 +118,22 @@ var ErrWALAlreadyOpen = errors.New(
 // safe to call from multiple goroutines.  All file mutations
 // are serialised behind `mu`.
 type FileWAL struct {
-	dir         string
-	dataPath    string
-	offsetPath  string
-	lockPath    string
-	lockFile    *os.File
-	mu          sync.Mutex
-	depth       atomic.Int64
-	metrics     ObserveMetrics
-	logger      *slog.Logger
-	signal      chan struct{}
+	dir        string
+	dataPath   string
+	offsetPath string
+	lockPath   string
+	lockFile   *os.File
+	mu         sync.Mutex
+	depth      atomic.Int64
+	metrics    ObserveMetrics
+	logger     *slog.Logger
+	signal     chan struct{}
 	// flusher lifecycle
-	flushOnce    sync.Once
-	flusherUp    atomic.Bool
-	stopCh       chan struct{}
-	doneCh       chan struct{}
-	stopOnce     sync.Once
+	flushOnce sync.Once
+	flusherUp atomic.Bool
+	stopCh    chan struct{}
+	doneCh    chan struct{}
+	stopOnce  sync.Once
 }
 
 // FileWALOptions configures NewFileWAL.
@@ -124,8 +146,10 @@ type FileWALOptions struct {
 }
 
 // NewFileWAL opens (or creates) the WAL in `dir`.  Returns
-// `ErrWALAlreadyOpen` when another process holds the lock,
-// otherwise an I/O error from disk.
+// `ErrWALAlreadyOpen` when another LIVE process holds the
+// lock, otherwise an I/O error from disk.  Stale lock files
+// from a crashed predecessor are reclaimed transparently and
+// logged at warn level.
 func NewFileWAL(dir string, opts FileWALOptions) (*FileWAL, error) {
 	if dir == "" {
 		return nil, errors.New("agentapi: observe WAL: empty directory")
@@ -149,18 +173,14 @@ func NewFileWAL(dir string, opts FileWALOptions) (*FileWAL, error) {
 		doneCh:     make(chan struct{}),
 	}
 	// Acquire the lock file.  `O_CREATE | O_EXCL` fails if
-	// the file already exists (another process owns it).  We
-	// write the PID in for an operator to see who's holding
-	// it when triage is needed.
-	lockFile, err := os.OpenFile(w.lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	// the file already exists; acquireLockFile handles the
+	// stale-vs-live disambiguation and writes our PID in for
+	// an operator to see who's holding it when triage is
+	// needed.
+	lockFile, err := w.acquireLockFile()
 	if err != nil {
-		if os.IsExist(err) {
-			return nil, ErrWALAlreadyOpen
-		}
-		return nil, fmt.Errorf("agentapi: observe WAL: lock: %w", err)
+		return nil, err
 	}
-	_, _ = lockFile.WriteString(strconv.Itoa(os.Getpid()))
-	_ = lockFile.Sync()
 	w.lockFile = lockFile
 
 	// Seed the depth gauge from on-disk state so a process
@@ -176,6 +196,132 @@ func NewFileWAL(dir string, opts FileWALOptions) (*FileWAL, error) {
 		slog.String("dir", dir),
 		slog.Int64("depth", depth))
 	return w, nil
+}
+
+// acquireLockFile creates the WAL lock file with O_CREATE|
+// O_EXCL.  On EEXIST it inspects the recorded PID: if the
+// holder is still alive the call fails with
+// ErrWALAlreadyOpen; if the holder is gone (crashed, OOM
+// killed, SIGKILLed before Close ran) the stale lock is
+// removed and the open is retried exactly once.  Returns the
+// open lock file with our PID written and fsynced.
+func (w *FileWAL) acquireLockFile() (*os.File, error) {
+	for attempt := 1; attempt <= lockAcquireMaxAttempts; attempt++ {
+		f, err := os.OpenFile(w.lockPath,
+			os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			_, _ = f.WriteString(strconv.Itoa(os.Getpid()))
+			_ = f.Sync()
+			return f, nil
+		}
+		if !os.IsExist(err) {
+			return nil, fmt.Errorf("agentapi: observe WAL: lock: %w", err)
+		}
+		// Last attempt: do not re-probe; if we got here
+		// after already reclaiming once, treat the new lock
+		// as a legitimate live owner (someone raced us) and
+		// fail loudly rather than spinning.
+		if attempt == lockAcquireMaxAttempts {
+			return nil, ErrWALAlreadyOpen
+		}
+		holder, perr := w.readLockHolderPID()
+		// Live owner = our own PID (a same-process double-open
+		// is, by definition, an in-process conflict — we are
+		// running, so any PID equal to ours is alive) OR a
+		// foreign PID that responds to a signal-0 probe.  In
+		// both cases the existing handle is real and we MUST
+		// NOT touch it.
+		if perr == nil && holder > 0 &&
+			(holder == os.Getpid() || isPIDAlive(holder)) {
+			return nil, ErrWALAlreadyOpen
+		}
+		// Stale (or unreadable / empty / non-numeric) lock —
+		// reclaim it.  Log loudly so operators can correlate
+		// with the prior crash/OOM in the same pod.
+		w.logger.Warn("agentapi.observe.wal_stale_lock_reclaimed",
+			slog.String("path", w.lockPath),
+			slog.Int("stale_pid", holder),
+			slog.String("read_error", errString(perr)))
+		if rerr := os.Remove(w.lockPath); rerr != nil && !os.IsNotExist(rerr) {
+			return nil, fmt.Errorf(
+				"agentapi: observe WAL: remove stale lock: %w", rerr)
+		}
+	}
+	// Unreachable — loop body always returns.
+	return nil, ErrWALAlreadyOpen
+}
+
+// readLockHolderPID returns the PID stored inside an existing
+// lock file.  Returns (0, nil) if the file is empty or holds
+// non-numeric content (we still treat it as stale-and-
+// reclaimable; an unreadable lock from a crashed predecessor
+// is worse than useless).
+func (w *FileWAL) readLockHolderPID() (int, error) {
+	b, err := os.ReadFile(w.lockPath)
+	if err != nil {
+		return 0, err
+	}
+	s := strings.TrimSpace(string(b))
+	if s == "" {
+		return 0, nil
+	}
+	pid, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, nil
+	}
+	return pid, nil
+}
+
+// isPIDAlive reports whether a process with the given PID is
+// currently running.  Used to distinguish a real second-binary
+// misconfiguration (return ErrWALAlreadyOpen) from a stale
+// lock left by a crashed/OOM-killed predecessor (reclaim).
+//
+// On Unix this is the standard signal-0 probe:
+//   - Signal returns nil          → process exists and we can signal it → alive.
+//   - Signal returns EPERM        → process exists, no permission       → alive.
+//   - Signal returns ESRCH /
+//     errors.Is(ErrProcessDone)   → process is gone                     → dead.
+//   - Any other error             → unknown; treat as alive so we never
+//     incorrectly reclaim a live owner's lock.
+//
+// On Windows os.FindProcess opens a real handle; failure to
+// open already means the process is gone (returns dead).  If
+// the handle does open, Signal(0) is best-effort and we again
+// fall back to the conservative "alive" default for unknown
+// errors.
+func isPIDAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	err = process.Signal(syscall.Signal(0))
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, syscall.EPERM) {
+		return true
+	}
+	if errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrProcessDone) {
+		return false
+	}
+	// Unknown error — be conservative: report alive so we
+	// never reclaim a lock from a live owner just because
+	// the platform returned something we don't recognise.
+	return true
+}
+
+// errString returns err.Error() or "" so we can pass a nil-
+// safe value into slog.String without an extra branch at every
+// call site.
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // Enqueue appends the prepared Episode + Observations payload

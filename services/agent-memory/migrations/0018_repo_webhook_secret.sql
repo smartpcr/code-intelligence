@@ -41,6 +41,66 @@
 -- raw signature header, or the raw request body. This is a
 -- code-level invariant (enforced in `internal/webhookreceiver`),
 -- not a schema-level one.
+--
+-- Residual risk -- cleartext storage at rest
+-- ------------------------------------------
+-- `webhook_secret` is stored as plain `text` in the table heap.
+-- The ACLs defined below keep it invisible to `agent_memory_ro`
+-- (recall / mgmt.read.* paths) at SQL level, but the ciphertext
+-- of the heap pages is what ends up in:
+--
+--   * `pg_dump` / `pg_basebackup` artefacts,
+--   * archived WAL segments and any standby's WAL stream,
+--   * logical-replication subscribers if `repo_webhook_secret`
+--     is ever added to a publication.
+--
+-- Anyone with read access to those byte streams can recover the
+-- secret without ever touching a SQL connection. We accept this
+-- residual risk in Stage 3.5 because the operational controls
+-- below shift the trust boundary to the same operators who
+-- already hold the schema-owner / superuser credentials -- a
+-- strictly lower-privilege actor cannot reach the secret.
+--
+-- Required operational controls (deployment runbook MUST
+-- enforce all of these; CI cannot verify them):
+--
+--   1. Backup encryption. `pg_dump` / `pg_basebackup` output is
+--      written only to encrypted storage (Azure SSE with
+--      customer-managed keys for the production cluster; GPG-
+--      encrypted local archives for the dev stack).
+--   2. WAL volume encryption. The pg_wal mount and any archive
+--      target use storage-layer encryption (Azure disk encryption
+--      / managed-disk SSE). Standbys replicate over TLS only.
+--   3. Replication ACLs. If a logical-replication publication is
+--      ever added to this database, `repo_webhook_secret` is
+--      explicitly excluded from `FOR ALL TABLES` / table lists;
+--      no external subscriber may consume the row stream.
+--   4. Operator access. The schema-owner role (which can SELECT
+--      this table regardless of the REVOKE below) is restricted
+--      to the same operator tier that would hold a KMS key for
+--      app-side encryption -- so adding `pgcrypto.pgp_sym_encrypt`
+--      with a database-resident KEK would not raise the trust
+--      bar, only the mechanical complexity.
+--
+-- Why we DO NOT use `pgcrypto.pgp_sym_encrypt(...)` today:
+--
+--   * Secret rotation itself is explicitly deferred to the
+--     operations runbook per tech-spec §9.12. Envelope encryption
+--     is only useful once a rotation story exists (the KEK has to
+--     be rotatable, otherwise the ciphertext is just a more
+--     awkward plaintext).
+--   * No KMS integration is in scope for Stage 3.5. The
+--     `pgcrypto` extension is loaded only for `gen_random_uuid()`
+--     (tech-spec §8.7); introducing a key-wrap path here would
+--     pull KMS access into the Webhook Receiver and
+--     `mgmt.register` (Stage 7.1), both out of scope for this
+--     stage.
+--   * When rotation lands, the migration that adds rotation
+--     tracking is the right place to convert this column to
+--     `bytea` ciphertext via `pgp_sym_encrypt(secret,
+--     current_setting('agent_memory.webhook_kek'))` and add a
+--     `kek_version smallint` companion column. The TODO is
+--     captured against §9.12 in the tech-spec.
 
 -- migrate:up
 BEGIN;
@@ -52,6 +112,14 @@ CREATE TABLE repo_webhook_secret (
     -- The secret is high-entropy (>= 32 bytes; Stage 7.1
     -- `mgmt.register` generates via crypto/rand) so no
     -- additional KDF is layered here.
+    --
+    -- Cleartext-at-rest residual risk is documented in the file
+    -- header ("Residual risk -- cleartext storage at rest") and
+    -- is mitigated by deployment-level controls (backup / WAL
+    -- encryption, replication ACLs, operator-tier access) rather
+    -- than app-side `pgcrypto` envelope encryption. App-side
+    -- encryption is deferred to the same migration that lands
+    -- the §9.12 secret-rotation story, which it depends on.
     webhook_secret text        NOT NULL,
     created_at     timestamptz NOT NULL DEFAULT now(),
     -- rotated_at == created_at on first insert; bumped to now()
@@ -85,6 +153,11 @@ END$$;
 --      auto-granted at CREATE TABLE time above.
 --   2. REVOKE ALL just in case a future migration adds another
 --      grant rule (e.g. INSERT default privileges).
+--
+-- Note: this REVOKE is the SQL-level half of the cleartext-at-
+-- rest mitigation. The deployment-level half (backup / WAL
+-- encryption, replication ACLs) is enforced operationally per
+-- the residual-risk section in this file's header.
 DO $$
 DECLARE
     cs text := current_schema();

@@ -258,12 +258,21 @@ func (g *GitDeltaDiffer) Diff(ctx context.Context, repoURL, fromSHA, toSHA strin
 		return nil, fmt.Errorf("repoindexer: git remote add origin: %w", err)
 	}
 
-	fetchCtx, cancel := context.WithTimeout(ctx, fetchTO)
-	defer cancel()
-	if _, err := bareRun(fetchCtx, "fetch", "--depth=1", "--quiet", "origin", fromSHA); err != nil {
+	// Each fetch gets its OWN timeout so a slow first fetch
+	// cannot starve the second. Sharing a single fetchCtx
+	// across both invocations meant a fromSHA fetch that
+	// consumed most of the 5-min budget would leave the toSHA
+	// fetch with a near-zero deadline and time out spuriously
+	// even though the network was healthy. fetchTO is the
+	// per-invocation cap, not a budget for both calls.
+	fetchCtx1, cancel1 := context.WithTimeout(ctx, fetchTO)
+	defer cancel1()
+	if _, err := bareRun(fetchCtx1, "fetch", "--depth=1", "--quiet", "origin", fromSHA); err != nil {
 		return nil, fmt.Errorf("repoindexer: git fetch %s: %w", fromSHA, err)
 	}
-	if _, err := bareRun(fetchCtx, "fetch", "--depth=1", "--quiet", "origin", toSHA); err != nil {
+	fetchCtx2, cancel2 := context.WithTimeout(ctx, fetchTO)
+	defer cancel2()
+	if _, err := bareRun(fetchCtx2, "fetch", "--depth=1", "--quiet", "origin", toSHA); err != nil {
 		return nil, fmt.Errorf("repoindexer: git fetch %s: %w", toSHA, err)
 	}
 

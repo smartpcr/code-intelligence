@@ -1161,12 +1161,11 @@ func (i *Ingestor) pickObservationTarget(res Resolution) ObservationTarget {
 	return ObservationTarget{}
 }
 
-// startedAt returns the span's StartedAt when set; otherwise it
-// falls back to the ingestor's injectable clock (UTC-normalized
-// to preserve the original zero-StartedAt contract). Routing the
-// fallback through i.now matches the rest of the ingestor
-// (supervisor, caches, processBatch) and keeps the zero-
-// StartedAt path testable with a deterministic clock.
+// startedAt returns the span's StartedAt when present, falling
+// back to the Ingestor's injectable clock (`i.now`) so the
+// zero-StartedAt path is testable with a deterministic clock,
+// matching how the supervisor, caches, and processBatch source
+// wall-clock time.
 func (i *Ingestor) startedAt(s ObservationSpan) time.Time {
 	if !s.StartedAt.IsZero() {
 		return s.StartedAt

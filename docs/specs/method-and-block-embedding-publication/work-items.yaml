@@ -35,19 +35,26 @@ phases:
               scaffold; unit test asserts the enum members exactly match
               the S 9.6a closed set.
           - id: step-qdrant-adapter
-            title: "Qdrant client adapter (UpsertPoint + FetchPoint)"
+            title: "Qdrant client adapter (UpsertPoint + FetchPoint) + NS_EMBEDDING_PUBLISH"
             expectedFileChanges: 4
             summary: >-
               qdrant.go over the Qdrant SDK exposing UpsertPoint and
               FetchPoint (the read-after-write check in S 9.6a step 5).
-              Config via AM_QDRANT_ENDPOINT / AM_QDRANT_COLLECTION. Unit
-              test with a fake transport asserts the upsert payload
-              carries the full identity tuple needed to dereference a
-              recall hit back to EmbeddingPublish in a single SQL
-              lookup: publish_id (PK into the log), target_id,
-              target_kind ('node' | 'concept_version'), repo_id, kind,
+              Config via AM_QDRANT_ENDPOINT / AM_QDRANT_COLLECTION.
+              Exports the fixed UUIDv5 namespace constant
+              NS_EMBEDDING_PUBLISH used to derive point_id - pinning
+              the namespace makes independent implementations and tests
+              produce byte-identical point_ids for the same publish_id
+              (no orphan vectors on retry). Unit test with a fake
+              transport asserts the upsert payload carries the full
+              identity tuple needed to dereference a recall hit back
+              to EmbeddingPublish in a single SQL lookup: publish_id
+              (PK into the log), target_id, target_kind ('node' |
+              'concept_version'), repo_id, kind,
               embedding_model_version. Also asserts point_id =
-              uuid_v5(publish_id) so retries are idempotent in Qdrant.
+              uuid_v5(NS_EMBEDDING_PUBLISH, publish_id) so retries are
+              byte-identical idempotent in Qdrant across
+              implementations.
           - id: step-embedding-model-client
             title: "Embedding model HTTP client + version accessor"
             expectedFileChanges: 4
@@ -69,43 +76,82 @@ phases:
         title: "S 9.6a write protocol + handler wiring + retry"
         steps:
           - id: step-publisher-state-machine
-            title: "Publisher state machine - PublishNew + RetryExisting entry points"
+            title: "Publisher state machine - PublishNew (idempotent ON CONFLICT) + RetryExisting (monotonic-published re-check); Tx-A/B/C split"
             expectedFileChanges: 6
             summary: >-
               publisher.go realising S 9.6a steps 2-5 behind two entry
               points sharing one inner core publishCore(publish_id,
-              point_id, attempt_index). PublishNew(ctx, node) is the
-              full-mode entry point: inserts a fresh EmbeddingPublish
-              (uuid_v7 publish_id, deterministic point_id =
-              uuid_v5(publish_id), stamping embedding_model_version,
-              target_id=node.id, target_kind='node') then calls
-              publishCore with attempt_index=1. Happy path = 4 INSERTs
-              (1 EmbeddingPublish + queued + vector_written + published).
+              point_id, attempt_index). External I/O (embed + Qdrant
+              UpsertPoint/FetchPoint) runs OUTSIDE any open
+              PostgreSQL transaction; each state transition is its
+              own short committed tx (Tx-A admit + reserve queued@N
+              under pg_advisory_xact_lock; Tx-B vector_written or
+              failed; Tx-C published). The advisory lock is held
+              only inside Tx-A so its window is a single SELECT +
+              1-2 INSERTs, never bounded by Qdrant latency.
+              PublishNew(ctx, node) is the full-mode entry point and
+              is AT-MOST-ONCE on (target_id, target_kind,
+              embedding_model_version): Tx-A takes
+              pg_advisory_xact_lock(hashtext(target_id::text)) and
+              attempts INSERT INTO EmbeddingPublish ... ON CONFLICT
+              (target_id, target_kind, embedding_model_version)
+              WHERE NOT EXISTS (superseded) DO NOTHING RETURNING
+              publish_id. If a live row already exists, reads it
+              back and tail-calls RetryExisting(ctx, existing). If
+              fresh: mints uuid_v7 publish_id, deterministic
+              point_id = uuid_v5(NS_EMBEDDING_PUBLISH, publish_id),
+              stamps embedding_model_version, inserts queued@1,
+              commits. Then external embed + UpsertPoint; Tx-B
+              vector_written@1 or failed@1; external FetchPoint;
+              Tx-C published@1. Happy path = 4 INSERTs across 3
+              committed transactions.
               RetryExisting(ctx, publish) is the flusher entry point:
               reuses input row's publish_id + point_id + target_id +
-              embedding_model_version, reads max(attempt_index) from
-              EmbeddingPublishEvent for that publish_id, calls
-              publishCore with attempt_index=max+1. NEVER inserts a new
+              embedding_model_version. Tx-A takes the advisory lock
+              on hashtext(publish_id::text), FIRST checks the
+              monotonic-published predicate (EXISTS published AND
+              NOT EXISTS superseded). If true, no-ops the retry and
+              returns - prevents a racing loser from being scheduled
+              against a successfully-published row (the advisory
+              lock alone does NOT prevent regression because Tx-B
+              and Tx-C of two attempts can interleave; the
+              monotonic predicate does). If false, re-reads latest
+              event for that publish_id. If latest is 'queued' newer
+              than AM_PUBLISH_QUEUED_TIMEOUT, also no-ops.
+              Otherwise reserves attempt_index=max+1, inserts
+              queued@attempt_index, commits. Post-Tx-A flow
+              identical to PublishNew. NEVER inserts a new
               EmbeddingPublish. NEVER decides to supersede on model
-              mismatch (that flow is owned by the bulk re-embed driver,
-              out of scope). Happy path = 3 INSERTs (3 events only).
-              publishCore runs inside a single tx that takes
-              pg_advisory_xact_lock(hashtext(publish_id::text)) before
-              the max read so two flusher replicas cannot both append
-              at N+1 (race-safety). On Qdrant UpsertPoint success but
-              FetchPoint failure (or crash) the row is left at
-              vector_written; the flusher's vector_written staleness
-              predicate (step-8) re-drives it, and the deterministic
-              point_id makes the re-upsert idempotent in Qdrant.
-              Unit test asserts: (a) PublishNew emits exactly 4 INSERTs
-              in order; (b) RetryExisting emits exactly 3 INSERTs with
-              the right incremented attempt_index and zero new
-              EmbeddingPublish rows; (c) Qdrant-failure path inserts
-              EmbeddingPublish (PublishNew only) + queued + failed only;
-              (d) no UPDATE or DELETE statement is ever issued;
-              (e) two concurrent RetryExisting calls for the same
-              publish_id never produce duplicate attempt_index values
-              (advisory-lock contract).
+              mismatch (owned by bulk re-embed driver, out of
+              scope). Happy path on non-published row = 3 INSERTs;
+              retry against already-published row = 0 INSERTs.
+              On Qdrant UpsertPoint success but FetchPoint failure
+              (or crash) the row is left at vector_written; the
+              flusher's vector_written staleness predicate (step-8)
+              re-drives it, and the deterministic point_id makes
+              the re-upsert idempotent in Qdrant.
+              Unit test asserts: (a) PublishNew emits exactly 4
+              INSERTs across 3 committed transactions on the happy
+              path; (b) PublishNew called twice for the same
+              (target_id, target_kind, embedding_model_version)
+              produces exactly ONE EmbeddingPublish row total -
+              at-most-once contract; (c) RetryExisting on a
+              non-published row emits exactly 3 INSERTs across 3
+              transactions with the right incremented
+              attempt_index; (d) RetryExisting against a row whose
+              monotonic-published predicate (EXISTS published AND
+              NOT EXISTS superseded) holds emits ZERO INSERTs
+              (no-op); (e) Qdrant-failure path inserts
+              EmbeddingPublish (PublishNew only) + queued + failed
+              only; (f) no UPDATE or DELETE statement is ever
+              issued; (g) two concurrent RetryExisting calls on the
+              same non-published publish_id never duplicate
+              attempt_index (loser blocks on Tx-A lock then either
+              no-ops on monotonic predicate or reserves
+              attempt_index=max+2); (h) the advisory lock is NOT
+              held across the embed / UpsertPoint / FetchPoint
+              external calls (slow-fake-adapter test against a
+              DIFFERENT publish_id proceeds without waiting).
           - id: step-model-version-stamping
             title: "Stamp embedding_model_version on every EmbeddingPublish"
             expectedFileChanges: 3
@@ -126,55 +172,79 @@ phases:
               Integration test: 3-method fixture yields three
               'published' events, each at attempt_index=1.
           - id: step-background-flusher
-            title: "Background flusher retries via RetryExisting (reuses publish_id/point_id; recovers stale vector_written)"
+            title: "Background flusher retries via RetryExisting (recovers stale vector_written; skips already-published rows)"
             expectedFileChanges: 5
             summary: >-
               flusher.go worker goroutine polls EmbeddingPublish rows
-              whose latest EmbeddingPublishEvent is (a) 'queued' or
-              'failed' past the standard backoff, OR (b)
-              'vector_written' whose created_at is older than
+              whose latest EmbeddingPublishEvent is (a) 'queued' older
+              than AM_PUBLISH_QUEUED_TIMEOUT (same knob as Tx-A's
+              "queued within backoff" check), (b) 'failed' past the
+              standard backoff, OR (c) 'vector_written' older than
               AM_PUBLISH_RAW_STALENESS (proposed 60 s). The third
               state must be flushed too: otherwise a crash or
               FetchPoint failure between vector_written and published
-              would leave the row permanently invisible to recall.
-              LATERAL join on (publish_id, created_at DESC) from
-              S 8.7.2. The flusher calls
-              publisher.RetryExisting(ctx, publish) with each such row.
-              Flusher passes the EXISTING EmbeddingPublish row (never a
-              Node) so publish_id + point_id + target_id +
-              embedding_model_version are reused; only a fresh event
-              chain at attempt_index = max(prior) + 1 is appended. The
-              deterministic point_id = uuid_v5(publish_id) keeps the
-              re-UpsertPoint idempotent in Qdrant (in-place update of
-              the same point). Integration tests: (1) fake Qdrant
-              fails once then succeeds; the target's EmbeddingPublish
-              row count stays at 1 and the row reaches 'published' at
-              attempt_index=2; (2) fake Qdrant UpsertPoint succeeds
-              but FetchPoint errors once; after staleness window,
-              flusher re-drives the row to published@2 via the
-              vector_written predicate (step-11 Scenario E).
+              would leave the row permanently invisible. ALL THREE
+              branches additionally require NOT (EXISTS published AND
+              NOT EXISTS superseded) on the publish_id so a row whose
+              published@N has already landed (even with later
+              vector_written@N+1 from a racing retry) is NOT
+              re-driven again - wasted Qdrant work, harmless to
+              correctness because the reader's monotonic-published
+              filter (step-9) keeps the row visible. LATERAL join on
+              (publish_id, created_at DESC) from S 8.7.2 for latest
+              event; EXISTS checks on partial (publish_id) WHERE
+              event_kind IN ('published','superseded') index. The
+              flusher calls publisher.RetryExisting(ctx, publish)
+              with each eligible row. Passes the EXISTING
+              EmbeddingPublish row (never a Node) so publish_id +
+              point_id + target_id + embedding_model_version are
+              reused; only a fresh event chain at
+              attempt_index=max(prior)+1 is appended. The
+              deterministic point_id = uuid_v5(NS_EMBEDDING_PUBLISH,
+              publish_id) keeps the re-UpsertPoint idempotent in
+              Qdrant (in-place update). Integration tests: (1) fake
+              Qdrant fails once then succeeds; row reaches
+              'published' at attempt_index=2 and EmbeddingPublish
+              row count stays at 1; (2) UpsertPoint succeeds but
+              FetchPoint errors once; after staleness window the
+              flusher re-drives to published@2 via the
+              vector_written predicate (step-11 Scenario E); (3) NO
+              redundant re-flush after published@1 lands - even an
+              artificially-stale vector_written@2 chain does NOT
+              trigger another flusher attempt (asserts the NOT
+              EXISTS published clause on eligibility).
 
       - id: stage-read-side-filter-and-verification
         title: "Read-side filter, metrics, and S 9.6a integration test"
         steps:
           - id: step-graphreader-published-filter
-            title: "GraphReader recall filters via publish_id payload + active model version + payload cross-check"
+            title: "GraphReader recall filters via monotonic EXISTS published + active model version + payload cross-check"
             expectedFileChanges: 5
             summary: >-
               Modify internal/graphreader recall path to filter Qdrant
-              hits through the S 9.6a 'latest event published' join AND
+              hits through the MONOTONIC-published predicate
+              (EXISTS published AND NOT EXISTS superseded) on the
+              publish_id carried in the Qdrant payload, plus the
               EmbeddingPublish.embedding_model_version = <active>
-              predicate. Join key is the publish_id carried in the
-              Qdrant payload (single SQL lookup into EmbeddingPublish,
-              then the (publish_id, created_at DESC) index for the
-              latest event). After the join the reader MUST reject any
-              hit whose Qdrant payload target_id, target_kind, or
-              embedding_model_version disagree with the joined
-              EmbeddingPublish row (increments
+              predicate. This is NOT a "latest event by created_at
+              DESC = 'published'" scan - that semantics would regress
+              a successful publish when a racing retry lands
+              vector_written@N+1 between winner's vector_written@N
+              and published@N (see plan section "No regression on
+              race" for the concrete walk-through). 'published' is a
+              MONOTONIC TERMINAL STATE; only 'superseded' (out of
+              scope, owned by bulk re-embed driver) can revoke it.
+              Implementation: single SQL lookup into EmbeddingPublish
+              by publish_id, then two EXISTS point-lookups against
+              the partial index (publish_id) WHERE event_kind IN
+              ('published','superseded'). After the join the reader
+              MUST reject any hit whose Qdrant payload target_id,
+              target_kind, or embedding_model_version disagree with
+              the joined EmbeddingPublish row (increments
               recall_filter_unpublished_total with reason=
-              'payload_mismatch') - catches stale/corrupt Qdrant points
-              whose publish_id still resolves. Filtered hits are
-              backfilled from next-best candidates via overfetch
+              'payload_mismatch') - catches stale/corrupt Qdrant
+              points whose publish_id still resolves. Filtered hits
+              are backfilled from next-best candidates via overfetch
               (start with k*2, expand on demand) UNTIL k results are
               reached OR candidates are exhausted (e2e-scenarios.md
               L461) - no unbounded loop.
@@ -194,7 +264,7 @@ phases:
               carries the backlog gauge and active
               embedding_model_version as operational observability only.
           - id: step-9-6a-integration-test
-            title: "Integration tests covering S 9.6a scenarios + identity + liveness + concurrency"
+            title: "Integration tests covering S 9.6a scenarios + identity + liveness + concurrency + at-most-once"
             expectedFileChanges: 4
             summary: >-
               publisher_integration_test.go against deploy/local stack.
@@ -206,31 +276,56 @@ phases:
               queued@1, failed@1, queued@2, vector_written@2,
               published@2. Test ALSO captures every UpsertPoint call
               and asserts both calls use the same deterministic
-              point_id and same payload tuple (publish_id, target_id,
-              target_kind, embedding_model_version) - proves point
-              identity is reused, not just the parent row.
+              point_id AND the same full payload tuple (publish_id,
+              target_id, target_kind, repo_id, kind,
+              embedding_model_version) byte-for-byte.
               Scenario C: row whose latest event is 'queued' is
               excluded from agent.recall and increments
-              recall_filter_unpublished_total; response is NOT degraded
-              (filter drops are normal flow).
+              recall_filter_unpublished_total; response is NOT
+              degraded (filter drops are normal flow).
               Scenario D: when the Qdrant cosine query itself fails,
               agent.recall returns degraded=true,
-              degraded_reason='embedding_index_unavailable' (C22 on the
-              verb response).
+              degraded_reason='embedding_index_unavailable' (C22 on
+              the verb response).
               Scenario E: fake Qdrant UpsertPoint succeeds but
               FetchPoint errors once; publisher leaves row at
               vector_written@1. After staleness window the flusher
-              re-drives it to published@2 (events queued@1,
-              vector_written@1, queued@2, vector_written@2,
-              published@2) - proves the vector_written predicate and
-              deterministic-point_id idempotency together close the
-              S 9.6a liveness gap.
-              Scenario F: two RetryExisting goroutines invoked
-              concurrently on the same publish_id never collide on
-              attempt_index=2 - the loser blocks on the advisory lock,
-              then sees the incremented max and either no-ops or
-              appends queued@3 cleanly. Proves the
-              pg_advisory_xact_lock serialisation contract.
+              re-drives to published@2.
+              Scenario F: two RetryExisting goroutines concurrently
+              on the same non-published publish_id produce exactly
+              one queued@2/vector_written@2/published@2 chain
+              (loser blocks on Tx-A advisory lock, sees reserved
+              queued@2, no-ops). Second sub-case: loser arrives
+              AFTER published@2 - MUST emit ZERO INSERTs
+              (monotonic-published eligibility re-check).
+              Scenario G (actual interleaving race - the
+              monotonic-published reader filter raison d'etre): fake
+              QdrantClient FetchPoint blocks on a test channel.
+              (1) W1 PublishNew -> Tx-A queued@1 -> embed +
+              UpsertPoint -> Tx-B vector_written@1 -> blocks in
+              FetchPoint. (2) Fake clock past
+              AM_PUBLISH_RAW_STALENESS. (3) F2 flusher polls, finds
+              row eligible, RetryExisting enters Tx-A,
+              monotonic-published check false, reserves
+              attempt_index=2, inserts queued@2, runs embed +
+              UpsertPoint (idempotent, same point_id), inserts
+              vector_written@2 in Tx-B; F2's FetchPoint then made
+              to fail (no Tx-C). (4) Release W1's FetchPoint -> Tx-C
+              inserts published@1. (5) ASSERT reader's
+              published-filter SURFACES the row - this is the
+              precise case where a naive "latest by created_at DESC"
+              predicate would DROP the row because newest by clock
+              is vector_written@2; monotonic predicate correctly
+              keeps it visible. (6) ASSERT the next flusher cycle
+              does NOT re-drive the row (NOT EXISTS published
+              clause filters it out).
+              Scenario H (at-most-once on PublishNew): calling
+              PublishNew(node) twice for the same node leaves
+              exactly ONE EmbeddingPublish row total - the second
+              call's ON CONFLICT triggers the tail call to
+              RetryExisting. Asserts the (target_id, target_kind,
+              embedding_model_version) partial UNIQUE invariant is
+              enforced end-to-end.
 
 out_of_scope:
   - "ConceptVersion embedding publication (later Concept Promoter stage; the publisher accepts concept_version_id but is not wired here)."
@@ -243,4 +338,6 @@ out_of_scope:
 open_questions:
   - "LISTEN/NOTIFY wakeup for the flusher vs simple poll - poll is the safer v1 default."
   - "Flusher backoff curve - proposed exponential, capped 5 min, abandoned after 24 h with alert."
-  - "AM_PUBLISH_RAW_STALENESS default - proposed 60 s; confirm with operations once we have real Qdrant FetchPoint p99 numbers."
+  - "AM_PUBLISH_RAW_STALENESS default - proposed 60 s; must be >= p99(UpsertPoint) + p99(FetchPoint) to avoid spurious retries on every slow-but-correct publish. Tune once we have real Qdrant timings."
+  - "AM_PUBLISH_QUEUED_TIMEOUT (single knob shared by Tx-A's 'queued within backoff' no-op and the flusher's queued-poll predicate) - proposed 5 min. Both code paths MUST read the same env var."
+  - "HARD DEPENDENCY: EmbeddingPublish (target_id, target_kind, embedding_model_version) WHERE NOT EXISTS superseded partial UNIQUE index. PublishNew at-most-once relies on it. If phase-foundation-and-schema/stage-embedding-state-log-migrations-and-roles has not added it, step-5 cannot land without a one-migration dependency PR to that stage."

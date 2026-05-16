@@ -63,6 +63,16 @@ func NewPGLookup(db *sql.DB) *PGLookup {
 // `#<namespace>.<function>(` (literal — `LIKE` with the
 // surrounding `%` so the relPath / repo URL are wildcards).
 //
+// User-supplied segments (`namespace`, `function`) flow in
+// from OTel span attributes and routinely contain LIKE
+// metacharacters — `_` is endemic in identifiers (`my_method`,
+// `__init__`) and `%` can appear in URL-encoded paths or
+// generated names. We therefore escape `\`, `%`, `_` in the
+// interpolated segments and pin the escape character with
+// `ESCAPE '\'`. Without this, `my_method` would also match
+// `myXmethod`, broadening the candidate set (extra scan + risk
+// of wrong-candidate selection downstream).
+//
 // A more selective index could be built on a generated column
 // extracting the qualifiedName from canonical_signature, but
 // v1 relies on the (repo_id, kind) index from migration 0003
@@ -81,7 +91,7 @@ func (l *PGLookup) LookupMethodsByName(
 	// `<url>::method::<relPath>#<namespace>.<function>(...)`.
 	// The trailing `(` ensures we don't accept a prefix match
 	// (e.g. searching for `foo.bar` does not match `foo.baz`).
-	pattern := "%#" + qualified + "(%"
+	pattern := "%#" + escapeLikePattern(qualified) + `(%`
 	const q = `
 		SELECT
 		    node_id::text,
@@ -90,7 +100,7 @@ func (l *PGLookup) LookupMethodsByName(
 		FROM node
 		WHERE repo_id = $1
 		  AND kind = 'method'
-		  AND canonical_signature LIKE $2
+		  AND canonical_signature LIKE $2 ESCAPE '\'
 	`
 	rows, err := l.db.QueryContext(ctx, q, repoID, pattern)
 	if err != nil {
@@ -119,6 +129,14 @@ func (l *PGLookup) LookupMethodsByName(
 // Returns the most-specific (smallest line range) one — when
 // multiple Methods overlap (rare, but possible with nested
 // closures) the smallest range is the most precise.
+//
+// `filepath` comes from OTel span attributes and frequently
+// contains `_` (any non-trivial source tree has underscored
+// filenames). We escape `\`, `%`, `_` in the interpolated
+// segment and pin `ESCAPE '\'` on the LIKE; otherwise a query
+// for `foo_bar.py` would also match `fooXbar.py`, and the
+// `LIMIT 1` smallest-range ordering could silently pick the
+// wrong file's method.
 func (l *PGLookup) LookupMethodByLocation(
 	ctx context.Context, repoID, filepath string, lineno int,
 ) (*MethodCandidate, error) {
@@ -129,7 +147,7 @@ func (l *PGLookup) LookupMethodByLocation(
 	// that pins a Method to its file. `%::method::filepath#%`
 	// is the LIKE pattern; the leading `%` covers the
 	// arbitrary-length repo URL prefix.
-	pattern := "%::method::" + filepath + "#%"
+	pattern := "%::method::" + escapeLikePattern(filepath) + "#%"
 	const q = `
 		SELECT
 		    node_id::text,
@@ -140,7 +158,7 @@ func (l *PGLookup) LookupMethodByLocation(
 		FROM node
 		WHERE repo_id = $1
 		  AND kind = 'method'
-		  AND canonical_signature LIKE $2
+		  AND canonical_signature LIKE $2 ESCAPE '\'
 		  AND COALESCE((attrs_json->>'start_line')::int, 0) <= $3
 		  AND COALESCE((attrs_json->>'end_line')::int,   0) >= $3
 		ORDER BY (COALESCE((attrs_json->>'end_line')::int, 0)
@@ -249,4 +267,35 @@ func filePathFromSignature(sig string) string {
 		return rest
 	}
 	return rest[:j]
+}
+
+// escapeLikePattern escapes the SQL LIKE metacharacters `%`
+// and `_` (and the escape character `\` itself) in a user-
+// supplied segment so it can be safely interpolated into a
+// LIKE pattern that already contains literal wildcards. The
+// companion query MUST be issued with `LIKE $N ESCAPE '\'`
+// (PostgreSQL's default escape character is also `\` when no
+// ESCAPE clause is supplied, but pinning it explicitly keeps
+// the contract obvious at the call site and survives any
+// future change to the server default).
+//
+// We rune-iterate rather than byte-iterate so multi-byte
+// UTF-8 sequences (common in international identifiers and
+// path segments) are preserved verbatim — none of the LIKE
+// metacharacters are multi-byte, so the byte-level fast path
+// would also be correct, but ranging by rune is clearer.
+func escapeLikePattern(s string) string {
+	if !strings.ContainsAny(s, `\%_`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 4)
+	for _, r := range s {
+		switch r {
+		case '\\', '%', '_':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

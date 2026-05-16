@@ -265,6 +265,9 @@ func loadConfig() (config, error) {
 		if err != nil {
 			return c, fmt.Errorf("AGENT_MEMORY_SHUTDOWN_TIMEOUT: %w", err)
 		}
+		if d <= 0 {
+			return c, fmt.Errorf("AGENT_MEMORY_SHUTDOWN_TIMEOUT: must be positive, got %v", d)
+		}
 		c.ShutdownTimeout = d
 	}
 	return c, nil

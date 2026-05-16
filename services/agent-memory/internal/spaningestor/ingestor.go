@@ -209,6 +209,19 @@ func (m *IngestorMetrics) add(bucket map[string]*atomic.Int64, repoID string, de
 // per successfully-enqueued span (NOT per-batch).
 func (m *IngestorMetrics) IncIngested(repoID string) { m.inc(m.spansIngested, repoID) }
 
+// AddIngested adjusts the per-repo ingested counter by delta.
+// Normal accumulation should prefer IncIngested so the per-span
+// semantics stay obvious at the call site; AddIngested exists
+// so EnqueueAtomic's defensive partial-overflow rollback can
+// symmetrically undo the IncIngested calls for batches that the
+// rollback retroactively promotes into the dropped ledger.
+// Without this decrement, ingested + dropped would double-count
+// the same spans and corrupt the operator drop-rate ratio
+// (span_dropped_total / span_ingested_total).
+func (m *IngestorMetrics) AddIngested(repoID string, delta int64) {
+	m.add(m.spansIngested, repoID, delta)
+}
+
 // IncDropped is the per-span counter incremented when a batch
 // is rejected at `Enqueue` due to queue-full backpressure. The
 // caller MUST add one per dropped span (not one per dropped
@@ -756,11 +769,22 @@ func (i *Ingestor) EnqueueAtomic(batches []SpanBatch) error {
 			// Defensive: should be unreachable while we hold
 			// the mutex (no other producer, drainer only
 			// consumes). Roll back any accepted sends'
-			// in-flight counts so the supervisor doesn't pin
-			// degraded for never-processed spans, and report
-			// the partial-overflow as ErrQueueFull.
+			// ingested + in-flight counts so the spans the
+			// rollback promotes back into the dropped ledger
+			// are not double-counted as both ingested and
+			// dropped — without the AddIngested(-N) decrement
+			// the operator drop-rate ratio
+			// (span_dropped_total / span_ingested_total)
+			// would be silently corrupted, and the supervisor
+			// would also pin degraded for never-processed
+			// spans. Then count every input span as dropped
+			// to match the precheck rejection path's
+			// semantics, and report the partial-overflow as
+			// ErrQueueFull.
 			for _, ab := range accepted {
-				i.metrics.AddInflight(ab.RepoID, -int64(len(ab.Spans)))
+				n := int64(len(ab.Spans))
+				i.metrics.AddInflight(ab.RepoID, -n)
+				i.metrics.AddIngested(ab.RepoID, -n)
 			}
 			for _, rb := range batches {
 				for range rb.Spans {

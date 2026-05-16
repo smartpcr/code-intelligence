@@ -23,6 +23,7 @@ package retirement
 //       -> TestRetireNode_deleteOnTombstoneSurfacesContractViolation
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -478,11 +479,11 @@ func TestRetireNode_renameLinksNewNodeViaSupersedeAndEdge(t *testing.T) {
 	// (old, new) node fingerprints. This is what makes the
 	// renamed_to edge "point from old to new fingerprint" per
 	// the brief.
-	if !bytesEqual(gotEdgeSrcFP, s.node.Fingerprint.Bytes()) {
+	if !bytes.Equal(gotEdgeSrcFP, s.node.Fingerprint.Bytes()) {
 		t.Errorf("renamed_to edge src fingerprint mismatch:\n got %x\nwant %x",
 			gotEdgeSrcFP, s.node.Fingerprint.Bytes())
 	}
-	if !bytesEqual(gotEdgeDstFP, newNode.Fingerprint.Bytes()) {
+	if !bytes.Equal(gotEdgeDstFP, newNode.Fingerprint.Bytes()) {
 		t.Errorf("renamed_to edge dst fingerprint mismatch:\n got %x\nwant %x",
 			gotEdgeDstFP, newNode.Fingerprint.Bytes())
 	}
@@ -1043,19 +1044,4 @@ func TestRetireManyEdges_anyDuplicateAbortsWholeBatch(t *testing.T) {
 				id, n)
 		}
 	}
-}
-
-// bytesEqual is a tiny helper to keep test assertions readable.
-// bytes.Equal would do; we avoid the extra import in this file
-// since assertions are the only consumer.
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

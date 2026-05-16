@@ -86,24 +86,15 @@ type Writer struct {
 
 // New constructs a Writer over the supplied *sql.DB. The DB must
 // be authenticated as a role that satisfies the GRANTs in
-// migration 0016 (typically `agent_memory_app`).
-//
-// Both `db` and `logger` are required and New panics if either
-// is nil. The asymmetric-fallback path (substituting
-// slog.Default() for a nil logger) was rejected on purpose: the
-// package commits in its doc to emitting exactly one structured
-// audit record per public call, and silently routing those
-// records to whatever the process happens to have configured as
-// the default logger would break the audit-trail guarantee with
-// no visible signal at construction time. Failing loud at New
-// forces a misconfigured caller to surface the bug before any
-// graph mutation is attempted.
+// migration 0016 (typically `agent_memory_app`). A nil logger is
+// replaced with slog.Default(); a nil now-func is replaced with
+// time.Now.
 func New(db *sql.DB, logger *slog.Logger) *Writer {
 	if db == nil {
 		panic("graphwriter: nil *sql.DB")
 	}
 	if logger == nil {
-		panic("graphwriter: nil *slog.Logger")
+		logger = slog.Default()
 	}
 	return &Writer{
 		db:     db,
@@ -622,11 +613,7 @@ func (w *Writer) InsertEdge(ctx context.Context, in EdgeInput) (rec EdgeRecord, 
 // Emits its OWN audit record under op="insert_observed_calls_edge"
 // — it does NOT delegate to InsertEdge, which would produce two
 // log lines per single public call. The underlying SQL work runs
-// through the shared `insertEdgeImpl` helper, which is passed the
-// caller's op name so a SQLSTATE 42501 surfaces as
-// `WriteContractViolation{Op: "InsertObservedCallsEdge"}` rather
-// than the misleading "InsertEdge" label the generic helper would
-// otherwise stamp.
+// through the shared `insertEdgeImpl` helper.
 func (w *Writer) InsertObservedCallsEdge(ctx context.Context, in EdgeInput) (rec EdgeRecord, err error) {
 	in.Kind = "observed_calls"
 	repoIDStr := in.RepoID.String()
@@ -646,66 +633,63 @@ func (w *Writer) InsertObservedCallsEdge(ctx context.Context, in EdgeInput) (rec
 // `auditFields` pointer so this helper can write
 // fingerprint_hex / edge_id / inserted back as they're computed.
 //
-// `op` is the caller's public-method name (e.g. "InsertEdge" or
-// "InsertObservedCallsEdge"). It is forwarded to `runInTx` so a
-// SQLSTATE 42501 surfaces as a `WriteContractViolation` whose
-// `Op` field identifies the actual entry point an operator
-// invoked — using a hardcoded "InsertEdge" here would mislead
-// triage when the call came in through InsertObservedCallsEdge.
-// The same `op` is also used to prefix the validation / lookup
-// error strings produced inside the helper so non-contract
-// failures stay consistent with the contract-violation labelling.
+// `txOp` MUST be the caller's exported method name (e.g.
+// "InsertEdge" or "InsertObservedCallsEdge"). It is threaded to
+// `runInTx` -> `classifyErr` so any `*WriteContractViolation`
+// surfaced from this transaction is labelled with the actual
+// public entry point rather than a hardcoded default — operators
+// triaging SQLSTATE 42501 in audit logs need that distinction.
 //
 // `auditFields.RepoID`, `.Kind`, `.SHA` MUST be pre-populated by
 // the caller — this helper only fills the fields that depend on
 // SQL results.
 func (w *Writer) insertEdgeImpl(
-	ctx context.Context, op string, in EdgeInput, fields *auditFields,
+	ctx context.Context, txOp string, in EdgeInput, fields *auditFields,
 ) (EdgeRecord, error) {
 	if in.Kind == "" {
-		return EdgeRecord{}, fmt.Errorf("graphwriter: %s: empty kind", op)
+		return EdgeRecord{}, errors.New("graphwriter: InsertEdge: empty kind")
 	}
 	if in.SrcNodeID == "" || in.DstNodeID == "" {
-		return EdgeRecord{}, fmt.Errorf("graphwriter: %s: empty src/dst node_id", op)
+		return EdgeRecord{}, errors.New("graphwriter: InsertEdge: empty src/dst node_id")
 	}
 	if in.FromSHA == "" {
-		return EdgeRecord{}, fmt.Errorf("graphwriter: %s: empty from_sha", op)
+		return EdgeRecord{}, errors.New("graphwriter: InsertEdge: empty from_sha")
 	}
 	attrs, err := normaliseAttrs(in.AttrsJSON)
 	if err != nil {
-		return EdgeRecord{}, fmt.Errorf("graphwriter: %s attrs_json: %w", op, err)
+		return EdgeRecord{}, fmt.Errorf("graphwriter: InsertEdge attrs_json: %w", err)
 	}
 	repoIDStr := in.RepoID.String()
 
 	var rec EdgeRecord
-	err = w.runInTx(ctx, op, func(tx *sql.Tx) error {
+	err = w.runInTx(ctx, txOp, func(tx *sql.Tx) error {
 		// Resolve src/dst inside the tx. A single SELECT with
 		// ARRAY[$1,$2] would be cuter but it's harder to map back
 		// to the right endpoint when the rows come back.
 		srcRepo, srcFP, err := lookupNodeFingerprint(ctx, tx, in.SrcNodeID)
 		if err != nil {
-			return fmt.Errorf("graphwriter: %s src: %w", op, err)
+			return fmt.Errorf("graphwriter: InsertEdge src: %w", err)
 		}
 		dstRepo, dstFP, err := lookupNodeFingerprint(ctx, tx, in.DstNodeID)
 		if err != nil {
-			return fmt.Errorf("graphwriter: %s dst: %w", op, err)
+			return fmt.Errorf("graphwriter: InsertEdge dst: %w", err)
 		}
 		if srcRepo != repoIDStr {
 			return fmt.Errorf(
-				"graphwriter: %s: src_node_id %s belongs to repo %s, not %s",
-				op, in.SrcNodeID, srcRepo, repoIDStr,
+				"graphwriter: InsertEdge: src_node_id %s belongs to repo %s, not %s",
+				in.SrcNodeID, srcRepo, repoIDStr,
 			)
 		}
 		if dstRepo != repoIDStr {
 			return fmt.Errorf(
-				"graphwriter: %s: dst_node_id %s belongs to repo %s, not %s",
-				op, in.DstNodeID, dstRepo, repoIDStr,
+				"graphwriter: InsertEdge: dst_node_id %s belongs to repo %s, not %s",
+				in.DstNodeID, dstRepo, repoIDStr,
 			)
 		}
 
 		fp, err := fingerprint.EdgeFingerprint(in.RepoID, in.Kind, srcFP, dstFP, in.FromSHA)
 		if err != nil {
-			return fmt.Errorf("graphwriter: %s fingerprint: %w", op, err)
+			return fmt.Errorf("graphwriter: InsertEdge fingerprint: %w", err)
 		}
 		rec.Fingerprint = fp
 		rec.SrcFP = srcFP
@@ -734,7 +718,7 @@ func (w *Writer) insertEdgeImpl(
 			`
 			if err := tx.QueryRowContext(ctx, selectQ, repoIDStr, fp.Bytes()).
 				Scan(&rec.EdgeID); err != nil {
-				return fmt.Errorf("graphwriter: %s fallback select: %w", op, err)
+				return fmt.Errorf("graphwriter: InsertEdge fallback select: %w", err)
 			}
 			rec.Inserted = false
 			return nil

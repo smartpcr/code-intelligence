@@ -72,8 +72,17 @@ type AgentServiceClient interface {
 	// and durably append a RecallContextLog row before
 	// returning.
 	Recall(ctx context.Context, in *RecallRequest, opts ...grpc.CallOption) (*RecallResponse, error)
-	// Observe is the agent's outcome-record path; owned by
-	// Stage 5.2. Placeholder so the IDL surface is complete.
+	// Observe is the §6.1.2 agent outcome-record path. The
+	// server validates the request (rejects
+	// outcome=human_corrected and caller-supplied
+	// observation_refs[].role=degraded_recall_context),
+	// auto-stamps an extra
+	// observation when the supplied context_id resolves to a
+	// degraded recall row, transactionally appends one
+	// Episode + N Observation rows to the EpisodicLog, and
+	// returns the pre-minted episode_id (so the response is
+	// deterministic even when the writer is later replayed
+	// from the §7.5 WAL).
 	Observe(ctx context.Context, in *ObserveRequest, opts ...grpc.CallOption) (*ObserveResponse, error)
 	// Expand walks structural edges from a node id; owned by
 	// Stage 5.3. Placeholder.
@@ -147,8 +156,17 @@ type AgentServiceServer interface {
 	// and durably append a RecallContextLog row before
 	// returning.
 	Recall(context.Context, *RecallRequest) (*RecallResponse, error)
-	// Observe is the agent's outcome-record path; owned by
-	// Stage 5.2. Placeholder so the IDL surface is complete.
+	// Observe is the §6.1.2 agent outcome-record path. The
+	// server validates the request (rejects
+	// outcome=human_corrected and caller-supplied
+	// observation_refs[].role=degraded_recall_context),
+	// auto-stamps an extra
+	// observation when the supplied context_id resolves to a
+	// degraded recall row, transactionally appends one
+	// Episode + N Observation rows to the EpisodicLog, and
+	// returns the pre-minted episode_id (so the response is
+	// deterministic even when the writer is later replayed
+	// from the §7.5 WAL).
 	Observe(context.Context, *ObserveRequest) (*ObserveResponse, error)
 	// Expand walks structural edges from a node id; owned by
 	// Stage 5.3. Placeholder.

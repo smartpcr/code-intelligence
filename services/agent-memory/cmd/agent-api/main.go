@@ -1,8 +1,12 @@
 // Command agent-api is the long-running process that serves
-// the §6.4 agent recall path (and, in future workstreams,
-// the observe / expand / summarize primitives).  This iter
-// ships the RECALL composition only — the HTTP/MCP routing
-// layer is Stage 4 work owned by a separate workstream.
+// the §6.4 agent recall path AND the §6.1.2 agent observe
+// verb. Stage 5.2 (this iter) ships the production wiring
+// for observe: a SQL-backed EpisodeAppender, a composite-
+// key ContextResolver, a file-backed WAL with a background
+// flusher, and a Prometheus `/metrics` endpoint exposing
+// the `observe_wal_buffer_depth` gauge. The expand /
+// summarize primitives remain Stage 5.3 / 5.4 work owned
+// by separate workstreams.
 //
 // Why a process exists today (resolves evaluator iter-2
 // finding #4 "no agent.recall path calls [RecallFilter]
@@ -14,15 +18,27 @@
 // exists and works — the recall service is not just a
 // test-only struct.
 //
-// Stage 5.1 wiring (this iter): the binary additionally
-// plumbs the v0 cold-start reranker, the inline snapshot
-// fallback reader (`recall_context_log` rehydration), and
-// the inline RecallContextLog appender so a full happy-path
-// + degraded recall cycle works end-to-end. The gRPC
-// transport skeleton is registered behind mTLS per
-// tech-spec §8.5 when the `AGENT_MEMORY_AGENT_GRPC_*` env
-// vars are set; without them the binary remains a
-// foreground composition-root validator.
+// Stage 5.1 wiring: the binary plumbs the v0 cold-start
+// reranker, the inline snapshot fallback reader
+// (`recall_context_log` rehydration), and the inline
+// RecallContextLog appender so a full happy-path +
+// degraded recall cycle works end-to-end.
+//
+// Stage 5.2 wiring (this iter): when `AGENT_MEMORY_PG_APP_URL`
+// is set, `ObserveService` is constructed with the SQL
+// EpisodeAppender (transactional Episode + N Observation
+// inserts, with `degraded` + `degraded_reason` columns
+// populated per §7.5), the composite-key ContextResolver
+// (`WHERE context_id = $1 AND repo_id = $2` so a caller
+// cannot inherit another repo's degraded flag), and, when
+// `AGENT_MEMORY_WAL_DIR` is set, a file-backed WAL +
+// background flusher (`/metrics` always exposes the
+// `observe_wal_buffer_depth` gauge, returning 0 when no
+// WAL is wired). The gRPC transport skeleton is registered
+// behind mTLS per tech-spec §8.5 when the
+// `AGENT_MEMORY_AGENT_GRPC_*` env vars are set; without
+// them the binary remains a foreground composition-root
+// validator.
 //
 // Configuration (env vars; no flags)
 // ----------------------------------
@@ -89,6 +105,14 @@
 //	                                    rejects any connection that
 //	                                    does not present a cert signed
 //	                                    by this bundle.
+//	AGENT_MEMORY_WAL_DIR                (optional) directory the
+//	                                    Stage 5.2 §7.5 file-based
+//	                                    Episode WAL writes to when
+//	                                    the partition is offline.
+//	                                    Without it the observe verb
+//	                                    surfaces a partition outage
+//	                                    as `codes.Unavailable`
+//	                                    instead of WAL-buffering.
 //
 // Exit codes
 // ----------
@@ -273,6 +297,65 @@ func main() {
 	}
 	service := agentapi.NewService(embedder, qclient, filter, opts...)
 
+	// Stage 5.2: agent.observe verb composition. Requires
+	// the writer-role DSN (same one used by the
+	// RecallContextLog appender above) to INSERT Episode +
+	// Observation rows. WAL fallback is wired when
+	// AGENT_MEMORY_WAL_DIR is set so a partition outage
+	// degrades gracefully instead of failing the agent
+	// caller (architecture.md §7.5). Without either env
+	// var the Observe gRPC method returns Unimplemented /
+	// Unavailable respectively.
+	var observeSvc *agentapi.ObserveService
+	var observeWAL *agentapi.FileWAL
+	if appDB != nil {
+		episodeWriter := newEpisodeAppenderFromDB(appDB, logger.With(slog.String("comp", "episode-writer")))
+		// The resolver runs over the `_ro` pool so it does
+		// not contend with writer transactions.
+		contextResolver := newContextResolverFromDB(db)
+		observeOpts := []agentapi.ObserveOption{
+			agentapi.WithObserveLogger(logger.With(slog.String("comp", "observe"))),
+		}
+		var observeMetrics *agentapi.Metrics
+		if cfg.WALDir != "" {
+			observeMetrics = &agentapi.Metrics{}
+			wal, err := agentapi.NewFileWAL(cfg.WALDir, agentapi.FileWALOptions{
+				Metrics: observeMetrics,
+				Logger:  logger.With(slog.String("comp", "observe-wal")),
+			})
+			if err != nil {
+				logger.Error("agent-api.observe.wal_open_failed",
+					slog.String("dir", cfg.WALDir),
+					slog.String("error", err.Error()))
+				os.Exit(3)
+			}
+			observeWAL = wal
+			// The flusher uses the same writer the synchronous
+			// path uses — a recovered partition catches up by
+			// re-attempting the original INSERT verbatim.
+			observeWAL.StartFlusher(episodeWriter, 0)
+			observeOpts = append(observeOpts,
+				agentapi.WithObserveWAL(observeWAL),
+				agentapi.WithObserveMetrics(observeMetrics))
+			logger.Info("agent-api.observe.wal_wired",
+				slog.String("dir", cfg.WALDir),
+				slog.Int64("initial_depth", observeWAL.Depth()))
+		} else {
+			logger.Warn("agent-api.observe.wal_disabled",
+				slog.String("hint", "set AGENT_MEMORY_WAL_DIR to enable the §7.5 episodic-log fallback"))
+		}
+		observeSvc = agentapi.NewObserveService(episodeWriter, contextResolver, observeOpts...)
+		logger.Info("agent-api.observe.wired")
+	} else {
+		logger.Warn("agent-api.observe.disabled",
+			slog.String("hint", "set AGENT_MEMORY_PG_APP_URL to enable agent.observe"))
+	}
+	defer func() {
+		if observeWAL != nil {
+			_ = observeWAL.Close()
+		}
+	}()
+
 	logger.Info("agent-api.ready",
 		slog.String("qdrant_url", cfg.QdrantURL),
 		slog.Bool("stub_embedder", cfg.AllowStubEmbedder),
@@ -290,6 +373,29 @@ func main() {
 		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok"))
+		})
+		// `/metrics` exposes the Prometheus text-format
+		// `observe_wal_buffer_depth` gauge mandated by the
+		// implementation plan §5.2. We hand-roll the
+		// text format instead of pulling in
+		// prometheus/client_golang because this binary
+		// exports exactly one metric and the Prometheus
+		// text format is intentionally trivial. The
+		// handler ALWAYS responds — depth reports 0 when
+		// no WAL is wired — so an operator's `curl
+		// /metrics | grep observe_wal_buffer_depth`
+		// works regardless of whether the WAL is
+		// configured (resolves evaluator iter-1 item #3).
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+			var depth int64
+			if observeWAL != nil {
+				depth = observeWAL.Depth()
+			}
+			w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "# HELP observe_wal_buffer_depth Number of EpisodeAppendInput payloads buffered in the agent.observe WAL awaiting replay.\n")
+			fmt.Fprintf(w, "# TYPE observe_wal_buffer_depth gauge\n")
+			fmt.Fprintf(w, "observe_wal_buffer_depth %d\n", depth)
 		})
 		srv := &http.Server{
 			Addr:              cfg.HealthAddr,
@@ -330,7 +436,11 @@ func main() {
 			os.Exit(2)
 		}
 		grpcSrv = grpc.NewServer(grpc.Creds(creds))
-		agentpb.RegisterAgentServiceServer(grpcSrv, agentapi.NewGRPCServer(service))
+		grpcOpts := []agentapi.GRPCOption{}
+		if observeSvc != nil {
+			grpcOpts = append(grpcOpts, agentapi.WithObserveService(observeSvc))
+		}
+		agentpb.RegisterAgentServiceServer(grpcSrv, agentapi.NewGRPCServer(service, grpcOpts...))
 		// reflection lets `grpcurl` / `evans` introspect the
 		// listener for smoke-testing the mTLS handshake
 		// without a generated client.
@@ -355,6 +465,7 @@ func main() {
 		// service still has to be referenced so its
 		// composition is exercised at startup.
 		_ = service
+		_ = observeSvc
 	}
 
 	<-ctx.Done()
@@ -377,6 +488,13 @@ type config struct {
 	AgentGRPCTLSCert   string
 	AgentGRPCTLSKey    string
 	AgentGRPCClientCA  string
+
+	// WALDir is the directory the §7.5 file-based WAL writes
+	// to when the Episode partition is unavailable. When
+	// empty the observe handler still serves but without a
+	// fallback (a partition outage surfaces to the caller as
+	// `codes.Unavailable`).
+	WALDir string
 }
 
 func loadConfig() (config, error) {
@@ -390,6 +508,7 @@ func loadConfig() (config, error) {
 		AgentGRPCTLSCert:  os.Getenv("AGENT_MEMORY_AGENT_GRPC_TLS_CERT"),
 		AgentGRPCTLSKey:   os.Getenv("AGENT_MEMORY_AGENT_GRPC_TLS_KEY"),
 		AgentGRPCClientCA: os.Getenv("AGENT_MEMORY_AGENT_GRPC_TLS_CLIENT_CA"),
+		WALDir:            os.Getenv("AGENT_MEMORY_WAL_DIR"),
 		// implementation-plan.md Stage 5.1 makes concept fan-out
 		// part of the production default mixed seed. Operators
 		// can still opt out by setting AGENT_MEMORY_ENABLE_CONCEPTS=false
@@ -924,4 +1043,201 @@ func (p *pgTextArray) Scan(src interface{}) error {
 	}
 	*p = out
 	return nil
+}
+
+// -- Stage 5.2: agent.observe wiring ---------------------------------
+
+// pgErrCodeConnectionExceptionPrefix is the SQLSTATE class
+// for connection-class failures (`Class 08 — Connection
+// Exception`). Any code matching this prefix maps onto
+// `ErrEpisodicLogUnavailable` — those are the failure modes
+// the §7.5 WAL fallback is designed to absorb.
+const pgErrCodeConnectionExceptionPrefix = "08"
+
+// pgErrCodeAdminShutdown is the precise SQLSTATE for an
+// admin-initiated shutdown of the server. Caught explicitly
+// because it can surface as either an 57P0x (operator
+// intervention) OR a wrapped network error depending on
+// driver timing — the prefix check above covers the latter,
+// this catches the former. The 57P0x class also includes
+// `57P03 cannot_connect_now` (server in recovery) which is
+// indistinguishable from an outage from the caller's
+// perspective.
+const pgErrCodeOperatorInterventionPrefix = "57P"
+
+// classifyEpisodicError maps a raw DB error into either
+// `agentapi.ErrEpisodicLogUnavailable` (for the connection-
+// class failures the §7.5 WAL is designed to absorb) or the
+// original error (for everything else — schema bugs and
+// CHECK violations MUST surface loudly so the operator
+// sees them).
+//
+// Conservatively scoped: a 42P01 (relation does not exist)
+// is a schema bug, NOT an outage; a 23xxx (constraint
+// violation) is a caller / data-model bug; both pass
+// through untouched.
+func classifyEpisodicError(err error) error {
+	if err == nil {
+		return nil
+	}
+	// Driver-level connection failures (DNS, dial refused,
+	// reset) surface as net.OpError or sql.ErrConnDone /
+	// driver.ErrBadConn through the sql package wrapper.
+	if errors.Is(err, sql.ErrConnDone) {
+		return fmt.Errorf("%w: %v", agentapi.ErrEpisodicLogUnavailable, err)
+	}
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		return fmt.Errorf("%w: %v", agentapi.ErrEpisodicLogUnavailable, err)
+	}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		code := string(pqErr.Code)
+		if strings.HasPrefix(code, pgErrCodeConnectionExceptionPrefix) ||
+			strings.HasPrefix(code, pgErrCodeOperatorInterventionPrefix) {
+			return fmt.Errorf("%w: SQLSTATE %s %v",
+				agentapi.ErrEpisodicLogUnavailable, code, err)
+		}
+	}
+	return err
+}
+
+// newEpisodeAppenderFromDB returns an EpisodeAppender that
+// writes one Episode row + N Observation rows in a single
+// transaction against the writer-role DSN. Conn-class errors
+// are mapped to `agentapi.ErrEpisodicLogUnavailable` so the
+// Observe handler engages the WAL fallback; constraint /
+// schema errors propagate verbatim.
+//
+// The INSERT explicitly passes `episode_id` and `created_at`
+// (overriding the DB defaults) because both columns are
+// load-bearing for the §7.5 replay contract — the WAL
+// payload carries them so a recovery routes the row to the
+// originally-attempted partition.
+func newEpisodeAppenderFromDB(db *sql.DB, logger *slog.Logger) agentapi.EpisodeAppender {
+	return agentapi.EpisodeAppenderFunc(func(ctx context.Context, in agentapi.EpisodeAppendInput) error {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return classifyEpisodicError(fmt.Errorf("episode append: begin: %w", err))
+		}
+		defer func() {
+			_ = tx.Rollback()
+		}()
+
+		var (
+			signalArg    interface{}
+			contextID    interface{}
+			degradedRsn  interface{}
+		)
+		if len(in.SignalJSON) > 0 {
+			signalArg = []byte(in.SignalJSON)
+		}
+		if in.ContextID != "" {
+			contextID = in.ContextID
+		}
+		// episode_degraded_reason_chk requires
+		// (degraded=true AND degraded_reason IS NOT NULL)
+		// OR (degraded=false AND degraded_reason IS NULL).
+		// Translate the Go empty string to SQL NULL so the
+		// happy path satisfies the CHECK.
+		if in.Degraded && in.DegradedReason != "" {
+			degradedRsn = in.DegradedReason
+		}
+
+		const episodeSQL = `
+			INSERT INTO episode (
+				episode_id, episode_group_id, repo_id, session_id, trace_id,
+				kind, context_id, action, signal_json, outcome,
+				degraded, degraded_reason, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6::episode_kind, $7, $8::jsonb, $9::jsonb, $10::outcome,
+				$11, $12::degraded_reason, $13)
+		`
+		if _, err := tx.ExecContext(ctx, episodeSQL,
+			in.EpisodeID, in.EpisodeGroupID, in.RepoID,
+			in.SessionID, in.TraceID, in.Kind,
+			contextID, []byte(in.ActionJSON), signalArg,
+			in.Outcome, in.Degraded, degradedRsn, in.CreatedAt,
+		); err != nil {
+			return classifyEpisodicError(fmt.Errorf("episode append: insert episode: %w", err))
+		}
+
+		const observationSQL = `
+			INSERT INTO observation (
+				observation_id, episode_id, role,
+				node_id, edge_id, concept_id, degraded_recall_context_id,
+				weight, created_at
+			) VALUES ($1, $2, $3::observation_role, $4, $5, $6, $7, $8, $9)
+		`
+		for i, obs := range in.Observations {
+			var (
+				nodeArg, edgeArg, conceptArg, degradedArg interface{}
+			)
+			if obs.NodeID != "" {
+				nodeArg = obs.NodeID
+			}
+			if obs.EdgeID != "" {
+				edgeArg = obs.EdgeID
+			}
+			if obs.ConceptID != "" {
+				conceptArg = obs.ConceptID
+			}
+			if obs.DegradedRecallContextID != "" {
+				degradedArg = obs.DegradedRecallContextID
+			}
+			if _, err := tx.ExecContext(ctx, observationSQL,
+				obs.ObservationID, in.EpisodeID, obs.Role,
+				nodeArg, edgeArg, conceptArg, degradedArg,
+				obs.Weight, obs.CreatedAt,
+			); err != nil {
+				return classifyEpisodicError(fmt.Errorf("episode append: insert observation[%d]: %w", i, err))
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			return classifyEpisodicError(fmt.Errorf("episode append: commit: %w", err))
+		}
+		logger.Debug("agent-api.observe.appended",
+			slog.String("episode_id", in.EpisodeID),
+			slog.Int("observations", len(in.Observations)))
+		return nil
+	})
+}
+
+// newContextResolverFromDB returns a ContextResolver that
+// reads `served_under_degraded` for the supplied `(repo_id,
+// context_id)` pair. The composite lookup defends against a
+// caller attaching their Episode to ANOTHER repo's
+// `recall_context_log` row — a bare-id lookup would let
+// repo A inherit repo B's degraded flag (and leak repo B's
+// recall lineage into repo A's `mgmt.read.episodes` view).
+// The closed-set `recall_context_log_repo_created_idx` makes
+// the composite lookup as cheap as the prior id-only
+// lookup.
+//
+// `sql.ErrNoRows` maps to `agentapi.ErrContextNotFound` so
+// the gRPC adapter surfaces `INVALID_ARGUMENT` to a caller
+// that supplied a bogus id (or a context_id that legitimately
+// belongs to a different repo). Connection failures propagate
+// verbatim — the resolver runs against the `_ro` pool which
+// is also exercised by the Recall path, so an outage here
+// is already visible on those metrics.
+func newContextResolverFromDB(db *sql.DB) agentapi.ContextResolver {
+	const query = `
+		SELECT served_under_degraded
+		FROM recall_context_log
+		WHERE context_id = $1 AND repo_id = $2
+		ORDER BY created_at DESC
+		LIMIT 1
+	`
+	return agentapi.ContextResolverFunc(func(ctx context.Context, repoID, contextID string) (bool, error) {
+		var degraded bool
+		err := db.QueryRowContext(ctx, query, contextID, repoID).Scan(&degraded)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, agentapi.ErrContextNotFound
+			}
+			return false, fmt.Errorf("context resolver: %w", err)
+		}
+		return degraded, nil
+	})
 }

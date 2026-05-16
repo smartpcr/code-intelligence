@@ -25,6 +25,46 @@ import (
 // Pattern-match with `errors.Is(err, graphreader.ErrNotFound)`.
 var ErrNotFound = errors.New("graphreader: row not found")
 
+// MaxListLimit caps every list-style read (ListNodes,
+// ListEdgesFrom) at ten thousand rows. Without this bound a repo
+// with tens of thousands of Nodes — or a pathological file Node
+// with thousands of `contains` edges — would stream every row
+// into the reader's address space on every `agent.recall` /
+// `mgmt.read.*` request, which is the hot path the cap defends.
+//
+// The cap is BOTH the default (applied when a caller passes
+// `Limit <= 0`) AND the maximum (caller-supplied values above
+// this number are silently clamped down). Two roles, one number,
+// because the policy here is a defence — not a UX-tunable page
+// size. Callers who explicitly need < MaxListLimit rows can set
+// `Limit` to a smaller value; nobody needs more in a single
+// round-trip.
+//
+// Silent clamping is intentional but lossy: a caller asking for
+// 50 000 rows and receiving 10 000 has no in-band signal that the
+// result was truncated. Stage 2.2 ships this as the conservative
+// safety net and explicitly defers cursor-based pagination — the
+// stable `ORDER BY` on every list query (see query.go) makes
+// `(last_key, limit)` seek-pagination straightforward to bolt on
+// when a future surface demands exhaustive enumeration.
+const MaxListLimit = 10_000
+
+// normaliseLimit returns the effective `LIMIT` applied to a
+// list-style query for the supplied caller-requested value. See
+// MaxListLimit for the cap policy.
+//
+// Pulled out as a standalone helper so the same clamp rule is
+// shared by `ListNodes` (which reads `ListNodesFilter.Limit`)
+// and `ListEdgesFrom` (which reads `ReaderOptions.Limit`); a
+// future cursor-pagination patch will reuse it for the per-page
+// fetch size.
+func normaliseLimit(requested int) int {
+	if requested <= 0 || requested > MaxListLimit {
+		return MaxListLimit
+	}
+	return requested
+}
+
 // Reader is the read-only access path for the structural graph
 // tables. Construct one with `New`; the underlying pgxpool.Pool
 // is owned by the caller (typically built via `NewPool`).
@@ -61,8 +101,8 @@ func New(pool *pgxpool.Pool, logger *slog.Logger) *Reader {
 
 // ReaderOptions controls per-call behaviour shared across the
 // Reader entry points. The zero value is the production default
-// (`current view, no retired rows`) so omitting the parameter
-// gives the safest behaviour.
+// (`current view, no retired rows, default result cap`) so
+// omitting the parameter gives the safest behaviour.
 type ReaderOptions struct {
 	// IncludeRetired drops the tombstone anti-join, returning
 	// retired Node / Edge rows alongside current ones. When set,
@@ -76,6 +116,27 @@ type ReaderOptions struct {
 	// inspectable after their referenced rows are retired
 	// (risk §9.13).
 	IncludeRetired bool
+
+	// Limit caps the number of rows returned by `ListEdgesFrom`.
+	// It is the "analogous option" — alongside the
+	// `ListNodesFilter.Limit` field consumed by `ListNodes` —
+	// that bounds the two list-style entry points.
+	//
+	// Clamping policy (shared with `ListNodesFilter.Limit`):
+	//
+	//   * `Limit <= 0`             → `MaxListLimit` (default)
+	//   * `0 < Limit <= MaxListLimit` → used as-is
+	//   * `Limit > MaxListLimit`   → `MaxListLimit` (clamped)
+	//
+	// Honoured only by `ListEdgesFrom`. `GetNode` and `GetEdge`
+	// are single-row lookups so `Limit` is meaningless there;
+	// `NeighborhoodCard` is a 1-hop scan whose fan-out is
+	// bounded by the seed Node's outbound degree, so it ignores
+	// this field today (a defensive cap on the card's edge scan
+	// is tracked as a follow-up — see doc.go). `ListNodes`
+	// reads `ListNodesFilter.Limit` instead so per-call list
+	// shape is configured next to the rest of the list filter.
+	Limit int
 }
 
 // NodeRetirement is the tombstone metadata attached to a Node
@@ -144,7 +205,7 @@ type Edge struct {
 //
 // Returns `ErrNotFound` when the row does not exist OR when the
 // row is retired and IncludeRetired is false — see ErrNotFound
-// docs.
+// docs. `opts.Limit` is ignored: GetNode is a single-row lookup.
 func (r *Reader) GetNode(ctx context.Context, nodeID string, opts ReaderOptions) (Node, error) {
 	if nodeID == "" {
 		return Node{}, errors.New("graphreader: GetNode: empty node_id")
@@ -157,7 +218,8 @@ func (r *Reader) GetNode(ctx context.Context, nodeID string, opts ReaderOptions)
 
 // GetEdge fetches a single Edge by id. Same retirement semantics
 // as GetNode: retired Edges are hidden by default and surfaced
-// (with `EdgeRetirement` metadata) on opt-in.
+// (with `EdgeRetirement` metadata) on opt-in. `opts.Limit` is
+// ignored: GetEdge is a single-row lookup.
 func (r *Reader) GetEdge(ctx context.Context, edgeID string, opts ReaderOptions) (Edge, error) {
 	if edgeID == "" {
 		return Edge{}, errors.New("graphreader: GetEdge: empty edge_id")
@@ -178,6 +240,13 @@ func (r *Reader) GetEdge(ctx context.Context, edgeID string, opts ReaderOptions)
 // `kind, edge_id` so successive calls with identical arguments
 // return stable output (important for snapshot tests in
 // downstream stages).
+//
+// `opts.Limit` bounds the row count — see ReaderOptions.Limit
+// for the clamp policy. The query is always issued with a
+// server-side `LIMIT $N` so even a caller that passes the
+// zero-valued options struct cannot trip the OOM hazard a
+// pathological repo (10k+ outbound edges from one Node) would
+// otherwise pose on `agent.recall`.
 func (r *Reader) ListEdgesFrom(
 	ctx context.Context, srcNodeID string, kinds []string, opts ReaderOptions,
 ) ([]Edge, error) {
@@ -189,6 +258,7 @@ func (r *Reader) ListEdgesFrom(
 	}
 
 	query, args := selectEdgesFromQuery(srcNodeID, kinds, opts.IncludeRetired)
+	query, args = appendLimit(query, args, opts.Limit)
 	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("graphreader: ListEdgesFrom query: %w", err)
@@ -198,8 +268,8 @@ func (r *Reader) ListEdgesFrom(
 }
 
 // ListNodesFilter is the structured filter shape ListNodes
-// accepts. The zero value selects every Node in the repo. Each
-// non-zero field adds an AND clause.
+// accepts. The zero value selects every Node in the repo (up to
+// `MaxListLimit`). Each non-zero field adds an AND clause.
 type ListNodesFilter struct {
 	// ParentNodeID restricts the result to Nodes whose
 	// `parent_node_id` is this id. Use the
@@ -216,6 +286,21 @@ type ListNodesFilter struct {
 	// natural-key resolution path callers use when they have a
 	// Java method handle but no node_id.
 	CanonicalSignature string
+	// Limit caps the number of Nodes returned. The clamp policy
+	// matches `ReaderOptions.Limit`:
+	//
+	//   * `Limit <= 0`             → `MaxListLimit` (default)
+	//   * `0 < Limit <= MaxListLimit` → used as-is
+	//   * `Limit > MaxListLimit`   → `MaxListLimit` (clamped)
+	//
+	// Per the reviewer note that drove this field, the cap
+	// stops a repo with tens of thousands of Nodes from
+	// loading every row into memory on every `agent.recall` /
+	// `mgmt.read.*` call. Combine `Limit` with the stable
+	// `ORDER BY (kind, canonical_signature, node_id)` (see
+	// query.go) for deterministic batches; full cursor-based
+	// pagination is deferred (see doc.go).
+	Limit int
 }
 
 // ListNodes returns every Node in `repoID` matching `kinds`
@@ -225,6 +310,14 @@ type ListNodesFilter struct {
 // Stable order: `kind, canonical_signature, node_id` so
 // snapshot tests in downstream stages can assert on a
 // deterministic sequence.
+//
+// `f.Limit` bounds the row count — see ListNodesFilter.Limit
+// for the clamp policy. The query is always issued with a
+// server-side `LIMIT $N` so even a caller that passes the
+// zero-valued filter cannot trip the OOM hazard a large repo
+// would otherwise pose on `agent.recall` / `mgmt.read.*`.
+// `opts.Limit` is ignored on this method; configure list shape
+// alongside the other list filters via `f.Limit`.
 func (r *Reader) ListNodes(
 	ctx context.Context,
 	repoID fingerprint.RepoID,
@@ -240,12 +333,27 @@ func (r *Reader) ListNodes(
 	}
 
 	query, args := selectNodesQuery(repoID, kinds, f, opts.IncludeRetired)
+	query, args = appendLimit(query, args, f.Limit)
 	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("graphreader: ListNodes query: %w", err)
 	}
 	defer rows.Close()
 	return scanNodeRows(rows, opts.IncludeRetired)
+}
+
+// appendLimit clamps the caller-requested limit to
+// `MaxListLimit`, appends it as the next positional parameter,
+// and tacks ` LIMIT $N` onto the SQL string. The space prefix
+// is significant: the SQL strings produced by `query.go` end on
+// the `ORDER BY` line so a bare `LIMIT` token would collide
+// with the trailing whitespace/newline of the multi-line
+// string literal. Returning the new query+args pair keeps the
+// caller free of any "remember to also extend args" hazard.
+func appendLimit(query string, args []any, requested int) (string, []any) {
+	args = append(args, normaliseLimit(requested))
+	query += fmt.Sprintf(" LIMIT $%d", len(args))
+	return query, args
 }
 
 // rowScanner is the minimal interface common to pgx.Row and

@@ -27,10 +27,16 @@ left over from a half-finished publish.
 Tech-spec §9.6a pins the mitigation: two append-only operational tables
 (`EmbeddingPublish` + `EmbeddingPublishEvent`) and a strict 5-step write
 protocol that records every transition without ever rewriting a row, so
-the cross-store invariant is observable from the read side as
-"latest `EmbeddingPublishEvent` for this `publish_id` = `'published'`".
-This stage owns the **writer** that drives that protocol and the
-**reader filter** that consults it.
+the cross-store invariant is observable from the read side as the
+**monotonic predicate** "there exists at least one
+`EmbeddingPublishEvent` of kind `'published'` for this `publish_id`
+**and** no `EmbeddingPublishEvent` of kind `'superseded'` has been
+written for it." See §"No regression on race" for why a naïve "latest
+event by `created_at DESC` = `'published'`" reader contract would
+regress under interleaved retries; the monotonic predicate is the only
+reader contract the writer protocol below actually upholds. This stage
+owns the **writer** that drives that protocol and the **reader filter**
+that consults it.
 
 Constraints inherited from upstream docs:
 - G3 / G4 / G5 — no Node, ConceptVersion, EmbeddingPublish, or
@@ -90,10 +96,14 @@ The GraphReader's recall path gains a `published-filter` that joins
 Qdrant hits to `EmbeddingPublishEvent` via the Qdrant payload's
 `publish_id` (primary key into the log) plus the
 `(publish_id, created_at DESC)` index from §8.7.2, and excludes any row
-whose latest event is not `'published'` **or** whose
-`embedding_model_version` ≠ the active version, incrementing
+whose **monotonic predicate** (`EXISTS published AND NOT EXISTS
+superseded`, see §"No regression on race") does not hold — **or** whose
+`embedding_model_version` ≠ the active version — incrementing
 `recall_filter_unpublished_total` (e2e-scenarios.md L460) per filtered
-hit. When the Qdrant cosine query itself fails (not the join), the
+hit. **This is intentionally not a "latest event by `created_at DESC` =
+`'published'`" predicate**; that semantics would regress a successful
+publish under the race walked through in §"No regression on race".
+When the Qdrant cosine query itself fails (not the join), the
 recall verb's response carries `degraded=true,
 degraded_reason='embedding_index_unavailable'` (C22).
 
@@ -141,10 +151,10 @@ which mandates "a new `'queued'` event row, never an update").
 | Field                       | New publish (full-mode)       | Retry (flusher)                  |
 | --------------------------- | ----------------------------- | -------------------------------- |
 | `publish_id`                | freshly minted (uuid_v7)      | reused from input row            |
-| `point_id`                  | `uuid_v5(publish_id)`         | reused from input row            |
+| `point_id`                  | `uuid_v5(NS_EMBEDDING_PUBLISH, publish_id)` | reused from input row            |
 | `target_id`, `target_kind`  | from the just-committed Node  | reused from input row            |
 | `embedding_model_version`   | from `EmbeddingModel.Version()` at insert time | **always reused as-is.** If it no longer matches the active version, the reader's published-filter silently drops the hit (§9.6). The model-upgrade supersede flow — *new* `EmbeddingPublish` at the active version plus a `superseded` event on the prior `publish_id` — is **owned by the bulk re-embed driver and is out of scope here**. The flusher in this stage **never** mints a new `EmbeddingPublish`. |
-| `attempt_index` (on event)  | `1`                           | reserved inside a short Tx-A that takes `pg_advisory_xact_lock(hashtext(publish_id::text))`, re-reads the latest event for the `publish_id`, no-ops if latest is `published` / `superseded` (so a racing loser cannot regress a successful publish), otherwise inserts `queued@max+1` and commits. Subsequent `vector_written` / `failed` / `published` events for that attempt are committed in separate short transactions **without** the advisory lock — uniqueness on `(publish_id, attempt_index, event_kind)` is enough because the `attempt_index` was already reserved in Tx-A. External embed + Qdrant calls run **outside** any DB transaction. See §"Transaction scope" and §"No regression on race" below for the rationale. |
+| `attempt_index` (on event)  | `1`                           | reserved inside a short Tx-A that takes `pg_advisory_xact_lock(LockKeyForRetry(publish_id))` (64-bit `hashtextextended` per §"`PublishNew` at-most-once contract" / step-4), re-reads the latest event for the `publish_id`, no-ops if latest is `published` / `superseded` (so a racing loser cannot regress a successful publish), otherwise inserts `queued@max+1` and commits. Subsequent `vector_written` / `failed` / `published` events for that attempt are committed in separate short transactions **without** the advisory lock — uniqueness on `(publish_id, attempt_index, event_kind)` is enough because the `attempt_index` was already reserved in Tx-A. External embed + Qdrant calls run **outside** any DB transaction. See §"Transaction scope" and §"No regression on race" below for the rationale. |
 | `EmbeddingPublish` row      | **inserted**                  | **not inserted**                 |
 
 This is what makes the retry path duplication-free: there is one and
@@ -167,9 +177,12 @@ also orphan a Qdrant point with no committed event trail).
 The protocol is therefore three short, independently committed DB
 transactions per attempt, with external I/O strictly between them:
 
-1. **Tx-A — admit attempt.** Open tx, take
-   `pg_advisory_xact_lock(hashtext(publish_id::text))`, re-read the
-   latest event for that `publish_id`, decide eligibility (see "No
+1. **Tx-A — admit attempt.** Open tx, take the advisory lock
+   (`LockKeyForRetry(publish_id)` for `RetryExisting`;
+   `LockKeyForPublishNew(targetKind, targetID, version)` for
+   `PublishNew` — see §"`PublishNew` at-most-once contract" for why
+   the two lock-key namespaces are distinct), re-read the latest
+   event for that `publish_id`, decide eligibility (see "No
    regression on race" below), reserve `attempt_index = max+1`, and
    insert `queued@attempt_index`. Commit. Lock released on commit.
    For `PublishNew` the same transaction also inserts the brand-new
@@ -251,12 +264,24 @@ makes both EXISTS checks point-lookups.
 With monotonic-`published` in place, `RetryExisting` inside Tx-A
 does:
 
-1. Take `pg_advisory_xact_lock(hashtext(publish_id::text))`.
-2. Re-check the monotonic predicate above. If it holds (row is
-   already published and not superseded), **no-op the retry**
-   (release lock on commit and return). This catches the case where
-   `published@N` was written *after* the flusher polled but *before*
-   the flusher entered Tx-A.
+1. Take `pg_advisory_xact_lock(LockKeyForRetry(publish_id))` (64-bit
+   `hashtextextended('publish_retry:' || publish_id::text, 0)`).
+2. **Terminal-state guards (in order).**
+   - If `EXISTS (… event_kind = 'superseded' …)` for this
+     `publish_id`, **no-op the retry** — `'superseded'` is a terminal
+     dead-letter state and the bulk re-embed driver owns any further
+     work for this target. Without this guard, a flusher race could
+     append a fresh `queued / vector_written / published` chain
+     *after* a `'superseded'` event landed, leaving the log in a
+     contradictory state. (Reader correctness still survives because
+     the published-filter also checks `NOT EXISTS superseded`, but
+     the log integrity does not — adopted from the rubber-duck
+     review.)
+   - Else, re-check the monotonic predicate above. If it holds (row
+     is already published and not superseded), **no-op the retry**
+     (release lock on commit and return). This catches the case
+     where `published@N` was written *after* the flusher polled but
+     *before* the flusher entered Tx-A.
 3. Otherwise re-read the latest `EmbeddingPublishEvent` for that
    `publish_id`. If latest is still `'queued'` whose `created_at` is
    newer than `AM_PUBLISH_QUEUED_TIMEOUT` (see "Backoff knob" below),
@@ -267,10 +292,10 @@ does:
    insert `queued@attempt_index`. Commit.
 
 The flusher's eligibility predicate (step-8) is similarly tightened
-with `AND NOT (EXISTS published AND NOT EXISTS superseded)` so a
-published row that still has a stale `vector_written@N+1` chain in
-flight is **not** re-driven again — wasted Qdrant work, harmless to
-correctness but worth avoiding.
+with `AND NOT EXISTS (… 'superseded' …) AND NOT (EXISTS published AND
+NOT EXISTS superseded)` so neither a superseded row nor a published
+row is re-driven — wasted Qdrant work and (for the superseded case)
+contradictory log entries, both worth avoiding.
 
 Combined, the protocol delivers two strong properties:
 
@@ -284,32 +309,133 @@ Combined, the protocol delivers two strong properties:
   `'superseded'` is owned by the bulk re-embed driver, out of scope
   here).
 
-### `PublishNew` at-most-once contract
+### `PublishNew` at-most-once contract — advisory lock + SELECT, no schema dependency
 
 `PublishNew` mints a fresh `publish_id` every time it is called. If
 the Stage 3.1 full-mode handler ever calls it twice for the same
-`(target_id, embedding_model_version)` — handler crash recovery,
-at-least-once worker semantics, an ingest job re-running over the
-same file set — the publisher would happily create **two**
-`EmbeddingPublish` rows with two distinct `publish_id`s and two
-distinct deterministic `point_id`s, surfacing the same node as two
-hits in recall. The plan handles this by:
+target (handler crash recovery, at-least-once worker semantics, an
+ingest job re-running over the same file set), naïve code would
+create **two** `EmbeddingPublish` rows with two distinct `publish_id`s
+and two distinct deterministic `point_id`s, surfacing the same node
+as two hits in recall.
 
-1. **Idempotent insert in `PublishNew`.** The `EmbeddingPublish`
-   insert is `INSERT … ON CONFLICT (target_id, target_kind,
-   embedding_model_version) WHERE NOT EXISTS (… superseded …) DO
-   NOTHING RETURNING publish_id`. If a live row already exists,
-   `PublishNew` reads it back and falls through to a tail call of
-   `RetryExisting(ctx, existing_publish)`, so re-invoking
-   `PublishNew` is at-most-once on (`target_id`, `target_kind`,
-   active `embedding_model_version`).
-2. **Schema assumption.** The
-   `phase-foundation-and-schema/stage-embedding-state-log-migrations-and-roles`
-   stage (a hard dependency) is expected to provide the matching
-   partial UNIQUE index. If it does not, the implementer must open a
-   dependency PR to add it before landing step-5 — `EmbeddingPublish`
-   without that uniqueness constraint cannot guarantee at-most-once.
-   This is called out in §"Open questions" below.
+**Why a partial UNIQUE index cannot enforce this against migration 0015.**
+The natural shape `UNIQUE (target_id, target_kind, embedding_model_version)
+WHERE NOT EXISTS (… superseded …)` is **not implementable** against the
+shipped schema, for three independent reasons:
+
+1. `services/agent-memory/migrations/0015_embedding_publish.sql`
+   defines the target discriminator as two nullable columns —
+   `node_id` and `concept_version_id` (with a CHECK enforcing
+   exactly-one) — not as a `(target_id, target_kind)` pair. There is
+   no `target_id` column to index.
+2. `embedding_publish` is `PARTITION BY RANGE (created_at)`. PostgreSQL
+   requires every UNIQUE index on a partitioned table to **include the
+   partition key**. A unique index over `(node_id, embedding_model_version,
+   created_at)` does not enforce global uniqueness — two inserts at
+   different timestamps would both succeed.
+3. PostgreSQL partial-index predicates **cannot reference another
+   table**. `WHERE NOT EXISTS (SELECT 1 FROM embedding_publish_event …
+   AND event_kind = 'superseded')` is rejected by the planner because
+   `'superseded'` is an `event_kind` value in the sibling table
+   `embedding_publish_event`, not a column on `embedding_publish`.
+
+The plan therefore enforces at-most-once **in the publisher, not in
+the schema**, using a `pg_advisory_xact_lock` keyed on the target +
+model-version tuple. This requires no migration change and is fully
+compatible with the append-only contract:
+
+1. **Tx-A discriminated SELECT under an advisory lock.** Inside the
+   short Tx-A that admits the attempt, before any INSERT, the publisher
+   takes
+   `pg_advisory_xact_lock(LockKeyForPublishNew(targetKind, targetID, version))`.
+   The lock-key helper is exported from the publisher package and uses
+   PostgreSQL `hashtextextended('publish_new:' || targetKind || ':' ||
+   targetID::text || ':' || version, 0)::bigint` so the key is 64-bit
+   (32-bit `hashtext` collisions cause spurious blocking under bulk
+   ingest, never wrong correctness, but the 64-bit variant is the
+   safer default — see rubber-duck finding 3). The lock is released
+   automatically when Tx-A commits.
+2. **Inside the lock, SELECT for any LIVE (non-superseded) publish for
+   this target.** Uses `LIMIT 2` (not `LIMIT 1`) so the implementation
+   can detect — and refuse to silently proceed past — an invariant
+   violation where two non-superseded rows already exist for the same
+   target (rubber-duck finding 4). The SELECT is:
+
+   ```sql
+   SELECT ep.publish_id, ep.qdrant_point_id
+     FROM embedding_publish ep
+    WHERE ep.node_id = $1                                            -- or concept_version_id = $1
+      AND ep.embedding_model_version = $2
+      AND NOT EXISTS (
+        SELECT 1 FROM embedding_publish_event ev
+         WHERE ev.publish_id = ep.publish_id
+           AND ev.event_kind = 'superseded'
+      )
+    ORDER BY ep.created_at DESC
+    LIMIT 2;
+   ```
+
+   The two existing partial indexes
+   (`embedding_publish_node_id_idx` and
+   `embedding_publish_concept_version_id_idx`, both `WHERE … IS NOT
+   NULL`) back the node lookup; the EXISTS check rides the
+   `(publish_id, created_at DESC)` index from §8.7.2 (point lookup,
+   ride-along on the optional partial
+   `(publish_id) WHERE event_kind IN ('published','superseded')` index
+   if step-9 lands it as a perf addition). Note: the partitioned
+   parent has no `(node_id, embedding_model_version)` composite index,
+   so PostgreSQL may probe every monthly partition for the node_id
+   index. That is fast at v1 partition counts but should be re-measured
+   once the rolling window has accumulated >12 months — step-5's
+   implementation note calls this out as an observability ask, not a
+   schema change here.
+3. **Branch A (live row found, `count == 1`):** Tx-A commits with no
+   inserts. The publisher facade then dispatches a **fresh call** to
+   `RetryExisting(ctx, existing_publish)`, which opens its **own**
+   independent Tx-A keyed on
+   `pg_advisory_xact_lock(LockKeyForRetry(publish_id))`. **No nested
+   lock holding** — PublishNew's lock is fully released before
+   RetryExisting acquires its lock. This eliminates the lock-ordering
+   ambiguity flagged by iteration 3's evaluator. The two lock-key
+   namespaces (`publish_new:…` and `publish_retry:…`) cannot collide.
+4. **Branch B (no live row found, `count == 0`):** Tx-A mints
+   `publish_id = uuid_v7()` and `point_id =
+   uuid_v5(NS_EMBEDDING_PUBLISH, publish_id)`, INSERTs the new
+   `EmbeddingPublish` row, INSERTs `queued@1`, commits. The lock is
+   released on commit, then the inner core runs external embed +
+   `UpsertPoint` + Tx-B + `FetchPoint` + Tx-C as described in
+   §"Transaction scope" above.
+5. **Branch C (`count == 2`, invariant violated):** the publisher
+   logs an `embedding_publish_invariant_violation_total{reason=
+   "duplicate_live_publish"}` counter, refuses the attempt, and
+   surfaces an error to the handler so an operator alert fires.
+   This is defence-in-depth — Branch C should never trigger if all
+   writers cooperate via the advisory lock and migration 0015 is
+   unchanged — but a manual SQL repair or a future bug must not be
+   able to silently double-publish.
+
+**Why the advisory lock is sufficient** (and why the schema needs no
+change):
+
+- `pg_advisory_xact_lock` is **cluster-scoped**, not session-scoped.
+  Two concurrent `PublishNew` calls from **different** application
+  processes (or different `agent-memory` HA replicas) connecting to
+  the same PostgreSQL cluster will serialise on the same key, so
+  Branch B → Branch A transitions are visible across processes.
+- The lock is held for **only Tx-A's duration** (a SELECT + at-most-2
+  INSERTs, sub-millisecond). It is **never held across embed or
+  Qdrant calls** — those run after Tx-A commits.
+- Between Tx-A's SELECT and INSERT, **no other writer can slip in for
+  the same target** because the lock is held for the whole transaction.
+- The design contract that **all writers go through `PublishNew`** is
+  honoured by every call site in this stage. Out-of-scope callers
+  that may also insert into `embedding_publish` (the bulk re-embed
+  driver — see §"Out of scope") MUST take the same
+  `LockKeyForPublishNew(targetKind, targetID, version)` lock and must
+  append the prior publish's `superseded` event **in the same Tx-A**
+  as their new `EmbeddingPublish` insert; this contract is called out
+  in §"Out of scope" so the future stage carries it forward.
 
 ### Stale `vector_written` is a flusher-eligible state too
 
@@ -329,11 +455,11 @@ therefore is:
 `RetryExisting` handles all three uniformly by **restarting the full
 event chain** at `attempt_index = max+1` (`queued` → re-upsert →
 `vector_written` → re-check → `published`). The re-upsert is safe
-because `point_id = uuid_v5(publish_id)` is deterministic, so Qdrant
-treats the second upsert as an in-place update of the same point —
-no orphan vectors, no duplicate hits. This keeps the publisher's
-public surface to exactly `PublishNew` + `RetryExisting` (no third
-"resume-from-vector_written" method).
+because `point_id = uuid_v5(NS_EMBEDDING_PUBLISH, publish_id)` is
+deterministic, so Qdrant treats the second upsert as an in-place
+update of the same point — no orphan vectors, no duplicate hits. This
+keeps the publisher's public surface to exactly `PublishNew` +
+`RetryExisting` (no third "resume-from-vector_written" method).
 
 ### Embedding model version
 
@@ -402,8 +528,20 @@ the file count for that PR (≤ 20 enforced server-side).
   `publish_log.go` against the `EmbeddingPublish` /
   `EmbeddingPublishEvent` tables migrated in
   `phase-foundation-and-schema/stage-embedding-state-log-migrations-and-roles`.
-  Unit test asserts the prepared SQL has no `UPDATE`/`DELETE` keyword
-  (defence-in-depth against accidental mutation).
+  Both helpers map the conceptual `(target_kind, target_id)` tuple
+  onto the schema's two-column discriminator (`node_id` /
+  `concept_version_id`, exactly-one CHECK per migration 0015) at the
+  SQL boundary. Also exports two lock-key helpers used by step-5:
+  `LockKeyForPublishNew(targetKind, targetID, version) int64`
+  (`hashtextextended('publish_new:' || targetKind || ':' ||
+  targetID::text || ':' || version, 0)`) and `LockKeyForRetry(publishID)
+  int64` (`hashtextextended('publish_retry:' || publishID::text, 0)`).
+  Centralising key construction (rubber-duck finding 6) prevents
+  implementation drift across call sites; unit tests assert byte-
+  identical key generation for `node` vs `concept_version` and for
+  matching/non-matching versions. Unit test also asserts the prepared
+  SQL has no `UPDATE`/`DELETE` keyword (defence-in-depth against
+  accidental mutation).
 
 ### Stage 2: §9.6a write protocol + wiring
 
@@ -413,50 +551,73 @@ the file count for that PR (≤ 20 enforced server-side).
   Qdrant) runs outside any open PostgreSQL transaction**; each state
   transition is its own short committed tx (see §"Transaction scope"
   for the rationale):
-    - `PublishNew(ctx, node)` — the full-mode call site. Opens **Tx-A**:
-      takes `pg_advisory_xact_lock(hashtext(target_id::text))` (note:
-      keyed on `target_id`, not `publish_id`, because there is no
-      `publish_id` yet and we must serialise concurrent
-      `PublishNew` calls for the same node), then attempts the
-      idempotent insert
-      `INSERT INTO EmbeddingPublish (…) … ON CONFLICT (target_id,
-      target_kind, embedding_model_version) WHERE NOT EXISTS
-      (superseded) DO NOTHING RETURNING publish_id`. If a live row
-      already exists (no row returned), reads it back and **tail-calls
-      `RetryExisting(ctx, existing)`** within the same Tx-A so the
-      handler sees one logical "did the right thing" outcome. If a
-      fresh row was inserted: `publish_id` minted uuid_v7, `point_id =
-      uuid_v5(NS_EMBEDDING_PUBLISH, publish_id)`, stamping
-      `embedding_model_version`, `target_id = node.id`,
-      `target_kind = 'node'`; then inserts `queued@1`, commits.
-      Then runs embed + `UpsertPoint` outside any tx. Opens **Tx-B**:
-      inserts `vector_written@1` (or `failed@1` and returns), commits.
-      Runs `FetchPoint` outside any tx. Opens **Tx-C**: inserts
-      `published@1`, commits.
-      **Happy path row count = 4**: 1 `EmbeddingPublish` + 3
+    - `PublishNew(ctx, node)` — the full-mode call site. Opens **Tx-A**
+      and takes
+      `pg_advisory_xact_lock(LockKeyForPublishNew('node', node.id,
+      activeVersion))` (the helper exported from step-4 produces a
+      64-bit `hashtextextended` key — see §"`PublishNew` at-most-once
+      contract" for why this is the only at-most-once mechanism the
+      shipped schema supports; the prior plan's `ON CONFLICT` over a
+      partial UNIQUE index was **withdrawn** because PostgreSQL cannot
+      create such an index on a `created_at`-partitioned parent with a
+      cross-table NOT EXISTS predicate). With the lock held, Tx-A runs
+      the **`LIMIT 2` live-row SELECT** (see §"`PublishNew`
+      at-most-once contract" for the exact statement):
+        - **Branch A (1 row found)** — Tx-A commits with **zero
+          inserts** (lock released on commit). The publisher facade
+          then dispatches a **fresh, independent** call to
+          `RetryExisting(ctx, existing_publish)`. The fresh call opens
+          its own Tx-A keyed on `LockKeyForRetry(existing.publish_id)`.
+          **No nested lock holding** — PublishNew's `publish_new:…` lock
+          is fully released before RetryExisting's `publish_retry:…`
+          lock is acquired, and the two lock-key namespaces cannot
+          collide. This is the explicit commit / lock-ordering fix to
+          iteration 3's "tail-call within Tx-A" ambiguity.
+        - **Branch B (0 rows found)** — Tx-A mints `publish_id =
+          uuid_v7()`, derives `point_id = uuid_v5(NS_EMBEDDING_PUBLISH,
+          publish_id)`, INSERTs the new `EmbeddingPublish` row
+          (populating either `node_id` or `concept_version_id` per the
+          schema's exactly-one CHECK) with the active
+          `embedding_model_version` stamped, INSERTs `queued@1`, and
+          commits. The lock is released on commit. Then the inner core
+          runs embed + `UpsertPoint` outside any tx; Tx-B inserts
+          `vector_written@1` (or `failed@1` and returns); `FetchPoint`
+          outside any tx; Tx-C inserts `published@1`.
+        - **Branch C (2 rows found — invariant violation)** — Tx-A
+          rolls back, increments
+          `embedding_publish_invariant_violation_total{reason=
+          "duplicate_live_publish"}`, and returns an error to the
+          handler so an operator alert fires (rubber-duck finding 4).
+      **Branch B happy path row count = 4**: 1 `EmbeddingPublish` + 3
       `EmbeddingPublishEvent` rows (`queued`, `vector_written`,
-      `published`).
-    - `RetryExisting(ctx, publish)` — the flusher call site. Reuses
-      the input row's `publish_id` + `point_id` + `target_id` +
-      `embedding_model_version`. Opens **Tx-A**: takes the advisory
-      lock on `hashtext(publish_id::text)`, **first checks the
-      monotonic-published predicate** (`EXISTS published AND NOT
-      EXISTS superseded`). If true, **no-op the retry** and return —
-      this prevents a racing loser from being scheduled to overwrite
-      a successfully-published row (see plan §"No regression on
-      race" for why a latest-by-clock check is not sufficient). If
-      false, re-reads the latest `EmbeddingPublishEvent` for that
-      `publish_id`. If latest is still `'queued'` whose `created_at`
-      is newer than `AM_PUBLISH_QUEUED_TIMEOUT`, also no-op (the
-      prior attempt is still in flight). Otherwise reserves
-      `attempt_index = max+1`, inserts `queued@attempt_index`,
-      commits. Then runs embed + `UpsertPoint` outside any tx, opens
-      Tx-B for `vector_written` / `failed`, runs `FetchPoint`, opens
-      Tx-C for `published` — identical to the post-Tx-A flow of
-      `PublishNew`. **Never** inserts a new `EmbeddingPublish` row.
+      `published`). **Branch A** invokes RetryExisting which has its
+      own row count.
+    - `RetryExisting(ctx, publish)` — the flusher call site (also
+      called by PublishNew Branch A above as a fresh call after Tx-A
+      commits). Reuses the input row's `publish_id` + `point_id` +
+      `node_id` (or `concept_version_id`) + `embedding_model_version`.
+      Opens **Tx-A**: takes the advisory lock on
+      `LockKeyForRetry(publish_id)`. **First** checks `EXISTS (…
+      event_kind = 'superseded' …)` for this `publish_id` — if true,
+      no-ops (terminal dead-letter, rubber-duck finding 1). **Second**
+      checks the monotonic-published predicate (`EXISTS published AND
+      NOT EXISTS superseded`). If true, **no-op the retry** and
+      return — this prevents a racing loser from being scheduled to
+      overwrite a successfully-published row (see plan §"No regression
+      on race" for why a latest-by-clock check is not sufficient). If
+      neither terminal guard fires, re-reads the latest
+      `EmbeddingPublishEvent` for that `publish_id`. If latest is still
+      `'queued'` whose `created_at` is newer than
+      `AM_PUBLISH_QUEUED_TIMEOUT`, also no-op (the prior attempt is
+      still in flight). Otherwise reserves `attempt_index = max+1`,
+      inserts `queued@attempt_index`, commits. Then runs embed +
+      `UpsertPoint` outside any tx, opens Tx-B for `vector_written` /
+      `failed`, runs `FetchPoint`, opens Tx-C for `published` —
+      identical to the post-Tx-A flow of `PublishNew`. **Never**
+      inserts a new `EmbeddingPublish` row.
       **Happy path row count = 3**: 3 `EmbeddingPublishEvent` rows
-      only. **Retry against an already-published row = 0 INSERTs**
-      (no-op).
+      only. **Retry against an already-published or already-superseded
+      row = 0 INSERTs** (no-op).
     - Inner core `publishCore(publish_id, point_id, attempt_index)`
       starts immediately after Tx-A has reserved the attempt and
       committed the initial `queued@attempt_index`. It runs the
@@ -472,29 +633,51 @@ the file count for that PR (≤ 20 enforced server-side).
       flusher predicate (plan §"No regression on race") absorb the
       interleaving without regression.
 
-  Unit test against fake adapters asserts: (a) `PublishNew` emits
-  exactly 4 INSERTs in order across exactly 3 committed transactions
-  on the happy path; (b) `PublishNew` called twice for the same
-  `(target_id, target_kind, embedding_model_version)` produces
-  exactly **one** `EmbeddingPublish` row total (the second call
-  observes the ON CONFLICT, reads the existing row, and tail-calls
-  `RetryExisting` — at-most-once contract); (c) `RetryExisting` on a
-  non-published row emits exactly 3 INSERTs across 3 transactions
-  with the right incremented `attempt_index` and **zero** new
-  `EmbeddingPublish` rows; (d) `RetryExisting` invoked against a row
-  whose `EXISTS published AND NOT EXISTS superseded` predicate holds
-  emits **zero** INSERTs (no-op); (e) on Qdrant upsert failure, the
-  failed-path INSERTs are `EmbeddingPublish (PublishNew only) +
-  queued + failed` and nothing else; (f) **no** UPDATE or DELETE
-  statement is issued in any path; (g) two concurrent `RetryExisting`
-  calls for the same `publish_id` on a non-published row never
-  produce duplicate `attempt_index` values (the second caller blocks
-  on the advisory lock in Tx-A, then either no-ops on the monotonic
-  predicate or reserves `attempt_index = max+2`); (h) the advisory
-  lock is **not** held across the embed / `UpsertPoint` /
-  `FetchPoint` external calls (asserted by injecting a slow fake
-  adapter and observing that a concurrent `RetryExisting` against a
-  *different* `publish_id` proceeds without waiting).
+  Implementation note: the SELECT in PublishNew's Tx-A rides the
+  partial `embedding_publish_node_id_idx` (or `…_concept_version_id_idx`)
+  defined in migration 0015; there is no composite
+  `(node_id, embedding_model_version)` index on the partitioned parent,
+  so PostgreSQL may probe every monthly partition for the node-id
+  seek. At v1 partition counts this is fast, but step-10 must emit an
+  `embedding_publish_tx_a_seconds` histogram so an operator can spot
+  degradation once the rolling partition window crosses ~12 months
+  (rubber-duck finding 5).
+
+  Unit test against fake adapters asserts: (a) `PublishNew` Branch B
+  emits exactly 4 INSERTs in order across exactly 3 committed
+  transactions on the happy path; (b) `PublishNew` called twice for
+  the same `(node_id, embedding_model_version)` produces exactly
+  **one** `EmbeddingPublish` row total (the second call's Tx-A SELECT
+  finds the row, Tx-A commits with zero inserts, and the publisher
+  facade then dispatches a fresh `RetryExisting` call — at-most-once
+  contract enforced via advisory lock + SELECT, **not** via a partial
+  UNIQUE index); (c) `RetryExisting` on a non-published row emits
+  exactly 3 INSERTs across 3 transactions with the right incremented
+  `attempt_index` and **zero** new `EmbeddingPublish` rows;
+  (d) `RetryExisting` invoked against a row whose `EXISTS published
+  AND NOT EXISTS superseded` predicate holds emits **zero** INSERTs
+  (no-op); (d′) `RetryExisting` invoked against a row whose `EXISTS
+  superseded` predicate holds also emits **zero** INSERTs (terminal
+  guard, rubber-duck finding 1); (e) on Qdrant upsert failure, the
+  failed-path INSERTs are `EmbeddingPublish (PublishNew Branch B
+  only) + queued + failed` and nothing else; (f) **no** UPDATE or
+  DELETE statement is issued in any path; (g) two concurrent
+  `RetryExisting` calls for the same `publish_id` on a non-published
+  row never produce duplicate `attempt_index` values (the second
+  caller blocks on the advisory lock in Tx-A, then either no-ops on
+  the monotonic predicate or reserves `attempt_index = max+2`);
+  (g′) two concurrent `PublishNew` calls for the same
+  `(node_id, version)` produce exactly one `EmbeddingPublish` row —
+  the loser observes the winner's row in its post-lock SELECT and
+  takes Branch A (zero inserts); (h) the advisory lock is **not**
+  held across the embed / `UpsertPoint` / `FetchPoint` external
+  calls (asserted by injecting a slow fake adapter and observing
+  that a concurrent `RetryExisting` against a *different*
+  `publish_id` proceeds without waiting); (i) Branch C path: a test
+  that pre-inserts two non-superseded `EmbeddingPublish` rows
+  directly for the same target observes that the next `PublishNew`
+  call refuses the attempt and increments
+  `embedding_publish_invariant_violation_total`.
 - **step-6-model-version-stamping** (`expectedFileChanges: 3`) — wire
   `EmbeddingModel.Version()` into every `EmbeddingPublish` insert and
   add a config flag `AM_EMBEDDING_MODEL_VERSION` that overrides the
@@ -591,9 +774,10 @@ the file count for that PR (≤ 20 enforced server-side).
   operational observability; it is **not** a C22 carrier.
 - **step-11-9_6a-integration-test** (`expectedFileChanges: 4`) —
   add `publisher_integration_test.go` against the
-  `deploy/local/docker-compose.yml` stack (PostgreSQL + Qdrant). Six
-  test cases mirror the work-item scenarios and lock in the identity,
-  liveness, and concurrency contracts:
+  `deploy/local/docker-compose.yml` stack (PostgreSQL + Qdrant).
+  **Nine** test cases mirror the work-item scenarios and lock in the
+  identity, liveness, concurrency, at-most-once, and supersede-
+  guard contracts:
     (a) **Publish state log is complete** — after `PublishNew`, the
     log for the target contains exactly one `EmbeddingPublish` and
     exactly one each of `queued`, `vector_written`, `published` events
@@ -668,15 +852,39 @@ the file count for that PR (≤ 20 enforced server-side).
          `NOT (EXISTS published AND NOT EXISTS superseded)` clause
          filters the row out — no redundant Qdrant call, no
          `attempt_index=3`.
-    (h) **`PublishNew` is at-most-once on (target_id,
+    (h) **`PublishNew` is at-most-once on (node_id,
     embedding_model_version)** — calling `PublishNew(node)` twice
-    for the same node (handler retry) leaves exactly **one**
-    `EmbeddingPublish` row in the log. The second call's ON CONFLICT
-    triggers the tail call to `RetryExisting`, which sees the first
-    attempt is either in-flight or published and no-ops or appends
-    `attempt_index=2`. Asserts the
-    `(target_id, target_kind, embedding_model_version)` partial
-    UNIQUE invariant is enforced end-to-end.
+    for the same node (handler retry) leaves exactly **one** live
+    `EmbeddingPublish` row in the log. The second call's Tx-A SELECT
+    inside the `LockKeyForPublishNew` advisory lock observes the
+    winner's committed row, commits Tx-A with zero inserts (Branch
+    A), and the publisher facade then dispatches a fresh
+    `RetryExisting(existing)` which sees the first attempt is
+    either in-flight (no-op) or already published (no-op) or
+    failed/stale (appends `attempt_index=2`). The test additionally
+    pre-inserts two non-superseded `EmbeddingPublish` rows directly
+    for one target and asserts that a subsequent `PublishNew` call
+    (i) refuses the attempt, (ii) increments
+    `embedding_publish_invariant_violation_total{reason=
+    "duplicate_live_publish"}`, (iii) emits zero further INSERTs
+    (Branch C — the `LIMIT 2` defence-in-depth contract from §
+    "`PublishNew` at-most-once contract"). This asserts the
+    end-to-end at-most-once invariant **without** requiring a
+    partial UNIQUE index — which is unimplementable against
+    migration 0015 (see §"`PublishNew` at-most-once contract" for
+    why).
+    (i) **`RetryExisting` terminal-superseded guard.** A test
+    pre-inserts a `superseded` event on a `publish_id` whose latest
+    pre-supersede event was `failed@1` (no `published` ever
+    landed). The flusher polls and decides this row is eligible by
+    the legacy `latest = failed past backoff` predicate; the test
+    asserts that `RetryExisting`'s **first** Tx-A guard
+    (`EXISTS superseded`) fires and produces **zero** INSERTs —
+    proving the rubber-duck finding 1 fix. The flusher's own
+    eligibility predicate (step-8) should already filter this row
+    out before invoking RetryExisting; this scenario exercises the
+    inside-Tx-A safety net for paths that bypass the flusher (e.g.
+    direct administrative `RetryExisting` calls).
 
 ## Out of scope
 
@@ -704,7 +912,18 @@ the file count for that PR (≤ 20 enforced server-side).
 - **Bulk re-embed driver for model upgrades.** Same boundary as the
   bullet above — this is the `mgmt.snapshot`-driven background job
   that issues the `PublishNew` + `superseded` pairs. Out of scope
-  here.
+  here. **Forward contract that the future stage MUST honour** (so
+  the at-most-once invariant survives across writers, rubber-duck
+  finding 2): (i) the driver MUST take
+  `pg_advisory_xact_lock(LockKeyForPublishNew(targetKind, targetID,
+  newVersion))` before inserting the new `EmbeddingPublish`; (ii) the
+  `superseded` event on the prior `publish_id` and the insert of the
+  new `EmbeddingPublish` row MUST be committed in the **same Tx-A**
+  (atomic transition) so readers never observe either two live rows
+  or zero live rows for the target. If those rules are violated, the
+  PublishNew advisory lock alone cannot prevent duplicates. Calling
+  this out here so the future stage can lift the contract from this
+  plan verbatim.
 - **Delta-mode re-embed.** Stage 3.4 (Delta re-index handler) calls
   the publisher for Methods / Blocks whose canonical signature
   changed. That call site is not part of this stage; it is wired in
@@ -738,193 +957,112 @@ the file count for that PR (≤ 20 enforced server-side).
   "queued within backoff" no-op check and the flusher's queued
   eligibility) — proposed 5 min. Both must read the *same* env var
   so the flusher cannot keep polling a row that Tx-A keeps no-oping.
-- **Hard dependency on `EmbeddingPublish (target_id, target_kind,
-  embedding_model_version) WHERE NOT EXISTS superseded` partial
-  UNIQUE index.** The `PublishNew` at-most-once contract relies on
-  it. If
+- **No schema dependency for at-most-once.** Iteration 3 named a
+  partial UNIQUE index in
   `phase-foundation-and-schema/stage-embedding-state-log-migrations-and-roles`
-  has not added this index, step-5 cannot land without a
-  one-migration dependency PR against that stage. Implementer to
-  confirm at start of step-5.
+  as a hard prerequisite for `PublishNew`. That dependency is
+  **withdrawn**: such an index is not implementable against the
+  shipped `services/agent-memory/migrations/0015_embedding_publish.sql`
+  (two-column discriminator, `created_at`-partitioned parent,
+  no cross-table NOT EXISTS predicates in partial indexes — see
+  §"`PublishNew` at-most-once contract" for the full rationale).
+  At-most-once is enforced by `pg_advisory_xact_lock + SELECT`
+  inside Tx-A, with `LIMIT 2` defence-in-depth and an
+  `embedding_publish_invariant_violation_total` counter. **No
+  migration change is required from
+  `phase-foundation-and-schema/stage-embedding-state-log-migrations-and-roles`.**
+  An optional, additive performance index that step-9 may request —
+  partial `(publish_id) WHERE event_kind IN ('published',
+  'superseded')` on `embedding_publish_event` — would make the
+  reader's two EXISTS lookups point-probes; it is not required for
+  correctness and is called out as a perf nicety, not a blocker.
+- Should the publisher set a per-transaction `statement_timeout` on
+  Tx-A (e.g. 2 s) so a broken connection cannot stall the advisory
+  lock indefinitely? Rubber-duck finding 7 — likely yes, with the
+  exact value tuned during operational shakeout. Not a blocker.
 
-## Prior feedback resolution (iteration 3)
+## Prior feedback resolution (iteration 4)
 
-This section addresses each numbered finding from iteration 2's
-`## What still needs work`:
+Direct response to iteration 3's `## Still needs improvement` list,
+one item per evaluator finding, plus a small set of additional
+rubber-duck blind-spots fixed before push. Iteration 3's four prior
+`## Additional gaps closed …` subsections are intentionally elided
+here — the evaluator flagged them as "overly repetitive"; their
+content is preserved inline in the §"Approach", §"No regression on
+race", §"Transaction scope", and §"`PublishNew` at-most-once
+contract" sections where it actually informs the implementation.
 
-1. **ADDRESSED — "5 INSERTs" insert-count bug.** Plan §"step-5" and
-   work-items.yaml `step-publisher-state-machine` now state the
-   correct counts: `PublishNew` happy path = **4 INSERTs** (1
-   `EmbeddingPublish` + 3 `EmbeddingPublishEvent` rows: `queued`,
-   `vector_written`, `published`); `RetryExisting` happy path = **3
-   INSERTs** (events only); Qdrant-failure path = `EmbeddingPublish
-   (PublishNew only) + queued + failed` and nothing else. Step-11
-   Scenario A asserts the exact 4-row shape.
-2. **ADDRESSED — retry/flusher identity ambiguity.** The publisher
-   now exposes **two narrow entry points** with explicit identity
-   semantics (plan §"Approach" item 3 and §"Identity contract" table):
-   `PublishNew(ctx, node)` mints a fresh `publish_id` + deterministic
-   `point_id`; `RetryExisting(ctx, publish)` reuses `publish_id` +
-   `point_id` + `target_id` + `embedding_model_version` and only
-   appends an event chain with `attempt_index = max(prior) + 1`. The
-   flusher (step-8) is rewritten to call `RetryExisting` with the
-   existing `EmbeddingPublish` row, never a `Node`. Step-11
-   Scenario B asserts that after a retry the
-   `EmbeddingPublish` row count for the target is still **1** and the
-   event chain is `queued@1, failed@1, queued@2, vector_written@2,
-   published@2`.
-3. **ADDRESSED — Qdrant payload identity for dereferencing hits.**
-   Plan §"Approach" item 1 and `step-qdrant-adapter` now specify the
-   payload carries `publish_id` (the single SQL lookup key into
-   `EmbeddingPublish`, per tech-spec line 569's join contract),
-   `target_id`, `target_kind ∈ {'node','concept_version'}`, `repo_id`,
-   `kind`, and `embedding_model_version`. The adapter unit test
-   asserts every field is present and that `point_id ==
-   uuid_v5(publish_id)`. `step-graphreader-published-filter` joins on
-   the payload `publish_id`, not on `(repo_id, kind)` alone.
-4. **ADDRESSED — C22 degraded-handling location.** Plan §"Constraints"
-   re-anchors C22 as an Agent/Management **verb response field**
-   (tech-spec L414). `step-metrics-and-degraded-flag` now sets it on
-   the **recall verb response** (not `/health`, not the writer), and
-   only when the Qdrant cosine query itself fails — *not* when the
-   published-filter merely drops some hits. `/health` keeps only an
-   operational backlog gauge + active model version. Step-11 Scenario
-   D was added to lock in the recall-time C22 behaviour; Scenario C
-   explicitly asserts that filter drops are **not** `degraded`.
+### Prior feedback resolution
 
-### Additional gaps closed in iteration 3 (rubber-duck pass)
+1. **ADDRESSED — at-most-once redesigned for the actual schema.**
+   The evaluator correctly observed that `INSERT … ON CONFLICT
+   (target_id, target_kind, embedding_model_version) WHERE NOT
+   EXISTS superseded` is not implementable against migration 0015 on
+   three independent grounds (column shape, partition-key forced
+   into UNIQUE, no cross-table predicates in partial indexes). The
+   plan now enforces at-most-once **in the publisher** via
+   `pg_advisory_xact_lock(LockKeyForPublishNew(targetKind, targetID,
+   version)) + SELECT … LIMIT 2 + INSERT` inside Tx-A — fully
+   implementable against the shipped schema with no migration
+   change. See §"`PublishNew` at-most-once contract" (rewritten
+   end-to-end) and the rewritten step-5 PublishNew bullet. The
+   schema-dependency open-question bullet is rewritten to state the
+   dependency is **withdrawn**.
+2. **ADDRESSED — stale "latest event = published" reader contract
+   purged.** The Problem section and the Approach section's
+   read-side description now both use the monotonic predicate
+   (`EXISTS published AND NOT EXISTS superseded`), with explicit
+   forward references to §"No regression on race" so a reader
+   following the plan top-down never sees a contradictory
+   contract. All eligibility predicates (RetryExisting Tx-A, flusher
+   step-8, reader filter step-9) use the same monotonic semantics.
+3. **ADDRESSED — `uuid_v5(publish_id)` → `uuid_v5(NS_EMBEDDING_PUBLISH,
+   publish_id)` everywhere.** Every remaining bare `uuid_v5(publish_id)`
+   in the §"Identity contract" table, §"Stale `vector_written`" section,
+   and the prior-feedback churn was rewritten to use the namespaced
+   form. The NS_EMBEDDING_PUBLISH constant is exported from the
+   embedding package (step-2 owns the constant; step-4 / step-5
+   reference it).
+4. **ADDRESSED — explicit commit/lock ordering for PublishNew →
+   RetryExisting dispatch.** PublishNew's Tx-A **always commits
+   before** any dispatch to RetryExisting. Branch A (live row found):
+   Tx-A commits with zero inserts, advisory lock released, then the
+   publisher facade makes a **fresh** RetryExisting call which opens
+   its own Tx-A keyed on a different lock namespace
+   (`publish_retry:…`). **No nested lock holding, no lock-namespace
+   collision** — see the rewritten step-5 PublishNew bullet and
+   §"`PublishNew` at-most-once contract" Branch A.
 
-These are not from iteration 2's checklist but were caught by an
-independent design critique before push. Calling them out so the
-grader can see the surface area:
+### Additional design fixes (rubber-duck pass before iter-4 push)
 
-- **`vector_written` was a dead state.** The original iter-3 flusher
-  only retried `queued`/`failed`; a process crash (or `FetchPoint`
-  failure) between `vector_written` and `published` would have left
-  the row invisible to recall forever. Step-8's eligibility predicate
-  now includes `vector_written` past `AM_PUBLISH_RAW_STALENESS`, and
-  the deterministic `point_id = uuid_v5(publish_id)` makes the
-  re-`UpsertPoint` idempotent in Qdrant. Step-11 Scenario E exercises
-  this recovery path.
-- **`attempt_index` increment was racy.** Two flusher replicas could
-  both `SELECT max(attempt_index)` and append at `N+1`. `RetryExisting`
-  now wraps the read/write in a transaction that takes
-  `pg_advisory_xact_lock(hashtext(publish_id::text))`. Step-11
-  Scenario F asserts concurrent retries never produce a duplicate
-  `attempt_index`.
-- **Model-version row in the identity-contract table was
-  self-contradictory.** It said retry "creates a new `EmbeddingPublish`
-  at the active version" while the rest of the plan said retry NEVER
-  inserts a new row. The row is rewritten: retry always reuses the
-  stored version; the reader filter drops the hit if it is no longer
-  active; the supersede flow is moved fully into Out of scope.
-- **Step-11 Scenario B did not actually prove `point_id` reuse.** It
-  is now strengthened to capture every `UpsertPoint` call and assert
-  the deterministic `point_id` + full payload tuple is identical
-  across the original attempt and the retry — not just that the
-  parent `EmbeddingPublish` count stayed at 1.
-- **Reader payload cross-check was implicit.** Step-9 now requires the
-  reader to reject Qdrant hits whose payload `target_id`,
-  `target_kind`, or `embedding_model_version` disagree with the joined
-  `EmbeddingPublish` row (incrementing the filter counter with a
-  `reason="payload_mismatch"` label) — catches stale/corrupt Qdrant
-  points whose `publish_id` still resolves.
-- **`len == k` was absolute.** Step-9 now says overfetch backfills
-  "until `k` results are reached **or** candidates are exhausted",
-  not an unbounded loop.
-
-### Additional gaps closed in iteration 3 (second rubber-duck pass)
-
-A second independent design critique caught two more substantive
-correctness issues before this push. Both are now reflected in the
-plan and work-items:
-
-- **`publishCore` was wrapping external embed + Qdrant calls inside
-  one PostgreSQL transaction.** A crash mid-tx would have **rolled
-  back** the `vector_written` event we depend on for staleness
-  recovery, and could orphan a Qdrant point with no committed event
-  trail. It also serialised every retry against the same
-  `publish_id` for hundreds of milliseconds of remote latency,
-  contradicting the "short lock window" claim. The protocol is now
-  three short committed transactions per attempt — Tx-A
-  (advisory-locked eligibility + reserve `queued@N`), Tx-B
-  (`vector_written` / `failed`), Tx-C (`published`) — with external
-  embed + `UpsertPoint` + `FetchPoint` running **outside** any open
-  DB transaction. See plan §"Transaction scope" and the rewritten
-  step-5. The step-5 unit test now asserts (a) the lock is **not**
-  held across the external calls (slow-fake adapter test) and (b)
-  there are exactly 3 committed transactions per happy path.
-- **Concurrent `RetryExisting` could regress a successful publish to
-  unpublished.** The prior iter-3 wording allowed the lock loser to
-  "append `queued@3` cleanly" even if the winner had already reached
-  `published@2`, which would temporarily hide a correctly-published
-  vector (and could leave it as `failed@3` if the unnecessary retry
-  failed). `RetryExisting` now performs an explicit eligibility
-  re-read inside Tx-A and **no-ops** if the latest event is
-  `'published'` or `'superseded'`. See plan §"No regression on race".
-  Step-11 Scenario F is rewritten with a second sub-case that
-  asserts the loser performs **zero** INSERTs when arriving after
-  `published@2`.
-- **UUIDv5 namespace was unpinned.** `point_id = uuid_v5(publish_id)`
-  was ambiguous because UUIDv5 needs a namespace. The plan now pins
-  it to a fixed exported constant `NS_EMBEDDING_PUBLISH` so
-  independent implementations and tests produce byte-identical
-  `point_id`s. See plan §"Approach" item 1 and step-2.
-- **Scenario B payload assertion was a subset.** The Qdrant adapter
-  unit test asserts the full 6-tuple but Scenario B only asserted
-  4 fields. Scenario B now asserts the same full tuple
-  (`publish_id`, `target_id`, `target_kind`, `repo_id`, `kind`,
-  `embedding_model_version`) byte-for-byte across the failed and
-  retried `UpsertPoint` calls.
-
-### Additional gaps closed in iteration 3 (third rubber-duck pass)
-
-A third independent design critique caught two genuinely substantive
-race-condition gaps that the prior passes had missed. Both are
-correctness bugs (not just "could be tightened"); both are now
-addressed in the plan:
-
-- **The advisory lock alone did NOT prevent regression of a
-  successful publish.** The prior wording claimed the
-  `pg_advisory_xact_lock` + Tx-A eligibility re-check together
-  guarantee "no regression of a successful publish on race". A
-  concrete walk-through (now in plan §"No regression on race")
-  shows that with the Tx-A / Tx-B / Tx-C split + a
-  `vector_written` staleness threshold, a loser flusher can enter
-  Tx-A *between* the winner's Tx-B and Tx-C, reserve attempt N+1,
-  reach `vector_written@N+1`, and overwrite the winner's
-  about-to-be-`published@N` in the "latest by `created_at DESC`"
-  view. Fix: the reader's published-filter and both eligibility
-  predicates (Tx-A re-check + flusher poll) now use the
-  **monotonic** predicate `EXISTS published AND NOT EXISTS
-  superseded` — once any attempt has reached `published`, the row
-  is permanently visible until `superseded` (out of scope, owned by
-  bulk re-embed). Step-11 Scenario G was added to exercise the
-  precise interleaving the prior tests did not cover (loser enters
-  Tx-A between winner's `vector_written` and `published`). Step-8
-  flusher predicate now adds `AND NOT (EXISTS published AND NOT
-  EXISTS superseded)` so a successfully-published row is not
-  redundantly re-driven.
-- **`PublishNew` had no at-most-once contract.** Handler crash
-  recovery or at-least-once worker semantics would call
-  `PublishNew(node)` twice for the same `(target_id,
-  embedding_model_version)` and produce **two** `EmbeddingPublish`
-  rows with two distinct `publish_id`s and two distinct
-  deterministic `point_id`s — i.e., the same node surfacing as two
-  hits in recall. Fix: `PublishNew`'s `INSERT … ON CONFLICT
-  (target_id, target_kind, embedding_model_version) WHERE NOT
-  EXISTS superseded DO NOTHING RETURNING publish_id` gracefully
-  tail-calls `RetryExisting` when a live row already exists, so
-  re-invocation is at-most-once on the active version. The
-  dependency on the partial UNIQUE index in
-  `phase-foundation-and-schema/stage-embedding-state-log-migrations-and-roles`
-  is now called out explicitly in §"Open questions". Step-11
-  Scenario H asserts the end-to-end at-most-once invariant.
-- **`AM_PUBLISH_QUEUED_TIMEOUT` was implicit.** Tx-A said "no-op if
-  latest is queued within backoff" but the backoff value was
-  undefined; the flusher's poll cadence was a separate concept
-  with its own undefined backoff. Two undefined timers cannot agree
-  by accident. Fix: one named env var
-  `AM_PUBLISH_QUEUED_TIMEOUT` (proposed 5 min) is now the single
-  knob shared by both, and is wired through step-5 (`RetryExisting`
-  Tx-A eligibility) and step-8 (flusher queued-poll predicate).
+- **`superseded` is now a terminal guard in RetryExisting.** Prior
+  iter-3 only no-oped on `EXISTS published AND NOT EXISTS
+  superseded`. A flusher arriving after a model-upgrade `superseded`
+  event (but before any `published` ever landed on that publish_id)
+  would have appended a fresh `queued / vector_written / published`
+  chain *after* the supersede. Log correctness now matches reader
+  correctness: RetryExisting checks `EXISTS superseded` first as a
+  terminal dead-letter guard. See plan §"No regression on race"
+  step 2 and step-5 unit-test assertion (d′).
+- **Lock-key helper centralised + 64-bit hash.** Iter-3 used
+  ad-hoc `hashtext(publish_id::text)` (32-bit). Step-4 now exports
+  `LockKeyForPublishNew` and `LockKeyForRetry` using
+  `hashtextextended(…, 0)` for a 64-bit key, with unit tests
+  asserting byte-identical key generation across call sites.
+- **`LIMIT 2` defence-in-depth for the at-most-once SELECT.** A
+  pre-existing duplicate live row (manual repair, future bug, or a
+  non-cooperating writer) would have been silently masked by `LIMIT
+  1`. PublishNew now selects up to two rows and refuses the attempt
+  with `embedding_publish_invariant_violation_total{reason=
+  "duplicate_live_publish"}` if two are returned.
+- **Tx-A latency observable.** Step-10 emits an
+  `embedding_publish_tx_a_seconds` histogram so operators can spot
+  the partition-probe regression flagged in step-5's implementation
+  note once the rolling partition window crosses ~12 months.
+- **Bulk re-embed driver contract spelled out in §"Out of scope".**
+  Any future writer that creates a publish for an existing
+  `(target, model)` tuple MUST take the same
+  `LockKeyForPublishNew(…)` advisory lock, and the supersede event
+  on the prior `publish_id` MUST be appended **in the same Tx-A** as
+  the new `EmbeddingPublish` insert. Without that contract, the
+  bulk driver can race PublishNew and produce two live rows.

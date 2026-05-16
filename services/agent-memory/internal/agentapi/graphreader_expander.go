@@ -54,6 +54,21 @@
 // silently swallowing the outage (the pre-iter-2 behaviour)
 // or surfacing it as a hard 5xx.
 //
+// `context.Canceled` is intentionally NOT classified as a
+// graph-store outage: it signals that the CALLER walked
+// away (e.g. a gRPC client cancelled the stream or hit its
+// own deadline before passing one to us). Promoting it to
+// `ErrGraphStoreUnavailable` would route the request into
+// `degradedFallback`, whose snapshot lookup also runs on
+// the same already-cancelled context — producing a
+// misleading degraded envelope tagged
+// `graph_store_unavailable` when the real cause was client
+// cancellation. Letting `context.Canceled` propagate
+// untouched lets the recall handler treat it as a soft
+// expansion error and the downstream ctx-aware calls
+// surface the cancellation naturally (gRPC will translate
+// it to `CANCELLED`).
+//
 // All other errors (validation failures, malformed
 // signatures, etc.) propagate as-is and the recall handler
 // treats them as soft failures.
@@ -445,16 +460,32 @@ func dedupeStrings(in []string) []string {
 //
 // Recognised shapes:
 //
-//   - `context.DeadlineExceeded` / `context.Canceled` —
-//     the caller's deadline blew through; treat as a
-//     transient outage so the snapshot fallback can serve
-//     the agent.
+//   - `context.DeadlineExceeded` — a server-side timeout
+//     (the request blew through the deadline the server
+//     wrapped around the pool call). This is a real
+//     "store is slow or down" signal and the snapshot
+//     fallback can usefully serve the agent.
 //   - `*net.OpError` — TCP / socket failures (refused,
 //     reset, timeout).
 //   - `*pgconn.ConnectError` — pgx's typed "couldn't open
 //     a connection" wrapper.
 //   - `*pgconn.PgError` with SQLSTATE class 08 — "connection
 //     exception" (08000-08P01 per the postgres docs).
+//
+// `context.Canceled` is INTENTIONALLY NOT classified as a
+// graph-store outage. Cancellation is a caller-side signal
+// (the gRPC client closed the stream, the upstream
+// orchestrator hit its own deadline, etc.) and not a sign
+// that pgxpool is broken. Promoting it to
+// `ErrGraphStoreUnavailable` would route the call into
+// `degradedFallback`, whose snapshot lookup runs on the
+// same already-cancelled context and ALSO fails — leaving
+// the agent with a misleading degraded envelope tagged
+// `graph_store_unavailable` when the real cause was the
+// caller giving up. Letting `context.Canceled` propagate
+// untouched lets the recall handler treat it as a soft
+// error and surface the cancellation naturally on the next
+// ctx-aware call.
 //
 // Anything else propagates as a non-degraded error and the
 // recall handler treats it as a soft expansion failure.
@@ -473,7 +504,10 @@ func isGraphStoreUnavailable(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+	// NOTE: context.Canceled is deliberately excluded — see
+	// the doc comment above. Only DeadlineExceeded counts
+	// as a server-side outage signal.
+	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
 	var opErr *net.OpError

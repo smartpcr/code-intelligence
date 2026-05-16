@@ -14,35 +14,81 @@
 // exists and works — the recall service is not just a
 // test-only struct.
 //
+// Stage 5.1 wiring (this iter): the binary additionally
+// plumbs the v0 cold-start reranker, the inline snapshot
+// fallback reader (`recall_context_log` rehydration), and
+// the inline RecallContextLog appender so a full happy-path
+// + degraded recall cycle works end-to-end. The gRPC
+// transport skeleton is registered behind mTLS per
+// tech-spec §8.5 when the `AGENT_MEMORY_AGENT_GRPC_*` env
+// vars are set; without them the binary remains a
+// foreground composition-root validator.
+//
 // Configuration (env vars; no flags)
 // ----------------------------------
 //
-//	AGENT_MEMORY_PG_RO_URL           postgres:// DSN for the
-//	                                 reader-role connection
-//	                                 (REQUIRED).  Should be a
-//	                                 `agent_memory_ro` DSN so
-//	                                 the recall path is
-//	                                 mechanically read-only.
-//	AGENT_MEMORY_QDRANT_URL          Qdrant base URL (REQUIRED)
-//	AGENT_MEMORY_QDRANT_API_KEY      Qdrant api-key (optional)
-//	AGENT_MEMORY_ALLOW_STUB_EMBEDDER if "true", uses an
-//	                                 in-process stub query
-//	                                 embedder.  Same caveat as
-//	                                 cmd/repoindexer — NOT FIT
-//	                                 FOR PRODUCTION.  Required
-//	                                 today until the real
-//	                                 embedder workstream
-//	                                 lands.
-//	AGENT_MEMORY_HEALTH_ADDR         (optional) bind address
-//	                                 for a tiny health probe
-//	                                 endpoint.  Default
-//	                                 disabled (the binary
-//	                                 stays foreground).  This
-//	                                 hook lets Kubernetes
-//	                                 liveness/readiness probes
-//	                                 see the process before
-//	                                 the Stage 4 HTTP router
-//	                                 lands.
+//	AGENT_MEMORY_PG_RO_URL              postgres:// DSN for the
+//	                                    reader-role connection
+//	                                    (REQUIRED).  Should be a
+//	                                    `agent_memory_ro` DSN so
+//	                                    the recall path is
+//	                                    mechanically read-only.
+//	AGENT_MEMORY_PG_APP_URL             postgres:// DSN for the
+//	                                    writer-role connection
+//	                                    used by the Stage 5.1
+//	                                    Step-6 RecallContextLog
+//	                                    appender (OPTIONAL).
+//	                                    When unset the recall
+//	                                    response carries an
+//	                                    empty `ContextID`.
+//	AGENT_MEMORY_QDRANT_URL             Qdrant base URL (REQUIRED)
+//	AGENT_MEMORY_QDRANT_API_KEY         Qdrant api-key (optional)
+//	AGENT_MEMORY_ALLOW_STUB_EMBEDDER    if "true", uses an
+//	                                    in-process stub query
+//	                                    embedder.  Same caveat as
+//	                                    cmd/repoindexer — NOT FIT
+//	                                    FOR PRODUCTION.  Required
+//	                                    today until the real
+//	                                    embedder workstream
+//	                                    lands.
+//	AGENT_MEMORY_ENABLE_CONCEPTS        if "true", the recall
+//	                                    handler fans out across
+//	                                    the `agent_memory_concept`
+//	                                    Qdrant collection as part
+//	                                    of the Stage 5.1 §7.8
+//	                                    mixed seed. **Default
+//	                                    true** — the
+//	                                    implementation-plan
+//	                                    Stage-5.1 contract makes
+//	                                    {method, block, concept}
+//	                                    the production default;
+//	                                    set this to "false" only
+//	                                    when the Concept collection
+//	                                    is not yet provisioned in
+//	                                    the target environment.
+//	AGENT_MEMORY_HEALTH_ADDR            (optional) bind address
+//	                                    for a tiny health probe
+//	                                    endpoint.  Default
+//	                                    disabled (the binary
+//	                                    stays foreground).  This
+//	                                    hook lets Kubernetes
+//	                                    liveness/readiness probes
+//	                                    see the process before
+//	                                    the Stage 4 HTTP router
+//	                                    lands.
+//	AGENT_MEMORY_AGENT_GRPC_ADDR        (optional) bind address
+//	                                    for the mTLS gRPC server
+//	                                    skeleton (tech-spec §8.5).
+//	                                    Requires the three TLS
+//	                                    env vars below; absence
+//	                                    disables the listener.
+//	AGENT_MEMORY_AGENT_GRPC_TLS_CERT    server certificate path.
+//	AGENT_MEMORY_AGENT_GRPC_TLS_KEY     server private key path.
+//	AGENT_MEMORY_AGENT_GRPC_TLS_CLIENT_CA  client-cert CA bundle path.
+//	                                    Required for mTLS: the server
+//	                                    rejects any connection that
+//	                                    does not present a cert signed
+//	                                    by this bundle.
 //
 // Exit codes
 // ----------
@@ -54,10 +100,14 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -66,11 +116,18 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/reflection"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/agentapi"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/embedding"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphreader"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/recallcontext"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/spaningestor"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
+	agentpb "github.com/smartpcr/code-intelligence/services/agent-memory/proto/agent"
 )
 
 func main() {
@@ -130,15 +187,99 @@ func main() {
 		}
 		return agentapi.HealthState{Degraded: st.Degraded, Reason: st.Reason, Source: st.Source}, nil
 	})
-	service := agentapi.NewService(embedder, qclient, filter,
+
+	// Stage 5.1: v0 cold-start reranker. The in-process,
+	// no-trained-model reranker keeps the recall path useful
+	// for the first deployment; later iters can swap it for
+	// a learned model loaded from the `reranker_model` table
+	// without touching this binary (the agentapi.Reranker
+	// interface is the contract).
+	reranker := agentapi.NewV0ColdStartReranker(nil)
+	logger.Info("agent-api.reranker", slog.String("model_version", reranker.ModelVersion()))
+
+	// Stage 5.1 Step-4: graph expansion adapter. The
+	// production expander wraps `*graphreader.Reader` (the
+	// Stage 2.2 abstraction the rest of the read path
+	// already consumes) so retired-row filtering, edge-kind
+	// validation, and the server-side LIMIT clamp all
+	// flow through one code path (evaluator iter-1 #5).
+	// `graphreader.NewPool` runs the role assertion at
+	// pool construction so a misconfigured DSN (e.g.
+	// pointing at the `_app` role) fails fast at startup.
+	gReaderPool, err := graphreader.NewPool(ctx, cfg.PGURL, graphreader.PoolOptions{})
+	if err != nil {
+		logger.Error("agent-api.graphreader.pool", slog.String("error", err.Error()))
+		os.Exit(3)
+	}
+	defer gReaderPool.Close()
+	gReader := graphreader.New(gReaderPool, logger.With(slog.String("comp", "graphreader")))
+	// Stage 5.1 step 4: the GraphReader-backed BFS expander.
+	// Wired with the SQL-backed EdgeObservationCounter so the
+	// proto `EdgeCard.observation_count` field reflects the
+	// real Stage 4.2 trace_observation aggregate instead of
+	// a hard-coded zero (evaluator iter-2 finding #4).
+	obsCounter := newObservationCounterFromDB(db, logger)
+	expander := agentapi.NewGraphReaderExpander(gReader, nil, agentapi.DefaultExpanderFanOut).
+		WithObservationCounter(obsCounter)
+
+	// Stage 5.1 Step-6: RecallContextLog appender. Wraps
+	// `*recallcontext.Log` (Stage 2.4) so the writer
+	// inherits the validator + role-assertion +
+	// SQLSTATE-classifier contract instead of duplicating
+	// it inline (evaluator iter-1 #7). Optional —
+	// requires AGENT_MEMORY_PG_APP_URL pointing at a
+	// writer-role DSN.
+	var appDB *sql.DB
+	var contextLog agentapi.ContextLogAppender
+	if cfg.PGAppURL != "" {
+		var err error
+		appDB, err = openPG(ctx, cfg.PGAppURL, logger.With(slog.String("role", "app")))
+		if err != nil {
+			logger.Error("agent-api.pg_app_open", slog.String("error", err.Error()))
+			os.Exit(3)
+		}
+		rcLog := recallcontext.New(appDB, gReader, logger.With(slog.String("comp", "recallcontext")))
+		contextLog = newContextLogAppenderFromRecallContext(rcLog, logger)
+		logger.Info("agent-api.context_log.wired")
+	} else {
+		logger.Warn("agent-api.context_log.disabled",
+			slog.String("hint", "set AGENT_MEMORY_PG_APP_URL to enable RecallContextLog audit rows"))
+	}
+
+	// Stage 5.1 Step-6: degraded snapshot source. Reads the
+	// most recent `recall_context_log` row for a repo via
+	// the `_ro` pool AND rehydrates the referenced Node /
+	// Edge / Concept cards through GraphReader with
+	// `IncludeRetired=true` (evaluator iter-1 #8 — pre-
+	// iter-2 the snapshot returned bare id arrays so the
+	// degraded envelope was unusable).  Connection errors
+	// during hydration are mapped onto
+	// `ErrGraphStoreUnavailable` so the degraded fallback
+	// still emits the §C22 closed-set signal even when the
+	// underlying graph store is down.
+	snapshot := newSnapshotSourceFromDB(db, gReader, obsCounter, logger)
+
+	opts := []agentapi.Option{
 		agentapi.WithLogger(logger),
-		agentapi.WithHealthSource(healthSource))
+		agentapi.WithHealthSource(healthSource),
+		agentapi.WithReranker(reranker),
+		agentapi.WithSeedExpander(expander),
+		agentapi.WithExpansionDepth(1),
+		agentapi.WithSnapshotFallback(snapshot),
+		agentapi.WithConceptsEnabled(cfg.EnableConcepts),
+	}
+	if contextLog != nil {
+		opts = append(opts, agentapi.WithContextLog(contextLog))
+	}
+	service := agentapi.NewService(embedder, qclient, filter, opts...)
 
 	logger.Info("agent-api.ready",
 		slog.String("qdrant_url", cfg.QdrantURL),
 		slog.Bool("stub_embedder", cfg.AllowStubEmbedder),
+		slog.Bool("concepts_enabled", cfg.EnableConcepts),
 		slog.String("collection_method", embedding.CollectionMethod),
-		slog.String("collection_block", embedding.CollectionBlock))
+		slog.String("collection_block", embedding.CollectionBlock),
+		slog.String("collection_concept", embedding.CollectionConcept))
 
 	// Optional health probe.  Cheap; lets the operator confirm
 	// the process is alive without standing up the Stage 4
@@ -169,31 +310,91 @@ func main() {
 		}()
 	}
 
-	// Reference `service` so the linker does NOT GC the
-	// composition.  The actual HTTP/MCP routing wiring (which
-	// will call `service.Recall(ctx, req)`) is Stage 4.
-	// Until then this binary is the smallest live proof that
-	// the production composition compiles and starts.
-	_ = service
+	// Stage 5.1: mTLS gRPC server. The protoc-generated
+	// bindings for `proto/agent.proto` now exist
+	// (`proto/agent/agent_grpc.pb.go`) so this listener
+	// actually registers `AgentService.Recall` instead of
+	// only proving the TLS handshake. The adapter in
+	// `agentapi.NewGRPCServer` translates the proto wire
+	// shape onto the in-process `*agentapi.Service` and
+	// maps domain sentinel errors (`ErrEmptyQuery`, etc.)
+	// onto `codes.InvalidArgument`; everything else
+	// degrades to `codes.Internal` because the recall
+	// handler already projects dependency outages onto a
+	// snapshot envelope internally.
+	var grpcSrv *grpc.Server
+	if cfg.AgentGRPCAddr != "" {
+		creds, err := loadMTLS(cfg)
+		if err != nil {
+			logger.Error("agent-api.grpc.tls_load", slog.String("error", err.Error()))
+			os.Exit(2)
+		}
+		grpcSrv = grpc.NewServer(grpc.Creds(creds))
+		agentpb.RegisterAgentServiceServer(grpcSrv, agentapi.NewGRPCServer(service))
+		// reflection lets `grpcurl` / `evans` introspect the
+		// listener for smoke-testing the mTLS handshake
+		// without a generated client.
+		reflection.Register(grpcSrv)
+		lis, err := net.Listen("tcp", cfg.AgentGRPCAddr)
+		if err != nil {
+			logger.Error("agent-api.grpc.listen", slog.String("error", err.Error()))
+			os.Exit(3)
+		}
+		go func() {
+			logger.Info("agent-api.grpc.listen",
+				slog.String("addr", cfg.AgentGRPCAddr),
+				slog.String("service", "AgentService"))
+			if err := grpcSrv.Serve(lis); err != nil {
+				logger.Error("agent-api.grpc.serve_failed",
+					slog.String("error", err.Error()))
+			}
+		}()
+		defer grpcSrv.GracefulStop()
+	} else {
+		// Keep the linker honest: without an addr, the
+		// service still has to be referenced so its
+		// composition is exercised at startup.
+		_ = service
+	}
 
 	<-ctx.Done()
 	logger.Info("agent-api.shutdown")
+	if appDB != nil {
+		_ = appDB.Close()
+	}
 }
 
 type config struct {
 	PGURL             string
+	PGAppURL          string
 	QdrantURL         string
 	QdrantAPIKey      string
 	HealthAddr        string
 	AllowStubEmbedder bool
+	EnableConcepts    bool
+
+	AgentGRPCAddr      string
+	AgentGRPCTLSCert   string
+	AgentGRPCTLSKey    string
+	AgentGRPCClientCA  string
 }
 
 func loadConfig() (config, error) {
 	c := config{
-		PGURL:        os.Getenv("AGENT_MEMORY_PG_RO_URL"),
-		QdrantURL:    os.Getenv("AGENT_MEMORY_QDRANT_URL"),
-		QdrantAPIKey: os.Getenv("AGENT_MEMORY_QDRANT_API_KEY"),
-		HealthAddr:   os.Getenv("AGENT_MEMORY_HEALTH_ADDR"),
+		PGURL:             os.Getenv("AGENT_MEMORY_PG_RO_URL"),
+		PGAppURL:          os.Getenv("AGENT_MEMORY_PG_APP_URL"),
+		QdrantURL:         os.Getenv("AGENT_MEMORY_QDRANT_URL"),
+		QdrantAPIKey:      os.Getenv("AGENT_MEMORY_QDRANT_API_KEY"),
+		HealthAddr:        os.Getenv("AGENT_MEMORY_HEALTH_ADDR"),
+		AgentGRPCAddr:     os.Getenv("AGENT_MEMORY_AGENT_GRPC_ADDR"),
+		AgentGRPCTLSCert:  os.Getenv("AGENT_MEMORY_AGENT_GRPC_TLS_CERT"),
+		AgentGRPCTLSKey:   os.Getenv("AGENT_MEMORY_AGENT_GRPC_TLS_KEY"),
+		AgentGRPCClientCA: os.Getenv("AGENT_MEMORY_AGENT_GRPC_TLS_CLIENT_CA"),
+		// implementation-plan.md Stage 5.1 makes concept fan-out
+		// part of the production default mixed seed. Operators
+		// can still opt out by setting AGENT_MEMORY_ENABLE_CONCEPTS=false
+		// (e.g. during cold-start / pre-promoter bring-up).
+		EnableConcepts: true,
 	}
 	if c.PGURL == "" {
 		return c, errors.New("AGENT_MEMORY_PG_RO_URL is required")
@@ -207,6 +408,19 @@ func loadConfig() (config, error) {
 			return c, fmt.Errorf("AGENT_MEMORY_ALLOW_STUB_EMBEDDER: %w", err)
 		}
 		c.AllowStubEmbedder = b
+	}
+	if v := os.Getenv("AGENT_MEMORY_ENABLE_CONCEPTS"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return c, fmt.Errorf("AGENT_MEMORY_ENABLE_CONCEPTS: %w", err)
+		}
+		c.EnableConcepts = b
+	}
+	if c.AgentGRPCAddr != "" {
+		if c.AgentGRPCTLSCert == "" || c.AgentGRPCTLSKey == "" || c.AgentGRPCClientCA == "" {
+			return c, errors.New(
+				"AGENT_MEMORY_AGENT_GRPC_ADDR set without AGENT_MEMORY_AGENT_GRPC_TLS_{CERT,KEY,CLIENT_CA}: mTLS is mandatory")
+		}
 	}
 	return c, nil
 }
@@ -326,4 +540,388 @@ func (t *apiKeyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		rt = http.DefaultTransport
 	}
 	return rt.RoundTrip(clone)
+}
+
+// loadMTLS reads the cert/key/CA bundle from disk and
+// builds a credentials.TransportCredentials that requires
+// mutual auth. Returns a typed error on any I/O or parse
+// failure so the binary can fail-fast with a clean message
+// (rather than discovering misconfiguration on the first
+// connection).
+func loadMTLS(cfg config) (credentials.TransportCredentials, error) {
+	cert, err := tls.LoadX509KeyPair(cfg.AgentGRPCTLSCert, cfg.AgentGRPCTLSKey)
+	if err != nil {
+		return nil, fmt.Errorf("load server cert/key: %w", err)
+	}
+	caPEM, err := os.ReadFile(cfg.AgentGRPCClientCA)
+	if err != nil {
+		return nil, fmt.Errorf("read client CA bundle: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("parse client CA bundle: no PEM blocks found in %q", cfg.AgentGRPCClientCA)
+	}
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		// mTLS: every client connection MUST present a cert
+		// chain that validates against the configured CA
+		// bundle. The §8.5 tech-spec calls this out as the
+		// non-negotiable transport invariant.
+		ClientAuth: tls.RequireAndVerifyClientCert,
+		ClientCAs:  pool,
+		MinVersion: tls.VersionTLS13,
+	}
+	return credentials.NewTLS(tlsCfg), nil
+}
+
+// newContextLogAppenderFromRecallContext wraps a
+// `*recallcontext.Log` (Stage 2.4) and adapts it onto the
+// `agentapi.ContextLogAppender` interface. This is the
+// replacement for the previous inline INSERT
+// (`newContextLogAppenderFromDB`) — evaluator iter-1 #7
+// flagged the duplication: the inline path bypassed the
+// helper's validation (`validateAppendInput` — verb enum,
+// non-zero RepoID, well-formed JSON, well-formed UUIDs,
+// non-empty reranker version) AND its structured-log
+// emission, so a future change to either contract would
+// silently skew between the two writers.
+//
+// The adapter translates the agentapi-shape RepoID (a
+// textual UUID) into the typed `fingerprint.RepoID` the
+// writer requires, surfaces any parse failure as a
+// soft-degrade signal the recall handler already tolerates
+// (logged + empty ContextID), and forwards the rest of the
+// payload verbatim.
+func newContextLogAppenderFromRecallContext(rcLog *recallcontext.Log, logger *slog.Logger) agentapi.ContextLogAppender {
+	return agentapi.ContextLogAppenderFunc(func(ctx context.Context, in agentapi.ContextLogInput) (agentapi.ContextLogRecord, error) {
+		repoID, err := fingerprint.ParseRepoID(in.RepoID)
+		if err != nil {
+			// Recall handler classifies any non-nil error
+			// as soft — it warn-logs and keeps the response
+			// without a context_id. Returning the parse
+			// error keeps the observability trail honest.
+			return agentapi.ContextLogRecord{}, fmt.Errorf("context log: parse repo_id %q: %w", in.RepoID, err)
+		}
+		queryJSON := json.RawMessage(in.QueryJSON)
+		if len(queryJSON) == 0 {
+			// The writer rejects an empty `query_json`
+			// outright; synthesize a minimal `{}` so the
+			// audit row still lands when the caller's
+			// downstream JSON marshalling drops the field.
+			queryJSON = json.RawMessage(`{}`)
+		}
+		rec, err := rcLog.Append(ctx, recallcontext.AppendInput{
+			Verb:                 in.Verb,
+			RepoID:               repoID,
+			QueryJSON:            queryJSON,
+			NodeIDs:              in.NodeIDs,
+			EdgeIDs:              in.EdgeIDs,
+			ConceptIDs:           in.ConceptIDs,
+			RerankerModelVersion: in.RerankerModelVersion,
+			ServedUnderDegraded:  in.ServedUnderDegraded,
+		})
+		if err != nil {
+			return agentapi.ContextLogRecord{}, err
+		}
+		logger.Debug("agent-api.context_log.appended",
+			slog.String("context_id", rec.ContextID),
+			slog.String("repo_id", in.RepoID),
+			slog.Bool("degraded", in.ServedUnderDegraded),
+		)
+		return agentapi.ContextLogRecord{ContextID: rec.ContextID}, nil
+	})
+}
+
+// newSnapshotSourceFromDB loads the most recent
+// `recall_context_log` row for a repo and HYDRATES the
+// referenced Node / Edge / Concept rows through the
+// GraphReader (evaluator iter-1 #8 — the previous version
+// returned bare id arrays, leaving the degraded envelope
+// useless because the agent caller could not render any
+// card metadata without a follow-up query).
+//
+// Hydration policy:
+//   - Each id is dereffed via `GetNode` / `GetEdge` /
+//     `GetConcept` with `IncludeRetired = true` so a degraded
+//     snapshot remains inspectable even after the underlying
+//     row has been tombstoned (architecture.md §9.13 risk).
+//   - `graphreader.ErrNotFound` on any single id is logged
+//     and skipped — the snapshot is best-effort and we'd
+//     rather return N-1 cards than fail the whole degraded
+//     response.
+//   - Connection-class errors (the graph store is
+//     genuinely unreachable) are mapped onto
+//     `agentapi.ErrGraphStoreUnavailable` so the recall
+//     handler emits the §C22 `graph_store_unavailable`
+//     closed-set signal instead of leaking a transport
+//     error to the agent.
+//
+// Returns agentapi.ErrNoSnapshot when the repo has no
+// prior non-degraded recall row (cold-start) OR when the
+// supplied `repoID` is not a well-formed UUID — `repo_id`
+// is a `uuid` column, and bypassing pre-validation would
+// hit Postgres with a guaranteed-to-fail cast that surfaces
+// as SQLSTATE 22P02 (`invalid_input_syntax_for_type_uuid`),
+// which `classifyGraphStoreError` does not recognise as a
+// graph-store outage. The recall handler projects
+// `ErrNoSnapshot` onto an empty-hits degraded envelope —
+// the same shape it produces for a cold-start repo — which
+// is the right behaviour for a malformed id (it has, by
+// definition, no snapshot row).
+func newSnapshotSourceFromDB(db *sql.DB, gReader *graphreader.Reader, obsCounter agentapi.EdgeObservationCounter, logger *slog.Logger) agentapi.SnapshotSource {
+	return agentapi.SnapshotSourceFunc(func(ctx context.Context, repoID string) (agentapi.RecallSnapshot, error) {
+		// Pre-validate the RepoID before issuing the
+		// query. This mirrors the appender path
+		// (`newContextLogAppenderFromRecallContext`) which
+		// already runs `fingerprint.ParseRepoID` up front,
+		// keeping both writers and readers on the same
+		// validation contract. A malformed RepoID is
+		// surfaced as `ErrNoSnapshot` so the recall
+		// handler stays on the soft path (warn-free empty
+		// degraded envelope) instead of routing through
+		// the generic SQL error branch.
+		if _, parseErr := fingerprint.ParseRepoID(repoID); parseErr != nil {
+			logger.Warn("agent-api.snapshot.repo_id_malformed",
+				slog.String("repo_id", repoID),
+				slog.String("error", parseErr.Error()))
+			return agentapi.RecallSnapshot{}, agentapi.ErrNoSnapshot
+		}
+
+		const q = `
+SELECT context_id::text,
+       (SELECT COALESCE(array_agg(x::text), ARRAY[]::text[]) FROM unnest(node_ids)    AS x),
+       (SELECT COALESCE(array_agg(x::text), ARRAY[]::text[]) FROM unnest(edge_ids)    AS x),
+       (SELECT COALESCE(array_agg(x::text), ARRAY[]::text[]) FROM unnest(concept_ids) AS x),
+       reranker_model_version
+  FROM recall_context_log
+ WHERE repo_id = $1
+   AND served_under_degraded = false
+ ORDER BY created_at DESC
+ LIMIT 1`
+		var (
+			snap       agentapi.RecallSnapshot
+			nodeIDs    pgTextArray
+			edgeIDs    pgTextArray
+			conceptIDs pgTextArray
+		)
+		row := db.QueryRowContext(ctx, q, repoID)
+		if err := row.Scan(
+			&snap.ContextID,
+			&nodeIDs,
+			&edgeIDs,
+			&conceptIDs,
+			&snap.RerankerModelVersion,
+		); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return agentapi.RecallSnapshot{}, agentapi.ErrNoSnapshot
+			}
+			return agentapi.RecallSnapshot{}, fmt.Errorf("snapshot: scan: %w", err)
+		}
+
+		// Hydrate Node cards. We use IncludeRetired so the
+		// snapshot remains usable even when the row that
+		// inspired it has since been tombstoned (the
+		// caller wanted "what was true at recall time", not
+		// "what is true now").
+		readerOpts := graphreader.ReaderOptions{IncludeRetired: true}
+		for _, id := range nodeIDs {
+			n, err := gReader.GetNode(ctx, id, readerOpts)
+			if err != nil {
+				if errors.Is(err, graphreader.ErrNotFound) {
+					logger.Warn("agent-api.snapshot.node_missing", slog.String("node_id", id))
+					continue
+				}
+				return agentapi.RecallSnapshot{}, classifyGraphStoreError(err, "snapshot.node")
+			}
+			snap.Nodes = append(snap.Nodes, agentapi.NodeHit{
+				NodeID:             n.NodeID,
+				RepoID:             n.RepoID,
+				Kind:               n.Kind,
+				CanonicalSignature: n.CanonicalSignature,
+			})
+		}
+		for _, id := range edgeIDs {
+			e, err := gReader.GetEdge(ctx, id, readerOpts)
+			if err != nil {
+				if errors.Is(err, graphreader.ErrNotFound) {
+					logger.Warn("agent-api.snapshot.edge_missing", slog.String("edge_id", id))
+					continue
+				}
+				return agentapi.RecallSnapshot{}, classifyGraphStoreError(err, "snapshot.edge")
+			}
+			snap.Edges = append(snap.Edges, agentapi.EdgeHit{
+				EdgeID:    e.EdgeID,
+				RepoID:    e.RepoID,
+				Kind:      e.Kind,
+				SrcNodeID: e.SrcNodeID,
+				DstNodeID: e.DstNodeID,
+			})
+		}
+		// Populate EdgeHit.ObservationCount on the snapshot
+		// edges using the same SQL-backed counter the
+		// expander wires. Soft failure: counts stay zero on
+		// the degraded response if the trace_observation
+		// query fails, since the rest of the snapshot is
+		// already the load-bearing signal for the agent.
+		if obsCounter != nil && len(snap.Edges) > 0 {
+			ids := make([]string, 0, len(snap.Edges))
+			for _, e := range snap.Edges {
+				if e.EdgeID != "" {
+					ids = append(ids, e.EdgeID)
+				}
+			}
+			if counts, err := obsCounter.CountByEdgeIDs(ctx, ids); err == nil {
+				for i := range snap.Edges {
+					if c, ok := counts[snap.Edges[i].EdgeID]; ok {
+						snap.Edges[i].ObservationCount = c
+					}
+				}
+			} else {
+				logger.Warn("agent-api.snapshot.observation_counts",
+					slog.String("error", err.Error()))
+			}
+		}
+		for _, id := range conceptIDs {
+			c, err := gReader.GetConcept(ctx, id)
+			if err != nil {
+				if errors.Is(err, graphreader.ErrNotFound) {
+					logger.Warn("agent-api.snapshot.concept_missing", slog.String("concept_id", id))
+					continue
+				}
+				return agentapi.RecallSnapshot{}, classifyGraphStoreError(err, "snapshot.concept")
+			}
+			snap.Concepts = append(snap.Concepts, agentapi.ConceptHit{
+				ConceptID: c.ConceptID,
+				Name:      c.Name,
+			})
+		}
+		return snap, nil
+	})
+}
+
+// newObservationCounterFromDB returns a SQL-backed
+// EdgeObservationCounter that resolves
+// `trace_observation.observation_count` for a batch of
+// edge ids in ONE round-trip. The `_ro` role has SELECT on
+// `trace_observation` per migration 0017 §reader_role.
+//
+// Missing rows in the result map (i.e. edges with no
+// recorded observations) are correctly reflected as a zero
+// count when the consumer iterates the result by edge_id.
+// Connection-class failures are wrapped onto
+// `agentapi.ErrGraphStoreUnavailable` so the expander can
+// route the error into the degraded fallback path.
+func newObservationCounterFromDB(db *sql.DB, logger *slog.Logger) agentapi.EdgeObservationCounter {
+	return observationCounterFunc(func(ctx context.Context, edgeIDs []string) (map[string]int64, error) {
+		if len(edgeIDs) == 0 {
+			return map[string]int64{}, nil
+		}
+		// `pq.Array` encodes a `[]string` as the canonical
+		// `text[]` literal. Postgres coerces it to `uuid[]`
+		// (the column type) implicitly because every
+		// element is a well-formed uuid; the cast is safer
+		// in SQL than in driver-side code because a single
+		// malformed id surfaces as a SQLSTATE 22P02 we can
+		// log instead of a panic.
+		const q = `
+SELECT edge_id::text, observation_count
+  FROM trace_observation
+ WHERE edge_id = ANY($1::uuid[])`
+		rows, err := db.QueryContext(ctx, q, pq.Array(edgeIDs))
+		if err != nil {
+			if agentapi.IsGraphStoreUnavailable(err) {
+				return nil, fmt.Errorf("%w: trace_observation: %v",
+					agentapi.ErrGraphStoreUnavailable, err)
+			}
+			logger.Warn("agent-api.observation_counts.query",
+				slog.String("error", err.Error()))
+			return nil, fmt.Errorf("trace_observation: %w", err)
+		}
+		defer rows.Close()
+		out := make(map[string]int64, len(edgeIDs))
+		for rows.Next() {
+			var (
+				id    string
+				count int64
+			)
+			if err := rows.Scan(&id, &count); err != nil {
+				return nil, fmt.Errorf("trace_observation: scan: %w", err)
+			}
+			out[id] = count
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("trace_observation: rows: %w", err)
+		}
+		return out, nil
+	})
+}
+
+// observationCounterFunc adapts a function literal onto the
+// EdgeObservationCounter interface so the SQL wiring lives
+// in one place without a one-off struct.
+type observationCounterFunc func(ctx context.Context, edgeIDs []string) (map[string]int64, error)
+
+func (f observationCounterFunc) CountByEdgeIDs(ctx context.Context, edgeIDs []string) (map[string]int64, error) {
+	return f(ctx, edgeIDs)
+}
+
+// classifyGraphStoreError maps a graphreader error onto
+// either `ErrGraphStoreUnavailable` (when the pool /
+// connection is genuinely down) or the original error
+// (when the failure is a domain issue like a malformed id).
+// The recall handler routes the unavailable signal to the
+// `graph_store_unavailable` degraded reason.
+func classifyGraphStoreError(err error, op string) error {
+	if agentapi.IsGraphStoreUnavailable(err) {
+		return fmt.Errorf("%s: %w", op, agentapi.ErrGraphStoreUnavailable)
+	}
+	return fmt.Errorf("%s: %w", op, err)
+}
+
+// pgTextArray scans a Postgres `text[]` column into a Go
+// `[]string` without pulling in the `lib/pq` dep for one
+// call site. The driver-side representation of `text[]` is
+// a curly-brace delimited literal (`{a,b,c}`); we parse
+// the trivial subset our snapshot query emits (well-formed
+// UUID strings, no quoting, no embedded commas).
+type pgTextArray []string
+
+func (p *pgTextArray) Scan(src interface{}) error {
+	if src == nil {
+		*p = nil
+		return nil
+	}
+	var s string
+	switch v := src.(type) {
+	case string:
+		s = v
+	case []byte:
+		s = string(v)
+	default:
+		return fmt.Errorf("pgTextArray: unsupported scan type %T", src)
+	}
+	s = strings.TrimSpace(s)
+	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
+		return fmt.Errorf("pgTextArray: malformed array literal %q", s)
+	}
+	inner := s[1 : len(s)-1]
+	if inner == "" {
+		*p = nil
+		return nil
+	}
+	parts := strings.Split(inner, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		v := strings.TrimSpace(part)
+		// The snapshot query already coerces to text via
+		// `::text`, so we never see NULL markers or quoted
+		// elements. A defensive trim of NULL keeps a future
+		// schema migration from blowing this up silently.
+		if v == "" || strings.EqualFold(v, "NULL") {
+			continue
+		}
+		out = append(out, v)
+	}
+	*p = out
+	return nil
 }

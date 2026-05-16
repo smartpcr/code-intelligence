@@ -37,6 +37,7 @@ package agentapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -141,6 +142,26 @@ type HealthState struct {
 // `NewService`; `Recall` is the only exported method today.
 // Future Stage-4 work will add `Observe` / `Expand` /
 // `Summarize` to this struct.
+//
+// Stage 5.1 dependencies
+// ----------------------
+// The three required dependencies (`embedder`, `searcher`,
+// `filter`) implement Steps 1–3 of §6.4 — embed query,
+// k-NN against Qdrant, filter unpublished hits. The four
+// optional dependencies wired via `With*` options light up
+// Steps 4–6 + the degraded-snapshot fallback:
+//
+//   - `seedExpander` -> Step 4 (1–2 hop expansion).
+//   - `reranker`     -> Step 5 (final ordering).
+//   - `contextLog`   -> Step 6 (RecallContextLog append).
+//   - `snapshot`     -> Step 9 (degraded fallback).
+//   - `conceptsEnabled` plumbs the §7.8 mixed seed (Method +
+//     Block + Concept fan-out).
+//
+// All optionals default to "off" so existing test fixtures
+// (which assemble the three core deps only) continue to see
+// the legacy two-step behaviour; production wiring in
+// `cmd/agent-api/main.go` sets every option.
 type Service struct {
 	embedder QueryEmbedder
 	searcher VectorSearcher
@@ -152,6 +173,15 @@ type Service struct {
 	// requests from Qdrant before §9.6a filtering.  See
 	// `RecallRequest.K` for the contract.
 	overFetchMultiplier int
+
+	// Stage 5.1 optional dependencies — see the Service doc
+	// comment for the per-field rationale.
+	seedExpander    SeedExpander
+	reranker        Reranker
+	contextLog      ContextLogAppender
+	snapshot        SnapshotSource
+	conceptsEnabled bool
+	expansionDepth  int
 }
 
 // Option configures a `Service`.
@@ -207,6 +237,101 @@ func WithHealthSource(h HealthSource) Option {
 	}
 }
 
+// WithReranker plumbs the v0 cold-start (or trained) reranker
+// the recall handler invokes at Step 5 of §6.4. Without it the
+// handler returns hits in raw Qdrant cosine order and reports
+// the empty string for `reranker_model_version`. The
+// production binary wires `NewV0ColdStartReranker(nil)` until
+// the Stage 6.4 trainer publishes its first row.
+func WithReranker(r Reranker) Option {
+	return func(s *Service) {
+		s.reranker = r
+	}
+}
+
+// WithSeedExpander plumbs the Step-4 graph-expansion source.
+// The recall handler walks up to `WithExpansionDepth` hops
+// outward from each candidate seed and folds the discovered
+// edges into the response envelope.
+//
+// Without it Step 4 short-circuits to the seed set only (no
+// edges in the response). The expander is OPTIONAL because
+// the §9.5 cold-start fallback path can serve useful answers
+// from raw vector similarity alone — the structural fan-out
+// is a quality boost, not a correctness gate.
+func WithSeedExpander(e SeedExpander) Option {
+	return func(s *Service) {
+		s.seedExpander = e
+	}
+}
+
+// WithExpansionDepth overrides the per-call hop count Step 4
+// walks. Defaults to 1; clamped to [1, maxExpansionDepth=2]
+// to keep the per-request fan-out linear in seed count.
+func WithExpansionDepth(d int) Option {
+	return func(s *Service) {
+		if d < 1 {
+			d = 1
+		}
+		if d > maxExpansionDepth {
+			d = maxExpansionDepth
+		}
+		s.expansionDepth = d
+	}
+}
+
+// WithContextLog plumbs the Step-6 RecallContextLog writer.
+// On every successful recall (happy path AND degraded
+// fallback) the handler appends exactly one row so the
+// caller can replay the snapshot via `agent.observe`. A nil
+// writer disables Step 6 and the response carries an empty
+// `ContextID`.
+//
+// The handler treats any error returned by the appender as
+// a soft failure: the recall response still surfaces, just
+// without a context_id. A hard-failure model would mean a
+// transient PostgreSQL outage takes down the read path,
+// which is the failure mode the §9.5 degraded contract
+// explicitly avoids.
+func WithContextLog(a ContextLogAppender) Option {
+	return func(s *Service) {
+		s.contextLog = a
+	}
+}
+
+// WithSnapshotFallback plumbs the Step-9 degraded snapshot
+// source. When Qdrant or GraphReader is unreachable the
+// handler degrades to the most recent valid snapshot for
+// the requesting repo, stamps `Degraded=true` with the
+// appropriate `degraded_reason`, and appends a new
+// RecallContextLog row with `ServedUnderDegraded=true`.
+//
+// A nil source disables the fallback (the handler returns
+// the underlying dependency error verbatim, matching the
+// legacy behaviour). Production wiring should always supply
+// one.
+func WithSnapshotFallback(s2 SnapshotSource) Option {
+	return func(s *Service) {
+		s.snapshot = s2
+	}
+}
+
+// WithConceptsEnabled toggles the §7.8 mixed-seed fan-out
+// across the `agent_memory_concept` collection. When set
+// the handler issues an additional Qdrant Search call
+// against the concept collection and surfaces matching
+// Concept hits in `RecallResponse.Concepts`.
+//
+// Default is OFF so existing fixtures (which assert that
+// `Search` is called exactly once against the Method
+// collection) continue to pass. Production wiring sets this
+// to true.
+func WithConceptsEnabled(enabled bool) Option {
+	return func(s *Service) {
+		s.conceptsEnabled = enabled
+	}
+}
+
 // NewService constructs a recall service.  All three
 // dependencies (`embedder`, `searcher`, `filter`) are
 // REQUIRED; a nil dependency panics at construction rather
@@ -228,6 +353,7 @@ func NewService(embedder QueryEmbedder, searcher VectorSearcher, filter PublishF
 		filter:              filter,
 		logger:              slog.Default(),
 		overFetchMultiplier: 3,
+		expansionDepth:      defaultExpansionDepth,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -246,12 +372,43 @@ type RecallRequest struct {
 	// guaranteed-zero result.
 	Query string
 
+	// Kinds restricts the mixed seed fan-out to the supplied
+	// kinds. Each entry MUST be one of "method", "block",
+	// "concept" (matches the proto `agent.v1.RecallRequest.kinds`
+	// closed set). Duplicates are deduped.
+	//
+	// When both Kinds and Kind are empty the recall handler
+	// defaults to the §7.8 mixed-seed set:
+	//   - {method, block}            when conceptsEnabled = false
+	//   - {method, block, concept}   when conceptsEnabled = true
+	// matching the Stage 5.1 critique #2 "mixed search
+	// across agent_memory_method, agent_memory_block, and
+	// agent_memory_concept".
+	//
+	// When Kind is set and Kinds is empty, Kinds resolves to
+	// {Kind} (legacy single-collection lookup); concept
+	// fan-out is appended on top when conceptsEnabled = true
+	// so the existing `TestRecall_mixedSeedIncludesConcepts`
+	// contract (single Kind + concepts enabled = method
+	// + concept fan-out) keeps holding.
+	//
+	// When both Kinds and Kind are set, Kind MUST appear in
+	// Kinds — a mismatch returns ErrInvalidKind so a caller
+	// that accidentally narrows past the proto contract sees
+	// the error rather than silently dropping the legacy
+	// constraint.
+	Kinds []string
+
 	// Kind is the §6.2 node kind to search.  Either
 	// `embedding.NodeKindMethod` ("method") or
-	// `embedding.NodeKindBlock` ("block").  Required —
-	// each kind lives in its OWN Qdrant collection per
-	// tech-spec §8.1, so a kindless query has no
-	// well-defined target collection.
+	// `embedding.NodeKindBlock` ("block").
+	//
+	// Deprecated: prefer Kinds. Retained as a single-kind
+	// alias so existing fixtures that pre-date the multi-
+	// kind contract keep compiling. The deprecated field
+	// rejects "concept" so the legacy single-kind validator
+	// stays strict; pass `Kinds = []string{"concept"}` if
+	// you want the concept-only recall path.
 	Kind string
 
 	// RepoID, when non-empty, restricts the search to
@@ -333,6 +490,38 @@ type RecallResponse struct {
 	// empty when `Degraded` is false.
 	Degraded       bool
 	DegradedReason string
+
+	// ContextID is the durable RecallContextLog row id the
+	// handler appended at Step 6. Empty when no
+	// `ContextLogAppender` was wired or when the append
+	// failed (soft-error contract).  The caller stores this
+	// id and can later replay the snapshot via
+	// `agent.observe(context_id=ContextID)`.
+	ContextID string
+
+	// RerankerModelVersion is the version string the
+	// reranker reported at Step 5. Pinned onto the
+	// RecallContextLog row for reproducibility per
+	// architecture.md §5.4.1. Empty when no `Reranker` was
+	// wired (legacy two-step path).
+	RerankerModelVersion string
+
+	// Nodes is the typed Node-card surface. Mirrors `Hits`
+	// for Method/Block kinds; downstream gRPC projection
+	// uses this slice. The legacy `Hits` slice is preserved
+	// for backward compatibility with existing tests.
+	Nodes []NodeHit
+
+	// Edges is the structural edge fan-out the Step-4
+	// `SeedExpander` discovered. Empty when no expander was
+	// wired.
+	Edges []EdgeHit
+
+	// Concepts is the Concept-layer hits the mixed-seed
+	// fan-out surfaced (Stage 5.1 step 2). Empty when
+	// `WithConceptsEnabled(false)` (the default) or the
+	// concept collection returned no hits.
+	Concepts []ConceptHit
 }
 
 // ErrEmptyQuery is returned by `Service.Recall` when the
@@ -349,19 +538,49 @@ var ErrInvalidK = errors.New("agentapi: recall: K must be > 0")
 // maxK is the per-call ceiling for `RecallRequest.K`.
 const maxK = 256
 
-// Recall implements the §6.4 read path:
+// Recall implements the §6.4 read path. The full Stage 5.1
+// pipeline (when every optional dependency is wired):
 //
 //  1. Embed the query into a vector via `s.embedder`.
-//  2. Search Qdrant with `K * overFetchMultiplier`
-//     candidates AND the repo/kind filters (server-side
-//     pushdown — keeps Qdrant from scanning unrelated
-//     points).
+//  2. Issue a MIXED k-NN search against the Method
+//     collection AND, when `WithConceptsEnabled(true)`, the
+//     Concept collection — both filtered by `repo_id`
+//     server-side per §7.8 mixed seed.
 //  3. Extract candidate point ids and feed them to
 //     `s.filter.FilterPublishedPoints`, which returns the
-//     subset that has reached §9.6a `published`.
-//  4. Walk the original (score-ordered) hits, keep the
-//     ones that survived the filter, cap at `req.K`, and
-//     return.
+//     subset that has reached §9.6a `published`. The filter
+//     increments `recall_filter_unpublished_total` per
+//     filtered hit on its own (we do not double-count here).
+//  4. When a `SeedExpander` is wired, walk 1–2 hops from the
+//     seed Node ids and fold the discovered edges into the
+//     response envelope; tag any newly-discovered candidates
+//     with a non-zero structural distance for the reranker.
+//  5. When a `Reranker` is wired, recompute the per-hit
+//     score and re-order. Otherwise hits surface in raw
+//     cosine order.
+//  6. When a `ContextLogAppender` is wired, append one
+//     RecallContextLog row carrying the rank-ordered ids +
+//     the reranker model version + the degraded flag. The
+//     returned context_id surfaces on the response so the
+//     caller can replay via `agent.observe`.
+//
+// Degraded fallback (Step 9). When Qdrant returns a
+// dependency error AND a `SnapshotSource` is wired, the
+// handler:
+//
+//   - Loads the most recent valid RecallContextLog snapshot
+//     for the repo via `SnapshotSource.LatestForRepo`.
+//   - Projects it onto a `RecallResponse` stamped with
+//     `Degraded=true` and
+//     `DegradedReason='embedding_index_unavailable'`.
+//   - Appends a fresh RecallContextLog row with
+//     `ServedUnderDegraded=true` so a later observe knows.
+//   - Returns nil error so the agent keeps its loop alive.
+//
+// The legacy two-step path (no Reranker, no Expander, no
+// ContextLog, no Snapshot, no Concepts) is preserved when
+// none of the optionals are wired so existing fixtures keep
+// passing.
 //
 // The function NEVER returns an empty `Hits` slice with a
 // nil error AND `OverFetched > 0` silently — when the
@@ -373,24 +592,15 @@ func (s *Service) Recall(ctx context.Context, req RecallRequest) (RecallResponse
 	if strings.TrimSpace(req.Query) == "" {
 		return RecallResponse{}, ErrEmptyQuery
 	}
-	if req.Kind != embedding.NodeKindMethod && req.Kind != embedding.NodeKindBlock {
-		return RecallResponse{}, fmt.Errorf("%w: got %q", ErrInvalidKind, req.Kind)
-	}
 	if req.K <= 0 {
 		return RecallResponse{}, ErrInvalidK
 	}
 	if req.K > maxK {
 		req.K = maxK
 	}
-
-	collection, err := embedding.CollectionFor(req.Kind)
+	kinds, err := s.normalizeKinds(req)
 	if err != nil {
-		// Defence-in-depth: CollectionFor only returns an
-		// error for kinds we've already rejected above, but
-		// keeping the check here means a future kind added
-		// to the enum without updating this switch surfaces
-		// here, not as a nil-collection Qdrant request.
-		return RecallResponse{}, fmt.Errorf("agentapi: recall: %w", err)
+		return RecallResponse{}, err
 	}
 
 	vec, err := s.embedder.Embed(ctx, req.Query)
@@ -409,36 +619,77 @@ func (s *Service) Recall(ctx context.Context, req RecallRequest) (RecallResponse
 
 	if req.RepoID == "" {
 		s.logger.Warn("agentapi.recall.unscoped",
-			slog.String("collection", collection),
+			slog.String("collections", strings.Join(kindsToCollections(kinds), ",")),
 			slog.Int("k", req.K),
 			slog.String("hint", "set RecallRequest.RepoID for cross-tenant scoping"))
 	}
 
-	candidates, err := s.searcher.Search(ctx, collection, embedding.SearchRequest{
-		Vector:       vec,
-		Limit:        overFetch,
-		RepoIDFilter: req.RepoID,
-	})
-	if err != nil {
-		return RecallResponse{}, fmt.Errorf("agentapi: recall: qdrant search: %w", err)
+	// Step 2 — mixed seed search across every requested
+	// kind's Qdrant collection. One Search call per kind so
+	// the per-collection filters stay scoped; the candidate
+	// lists merge downstream before the §9.6a filter runs.
+	type collectionResult struct {
+		kind string
+		hits []embedding.SearchHit
 	}
-	if len(candidates) == 0 {
-		resp := RecallResponse{Hits: []Hit{}, OverFetched: 0, Filtered: 0}
+	results := make([]collectionResult, 0, len(kinds))
+	totalOverFetched := 0
+	for _, kind := range kinds {
+		collection, cerr := collectionFor(kind)
+		if cerr != nil {
+			// Defence-in-depth: normalizeKinds already
+			// validated the kind, but if a future kind is
+			// added without updating the collection table
+			// the error surfaces here instead of a nil-
+			// collection Qdrant request.
+			return RecallResponse{}, fmt.Errorf("agentapi: recall: %w", cerr)
+		}
+		hits, serr := s.searcher.Search(ctx, collection, embedding.SearchRequest{
+			Vector:       vec,
+			Limit:        overFetch,
+			RepoIDFilter: req.RepoID,
+		})
+		if serr != nil {
+			return s.degradedFallback(ctx, req, "qdrant", serr)
+		}
+		results = append(results, collectionResult{kind: kind, hits: hits})
+		totalOverFetched += len(hits)
+	}
+
+	if totalOverFetched == 0 {
+		resp := RecallResponse{
+			Hits:        []Hit{},
+			Nodes:       []NodeHit{},
+			Edges:       []EdgeHit{},
+			Concepts:    []ConceptHit{},
+			OverFetched: 0,
+			Filtered:    0,
+		}
 		// Surface the cross-process degraded flag even on
 		// the empty-candidates path. Evaluator iter-1 #4:
 		// before this fix, a backpressured repo with zero
 		// Qdrant hits returned a Degraded=false envelope,
 		// suppressing the §C22 contract signal.
 		s.populateDegraded(ctx, req, &resp)
+		if s.reranker != nil {
+			resp.RerankerModelVersion = s.reranker.ModelVersion()
+		}
+		s.appendContextLog(ctx, req, &resp, kinds)
 		return resp, nil
 	}
 
-	pointIDs := make([]string, 0, len(candidates))
-	for _, c := range candidates {
-		if c.PointID == "" {
-			continue
+	// Step 3 — §9.6a publish filter. We collect point ids
+	// across EVERY collection in one round-trip so the
+	// counter and the network call stay bounded by the
+	// total candidate count, not the per-collection count.
+	pointIDs := make([]string, 0, totalOverFetched)
+	for _, r := range results {
+		for _, c := range r.hits {
+			if c.PointID == "" {
+				continue
+			}
+			pointIDs = append(pointIDs, c.PointID)
 		}
-		pointIDs = append(pointIDs, c.PointID)
 	}
 	allowed, err := s.filter.FilterPublishedPoints(ctx, pointIDs)
 	if err != nil {
@@ -449,36 +700,620 @@ func (s *Service) Recall(ctx context.Context, req RecallRequest) (RecallResponse
 		allowSet[id] = struct{}{}
 	}
 
-	out := make([]Hit, 0, req.K)
-	for _, c := range candidates {
-		if len(out) >= req.K {
+	// Build the candidate slice preserving per-collection
+	// cosine-order (Method/Block first, Concept last per
+	// the iteration order of `kinds`).  The reranker
+	// re-orders before the K cap.
+	candidates := make([]Candidate, 0, totalOverFetched)
+	for _, r := range results {
+		for _, c := range r.hits {
+			if _, ok := allowSet[c.PointID]; !ok {
+				continue
+			}
+			candidates = append(candidates, Candidate{
+				PointID:            c.PointID,
+				Score:              c.Score,
+				Kind:               r.kind,
+				StructuralDistance: 0,
+				Payload:            c.Payload,
+			})
+		}
+	}
+
+	// Step 4 — graph expansion. Walks outward from each seed
+	// Node id discovered in the Method/Block collections;
+	// Concept hits do NOT seed expansion (they live in the
+	// Concept space, not the structural graph).
+	var expansion ExpansionResult
+	if s.seedExpander != nil {
+		seedNodeIDs := collectSeedNodeIDs(candidates)
+		if len(seedNodeIDs) > 0 {
+			depth := s.expansionDepth
+			if depth < 1 {
+				depth = defaultExpansionDepth
+			}
+			expanded, expErr := s.seedExpander.Expand(ctx, seedNodeIDs, depth)
+			if expErr != nil {
+				// Graph-store outages map to the §C22
+				// `graph_store_unavailable` reason; the
+				// recall falls back to the most recent
+				// snapshot for the repo (evaluator iter-1
+				// #6 — pre-iter-2 this path silently
+				// swallowed graph outages).
+				if errors.Is(expErr, ErrGraphStoreUnavailable) {
+					return s.degradedFallback(ctx, req, "graph", expErr)
+				}
+				// Other expander errors stay soft: a
+				// transient hiccup in one expander call
+				// should NOT take down the recall response.
+				s.logger.Warn("agentapi.recall.expand_failed",
+					slog.String("err", expErr.Error()),
+					slog.Int("seed_count", len(seedNodeIDs)))
+			} else {
+				expansion = expanded
+				candidates = appendFrontierCandidates(candidates, expansion, allowSet)
+			}
+		}
+	}
+
+	// Step 5 — rerank. v0 cold-start (cosine + structural
+	// distance) or the trained model when one exists. When no
+	// reranker is wired we keep the raw cosine order from
+	// Qdrant and propagate `Score` → `FinalScore` so the
+	// response projection below (which reads `c.FinalScore`)
+	// still surfaces a meaningful similarity number instead
+	// of the struct zero value.
+	ranked := candidates
+	rerankerVersion := ""
+	if s.reranker != nil {
+		ranked = s.reranker.Rank(candidates)
+		rerankerVersion = s.reranker.ModelVersion()
+	} else {
+		for i := range ranked {
+			ranked[i].FinalScore = ranked[i].Score
+		}
+	}
+
+	// Project ranked candidates onto the response shape.
+	// `Hits` (legacy) carries Method/Block in rank order;
+	// `Nodes` is the new typed surface, `Concepts` carries
+	// the Concept hits separately.  The combined cap is
+	// `req.K` per the e2e scenario "len(nodes)+len(concepts)
+	// == k" (e2e-scenarios.md line 461).
+	totalCap := req.K
+	hits := make([]Hit, 0, totalCap)
+	nodes := make([]NodeHit, 0, totalCap)
+	concepts := make([]ConceptHit, 0, totalCap)
+	taken := 0
+	for _, c := range ranked {
+		if taken >= totalCap {
 			break
 		}
-		if _, ok := allowSet[c.PointID]; !ok {
-			continue
+		if c.Kind == NodeKindConcept {
+			concepts = append(concepts, conceptHitFromCandidate(c))
+		} else {
+			hits = append(hits, Hit{
+				PointID: c.PointID,
+				Score:   c.FinalScore,
+				Payload: c.Payload,
+			})
+			nodes = append(nodes, nodeHitFromCandidate(c))
 		}
-		out = append(out, Hit{
-			PointID: c.PointID,
-			Score:   c.Score,
-			Payload: c.Payload,
-		})
+		taken++
 	}
 
 	resp := RecallResponse{
-		Hits:        out,
-		OverFetched: len(candidates),
-		// Count only hits the filter actually examined and
-		// rejected — candidates with empty PointID were
-		// stripped before the filter call (see pointIDs
-		// build loop above), so subtracting from
-		// len(candidates) would conflate invalid Qdrant
-		// responses with genuinely unpublished vectors and
-		// pollute the recall_filter_unpublished_total
-		// operator signal (§9.6a read-side).
-		Filtered: len(pointIDs) - len(allowed),
+		Hits:                 hits,
+		Nodes:                nodes,
+		Edges:                expansion.Edges,
+		Concepts:             concepts,
+		OverFetched:          totalOverFetched,
+		Filtered:             len(pointIDs) - len(allowed),
+		RerankerModelVersion: rerankerVersion,
 	}
 	s.populateDegraded(ctx, req, &resp)
+	s.appendContextLog(ctx, req, &resp, kinds)
 	return resp, nil
+}
+
+// normalizeKinds resolves the deprecated `Kind` and the new
+// `Kinds` fields into a single validated + deduped slice the
+// recall handler iterates over. See `RecallRequest.Kinds`
+// for the full resolution contract (defaults / single-Kind
+// alias / concept fan-out).
+func (s *Service) normalizeKinds(req RecallRequest) ([]string, error) {
+	// 1) Both Kinds and Kind set: Kind MUST be present in
+	//    Kinds — a mismatch is almost always a copy-paste
+	//    bug and silently dropping the legacy constraint
+	//    would surprise the caller.
+	if len(req.Kinds) > 0 && req.Kind != "" {
+		found := false
+		for _, k := range req.Kinds {
+			if k == req.Kind {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf(
+				"%w: req.Kind=%q not present in req.Kinds=%v",
+				ErrInvalidKind, req.Kind, req.Kinds)
+		}
+	}
+
+	var raw []string
+	switch {
+	case len(req.Kinds) > 0:
+		// Multi-kind path. `Kinds` is the canonical input;
+		// the validator below rejects any entry outside the
+		// closed set {method, block, concept}.
+		raw = append(raw, req.Kinds...)
+	case req.Kind != "":
+		// Deprecated single-Kind path. Stays strict on
+		// method/block to keep the legacy
+		// TestRecall_inputValidation "Kind=concept rejected"
+		// contract intact; callers that want concept-only
+		// recall should pass `Kinds: []string{"concept"}`.
+		if req.Kind != embedding.NodeKindMethod && req.Kind != embedding.NodeKindBlock {
+			return nil, fmt.Errorf("%w: got %q", ErrInvalidKind, req.Kind)
+		}
+		raw = []string{req.Kind}
+		if s.conceptsEnabled {
+			// Backward compat: legacy `Kind=method` +
+			// `conceptsEnabled=true` callers expect the
+			// concept fan-out the iter-1 tests pinned.
+			raw = append(raw, NodeKindConcept)
+		}
+	default:
+		// Both empty: the §7.8 mixed seed default set.
+		raw = []string{embedding.NodeKindMethod, embedding.NodeKindBlock}
+		if s.conceptsEnabled {
+			raw = append(raw, NodeKindConcept)
+		}
+	}
+
+	seen := make(map[string]struct{}, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, k := range raw {
+		switch k {
+		case embedding.NodeKindMethod, embedding.NodeKindBlock, NodeKindConcept:
+		default:
+			return nil, fmt.Errorf(
+				"%w: %q (allowed: method/block/concept)",
+				ErrInvalidKind, k)
+		}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, k)
+	}
+	if len(out) == 0 {
+		// Unreachable via the normal flow (defaults always
+		// produce at least method+block); defensive belt
+		// for a future refactor that disables every default.
+		return nil, fmt.Errorf("%w: no kinds resolved", ErrInvalidKind)
+	}
+	return out, nil
+}
+
+// collectionFor maps a recall kind to the Qdrant collection
+// the publisher writes that kind's vectors into. Wraps
+// `embedding.CollectionFor` so the Concept kind (which
+// `embedding.CollectionFor` does NOT recognise — Concepts
+// have their own collection but no publisher Kind enum
+// value) is handled in one place.
+func collectionFor(kind string) (string, error) {
+	if kind == NodeKindConcept {
+		return embedding.CollectionConcept, nil
+	}
+	return embedding.CollectionFor(kind)
+}
+
+// kindsToCollections is a tiny adapter for the unscoped-query
+// warn log so an operator sees `agent_memory_method,agent_memory_concept`
+// in the log line instead of `method,concept`.
+func kindsToCollections(kinds []string) []string {
+	out := make([]string, 0, len(kinds))
+	for _, k := range kinds {
+		if c, err := collectionFor(k); err == nil {
+			out = append(out, c)
+		} else {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// appendFrontierCandidates promotes the expander's frontier
+// onto the candidate set with an inherited seed score and a
+// structural distance equal to the hop count. Resolves
+// evaluator iter-1 #4 ("ExpansionResult.FrontierNodeIDs is
+// never converted into rerankable Candidates and structural
+// distance is effectively always zero for served candidates").
+//
+// The inherited-score formula is `BestSeedScore * 0.5^hop`
+// (rubber-duck #3 on the iter-2 plan): a 1-hop neighbour of a
+// 0.9-score seed scores 0.45, a 2-hop neighbour 0.225. The
+// reranker then subtracts `StructuralWeight * hop = 0.1*hop`
+// from that figure for the §9.5 cold-start ordering. The
+// combination keeps a 1-hop frontier candidate competitive
+// with a low-score direct hit while still preferring direct
+// hits at parity.
+//
+// Frontier entries with the same NodeID as an existing seed
+// candidate are skipped: the seed already scored against the
+// reranker with its true cosine; promoting a frontier shadow
+// of the same NodeID would double-count.
+//
+// When the expander did NOT hydrate the Frontier slice but
+// populated the deprecated `FrontierNodeIDs`, the function
+// synthesises one `FrontierNode{NodeID, Hop:1}` per id with
+// the best seed score of the input candidates so legacy test
+// fakes (which only set FrontierNodeIDs) still see promotion.
+func appendFrontierCandidates(
+	seeds []Candidate, exp ExpansionResult, allowSet map[string]struct{},
+) []Candidate {
+	// Compute the best seed score once. ANY frontier node
+	// whose own BestSeedScore is unset (production
+	// GraphReaderExpander leaves it at zero because the
+	// underlying graph layer has no notion of the embedding
+	// score) inherits this value so it ranks ahead of the
+	// "structural-only" floor instead of as a negative
+	// candidate. Resolves evaluator iter-2 finding #2.
+	var bestSeedScore float32
+	for _, s := range seeds {
+		if s.Score > bestSeedScore {
+			bestSeedScore = s.Score
+		}
+	}
+
+	frontier := exp.Frontier
+	if len(frontier) == 0 && len(exp.FrontierNodeIDs) > 0 {
+		frontier = make([]FrontierNode, 0, len(exp.FrontierNodeIDs))
+		for _, id := range exp.FrontierNodeIDs {
+			frontier = append(frontier, FrontierNode{
+				NodeID:        id,
+				Hop:           1,
+				BestSeedScore: bestSeedScore,
+			})
+		}
+	}
+	if len(frontier) == 0 {
+		return seeds
+	}
+
+	// Build a set of seed NodeIDs so we don't double-count
+	// nodes that are both a seed AND a frontier destination.
+	seedSet := make(map[string]struct{}, len(seeds))
+	for _, c := range seeds {
+		if id, ok := c.Payload["node_id"].(string); ok && id != "" {
+			seedSet[id] = struct{}{}
+		}
+	}
+
+	out := seeds
+	for _, fn := range frontier {
+		if fn.NodeID == "" {
+			continue
+		}
+		if _, dup := seedSet[fn.NodeID]; dup {
+			continue
+		}
+		hop := fn.Hop
+		if hop <= 0 {
+			hop = 1
+		}
+		// Discount the best seed score by 0.5 per hop.
+		// `0.5^hop` is computed inline (no math.Pow) so the
+		// branch stays allocation-free.
+		discount := float32(1)
+		for i := 0; i < hop; i++ {
+			discount *= 0.5
+		}
+		// Use the FrontierNode's own seed-score signal when the
+		// expander supplied one (in-tree fakes do); fall back
+		// to the aggregate best-seed-score when it's missing or
+		// non-positive — this is the load-bearing branch for the
+		// production GraphReaderExpander which doesn't track
+		// embedding scores on the graph side.
+		seedScore := fn.BestSeedScore
+		if seedScore <= 0 {
+			seedScore = bestSeedScore
+		}
+		inheritedScore := seedScore * discount
+		kind := fn.Kind
+		if kind == "" {
+			// Unknown kind from a non-hydrated expander —
+			// default to method so the reranker scores the
+			// candidate against the seed prior, not the
+			// concept bonus.
+			kind = embedding.NodeKindMethod
+		}
+		// Frontier candidates don't carry a Qdrant point id
+		// (graph-only nodes); the publish filter doesn't
+		// apply, so we don't consult `allowSet`. We do
+		// stamp the payload with the dereferenced NodeID
+		// so `nodeHitFromCandidate` can project a NodeHit
+		// onto the response.
+		payload := map[string]any{
+			"node_id":             fn.NodeID,
+			"repo_id":             fn.RepoID,
+			"kind":                kind,
+			"canonical_signature": fn.CanonicalSignature,
+		}
+		out = append(out, Candidate{
+			PointID:            "", // graph-only, no Qdrant id
+			Score:              inheritedScore,
+			Kind:               kind,
+			StructuralDistance: hop,
+			Payload:            payload,
+		})
+	}
+	_ = allowSet // kept on signature for future per-frontier filtering
+	return out
+}
+
+// degradedFallback projects the most recent valid snapshot
+// onto a degraded response, appends a fresh
+// `served_under_degraded=true` RecallContextLog row, and
+// returns. When no `SnapshotSource` is wired the underlying
+// dependency error propagates verbatim (matching legacy
+// behaviour). When the snapshot lookup itself errors the
+// handler emits a degraded ENVELOPE with empty hits — the
+// degraded contract is the load-bearing signal here, even
+// if there is no prior snapshot to dehydrate.
+func (s *Service) degradedFallback(
+	ctx context.Context, req RecallRequest, layer string, cause error,
+) (RecallResponse, error) {
+	reason := classifyDegradedReason(layer, cause)
+	if reason == "" || s.snapshot == nil {
+		// No snapshot wired (or unknown layer): preserve
+		// the legacy hard-fail contract so a misconfigured
+		// production binary surfaces the underlying error
+		// instead of silently swallowing it.
+		switch layer {
+		case "qdrant":
+			return RecallResponse{}, fmt.Errorf(
+				"agentapi: recall: qdrant search: %w", cause)
+		case "graph":
+			return RecallResponse{}, fmt.Errorf(
+				"agentapi: recall: graph reader: %w", cause)
+		default:
+			return RecallResponse{}, cause
+		}
+	}
+
+	s.logger.Warn("agentapi.recall.degraded_fallback",
+		slog.String("layer", layer),
+		slog.String("reason", reason),
+		slog.String("repo_id", req.RepoID),
+		slog.String("cause", cause.Error()))
+
+	// Resolve `kinds` for the context-log row WITHOUT
+	// failing the fallback if the request's kinds are
+	// invalid: we want the degraded envelope to surface
+	// even on a malformed request. `normalizeKinds`
+	// returning an error here is non-fatal — the row just
+	// records an empty `kinds[]`.
+	kinds, _ := s.normalizeKinds(req)
+
+	snap, snapErr := s.snapshot.LatestForRepo(ctx, req.RepoID)
+	if snapErr != nil {
+		if !errors.Is(snapErr, ErrNoSnapshot) {
+			s.logger.Warn("agentapi.recall.snapshot_lookup_failed",
+				slog.String("repo_id", req.RepoID),
+				slog.String("err", snapErr.Error()))
+		}
+		// Empty-hit degraded envelope — still useful (the
+		// agent sees the degraded flag and can decide
+		// whether to retry).
+		resp := RecallResponse{
+			Hits:           []Hit{},
+			Nodes:          []NodeHit{},
+			Edges:          []EdgeHit{},
+			Concepts:       []ConceptHit{},
+			Degraded:       true,
+			DegradedReason: reason,
+		}
+		if s.reranker != nil {
+			resp.RerankerModelVersion = s.reranker.ModelVersion()
+		}
+		s.appendContextLogDegraded(ctx, req, &resp, kinds)
+		return resp, nil
+	}
+
+	resp := snapshotResponseForDegraded(snap, reason, req.K)
+	// Project Nodes onto the legacy Hits slice so callers
+	// reading the old surface still see the fallback hits.
+	resp.Hits = make([]Hit, 0, len(resp.Nodes))
+	for _, n := range resp.Nodes {
+		resp.Hits = append(resp.Hits, Hit{
+			PointID: n.PointID,
+			Score:   n.Score,
+			Payload: map[string]any{
+				"node_id":             n.NodeID,
+				"repo_id":             n.RepoID,
+				"kind":                n.Kind,
+				"canonical_signature": n.CanonicalSignature,
+			},
+		})
+	}
+	s.appendContextLogDegraded(ctx, req, &resp, kinds)
+	return resp, nil
+}
+
+// collectSeedNodeIDs extracts the `node_id` payload field
+// from each Method/Block candidate so the expander has a
+// concrete id set to walk outward from. Concepts are not
+// part of the structural graph so they are skipped.
+func collectSeedNodeIDs(cs []Candidate) []string {
+	seen := make(map[string]struct{}, len(cs))
+	out := make([]string, 0, len(cs))
+	for _, c := range cs {
+		if c.Kind == NodeKindConcept {
+			continue
+		}
+		id, _ := c.Payload["node_id"].(string)
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+// nodeHitFromCandidate projects a ranked Method/Block
+// Candidate onto the typed NodeHit shape. Pulls the
+// canonical fields out of the Qdrant payload the publisher
+// wrote.
+func nodeHitFromCandidate(c Candidate) NodeHit {
+	nh := NodeHit{
+		PointID: c.PointID,
+		Score:   c.FinalScore,
+		Kind:    c.Kind,
+	}
+	if id, ok := c.Payload["node_id"].(string); ok {
+		nh.NodeID = id
+	}
+	if id, ok := c.Payload["repo_id"].(string); ok {
+		nh.RepoID = id
+	}
+	if sig, ok := c.Payload["canonical_signature"].(string); ok {
+		nh.CanonicalSignature = sig
+	}
+	return nh
+}
+
+// conceptHitFromCandidate projects a Concept Candidate onto
+// the typed ConceptHit shape. The publisher writes `name`
+// onto the Concept payload (see
+// `cmd/concept-promoter/main.go.buildPayload` once Stage
+// 6.2 lands); until then the Name field may be empty.
+func conceptHitFromCandidate(c Candidate) ConceptHit {
+	ch := ConceptHit{
+		PointID: c.PointID,
+		Score:   c.FinalScore,
+	}
+	if id, ok := c.Payload["concept_id"].(string); ok {
+		ch.ConceptID = id
+	}
+	if name, ok := c.Payload["name"].(string); ok {
+		ch.Name = name
+	}
+	return ch
+}
+
+// appendContextLog writes the Step-6 RecallContextLog row
+// for a happy-path recall (ServedUnderDegraded=false). The
+// resolved `kinds` slice is stored verbatim on the row so a
+// later operator inspection sees exactly which collections
+// the recall fanned out across (not just the deprecated
+// singular `kind` value).
+func (s *Service) appendContextLog(
+	ctx context.Context, req RecallRequest, resp *RecallResponse, kinds []string,
+) {
+	if s.contextLog == nil {
+		return
+	}
+	in := s.buildContextLogInput(req, resp, false, kinds)
+	rec, err := s.contextLog.Append(ctx, in)
+	if err != nil {
+		// Soft failure — recall response is still served.
+		s.logger.Warn("agentapi.recall.context_log_append_failed",
+			slog.String("repo_id", req.RepoID),
+			slog.String("err", err.Error()))
+		return
+	}
+	resp.ContextID = rec.ContextID
+}
+
+// appendContextLogDegraded writes the Step-6 row for a
+// degraded-fallback recall. ServedUnderDegraded=true so a
+// later Stage 5.2 observe knows to auto-stamp a
+// `degraded_recall_context` Observation per
+// architecture.md §6.1.2.
+func (s *Service) appendContextLogDegraded(
+	ctx context.Context, req RecallRequest, resp *RecallResponse, kinds []string,
+) {
+	if s.contextLog == nil {
+		return
+	}
+	in := s.buildContextLogInput(req, resp, true, kinds)
+	rec, err := s.contextLog.Append(ctx, in)
+	if err != nil {
+		s.logger.Warn("agentapi.recall.context_log_append_failed_degraded",
+			slog.String("repo_id", req.RepoID),
+			slog.String("err", err.Error()))
+		return
+	}
+	resp.ContextID = rec.ContextID
+}
+
+// buildContextLogInput packs the response into the
+// `ContextLogAppender.Append` shape. The reranker model
+// version on the input is the response's value (which is
+// the snapshot's version on the degraded path and the live
+// reranker's version on the happy path).
+//
+// The `kinds` slice is the post-normalisation set of node
+// kinds the recall fanned out across; stored under the
+// `kinds` JSON key (plural) so a multi-kind recall round-
+// trips faithfully. The deprecated singular `kind` field is
+// retained on the doc shape (omitted from JSON when empty)
+// so legacy operator scripts that still read it keep
+// working.
+func (s *Service) buildContextLogInput(
+	req RecallRequest, resp *RecallResponse, degraded bool, kinds []string,
+) ContextLogInput {
+	in := ContextLogInput{
+		Verb:                 "recall",
+		RepoID:               req.RepoID,
+		RerankerModelVersion: resp.RerankerModelVersion,
+		ServedUnderDegraded:  degraded,
+	}
+	queryDoc := struct {
+		Query  string   `json:"query"`
+		Kind   string   `json:"kind,omitempty"`
+		Kinds  []string `json:"kinds"`
+		K      int      `json:"k"`
+		RepoID string   `json:"repo_id,omitempty"`
+	}{
+		Query:  req.Query,
+		Kind:   req.Kind,
+		Kinds:  kinds,
+		K:      req.K,
+		RepoID: req.RepoID,
+	}
+	if buf, err := json.Marshal(queryDoc); err == nil {
+		in.QueryJSON = buf
+	} else {
+		// Marshal of a fixed-shape struct should never
+		// fail; fall back to an empty object so the
+		// downstream validator (`json.Valid`) still
+		// passes.
+		in.QueryJSON = json.RawMessage(`{}`)
+	}
+	for _, n := range resp.Nodes {
+		if n.NodeID != "" {
+			in.NodeIDs = append(in.NodeIDs, n.NodeID)
+		}
+	}
+	for _, e := range resp.Edges {
+		if e.EdgeID != "" {
+			in.EdgeIDs = append(in.EdgeIDs, e.EdgeID)
+		}
+	}
+	for _, c := range resp.Concepts {
+		if c.ConceptID != "" {
+			in.ConceptIDs = append(in.ConceptIDs, c.ConceptID)
+		}
+	}
+	return in
 }
 
 // populateDegraded reads the per-repo health state (if a

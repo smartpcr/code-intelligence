@@ -89,6 +89,25 @@
 //	                                    rejects any connection that
 //	                                    does not present a cert signed
 //	                                    by this bundle.
+//	AGENT_MEMORY_SUMMARISER_ENDPOINT    (optional) OpenAI-compatible
+//	                                    HTTPS endpoint for the
+//	                                    `agent.summarize` LLM client
+//	                                    (Stage 5.4). Absent → the
+//	                                    summarize verb is wired but
+//	                                    the LLM is disabled; every
+//	                                    call surfaces the templated
+//	                                    fallback with
+//	                                    `degraded_reason=summariser_unavailable`.
+//	AGENT_MEMORY_SUMMARISER_MODEL       (optional) Vendor model id
+//	                                    (e.g. `gpt-4o-mini`). Required
+//	                                    when AGENT_MEMORY_SUMMARISER_ENDPOINT
+//	                                    is set; rejected otherwise.
+//	AGENT_MEMORY_SUMMARISER_API_KEY     (optional) Bearer credential
+//	                                    for the summariser endpoint.
+//	                                    Sent as `Authorization: Bearer
+//	                                    <key>`. Omit for endpoints
+//	                                    behind mTLS or in-cluster
+//	                                    network-policy auth.
 //
 // Exit codes
 // ----------
@@ -271,6 +290,44 @@ func main() {
 	if contextLog != nil {
 		opts = append(opts, agentapi.WithContextLog(contextLog))
 	}
+
+	// Stage 5.4 wiring: agent.summarize verb. Resolver +
+	// freshness are always wired so a binary with a healthy
+	// graph store can serve summaries even when the LLM
+	// endpoint is absent (the verb falls back to the
+	// deterministic template + degraded envelope). The
+	// summariser itself is gated on AGENT_MEMORY_SUMMARISER_*
+	// so deployments without an LLM stay valid — they just
+	// always degrade. Without these three options the verb
+	// returns ErrSummarizeUnconfigured (→ Unimplemented),
+	// which iter-2 evaluator finding #1 flagged.
+	neighborhoodResolver := newNeighborhoodResolverFromGraphReader(gReader, db, logger)
+	rerankerFreshness := newRerankerFreshnessFromDB(db, logger)
+	opts = append(opts,
+		agentapi.WithNeighborhoodResolver(neighborhoodResolver),
+		agentapi.WithRerankerFreshness(rerankerFreshness),
+	)
+	logger.Info("agent-api.summarize.wired",
+		slog.Bool("resolver", true),
+		slog.Bool("reranker_freshness", true))
+	if cfg.SummariserEndpoint != "" {
+		summariser, err := newSummariserFromConfig(cfg, logger)
+		if err != nil {
+			logger.Error("agent-api.summarise.config",
+				slog.String("error", err.Error()))
+			os.Exit(2)
+		}
+		opts = append(opts, agentapi.WithSummariser(summariser))
+		logger.Info("agent-api.summarize.summariser_wired",
+			slog.String("endpoint", cfg.SummariserEndpoint),
+			slog.String("model", cfg.SummariserModel),
+			slog.Bool("api_key", cfg.SummariserAPIKey != ""))
+	} else {
+		logger.Warn("agent-api.summarize.summariser_disabled",
+			slog.String("hint",
+				"set AGENT_MEMORY_SUMMARISER_ENDPOINT + _MODEL to enable LLM-rendered summaries; verb still serves degraded template"))
+	}
+
 	service := agentapi.NewService(embedder, qclient, filter, opts...)
 
 	logger.Info("agent-api.ready",
@@ -373,23 +430,31 @@ type config struct {
 	AllowStubEmbedder bool
 	EnableConcepts    bool
 
-	AgentGRPCAddr      string
-	AgentGRPCTLSCert   string
-	AgentGRPCTLSKey    string
-	AgentGRPCClientCA  string
+	AgentGRPCAddr     string
+	AgentGRPCTLSCert  string
+	AgentGRPCTLSKey   string
+	AgentGRPCClientCA string
+
+	// Stage 5.4 summarize verb configuration.
+	SummariserEndpoint string
+	SummariserModel    string
+	SummariserAPIKey   string
 }
 
 func loadConfig() (config, error) {
 	c := config{
-		PGURL:             os.Getenv("AGENT_MEMORY_PG_RO_URL"),
-		PGAppURL:          os.Getenv("AGENT_MEMORY_PG_APP_URL"),
-		QdrantURL:         os.Getenv("AGENT_MEMORY_QDRANT_URL"),
-		QdrantAPIKey:      os.Getenv("AGENT_MEMORY_QDRANT_API_KEY"),
-		HealthAddr:        os.Getenv("AGENT_MEMORY_HEALTH_ADDR"),
-		AgentGRPCAddr:     os.Getenv("AGENT_MEMORY_AGENT_GRPC_ADDR"),
-		AgentGRPCTLSCert:  os.Getenv("AGENT_MEMORY_AGENT_GRPC_TLS_CERT"),
-		AgentGRPCTLSKey:   os.Getenv("AGENT_MEMORY_AGENT_GRPC_TLS_KEY"),
-		AgentGRPCClientCA: os.Getenv("AGENT_MEMORY_AGENT_GRPC_TLS_CLIENT_CA"),
+		PGURL:              os.Getenv("AGENT_MEMORY_PG_RO_URL"),
+		PGAppURL:           os.Getenv("AGENT_MEMORY_PG_APP_URL"),
+		QdrantURL:          os.Getenv("AGENT_MEMORY_QDRANT_URL"),
+		QdrantAPIKey:       os.Getenv("AGENT_MEMORY_QDRANT_API_KEY"),
+		HealthAddr:         os.Getenv("AGENT_MEMORY_HEALTH_ADDR"),
+		AgentGRPCAddr:      os.Getenv("AGENT_MEMORY_AGENT_GRPC_ADDR"),
+		AgentGRPCTLSCert:   os.Getenv("AGENT_MEMORY_AGENT_GRPC_TLS_CERT"),
+		AgentGRPCTLSKey:    os.Getenv("AGENT_MEMORY_AGENT_GRPC_TLS_KEY"),
+		AgentGRPCClientCA:  os.Getenv("AGENT_MEMORY_AGENT_GRPC_TLS_CLIENT_CA"),
+		SummariserEndpoint: os.Getenv("AGENT_MEMORY_SUMMARISER_ENDPOINT"),
+		SummariserModel:    os.Getenv("AGENT_MEMORY_SUMMARISER_MODEL"),
+		SummariserAPIKey:   os.Getenv("AGENT_MEMORY_SUMMARISER_API_KEY"),
 		// implementation-plan.md Stage 5.1 makes concept fan-out
 		// part of the production default mixed seed. Operators
 		// can still opt out by setting AGENT_MEMORY_ENABLE_CONCEPTS=false
@@ -421,6 +486,10 @@ func loadConfig() (config, error) {
 			return c, errors.New(
 				"AGENT_MEMORY_AGENT_GRPC_ADDR set without AGENT_MEMORY_AGENT_GRPC_TLS_{CERT,KEY,CLIENT_CA}: mTLS is mandatory")
 		}
+	}
+	if c.SummariserEndpoint != "" && c.SummariserModel == "" {
+		return c, errors.New(
+			"AGENT_MEMORY_SUMMARISER_ENDPOINT set without AGENT_MEMORY_SUMMARISER_MODEL: vendor model id is required")
 	}
 	return c, nil
 }
@@ -924,4 +993,406 @@ func (p *pgTextArray) Scan(src interface{}) error {
 	}
 	*p = out
 	return nil
+}
+
+// newNeighborhoodResolverFromGraphReader is the production
+// `agentapi.NeighborhoodResolver` adapter that resolves
+// `agent.summarize` Stage 5.4 targets through the existing
+// graph-reader stack.
+//
+// Node-target path
+// ----------------
+//   - `gReader.NeighborhoodCard(nodeID, IncludeRetired=false)`
+//     fetches the seed + outbound edges inside one
+//     REPEATABLE READ transaction.
+//   - For each unique outbound `DstNodeID`, a follow-up
+//     `gReader.GetNode` populates the destination card.
+//     This is bounded N+1: the verb already caps edges at
+//     `maxSummarizeEdges=32`, so the dst hydration is
+//     ≤32 reads per call. A `GetNode` returning ErrNotFound
+//     (the dst was retired between the card scan and the
+//     follow-up read) is logged and skipped — the verb's
+//     `deduplicatedTargets` helper drops any dst not
+//     present in the Targets slice, so the citation
+//     invariant ("every entry references a row that
+//     exists") still holds.
+//
+// Concept-target path
+// -------------------
+//   - `gReader.GetConcept(conceptID)` fetches the seed row.
+//   - A direct SQL query against `concept_support` scoped
+//     by `(concept_id, repo_id)` ONLY (no
+//     `concept_version_id` filter — iter-4 evaluator #1)
+//     loads the supporting Node/Episode rows the citation
+//     set surfaces. The Concept Promoter appends a new
+//     `ConceptVersion` AFTER the Consolidator writes
+//     supports, so filtering on the latest version would
+//     return zero rows for every promoted concept; the
+//     unscoped query matches the architecture §6.2
+//     `mgmt.read.concept_supports(concept_id, repo_id?)`
+//     contract instead. `node_id` / `episode_id` are
+//     nullable columns; either may be set per the
+//     migration 0011 CHECK constraint.
+//   - For supports with a non-empty `node_id`, a follow-up
+//     `GetNode` hydrates `NodeKind` / `NodeSignature` so the
+//     prompt + template can render the support inline.
+//
+// Error classification mirrors the snapshot source
+// (`newSnapshotSourceFromDB`):
+//   - `graphreader.ErrNotFound` on the seed →
+//     `agentapi.ErrSummarizeTargetNotFound`.
+//   - Connection-class errors (`IsGraphStoreUnavailable`) →
+//     `agentapi.ErrGraphStoreUnavailable` so the verb
+//     degrades to the graph-outage envelope.
+//   - Everything else is surfaced verbatim; the verb routes
+//     unclassified errors to a hard Internal status.
+func newNeighborhoodResolverFromGraphReader(
+	gReader *graphreader.Reader,
+	db *sql.DB,
+	logger *slog.Logger,
+) agentapi.NeighborhoodResolver {
+	return agentapi.NeighborhoodResolverFunc{
+		NeighborhoodFn: func(ctx context.Context, nodeID string) (agentapi.SummarizeNodeNeighborhood, error) {
+			card, err := gReader.NeighborhoodCard(ctx, nodeID, graphreader.ReaderOptions{IncludeRetired: false})
+			if err != nil {
+				if errors.Is(err, graphreader.ErrNotFound) {
+					return agentapi.SummarizeNodeNeighborhood{}, fmt.Errorf("%w: node_id=%q",
+						agentapi.ErrSummarizeTargetNotFound, nodeID)
+				}
+				return agentapi.SummarizeNodeNeighborhood{}, classifyGraphStoreError(err, "summarize.neighborhood")
+			}
+			seedCard := agentapi.SummarizeNodeCard{
+				NodeID:             card.Node.NodeID,
+				RepoID:             card.Node.RepoID,
+				Kind:               card.Node.Kind,
+				CanonicalSignature: card.Node.CanonicalSignature,
+			}
+			edges := make([]agentapi.SummarizeEdgeCard, 0, len(card.Edges))
+			seenDst := make(map[string]struct{}, len(card.Edges))
+			dstOrder := make([]string, 0, len(card.Edges))
+			for _, ce := range card.Edges {
+				var obs int64
+				if ce.TraceObservation != nil {
+					obs = ce.TraceObservation.ObservationCount
+				}
+				edges = append(edges, agentapi.SummarizeEdgeCard{
+					EdgeID:           ce.EdgeID,
+					RepoID:           ce.RepoID,
+					Kind:             ce.Kind,
+					SrcNodeID:        ce.SrcNodeID,
+					DstNodeID:        ce.DstNodeID,
+					ObservationCount: obs,
+				})
+				if ce.DstNodeID == "" || ce.DstNodeID == card.Node.NodeID {
+					continue
+				}
+				if _, dup := seenDst[ce.DstNodeID]; dup {
+					continue
+				}
+				seenDst[ce.DstNodeID] = struct{}{}
+				dstOrder = append(dstOrder, ce.DstNodeID)
+			}
+			// iter-4 evaluator #3: bound the N+1 dst
+			// hydration to `agentapi.MaxSummarizeEdges`
+			// BEFORE issuing GetNode calls. Without this
+			// cap a hot node with thousands of outbound
+			// edges (e.g. a popular utility method)
+			// would force the adapter into one DB
+			// round-trip per edge even though the verb
+			// downstream caps `cappedEdges` at the same
+			// value and discards everything past index
+			// 32. The cap is taken from the agentapi
+			// public alias so a future bump stays in
+			// sync.
+			targets, dstSig, hydErr := hydrateDstNodes(ctx, gReader, dstOrder, agentapi.MaxSummarizeEdges, logger)
+			if hydErr != nil {
+				return agentapi.SummarizeNodeNeighborhood{}, hydErr
+			}
+			// Backfill DstSignature on edges from the
+			// hydrated map so the prompt + template can
+			// render `src → dst` lines with both endpoints
+			// labelled.
+			for i := range edges {
+				if sig, ok := dstSig[edges[i].DstNodeID]; ok {
+					edges[i].DstSignature = sig
+				}
+			}
+			return agentapi.SummarizeNodeNeighborhood{
+				Node:    seedCard,
+				Edges:   edges,
+				Targets: targets,
+			}, nil
+		},
+		ConceptFn: func(ctx context.Context, conceptID, repoID string) (agentapi.SummarizeConceptCard, error) {
+			concept, err := gReader.GetConcept(ctx, conceptID)
+			if err != nil {
+				if errors.Is(err, graphreader.ErrNotFound) {
+					return agentapi.SummarizeConceptCard{}, fmt.Errorf("%w: concept_id=%q",
+						agentapi.ErrSummarizeTargetNotFound, conceptID)
+				}
+				return agentapi.SummarizeConceptCard{}, classifyGraphStoreError(err, "summarize.concept")
+			}
+			card := agentapi.SummarizeConceptCard{
+				ConceptID:     concept.ConceptID,
+				RepoID:        repoID,
+				Name:          concept.Name,
+				DescriptionMD: concept.DescriptionMD,
+			}
+			// concept_support lookup: scope by
+			// `(concept_id, repo_id)` ONLY — see
+			// `loadConceptSupports` for the iter-4 #1
+			// rationale on dropping the version filter.
+			// The 64-row DB cap keeps the query bounded;
+			// the verb re-caps at
+			// `agentapi.MaxSummarizeConceptSupports`
+			// (32) for the prompt + citation array.
+			supports, suppErr := loadConceptSupports(ctx, db, conceptID, repoID, logger)
+			if suppErr != nil {
+				// iter-4 evaluator #2: do NOT silently
+				// succeed with zero supports on a
+				// support-side outage — that hides the
+				// missing-citation path Stage 5.4
+				// requires. `loadConceptSupports`
+				// already wraps connection-class errors
+				// as `ErrGraphStoreUnavailable`, so the
+				// verb's `summarizeGraphFailure` path
+				// degrades cleanly; non-connection
+				// errors (scan / syntax / context) are
+				// genuine internal bugs and propagate
+				// hard.
+				return agentapi.SummarizeConceptCard{}, suppErr
+			}
+			// Hydrate NodeKind / NodeSignature for supports
+			// that carry a Node reference. Bounded by the
+			// 64-row DB cap above.
+			for i := range supports {
+				if supports[i].NodeID == "" {
+					continue
+				}
+				dn, gerr := gReader.GetNode(ctx, supports[i].NodeID, graphreader.ReaderOptions{IncludeRetired: false})
+				if gerr != nil {
+					if errors.Is(gerr, graphreader.ErrNotFound) {
+						// Support row pointed at a
+						// retired node; keep the
+						// citation but leave hydration
+						// fields empty.
+						continue
+					}
+					return agentapi.SummarizeConceptCard{}, classifyGraphStoreError(gerr, "summarize.support_node")
+				}
+				supports[i].NodeKind = dn.Kind
+				supports[i].NodeSignature = dn.CanonicalSignature
+			}
+			card.Supports = supports
+			return card, nil
+		},
+	}
+}
+
+// loadConceptSupports runs the `concept_support` SQL query
+// for the supplied (concept_id, repo_id) tuple. Returns the
+// rows in `created_at DESC` order so the verb's bounded
+// slice surfaces the most recent provenance first. The
+// 64-row cap is larger than the verb's
+// `agentapi.MaxSummarizeConceptSupports` (32) so an
+// operator can raise the verb cap without a schema-level
+// change.
+//
+// Version-filter rationale (iter-4 evaluator #1)
+// ---------------------------------------------
+// The query intentionally does NOT filter by
+// `concept_version_id`. The Concept Promoter
+// (architecture.md §3.5, §7.8) appends a NEW
+// `ConceptVersion` row on every promotion run, while the
+// Consolidator stamps `concept_support` rows against the
+// version it observed at write time. Filtering supports to
+// the latest `concept_version_id` therefore returns zero
+// rows for any concept the Promoter touched after the
+// Consolidator's most recent support write — i.e. exactly
+// the promoted-concept case Stage 5.4 needs to surface.
+//
+// This matches the architecture §6.2 contract for
+// `mgmt.read.concept_supports(concept_id, repo_id?)` which
+// is "a straight scan with a `support.repo_id` filter; no
+// Concept duplication across repos is needed" (§6.5).
+// Duplicate Node / Episode references across historical
+// versions are deduped downstream by
+// `buildConceptCitations`.
+func loadConceptSupports(
+	ctx context.Context, db *sql.DB,
+	conceptID, repoID string, logger *slog.Logger,
+) ([]agentapi.SummarizeConceptSupport, error) {
+	const q = `
+SELECT cs.support_id::text,
+       cs.node_id::text,
+       cs.episode_id::text,
+       cs.polarity::text
+  FROM concept_support cs
+ WHERE cs.concept_id = $1
+   AND cs.repo_id    = $2
+ ORDER BY cs.created_at DESC
+ LIMIT 64`
+	rows, err := db.QueryContext(ctx, q, conceptID, repoID)
+	if err != nil {
+		if agentapi.IsGraphStoreUnavailable(err) {
+			return nil, fmt.Errorf("%w: concept_support: %v",
+				agentapi.ErrGraphStoreUnavailable, err)
+		}
+		return nil, fmt.Errorf("concept_support: %w", err)
+	}
+	defer rows.Close()
+	var out []agentapi.SummarizeConceptSupport
+	for rows.Next() {
+		var (
+			supportID string
+			nodeID    sql.NullString
+			episodeID sql.NullString
+			polarity  string
+		)
+		if err := rows.Scan(&supportID, &nodeID, &episodeID, &polarity); err != nil {
+			return nil, fmt.Errorf("concept_support: scan: %w", err)
+		}
+		sup := agentapi.SummarizeConceptSupport{
+			SupportID: supportID,
+			Polarity:  polarity,
+		}
+		if nodeID.Valid {
+			sup.NodeID = nodeID.String
+		}
+		if episodeID.Valid {
+			sup.EpisodeID = episodeID.String
+		}
+		out = append(out, sup)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("concept_support: rows: %w", err)
+	}
+	logger.Debug("agent-api.summarize.concept_supports.loaded",
+		slog.String("concept_id", conceptID),
+		slog.String("repo_id", repoID),
+		slog.Int("rows", len(out)))
+	return out, nil
+}
+
+// dstNodeFetcher is the narrow interface `hydrateDstNodes`
+// consumes — pulled out so cmd/agent-api unit tests can
+// drive the helper with a counting fake instead of standing
+// up a full `*graphreader.Reader`. `*graphreader.Reader`
+// satisfies it implicitly via its public `GetNode` method,
+// so production wiring is unchanged.
+type dstNodeFetcher interface {
+	GetNode(ctx context.Context, nodeID string, opts graphreader.ReaderOptions) (graphreader.Node, error)
+}
+
+// hydrateDstNodes pulls the destination Node card for every
+// id in `dstOrder` and returns the resulting Targets[] slice
+// plus a `dstSig` map used to backfill `DstSignature` on the
+// edge cards.
+//
+// Bounded N+1 contract (iter-4 evaluator #3)
+// ------------------------------------------
+// `dstOrder` is hard-truncated to `max` BEFORE any
+// `GetNode` issue. Production callers pass
+// `agentapi.MaxSummarizeEdges` so the adapter never spends
+// more DB round-trips than the verb's downstream cap will
+// retain. A hot node returning 1000 edges therefore yields
+// at most `max` lookups, not 1000.
+//
+// Retirement race
+// ---------------
+// The dst reads happen OUTSIDE the seed card's repeatable-
+// read snapshot, so a destination that was retired between
+// the card scan and the follow-up read returns
+// `graphreader.ErrNotFound`; we skip it (the verb's
+// `deduplicatedTargets` helper drops any dst id missing
+// from Targets[], so the citation invariant holds).
+//
+// Connection-class errors are promoted to
+// `agentapi.ErrGraphStoreUnavailable` via
+// `classifyGraphStoreError` so the verb degrades cleanly
+// rather than emitting a 5xx.
+func hydrateDstNodes(
+	ctx context.Context,
+	fetcher dstNodeFetcher,
+	dstOrder []string,
+	max int,
+	logger *slog.Logger,
+) ([]agentapi.SummarizeNodeCard, map[string]string, error) {
+	if max > 0 && len(dstOrder) > max {
+		logger.Debug("agent-api.summarize.dst_hydration.capped",
+			slog.Int("requested", len(dstOrder)),
+			slog.Int("cap", max))
+		dstOrder = dstOrder[:max]
+	}
+	targets := make([]agentapi.SummarizeNodeCard, 0, len(dstOrder))
+	dstSig := make(map[string]string, len(dstOrder))
+	for _, dstID := range dstOrder {
+		dn, gerr := fetcher.GetNode(ctx, dstID, graphreader.ReaderOptions{IncludeRetired: false})
+		if gerr != nil {
+			if errors.Is(gerr, graphreader.ErrNotFound) {
+				logger.Debug("agent-api.summarize.dst_node_missing",
+					slog.String("node_id", dstID))
+				continue
+			}
+			return nil, nil, classifyGraphStoreError(gerr, "summarize.dst_node")
+		}
+		targets = append(targets, agentapi.SummarizeNodeCard{
+			NodeID:             dn.NodeID,
+			RepoID:             dn.RepoID,
+			Kind:               dn.Kind,
+			CanonicalSignature: dn.CanonicalSignature,
+		})
+		dstSig[dn.NodeID] = dn.CanonicalSignature
+	}
+	return targets, dstSig, nil
+}
+
+// newRerankerFreshnessFromDB returns the SQL-backed
+// `agentapi.RerankerFreshnessSource` the Stage 5.4 summarize
+// verb consults on the degraded fallback path to pick
+// between `summariser_unavailable` and
+// `reranker_model_stale`.
+//
+// Status filter: only `'published'` rows count. `'shadow'`
+// models are training-only and never deployed; including
+// them would mask a genuinely-stale published baseline.
+func newRerankerFreshnessFromDB(db *sql.DB, logger *slog.Logger) agentapi.RerankerFreshnessSource {
+	return agentapi.RerankerFreshnessFunc(func(ctx context.Context) (time.Time, bool, error) {
+		const q = `
+SELECT trained_at
+  FROM reranker_model
+ WHERE status = 'published'
+ ORDER BY trained_at DESC
+ LIMIT 1`
+		var t time.Time
+		err := db.QueryRowContext(ctx, q).Scan(&t)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return time.Time{}, false, nil
+			}
+			logger.Warn("agent-api.summarize.reranker_freshness.query",
+				slog.String("error", err.Error()))
+			return time.Time{}, false, fmt.Errorf("reranker_model: %w", err)
+		}
+		return t, true, nil
+	})
+}
+
+// newSummariserFromConfig constructs the OpenAI-compatible
+// HTTPS `agentapi.Summariser` from the AGENT_MEMORY_SUMMARISER_*
+// env vars. The config layer already verified that
+// ENDPOINT + MODEL are both set when this is called.
+func newSummariserFromConfig(cfg config, logger *slog.Logger) (agentapi.Summariser, error) {
+	cli, err := agentapi.NewOpenAICompatibleSummariser(agentapi.OpenAICompatibleConfig{
+		Endpoint:   cfg.SummariserEndpoint,
+		Model:      cfg.SummariserModel,
+		APIKey:     cfg.SummariserAPIKey,
+		HTTPClient: &http.Client{Timeout: 30 * time.Second},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("summariser: %w", err)
+	}
+	logger.Debug("agent-api.summarize.summariser.constructed",
+		slog.String("model_version", cli.ModelVersion()))
+	return cli, nil
 }

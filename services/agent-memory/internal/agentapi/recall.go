@@ -42,6 +42,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/embedding"
 )
@@ -182,6 +183,21 @@ type Service struct {
 	snapshot        SnapshotSource
 	conceptsEnabled bool
 	expansionDepth  int
+
+	// Stage 5.4 optional dependencies wired by
+	// `WithSummariser` / `WithNeighborhoodResolver` /
+	// `WithRerankerFreshness` / `WithSummariserTimeout`.
+	// See `summarize.go` for the per-field contract and the
+	// rationale for each interface boundary. `neighborhood`
+	// is the only field consulted on the `Recall` path
+	// indirectly — it stays nil unless a binary explicitly
+	// wires Stage 5.4, in which case `Service.Summarize`
+	// returns `ErrSummarizeUnconfigured` rather than a
+	// confusing partial result.
+	summariser        Summariser
+	neighborhood      NeighborhoodResolver
+	rerankerFreshness RerankerFreshnessSource
+	summariserTimeout time.Duration
 }
 
 // Option configures a `Service`.
@@ -354,6 +370,7 @@ func NewService(embedder QueryEmbedder, searcher VectorSearcher, filter PublishF
 		logger:              slog.Default(),
 		overFetchMultiplier: 3,
 		expansionDepth:      defaultExpansionDepth,
+		summariserTimeout:   defaultSummariserTimeout,
 	}
 	for _, opt := range opts {
 		opt(s)

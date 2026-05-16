@@ -219,3 +219,180 @@ func TestNewGRPCServer_nilServicePanics(t *testing.T) {
 	}()
 	_ = NewGRPCServer(nil)
 }
+
+// ---------------------------------------------------------------------------
+// Summarize (Stage 5.4) — proto translation + error mapping
+// ---------------------------------------------------------------------------
+
+// TestGRPCServer_summarizeTranslatesNodeTarget round-trips
+// a node-target proto request through the verb. Proves:
+//   - NodeId / RepoId / MaxTokens reach the service.
+//   - Internal Citations[] surface on the proto cards in
+//     the same order with the right field populated.
+//   - SummaryMD, ContextId, Degraded, TargetKind, TargetId
+//     all project verbatim.
+func TestGRPCServer_summarizeTranslatesNodeTarget(t *testing.T) {
+	nb := sampleNodeNeighborhood()
+	resolver := &fakeResolver{
+		nodes: map[string]SummarizeNodeNeighborhood{nb.Node.NodeID: nb},
+	}
+	summariser := &fakeSummariser{
+		output: SummariserOutput{SummaryMD: "## summary text"},
+	}
+	contextLog := &recordingContextLog{returnID: "ctx-grpc-001"}
+	svc := newSummarizeService(t,
+		WithNeighborhoodResolver(resolver),
+		WithSummariser(summariser),
+		WithContextLog(contextLog),
+	)
+	srv := NewGRPCServer(svc)
+
+	resp, err := srv.Summarize(context.Background(), &agentpb.SummarizeRequest{
+		NodeId:    nb.Node.NodeID,
+		RepoId:    "repo-a",
+		MaxTokens: 256,
+	})
+	if err != nil {
+		t.Fatalf("gRPC Summarize: %v", err)
+	}
+	if resp.GetSummaryMd() != "## summary text" {
+		t.Fatalf("SummaryMd = %q; want canned response", resp.GetSummaryMd())
+	}
+	if resp.GetContextId() != "ctx-grpc-001" {
+		t.Fatalf("ContextId = %q; want ctx-grpc-001", resp.GetContextId())
+	}
+	if resp.GetDegraded() {
+		t.Fatalf("Degraded = true; want false on happy path")
+	}
+	if resp.GetTargetKind() != "node" {
+		t.Fatalf("TargetKind = %q; want node", resp.GetTargetKind())
+	}
+	if resp.GetTargetId() != nb.Node.NodeID {
+		t.Fatalf("TargetId = %q; want %q", resp.GetTargetId(), nb.Node.NodeID)
+	}
+	wantCitations := 1 + len(nb.Edges) + 3
+	if got := len(resp.GetCitations()); got != wantCitations {
+		t.Fatalf("len(Citations) = %d; want %d", got, wantCitations)
+	}
+	// First citation == seed Node; verify the proto carries
+	// the NodeId, not EdgeId/ConceptId.
+	c0 := resp.GetCitations()[0]
+	if c0.GetNodeId() != nb.Node.NodeID {
+		t.Fatalf("Citations[0].NodeId = %q; want %q", c0.GetNodeId(), nb.Node.NodeID)
+	}
+	if c0.GetEdgeId() != "" || c0.GetConceptId() != "" {
+		t.Fatalf("Citations[0] has unexpected edge/concept ids: %+v", c0)
+	}
+	// Second citation == first edge.
+	c1 := resp.GetCitations()[1]
+	if c1.GetEdgeId() != "e1" {
+		t.Fatalf("Citations[1].EdgeId = %q; want e1", c1.GetEdgeId())
+	}
+	if c1.GetNodeId() != "" {
+		t.Fatalf("Citations[1].NodeId = %q; want empty", c1.GetNodeId())
+	}
+	if summariser.lastMaxToks != 256 {
+		t.Fatalf("summariser.MaxTokens = %d; want 256", summariser.lastMaxToks)
+	}
+}
+
+// TestGRPCServer_summarizeNilRequestRejected proves the
+// nil-guard.
+func TestGRPCServer_summarizeNilRequestRejected(t *testing.T) {
+	svc := newSummarizeService(t,
+		WithNeighborhoodResolver(&fakeResolver{}),
+	)
+	srv := NewGRPCServer(svc)
+	_, err := srv.Summarize(context.Background(), nil)
+	if err == nil {
+		t.Fatalf("expected error for nil request")
+	}
+	st, _ := status.FromError(err)
+	if st.Code() != codes.InvalidArgument {
+		t.Fatalf("code = %s; want InvalidArgument", st.Code())
+	}
+}
+
+// TestGRPCServer_summarizeMissingTargetInvalidArgument
+// proves the validation sentinel surfaces as
+// InvalidArgument.
+func TestGRPCServer_summarizeMissingTargetInvalidArgument(t *testing.T) {
+	svc := newSummarizeService(t,
+		WithNeighborhoodResolver(&fakeResolver{}),
+	)
+	srv := NewGRPCServer(svc)
+	_, err := srv.Summarize(context.Background(), &agentpb.SummarizeRequest{})
+	if err == nil {
+		t.Fatalf("expected validation error")
+	}
+	st, _ := status.FromError(err)
+	if st.Code() != codes.InvalidArgument {
+		t.Fatalf("code = %s; want InvalidArgument", st.Code())
+	}
+}
+
+// TestGRPCServer_summarizeTargetNotFoundNotFound proves
+// the resolver's not-found sentinel surfaces as NotFound.
+func TestGRPCServer_summarizeTargetNotFoundNotFound(t *testing.T) {
+	resolver := &fakeResolver{
+		nodeErr: map[string]error{
+			"66666666-6666-6666-6666-666666666666": ErrSummarizeTargetNotFound,
+		},
+	}
+	svc := newSummarizeService(t, WithNeighborhoodResolver(resolver))
+	srv := NewGRPCServer(svc)
+	_, err := srv.Summarize(context.Background(), &agentpb.SummarizeRequest{
+		NodeId: "66666666-6666-6666-6666-666666666666",
+	})
+	st, _ := status.FromError(err)
+	if st.Code() != codes.NotFound {
+		t.Fatalf("code = %s; want NotFound", st.Code())
+	}
+}
+
+// TestGRPCServer_summarizeUnconfiguredUnimplemented proves
+// a Service without a NeighborhoodResolver surfaces as
+// Unimplemented — the same wire signal a binary that
+// hasn't deployed Stage 5.4 would surface.
+func TestGRPCServer_summarizeUnconfiguredUnimplemented(t *testing.T) {
+	svc := newSummarizeService(t) // no resolver wired
+	srv := NewGRPCServer(svc)
+	_, err := srv.Summarize(context.Background(), &agentpb.SummarizeRequest{
+		NodeId: "11111111-1111-1111-1111-111111111111",
+	})
+	st, _ := status.FromError(err)
+	if st.Code() != codes.Unimplemented {
+		t.Fatalf("code = %s; want Unimplemented", st.Code())
+	}
+}
+
+// TestGRPCServer_summarizeDegradedEnvelopeIsNotAnError
+// proves a degraded summary (graph unavailable) surfaces
+// as a NORMAL gRPC response with `degraded=true`, NOT a
+// status error. The gRPC layer must distinguish
+// caller-correctable failures (status error) from
+// in-band degraded envelopes (response with flag set).
+func TestGRPCServer_summarizeDegradedEnvelopeIsNotAnError(t *testing.T) {
+	resolver := &fakeResolver{
+		nodeErr: map[string]error{
+			"55555555-5555-5555-5555-555555555555": ErrGraphStoreUnavailable,
+		},
+	}
+	svc := newSummarizeService(t,
+		WithNeighborhoodResolver(resolver),
+	)
+	srv := NewGRPCServer(svc)
+	resp, err := srv.Summarize(context.Background(), &agentpb.SummarizeRequest{
+		NodeId: "55555555-5555-5555-5555-555555555555",
+		RepoId: "repo-a",
+	})
+	if err != nil {
+		t.Fatalf("gRPC Summarize: %v (graph outage should be in-band, not status error)", err)
+	}
+	if !resp.GetDegraded() {
+		t.Fatalf("Degraded = false; want true")
+	}
+	if resp.GetDegradedReason() == "" {
+		t.Fatalf("DegradedReason empty; want non-empty")
+	}
+}

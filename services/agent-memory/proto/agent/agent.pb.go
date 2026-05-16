@@ -2,10 +2,13 @@
 //
 // Stage 5.1 of implementation-plan.md ships the IDL for the
 // `agent.recall` verb plus skeleton placeholders for the
-// `agent.observe`, `agent.expand`, and `agent.summarize` verbs
-// owned by Stages 5.2 / 5.3 / 5.4. Generated Go bindings will
-// land alongside the protoc tooling pin in a follow-up; for
-// now this file is the canonical contract that
+// `agent.observe` and `agent.expand` verbs owned by Stages
+// 5.2 / 5.3. Stage 5.4 (this iter) lands the full
+// `agent.summarize` verb shape (`SummarizeRequest` /
+// `SummarizeResponse` / `Citation`) wired through
+// `internal/agentapi/summarize.go`. Generated Go bindings
+// for all verbs are produced via the protoc tooling pin;
+// this file is the canonical contract that
 // `cmd/agent-api/main.go` mTLS server speaks.
 //
 // Transport contract (tech-spec §8.5):
@@ -528,10 +531,13 @@ func (x *RecallResponse) GetFiltered() int32 {
 	return 0
 }
 
-// Placeholder request / response messages for the other Agent
-// Surface verbs. They are defined here so the gRPC server can
-// register a single service descriptor today; the body shapes
-// will firm up as Stages 5.2 / 5.3 / 5.4 land.
+// Placeholder request / response messages for the Observe
+// and Expand verbs. They are defined here so the gRPC server
+// can register a single service descriptor today; the body
+// shapes will firm up as Stages 5.2 / 5.3 land. The Stage 5.4
+// `Summarize{Request,Response}` + `Citation` messages below
+// are NOT placeholders — they carry the full Stage 5.4 wire
+// contract that `internal/agentapi/summarize.go` consumes.
 type ObserveRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ContextId     string                 `protobuf:"bytes,1,opt,name=context_id,json=contextId,proto3" json:"context_id,omitempty"`
@@ -780,10 +786,28 @@ func (x *ExpandResponse) GetDegradedReason() string {
 	return ""
 }
 
+// SummarizeRequest is the input shape for `agent.summarize`
+// (architecture.md §6.1.4). Exactly one of `node_id` /
+// `concept_id` MUST be supplied; both empty or both set
+// is rejected with INVALID_ARGUMENT. `repo_id` is REQUIRED
+// when `concept_id` is set (concepts have no inherent repo
+// scope per architecture §5.5.1 + **G6**); for `node_id`
+// requests `repo_id` MAY be empty and is then derived from
+// the seed Node's repo. When supplied for a `node_id`
+// request, it MUST match the seed Node's repo.
 type SummarizeRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
-	ConceptId     string                 `protobuf:"bytes,2,opt,name=concept_id,json=conceptId,proto3" json:"concept_id,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	NodeId    string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	ConceptId string                 `protobuf:"bytes,2,opt,name=concept_id,json=conceptId,proto3" json:"concept_id,omitempty"`
+	// max_tokens caps the summariser's output budget. Values
+	// <= 0 default to 512; values > 4096 are clamped server-
+	// side so a single summarize call cannot saturate the
+	// shared LLM endpoint.
+	MaxTokens int32 `protobuf:"varint,3,opt,name=max_tokens,json=maxTokens,proto3" json:"max_tokens,omitempty"`
+	// repo_id scopes the RecallContextLog row written for
+	// this summarize. See the message-level doc above for
+	// the per-target requirement.
+	RepoId        string `protobuf:"bytes,4,opt,name=repo_id,json=repoId,proto3" json:"repo_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -832,19 +856,144 @@ func (x *SummarizeRequest) GetConceptId() string {
 	return ""
 }
 
+func (x *SummarizeRequest) GetMaxTokens() int32 {
+	if x != nil {
+		return x.MaxTokens
+	}
+	return 0
+}
+
+func (x *SummarizeRequest) GetRepoId() string {
+	if x != nil {
+		return x.RepoId
+	}
+	return ""
+}
+
+// Citation is one provenance entry the summariser surfaces
+// alongside `summary_md`. Exactly one of `node_id` /
+// `edge_id` / `concept_id` / `episode_id` is populated per
+// citation; the optional `snippet` carries a short excerpt
+// the agent caller can render inline. Mirrors
+// architecture.md §6.1.4 `SummarizeResponse.citations`.
+//
+// `episode_id` is populated when the citation references a
+// `concept_support` row whose support source is an episode
+// (Stage 5.4 concept-target citations — e2e-scenarios.md
+// "summary cites resolved nodes" concept branch).
+type Citation struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	EdgeId        string                 `protobuf:"bytes,2,opt,name=edge_id,json=edgeId,proto3" json:"edge_id,omitempty"`
+	ConceptId     string                 `protobuf:"bytes,3,opt,name=concept_id,json=conceptId,proto3" json:"concept_id,omitempty"`
+	Snippet       string                 `protobuf:"bytes,4,opt,name=snippet,proto3" json:"snippet,omitempty"`
+	EpisodeId     string                 `protobuf:"bytes,5,opt,name=episode_id,json=episodeId,proto3" json:"episode_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Citation) Reset() {
+	*x = Citation{}
+	mi := &file_proto_agent_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Citation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Citation) ProtoMessage() {}
+
+func (x *Citation) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Citation.ProtoReflect.Descriptor instead.
+func (*Citation) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *Citation) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *Citation) GetEdgeId() string {
+	if x != nil {
+		return x.EdgeId
+	}
+	return ""
+}
+
+func (x *Citation) GetConceptId() string {
+	if x != nil {
+		return x.ConceptId
+	}
+	return ""
+}
+
+func (x *Citation) GetSnippet() string {
+	if x != nil {
+		return x.Snippet
+	}
+	return ""
+}
+
+func (x *Citation) GetEpisodeId() string {
+	if x != nil {
+		return x.EpisodeId
+	}
+	return ""
+}
+
+// SummarizeResponse is the §6.1.4 envelope.
+//
+//   - `context_id` is the durable RecallContextLog row id
+//     the verb appended for this call (architecture §5.4.1,
+//     Stage 5.4 brief).
+//   - `target_kind` is "node" | "concept"; `target_id` is
+//     the same id the caller passed in `node_id` /
+//     `concept_id`. These echo the request so a caller that
+//     muxes many requests onto one stream can disambiguate
+//     without retaining the request payload.
+//   - `citations[]` carry the proof-of-reachability ids
+//     (every entry is reachable from `target_id` in the
+//     structural graph) per the Stage 5.4 acceptance
+//     scenario "summary cites resolved nodes".
+//   - `degraded` / `degraded_reason` use the §C22 closed
+//     set augmented with `summariser_unavailable` (new in
+//     Stage 5.4) and the existing `reranker_model_stale`.
+//     The Stage 5.4 brief pins `reranker_model_stale` for
+//     the case where the latest reranker run is older than
+//     7 days; `summariser_unavailable` covers a fresh-
+//     reranker-but-timed-out summariser.
 type SummarizeResponse struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	SummaryMd      string                 `protobuf:"bytes,1,opt,name=summary_md,json=summaryMd,proto3" json:"summary_md,omitempty"`
 	ContextId      string                 `protobuf:"bytes,2,opt,name=context_id,json=contextId,proto3" json:"context_id,omitempty"`
 	Degraded       bool                   `protobuf:"varint,3,opt,name=degraded,proto3" json:"degraded,omitempty"`
 	DegradedReason string                 `protobuf:"bytes,4,opt,name=degraded_reason,json=degradedReason,proto3" json:"degraded_reason,omitempty"`
+	TargetKind     string                 `protobuf:"bytes,5,opt,name=target_kind,json=targetKind,proto3" json:"target_kind,omitempty"`
+	TargetId       string                 `protobuf:"bytes,6,opt,name=target_id,json=targetId,proto3" json:"target_id,omitempty"`
+	Citations      []*Citation            `protobuf:"bytes,7,rep,name=citations,proto3" json:"citations,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
 
 func (x *SummarizeResponse) Reset() {
 	*x = SummarizeResponse{}
-	mi := &file_proto_agent_proto_msgTypes[10]
+	mi := &file_proto_agent_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -856,7 +1005,7 @@ func (x *SummarizeResponse) String() string {
 func (*SummarizeResponse) ProtoMessage() {}
 
 func (x *SummarizeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[10]
+	mi := &file_proto_agent_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -869,7 +1018,7 @@ func (x *SummarizeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SummarizeResponse.ProtoReflect.Descriptor instead.
 func (*SummarizeResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{10}
+	return file_proto_agent_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *SummarizeResponse) GetSummaryMd() string {
@@ -898,6 +1047,27 @@ func (x *SummarizeResponse) GetDegradedReason() string {
 		return x.DegradedReason
 	}
 	return ""
+}
+
+func (x *SummarizeResponse) GetTargetKind() string {
+	if x != nil {
+		return x.TargetKind
+	}
+	return ""
+}
+
+func (x *SummarizeResponse) GetTargetId() string {
+	if x != nil {
+		return x.TargetId
+	}
+	return ""
+}
+
+func (x *SummarizeResponse) GetCitations() []*Citation {
+	if x != nil {
+		return x.Citations
+	}
+	return nil
 }
 
 var File_proto_agent_proto protoreflect.FileDescriptor
@@ -960,18 +1130,33 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\n" +
 	"context_id\x18\x02 \x01(\tR\tcontextId\x12\x1a\n" +
 	"\bdegraded\x18\x03 \x01(\bR\bdegraded\x12'\n" +
-	"\x0fdegraded_reason\x18\x04 \x01(\tR\x0edegradedReason\"J\n" +
+	"\x0fdegraded_reason\x18\x04 \x01(\tR\x0edegradedReason\"\x82\x01\n" +
 	"\x10SummarizeRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1d\n" +
 	"\n" +
-	"concept_id\x18\x02 \x01(\tR\tconceptId\"\x96\x01\n" +
+	"concept_id\x18\x02 \x01(\tR\tconceptId\x12\x1d\n" +
+	"\n" +
+	"max_tokens\x18\x03 \x01(\x05R\tmaxTokens\x12\x17\n" +
+	"\arepo_id\x18\x04 \x01(\tR\x06repoId\"\x94\x01\n" +
+	"\bCitation\x12\x17\n" +
+	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x17\n" +
+	"\aedge_id\x18\x02 \x01(\tR\x06edgeId\x12\x1d\n" +
+	"\n" +
+	"concept_id\x18\x03 \x01(\tR\tconceptId\x12\x18\n" +
+	"\asnippet\x18\x04 \x01(\tR\asnippet\x12\x1d\n" +
+	"\n" +
+	"episode_id\x18\x05 \x01(\tR\tepisodeId\"\x86\x02\n" +
 	"\x11SummarizeResponse\x12\x1d\n" +
 	"\n" +
 	"summary_md\x18\x01 \x01(\tR\tsummaryMd\x12\x1d\n" +
 	"\n" +
 	"context_id\x18\x02 \x01(\tR\tcontextId\x12\x1a\n" +
 	"\bdegraded\x18\x03 \x01(\bR\bdegraded\x12'\n" +
-	"\x0fdegraded_reason\x18\x04 \x01(\tR\x0edegradedReason2\x8e\x02\n" +
+	"\x0fdegraded_reason\x18\x04 \x01(\tR\x0edegradedReason\x12\x1f\n" +
+	"\vtarget_kind\x18\x05 \x01(\tR\n" +
+	"targetKind\x12\x1b\n" +
+	"\ttarget_id\x18\x06 \x01(\tR\btargetId\x120\n" +
+	"\tcitations\x18\a \x03(\v2\x12.agent.v1.CitationR\tcitations2\x8e\x02\n" +
 	"\fAgentService\x12;\n" +
 	"\x06Recall\x12\x17.agent.v1.RecallRequest\x1a\x18.agent.v1.RecallResponse\x12>\n" +
 	"\aObserve\x12\x18.agent.v1.ObserveRequest\x1a\x19.agent.v1.ObserveResponse\x12;\n" +
@@ -990,7 +1175,7 @@ func file_proto_agent_proto_rawDescGZIP() []byte {
 	return file_proto_agent_proto_rawDescData
 }
 
-var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_proto_agent_proto_goTypes = []any{
 	(*RecallRequest)(nil),     // 0: agent.v1.RecallRequest
 	(*NodeCard)(nil),          // 1: agent.v1.NodeCard
@@ -1002,26 +1187,28 @@ var file_proto_agent_proto_goTypes = []any{
 	(*ExpandRequest)(nil),     // 7: agent.v1.ExpandRequest
 	(*ExpandResponse)(nil),    // 8: agent.v1.ExpandResponse
 	(*SummarizeRequest)(nil),  // 9: agent.v1.SummarizeRequest
-	(*SummarizeResponse)(nil), // 10: agent.v1.SummarizeResponse
+	(*Citation)(nil),          // 10: agent.v1.Citation
+	(*SummarizeResponse)(nil), // 11: agent.v1.SummarizeResponse
 }
 var file_proto_agent_proto_depIdxs = []int32{
 	1,  // 0: agent.v1.RecallResponse.nodes:type_name -> agent.v1.NodeCard
 	2,  // 1: agent.v1.RecallResponse.edges:type_name -> agent.v1.EdgeCard
 	3,  // 2: agent.v1.RecallResponse.concepts:type_name -> agent.v1.ConceptCard
 	2,  // 3: agent.v1.ExpandResponse.edges:type_name -> agent.v1.EdgeCard
-	0,  // 4: agent.v1.AgentService.Recall:input_type -> agent.v1.RecallRequest
-	5,  // 5: agent.v1.AgentService.Observe:input_type -> agent.v1.ObserveRequest
-	7,  // 6: agent.v1.AgentService.Expand:input_type -> agent.v1.ExpandRequest
-	9,  // 7: agent.v1.AgentService.Summarize:input_type -> agent.v1.SummarizeRequest
-	4,  // 8: agent.v1.AgentService.Recall:output_type -> agent.v1.RecallResponse
-	6,  // 9: agent.v1.AgentService.Observe:output_type -> agent.v1.ObserveResponse
-	8,  // 10: agent.v1.AgentService.Expand:output_type -> agent.v1.ExpandResponse
-	10, // 11: agent.v1.AgentService.Summarize:output_type -> agent.v1.SummarizeResponse
-	8,  // [8:12] is the sub-list for method output_type
-	4,  // [4:8] is the sub-list for method input_type
-	4,  // [4:4] is the sub-list for extension type_name
-	4,  // [4:4] is the sub-list for extension extendee
-	0,  // [0:4] is the sub-list for field type_name
+	10, // 4: agent.v1.SummarizeResponse.citations:type_name -> agent.v1.Citation
+	0,  // 5: agent.v1.AgentService.Recall:input_type -> agent.v1.RecallRequest
+	5,  // 6: agent.v1.AgentService.Observe:input_type -> agent.v1.ObserveRequest
+	7,  // 7: agent.v1.AgentService.Expand:input_type -> agent.v1.ExpandRequest
+	9,  // 8: agent.v1.AgentService.Summarize:input_type -> agent.v1.SummarizeRequest
+	4,  // 9: agent.v1.AgentService.Recall:output_type -> agent.v1.RecallResponse
+	6,  // 10: agent.v1.AgentService.Observe:output_type -> agent.v1.ObserveResponse
+	8,  // 11: agent.v1.AgentService.Expand:output_type -> agent.v1.ExpandResponse
+	11, // 12: agent.v1.AgentService.Summarize:output_type -> agent.v1.SummarizeResponse
+	9,  // [9:13] is the sub-list for method output_type
+	5,  // [5:9] is the sub-list for method input_type
+	5,  // [5:5] is the sub-list for extension type_name
+	5,  // [5:5] is the sub-list for extension extendee
+	0,  // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_proto_agent_proto_init() }
@@ -1035,7 +1222,7 @@ func file_proto_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_agent_proto_rawDesc), len(file_proto_agent_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   11,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

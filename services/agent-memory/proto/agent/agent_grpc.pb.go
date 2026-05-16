@@ -2,10 +2,13 @@
 //
 // Stage 5.1 of implementation-plan.md ships the IDL for the
 // `agent.recall` verb plus skeleton placeholders for the
-// `agent.observe`, `agent.expand`, and `agent.summarize` verbs
-// owned by Stages 5.2 / 5.3 / 5.4. Generated Go bindings will
-// land alongside the protoc tooling pin in a follow-up; for
-// now this file is the canonical contract that
+// `agent.observe` and `agent.expand` verbs owned by Stages
+// 5.2 / 5.3. Stage 5.4 (this iter) lands the full
+// `agent.summarize` verb shape (`SummarizeRequest` /
+// `SummarizeResponse` / `Citation`) wired through
+// `internal/agentapi/summarize.go`. Generated Go bindings
+// for all verbs are produced via the protoc tooling pin;
+// this file is the canonical contract that
 // `cmd/agent-api/main.go` mTLS server speaks.
 //
 // Transport contract (tech-spec §8.5):
@@ -78,8 +81,19 @@ type AgentServiceClient interface {
 	// Expand walks structural edges from a node id; owned by
 	// Stage 5.3. Placeholder.
 	Expand(ctx context.Context, in *ExpandRequest, opts ...grpc.CallOption) (*ExpandResponse, error)
-	// Summarize materialises a neighborhood card into a
-	// natural-language summary; owned by Stage 5.4. Placeholder.
+	// Summarize materialises a neighborhood card (node target)
+	// or a concept card + its `concept_support` rows (concept
+	// target) into a natural-language summary. Implemented in
+	// Stage 5.4. The verb invokes an LLM `Summariser` (the
+	// production adapter speaks the OpenAI-compatible HTTPS
+	// contract), caps the call at a 5 s defence-in-depth
+	// budget, and falls back to a deterministic Markdown
+	// template stamped with `degraded_reason=
+	// summariser_unavailable` (or `reranker_model_stale` when
+	// the reranker training is >7 d old) when the LLM is
+	// unavailable. The handler also durably appends a
+	// `recall_context_log(verb='summarize')` audit row keyed
+	// by the returned `context_id`.
 	Summarize(ctx context.Context, in *SummarizeRequest, opts ...grpc.CallOption) (*SummarizeResponse, error)
 }
 
@@ -153,8 +167,19 @@ type AgentServiceServer interface {
 	// Expand walks structural edges from a node id; owned by
 	// Stage 5.3. Placeholder.
 	Expand(context.Context, *ExpandRequest) (*ExpandResponse, error)
-	// Summarize materialises a neighborhood card into a
-	// natural-language summary; owned by Stage 5.4. Placeholder.
+	// Summarize materialises a neighborhood card (node target)
+	// or a concept card + its `concept_support` rows (concept
+	// target) into a natural-language summary. Implemented in
+	// Stage 5.4. The verb invokes an LLM `Summariser` (the
+	// production adapter speaks the OpenAI-compatible HTTPS
+	// contract), caps the call at a 5 s defence-in-depth
+	// budget, and falls back to a deterministic Markdown
+	// template stamped with `degraded_reason=
+	// summariser_unavailable` (or `reranker_model_stale` when
+	// the reranker training is >7 d old) when the LLM is
+	// unavailable. The handler also durably appends a
+	// `recall_context_log(verb='summarize')` audit row keyed
+	// by the returned `context_id`.
 	Summarize(context.Context, *SummarizeRequest) (*SummarizeResponse, error)
 	mustEmbedUnimplementedAgentServiceServer()
 }

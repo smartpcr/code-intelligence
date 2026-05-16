@@ -8,8 +8,9 @@ import (
 // TestAll_parsesEveryEmbeddedFile confirms every .sql file
 // embedded under //go:embed is parseable and emits a non-empty
 // up body. It also asserts the lexicographic sort produces the
-// implementation-plan.md Stage 1.2 + 1.3 + 1.4 + 2.2 + 3.4 order
-// (0001 .. 0006a then 0006b then 0007 .. 0014 then 0015 .. 0017).
+// implementation-plan.md Stage 1.2 + 1.3 + 1.4 + 2.2 + 3.4 + 3.5
+// order (0001 .. 0006a then 0006b then 0007 .. 0014 then
+// 0015 .. 0018).
 func TestAll_parsesEveryEmbeddedFile(t *testing.T) {
 	t.Parallel()
 	all, err := All()
@@ -30,9 +31,11 @@ func TestAll_parsesEveryEmbeddedFile(t *testing.T) {
 		"0015", "0016",
 		// Stage 2.2 reader-role grant.
 		"0017",
+		// Stage 3.5 webhook receiver per-repo secret table.
+		"0018",
 	}
 	if len(all) != len(wantVersions) {
-		t.Fatalf("All() returned %d migrations, want %d (Stage 1.2 + 1.3 + 1.4 set)",
+		t.Fatalf("All() returned %d migrations, want %d (Stage 1.2 + 1.3 + 1.4 + 2.2 + 3.4 + 3.5 set)",
 			len(all), len(wantVersions))
 	}
 	for i, w := range wantVersions {
@@ -203,6 +206,8 @@ func TestAll_filenamesMatchPlannedSet(t *testing.T) {
 		"0016_roles_grants.sql":      true,
 		// Stage 2.2 reader-role grant.
 		"0017_reader_role.sql": true,
+		// Stage 3.5 per-repo webhook secret table.
+		"0018_repo_webhook_secret.sql": true,
 	}
 	all, err := All()
 	if err != nil {

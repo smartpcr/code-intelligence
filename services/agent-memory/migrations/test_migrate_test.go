@@ -170,6 +170,8 @@ func TestUp_appliesEntireStage12_andEveryExpectedObjectExists(t *testing.T) {
 		"consolidator_run", "promoter_run", "reranker_model",
 		// Stage 1.4 embedding-publish state-log pair.
 		"embedding_publish", "embedding_publish_event",
+		// Stage 3.5 per-repo HMAC secret (Webhook Receiver).
+		"repo_webhook_secret",
 	}
 	for _, tbl := range wantTables {
 		if !relationExists(t, db, schema, tbl) {

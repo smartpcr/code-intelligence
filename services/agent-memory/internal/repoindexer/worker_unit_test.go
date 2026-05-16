@@ -133,10 +133,10 @@ func TestItoa_smallValues(t *testing.T) {
 // `nullableSHA` shim used by the markDoneAndPublish predicate.
 // Empty Go-side strings MUST collapse to a SQL NULL so the
 // in-tx EXISTS lookup matches the dedupe UNIQUE INDEX
-// (which is keyed on `COALESCE(from_sha, '')` and rejects two
+// (which is keyed on `COALESCE(from_sha, ”)` and rejects two
 // rows where the COALESCE'd value collides). A bug here would
 // silently let `repo.registered` fire twice for the same
-// (repo, sha) tuple when one row had `from_sha = ''` and another
+// (repo, sha) tuple when one row had `from_sha = ”` and another
 // had `from_sha = NULL`.
 func TestNullableSHA_emptyStringRoundsToNull(t *testing.T) {
 	t.Parallel()

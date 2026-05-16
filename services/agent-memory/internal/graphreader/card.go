@@ -116,7 +116,22 @@ func (r *Reader) NeighborhoodCard(
 	// snapshot, return the conn to the pool" semantics we
 	// actually want. pgx ignores Rollback after Commit, so
 	// `defer tx.Rollback` is idempotent.
-	defer func() { _ = tx.Rollback(ctx) }()
+	//
+	// We deliberately use `context.WithoutCancel(ctx)` for the
+	// deferred rollback rather than the caller's `ctx`: if the
+	// edge scan tripped a deadline or the caller cancelled, the
+	// outer `ctx` is already Done. Handing a cancelled context
+	// to `Rollback` makes pgx skip the wire-level ROLLBACK and
+	// just mark the connection for destruction on release —
+	// which leaves the PostgreSQL backend pinning the
+	// REPEATABLE READ snapshot (and any locks it implies) until
+	// the backend notices the TCP teardown or the pool's idle
+	// reaper closes the conn. Detaching cancellation here lets
+	// the ROLLBACK actually reach the server and release the
+	// snapshot promptly, while preserving the context's values
+	// (trace IDs, deadlines for tracing hooks, etc.). Available
+	// since Go 1.21; this module is on Go 1.24.
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
 	node, err := r.getNodeTx(ctx, tx, nodeID, opts.IncludeRetired)
 	if err != nil {

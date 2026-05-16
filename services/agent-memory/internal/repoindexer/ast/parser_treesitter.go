@@ -125,6 +125,8 @@ const (
 	tsNodeStatementBlock    = "statement_block"
 	tsNodeIdentifier        = "identifier"
 	tsNodeTypeIdentifier    = "type_identifier"
+	tsNodeTypeArguments     = "type_arguments"
+	tsNodeTypeParameters    = "type_parameters"
 	tsNodeFormalParameters  = "formal_parameters"
 	tsNodeCallExpression    = "call_expression"
 	tsNodeMemberExpression  = "member_expression"
@@ -384,6 +386,19 @@ func (w *tsWalker) handleImport(n *sitter.Node) {
 // without making assumptions about the exact wrapper-node
 // shape (which varies between TS class_heritage and
 // interface extends_type_clause).
+//
+// The walk explicitly STOPS at `type_arguments` /
+// `type_parameters` subtrees so that type-parameter
+// identifiers do not leak in as spurious heritage targets.
+// For `class Foo extends Base<T>`, tree-sitter produces a
+// `generic_type` with children `type_identifier:"Base"` and
+// `type_arguments -> type_identifier:"T"`; without the gate
+// the walk would collect both ["Base", "T"] and the
+// dispatcher would emit a bogus `extends` edge to any
+// class `T` that happens to live in the same file. The
+// scanner fallback in parser_typescript.go achieves the
+// same thing by stripping `<...>` via `baseIdent()` before
+// resolution.
 func collectTSIdentifiers(n *sitter.Node, src []byte) []string {
 	var out []string
 	var walk func(*sitter.Node)
@@ -394,6 +409,11 @@ func collectTSIdentifiers(n *sitter.Node, src []byte) []string {
 		switch node.Type() {
 		case tsNodeTypeIdentifier, tsNodeIdentifier:
 			out = append(out, node.Content(src))
+			return
+		case tsNodeTypeArguments, tsNodeTypeParameters:
+			// Type-level subtree -- identifiers inside
+			// are type parameters / instantiations, not
+			// the class/interface being extended.
 			return
 		}
 		for i := uint32(0); i < node.NamedChildCount(); i++ {
@@ -768,7 +788,15 @@ func (w *pyWalker) handleMethod(n *sitter.Node, enclosing string) {
 		method.BodyStartLine = int(body.StartPoint().Row) + 1
 		method.BodyEndLine = int(body.EndPoint().Row) + 1
 		method.BodyStartByte = int(body.StartByte())
-		method.BodyEndByte = int(body.EndByte())
+		// tree-sitter EndByte() is exclusive (byte AFTER the
+		// last byte); SubdivideMethod in block.go consumes
+		// MethodDecl.BodyEndByte as the INCLUSIVE index of
+		// the last body byte (matching the regex-based Python
+		// parser and tsStripBraceSpan, both of which return
+		// the last interior byte). Back off by one to keep
+		// block boundaries from spilling one byte past the
+		// body.
+		method.BodyEndByte = int(body.EndByte()) - 1
 		method.Calls = uniqueStringsInsert(walkPyCalls(body, w.src))
 		method.ReceiverCalls = uniqueStringsInsert(walkPySelfCalls(body, w.src))
 		method.MemberAccesses = walkPySelfAccesses(body, w.src)
@@ -798,7 +826,10 @@ func (w *pyWalker) handleFreeFunction(n *sitter.Node) {
 		method.BodyStartLine = int(body.StartPoint().Row) + 1
 		method.BodyEndLine = int(body.EndPoint().Row) + 1
 		method.BodyStartByte = int(body.StartByte())
-		method.BodyEndByte = int(body.EndByte())
+		// See handleMethod -- tree-sitter EndByte() is
+		// exclusive but SubdivideMethod expects an inclusive
+		// last-byte index.
+		method.BodyEndByte = int(body.EndByte()) - 1
 		method.Calls = uniqueStringsInsert(walkPyCalls(body, w.src))
 	}
 	w.methods = append(w.methods, method)

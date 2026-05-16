@@ -142,7 +142,7 @@ func TestDispatcher_RoutesByExtension(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fw := newFakeWriter()
 			d := NewDispatcher(fw)
-			if err := d.EmitFile(context.Background(), makeEvent(tc.relPath, tc.src)); err != nil {
+			if _, err := d.EmitFile(context.Background(), makeEvent(tc.relPath, tc.src)); err != nil {
 				t.Fatalf("EmitFile: %v", err)
 			}
 			nodes := append(fw.nodesOf("class"), fw.nodesOf("method")...)
@@ -168,7 +168,7 @@ func TestDispatcher_LanguageHintsFallbackForUnknownExtension(t *testing.T) {
 	d := NewDispatcher(fw, WithLanguageHints([]string{"python"}))
 	src := "class Foo:\n    def bar(self):\n        return 1\n"
 	// Use an unknown extension to force the hint path.
-	if err := d.EmitFile(context.Background(), makeEvent("oddball.unknown", src)); err != nil {
+	if _, err := d.EmitFile(context.Background(), makeEvent("oddball.unknown", src)); err != nil {
 		t.Fatalf("EmitFile: %v", err)
 	}
 	classes := fw.nodesOf("class")
@@ -187,7 +187,7 @@ func TestDispatcher_LanguageHintsFallbackForUnknownExtension(t *testing.T) {
 func TestDispatcher_UnknownExtensionWithoutHintIsSilent(t *testing.T) {
 	fw := newFakeWriter()
 	d := NewDispatcher(fw)
-	if err := d.EmitFile(context.Background(), makeEvent("README.md", "# heading")); err != nil {
+	if _, err := d.EmitFile(context.Background(), makeEvent("README.md", "# heading")); err != nil {
 		t.Fatalf("expected nil for unknown extension; got %v", err)
 	}
 	if len(fw.nodes) != 0 {
@@ -209,7 +209,7 @@ func TestDispatcher_OpenErrorPropagates(t *testing.T) {
 	ev.Open = func() (repoindexer.ReadCloser, error) {
 		return nil, io.ErrUnexpectedEOF
 	}
-	err := d.EmitFile(context.Background(), ev)
+	_, err := d.EmitFile(context.Background(), ev)
 	if err == nil {
 		t.Fatalf("expected IO error; got nil")
 	}
@@ -228,7 +228,7 @@ func TestDispatcher_FingerprintIncludesRelPathToPreventCrossFileCollision(t *tes
 	d := NewDispatcher(fw)
 	src := "class Foo { bar() { return 1; } }"
 	for _, p := range []string{"src/a.ts", "src/b.ts"} {
-		if err := d.EmitFile(context.Background(), makeEvent(p, src)); err != nil {
+		if _, err := d.EmitFile(context.Background(), makeEvent(p, src)); err != nil {
 			t.Fatalf("EmitFile %s: %v", p, err)
 		}
 	}
@@ -268,7 +268,7 @@ func TestDispatcher_BlockSubdivisionFiresThroughEmitter(t *testing.T) {
 	d := NewDispatcher(fw)
 	body := repeatStatementLines(81)
 	src := "class Foo {\n  bar() {\n" + body + "\n  }\n}\n"
-	if err := d.EmitFile(context.Background(), makeEvent("src/big.ts", src)); err != nil {
+	if _, err := d.EmitFile(context.Background(), makeEvent("src/big.ts", src)); err != nil {
 		t.Fatalf("EmitFile: %v", err)
 	}
 	blocks := fw.nodesOf("block")
@@ -300,7 +300,7 @@ func TestDispatcher_BlockSubdivisionDoesNotFireBelowThreshold(t *testing.T) {
 	d := NewDispatcher(fw)
 	body := repeatStatementLines(80)
 	src := "class Foo {\n  bar() {\n" + body + "\n  }\n}\n"
-	if err := d.EmitFile(context.Background(), makeEvent("src/just-under.ts", src)); err != nil {
+	if _, err := d.EmitFile(context.Background(), makeEvent("src/just-under.ts", src)); err != nil {
 		t.Fatalf("EmitFile: %v", err)
 	}
 	if blocks := fw.nodesOf("block"); len(blocks) != 0 {
@@ -314,7 +314,7 @@ func TestDispatcher_BlockSubdivisionDoesNotFireBelowThreshold(t *testing.T) {
 func TestDispatcher_PanicInParserIsRecovered(t *testing.T) {
 	fw := newFakeWriter()
 	d := NewDispatcher(fw, WithParsers(panickingParser{}))
-	if err := d.EmitFile(context.Background(), makeEvent("src/boom.bang", "anything")); err != nil {
+	if _, err := d.EmitFile(context.Background(), makeEvent("src/boom.bang", "anything")); err != nil {
 		t.Fatalf("expected nil despite parser panic; got %v", err)
 	}
 }
@@ -420,7 +420,7 @@ func TestDispatcher_EmitsImportsEdgesForExternalModules(t *testing.T) {
 		"import os from \"node:os\";\n" +
 		"import { helper } from \"./utils\";\n" +
 		"class Foo { bar() {} }\n"
-	if err := d.EmitFile(context.Background(), makeEvent("src/main.ts", src)); err != nil {
+	if _, err := d.EmitFile(context.Background(), makeEvent("src/main.ts", src)); err != nil {
 		t.Fatalf("EmitFile: %v", err)
 	}
 	importEdges := fw.edgesOf("imports")
@@ -463,7 +463,7 @@ func TestDispatcher_EmitsReadsAndWritesEdgesToEnclosingClass(t *testing.T) {
 		"  constructor(prefix) { this.prefix = prefix; this.count = 0; }\n" +
 		"  greet(name) { this.count = this.count + 1; return this.prefix + name; }\n" +
 		"}\n"
-	if err := d.EmitFile(context.Background(), makeEvent("src/g.ts", src)); err != nil {
+	if _, err := d.EmitFile(context.Background(), makeEvent("src/g.ts", src)); err != nil {
 		t.Fatalf("EmitFile: %v", err)
 	}
 	writes := fw.edgesOf("writes")
@@ -512,7 +512,7 @@ func TestDispatcher_ResolvesReceiverQualifiedStaticCalls(t *testing.T) {
 		"  helper() { return 42; }\n" +
 		"  bar() { return this.helper() + 1; }\n" +
 		"}\n"
-	if err := d.EmitFile(context.Background(), makeEvent("src/r.ts", src)); err != nil {
+	if _, err := d.EmitFile(context.Background(), makeEvent("src/r.ts", src)); err != nil {
 		t.Fatalf("EmitFile: %v", err)
 	}
 	calls := fw.edgesOf("static_calls")
@@ -543,7 +543,7 @@ func TestDispatcher_RecordsFileRelativeBlockBoundariesInAttrs(t *testing.T) {
 	d := NewDispatcher(fw)
 	body := repeatStatementLines(81)
 	src := "class Foo {\n  bar() {\n" + body + "\n  }\n}\n"
-	if err := d.EmitFile(context.Background(), makeEvent("src/coords.ts", src)); err != nil {
+	if _, err := d.EmitFile(context.Background(), makeEvent("src/coords.ts", src)); err != nil {
 		t.Fatalf("EmitFile: %v", err)
 	}
 	blocks := fw.nodesOf("block")
@@ -588,7 +588,7 @@ func TestDispatcher_PerEventLanguageHintsOverrideGlobal(t *testing.T) {
 	src := "class Foo:\n    def bar(self):\n        return 1\n"
 	ev := makeEvent("noext.unknown", src)
 	ev.LanguageHints = []string{"python"}
-	if err := d.EmitFile(context.Background(), ev); err != nil {
+	if _, err := d.EmitFile(context.Background(), ev); err != nil {
 		t.Fatalf("EmitFile: %v", err)
 	}
 	classes := fw.nodesOf("class")

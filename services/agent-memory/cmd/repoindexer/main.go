@@ -66,6 +66,7 @@ import (
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/repoindexer"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/repoindexer/ast"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/retirement"
 )
 
 func main() {
@@ -130,12 +131,26 @@ func main() {
 
 	notifyPub := repoindexer.NewPGNotifyPublisher(db, logger)
 
+	// Stage 3.4 (delta re-index) dependencies. The Differ
+	// self-manages a temp bare clone per Diff() call (see
+	// internal/repoindexer/diff.go); the Retirer wraps
+	// retirement.Service so the worker can write tombstones
+	// for removed / renamed Nodes. Both are required for
+	// delta jobs to dispatch — full-only deployments could
+	// leave these nil, but production wiring always supplies
+	// them so a misrouted delta job surfaces as a job-level
+	// failure rather than silently sitting in `pending`.
+	differ := &repoindexer.GitDeltaDiffer{}
+	retirer := repoindexer.NewRetirementAdapter(retirement.New(db, logger))
+
 	worker := repoindexer.NewWorker(db, gw, repoindexer.WorkerOptions{
 		WorkerID:     cfg.WorkerID,
 		PollEvery:    cfg.PollEvery,
 		Materializer: &repoindexer.GitMaterializer{},
 		Emitter:      dispatcher,
 		Publisher:    notifyPub,
+		Differ:       differ,
+		Retirer:      retirer,
 		Logger:       logger,
 	})
 

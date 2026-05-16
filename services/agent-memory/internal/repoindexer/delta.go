@@ -290,7 +290,7 @@ func (w *Worker) runDelta(ctx context.Context, job Job) (DeltaSummary, error) {
 			summary.NodesEmitted += n.touchedCount
 			summary.EmitterCalls++
 		case ChangeModified:
-			n, err := w.deltaProcessModified(ctx, job, repoURL, retiredAtSHA, repoNodeID, repoLang, wsFiles, ch.RelPath)
+			n, err := w.deltaProcessModified(ctx, job, repoURL, retiredAtSHA, repoNodeID, repoLang, packages, wsFiles, ch.RelPath)
 			if err != nil {
 				return summary, err
 			}
@@ -429,6 +429,7 @@ func (w *Worker) deltaProcessModified(
 	job Job,
 	repoURL, retiredAtSHA, repoNodeID string,
 	repoLang []string,
+	packages map[string]string,
 	wsFiles map[string]WalkFile,
 	relPath string,
 ) (deltaCounters, error) {
@@ -448,11 +449,15 @@ func (w *Worker) deltaProcessModified(
 		// Treat as Added — the diff said Modified but the
 		// graph has no live File Node. Most likely a prior
 		// delta retired it; the safe thing is to emit fresh.
+		// Reuse the outer run's `packages` cache so a Package
+		// Node ensured here is shared with subsequent files
+		// in the same directory within this delta run
+		// (avoids redundant DB round-trips and duplicate
+		// idempotent InsertNode/InsertEdge attempts).
 		w.logger.Warn("repoindexer.delta.modified_missing_old_file",
 			slog.String("op", "delta_modified"),
 			slog.String("rel_path", relPath),
 		)
-		packages := make(map[string]string)
 		return w.deltaProcessAdded(ctx, job, repoURL, repoNodeID, repoLang, packages, wsFiles, relPath)
 	}
 
@@ -479,8 +484,9 @@ func (w *Worker) deltaProcessModified(
 	if !found {
 		// Lost parent — fall back to ensure one. Use the
 		// supplied repoNodeID so we don't drift on a fresh
-		// lookup.
-		packages := make(map[string]string)
+		// lookup, and share the outer run's `packages` cache
+		// so this ensure benefits subsequent files in the
+		// same directory within the same delta run.
 		_, _, eErr := w.ensurePackageNode(ctx, job, repoURL, repoNodeID, packages, relPath)
 		if eErr != nil {
 			return c, eErr

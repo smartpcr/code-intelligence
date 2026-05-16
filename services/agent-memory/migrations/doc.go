@@ -31,6 +31,17 @@
 //	0015_embedding_publish.sql -- embedding_publish, embedding_publish_event (partitioned monthly, append-only; tech-spec §9.6a state machine)
 //	0016_roles_grants.sql      -- agent_memory_app (INSERT/SELECT on the §8.7.4 append-only set; INSERT/SELECT/UPDATE on the UPDATE-grantable set) + agent_memory_admin (ALL PRIVILEGES)
 //
+// Stage 2.2 adds the reader role used by the GraphReader library
+// and every recall / mgmt.read.* path:
+//
+//	0017_reader_role.sql -- agent_memory_ro (SELECT-only on every readable table)
+//
+// Stage 3.5 introduces the per-repo HMAC secret table that the
+// Webhook Receiver looks up to authenticate inbound git-host
+// pushes (risk §9.12):
+//
+//	0018_repo_webhook_secret.sql -- repo_webhook_secret (writer-only; SELECT revoked from agent_memory_ro)
+//
 // Later stages append more files; the migrator picks them up by
 // sorted filename so the lexicographic order matches the apply
 // order.

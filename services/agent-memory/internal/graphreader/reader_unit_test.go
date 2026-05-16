@@ -162,6 +162,98 @@ func TestSelectEdgesFromQuery_kindFilter(t *testing.T) {
 	})
 }
 
+// TestSelectEdgesToQuery_pivotsOnDstAndMirrorsFrom proves
+// the inbound query — used by `agent.expand(direction=
+// 'callers')` via `ListEdgesTo` — pivots on `e.dst_node_id`,
+// shares the projection / sort / retirement filter with
+// the outbound query, and accepts the same kind filter
+// shape so the two halves cannot drift silently. Drives
+// evaluator iter-1 item #4 (the inbound SQL path was
+// untested before this iter).
+func TestSelectEdgesToQuery_pivotsOnDstAndMirrorsFrom(t *testing.T) {
+	t.Run("pivots on dst_node_id", func(t *testing.T) {
+		q, args := selectEdgesToQuery("n1", nil, false)
+		if len(args) != 1 || args[0] != "n1" {
+			t.Fatalf("expected [n1], got %v", args)
+		}
+		if !strings.Contains(q, "e.dst_node_id = $1") {
+			t.Fatalf("inbound query must pivot on e.dst_node_id, got:\n%s", q)
+		}
+		if strings.Contains(q, "e.src_node_id = $1") {
+			t.Fatalf("inbound query must NOT pivot on e.src_node_id, got:\n%s", q)
+		}
+	})
+	t.Run("no kinds — clause omitted", func(t *testing.T) {
+		q, args := selectEdgesToQuery("n1", nil, false)
+		if strings.Contains(q, "ANY(") {
+			t.Fatalf("query must omit ANY clause when kinds is empty, got:\n%s", q)
+		}
+		if len(args) != 1 {
+			t.Fatalf("expected 1 arg, got %v", args)
+		}
+	})
+	t.Run("with kinds — ANY $2 clause", func(t *testing.T) {
+		q, args := selectEdgesToQuery("n1", []string{"static_calls", "observed_calls"}, false)
+		if len(args) != 2 {
+			t.Fatalf("expected 2 args, got %v", args)
+		}
+		if !strings.Contains(q, "ANY($2::text[])") {
+			t.Fatalf("query must use ANY($2::text[]), got:\n%s", q)
+		}
+		if !strings.Contains(q, "e.kind::text = ANY(") {
+			t.Fatalf("query must compare e.kind::text vs text[] (same shape as outbound), got:\n%s", q)
+		}
+	})
+	t.Run("stable sort matches outbound", func(t *testing.T) {
+		q, _ := selectEdgesToQuery("n1", nil, false)
+		if !strings.Contains(q, "ORDER BY e.kind, e.edge_id") {
+			t.Fatalf("inbound query must order by (kind, edge_id) to match outbound, got:\n%s", q)
+		}
+	})
+	t.Run("retirement filter — opt-out (default)", func(t *testing.T) {
+		q, _ := selectEdgesToQuery("n1", nil, false)
+		if !strings.Contains(q, "NOT EXISTS") {
+			t.Fatalf("default inbound query must hide retired edges via NOT EXISTS, got:\n%s", q)
+		}
+		if strings.Contains(q, "LEFT JOIN edge_retirement") {
+			t.Fatalf("opt-out path must not LEFT JOIN edge_retirement, got:\n%s", q)
+		}
+	})
+	t.Run("retirement filter — opt-in", func(t *testing.T) {
+		q, _ := selectEdgesToQuery("n1", nil, true)
+		if strings.Contains(q, "NOT EXISTS") {
+			t.Fatalf("opt-in inbound query must not use NOT EXISTS, got:\n%s", q)
+		}
+		if !strings.Contains(q, "LEFT JOIN edge_retirement") {
+			t.Fatalf("opt-in inbound query must LEFT JOIN edge_retirement, got:\n%s", q)
+		}
+	})
+}
+
+// TestListEdgesTo_validatesArgs ensures `ListEdgesTo`
+// rejects an empty dst_node_id and bad edge kinds BEFORE
+// the SQL round-trip, mirroring `ListEdgesFrom`'s pre-flight
+// validation contract. Drives evaluator iter-1 item #4.
+func TestListEdgesTo_validatesArgs(t *testing.T) {
+	r := &Reader{} // pool nil — validators must fail before any pool deref.
+	ctx := context.Background()
+	t.Run("empty dst_node_id rejected", func(t *testing.T) {
+		_, err := r.ListEdgesTo(ctx, "", nil, ReaderOptions{})
+		if err == nil {
+			t.Fatal("empty dst_node_id must be rejected")
+		}
+		if !strings.Contains(err.Error(), "ListEdgesTo") {
+			t.Fatalf("error should name the verb, got %v", err)
+		}
+	})
+	t.Run("invalid edge kind rejected", func(t *testing.T) {
+		_, err := r.ListEdgesTo(ctx, "n1", []string{"not_a_kind"}, ReaderOptions{})
+		if err == nil {
+			t.Fatal("invalid edge kind must be rejected")
+		}
+	})
+}
+
 // TestSelectNodesQuery_filterClauses ensures every non-empty
 // filter contributes its own AND clause with the right
 // parameter index, and that the absence of a filter omits the
@@ -374,14 +466,14 @@ func TestScanEdgeRow_translatesPgxErrNoRows(t *testing.T) {
 // pointer deref.
 func TestScanNodeRow_nullableParentNodeID(t *testing.T) {
 	scn := scriptedScanner{cols: []any{
-		"node-1",       // node_id
-		"repo-1",       // repo_id
-		[]byte(nil),    // fingerprint
-		"repo",         // kind
-		"my-repo",      // canonical_signature
-		any(nil),       // parent_node_id (NULL)
-		"sha1",         // from_sha
-		[]byte("{}"),   // attrs_json
+		"node-1",     // node_id
+		"repo-1",     // repo_id
+		[]byte(nil),  // fingerprint
+		"repo",       // kind
+		"my-repo",    // canonical_signature
+		any(nil),     // parent_node_id (NULL)
+		"sha1",       // from_sha
+		[]byte("{}"), // attrs_json
 	}}
 	got, err := scanNodeRow(scn, false)
 	if err != nil {
@@ -554,16 +646,16 @@ func TestScanNodeRow_includeRetiredPartialRetirementTriple(t *testing.T) {
 func TestScanEdgeRow_includeRetiredPopulatesRetirement(t *testing.T) {
 	retAt := time.Date(2024, 8, 9, 10, 11, 12, 0, time.UTC)
 	scn := scriptedScanner{cols: []any{
-		"edge-1",        // edge_id
-		"repo-1",        // repo_id
-		[]byte(nil),     // fingerprint
+		"edge-1",         // edge_id
+		"repo-1",         // repo_id
+		[]byte(nil),      // fingerprint
 		"observed_calls", // kind
-		"node-src",      // src_node_id
-		"node-dst",      // dst_node_id
-		"sha-old",       // from_sha
-		[]byte("{}"),    // attrs_json
-		"sha-ret",       // retired_at_sha
-		retAt,           // retired_at
+		"node-src",       // src_node_id
+		"node-dst",       // dst_node_id
+		"sha-old",        // from_sha
+		[]byte("{}"),     // attrs_json
+		"sha-ret",        // retired_at_sha
+		retAt,            // retired_at
 	}}
 	got, err := scanEdgeRow(scn, true)
 	if err != nil {
@@ -585,16 +677,16 @@ func TestScanEdgeRow_includeRetiredPopulatesRetirement(t *testing.T) {
 // Retirement nil.
 func TestScanEdgeRow_includeRetiredNullRetirementYieldsNilField(t *testing.T) {
 	scn := scriptedScanner{cols: []any{
-		"edge-2",        // edge_id
-		"repo-1",        // repo_id
-		[]byte(nil),     // fingerprint
-		"static_calls",  // kind
-		"node-src",      // src_node_id
-		"node-dst",      // dst_node_id
-		"sha-cur",       // from_sha
-		[]byte("{}"),    // attrs_json
-		any(nil),        // retired_at_sha (NULL)
-		any(nil),        // retired_at     (NULL)
+		"edge-2",       // edge_id
+		"repo-1",       // repo_id
+		[]byte(nil),    // fingerprint
+		"static_calls", // kind
+		"node-src",     // src_node_id
+		"node-dst",     // dst_node_id
+		"sha-cur",      // from_sha
+		[]byte("{}"),   // attrs_json
+		any(nil),       // retired_at_sha (NULL)
+		any(nil),       // retired_at     (NULL)
 	}}
 	got, err := scanEdgeRow(scn, true)
 	if err != nil {

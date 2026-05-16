@@ -1,12 +1,21 @@
 // agent.proto -- gRPC IDL for the Agent Surface (tech-spec §8.5).
 //
-// Stage 5.1 of implementation-plan.md ships the IDL for the
-// `agent.recall` verb plus skeleton placeholders for the
-// `agent.observe`, `agent.expand`, and `agent.summarize` verbs
-// owned by Stages 5.2 / 5.3 / 5.4. Generated Go bindings will
-// land alongside the protoc tooling pin in a follow-up; for
-// now this file is the canonical contract that
-// `cmd/agent-api/main.go` mTLS server speaks.
+// As of Stage 5.3 this file ships the IDL AND checked-in Go
+// bindings for two verbs:
+//   * `agent.recall`  -- Stage 5.1, §6.4 read path. Fully wired
+//     in `cmd/agent-api/main.go`; see `internal/agentapi/recall.go`.
+//   * `agent.expand`  -- Stage 5.3, §6.5 structural-walk path.
+//     Fully wired in `cmd/agent-api/main.go`; see
+//     `internal/agentapi/expand.go`.
+// The two remaining verbs are still skeleton placeholders so the
+// gRPC server can register a single stable service descriptor today;
+// the body shapes will firm up as their owning stages land:
+//   * `agent.observe`   -- Stage 5.2 (Observe request/response body).
+//   * `agent.summarize` -- Stage 5.4 (Summarize request/response body).
+// The protoc tooling pin (`protoc-gen-go v1.36.11`,
+// `protoc-gen-go-grpc v1.5.1`) and the `make proto` regen target
+// landed alongside Stage 5.3 — see `services/agent-memory/Makefile`
+// and the proto-drift CI gate in `.github/workflows/agent-memory-ci.yml`.
 //
 // Transport contract (tech-spec §8.5):
 //   * gRPC over HTTP/2.
@@ -52,8 +61,16 @@ service AgentService {
   // Stage 5.2. Placeholder so the IDL surface is complete.
   rpc Observe(ObserveRequest) returns (ObserveResponse);
 
-  // Expand walks structural edges from a node id; owned by
-  // Stage 5.3. Placeholder.
+  // Expand is the §6.5 structural-walk path: BFS over
+  // `static_calls` / `observed_calls` edges from a seed node
+  // in a requested direction (callees | callers), up to a
+  // configurable depth (default 5, hard ceiling 10), with
+  // hot-path ranking (DESC observation_count, hop ASC,
+  // edge_id ASC), node + edge budget clamping at the
+  // per-service ceiling, a RecallContextLog row appended
+  // with verb='expand', and the same `graph_store_unavailable`
+  // closed-set degraded-fallback path as `agent.recall`.
+  // See `internal/agentapi/expand.go.Service.Expand`.
   rpc Expand(ExpandRequest) returns (ExpandResponse);
 
   // Summarize materialises a neighborhood card into a
@@ -175,10 +192,13 @@ message RecallResponse {
   int32 filtered = 9;
 }
 
-// Placeholder request / response messages for the other Agent
-// Surface verbs. They are defined here so the gRPC server can
-// register a single service descriptor today; the body shapes
-// will firm up as Stages 5.2 / 5.3 / 5.4 land.
+// Placeholder request / response messages for the Observe
+// (Stage 5.2) and Summarize (Stage 5.4) verbs. They are
+// defined here so the gRPC server can register a single
+// service descriptor today; the body shapes will firm up
+// as Stages 5.2 / 5.4 land. Stage 5.3 (ExpandRequest /
+// ExpandResponse, below) is fully implemented and has its
+// own field-level documentation.
 message ObserveRequest {
   string context_id = 1;
   string outcome = 2;
@@ -190,16 +210,51 @@ message ObserveResponse {
   string degraded_reason = 3;
 }
 
+// ExpandRequest is the input shape for `agent.expand`.
+// Mirrors `internal/agentapi/expand.go.ExpandRequest`.
+//
+// `repo_id` is OPTIONAL on the happy path — the server
+// derefs the seed node and reads its `repo_id`. On the
+// degraded-fallback path (graph unreachable) the server
+// CANNOT deref the node, so callers SHOULD supply
+// `repo_id` if they want the snapshot fallback to work.
 message ExpandRequest {
   string node_id = 1;
+  // direction is one of "callees" (outbound) or
+  // "callers" (inbound). Rejected with INVALID_ARGUMENT
+  // when not in the closed set.
   string direction = 2;
+  // depth is the BFS hop limit. The server contract is:
+  //   * depth == 0 selects the server's default (5).
+  //   * depth < 0 is REJECTED with INVALID_ARGUMENT.
+  //   * depth > the hard ceiling (10) is clamped down
+  //     server-side per the §8.3 RPS budget.
   int32 depth = 3;
+  string repo_id = 4;
 }
 message ExpandResponse {
   repeated EdgeCard edges = 1;
   string context_id = 2;
   bool degraded = 3;
   string degraded_reason = 4;
+  // root_node_id is the seed Node id the walk started from
+  // (echoed for client convenience so a multiplexed caller
+  // does not have to remember which request a response
+  // belongs to).
+  string root_node_id = 5;
+  // nodes is the set of frontier Nodes reached by the BFS,
+  // ordered first by hop ASC then by node_id ASC so the
+  // response is snapshot-stable. The root Node is NOT
+  // included here (callers already have its id via
+  // root_node_id).
+  repeated NodeCard nodes = 6;
+  // truncated is set when the BFS stopped with non-empty
+  // work remaining — either the depth budget or the
+  // max_nodes / max_edges budget was exhausted while
+  // further edges or nodes existed. When the graph
+  // naturally terminates inside the budget this stays
+  // false.
+  bool truncated = 7;
 }
 
 message SummarizeRequest {

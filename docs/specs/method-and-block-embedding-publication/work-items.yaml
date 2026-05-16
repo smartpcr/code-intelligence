@@ -86,13 +86,26 @@ phases:
               embedding_model_version, reads max(attempt_index) from
               EmbeddingPublishEvent for that publish_id, calls
               publishCore with attempt_index=max+1. NEVER inserts a new
-              EmbeddingPublish. Happy path = 3 INSERTs (3 events only).
+              EmbeddingPublish. NEVER decides to supersede on model
+              mismatch (that flow is owned by the bulk re-embed driver,
+              out of scope). Happy path = 3 INSERTs (3 events only).
+              publishCore runs inside a single tx that takes
+              pg_advisory_xact_lock(hashtext(publish_id::text)) before
+              the max read so two flusher replicas cannot both append
+              at N+1 (race-safety). On Qdrant UpsertPoint success but
+              FetchPoint failure (or crash) the row is left at
+              vector_written; the flusher's vector_written staleness
+              predicate (step-8) re-drives it, and the deterministic
+              point_id makes the re-upsert idempotent in Qdrant.
               Unit test asserts: (a) PublishNew emits exactly 4 INSERTs
               in order; (b) RetryExisting emits exactly 3 INSERTs with
               the right incremented attempt_index and zero new
               EmbeddingPublish rows; (c) Qdrant-failure path inserts
               EmbeddingPublish (PublishNew only) + queued + failed only;
-              (d) no UPDATE or DELETE statement is ever issued.
+              (d) no UPDATE or DELETE statement is ever issued;
+              (e) two concurrent RetryExisting calls for the same
+              publish_id never produce duplicate attempt_index values
+              (advisory-lock contract).
           - id: step-model-version-stamping
             title: "Stamp embedding_model_version on every EmbeddingPublish"
             expectedFileChanges: 3
@@ -113,27 +126,39 @@ phases:
               Integration test: 3-method fixture yields three
               'published' events, each at attempt_index=1.
           - id: step-background-flusher
-            title: "Background flusher retries via RetryExisting (reuses publish_id/point_id)"
+            title: "Background flusher retries via RetryExisting (reuses publish_id/point_id; recovers stale vector_written)"
             expectedFileChanges: 5
             summary: >-
               flusher.go worker goroutine polls EmbeddingPublish rows
-              whose latest EmbeddingPublishEvent is 'queued' or 'failed'
-              (LATERAL join on (publish_id, created_at DESC) from
-              S 8.7.2) past a backoff, then calls
+              whose latest EmbeddingPublishEvent is (a) 'queued' or
+              'failed' past the standard backoff, OR (b)
+              'vector_written' whose created_at is older than
+              AM_PUBLISH_RAW_STALENESS (proposed 60 s). The third
+              state must be flushed too: otherwise a crash or
+              FetchPoint failure between vector_written and published
+              would leave the row permanently invisible to recall.
+              LATERAL join on (publish_id, created_at DESC) from
+              S 8.7.2. The flusher calls
               publisher.RetryExisting(ctx, publish) with each such row.
               Flusher passes the EXISTING EmbeddingPublish row (never a
               Node) so publish_id + point_id + target_id +
               embedding_model_version are reused; only a fresh event
-              chain at attempt_index = max(prior) + 1 is appended.
-              Integration test: fake Qdrant fails once then succeeds;
-              the target's EmbeddingPublish row count stays at 1 and
-              the row reaches 'published' at attempt_index=2.
+              chain at attempt_index = max(prior) + 1 is appended. The
+              deterministic point_id = uuid_v5(publish_id) keeps the
+              re-UpsertPoint idempotent in Qdrant (in-place update of
+              the same point). Integration tests: (1) fake Qdrant
+              fails once then succeeds; the target's EmbeddingPublish
+              row count stays at 1 and the row reaches 'published' at
+              attempt_index=2; (2) fake Qdrant UpsertPoint succeeds
+              but FetchPoint errors once; after staleness window,
+              flusher re-drives the row to published@2 via the
+              vector_written predicate (step-11 Scenario E).
 
       - id: stage-read-side-filter-and-verification
         title: "Read-side filter, metrics, and S 9.6a integration test"
         steps:
           - id: step-graphreader-published-filter
-            title: "GraphReader recall filters via publish_id payload + active model version"
+            title: "GraphReader recall filters via publish_id payload + active model version + payload cross-check"
             expectedFileChanges: 5
             summary: >-
               Modify internal/graphreader recall path to filter Qdrant
@@ -142,10 +167,17 @@ phases:
               predicate. Join key is the publish_id carried in the
               Qdrant payload (single SQL lookup into EmbeddingPublish,
               then the (publish_id, created_at DESC) index for the
-              latest event); target_id + target_kind from the payload
-              provide the cross-check back to Node / ConceptVersion.
-              Filtered hits are backfilled from next-best candidates so
-              len(nodes)+len(concepts) == k (e2e-scenarios.md L461).
+              latest event). After the join the reader MUST reject any
+              hit whose Qdrant payload target_id, target_kind, or
+              embedding_model_version disagree with the joined
+              EmbeddingPublish row (increments
+              recall_filter_unpublished_total with reason=
+              'payload_mismatch') - catches stale/corrupt Qdrant points
+              whose publish_id still resolves. Filtered hits are
+              backfilled from next-best candidates via overfetch
+              (start with k*2, expand on demand) UNTIL k results are
+              reached OR candidates are exhausted (e2e-scenarios.md
+              L461) - no unbounded loop.
           - id: step-metrics-and-degraded-flag
             title: "Embedding publish metrics + recall-verb C22 surface"
             expectedFileChanges: 4
@@ -162,7 +194,7 @@ phases:
               carries the backlog gauge and active
               embedding_model_version as operational observability only.
           - id: step-9-6a-integration-test
-            title: "Integration tests covering S 9.6a scenarios + identity contract"
+            title: "Integration tests covering S 9.6a scenarios + identity + liveness + concurrency"
             expectedFileChanges: 4
             summary: >-
               publisher_integration_test.go against deploy/local stack.
@@ -172,8 +204,11 @@ phases:
               Scenario B: transient Qdrant error then flusher retries -
               EmbeddingPublish row count stays at 1, events are
               queued@1, failed@1, queued@2, vector_written@2,
-              published@2 (proves publish_id + point_id reused,
-              attempt_index increments, no UPDATE).
+              published@2. Test ALSO captures every UpsertPoint call
+              and asserts both calls use the same deterministic
+              point_id and same payload tuple (publish_id, target_id,
+              target_kind, embedding_model_version) - proves point
+              identity is reused, not just the parent row.
               Scenario C: row whose latest event is 'queued' is
               excluded from agent.recall and increments
               recall_filter_unpublished_total; response is NOT degraded
@@ -182,10 +217,25 @@ phases:
               agent.recall returns degraded=true,
               degraded_reason='embedding_index_unavailable' (C22 on the
               verb response).
+              Scenario E: fake Qdrant UpsertPoint succeeds but
+              FetchPoint errors once; publisher leaves row at
+              vector_written@1. After staleness window the flusher
+              re-drives it to published@2 (events queued@1,
+              vector_written@1, queued@2, vector_written@2,
+              published@2) - proves the vector_written predicate and
+              deterministic-point_id idempotency together close the
+              S 9.6a liveness gap.
+              Scenario F: two RetryExisting goroutines invoked
+              concurrently on the same publish_id never collide on
+              attempt_index=2 - the loser blocks on the advisory lock,
+              then sees the incremented max and either no-ops or
+              appends queued@3 cleanly. Proves the
+              pg_advisory_xact_lock serialisation contract.
 
 out_of_scope:
   - "ConceptVersion embedding publication (later Concept Promoter stage; the publisher accepts concept_version_id but is not wired here)."
-  - "Bulk re-embed driver for model upgrades (risk S 9.6 mgmt.snapshot job; a later story)."
+  - "Embedding-model upgrade supersede flow - minting a new EmbeddingPublish at the active version + appending a 'superseded' event on the prior publish_id. The append-only log and reader's active-version predicate support it, but the driver (mgmt verb + worker that walks affected targets) is a later story. RetryExisting in this stage explicitly does NOT decide to supersede."
+  - "Bulk re-embed driver for model upgrades (risk S 9.6 mgmt.snapshot job; same boundary as the supersede bullet above)."
   - "Delta-mode publisher call site (owned by Stage 3.4 Delta re-index handler)."
   - "DDL for EmbeddingPublish / EmbeddingPublishEvent (owned by phase-foundation-and-schema/stage-embedding-state-log-migrations-and-roles)."
   - "Structural-prior fallback ranking (owned by GraphReader / Reranker stages)."
@@ -193,3 +243,4 @@ out_of_scope:
 open_questions:
   - "LISTEN/NOTIFY wakeup for the flusher vs simple poll - poll is the safer v1 default."
   - "Flusher backoff curve - proposed exponential, capped 5 min, abandoned after 24 h with alert."
+  - "AM_PUBLISH_RAW_STALENESS default - proposed 60 s; confirm with operations once we have real Qdrant FetchPoint p99 numbers."

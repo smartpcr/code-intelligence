@@ -311,6 +311,29 @@ message ExpandRequest {
   //     server-side per the §8.3 RPS budget.
   int32 depth = 3;
   string repo_id = 4;
+  // max_nodes / max_edges are the per-call payload caps.
+  // Mirrors `MaxNodes` / `MaxEdges` on the Go
+  // `ExpandRequest` (`internal/agentapi/expand.go`). The
+  // server contract is:
+  //   * <= 0 selects the package-level defaults
+  //     (`DefaultExpandMaxNodes` = 200,
+  //     `DefaultExpandMaxEdges` = 400).
+  //   * A POSITIVE value larger than the per-service
+  //     effective ceiling (the `WithExpandMaxNodes` /
+  //     `WithExpandMaxEdges` operator override if set,
+  //     else the package default) is CLAMPED DOWN to
+  //     that ceiling to keep the §8.3 RPS budget safe
+  //     AND to bound the `bfsExpand` map preallocations
+  //     (a caller asking for a million edges gets the
+  //     configured cap, not a million-edge response).
+  //   * A POSITIVE value SMALLER than the ceiling is
+  //     honoured verbatim — callers use this to request
+  //     a tighter budget than the server default.
+  // When the BFS exhausts either cap with work still
+  // remaining, `ExpandResponse.truncated` is set so the
+  // caller knows the answer is partial.
+  int32 max_nodes = 5;
+  int32 max_edges = 6;
 }
 message ExpandResponse {
   repeated EdgeCard edges = 1;

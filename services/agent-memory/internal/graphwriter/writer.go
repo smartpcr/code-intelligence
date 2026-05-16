@@ -86,15 +86,24 @@ type Writer struct {
 
 // New constructs a Writer over the supplied *sql.DB. The DB must
 // be authenticated as a role that satisfies the GRANTs in
-// migration 0016 (typically `agent_memory_app`). A nil logger is
-// replaced with slog.Default(); a nil now-func is replaced with
-// time.Now.
+// migration 0016 (typically `agent_memory_app`).
+//
+// Both `db` and `logger` are required and New panics if either
+// is nil. The asymmetric-fallback path (substituting
+// slog.Default() for a nil logger) was rejected on purpose: the
+// package commits in its doc to emitting exactly one structured
+// audit record per public call, and silently routing those
+// records to whatever the process happens to have configured as
+// the default logger would break the audit-trail guarantee with
+// no visible signal at construction time. Failing loud at New
+// forces a misconfigured caller to surface the bug before any
+// graph mutation is attempted.
 func New(db *sql.DB, logger *slog.Logger) *Writer {
 	if db == nil {
 		panic("graphwriter: nil *sql.DB")
 	}
 	if logger == nil {
-		logger = slog.Default()
+		panic("graphwriter: nil *slog.Logger")
 	}
 	return &Writer{
 		db:     db,

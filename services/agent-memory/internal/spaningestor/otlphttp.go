@@ -73,6 +73,10 @@ type OTLPReceiver struct {
 	logger            *slog.Logger
 	maxBytes          int64
 	retryAfterSeconds int
+	// mux is built once in NewOTLPReceiver so ServeHTTP and
+	// Handler() do not allocate a fresh http.ServeMux per
+	// request on the hot OTLP export path.
+	mux http.Handler
 }
 
 // OTLPConfig is the receiver's tunables.
@@ -115,27 +119,34 @@ func NewOTLPReceiver(
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &OTLPReceiver{
+	r := &OTLPReceiver{
 		ingestor:          ingestor,
 		serviceToRepoID:   lookup,
 		logger:            logger,
 		maxBytes:          cfg.MaxBytes,
 		retryAfterSeconds: cfg.RetryAfterSeconds,
 	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/traces", r.handleTraces)
+	r.mux = mux
+	return r
 }
 
 // Handler returns an http.Handler that routes /v1/traces.
-// Other routes return 404.
+// Other routes return 404. The underlying mux is built once
+// in NewOTLPReceiver and shared with ServeHTTP, so this is
+// allocation-free on the request path.
 func (r *OTLPReceiver) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/traces", r.handleTraces)
-	return mux
+	return r.mux
 }
 
 // ServeHTTP makes OTLPReceiver itself an http.Handler so
-// callers can compose it with their own mux.
+// callers can compose it with their own mux. Delegates to
+// the cached mux built in NewOTLPReceiver to avoid a
+// per-request http.ServeMux allocation on the OTLP export
+// hot path.
 func (r *OTLPReceiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	r.Handler().ServeHTTP(w, req)
+	r.mux.ServeHTTP(w, req)
 }
 
 func (r *OTLPReceiver) handleTraces(w http.ResponseWriter, req *http.Request) {

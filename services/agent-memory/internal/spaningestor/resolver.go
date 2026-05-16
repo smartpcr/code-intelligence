@@ -723,11 +723,26 @@ func signatureMatches(candidate, observed string) bool {
 //
 // Steps:
 //  1. TrimSpace.
-//  2. If a `(` is present, strip everything up to AND
-//     including the LAST `(`, then strip the trailing `)` if
-//     present.  This collapses `Foo.bar(int, string)` →
-//     `int, string` and `(int)` → `int`.
-//  3. Run the result through `ast.NormalizeSignature`, which
+//  2. If the trimmed value ends with `)`, locate the matching
+//     OUTERMOST `(` via a right-to-left balanced-paren scan
+//     and strip the `name(` prefix and trailing `)`.  This
+//     collapses `Foo.bar(int, string)` → `int, string`,
+//     `(int)` → `int`, and — critically for non-Go languages
+//     where parameter TYPES themselves can carry parens —
+//     keeps function-typed parameters intact (e.g. the
+//     TypeScript/Python shapes `bar(Func(int), string)` and
+//     `handler(callback: (x: int) => void, flag: bool)`).
+//     A naïve `strings.LastIndex(s, "(")` would lock onto the
+//     INNERMOST `(` and yield `int), string` /
+//     `x: int) => void, flag: bool` respectively, silently
+//     mangling the comparison key for every overload that
+//     uses a callback-typed parameter.
+//  3. If step 2 cannot find a balanced pair (e.g. an
+//     unbalanced legacy input like `foo(int`), fall back to
+//     the original LAST-`(` heuristic so historical inputs
+//     keep producing the same parameter slice rather than
+//     silently regressing to "no params extracted".
+//  4. Run the result through `ast.NormalizeSignature`, which
 //     (a) collapses Unicode whitespace runs to single ASCII
 //     spaces, (b) strips spaces adjacent to canonical
 //     punctuation (`,`/`(`/`)`/`[`/`]`/`{`/`}`/`<`/`>`/`:`/`;`),
@@ -738,13 +753,54 @@ func signatureMatches(candidate, observed string) bool {
 //     `code.signature` produce byte-identical comparison keys.
 func normalizeParams(s string) string {
 	s = strings.TrimSpace(s)
-	if i := strings.LastIndex(s, "("); i >= 0 {
+	if open := matchingOpenParen(s); open >= 0 {
+		// Balanced trailing `)` — strip `name(` … `)`.
+		s = s[open+1 : len(s)-1]
+	} else if i := strings.LastIndex(s, "("); i >= 0 {
+		// Unbalanced / no trailing `)` — preserve the
+		// pre-fix behaviour so historical inputs like
+		// `foo(int` (no closing paren) keep yielding the
+		// same `int` rather than the raw `foo(int`.
 		s = s[i+1:]
 		if j := strings.LastIndex(s, ")"); j >= 0 {
 			s = s[:j]
 		}
 	}
 	return astpkg.NormalizeSignature(s)
+}
+
+// matchingOpenParen returns the byte index of the `(` that
+// matches the trailing `)` in `s` using a right-to-left
+// balanced-paren scan, or -1 when `s` does not end with `)`
+// or the parens are unbalanced (no zero-depth `(` reached).
+//
+// This is the structural fix for the nested-paren parameter
+// case: callers want the OUTERMOST `(` introducing the param
+// list, not the innermost one — `strings.LastIndex(s, "(")`
+// would return the innermost.  The scan ignores `(` and `)`
+// embedded in string / character literals because OTel
+// `code.signature` is a TYPE signature, not an expression
+// (no string defaults arrive on this path); guarding against
+// quoted parens would be over-engineering for the contract
+// the dispatcher actually emits.
+func matchingOpenParen(s string) int {
+	n := len(s)
+	if n == 0 || s[n-1] != ')' {
+		return -1
+	}
+	depth := 0
+	for i := n - 1; i >= 0; i-- {
+		switch s[i] {
+		case ')':
+			depth++
+		case '(':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 // parseLineno parses an OTel `code.lineno` attribute (a string

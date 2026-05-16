@@ -172,6 +172,9 @@ func TestUp_appliesEntireStage12_andEveryExpectedObjectExists(t *testing.T) {
 		"embedding_publish", "embedding_publish_event",
 		// Stage 3.5 per-repo HMAC secret (Webhook Receiver).
 		"repo_webhook_secret",
+		// Stage 4.2 per-repo health flag + root-span solo aggregate.
+		"repo_health",
+		"method_solo_observation",
 	}
 	for _, tbl := range wantTables {
 		if !relationExists(t, db, schema, tbl) {
@@ -268,6 +271,12 @@ func TestUp_appliesEntireStage12_andEveryExpectedObjectExists(t *testing.T) {
 		// Stage 1.4: EmbeddingPublishEvent "latest event" lookup
 		// per tech-spec §8.7.2 / §9.6a read protocol.
 		{"embedding_publish_event_publish_created_idx", "(publish_id, created_at DESC)"},
+		// Stage 4.2: per-repo health partial index (only degraded
+		// rows live in the index so the operator dashboard
+		// `WHERE degraded` query is fast).
+		{"repo_health_degraded_idx", "WHERE degraded"},
+		// Stage 4.2: method_solo_observation hot-path scan.
+		{"method_solo_observation_last_observed_at_idx", "(last_observed_at DESC NULLS LAST)"},
 	}
 	for _, w := range wantIdxDef {
 		def := indexDef(t, db, schema, w.index)

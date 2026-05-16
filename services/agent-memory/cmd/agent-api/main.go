@@ -70,6 +70,7 @@ import (
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/agentapi"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/embedding"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/spaningestor"
 )
 
 func main() {
@@ -109,8 +110,29 @@ func main() {
 
 	embedder := selectEmbedder(cfg, logger)
 	filter := embedding.NewRecallFilter(db, &embedding.RecallMetrics{})
+	// Stage 4.2: surface the cross-process `repo_health`
+	// degraded flag on RecallResponse. The Span Ingestor
+	// UPSERTs the row via the writer role; we read via the
+	// already-open `agent_memory_ro` pool (migration 0017's
+	// default-privileges rule grants SELECT to ro on every
+	// new table, including migration 0019's `repo_health`).
+	//
+	// The two packages each define a structurally-identical
+	// HealthState type to keep the dependency arrow
+	// one-directional (agentapi MUST NOT import spaningestor,
+	// per the import-graph rationale in
+	// agentapi/recall.go.HealthSource); the binary-level
+	// adapter bridges them here.
+	healthSource := agentapi.HealthSourceFunc(func(ctx context.Context, repoID string) (agentapi.HealthState, error) {
+		st, err := spaningestor.NewPGHealthSource(db).HealthForRepo(ctx, repoID)
+		if err != nil {
+			return agentapi.HealthState{}, err
+		}
+		return agentapi.HealthState{Degraded: st.Degraded, Reason: st.Reason, Source: st.Source}, nil
+	})
 	service := agentapi.NewService(embedder, qclient, filter,
-		agentapi.WithLogger(logger))
+		agentapi.WithLogger(logger),
+		agentapi.WithHealthSource(healthSource))
 
 	logger.Info("agent-api.ready",
 		slog.String("qdrant_url", cfg.QdrantURL),

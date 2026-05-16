@@ -657,10 +657,36 @@ func newContextLogAppenderFromRecallContext(rcLog *recallcontext.Log, logger *sl
 //     error to the agent.
 //
 // Returns agentapi.ErrNoSnapshot when the repo has no
-// prior non-degraded recall row; the recall handler
-// projects that onto an empty-hits degraded envelope.
+// prior non-degraded recall row (cold-start) OR when the
+// supplied `repoID` is not a well-formed UUID — `repo_id`
+// is a `uuid` column, and bypassing pre-validation would
+// hit Postgres with a guaranteed-to-fail cast that surfaces
+// as SQLSTATE 22P02 (`invalid_input_syntax_for_type_uuid`),
+// which `classifyGraphStoreError` does not recognise as a
+// graph-store outage. The recall handler projects
+// `ErrNoSnapshot` onto an empty-hits degraded envelope —
+// the same shape it produces for a cold-start repo — which
+// is the right behaviour for a malformed id (it has, by
+// definition, no snapshot row).
 func newSnapshotSourceFromDB(db *sql.DB, gReader *graphreader.Reader, obsCounter agentapi.EdgeObservationCounter, logger *slog.Logger) agentapi.SnapshotSource {
 	return agentapi.SnapshotSourceFunc(func(ctx context.Context, repoID string) (agentapi.RecallSnapshot, error) {
+		// Pre-validate the RepoID before issuing the
+		// query. This mirrors the appender path
+		// (`newContextLogAppenderFromRecallContext`) which
+		// already runs `fingerprint.ParseRepoID` up front,
+		// keeping both writers and readers on the same
+		// validation contract. A malformed RepoID is
+		// surfaced as `ErrNoSnapshot` so the recall
+		// handler stays on the soft path (warn-free empty
+		// degraded envelope) instead of routing through
+		// the generic SQL error branch.
+		if _, parseErr := fingerprint.ParseRepoID(repoID); parseErr != nil {
+			logger.Warn("agent-api.snapshot.repo_id_malformed",
+				slog.String("repo_id", repoID),
+				slog.String("error", parseErr.Error()))
+			return agentapi.RecallSnapshot{}, agentapi.ErrNoSnapshot
+		}
+
 		const q = `
 SELECT context_id::text,
        (SELECT COALESCE(array_agg(x::text), ARRAY[]::text[]) FROM unnest(node_ids)    AS x),

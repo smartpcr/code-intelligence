@@ -486,8 +486,11 @@ func (w *Worker) deltaProcessModified(
 			return c, eErr
 		}
 		pkgNode, found, err = w.lookupCurrentNodeBySig(ctx, job.RepoID, "package", pkgSig)
-		if err != nil || !found {
-			return c, fmt.Errorf("repoindexer: deltaProcessModified: ensure package failed: %w", err)
+		if err != nil {
+			return c, fmt.Errorf("repoindexer: deltaProcessModified: lookup after ensure package: %w", err)
+		}
+		if !found {
+			return c, fmt.Errorf("repoindexer: deltaProcessModified: package node %s not found after ensure (ensurePackageNode succeeded but subsequent lookup returned no live row)", pkgSig)
 		}
 	}
 

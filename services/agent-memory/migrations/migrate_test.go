@@ -8,8 +8,8 @@ import (
 // TestAll_parsesEveryEmbeddedFile confirms every .sql file
 // embedded under //go:embed is parseable and emits a non-empty
 // up body. It also asserts the lexicographic sort produces the
-// implementation-plan.md Stage 1.2 + 1.3 + 1.4 order
-// (0001 .. 0006a then 0007 .. 0014 then 0015 .. 0016).
+// implementation-plan.md Stage 1.2 + 1.3 + 1.4 + 2.2 order
+// (0001 .. 0006a then 0007 .. 0014 then 0015 .. 0017).
 func TestAll_parsesEveryEmbeddedFile(t *testing.T) {
 	t.Parallel()
 	all, err := All()
@@ -26,6 +26,8 @@ func TestAll_parsesEveryEmbeddedFile(t *testing.T) {
 		"0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014",
 		// Stage 1.4 embedding-publish + role-grants set.
 		"0015", "0016",
+		// Stage 2.2 reader-role grant.
+		"0017",
 	}
 	if len(all) != len(wantVersions) {
 		t.Fatalf("All() returned %d migrations, want %d (Stage 1.2 + 1.3 + 1.4 set)",
@@ -193,6 +195,8 @@ func TestAll_filenamesMatchPlannedSet(t *testing.T) {
 		// Stage 1.4 embedding-publish + role-grants set.
 		"0015_embedding_publish.sql": true,
 		"0016_roles_grants.sql":      true,
+		// Stage 2.2 reader-role grant.
+		"0017_reader_role.sql": true,
 	}
 	all, err := All()
 	if err != nil {

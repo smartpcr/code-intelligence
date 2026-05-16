@@ -87,6 +87,22 @@ import (
 // 0x41 0x47 0x4E 0x54 0x4D 0x45 0x4D 0x31 = "AGNTMEM1"
 const AppRoleLoginKey int64 = 0x41474E544D454D31
 
+// RoRoleLoginKey is the analogous lock key for the
+// `agent_memory_ro` role created in migration 0017. The
+// GraphReader integration tests in `internal/graphreader`
+// flip the role's LOGIN flag with a per-test random password
+// (mirroring the writer's pattern) and acquire this lock for
+// the LOGIN window so concurrent test binaries don't clobber
+// each other's password.
+//
+// Distinct key from `AppRoleLoginKey` so a reader test can hold
+// its LOGIN window WHILE a writer test holds its own — the two
+// roles are independent objects in the cluster and a single
+// shared lock would needlessly serialise the test packages.
+//
+// 0x41 0x47 0x4E 0x54 0x4D 0x45 0x4D 0x32 = "AGNTMEM2"
+const RoRoleLoginKey int64 = 0x41474E544D454D32
+
 // unlockTimeout bounds the best-effort `pg_advisory_unlock` call
 // in the release closure so a misbehaving cluster doesn't pin
 // the test goroutine. The lock itself drops automatically when
@@ -125,6 +141,35 @@ const unlockTimeout = 5 * time.Second
 // installed would otherwise leak the lock until process exit,
 // stalling sibling packages.
 func AcquireAppRoleLogin(ctx context.Context, dsn string) (release func(), err error) {
+	return acquireRoleLogin(ctx, dsn, AppRoleLoginKey)
+}
+
+// AcquireRoRoleLogin is the analogue of AcquireAppRoleLogin
+// for the read-only `agent_memory_ro` role created in
+// migration 0017. The GraphReader integration tests in
+// `internal/graphreader` use the same LOGIN-flip pattern; the
+// distinct lock key (RoRoleLoginKey) lets reader and writer
+// test packages run concurrently while still serialising
+// LOGIN/NOLOGIN flips within each role.
+//
+// Call-site pattern is identical to AcquireAppRoleLogin (see
+// that function's doc comment for the recommended
+// `success`-sentinel guard).
+func AcquireRoRoleLogin(ctx context.Context, dsn string) (release func(), err error) {
+	return acquireRoleLogin(ctx, dsn, RoRoleLoginKey)
+}
+
+// acquireRoleLogin is the shared body of AcquireAppRoleLogin
+// and AcquireRoRoleLogin. It opens a dedicated *sql.DB,
+// takes a session-level advisory lock on `key`, and returns a
+// release closure that unlocks + closes the dedicated DB.
+//
+// Keeping this private prevents an arbitrary caller from
+// minting their own ad-hoc lock key — every cross-package
+// LOGIN-flip serialisation MUST be funnelled through the two
+// named constants (`AppRoleLoginKey`, `RoRoleLoginKey`) so a
+// `grep -F` on either string finds every call site.
+func acquireRoleLogin(ctx context.Context, dsn string, key int64) (release func(), err error) {
 	if dsn == "" {
 		return nil, errors.New("testpglock: empty dsn")
 	}
@@ -143,11 +188,11 @@ func AcquireAppRoleLogin(ctx context.Context, dsn string) (release func(), err e
 		return nil, fmt.Errorf("testpglock: ping: %w", err)
 	}
 	if _, err := db.ExecContext(ctx,
-		"SELECT pg_advisory_lock($1)", AppRoleLoginKey,
+		"SELECT pg_advisory_lock($1)", key,
 	); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf(
-			"testpglock: pg_advisory_lock(%d): %w", AppRoleLoginKey, err,
+			"testpglock: pg_advisory_lock(%d): %w", key, err,
 		)
 	}
 	return func() {
@@ -157,7 +202,7 @@ func AcquireAppRoleLogin(ctx context.Context, dsn string) (release func(), err e
 		// times out, closing the connection drops the
 		// session-level lock automatically.
 		_, _ = db.ExecContext(ctx2,
-			"SELECT pg_advisory_unlock($1)", AppRoleLoginKey,
+			"SELECT pg_advisory_unlock($1)", key,
 		)
 		_ = db.Close()
 	}, nil

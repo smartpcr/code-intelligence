@@ -57,8 +57,17 @@ service AgentService {
   // returning.
   rpc Recall(RecallRequest) returns (RecallResponse);
 
-  // Observe is the agent's outcome-record path; owned by
-  // Stage 5.2. Placeholder so the IDL surface is complete.
+  // Observe is the §6.1.2 agent outcome-record path. The
+  // server validates the request (rejects
+  // outcome=human_corrected and caller-supplied
+  // observation_refs[].role=degraded_recall_context),
+  // auto-stamps an extra
+  // observation when the supplied context_id resolves to a
+  // degraded recall row, transactionally appends one
+  // Episode + N Observation rows to the EpisodicLog, and
+  // returns the pre-minted episode_id (so the response is
+  // deterministic even when the writer is later replayed
+  // from the §7.5 WAL).
   rpc Observe(ObserveRequest) returns (ObserveResponse);
 
   // Expand is the §6.5 structural-walk path: BFS over
@@ -204,10 +213,81 @@ message ObserveRequest {
   string outcome = 2;
   string actor = 3;
 }
+
+// ObserveRequest is the wire shape for `agent.observe`
+// (architecture.md §6.1.2). The verb writes one `Episode`
+// row plus one `Observation` row per `observation_refs[]`
+// entry in a single transaction. See `internal/agentapi/observe.go`
+// for the canonical Go contract.
+//
+// Closed-set rules:
+//   - outcome MUST be one of {success, failure, refused,
+//     degraded}. `human_corrected` is reserved for
+//     `mgmt.feedback` (§6.2.2) — supplying it on observe is
+//     rejected with INVALID_ARGUMENT per C15.
+//   - observation_refs[*].role MUST be one of {node_hit,
+//     edge_hit, call_edge_hit, concept_hit}. `degraded_recall_context`
+//     is server-only per C23.
+message ObserveRequest {
+  // context_id ties the Episode back to the recall snapshot
+  // the agent consumed (architecture.md §6.1.2). REQUIRED for
+  // `outcome != feedback` per the §5.3.1 schema CHECK.
+  string context_id = 1;
+  // outcome is the closed-set `outcome` ENUM literal
+  // (architecture.md §5.3.1). See the message-level closed-set
+  // rules above for the rejection contract.
+  string outcome = 2;
+  // actor is the legacy field carried over from the Stage 5.1
+  // placeholder. The §6.1.2 schema does not name a separate
+  // `actor` column on `Episode` — `kind='agent'` is always the
+  // surrogate. Retained on the wire for backward-compat; the
+  // server ignores it.
+  string actor = 3;
+  // repo_id (textual UUID) names the repo whose recall this
+  // Episode is paired with. REQUIRED.
+  string repo_id = 4;
+  // session_id is the agent's per-conversation correlation id
+  // (free-form text). REQUIRED.
+  string session_id = 5;
+  // trace_id is the per-action trace correlation id (free-form
+  // text). REQUIRED.
+  string trace_id = 6;
+  // action_json is the structured action the agent took, stored
+  // verbatim on `Episode.action jsonb`. REQUIRED, MUST be valid
+  // JSON.
+  bytes action_json = 7;
+  // signal_json is the optional reward / training signal the
+  // agent surfaced (architecture.md §5.3.1). Stored verbatim on
+  // `Episode.signal_json jsonb`. Empty or zero-length omits the
+  // column.
+  bytes signal_json = 8;
+  // observation_refs[] is the rank-ordered list of refs that
+  // become `Observation` rows (one per ref). May be empty (an
+  // Episode with no Observations is legal).
+  repeated ObservationRef observation_refs = 9;
+  // episode_group_id (textual UUID) is the optional group id
+  // the agent uses to correlate a multi-step plan. When empty
+  // the server mints a fresh group id.
+  string episode_group_id = 10;
+}
+
+// ObserveResponse is the wire shape for `agent.observe`.
+// `episode_id` is durable across the WAL fallback: the
+// pre-minted id surfaces on the response BEFORE the row is
+// guaranteed to be in the partition, and the eventually-
+// flushed `Episode` row carries the same id (architecture.md
+// §7.5).
 message ObserveResponse {
   string episode_id = 1;
   bool degraded = 2;
+  // degraded_reason is one of the §C22 closed-set values:
+  //   * episodic_log_unavailable  — Episode partition offline; WAL fallback engaged.
+  //   * consolidator_backpressure — Episode written; Consolidator queue full.
+  // Empty when degraded=false.
   string degraded_reason = 3;
+  // episode_group_id echoes the resolved group id (server-
+  // generated when the caller left the request field empty).
+  string episode_group_id = 4;
 }
 
 // ExpandRequest is the input shape for `agent.expand`.

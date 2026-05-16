@@ -553,6 +553,131 @@ type ObserveRequest struct {
 	sizeCache     protoimpl.SizeCache
 }
 
+func (x *ObservationRef) Reset() {
+	*x = ObservationRef{}
+	mi := &file_proto_agent_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ObservationRef) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ObservationRef) ProtoMessage() {}
+
+func (x *ObservationRef) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ObservationRef.ProtoReflect.Descriptor instead.
+func (*ObservationRef) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *ObservationRef) GetRole() string {
+	if x != nil {
+		return x.Role
+	}
+	return ""
+}
+
+func (x *ObservationRef) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *ObservationRef) GetEdgeId() string {
+	if x != nil {
+		return x.EdgeId
+	}
+	return ""
+}
+
+func (x *ObservationRef) GetConceptId() string {
+	if x != nil {
+		return x.ConceptId
+	}
+	return ""
+}
+
+func (x *ObservationRef) GetWeight() float64 {
+	if x != nil {
+		return x.Weight
+	}
+	return 0
+}
+
+// ObserveRequest is the wire shape for `agent.observe`
+// (architecture.md §6.1.2). The verb writes one `Episode`
+// row plus one `Observation` row per `observation_refs[]`
+// entry in a single transaction. See `internal/agentapi/observe.go`
+// for the canonical Go contract.
+//
+// Closed-set rules:
+//   - outcome MUST be one of {success, failure, refused,
+//     degraded}. `human_corrected` is reserved for
+//     `mgmt.feedback` (§6.2.2) — supplying it on observe is
+//     rejected with INVALID_ARGUMENT per C15.
+//   - observation_refs[*].role MUST be one of {node_hit,
+//     edge_hit, call_edge_hit, concept_hit}. `degraded_recall_context`
+//     is server-only per C23.
+type ObserveRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// context_id ties the Episode back to the recall snapshot
+	// the agent consumed (architecture.md §6.1.2). REQUIRED for
+	// `outcome != feedback` per the §5.3.1 schema CHECK.
+	ContextId string `protobuf:"bytes,1,opt,name=context_id,json=contextId,proto3" json:"context_id,omitempty"`
+	// outcome is the closed-set `outcome` ENUM literal
+	// (architecture.md §5.3.1). See the message-level closed-set
+	// rules above for the rejection contract.
+	Outcome string `protobuf:"bytes,2,opt,name=outcome,proto3" json:"outcome,omitempty"`
+	// actor is the legacy field carried over from the Stage 5.1
+	// placeholder. The §6.1.2 schema does not name a separate
+	// `actor` column on `Episode` — `kind='agent'` is always the
+	// surrogate. Retained on the wire for backward-compat; the
+	// server ignores it.
+	Actor string `protobuf:"bytes,3,opt,name=actor,proto3" json:"actor,omitempty"`
+	// repo_id (textual UUID) names the repo whose recall this
+	// Episode is paired with. REQUIRED.
+	RepoId string `protobuf:"bytes,4,opt,name=repo_id,json=repoId,proto3" json:"repo_id,omitempty"`
+	// session_id is the agent's per-conversation correlation id
+	// (free-form text). REQUIRED.
+	SessionId string `protobuf:"bytes,5,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	// trace_id is the per-action trace correlation id (free-form
+	// text). REQUIRED.
+	TraceId string `protobuf:"bytes,6,opt,name=trace_id,json=traceId,proto3" json:"trace_id,omitempty"`
+	// action_json is the structured action the agent took, stored
+	// verbatim on `Episode.action jsonb`. REQUIRED, MUST be valid
+	// JSON.
+	ActionJson []byte `protobuf:"bytes,7,opt,name=action_json,json=actionJson,proto3" json:"action_json,omitempty"`
+	// signal_json is the optional reward / training signal the
+	// agent surfaced (architecture.md §5.3.1). Stored verbatim on
+	// `Episode.signal_json jsonb`. Empty or zero-length omits the
+	// column.
+	SignalJson []byte `protobuf:"bytes,8,opt,name=signal_json,json=signalJson,proto3" json:"signal_json,omitempty"`
+	// observation_refs[] is the rank-ordered list of refs that
+	// become `Observation` rows (one per ref). May be empty (an
+	// Episode with no Observations is legal).
+	ObservationRefs []*ObservationRef `protobuf:"bytes,9,rep,name=observation_refs,json=observationRefs,proto3" json:"observation_refs,omitempty"`
+	// episode_group_id (textual UUID) is the optional group id
+	// the agent uses to correlate a multi-step plan. When empty
+	// the server mints a fresh group id.
+	EpisodeGroupId string `protobuf:"bytes,10,opt,name=episode_group_id,json=episodeGroupId,proto3" json:"episode_group_id,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
 func (x *ObserveRequest) Reset() {
 	*x = ObserveRequest{}
 	mi := &file_agent_proto_msgTypes[5]
@@ -604,11 +729,74 @@ func (x *ObserveRequest) GetActor() string {
 	return ""
 }
 
+func (x *ObserveRequest) GetRepoId() string {
+	if x != nil {
+		return x.RepoId
+	}
+	return ""
+}
+
+func (x *ObserveRequest) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+func (x *ObserveRequest) GetTraceId() string {
+	if x != nil {
+		return x.TraceId
+	}
+	return ""
+}
+
+func (x *ObserveRequest) GetActionJson() []byte {
+	if x != nil {
+		return x.ActionJson
+	}
+	return nil
+}
+
+func (x *ObserveRequest) GetSignalJson() []byte {
+	if x != nil {
+		return x.SignalJson
+	}
+	return nil
+}
+
+func (x *ObserveRequest) GetObservationRefs() []*ObservationRef {
+	if x != nil {
+		return x.ObservationRefs
+	}
+	return nil
+}
+
+func (x *ObserveRequest) GetEpisodeGroupId() string {
+	if x != nil {
+		return x.EpisodeGroupId
+	}
+	return ""
+}
+
+// ObserveResponse is the wire shape for `agent.observe`.
+// `episode_id` is durable across the WAL fallback: the
+// pre-minted id surfaces on the response BEFORE the row is
+// guaranteed to be in the partition, and the eventually-
+// flushed `Episode` row carries the same id (architecture.md
+// §7.5).
 type ObserveResponse struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	EpisodeId      string                 `protobuf:"bytes,1,opt,name=episode_id,json=episodeId,proto3" json:"episode_id,omitempty"`
-	Degraded       bool                   `protobuf:"varint,2,opt,name=degraded,proto3" json:"degraded,omitempty"`
-	DegradedReason string                 `protobuf:"bytes,3,opt,name=degraded_reason,json=degradedReason,proto3" json:"degraded_reason,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	EpisodeId string                 `protobuf:"bytes,1,opt,name=episode_id,json=episodeId,proto3" json:"episode_id,omitempty"`
+	Degraded  bool                   `protobuf:"varint,2,opt,name=degraded,proto3" json:"degraded,omitempty"`
+	// degraded_reason is one of the §C22 closed-set values:
+	//   - episodic_log_unavailable  — Episode partition offline; WAL fallback engaged.
+	//   - consolidator_backpressure — Episode written; Consolidator queue full.
+	//
+	// Empty when degraded=false.
+	DegradedReason string `protobuf:"bytes,3,opt,name=degraded_reason,json=degradedReason,proto3" json:"degraded_reason,omitempty"`
+	// episode_group_id echoes the resolved group id (server-
+	// generated when the caller left the request field empty).
+	EpisodeGroupId string `protobuf:"bytes,4,opt,name=episode_group_id,json=episodeGroupId,proto3" json:"episode_group_id,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -1015,12 +1203,30 @@ const file_agent_proto_rawDesc = "" +
 	"\bdegraded\x18\x06 \x01(\bR\bdegraded\x12'\n" +
 	"\x0fdegraded_reason\x18\a \x01(\tR\x0edegradedReason\x12!\n" +
 	"\fover_fetched\x18\b \x01(\x05R\voverFetched\x12\x1a\n" +
-	"\bfiltered\x18\t \x01(\x05R\bfiltered\"_\n" +
+	"\bfiltered\x18\t \x01(\x05R\bfiltered\"\x8d\x01\n" +
+	"\x0eObservationRef\x12\x12\n" +
+	"\x04role\x18\x01 \x01(\tR\x04role\x12\x17\n" +
+	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x17\n" +
+	"\aedge_id\x18\x03 \x01(\tR\x06edgeId\x12\x1d\n" +
+	"\n" +
+	"concept_id\x18\x04 \x01(\tR\tconceptId\x12\x16\n" +
+	"\x06weight\x18\x05 \x01(\x01R\x06weight\"\xe3\x02\n" +
 	"\x0eObserveRequest\x12\x1d\n" +
 	"\n" +
 	"context_id\x18\x01 \x01(\tR\tcontextId\x12\x18\n" +
 	"\aoutcome\x18\x02 \x01(\tR\aoutcome\x12\x14\n" +
-	"\x05actor\x18\x03 \x01(\tR\x05actor\"u\n" +
+	"\x05actor\x18\x03 \x01(\tR\x05actor\x12\x17\n" +
+	"\arepo_id\x18\x04 \x01(\tR\x06repoId\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x05 \x01(\tR\tsessionId\x12\x19\n" +
+	"\btrace_id\x18\x06 \x01(\tR\atraceId\x12\x1f\n" +
+	"\vaction_json\x18\a \x01(\fR\n" +
+	"actionJson\x12\x1f\n" +
+	"\vsignal_json\x18\b \x01(\fR\n" +
+	"signalJson\x12C\n" +
+	"\x10observation_refs\x18\t \x03(\v2\x18.agent.v1.ObservationRefR\x0fobservationRefs\x12(\n" +
+	"\x10episode_group_id\x18\n" +
+	" \x01(\tR\x0eepisodeGroupId\"\x9f\x01\n" +
 	"\x0fObserveResponse\x12\x1d\n" +
 	"\n" +
 	"episode_id\x18\x01 \x01(\tR\tepisodeId\x12\x1a\n" +
@@ -1077,12 +1283,13 @@ var file_agent_proto_goTypes = []any{
 	(*EdgeCard)(nil),          // 2: agent.v1.EdgeCard
 	(*ConceptCard)(nil),       // 3: agent.v1.ConceptCard
 	(*RecallResponse)(nil),    // 4: agent.v1.RecallResponse
-	(*ObserveRequest)(nil),    // 5: agent.v1.ObserveRequest
-	(*ObserveResponse)(nil),   // 6: agent.v1.ObserveResponse
-	(*ExpandRequest)(nil),     // 7: agent.v1.ExpandRequest
-	(*ExpandResponse)(nil),    // 8: agent.v1.ExpandResponse
-	(*SummarizeRequest)(nil),  // 9: agent.v1.SummarizeRequest
-	(*SummarizeResponse)(nil), // 10: agent.v1.SummarizeResponse
+	(*ObservationRef)(nil),    // 5: agent.v1.ObservationRef
+	(*ObserveRequest)(nil),    // 6: agent.v1.ObserveRequest
+	(*ObserveResponse)(nil),   // 7: agent.v1.ObserveResponse
+	(*ExpandRequest)(nil),     // 8: agent.v1.ExpandRequest
+	(*ExpandResponse)(nil),    // 9: agent.v1.ExpandResponse
+	(*SummarizeRequest)(nil),  // 10: agent.v1.SummarizeRequest
+	(*SummarizeResponse)(nil), // 11: agent.v1.SummarizeResponse
 }
 var file_agent_proto_depIdxs = []int32{
 	1,  // 0: agent.v1.RecallResponse.nodes:type_name -> agent.v1.NodeCard
@@ -1116,7 +1323,7 @@ func file_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agent_proto_rawDesc), len(file_agent_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   11,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

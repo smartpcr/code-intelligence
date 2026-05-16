@@ -944,7 +944,7 @@ func (i *Ingestor) processBatch(ctx context.Context, batch SpanBatch) {
 		obs := graphwriter.ObservationInput{
 			TraceID:    r.span.TraceID,
 			SpanID:     r.span.SpanID,
-			StartedAt:  startedAt(r.span),
+			StartedAt:  i.startedAt(r.span),
 			DurationMs: r.span.DurationMs,
 		}
 
@@ -1161,9 +1161,15 @@ func (i *Ingestor) pickObservationTarget(res Resolution) ObservationTarget {
 	return ObservationTarget{}
 }
 
-func startedAt(s ObservationSpan) time.Time {
+// startedAt returns the span's StartedAt when set; otherwise it
+// falls back to the ingestor's injectable clock (UTC-normalized
+// to preserve the original zero-StartedAt contract). Routing the
+// fallback through i.now matches the rest of the ingestor
+// (supervisor, caches, processBatch) and keeps the zero-
+// StartedAt path testable with a deterministic clock.
+func (i *Ingestor) startedAt(s ObservationSpan) time.Time {
 	if !s.StartedAt.IsZero() {
 		return s.StartedAt
 	}
-	return time.Now().UTC()
+	return i.now().UTC()
 }

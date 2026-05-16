@@ -753,7 +753,14 @@ func (i *Ingestor) EnqueueAtomic(batches []SpanBatch) error {
 	// default arm (it should not under the mutex, but the
 	// rollback keeps the metrics honest if the channel is
 	// closed or replaced during the lock window).
-	accepted := batches[:0]
+	//
+	// Use a fresh backing array (NOT `batches[:0]`) — aliasing
+	// the caller's slice means `append(accepted, b)` after a
+	// skipped zero-span batch would overwrite a later entry in
+	// `batches`, and the rollback's `for _, rb := range batches`
+	// loop would then double-count the overwriting batch's drops
+	// while missing the original.
+	accepted := make([]SpanBatch, 0, len(batches))
 	for _, b := range batches {
 		if len(b.Spans) == 0 {
 			continue

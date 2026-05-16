@@ -90,6 +90,53 @@ type PublishFilter interface {
 	FilterPublishedPoints(ctx context.Context, pointIDs []string) ([]string, error)
 }
 
+// HealthSource is the read-side abstraction the recall
+// handler consults to surface per-repo degraded state on the
+// response envelope. The Span Ingestor (Stage 4.2) populates
+// the underlying `repo_health` rows via
+// `graphwriter.UpsertRepoHealth`; the production
+// implementation is `spaningestor.PGHealthSource`.
+//
+// We define a structurally-identical local interface here
+// (instead of importing `internal/spaningestor`) so this
+// package keeps a one-directional dependency arrow — the
+// agent-api consumer wires the concrete spaningestor type at
+// the binary level via the `HealthSourceFunc` adapter. Test
+// fakes can implement HealthSource without dragging the
+// spaningestor package in.
+//
+// Returning `(zero-value, nil)` on a healthy repo is the
+// contract; the recall handler treats any error from
+// HealthForRepo as a soft failure (logged, ignored) — a
+// degraded read of the health table itself should NOT also
+// fail the recall response (rubber-duck #1 on the cross-
+// process design).
+type HealthSource interface {
+	HealthForRepo(ctx context.Context, repoID string) (HealthState, error)
+}
+
+// HealthSourceFunc adapts a plain function into a HealthSource.
+// Used by the binary's composition root to bridge the
+// `spaningestor.HealthSource` type to this package's
+// structurally-identical interface without an import cycle.
+type HealthSourceFunc func(ctx context.Context, repoID string) (HealthState, error)
+
+// HealthForRepo implements HealthSource.
+func (f HealthSourceFunc) HealthForRepo(ctx context.Context, repoID string) (HealthState, error) {
+	return f(ctx, repoID)
+}
+
+// HealthState mirrors `spaningestor.HealthState` (see the
+// HealthSource doc above for why). The `Reason` value is the
+// closed-set `degraded_reason` ENUM literal from migration
+// 0001 (e.g. "span_ingestor_backpressure"), passed through
+// verbatim onto `RecallResponse.DegradedReason`.
+type HealthState struct {
+	Degraded bool
+	Reason   string
+	Source   string
+}
+
 // Service is the §6.4 recall implementation.  Construct via
 // `NewService`; `Recall` is the only exported method today.
 // Future Stage-4 work will add `Observe` / `Expand` /
@@ -98,6 +145,7 @@ type Service struct {
 	embedder QueryEmbedder
 	searcher VectorSearcher
 	filter   PublishFilter
+	health   HealthSource
 	logger   *slog.Logger
 
 	// overFetchMultiplier is the headroom the service
@@ -138,6 +186,24 @@ func WithOverFetchMultiplier(n int) Option {
 			n = 1
 		}
 		s.overFetchMultiplier = n
+	}
+}
+
+// WithHealthSource plumbs an optional cross-process degraded-
+// state source the recall handler consults to populate
+// `RecallResponse.Degraded` / `RecallResponse.DegradedReason`
+// per tech-spec §C22. A nil source is a no-op (the response
+// reports Degraded=false always); when a real source returns
+// an error the recall call still succeeds — the error is
+// logged but the degraded flags fall back to defaults.
+//
+// The Span Ingestor (Stage 4.2) writes `repo_health` rows that
+// `spaningestor.NewPGHealthSource` reads here; the binary's
+// composition root in `cmd/agent-api/main.go` wires the
+// connection.
+func WithHealthSource(h HealthSource) Option {
+	return func(s *Service) {
+		s.health = h
 	}
 }
 
@@ -251,6 +317,22 @@ type RecallResponse struct {
 	// budget was insufficient — operators should consider
 	// bumping `WithOverFetchMultiplier`.
 	Filtered int
+
+	// Degraded surfaces the cross-process degraded-state
+	// flag the Span Ingestor (Stage 4.2) raises when its
+	// queue depth exceeds the §8.3 sustained envelope. The
+	// agent-api recall handler populates this from the
+	// `HealthSource` plumbed via `WithHealthSource`; when no
+	// HealthSource is configured (or it errors), this is
+	// always false.
+	//
+	// Per tech-spec §C22, the closed-set value the recall
+	// surface contract expects on `DegradedReason` is one of
+	// the `degraded_reason` ENUM literals (e.g.
+	// "span_ingestor_backpressure"). `DegradedReason` is
+	// empty when `Degraded` is false.
+	Degraded       bool
+	DegradedReason string
 }
 
 // ErrEmptyQuery is returned by `Service.Recall` when the
@@ -341,7 +423,14 @@ func (s *Service) Recall(ctx context.Context, req RecallRequest) (RecallResponse
 		return RecallResponse{}, fmt.Errorf("agentapi: recall: qdrant search: %w", err)
 	}
 	if len(candidates) == 0 {
-		return RecallResponse{Hits: []Hit{}, OverFetched: 0, Filtered: 0}, nil
+		resp := RecallResponse{Hits: []Hit{}, OverFetched: 0, Filtered: 0}
+		// Surface the cross-process degraded flag even on
+		// the empty-candidates path. Evaluator iter-1 #4:
+		// before this fix, a backpressured repo with zero
+		// Qdrant hits returned a Degraded=false envelope,
+		// suppressing the §C22 contract signal.
+		s.populateDegraded(ctx, req, &resp)
+		return resp, nil
 	}
 
 	pointIDs := make([]string, 0, len(candidates))
@@ -375,7 +464,7 @@ func (s *Service) Recall(ctx context.Context, req RecallRequest) (RecallResponse
 		})
 	}
 
-	return RecallResponse{
+	resp := RecallResponse{
 		Hits:        out,
 		OverFetched: len(candidates),
 		// Count only hits the filter actually examined and
@@ -387,5 +476,35 @@ func (s *Service) Recall(ctx context.Context, req RecallRequest) (RecallResponse
 		// pollute the recall_filter_unpublished_total
 		// operator signal (§9.6a read-side).
 		Filtered: len(pointIDs) - len(allowed),
-	}, nil
+	}
+	s.populateDegraded(ctx, req, &resp)
+	return resp, nil
+}
+
+// populateDegraded reads the per-repo health state (if a
+// HealthSource is wired) and writes it onto the response. A
+// HealthSource error is logged at warn level and ignored —
+// per the rubber-duck pass on the cross-process design, a
+// degraded read of the health table itself MUST NOT cascade
+// into a recall failure.
+//
+// An empty RecallRequest.RepoID skips the lookup: the recall
+// path treats "no scope" as a global query (see the unscoped
+// warning above), and there is no per-repo health row to
+// consult when the recall isn't scoped to a repo.
+func (s *Service) populateDegraded(
+	ctx context.Context, req RecallRequest, resp *RecallResponse,
+) {
+	if s.health == nil || req.RepoID == "" {
+		return
+	}
+	state, err := s.health.HealthForRepo(ctx, req.RepoID)
+	if err != nil {
+		s.logger.Warn("agentapi.recall.health_lookup_failed",
+			slog.String("repo_id", req.RepoID),
+			slog.String("err", err.Error()))
+		return
+	}
+	resp.Degraded = state.Degraded
+	resp.DegradedReason = state.Reason
 }

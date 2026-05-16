@@ -33,9 +33,11 @@ func TestAll_parsesEveryEmbeddedFile(t *testing.T) {
 		"0017",
 		// Stage 3.5 webhook receiver per-repo secret table.
 		"0018",
+		// Stage 4.2 Span Ingestor: degraded-state + solo-method aggregate.
+		"0019", "0020",
 	}
 	if len(all) != len(wantVersions) {
-		t.Fatalf("All() returned %d migrations, want %d (Stage 1.2 + 1.3 + 1.4 + 2.2 + 3.4 + 3.5 set)",
+		t.Fatalf("All() returned %d migrations, want %d (Stage 1.2 + 1.3 + 1.4 + 2.2 + 3.4 + 3.5 + 4.2 set)",
 			len(all), len(wantVersions))
 	}
 	for i, w := range wantVersions {
@@ -208,6 +210,9 @@ func TestAll_filenamesMatchPlannedSet(t *testing.T) {
 		"0017_reader_role.sql": true,
 		// Stage 3.5 per-repo webhook secret table.
 		"0018_repo_webhook_secret.sql": true,
+		// Stage 4.2 Span Ingestor cross-process backpressure + root-span aggregate.
+		"0019_repo_health.sql":              true,
+		"0020_method_solo_observation.sql":  true,
 	}
 	all, err := All()
 	if err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -119,6 +120,18 @@ type PoolOptions struct {
 	// returned error wraps the actual role pgx authenticated
 	// as so operators can debug the deployment misconfiguration
 	// without scraping logs.
+	//
+	// The verification result is cached for the lifetime of
+	// the pool: subsequent connections opened by pgxpool
+	// (e.g. when MaxConnLifetime expiry rotates a backend or
+	// burst traffic grows the pool) skip the per-connection
+	// `SELECT current_user` round-trip once the first new
+	// connection has confirmed the role. This is sound
+	// because every connection in the pool shares the same
+	// DSN and therefore authenticates as the same role; the
+	// per-connection re-check would burn a backend round-trip
+	// every connection-recycle cycle without changing the
+	// answer.
 	ExpectedRole string
 	// AllowAnyRole disables the role assertion. Set this only
 	// in tests / tooling that intentionally connect as a
@@ -218,10 +231,23 @@ func NewPool(ctx context.Context, dsn string, opts PoolOptions) (*pgxpool.Pool, 
 
 	// Compose the optional AfterConnect hooks. SearchPath runs
 	// first (it's stateful — every later query depends on it),
-	// ExpectedRole runs second (it's a one-shot assertion
-	// against the same connection). Either may be absent; if
-	// both are absent we leave AfterConnect at nil so pgxpool
-	// skips the indirection entirely.
+	// ExpectedRole runs second.
+	//
+	// The role check is a *first-connection-only* assertion:
+	// once one new backend session has reported the expected
+	// role, the closure latches `verified = true` and every
+	// later AfterConnect skips the `SELECT current_user`
+	// round-trip. All connections in the pool share one DSN
+	// and therefore authenticate as the same role, so the
+	// per-connection re-check would burn a backend round-trip
+	// on every `MaxConnLifetime`-driven reconnect without
+	// changing the answer. We only cache the *success* case —
+	// a transient query failure on the first attempt leaves
+	// `verified = false` so the next new connection retries
+	// rather than the pool getting stuck on a stale error.
+	// Either hook may be absent; if both are absent we leave
+	// AfterConnect at nil so pgxpool skips the indirection
+	// entirely.
 	var hooks []func(context.Context, *pgx.Conn) error
 	if sp := opts.SearchPath; sp != "" {
 		// The hook runs once per new backend session. We use
@@ -240,7 +266,11 @@ func NewPool(ctx context.Context, dsn string, opts PoolOptions) (*pgxpool.Pool, 
 	}
 	if effectiveRole != "" {
 		want := effectiveRole
+		var verified atomic.Bool
 		hooks = append(hooks, func(ctx context.Context, conn *pgx.Conn) error {
+			if verified.Load() {
+				return nil
+			}
 			var got string
 			if err := conn.QueryRow(ctx, "SELECT current_user").Scan(&got); err != nil {
 				return fmt.Errorf("graphreader: check current_user: %w", err)
@@ -254,6 +284,7 @@ func NewPool(ctx context.Context, dsn string, opts PoolOptions) (*pgxpool.Pool, 
 					got, want,
 				)
 			}
+			verified.Store(true)
 			return nil
 		})
 	}

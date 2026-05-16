@@ -20,6 +20,15 @@ func TestAcquireAppRoleLogin_rejectsEmptyDSN(t *testing.T) {
 	}
 }
 
+// TestAcquireRoRoleLogin_rejectsEmptyDSN mirrors the App
+// guard for the read-only role lock added in Stage 2.2.
+func TestAcquireRoRoleLogin_rejectsEmptyDSN(t *testing.T) {
+	t.Parallel()
+	if _, err := AcquireRoRoleLogin(context.Background(), ""); err == nil {
+		t.Error("expected error for empty DSN; got nil")
+	}
+}
+
 // TestAppRoleLoginKey_isExpectedMagic pins the deterministic
 // bigint value cross-package callers depend on. A future refactor
 // that accidentally changes the constant would silently break
@@ -30,6 +39,23 @@ func TestAppRoleLoginKey_isExpectedMagic(t *testing.T) {
 	if AppRoleLoginKey != want {
 		t.Errorf("AppRoleLoginKey = %#x, want %#x (ASCII \"AGNTMEM1\")",
 			AppRoleLoginKey, want)
+	}
+}
+
+// TestRoRoleLoginKey_isExpectedMagic pins the read-only-role
+// lock key, distinct from the app-role key so the two role
+// flips don't needlessly serialise across test packages.
+func TestRoRoleLoginKey_isExpectedMagic(t *testing.T) {
+	t.Parallel()
+	const want int64 = 0x41474E544D454D32 // "AGNTMEM2"
+	if RoRoleLoginKey != want {
+		t.Errorf("RoRoleLoginKey = %#x, want %#x (ASCII \"AGNTMEM2\")",
+			RoRoleLoginKey, want)
+	}
+	if RoRoleLoginKey == AppRoleLoginKey {
+		t.Errorf("RoRoleLoginKey == AppRoleLoginKey (%#x); keys must differ "+
+			"so reader / writer role flips don't serialise across packages",
+			RoRoleLoginKey)
 	}
 }
 

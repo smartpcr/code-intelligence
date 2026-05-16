@@ -651,24 +651,32 @@ storyId: "code-intelligence:AGENT-MEMORY"
 ## Stage 4.3: TraceObservationLog retention pruner
 
 ### Implementation Steps
-- [ ] Implement a daily-cron pruner that calls `pg_partman`'s
+- [x] Implement a daily-cron pruner that calls `pg_partman`'s
       `drop_partition_time` to detach partitions older than the
       §8.1 30-day retention window (the §8.1 default).
-- [ ] Verify the `TraceObservation` aggregate row is **never**
+- [x] Verify the `TraceObservation` aggregate row is **never**
       pruned (only log partitions are detached) per C8.
-- [ ] Emit a `trace_log_partitions_dropped_total` metric per run.
-- [ ] Add an integration test that materialises a 35-day-old log
-      partition and asserts the pruner detaches it.
+- [x] Emit a `trace_log_partitions_dropped_total` metric per run.
+- [x] Add an integration test that materialises a log partition
+      older than the 30-day retention window and asserts the
+      pruner detaches it. (The test seeds a row 45 days in the
+      past so the containing weekly partition's UPPER bound is
+      deterministically older than 30 days regardless of
+      weekday alignment.)
 
 ### Dependencies
 - phase-dynamic-ingestion-pipeline/stage-span-ingestor-worker
 
 ### Test Scenarios
-- [ ] Scenario: 30-day window dropped -- Given a
-      `TraceObservationLog` partition whose week-range ends 35
-      days ago, When the pruner runs, Then that partition is
-      detached and `trace_log_partitions_dropped_total += 1`.
-- [ ] Scenario: aggregate row preserved -- Given an Edge whose
+- [x] Scenario: 30-day window dropped -- Given a
+      `TraceObservationLog` partition whose week-range upper
+      bound is ≥30 days ago (seeded as a 45-day-old started_at
+      so weekly alignment cannot push the upper bound back
+      inside the window), When the pruner runs, Then that
+      partition is detached and
+      `trace_log_partitions_dropped_total += 1` (per
+      `partman.drop_partition_time`'s integer return value).
+- [x] Scenario: aggregate row preserved -- Given an Edge whose
       `TraceObservation` row was populated 60 days ago, When the
       pruner runs, Then the `TraceObservation` row is still
       present (C8 — aggregates are never pruned).

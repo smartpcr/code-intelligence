@@ -870,10 +870,17 @@ func failureDetails(phase string, err error) json.RawMessage {
 	}
 	raw, mErr := json.Marshal(body)
 	if mErr != nil {
-		// json.Marshal of a `map[string]string` cannot fail;
-		// fall back to a hard-coded payload so a future
-		// reflection bug never crashes the publisher.
-		return json.RawMessage(`{"phase":"` + phase + `","error":"json_marshal_failed"}`)
+		// json.Marshal of a `map[string]any` keyed by string
+		// literals cannot fail for our inputs; this branch
+		// guards against a future reflection bug. We hard-code
+		// the phase to a sentinel rather than interpolating the
+		// caller-supplied value because the signature accepts
+		// arbitrary `string` — if a future caller passes a phase
+		// containing `"` or `\`, raw concatenation would emit
+		// malformed JSON that the `$4::jsonb` cast in
+		// `insertEvent` would reject, turning a marshal-fallback
+		// into a second failure that masks the original error.
+		return json.RawMessage(`{"phase":"unknown","error":"json_marshal_failed"}`)
 	}
 	return json.RawMessage(raw)
 }

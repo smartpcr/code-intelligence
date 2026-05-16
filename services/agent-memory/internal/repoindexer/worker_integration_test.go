@@ -456,9 +456,9 @@ func TestWorker_claimIsExclusive_underContention(t *testing.T) {
 	// Run the two Claim() calls concurrently. Exactly one
 	// must succeed; the other must see ErrNoJob.
 	var (
-		wg                   sync.WaitGroup
-		jobA, jobB           Job
-		errA, errB           error
+		wg         sync.WaitGroup
+		jobA, jobB Job
+		errA, errB error
 	)
 	wg.Add(2)
 	start := make(chan struct{})

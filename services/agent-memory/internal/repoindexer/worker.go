@@ -10,6 +10,8 @@ import (
 	"path"
 	"time"
 
+	"github.com/lib/pq"
+
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
 )
@@ -585,7 +587,7 @@ func (w *Worker) markRunning(ctx context.Context, jobID string) error {
 //     re-ingest of an already-indexed SHA).
 //
 // Concurrency: the dedupe UNIQUE INDEX on
-// (repo_id, mode, COALESCE(from_sha,''), to_sha) prevents two
+// (repo_id, mode, COALESCE(from_sha,”), to_sha) prevents two
 // distinct ingest_jobs rows for the same tuple, so concurrent
 // jobs racing the predicate is impossible by construction. The
 // predicate's `from_sha` clause matches the COALESCE shape of
@@ -693,7 +695,7 @@ func (w *Worker) markDoneAndPublish(ctx context.Context, job Job, summary FullSu
 
 // nullableSHA preserves the NULL/empty distinction the
 // ingest_jobs schema's `from_sha text` column uses. The
-// dedupe UNIQUE INDEX is keyed on COALESCE(from_sha,''), so
+// dedupe UNIQUE INDEX is keyed on COALESCE(from_sha,”), so
 // passing NULL for an empty Go-side string keeps the predicate
 // in markDoneAndPublish aligned with the index. lib/pq decodes
 // `nil any` to a SQL NULL literal.
@@ -801,17 +803,17 @@ type fullModeAttrs struct {
 //     `repo.registered` event branch).
 //  4. Ensures the root Repo Node.
 //  5. Walks every file. For each file:
-//       a. Ensures the parent Package Node (one per unique
-//          directory) with parent_node_id pointing at the Repo
-//          Node.
-//       b. Inserts a Repo→Package `contains` Edge the first
-//          time the package is seen.
-//       c. Inserts the File Node with parent_node_id pointing
-//          at the Package Node.
-//       d. Inserts a Package→File `contains` Edge.
-//       e. Delegates to the ASTEmitter for per-file Class /
-//          Method / Block emission (Stage 3.2 surface; the
-//          default emitter is a no-op).
+//     a. Ensures the parent Package Node (one per unique
+//     directory) with parent_node_id pointing at the Repo
+//     Node.
+//     b. Inserts a Repo→Package `contains` Edge the first
+//     time the package is seen.
+//     c. Inserts the File Node with parent_node_id pointing
+//     at the Package Node.
+//     d. Inserts a Package→File `contains` Edge.
+//     e. Delegates to the ASTEmitter for per-file Class /
+//     Method / Block emission (Stage 3.2 surface; the
+//     default emitter is a no-op).
 //
 // All structural inserts are routed through the graphwriter
 // library so the role-grant policy (§8.7.4) and G2/G5 invariants
@@ -819,13 +821,20 @@ type fullModeAttrs struct {
 // re-running it against the same SHA produces zero net new rows
 // (Stage 2.1 dedupe path).
 func (w *Worker) runFull(ctx context.Context, job Job) (FullSummary, error) {
-	// 1. Resolve repo URL. The worker is the only caller that
-	// needs this read on the `repo` table; the app role has
-	// SELECT (per migration 0016 USAGE + per-table grants).
-	var repoURL string
+	// 1. Resolve repo URL + language_hints. The worker is the
+	// only caller that needs this read on the `repo` table;
+	// the app role has SELECT (per migration 0016 USAGE +
+	// per-table grants). `language_hints` flows through to
+	// EmitFileEvent so each per-file dispatcher invocation
+	// receives the repo's own hint set -- the evaluator-
+	// flagged correctness gate (Stage 3.2 iter-2 finding #4).
+	var (
+		repoURL  string
+		repoLang []string
+	)
 	if err := w.db.QueryRowContext(ctx,
-		`SELECT url FROM repo WHERE repo_id = $1`, job.RepoID.String(),
-	).Scan(&repoURL); err != nil {
+		`SELECT url, language_hints FROM repo WHERE repo_id = $1`, job.RepoID.String(),
+	).Scan(&repoURL, pq.Array(&repoLang)); err != nil {
 		return FullSummary{}, fmt.Errorf("repoindexer: lookup repo url: %w", err)
 	}
 
@@ -974,13 +983,15 @@ func (w *Worker) runFull(ctx context.Context, job Job) (FullSummary, error) {
 
 		// Delegate Class/Method/Block emission to Stage 3.2.
 		emErr := w.emitter.EmitFile(ctx, EmitFileEvent{
-			RepoID:     job.RepoID,
-			RepoURL:    repoURL,
-			SHA:        job.ToSHA,
-			FileNodeID: fileRec.NodeID,
-			RelPath:    file.RelPath,
-			AbsPath:    file.AbsPath,
-			Open:       file.Reader,
+			RepoID:        job.RepoID,
+			RepoURL:       repoURL,
+			SHA:           job.ToSHA,
+			FileNodeID:    fileRec.NodeID,
+			RepoNodeID:    repoNode.NodeID,
+			RelPath:       file.RelPath,
+			AbsPath:       file.AbsPath,
+			LanguageHints: repoLang,
+			Open:          file.Reader,
 		})
 		if emErr != nil {
 			return fmt.Errorf("repoindexer: ast emitter (%s): %w", file.RelPath, emErr)

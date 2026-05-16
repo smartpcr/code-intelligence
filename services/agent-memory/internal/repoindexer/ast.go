@@ -53,6 +53,20 @@ type EmitFileEvent struct {
 	// Nodes set `parent_node_id = FileNodeID` so the
 	// repo→package→file→class chain stays intact.
 	FileNodeID string
+	// RepoNodeID is the textual UUID of the root Repo Node
+	// the worker has already ensured during this ingest.
+	// The dispatcher uses it as the ParentNodeID for the
+	// synthetic external-package Nodes it mints for
+	// non-relative imports, keeping those Nodes hooked into
+	// the same Repo→Package hierarchy the worker built for
+	// first-party packages (per evaluator finding #4).
+	// Empty when the worker has not minted a Repo Node yet
+	// (e.g. unit-test fakes that go straight from File to
+	// Class); external-package Nodes are still inserted in
+	// that case but without a ParentNodeID -- consumers
+	// observe the gap via `attrs_json["parent_missing"]`
+	// on the package node.
+	RepoNodeID string
 	// RelPath is the workspace-relative path of the file,
 	// always forward-slash. Useful for the emitter's log
 	// records and for deriving the language hint.
@@ -60,6 +74,23 @@ type EmitFileEvent struct {
 	// AbsPath is the absolute filesystem path of the file. Empty
 	// for in-memory workspaces; emitters MUST prefer `Open`.
 	AbsPath string
+	// LanguageHints is the per-repo `repo.language_hints[]`
+	// closed list supplied at registration time (architecture
+	// §3.7). The dispatcher uses it as a tie-breaker for
+	// files whose extension does not map to a registered
+	// parser. The worker reads the list from the `repo` row
+	// and passes it through unchanged so each file event
+	// carries the hint set that was current at the time the
+	// row was last updated; subsequent registrations do not
+	// affect in-flight ingests.
+	//
+	// Per-event population (rather than a dispatcher-global
+	// option) is the evaluator-flagged correctness gate: when
+	// the worker indexes multiple repos with different
+	// language profiles concurrently, each EmitFile call must
+	// receive its OWN repo's hints. A dispatcher-global
+	// setting cannot satisfy that.
+	LanguageHints []string
 	// Open returns a fresh ReadCloser for the file's contents.
 	// Each call returns a new reader at offset 0 so the emitter
 	// can perform multiple passes (e.g. lex + parse) without

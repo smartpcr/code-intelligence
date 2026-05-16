@@ -72,37 +72,40 @@ var buildErr error
 var binaryPath string
 
 // lockedBuffer is a minimal goroutine-safe wrapper around
-// bytes.Buffer. We need it because os/exec spawns an internal
-// goroutine to copy the child's stdout/stderr pipes into any
-// non-*os.File writer we hand it. The test goroutine then reads
-// the captured output via String() in failure-diagnostic paths
-// (e.g., when /healthz times out or a request fails) WHILE the
-// child process is still running and the copy goroutine is still
-// writing. bytes.Buffer is documented as not safe for concurrent
-// use, so without this wrapper `go test -race` flags the access
-// as a data race.
+// bytes.Buffer. It exists because os/exec, when handed any
+// non-*os.File writer for Cmd.Stdout / Cmd.Stderr, spawns an
+// internal goroutine per pipe that copies the child's output
+// into that writer for the lifetime of the process. The test
+// goroutine in this file reads the captured output via String()
+// from several failure-diagnostic paths -- the /healthz timeout
+// branch in startReceiver as well as rr.output.String() in each
+// subtest -- WHILE the child is still running and the copy
+// goroutines are still writing. bytes.Buffer is documented as
+// unsafe for concurrent use, so without this wrapper `go test
+// -race` flags the writer/reader interleave as a data race.
 //
-// We only need Write (to satisfy io.Writer for cmd.Stdout /
-// cmd.Stderr) and String (for diagnostic snapshots); Bytes,
-// Len, Reset, etc. are intentionally omitted to keep the
-// concurrency surface narrow.
+// Only Write (to satisfy io.Writer for cmd.Stdout / cmd.Stderr)
+// and String (for diagnostic snapshots) are exposed; the rest
+// of bytes.Buffer's surface is intentionally hidden to keep the
+// concurrency contract narrow.
 type lockedBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
 }
 
 // Write appends p to the underlying buffer under the mutex. It
-// is safe to call concurrently with String and with other Writes.
+// is safe to call concurrently with String and with other
+// Write calls from the os/exec stdout / stderr copy goroutines.
 func (b *lockedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.Write(p)
 }
 
-// String returns a snapshot copy of the buffer contents under
-// the mutex. The returned string is independent of the buffer
-// and safe to use after the lock is released because Go's
-// []byte->string conversion copies.
+// String returns a snapshot of the buffer contents under the
+// mutex. The result is independent of the buffer (Go's
+// []byte->string conversion copies) and safe to use after the
+// lock is released.
 func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -270,11 +273,12 @@ func startReceiver(t *testing.T, dsn, certFile, keyFile string, caPEM []byte) *r
 	)
 	// combined captures stdout+stderr from the child. It MUST
 	// be the mutex-guarded lockedBuffer (not a bare
-	// bytes.Buffer) because os/exec spawns a goroutine that
-	// writes here while the test goroutine may concurrently
-	// read via String() in failure paths below and in the
-	// subtests via rr.output.String(). bytes.Buffer is not
-	// safe for concurrent use; -race would flag it.
+	// bytes.Buffer) because os/exec spawns goroutines that
+	// write here while the test goroutine concurrently reads
+	// via String() from the failure-diagnostic paths below
+	// and from rr.output.String() in the subtests.
+	// bytes.Buffer is not safe for concurrent use; `go test
+	// -race` would flag the interleave.
 	combined := &lockedBuffer{}
 	cmd.Stdout = combined
 	cmd.Stderr = combined
@@ -485,11 +489,13 @@ func TestE2E_binaryRejectsTLS10Connection_pinsMinTLSVersion(t *testing.T) {
 
 	certFile, keyFile, caPEM := generateSelfSignedCert(t)
 	rr := startReceiver(t, fix.dsn, certFile, keyFile, caPEM)
+	_ = rr // start/stop is enough; we only need the listener bound.
 
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caPEM) {
 		t.Fatal("AppendCertsFromPEM: failed to add test CA")
 	}
+
 	// Force a TLS 1.0 client config -- the handshake MUST be
 	// rejected by the server's MinVersion=TLS12 setting.
 	conn, err := tls.Dial("tcp", rr.addr, &tls.Config{
@@ -502,10 +508,12 @@ func TestE2E_binaryRejectsTLS10Connection_pinsMinTLSVersion(t *testing.T) {
 		_ = conn.Close()
 		t.Fatal("TLS 1.0 handshake succeeded; server MinVersion not enforced")
 	}
+
 	// Any handshake failure is acceptable (the local Go stack
 	// may refuse to even attempt TLS 1.0). Surface the error
 	// in a log so future debug is easier.
 	t.Logf("TLS 1.0 handshake correctly rejected: %v", err)
+
 	// Sanity-check the error mentions a version / protocol
 	// issue rather than e.g. ECONNREFUSED.
 	if errors.Is(err, io.EOF) {

@@ -1265,6 +1265,19 @@ SELECT cs.support_id::text,
 		out = append(out, sup)
 	}
 	if err := rows.Err(); err != nil {
+		// Connection-class failures can surface here when
+		// the pool drops mid-iteration (TCP timeout, PG
+		// partition); route them through
+		// `ErrGraphStoreUnavailable` so
+		// `summarizeGraphFailure` emits the degraded
+		// envelope instead of falling through to
+		// `codes.Internal`, matching the `QueryContext`
+		// branch above and the node-path's
+		// `classifyGraphStoreError` contract.
+		if agentapi.IsGraphStoreUnavailable(err) {
+			return nil, fmt.Errorf("%w: concept_support: rows: %v",
+				agentapi.ErrGraphStoreUnavailable, err)
+		}
 		return nil, fmt.Errorf("concept_support: rows: %w", err)
 	}
 	logger.Debug("agent-api.summarize.concept_supports.loaded",

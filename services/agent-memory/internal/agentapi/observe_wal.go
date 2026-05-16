@@ -52,23 +52,6 @@
 // the stale lock is removed and the open is retried once.  A
 // live holder still produces `ErrWALAlreadyOpen` exactly as
 // before so a real misconfiguration continues to fail loudly.
-//
-// Data-file handle lifecycle
-// --------------------------
-// The append-only data file handle is kept open for the
-// lifetime of the FileWAL so each Enqueue pays only write +
-// fsync — not the open / write+fsync / close round-trip the
-// original implementation did on every call.  Under sustained
-// partition outages (the very scenario this WAL exists for)
-// that previous per-call open/close was 3+ syscalls of pure
-// overhead and excessive file-descriptor churn.  The handle
-// is opened lazily on the first Enqueue (so a WAL that never
-// has anything written to it does not create an empty file
-// on disk) and closed by Close — but only when the flusher
-// has actually stopped, so a stuck Drain holding `mu` cannot
-// turn the bounded 5-second Stop deadline into an indefinite
-// hang.  In the (rare) timeout case the OS reclaims the FD
-// at process exit.
 package agentapi
 
 import (
@@ -115,11 +98,6 @@ const (
 	// cannot spin NewFileWAL forever.  We only need one
 	// extra attempt after reclaiming a stale lock.
 	lockAcquireMaxAttempts = 2
-	// stopWaitDeadline bounds how long Close / Stop will wait
-	// for the flusher goroutine to exit.  A stuck Drain (the
-	// downstream EpisodeAppender hanging on an external call)
-	// would otherwise wedge shutdown indefinitely.
-	stopWaitDeadline = 5 * time.Second
 )
 
 // ErrWALAlreadyOpen is returned by NewFileWAL when another
@@ -145,46 +123,20 @@ type FileWAL struct {
 	offsetPath string
 	lockPath   string
 	lockFile   *os.File
-	// dataFile is the long-lived append-only write handle.
-	// It is lazily opened by Enqueue under `mu` on first use
-	// and released by Close, eliminating the per-Enqueue
-	// open/close syscall churn the original implementation
-	// paid on every fallback-path call.  Every access to
-	// this field is serialised by `mu`.
-	dataFile *os.File
-	mu       sync.Mutex
-	depth    atomic.Int64
-	metrics  ObserveMetrics
-	logger   *slog.Logger
-	signal   chan struct{}
-	// flusher lifecycle.
-	//
-	// Start/Stop handshake: a concurrent StartFlusher and
-	// Stop must NEVER leave an unsupervised flusher goroutine
-	// running after Stop has returned.  The two atomics
-	// `stopped` and `flusherUp` form a sequentially-consistent
-	// double-check:
-	//
-	//   stopAndWait: stopped.Store(true) THEN flusherUp.Load()
-	//   StartFlusher: flusherUp.Store(true) THEN stopped.Load()
-	//
-	// With Go's SC atomic ordering, at least one side observes
-	// the other's write.  Either stopAndWait sees flusherUp=
-	// true and waits on doneCh, OR StartFlusher sees stopped=
-	// true and bails out (closing doneCh itself so any later
-	// Close that observes flusherUp=true does not deadlock on
-	// the never-launched goroutine's defer).  After this fix
-	// `flusherUp == true` means "doneCh will be closed" — by
-	// the goroutine's defer if it launched, by StartFlusher's
-	// bail-out branch otherwise — NOT "a goroutine is
-	// currently running".  Do not simplify back into a single-
-	// flag scheme without re-deriving the ordering.
+	mu         sync.Mutex
+	depth      atomic.Int64
+	metrics    ObserveMetrics
+	logger     *slog.Logger
+	signal     chan struct{}
+	// flusher lifecycle.  `flushOnce` is the gating
+	// primitive shared between StartFlusher and Stop so that
+	// a Stop+StartFlusher race cannot leave an unsupervised
+	// goroutine running past Stop's return.  See StartFlusher
+	// and Stop for the full state-machine commentary.
 	flushOnce sync.Once
-	flusherUp atomic.Bool
 	stopCh    chan struct{}
 	doneCh    chan struct{}
 	stopOnce  sync.Once
-	stopped   atomic.Bool
 }
 
 // FileWALOptions configures NewFileWAL.
@@ -379,20 +331,6 @@ func errString(err error) string {
 // to the WAL data file.  Returns a non-nil error only on disk
 // failure; on success the depth gauge is bumped and the
 // flusher is signalled.
-//
-// The data file handle is kept open across calls (lazily
-// opened here on first use under `mu`, closed by Close) so
-// each enqueue pays only `write` + `fsync` — no open/close
-// churn on the hot fallback path during a sustained partition
-// outage.  `mu` serialises every Enqueue and every internal
-// reader/writer of `w.dataFile`, so the shared handle has
-// exactly one user at a time.
-//
-// On a write or fsync failure the handle is closed and
-// cleared so the next Enqueue gets a fresh open — that
-// preserves the original implementation's "next call gets a
-// fresh fd" recovery property in case the failure was
-// handle-specific (e.g. EBADF after an external truncate).
 func (w *FileWAL) Enqueue(_ context.Context, in EpisodeAppendInput) error {
 	payload, err := json.Marshal(in)
 	if err != nil {
@@ -400,20 +338,15 @@ func (w *FileWAL) Enqueue(_ context.Context, in EpisodeAppendInput) error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.dataFile == nil {
-		f, err := os.OpenFile(w.dataPath,
-			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-		if err != nil {
-			return fmt.Errorf("agentapi: observe WAL: open data: %w", err)
-		}
-		w.dataFile = f
+	f, err := os.OpenFile(w.dataPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("agentapi: observe WAL: open data: %w", err)
 	}
-	if _, err := w.dataFile.Write(append(payload, '\n')); err != nil {
-		w.discardDataFileLocked()
+	defer f.Close()
+	if _, err := f.Write(append(payload, '\n')); err != nil {
 		return fmt.Errorf("agentapi: observe WAL: write: %w", err)
 	}
-	if err := w.dataFile.Sync(); err != nil {
-		w.discardDataFileLocked()
+	if err := f.Sync(); err != nil {
 		return fmt.Errorf("agentapi: observe WAL: fsync: %w", err)
 	}
 	d := w.depth.Add(1)
@@ -425,19 +358,6 @@ func (w *FileWAL) Enqueue(_ context.Context, in EpisodeAppendInput) error {
 	default:
 	}
 	return nil
-}
-
-// discardDataFileLocked closes and nils the kept-open data
-// file handle so the next Enqueue gets a fresh open.  Caller
-// MUST hold `mu`.  Errors from Close are ignored — the caller
-// is already returning a write/fsync error and forcing a
-// reopen is the recovery action.
-func (w *FileWAL) discardDataFileLocked() {
-	if w.dataFile == nil {
-		return
-	}
-	_ = w.dataFile.Close()
-	w.dataFile = nil
 }
 
 // Depth returns the current number of pending entries.  Safe
@@ -572,88 +492,93 @@ func (w *FileWAL) Drain(ctx context.Context, writer EpisodeAppender, batch int) 
 // to defaultFlushInterval); each Enqueue also signals the
 // flusher immediately so the typical drain happens promptly.
 //
-// Start/Stop race handling: after publishing flusherUp=true
-// we re-check `stopped` (see field-block docs).  If Stop has
-// already run, launching the goroutine would leave it
-// unsupervised — Stop saw flusherUp=false and returned
-// without waiting on doneCh.  In that case we close doneCh
-// ourselves and skip the goroutine so any later Close that
-// observes flusherUp=true wakes up immediately.
+// Stop+StartFlusher ordering contract: once Stop has been
+// called, future StartFlusher calls are no-ops and no new
+// flusher goroutine is launched — even when the two calls
+// race.  The check uses `flushOnce` so that exactly one of
+// {Stop, StartFlusher} runs the gating block, and the gating
+// block decides whether to launch the goroutine or short-
+// circuit doneCh so any concurrent Stop caller unblocks.
 func (w *FileWAL) StartFlusher(writer EpisodeAppender, tick time.Duration) {
 	if tick <= 0 {
 		tick = defaultFlushInterval
 	}
 	w.flushOnce.Do(func() {
-		w.flusherUp.Store(true)
-		if w.stopped.Load() {
+		// If Stop has already closed stopCh and won the race
+		// to flushOnce, this branch never runs (Stop's Do
+		// block already closed doneCh).  If we win flushOnce
+		// after Stop closed stopCh, do NOT launch an
+		// unsupervised goroutine — close doneCh ourselves so
+		// the concurrent Stop caller (which is now blocked
+		// in our flushOnce.Do, then will wait on doneCh)
+		// unblocks cleanly.
+		select {
+		case <-w.stopCh:
 			close(w.doneCh)
 			return
+		default:
 		}
 		go w.flusherLoop(writer, tick)
 	})
 }
 
-// Stop signals the flusher goroutine to exit and waits for it.
-// Safe to call before StartFlusher (in which case Stop is a
-// no-op). Idempotent.  Use Close instead during normal
-// shutdown — Close stops the flusher AND releases the lock
-// file (and the kept-open data file handle).
+// Stop signals the flusher goroutine (if any) to exit and
+// waits for it to finish.  Safe to call before, during, or
+// after StartFlusher; safe to call concurrently with
+// StartFlusher.  Idempotent.  Once Stop has been called,
+// future StartFlusher calls are permanent no-ops — a stopped
+// FileWAL cannot be restarted.  Use Close instead during
+// normal shutdown — Close stops the flusher AND releases the
+// lock file.
+//
+// The previous implementation used a `flusherUp` atomic gate
+// and skipped the doneCh wait when it observed `flusherUp ==
+// false`.  That created a race window: if Stop's Load saw
+// `flusherUp == false` between StartFlusher's `select` on
+// stopCh and StartFlusher's `go w.flusherLoop`, Stop returned
+// while a fresh goroutine ran unsupervised.  The fix uses
+// `flushOnce` as the single rendezvous point: exactly one of
+// {Stop's Do block, StartFlusher's Do block} executes, and
+// both branches close doneCh in the no-launch case so the
+// wait below always terminates without needing the timeout.
 func (w *FileWAL) Stop() {
-	_ = w.stopAndWait()
-}
-
-// stopAndWait runs the Stop logic and reports whether the
-// flusher actually exited within the deadline (true) or the
-// 5-second wait timed out (false).  Close uses the bool to
-// decide whether it is safe to close the kept-open data file
-// handle under `mu`: a Drain stuck on a stuck downstream
-// writer still holds `mu`, and waiting on it during shutdown
-// would convert the bounded deadline into an indefinite hang.
-func (w *FileWAL) stopAndWait() bool {
 	w.stopOnce.Do(func() {
-		// Publish `stopped` BEFORE close(stopCh) so a
-		// concurrent StartFlusher's double-check sees it.
-		// See field-block docs for the Start/Stop handshake.
-		w.stopped.Store(true)
 		close(w.stopCh)
 	})
-	// Only wait when a flusher (or a bailed-out StartFlusher
-	// that will close doneCh) has published flusherUp=true,
-	// otherwise doneCh would never close and we'd burn the
-	// timeout.  The handshake guarantees that if we read
-	// flusherUp=false here, no goroutine will subsequently
-	// launch: a concurrent StartFlusher will observe
-	// stopped=true and bail.
-	if !w.flusherUp.Load() {
-		return true
-	}
+	// Drive flushOnce ourselves so the lifecycle has a
+	// deterministic outcome regardless of whether
+	// StartFlusher was ever called or is currently racing
+	// with us:
+	//
+	//   (a) StartFlusher already launched the goroutine
+	//       (its Do block consumed flushOnce): our Do is a
+	//       no-op; doneCh will be closed by flusherLoop's
+	//       deferred close on the way out.
+	//   (b) StartFlusher is mid-Do, has not yet launched
+	//       the goroutine: our Do blocks until StartFlusher's
+	//       Do returns; whichever path StartFlusher took
+	//       (launch goroutine OR observe closed stopCh and
+	//       close doneCh) leaves doneCh on a path to closure,
+	//       and our Do becomes a no-op.
+	//   (c) StartFlusher was never called and never will win
+	//       flushOnce because we are about to: our Do
+	//       executes and closes doneCh directly so the wait
+	//       returns immediately.
+	w.flushOnce.Do(func() {
+		close(w.doneCh)
+	})
 	select {
 	case <-w.doneCh:
-		return true
-	case <-time.After(stopWaitDeadline):
+	case <-time.After(5 * time.Second):
 		// Best-effort — a stuck writer should not block
 		// shutdown indefinitely.
-		return false
 	}
 }
 
-// Close stops the flusher (if running), releases the kept-
-// open data file handle, and releases the lock file.
-// Idempotent: safe to call multiple times.
-//
-// If the flusher's bounded shutdown deadline is exceeded
-// (a Drain stuck on a downstream writer keeps `mu` held),
-// the data file handle is NOT closed here — taking `mu`
-// would turn the bounded shutdown into an indefinite hang.
-// The OS reclaims the FD at process exit; lock-file cleanup
-// always runs so a restart can re-acquire the directory.
+// Close stops the flusher (if running) and releases the lock
+// file.  Idempotent: safe to call multiple times.
 func (w *FileWAL) Close() error {
-	flusherStopped := w.stopAndWait()
-	if flusherStopped {
-		w.mu.Lock()
-		w.discardDataFileLocked()
-		w.mu.Unlock()
-	}
+	w.Stop()
 	return w.releaseLock()
 }
 
@@ -771,12 +696,6 @@ func (w *FileWAL) writeOffsetLocked(offset int64) error {
 // compactLocked truncates the data file + resets the offset
 // to 0.  Called when offset >= file size (everything
 // drained).  Caller MUST hold w.mu.
-//
-// The kept-open append-only `dataFile` handle remains valid
-// across this call: O_APPEND on Linux positions writes at
-// the current EOF atomically per-write, so a subsequent
-// Enqueue after a truncate-to-0 lands at offset 0 as
-// expected.  No reopen is required.
 func (w *FileWAL) compactLocked() error {
 	if err := os.Truncate(w.dataPath, 0); err != nil {
 		if !os.IsNotExist(err) {

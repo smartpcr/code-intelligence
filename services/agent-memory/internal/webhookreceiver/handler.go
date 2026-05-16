@@ -14,7 +14,18 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/lib/pq"
 )
+
+// pgErrCodeInvalidTextRepresentation is the SQLSTATE PostgreSQL
+// returns when a text value can not be cast to the requested
+// type (class 22, code P02). For this package the canonical
+// trigger is the `$1::uuid` cast in `lookupSecret` against a
+// non-UUID URL segment. Pulled out as a constant so the
+// classifier and any future test fixture share the same literal
+// rather than scattering "22P02" through the code.
+const pgErrCodeInvalidTextRepresentation = "22P02"
 
 // DefaultMaxBodyBytes caps the inbound webhook body so a
 // pre-auth attacker cannot exhaust memory before signature
@@ -47,6 +58,18 @@ const signaturePrefix = "sha256="
 // symbol.
 const RoutePrefix = "/webhook/"
 
+// gitSHA1HexLen is the length of a SHA-1 git object id rendered as
+// lowercase hex: 160 bits / 4 bits per hex char = 40 chars. This is
+// the historical (and still overwhelmingly common) git object-id
+// width.
+const gitSHA1HexLen = 40
+
+// gitSHA256HexLen is the length of a SHA-256 git object id rendered
+// as lowercase hex: 256 bits / 4 = 64 chars. Repos created with
+// `git init --object-format=sha256` (or hosts that have migrated)
+// use this width; the wire format from those hosts is still hex.
+const gitSHA256HexLen = 64
+
 // Allowed `kind` values on inbound webhook bodies. Mirrors
 // the `repo_event_kind` ENUM subset that a git host can
 // legitimately fire: `register` / `manual` come from `mgmt.*`
@@ -58,26 +81,6 @@ const RoutePrefix = "/webhook/"
 var allowedKinds = map[string]struct{}{
 	"push":  {},
 	"merge": {},
-}
-
-// allowedSHAByteLengths enumerates the legal byte-lengths for a
-// hex-encoded git commit hash that this handler accepts on the
-// wire:
-//
-//   - 40 chars for SHA-1 (today's default object format).
-//   - 64 chars for SHA-256 (`git --object-format=sha256`,
-//     supported from git 2.29).
-//
-// Anything else is rejected at the boundary so the Stage 3.4
-// delta worker -- which hands the value straight to `git fetch`
-// -- can not be asked to resolve an arbitrary attacker- or
-// operator-supplied string. Defence-in-depth against a
-// compromised webhook secret OR a misconfigured client is the
-// goal; the cost is a single allocation-free byte scan per
-// authenticated delivery.
-var allowedSHAByteLengths = map[int]struct{}{
-	40: {},
-	64: {},
 }
 
 // Payload is the canonical body shape the handler decodes from
@@ -346,6 +349,26 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request) {
 // signature verification so a 400 is only observable to a
 // caller that already authenticated -- prevents an
 // unauthenticated probe from distinguishing 400 from 401.
+//
+// SHA shape is enforced here: `to_sha` (and `from_sha`, when
+// present) MUST be exactly 40 or 64 lowercase hex characters,
+// matching the git SHA-1 / SHA-256 object-id widths. Without
+// this check, an authenticated caller could inject arbitrary
+// strings (shell metacharacters, refspec syntax, junk) into
+// `repo_event.to_sha` / `ingest_jobs.to_sha`, which the Stage
+// 3.4 delta worker will eventually hand to `git fetch`.
+// Enforcing a strict format here is the cheapest place to stop
+// confused-deputy / typo-class misuse and limits the blast
+// radius of a compromised webhook secret. Lowercase-only is
+// intentional: the `ingest_jobs` unique index keys on the raw
+// `(from_sha, to_sha)` columns, so accepting mixed case would
+// silently bypass the dedupe guard; every git host we target
+// (GitHub, GitLab, Bitbucket, Gitea) already emits lowercase
+// hex on the wire.
+//
+// Error strings never echo the attacker-controlled value back
+// to the HTTP caller -- they describe the expected shape only.
+// The structured log captures the rejected payload separately.
 func (p Payload) validate() error {
 	if _, ok := allowedKinds[p.Kind]; !ok {
 		// Closed set; the DB ENUM would also reject this but
@@ -361,59 +384,39 @@ func (p Payload) validate() error {
 		// destination. The DB has the same `NOT NULL`.
 		return errors.New("to_sha is required")
 	}
-	if !isHexGitSHA(p.ToSHA) {
-		// Defence-in-depth: the signature check above proves
-		// the caller knows the per-repo HMAC secret, but a
-		// compromised secret (OR a buggy client) could
-		// otherwise land an arbitrary string in
-		// `repo_event.to_sha` and `ingest_jobs.to_sha`. The
-		// Stage 3.4 delta worker hands that value straight to
-		// `git fetch`; we'd rather reject at the boundary
-		// than rely on git's refspec parser to be safe under
-		// hostile input. A basic hex + length check here also
-		// catches accidental misuse (operator typos a 39-char
-		// SHA, sends an empty placeholder, sends a branch
-		// name instead of a SHA).
-		return fmt.Errorf(
-			"to_sha must be a 40- or 64-char lower-case hex git SHA, got %q",
-			p.ToSHA)
+	if !isValidGitSHA(p.ToSHA) {
+		return errors.New("to_sha must be a 40 or 64 character lowercase hex git object id")
 	}
-	if p.FromSHA != "" && !isHexGitSHA(p.FromSHA) {
-		// Empty `from_sha` is legitimate (initial push from
-		// an orphan branch). A NON-empty value must be a real
-		// SHA for the same blast-radius reason as `to_sha`
-		// above -- the delta worker will pass it into the
-		// fetch refspec as the base commit.
-		return fmt.Errorf(
-			"from_sha must be empty or a 40- or 64-char lower-case hex git SHA, got %q",
-			p.FromSHA)
+	if p.FromSHA != "" && !isValidGitSHA(p.FromSHA) {
+		return errors.New("from_sha must be empty or a 40 or 64 character lowercase hex git object id")
 	}
 	return nil
 }
 
-// isHexGitSHA reports whether s is a lower-case hex string of
-// a length that a git commit hash can take (40 chars for SHA-1,
-// 64 chars for SHA-256, per allowedSHAByteLengths).
+// isValidGitSHA reports whether s is exactly 40 or 64 lowercase
+// hex characters -- the two widths git uses for object ids
+// (SHA-1 and SHA-256 respectively).
 //
-// Lower-case only: every public git host (GitHub, GitLab,
-// Bitbucket, Gitea) emits SHAs in canonical lower-case form,
-// and the `ingest_jobs_dedupe_uidx` UNIQUE (migration 0006a) is
-// over the raw text -- treating "ABCD..." and "abcd..." as
-// distinct keys would silently double-enqueue what should be a
-// deduped job. Rejecting non-canonical input at the boundary
-// keeps the audit log normalised AND keeps the dedupe invariant
-// honest.
+// Lowercase-only is deliberate: the `ingest_jobs` dedupe index
+// is over the raw column bytes, so accepting upper-case here
+// would let the same commit register as two distinct jobs
+// (`ABCD...` vs `abcd...`). Every git host we target emits
+// lowercase on the wire, so a strict check costs nothing in
+// practice and removes the dedupe-bypass surface.
 //
-// Implemented as a manual byte scan rather than a regexp so the
-// hot path stays allocation-free; this runs on every
-// authenticated delivery.
-func isHexGitSHA(s string) bool {
-	if _, ok := allowedSHAByteLengths[len(s)]; !ok {
+// Empty is NOT valid here; callers that allow an empty field
+// (e.g. `from_sha` on an orphan-branch push) must short-circuit
+// before delegating to this helper.
+func isValidGitSHA(s string) bool {
+	if len(s) != gitSHA1HexLen && len(s) != gitSHA256HexLen {
 		return false
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f':
+		default:
 			return false
 		}
 	}
@@ -541,10 +544,11 @@ func (h *Handler) lookupSecret(ctx context.Context, repoID string) ([]byte, erro
 	if err != nil {
 		// Includes the case where `repoID` is not a valid UUID:
 		// PostgreSQL returns SQLSTATE 22P02 (invalid_text_repr)
-		// rather than no-rows. We treat that the same as "no
-		// such repo" so a malformed URL is still a uniform 401.
-		// We still log the error at WARN level inside verify so
-		// a flood of malformed requests is observable.
+		// on the `$1::uuid` cast rather than no-rows. We treat
+		// that the same as "no such repo" so a malformed URL is
+		// still a uniform 401. We still log the error at WARN
+		// level inside verify so a flood of malformed requests
+		// is observable.
 		if isInvalidUUIDError(err) {
 			return nil, nil
 		}
@@ -553,23 +557,48 @@ func (h *Handler) lookupSecret(ctx context.Context, repoID string) ([]byte, erro
 	return secret, nil
 }
 
-// isInvalidUUIDError matches PostgreSQL SQLSTATE 22P02
-// (`invalid_text_representation`) on the
-// `$1::uuid` cast -- the diagnostic carries the column type
-// in the error message. We classify it as "no such repo" so
-// non-UUID URL paths return 401 the same way a UUID-shaped
-// but unknown id does.
+// isInvalidUUIDError reports whether `err` is a PostgreSQL
+// invalid-text-representation diagnostic (SQLSTATE 22P02). For
+// this package the only practical trigger is the `$1::uuid`
+// cast in `lookupSecret` failing on a non-UUID URL segment; we
+// classify the cast failure as "no such repo" so a non-UUID URL
+// path returns 401 the same way a UUID-shaped but unknown id
+// does, instead of leaking a 500.
 //
-// String matching is robust enough here -- pq always renders
-// 22P02 with the literal `invalid input syntax for type uuid`
-// substring; we look for the lower-case form to avoid pulling
-// in `lib/pq`'s typed error just for this one classification.
+// Classification is done by SQLSTATE, NOT by substring matching
+// on the error message. The wire-protocol SQLSTATE is stable
+// across PostgreSQL versions and server `lc_messages` locales,
+// whereas the rendered message ("invalid input syntax for type
+// uuid") is English-only and has drifted historically. Two
+// driver shapes are accepted so this function does not need to
+// change if the package ever migrates from `lib/pq` to `pgx`:
+//
+//   - `*pq.Error` exposes the SQLSTATE on its `Code` field.
+//     This is the primary path -- it is what `database/sql`
+//     surfaces today via the registered `postgres` driver.
+//   - Any error satisfying `interface{ SQLState() string }` is
+//     also matched. `*pgconn.PgError` (pgx v5) implements this
+//     interface, so a future driver swap keeps working without
+//     a re-classification edit here.
+//
+// Returns false for `nil`, for non-Postgres errors, and for
+// Postgres errors with a different SQLSTATE -- those propagate
+// to the caller as opaque 500s, which is the correct behaviour
+// (an unexpected DB error should not be silently downgraded to
+// 401 "unauthorized").
 func isInvalidUUIDError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "invalid input syntax for type uuid")
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return string(pqErr.Code) == pgErrCodeInvalidTextRepresentation
+	}
+	var stateErr interface{ SQLState() string }
+	if errors.As(err, &stateErr) {
+		return stateErr.SQLState() == pgErrCodeInvalidTextRepresentation
+	}
+	return false
 }
 
 // enqueue writes the `repo_event` audit row and the

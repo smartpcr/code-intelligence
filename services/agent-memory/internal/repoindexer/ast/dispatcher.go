@@ -40,6 +40,15 @@ type Dispatcher struct {
 	extMap        map[string]LanguageParser
 	languageHints []string
 	logger        *slog.Logger
+	// publisher is the Stage 3.3 EmbeddingIndex writer hook
+	// the dispatcher invokes after each Method / Block Node
+	// insert.  Defaults to `noopNodeEmbeddingPublisher{}` so
+	// existing unit / integration tests that do not exercise
+	// publish state keep passing unchanged.  Production
+	// wiring (`embedding.AsASTPublisher(*embedding.Publisher)`)
+	// satisfies the interface through the one-file adapter in
+	// `internal/embedding/astadapter.go`.
+	publisher NodeEmbeddingPublisher
 }
 
 // Compile-time assertion: Dispatcher must satisfy the
@@ -93,6 +102,26 @@ func WithLogger(logger *slog.Logger) DispatcherOption {
 	}
 }
 
+// WithEmbeddingPublisher injects the Stage 3.3 EmbeddingIndex
+// writer hook.  When set, the dispatcher invokes the publisher
+// AFTER each Method / Block Node has been inserted AND its
+// corresponding `contains` edge has been committed — that
+// ordering keeps the brief partial-graph window from
+// rubber-duck #5 as small as possible (the publisher would
+// otherwise advertise a vector whose structural neighborhood
+// the recall path cannot yet walk).
+//
+// Defaults to a no-op publisher so existing dispatcher tests
+// keep compiling unchanged.  Production wires
+// `embedding.AsASTPublisher(*embedding.Publisher)` here.
+func WithEmbeddingPublisher(p NodeEmbeddingPublisher) DispatcherOption {
+	return func(d *Dispatcher) {
+		if p != nil {
+			d.publisher = p
+		}
+	}
+}
+
 // NewDispatcher constructs a Dispatcher wired to writer. The
 // default parser set is provided by `defaultParsers()`, which
 // is build-tag-aware: when the binary is built with CGO
@@ -111,9 +140,10 @@ func NewDispatcher(writer nodeEdgeWriter, opts ...DispatcherOption) *Dispatcher 
 		panic("ast: NewDispatcher: nil writer")
 	}
 	d := &Dispatcher{
-		writer:  writer,
-		parsers: defaultParsers(),
-		logger:  slog.Default(),
+		writer:    writer,
+		parsers:   defaultParsers(),
+		logger:    slog.Default(),
+		publisher: noopNodeEmbeddingPublisher{},
 	}
 	for _, opt := range opts {
 		opt(d)
@@ -166,7 +196,7 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 		return nil
 	}
 
-	if err := d.emit(ctx, ev, parser, result, logger); err != nil {
+	if err := d.emit(ctx, ev, parser, result, src, logger); err != nil {
 		return err
 	}
 	logger.Debug("ast.dispatch.ok",
@@ -285,6 +315,7 @@ func (d *Dispatcher) emit(
 	ev repoindexer.EmitFileEvent,
 	parser LanguageParser,
 	result ParseResult,
+	src []byte,
 	logger *slog.Logger,
 ) error {
 	// classNodeID and methodNodeID build the local-symbol
@@ -363,6 +394,47 @@ func (d *Dispatcher) emit(
 			return fmt.Errorf("ast: insert %s->method contains: %w", parentKind, err)
 		}
 
+		// Stage 3.3 §9.6a publish hook: the method's Node row
+		// AND its `contains` edge are now committed, so the
+		// EmbeddingIndex writer can durably advertise a vector
+		// whose neighborhood the recall path can walk.  Called
+		// after the contains edge per rubber-duck #5.
+		//
+		// Per evaluator iter-1 finding #2: bodyless Method
+		// declarations (TS interface members, abstract
+		// methods — see parser_typescript.go:361-369) MUST
+		// still get published; skipping them would leave a
+		// permanent gap in the recall index for every
+		// interface contract.  Fall back to embedding the
+		// canonical signature (always non-empty by
+		// construction here — `sig` was used immediately above
+		// to fingerprint the Node) so the recall path can
+		// still match on declaration shape even without body
+		// text.  The `SignatureOnly` flag propagates through
+		// the publisher onto the Qdrant payload so a future
+		// reader can distinguish "embedded body" from
+		// "embedded signature".
+		content := m.BodySource
+		signatureOnly := false
+		if strings.TrimSpace(content) == "" {
+			content = sig
+			signatureOnly = true
+			logger.Info("ast.publish.method_signature_only",
+				slog.String("node_id", rec.NodeID),
+				slog.String("method", m.QualifiedName),
+			)
+		}
+		if err := d.publishNodeEmbedding(ctx, ev, NodeEmbedRequest{
+			NodeID:             rec.NodeID,
+			RepoID:             ev.RepoID.String(),
+			Kind:               "method",
+			CanonicalSignature: sig,
+			Content:            content,
+			SignatureOnly:      signatureOnly,
+		}, logger); err != nil {
+			return err
+		}
+
 		// Pass 1c: blocks for this method.
 		for _, b := range SubdivideMethod(m) {
 			bsig := blockSignature(sig, b)
@@ -387,6 +459,36 @@ func (d *Dispatcher) emit(
 				FromSHA:   ev.SHA,
 			}); err != nil {
 				return fmt.Errorf("ast: insert method->block contains: %w", err)
+			}
+
+			// Publish hook: block Node + contains edge are
+			// now both committed.  Content is the file source
+			// sliced at the parser-reported byte offsets.
+			// Per rubber-duck #4: invalid offsets (parser bug)
+			// cause us to SKIP the publish rather than send
+			// an empty content vector to the embedder — an
+			// empty-content embedding silently corrupts the
+			// recall index.  We log a warn and continue.
+			content, ok := sliceBytes(src, b.StartByte, b.EndByte)
+			if !ok {
+				logger.Warn("ast.publish.skip_invalid_block_offsets",
+					slog.String("node_id", brec.NodeID),
+					slog.String("method", m.QualifiedName),
+					slog.Int("ordinal", b.Ordinal),
+					slog.Int("start_byte", b.StartByte),
+					slog.Int("end_byte", b.EndByte),
+					slog.Int("src_len", len(src)),
+				)
+				continue
+			}
+			if err := d.publishNodeEmbedding(ctx, ev, NodeEmbedRequest{
+				NodeID:             brec.NodeID,
+				RepoID:             ev.RepoID.String(),
+				Kind:               "block",
+				CanonicalSignature: bsig,
+				Content:            content,
+			}, logger); err != nil {
+				return err
 			}
 		}
 	}
@@ -852,4 +954,79 @@ func mustJSON(m map[string]any) json.RawMessage {
 		return json.RawMessage(`{}`)
 	}
 	return b
+}
+
+// publishNodeEmbedding fans a Method / Block emission into the
+// Stage 3.3 EmbeddingIndex writer.  Honours the two-bucket
+// error policy documented on `NodeEmbeddingPublisher`:
+//
+//   - `errors.Is(err, ErrPublishRecordedFailed)` → DURABLY
+//     RECORDED failure (an `embedding_publish_event` of kind
+//     `failed` exists).  Log warn and continue; a background
+//     flusher retries.  Returning here would otherwise abort
+//     the entire file ingest the FIRST time Qdrant blips,
+//     even though the §9.6a log is healthy.
+//
+//   - any other error → the publisher could NOT record state
+//     (database failure, validation bug, panic).  Propagate
+//     to fail the ingest job; a silent swallow would leave
+//     the EmbeddingIndex permanently divergent from the
+//     structural graph for the affected node.
+//
+// `nil` publisher is impossible (constructor defaults to a
+// no-op) but guarded anyway so the helper is safe to call
+// from emit() without a precondition check.
+func (d *Dispatcher) publishNodeEmbedding(
+	ctx context.Context,
+	ev repoindexer.EmitFileEvent,
+	req NodeEmbedRequest,
+	logger *slog.Logger,
+) error {
+	if d.publisher == nil {
+		return nil
+	}
+	res, err := d.publisher.PublishNodeEmbedding(ctx, req)
+	if err == nil {
+		logger.Debug("ast.publish.ok",
+			slog.String("node_kind", req.Kind),
+			slog.String("node_id", req.NodeID),
+			slog.String("publish_id", res.PublishID),
+			slog.String("last_event_kind", res.LastEventKind),
+		)
+		return nil
+	}
+	if errors.Is(err, ErrPublishRecordedFailed) {
+		logger.Warn("ast.publish.recorded_failed",
+			slog.String("node_kind", req.Kind),
+			slog.String("node_id", req.NodeID),
+			slog.String("publish_id", res.PublishID),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	return fmt.Errorf("ast: publish %s %s: %w", req.Kind, req.NodeID, err)
+}
+
+// sliceBytes returns `(string(src[start:end+1]), true)` with
+// defensive bounds-checking.  IMPORTANT: `start` and `end` are
+// treated as INCLUSIVE byte offsets to match the `Block.StartByte
+// / Block.EndByte` semantics documented in `block.go:64-69`
+// ("0-based file byte offsets of the block's first/LAST byte").
+// A naive half-open slice (`src[start:end]`) drops the final
+// byte of every block AND silently skips one-byte spans
+// (`end == start`).  Returns `("", false)` when offsets are
+// negative, out of order, or out of range; callers MUST treat
+// the false return as "skip this publish" rather than send
+// empty content to the embedder (which would otherwise corrupt
+// the recall index with a noise vector).
+func sliceBytes(src []byte, start, end int) (string, bool) {
+	if start < 0 || end < start || start >= len(src) {
+		return "", false
+	}
+	// `end` is inclusive, so the half-open upper bound is end+1.
+	upper := end + 1
+	if upper > len(src) {
+		upper = len(src)
+	}
+	return string(src[start:upper]), true
 }

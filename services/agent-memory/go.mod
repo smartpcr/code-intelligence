@@ -1,5 +1,19 @@
 module github.com/smartpcr/code-intelligence/services/agent-memory
 
-go 1.23
+go 1.24.0
 
-require github.com/lib/pq v1.10.9
+require (
+	github.com/jackc/pgx/v5 v5.7.5
+	github.com/lib/pq v1.10.9
+)
+
+require (
+	github.com/DATA-DOG/go-sqlmock v1.5.2 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
+	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82 // indirect
+	golang.org/x/crypto v0.37.0 // indirect
+	golang.org/x/sync v0.17.0 // indirect
+	golang.org/x/text v0.29.0 // indirect
+)

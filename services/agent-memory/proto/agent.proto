@@ -1,0 +1,214 @@
+// agent.proto -- gRPC IDL for the Agent Surface (tech-spec §8.5).
+//
+// Stage 5.1 of implementation-plan.md ships the IDL for the
+// `agent.recall` verb plus skeleton placeholders for the
+// `agent.observe`, `agent.expand`, and `agent.summarize` verbs
+// owned by Stages 5.2 / 5.3 / 5.4. Generated Go bindings will
+// land alongside the protoc tooling pin in a follow-up; for
+// now this file is the canonical contract that
+// `cmd/agent-api/main.go` mTLS server speaks.
+//
+// Transport contract (tech-spec §8.5):
+//   * gRPC over HTTP/2.
+//   * Mutual TLS — the caller MUST present a client
+//     certificate signed by the agent-memory CA. The server
+//     refuses any connection that does not present a trusted
+//     client cert.
+//
+// Recall envelope (architecture.md §6.1.1, e2e-scenarios.md §4):
+//   * `context_id` is the durable RecallContextLog row id the
+//     caller can later replay via `agent.observe(context_id=...)`.
+//   * `nodes`, `edges`, `concepts` are score-ordered; the
+//     reranker model version is pinned for reproducibility.
+//   * `degraded` / `degraded_reason` surface §C22 closed-set
+//     fallbacks; the recall response is NEVER hard-failed when
+//     a degraded fallback is available — operators only see a
+//     hard error when the verb itself is malformed.
+//
+// Versioning: this is `agent.v1`. Breaking changes require a
+// new package name (`agent.v2`) so two server versions can
+// run side-by-side during a rollout.
+
+syntax = "proto3";
+
+package agent.v1;
+
+option go_package = "github.com/smartpcr/code-intelligence/services/agent-memory/proto/agent;agentpb";
+
+// AgentService is the Agent Surface mTLS endpoint
+// (tech-spec §8.5). Each verb owns its own Stage in the
+// implementation plan; Stage 5.1 is `Recall`.
+service AgentService {
+  // Recall is the §6.4 read path: embed the query, fan out a
+  // mixed k-NN search across the Method / Block / Concept
+  // Qdrant collections, filter out hits whose latest
+  // EmbeddingPublishEvent is not `published`, expand the seed
+  // set 1-2 structural hops through the GraphReader, rerank,
+  // and durably append a RecallContextLog row before
+  // returning.
+  rpc Recall(RecallRequest) returns (RecallResponse);
+
+  // Observe is the agent's outcome-record path; owned by
+  // Stage 5.2. Placeholder so the IDL surface is complete.
+  rpc Observe(ObserveRequest) returns (ObserveResponse);
+
+  // Expand walks structural edges from a node id; owned by
+  // Stage 5.3. Placeholder.
+  rpc Expand(ExpandRequest) returns (ExpandResponse);
+
+  // Summarize materialises a neighborhood card into a
+  // natural-language summary; owned by Stage 5.4. Placeholder.
+  rpc Summarize(SummarizeRequest) returns (SummarizeResponse);
+}
+
+// RecallRequest is the input shape for `agent.recall`.
+// Mirrors `internal/agentapi/recall.go.RecallRequest`.
+message RecallRequest {
+  // repo_id scopes the search to one repository (textual UUID).
+  // Empty values fan out across all repos — discouraged in
+  // production; the recall service logs a warning when set.
+  string repo_id = 1;
+
+  // query is the natural-language string the agent wants to
+  // ground its next step against. Empty queries are rejected
+  // with INVALID_ARGUMENT.
+  string query = 2;
+
+  // k is the maximum number of ranked entries to return
+  // (combined across nodes and concepts). Values <= 0 are
+  // rejected; values above the per-call ceiling (256) are
+  // coerced down server-side.
+  int32 k = 3;
+
+  // kinds restricts the per-collection fan-out. The Stage
+  // 5.1 mixed-seed contract (implementation-plan.md §7.8)
+  // makes the production default the closed set
+  // [method, block, concept] — when empty, the recall
+  // service falls back to that union when concept fan-out
+  // is enabled (the agent-api binary defaults it on; see
+  // `AGENT_MEMORY_ENABLE_CONCEPTS`). Callers that want a
+  // narrower view pass an explicit subset, e.g. ["method"]
+  // for raw structural recall or ["concept"] to recall the
+  // concept layer alone. Unknown kinds are rejected with
+  // INVALID_ARGUMENT.
+  repeated string kinds = 4;
+}
+
+// NodeCard is the shape `agent.recall` returns for one Node
+// hit (method or block). Mirrors `agentapi.Hit` augmented
+// with the dereferenced canonical signature.
+message NodeCard {
+  string node_id = 1;
+  string repo_id = 2;
+  string kind = 3;
+  string canonical_signature = 4;
+  // score is the reranker's final score for this entry;
+  // descending across the response.
+  float score = 5;
+  // point_id is the Qdrant point id (textual UUID) used to
+  // dereference the row through `embedding_publish`.
+  string point_id = 6;
+}
+
+// EdgeCard is the shape for a structural edge surfaced via
+// the GraphReader expansion. Stage 5.1 returns an empty
+// `edges[]` when no expander is wired; the production
+// composition root wires one.
+message EdgeCard {
+  string edge_id = 1;
+  string repo_id = 2;
+  string kind = 3;
+  string src_node_id = 4;
+  string dst_node_id = 5;
+  // observation_count is the rolling TraceObservation
+  // aggregate (§5.2.3); zero when the edge has no
+  // observations OR when the agent-api binary has not been
+  // wired with a TraceObservation counter (defence-in-depth
+  // for environments where the Stage 4.2 span ingestor has
+  // not yet populated the aggregate table). The production
+  // composition root wires `sqlObservationCounter` so this
+  // surfaces a real value.
+  int64 observation_count = 6;
+}
+
+// ConceptCard is the shape for a Concept hit (architecture
+// §5.5.1). Stage 5.1 returns these when the Concept Promoter
+// has published Concept embeddings to
+// `agent_memory_concept`.
+message ConceptCard {
+  string concept_id = 1;
+  string name = 2;
+  float score = 3;
+  string point_id = 4;
+}
+
+// RecallResponse is the §6.1.1 envelope.
+message RecallResponse {
+  // context_id is the durable RecallContextLog row id; the
+  // caller stores this and can later replay the exact same
+  // snapshot via `agent.observe(context_id=...)`.
+  string context_id = 1;
+
+  // nodes / edges / concepts are score-ordered.
+  repeated NodeCard nodes = 2;
+  repeated EdgeCard edges = 3;
+  repeated ConceptCard concepts = 4;
+
+  // reranker_model_version pins the ranker that produced the
+  // ordering. Mirrored verbatim onto the RecallContextLog row.
+  string reranker_model_version = 5;
+
+  // degraded surfaces the §C22 closed-set fallback. When set,
+  // degraded_reason is one of:
+  //   * graph_store_unavailable
+  //   * embedding_index_unavailable
+  //   * reranker_model_stale
+  //   * span_ingestor_backpressure
+  // The recall response is STILL served; the caller can
+  // decide whether to retry or proceed with the snapshot.
+  bool degraded = 6;
+  string degraded_reason = 7;
+
+  // over_fetched / filtered are observability fields the
+  // operator dashboard uses to spot a publish backlog.
+  int32 over_fetched = 8;
+  int32 filtered = 9;
+}
+
+// Placeholder request / response messages for the other Agent
+// Surface verbs. They are defined here so the gRPC server can
+// register a single service descriptor today; the body shapes
+// will firm up as Stages 5.2 / 5.3 / 5.4 land.
+message ObserveRequest {
+  string context_id = 1;
+  string outcome = 2;
+  string actor = 3;
+}
+message ObserveResponse {
+  string episode_id = 1;
+  bool degraded = 2;
+  string degraded_reason = 3;
+}
+
+message ExpandRequest {
+  string node_id = 1;
+  string direction = 2;
+  int32 depth = 3;
+}
+message ExpandResponse {
+  repeated EdgeCard edges = 1;
+  string context_id = 2;
+  bool degraded = 3;
+  string degraded_reason = 4;
+}
+
+message SummarizeRequest {
+  string node_id = 1;
+  string concept_id = 2;
+}
+message SummarizeResponse {
+  string summary_md = 1;
+  string context_id = 2;
+  bool degraded = 3;
+  string degraded_reason = 4;
+}

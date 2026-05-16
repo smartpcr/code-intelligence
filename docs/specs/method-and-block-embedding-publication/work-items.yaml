@@ -41,8 +41,13 @@ phases:
               qdrant.go over the Qdrant SDK exposing UpsertPoint and
               FetchPoint (the read-after-write check in S 9.6a step 5).
               Config via AM_QDRANT_ENDPOINT / AM_QDRANT_COLLECTION. Unit
-              test with a fake transport asserts payload includes repo_id
-              and kind for S 9.6a payload filtering.
+              test with a fake transport asserts the upsert payload
+              carries the full identity tuple needed to dereference a
+              recall hit back to EmbeddingPublish in a single SQL
+              lookup: publish_id (PK into the log), target_id,
+              target_kind ('node' | 'concept_version'), repo_id, kind,
+              embedding_model_version. Also asserts point_id =
+              uuid_v5(publish_id) so retries are idempotent in Qdrant.
           - id: step-embedding-model-client
             title: "Embedding model HTTP client + version accessor"
             expectedFileChanges: 4
@@ -64,15 +69,30 @@ phases:
         title: "S 9.6a write protocol + handler wiring + retry"
         steps:
           - id: step-publisher-state-machine
-            title: "Publisher state machine implementing S 9.6a steps 2-5"
+            title: "Publisher state machine - PublishNew + RetryExisting entry points"
             expectedFileChanges: 6
             summary: >-
-              publisher.go realising insert EmbeddingPublish, queued,
-              embed, Qdrant upsert, vector_written (or failed),
-              read-after-write fetch, published. Reentrant: only input
-              is the Node row; never reads EmbeddingPublish to decide
-              what to do. Unit test against fake adapters asserts the
-              5 INSERTs land in order and no UPDATE statement is issued.
+              publisher.go realising S 9.6a steps 2-5 behind two entry
+              points sharing one inner core publishCore(publish_id,
+              point_id, attempt_index). PublishNew(ctx, node) is the
+              full-mode entry point: inserts a fresh EmbeddingPublish
+              (uuid_v7 publish_id, deterministic point_id =
+              uuid_v5(publish_id), stamping embedding_model_version,
+              target_id=node.id, target_kind='node') then calls
+              publishCore with attempt_index=1. Happy path = 4 INSERTs
+              (1 EmbeddingPublish + queued + vector_written + published).
+              RetryExisting(ctx, publish) is the flusher entry point:
+              reuses input row's publish_id + point_id + target_id +
+              embedding_model_version, reads max(attempt_index) from
+              EmbeddingPublishEvent for that publish_id, calls
+              publishCore with attempt_index=max+1. NEVER inserts a new
+              EmbeddingPublish. Happy path = 3 INSERTs (3 events only).
+              Unit test asserts: (a) PublishNew emits exactly 4 INSERTs
+              in order; (b) RetryExisting emits exactly 3 INSERTs with
+              the right incremented attempt_index and zero new
+              EmbeddingPublish rows; (c) Qdrant-failure path inserts
+              EmbeddingPublish (PublishNew only) + queued + failed only;
+              (d) no UPDATE or DELETE statement is ever issued.
           - id: step-model-version-stamping
             title: "Stamp embedding_model_version on every EmbeddingPublish"
             expectedFileChanges: 3
@@ -82,59 +102,86 @@ phases:
               refuses to start with an empty version. Unit test asserts
               every inserted row carries the configured version (risk S 9.6).
           - id: step-full-mode-handler-call-site
-            title: "Full-mode handler invokes publisher per Method/Block"
+            title: "Full-mode handler invokes publisher.PublishNew per Method/Block"
             expectedFileChanges: 4
             summary: >-
-              Modify internal/repoindexer worker to call the publisher
-              for every Method/Block Node after the GraphWriter txn
-              commits. Publish failures append 'failed' but do not fail
-              the ingest job - the flusher handles them. Integration
-              test: 3-method fixture yields three 'published' events.
+              Modify internal/repoindexer worker to call
+              publisher.PublishNew(ctx, node) for every Method/Block
+              Node after the GraphWriter txn commits. Publish failures
+              leave the latest event at 'failed' but do not fail the
+              ingest job - the flusher handles them via RetryExisting.
+              Integration test: 3-method fixture yields three
+              'published' events, each at attempt_index=1.
           - id: step-background-flusher
-            title: "Background flusher retries queued/failed publishes"
+            title: "Background flusher retries via RetryExisting (reuses publish_id/point_id)"
             expectedFileChanges: 5
             summary: >-
               flusher.go worker goroutine polls EmbeddingPublish rows
               whose latest EmbeddingPublishEvent is 'queued' or 'failed'
-              (LATERAL join on the (publish_id, created_at DESC) index
-              from S 8.7.2) past a backoff and re-runs the publisher.
-              Each new attempt is a fresh 'queued' event row, never an
-              UPDATE. Integration test: fake Qdrant fails once then
-              succeeds; row reaches 'published'.
+              (LATERAL join on (publish_id, created_at DESC) from
+              S 8.7.2) past a backoff, then calls
+              publisher.RetryExisting(ctx, publish) with each such row.
+              Flusher passes the EXISTING EmbeddingPublish row (never a
+              Node) so publish_id + point_id + target_id +
+              embedding_model_version are reused; only a fresh event
+              chain at attempt_index = max(prior) + 1 is appended.
+              Integration test: fake Qdrant fails once then succeeds;
+              the target's EmbeddingPublish row count stays at 1 and
+              the row reaches 'published' at attempt_index=2.
 
       - id: stage-read-side-filter-and-verification
         title: "Read-side filter, metrics, and S 9.6a integration test"
         steps:
           - id: step-graphreader-published-filter
-            title: "GraphReader recall filters by 'latest event = published' + active model version"
+            title: "GraphReader recall filters via publish_id payload + active model version"
             expectedFileChanges: 5
             summary: >-
               Modify internal/graphreader recall path to filter Qdrant
               hits through the S 9.6a 'latest event published' join AND
-              EmbeddingPublish.embedding_model_version = <active> predicate.
+              EmbeddingPublish.embedding_model_version = <active>
+              predicate. Join key is the publish_id carried in the
+              Qdrant payload (single SQL lookup into EmbeddingPublish,
+              then the (publish_id, created_at DESC) index for the
+              latest event); target_id + target_kind from the payload
+              provide the cross-check back to Node / ConceptVersion.
               Filtered hits are backfilled from next-best candidates so
               len(nodes)+len(concepts) == k (e2e-scenarios.md L461).
           - id: step-metrics-and-degraded-flag
-            title: "Embedding publish metrics + C22 degraded flag"
+            title: "Embedding publish metrics + recall-verb C22 surface"
             expectedFileChanges: 4
             summary: >-
-              Add OTel counters: embedding_publish_total{event_kind},
-              embedding_publish_latency_seconds histogram, and
-              recall_filter_unpublished_total (e2e-scenarios.md L460).
-              On sustained Qdrant outage surface
-              degraded_reason='embedding_index_unavailable' per C22.
+              Add OTel counters / gauges: embedding_publish_total{event_kind},
+              embedding_publish_latency_seconds histogram,
+              embedding_publish_backlog gauge (rows whose latest event
+              is 'queued' / 'failed'), and recall_filter_unpublished_total
+              (e2e-scenarios.md L460). C22's
+              degraded_reason='embedding_index_unavailable' is set on
+              the recall VERB RESPONSE (not /health, not the writer),
+              and only when the Qdrant cosine query itself fails - not
+              when the published-filter drops some hits. /health
+              carries the backlog gauge and active
+              embedding_model_version as operational observability only.
           - id: step-9-6a-integration-test
-            title: "Integration test covering the three S 9.6a scenarios"
+            title: "Integration tests covering S 9.6a scenarios + identity contract"
             expectedFileChanges: 4
             summary: >-
               publisher_integration_test.go against deploy/local stack.
-              Scenario A: publish state log is complete (queued ->
-              vector_written -> published, exactly one each, in order).
-              Scenario B: transient Qdrant error appends 'failed', then
-              the flusher writes a new 'queued' (no UPDATE) and the row
-              reaches 'published'. Scenario C: row whose latest event is
-              'queued' is excluded from agent.recall and increments
-              recall_filter_unpublished_total.
+              Scenario A: PublishNew yields exactly one
+              EmbeddingPublish + queued@1 + vector_written@1 +
+              published@1 (publish state log is complete).
+              Scenario B: transient Qdrant error then flusher retries -
+              EmbeddingPublish row count stays at 1, events are
+              queued@1, failed@1, queued@2, vector_written@2,
+              published@2 (proves publish_id + point_id reused,
+              attempt_index increments, no UPDATE).
+              Scenario C: row whose latest event is 'queued' is
+              excluded from agent.recall and increments
+              recall_filter_unpublished_total; response is NOT degraded
+              (filter drops are normal flow).
+              Scenario D: when the Qdrant cosine query itself fails,
+              agent.recall returns degraded=true,
+              degraded_reason='embedding_index_unavailable' (C22 on the
+              verb response).
 
 out_of_scope:
   - "ConceptVersion embedding publication (later Concept Promoter stage; the publisher accepts concept_version_id but is not wired here)."

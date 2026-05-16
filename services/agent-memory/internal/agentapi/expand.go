@@ -637,16 +637,23 @@ func (s *Service) Expand(ctx context.Context, req ExpandRequest) (ExpandResponse
 	// failure: when the counter errors out, counts stay
 	// zero and the response is still served (the proto
 	// contract permits zero as a fallback).
+	//
+	// All counter error classes (connection-class AND
+	// otherwise) take the warn-and-continue path. The
+	// BFS at Step 4 already produced a valid
+	// nodes/edges shape against the SAME graph
+	// infrastructure; routing into `expandDegradedFallback`
+	// here would discard that fresh structural data and
+	// substitute a (potentially stale or empty)
+	// snapshot, which is strictly worse than serving the
+	// just-fetched walk with zero counts. The counter is
+	// a hot-path-ranking ENRICHMENT, not the structural
+	// primary; a transient outage on it must not
+	// invalidate the walk. (Reviewer r0: the prior
+	// `isGraphStoreUnavailable` branch here contradicted
+	// the soft-fail contract documented just above.)
 	if s.expandObsCounter != nil && len(walkResult.edges) > 0 {
 		if err := s.hydrateExpandCounts(ctx, walkResult.edges); err != nil {
-			if isGraphStoreUnavailable(err) {
-				return s.expandDegradedFallback(
-					ctx, ExpandRequest{
-						NodeID: req.NodeID, Direction: req.Direction,
-						Depth: depth, MaxNodes: maxNodes, MaxEdges: maxEdges,
-						RepoID: repoID,
-					}, err, "hydrate observation counts failed")
-			}
 			s.logger.Warn("agentapi.expand.hydrate_obs_counts_failed",
 				slog.String("node_id", req.NodeID),
 				slog.String("direction", req.Direction),

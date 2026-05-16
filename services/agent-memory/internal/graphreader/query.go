@@ -62,47 +62,97 @@ func validateEdgeKinds(kinds []string) error {
 	return nil
 }
 
-// nodeProjectionCurrent is the column list every Node read
-// returns when retired rows are filtered out. The order MUST
-// match the dest slice in scanNodeRow.
-const nodeProjectionCurrent = `
-	n.node_id::text,
-	n.repo_id::text,
-	n.fingerprint,
-	n.kind::text,
-	n.canonical_signature,
-	n.parent_node_id::text,
-	n.from_sha,
-	n.attrs_json::text
-`
+// Column slices are the single source of truth for what each
+// Node / Edge read projects. The package-level projection
+// strings below are derived from these slices via joinColumns
+// (one-shot init); downstream code (query.go, card.go) consumes
+// only the joined strings.
+//
+// Why slices rather than raw multi-line string literals: the
+// previous shape composed `nodeProjectionWithRetirement` by
+// concatenating `nodeProjectionCurrent + ",\n\t..."`, which
+// silently produced a double comma if the trailing comma was
+// ever added to the current-projection literal. Building from
+// slices and joining with ", " makes that class of formatting
+// bug structurally unrepresentable — the join inserts exactly
+// one separator between elements regardless of how the slices
+// are spliced together.
+//
+// Order MUST match the dest slice in scanNodeRow / scanEdgeRow
+// (see reader.go). The retirement-column slices are appended to
+// (not interleaved with) the current-column slices, mirroring
+// the optional tail scanNodeRow / scanEdgeRow append when
+// `includeRetired` is true.
+//
+// These are slices (mutable) rather than arrays only because Go
+// has no concise const-slice literal; the projection strings
+// below snapshot the joined form at init, so any later mutation
+// of the slices would not propagate to the SQL anyway.
+var (
+	nodeColumnsCurrent = []string{
+		"n.node_id::text",
+		"n.repo_id::text",
+		"n.fingerprint",
+		"n.kind::text",
+		"n.canonical_signature",
+		"n.parent_node_id::text",
+		"n.from_sha",
+		"n.attrs_json::text",
+	}
+	nodeRetirementColumns = []string{
+		"nr.retired_at_sha",
+		"nr.retired_at",
+		"nr.superseded_by_node_id::text",
+	}
+	edgeColumnsCurrent = []string{
+		"e.edge_id::text",
+		"e.repo_id::text",
+		"e.fingerprint",
+		"e.kind::text",
+		"e.src_node_id::text",
+		"e.dst_node_id::text",
+		"e.from_sha",
+		"e.attrs_json::text",
+	}
+	edgeRetirementColumns = []string{
+		"er.retired_at_sha",
+		"er.retired_at",
+	}
+)
 
-// nodeProjectionWithRetirement is the column list returned when
-// `IncludeRetired = true`. The trailing three columns are
-// nullable — they're populated only when the LEFT JOIN onto
-// node_retirement matched.
-const nodeProjectionWithRetirement = nodeProjectionCurrent + `,
-	nr.retired_at_sha,
-	nr.retired_at,
-	nr.superseded_by_node_id::text
-`
+// joinColumns flattens one or more column-name slices into a
+// single comma-separated projection string. No leading or
+// trailing separator is emitted, so callers may safely
+// concatenate further SQL text on either side (e.g. card.go
+// appends ", obs.observation_count, ..." after the projection).
+func joinColumns(groups ...[]string) string {
+	var all []string
+	for _, g := range groups {
+		all = append(all, g...)
+	}
+	return strings.Join(all, ", ")
+}
 
-// edgeProjectionCurrent / edgeProjectionWithRetirement are the
-// edge analogues. Edges have no `superseded_by_*` column.
-const edgeProjectionCurrent = `
-	e.edge_id::text,
-	e.repo_id::text,
-	e.fingerprint,
-	e.kind::text,
-	e.src_node_id::text,
-	e.dst_node_id::text,
-	e.from_sha,
-	e.attrs_json::text
-`
-
-const edgeProjectionWithRetirement = edgeProjectionCurrent + `,
-	er.retired_at_sha,
-	er.retired_at
-`
+// Projection strings consumed by every Node / Edge SELECT in
+// this package and by sibling card.go. Built once at init from
+// the column slices above; never end with a comma and never
+// start with whitespace, so they compose cleanly with arbitrary
+// surrounding SQL.
+var (
+	// nodeProjectionCurrent is the column list every Node read
+	// returns when retired rows are filtered out.
+	nodeProjectionCurrent = joinColumns(nodeColumnsCurrent)
+	// nodeProjectionWithRetirement is the column list returned
+	// when `IncludeRetired = true`. The trailing three columns
+	// are nullable — they're populated only when the LEFT JOIN
+	// onto node_retirement matched.
+	nodeProjectionWithRetirement = joinColumns(nodeColumnsCurrent, nodeRetirementColumns)
+	// edgeProjectionCurrent / edgeProjectionWithRetirement are
+	// the edge analogues. Edges have no `superseded_by_*`
+	// column.
+	edgeProjectionCurrent        = joinColumns(edgeColumnsCurrent)
+	edgeProjectionWithRetirement = joinColumns(edgeColumnsCurrent, edgeRetirementColumns)
+)
 
 // selectNodeQuery returns the SQL used by GetNode. When
 // `includeRetired = false` we apply the G5 anti-join in the

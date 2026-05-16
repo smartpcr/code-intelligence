@@ -581,7 +581,7 @@ func WithNeighborhoodResolver(r NeighborhoodResolver) Option {
 // pins every degraded summarize to
 // `DegradedReasonSummariserUnavailable`. Production wiring
 // runs a one-line `SELECT max(trained_at) FROM
-// reranker_model WHERE status='active'` adapter.
+// reranker_model WHERE status='published'` adapter.
 func WithRerankerFreshness(r RerankerFreshnessSource) Option {
 	return func(svc *Service) {
 		svc.rerankerFreshness = r

@@ -1,0 +1,148 @@
+# WIT tree for: Method and Block embedding publication
+#
+# This file is the machine-readable representation of the phase -> stage -> step
+# tree described prose-first in plan.md. The Forge planning runner consumes it
+# to materialise WIT rows under the input feature.
+#
+# Hard caps (server-enforced, see plan-system preamble):
+#   phase  -> <=20 stages
+#   stage  -> <=20 steps
+#   step   -> <=20 expectedFileChanges
+#
+# Anchors:
+#   - tech-spec.md  S 8.7.1 (schema), S 9.6a (write/read protocol), S 9.6 (model upgrade)
+#   - implementation-plan.md Stage 3.3
+#   - e2e-scenarios.md L134-145, L425-433, L454-462
+
+feature: code-intelligence:AGENT-MEMORY/stage-method-and-block-embedding-publication
+
+phases:
+  - id: phase-method-and-block-embedding-publication
+    title: "Method and Block embedding publication"
+    stages:
+
+      - id: stage-embedding-publisher-core
+        title: "Embedding publisher core (adapters + log)"
+        steps:
+          - id: step-package-scaffold
+            title: "internal/embedding package scaffold + interfaces"
+            expectedFileChanges: 5
+            summary: >-
+              New internal/embedding/ package with doc.go, types.go
+              (PublishTarget, EventKind enum mirroring S 9.6a closed set
+              {queued, vector_written, published, failed, superseded}), and
+              the QdrantClient + EmbeddingModel interfaces. Behaviourless
+              scaffold; unit test asserts the enum members exactly match
+              the S 9.6a closed set.
+          - id: step-qdrant-adapter
+            title: "Qdrant client adapter (UpsertPoint + FetchPoint)"
+            expectedFileChanges: 4
+            summary: >-
+              qdrant.go over the Qdrant SDK exposing UpsertPoint and
+              FetchPoint (the read-after-write check in S 9.6a step 5).
+              Config via AM_QDRANT_ENDPOINT / AM_QDRANT_COLLECTION. Unit
+              test with a fake transport asserts payload includes repo_id
+              and kind for S 9.6a payload filtering.
+          - id: step-embedding-model-client
+            title: "Embedding model HTTP client + version accessor"
+            expectedFileChanges: 4
+            summary: >-
+              model_client.go returns (vector, version). Default version
+              e5-code-v1 per e2e-scenarios.md L69; Version() accessor
+              feeds downstream stamping. Unit test with a fake server.
+          - id: step-publish-log-repo
+            title: "Append-only INSERT helpers for EmbeddingPublish + EmbeddingPublishEvent"
+            expectedFileChanges: 6
+            summary: >-
+              publish_log.go with InsertPublish + InsertPublishEvent
+              against the tables migrated in
+              phase-foundation-and-schema/stage-embedding-state-log-migrations-and-roles.
+              Unit test asserts the prepared SQL contains neither UPDATE
+              nor DELETE (defence-in-depth on the G3/G5 contract).
+
+      - id: stage-9-6a-write-protocol-and-wiring
+        title: "S 9.6a write protocol + handler wiring + retry"
+        steps:
+          - id: step-publisher-state-machine
+            title: "Publisher state machine implementing S 9.6a steps 2-5"
+            expectedFileChanges: 6
+            summary: >-
+              publisher.go realising insert EmbeddingPublish, queued,
+              embed, Qdrant upsert, vector_written (or failed),
+              read-after-write fetch, published. Reentrant: only input
+              is the Node row; never reads EmbeddingPublish to decide
+              what to do. Unit test against fake adapters asserts the
+              5 INSERTs land in order and no UPDATE statement is issued.
+          - id: step-model-version-stamping
+            title: "Stamp embedding_model_version on every EmbeddingPublish"
+            expectedFileChanges: 3
+            summary: >-
+              Wire EmbeddingModel.Version() into every InsertPublish call
+              and add AM_EMBEDDING_MODEL_VERSION env override. Publisher
+              refuses to start with an empty version. Unit test asserts
+              every inserted row carries the configured version (risk S 9.6).
+          - id: step-full-mode-handler-call-site
+            title: "Full-mode handler invokes publisher per Method/Block"
+            expectedFileChanges: 4
+            summary: >-
+              Modify internal/repoindexer worker to call the publisher
+              for every Method/Block Node after the GraphWriter txn
+              commits. Publish failures append 'failed' but do not fail
+              the ingest job - the flusher handles them. Integration
+              test: 3-method fixture yields three 'published' events.
+          - id: step-background-flusher
+            title: "Background flusher retries queued/failed publishes"
+            expectedFileChanges: 5
+            summary: >-
+              flusher.go worker goroutine polls EmbeddingPublish rows
+              whose latest EmbeddingPublishEvent is 'queued' or 'failed'
+              (LATERAL join on the (publish_id, created_at DESC) index
+              from S 8.7.2) past a backoff and re-runs the publisher.
+              Each new attempt is a fresh 'queued' event row, never an
+              UPDATE. Integration test: fake Qdrant fails once then
+              succeeds; row reaches 'published'.
+
+      - id: stage-read-side-filter-and-verification
+        title: "Read-side filter, metrics, and S 9.6a integration test"
+        steps:
+          - id: step-graphreader-published-filter
+            title: "GraphReader recall filters by 'latest event = published' + active model version"
+            expectedFileChanges: 5
+            summary: >-
+              Modify internal/graphreader recall path to filter Qdrant
+              hits through the S 9.6a 'latest event published' join AND
+              EmbeddingPublish.embedding_model_version = <active> predicate.
+              Filtered hits are backfilled from next-best candidates so
+              len(nodes)+len(concepts) == k (e2e-scenarios.md L461).
+          - id: step-metrics-and-degraded-flag
+            title: "Embedding publish metrics + C22 degraded flag"
+            expectedFileChanges: 4
+            summary: >-
+              Add OTel counters: embedding_publish_total{event_kind},
+              embedding_publish_latency_seconds histogram, and
+              recall_filter_unpublished_total (e2e-scenarios.md L460).
+              On sustained Qdrant outage surface
+              degraded_reason='embedding_index_unavailable' per C22.
+          - id: step-9-6a-integration-test
+            title: "Integration test covering the three S 9.6a scenarios"
+            expectedFileChanges: 4
+            summary: >-
+              publisher_integration_test.go against deploy/local stack.
+              Scenario A: publish state log is complete (queued ->
+              vector_written -> published, exactly one each, in order).
+              Scenario B: transient Qdrant error appends 'failed', then
+              the flusher writes a new 'queued' (no UPDATE) and the row
+              reaches 'published'. Scenario C: row whose latest event is
+              'queued' is excluded from agent.recall and increments
+              recall_filter_unpublished_total.
+
+out_of_scope:
+  - "ConceptVersion embedding publication (later Concept Promoter stage; the publisher accepts concept_version_id but is not wired here)."
+  - "Bulk re-embed driver for model upgrades (risk S 9.6 mgmt.snapshot job; a later story)."
+  - "Delta-mode publisher call site (owned by Stage 3.4 Delta re-index handler)."
+  - "DDL for EmbeddingPublish / EmbeddingPublishEvent (owned by phase-foundation-and-schema/stage-embedding-state-log-migrations-and-roles)."
+  - "Structural-prior fallback ranking (owned by GraphReader / Reranker stages)."
+
+open_questions:
+  - "LISTEN/NOTIFY wakeup for the flusher vs simple poll - poll is the safer v1 default."
+  - "Flusher backoff curve - proposed exponential, capped 5 min, abandoned after 24 h with alert."

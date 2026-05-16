@@ -9,7 +9,7 @@ package spaningestor
 //
 // Why direct SQL (not graphreader)
 // --------------------------------
-//   * `graphreader.Reader` is the centralized read library, but
+//   - `graphreader.Reader` is the centralized read library, but
 //     its current surface (Stage 2.2) is focused on the recall
 //     path: full Node hydration, neighborhood walks, embedding
 //     publish-state reads. The Span Ingestor needs only three
@@ -17,7 +17,7 @@ package spaningestor
 //     `attrs_json` — adding them to graphreader would force a
 //     larger packaging change in the read library than this
 //     stage warrants.
-//   * Keeping them here also localizes the query coupling: any
+//   - Keeping them here also localizes the query coupling: any
 //     change to the canonical-signature format
 //     (`<url>::method::<relPath>#<qualifiedName>(<params>)`,
 //     see `repoindexer/ast/dispatcher.go.methodSignature`) is
@@ -31,6 +31,22 @@ package spaningestor
 // A breaking change there should be paired with a change here;
 // the integration test in `pglookup_integration_test.go`
 // validates the coupling against the real schema.
+//
+// LIKE-pattern hygiene
+// --------------------
+// The two `LIKE` queries below interpolate user-supplied
+// segments (`namespace`, `function`, `filepath`) sourced from
+// OTel span attributes. Those segments routinely contain LIKE
+// metacharacters — `_` is endemic in identifiers (`my_method`,
+// `__init__`) and Python/Ruby filenames, and `%` can appear in
+// URL-encoded path attributes. Without escaping, `_` matches
+// any single character and `%` matches any run of characters,
+// silently widening the candidate set (e.g. `my_method` would
+// also match `myXmethod`); the `LIMIT 1` smallest-range
+// ordering in `LookupMethodByLocation` could then pick the
+// wrong file's method. We therefore escape `\`, `%`, `_` in
+// every interpolated segment and pin the escape character with
+// `ESCAPE '\'` on each LIKE clause.
 
 import (
 	"context"
@@ -63,15 +79,14 @@ func NewPGLookup(db *sql.DB) *PGLookup {
 // `#<namespace>.<function>(` (literal — `LIKE` with the
 // surrounding `%` so the relPath / repo URL are wildcards).
 //
-// User-supplied segments (`namespace`, `function`) flow in
-// from OTel span attributes and routinely contain LIKE
-// metacharacters — `_` is endemic in identifiers (`my_method`,
-// `__init__`) and `%` can appear in URL-encoded paths or
-// generated names. We therefore escape `\`, `%`, `_` in the
-// interpolated segments and pin the escape character with
-// `ESCAPE '\'`. Without this, `my_method` would also match
-// `myXmethod`, broadening the candidate set (extra scan + risk
-// of wrong-candidate selection downstream).
+// `namespace` and `function` are user-supplied (OTel span
+// attributes) and routinely contain `_` (and occasionally `%`).
+// We escape both — plus the escape character `\` itself —
+// before interpolating, and pin `ESCAPE '\'` on the query so
+// the pattern's own framing wildcards (`%`) keep their
+// metacharacter meaning while the interpolated segment is
+// matched literally. See the "LIKE-pattern hygiene" note at
+// the top of the file.
 //
 // A more selective index could be built on a generated column
 // extracting the qualifiedName from canonical_signature, but
@@ -91,7 +106,9 @@ func (l *PGLookup) LookupMethodsByName(
 	// `<url>::method::<relPath>#<namespace>.<function>(...)`.
 	// The trailing `(` ensures we don't accept a prefix match
 	// (e.g. searching for `foo.bar` does not match `foo.baz`).
-	pattern := "%#" + escapeLikePattern(qualified) + `(%`
+	// `qualified` is escaped for LIKE; the framing `%` and `(`
+	// are literal pattern syntax and remain unescaped.
+	pattern := "%#" + escapeLikePattern(qualified) + "(%"
 	const q = `
 		SELECT
 		    node_id::text,
@@ -132,11 +149,11 @@ func (l *PGLookup) LookupMethodsByName(
 //
 // `filepath` comes from OTel span attributes and frequently
 // contains `_` (any non-trivial source tree has underscored
-// filenames). We escape `\`, `%`, `_` in the interpolated
-// segment and pin `ESCAPE '\'` on the LIKE; otherwise a query
-// for `foo_bar.py` would also match `fooXbar.py`, and the
-// `LIMIT 1` smallest-range ordering could silently pick the
-// wrong file's method.
+// filenames such as `foo_bar.py`). We escape `\`, `%`, `_` in
+// the interpolated segment and pin `ESCAPE '\'` on the LIKE;
+// otherwise a query for `foo_bar.py` would also match
+// `fooXbar.py`, and the `LIMIT 1` smallest-range ordering
+// could silently pick the wrong file's method.
 func (l *PGLookup) LookupMethodByLocation(
 	ctx context.Context, repoID, filepath string, lineno int,
 ) (*MethodCandidate, error) {
@@ -144,9 +161,11 @@ func (l *PGLookup) LookupMethodByLocation(
 		return nil, nil
 	}
 	// `::method::<filepath>#` is the exact in-signature segment
-	// that pins a Method to its file. `%::method::filepath#%`
+	// that pins a Method to its file. `%::method::<filepath>#%`
 	// is the LIKE pattern; the leading `%` covers the
-	// arbitrary-length repo URL prefix.
+	// arbitrary-length repo URL prefix. `filepath` is escaped
+	// for LIKE; the framing `%` and the literal `::method::`
+	// and `#` remain unescaped.
 	pattern := "%::method::" + escapeLikePattern(filepath) + "#%"
 	const q = `
 		SELECT
@@ -270,26 +289,30 @@ func filePathFromSignature(sig string) string {
 }
 
 // escapeLikePattern escapes the SQL LIKE metacharacters `%`
-// and `_` (and the escape character `\` itself) in a user-
+// and `_` — and the escape character `\` itself — in a user-
 // supplied segment so it can be safely interpolated into a
-// LIKE pattern that already contains literal wildcards. The
-// companion query MUST be issued with `LIKE $N ESCAPE '\'`
-// (PostgreSQL's default escape character is also `\` when no
-// ESCAPE clause is supplied, but pinning it explicitly keeps
-// the contract obvious at the call site and survives any
-// future change to the server default).
+// LIKE pattern that already contains literal wildcards. Call
+// sites MUST pair this with `LIKE $N ESCAPE '\'` on the query
+// (PostgreSQL's historical default escape is also `\`, but
+// pinning it explicitly keeps the contract obvious at the call
+// site and is robust against any future change to the server
+// default or `standard_conforming_strings` mode).
 //
-// We rune-iterate rather than byte-iterate so multi-byte
-// UTF-8 sequences (common in international identifiers and
-// path segments) are preserved verbatim — none of the LIKE
-// metacharacters are multi-byte, so the byte-level fast path
-// would also be correct, but ranging by rune is clearer.
+// All three LIKE metacharacters are ASCII, so byte iteration
+// would also be correct on UTF-8 input; we range over runes
+// purely for readability — multi-byte sequences in identifiers
+// and path segments pass through verbatim either way.
+//
+// Fast path: if the input contains none of the three
+// characters, return it unmodified (the common case for
+// well-formed Go/Java/etc. identifiers — `_` makes the fast
+// path miss often in Python codebases, which is expected).
 func escapeLikePattern(s string) string {
 	if !strings.ContainsAny(s, `\%_`) {
 		return s
 	}
 	var b strings.Builder
-	b.Grow(len(s) + 4)
+	b.Grow(len(s) + 8)
 	for _, r := range s {
 		switch r {
 		case '\\', '%', '_':

@@ -52,6 +52,23 @@
 // the stale lock is removed and the open is retried once.  A
 // live holder still produces `ErrWALAlreadyOpen` exactly as
 // before so a real misconfiguration continues to fail loudly.
+//
+// Data-file handle lifecycle
+// --------------------------
+// The append-only data file handle is kept open for the
+// lifetime of the FileWAL so each Enqueue pays only write +
+// fsync — not the open / write+fsync / close round-trip the
+// original implementation did on every call.  Under sustained
+// partition outages (the very scenario this WAL exists for)
+// that previous per-call open/close was 3+ syscalls of pure
+// overhead and excessive file-descriptor churn.  The handle
+// is opened lazily on the first Enqueue (so a WAL that never
+// has anything written to it does not create an empty file
+// on disk) and closed by Close — but only when the flusher
+// has actually stopped, so a stuck Drain holding `mu` cannot
+// turn the bounded 5-second Stop deadline into an indefinite
+// hang.  In the (rare) timeout case the OS reclaims the FD
+// at process exit.
 package agentapi
 
 import (
@@ -98,6 +115,11 @@ const (
 	// cannot spin NewFileWAL forever.  We only need one
 	// extra attempt after reclaiming a stale lock.
 	lockAcquireMaxAttempts = 2
+	// stopWaitDeadline bounds how long Close / Stop will wait
+	// for the flusher goroutine to exit.  A stuck Drain (the
+	// downstream EpisodeAppender hanging on an external call)
+	// would otherwise wedge shutdown indefinitely.
+	stopWaitDeadline = 5 * time.Second
 )
 
 // ErrWALAlreadyOpen is returned by NewFileWAL when another
@@ -123,11 +145,18 @@ type FileWAL struct {
 	offsetPath string
 	lockPath   string
 	lockFile   *os.File
-	mu         sync.Mutex
-	depth      atomic.Int64
-	metrics    ObserveMetrics
-	logger     *slog.Logger
-	signal     chan struct{}
+	// dataFile is the long-lived append-only write handle.
+	// It is lazily opened by Enqueue under `mu` on first use
+	// and released by Close, eliminating the per-Enqueue
+	// open/close syscall churn the original implementation
+	// paid on every fallback-path call.  Every access to
+	// this field is serialised by `mu`.
+	dataFile *os.File
+	mu       sync.Mutex
+	depth    atomic.Int64
+	metrics  ObserveMetrics
+	logger   *slog.Logger
+	signal   chan struct{}
 	// flusher lifecycle
 	flushOnce sync.Once
 	flusherUp atomic.Bool
@@ -328,6 +357,20 @@ func errString(err error) string {
 // to the WAL data file.  Returns a non-nil error only on disk
 // failure; on success the depth gauge is bumped and the
 // flusher is signalled.
+//
+// The data file handle is kept open across calls (lazily
+// opened here on first use under `mu`, closed by Close) so
+// each enqueue pays only `write` + `fsync` — no open/close
+// churn on the hot fallback path during a sustained partition
+// outage.  `mu` serialises every Enqueue and every internal
+// reader/writer of `w.dataFile`, so the shared handle has
+// exactly one user at a time.
+//
+// On a write or fsync failure the handle is closed and
+// cleared so the next Enqueue gets a fresh open — that
+// preserves the original implementation's "next call gets a
+// fresh fd" recovery property in case the failure was
+// handle-specific (e.g. EBADF after an external truncate).
 func (w *FileWAL) Enqueue(_ context.Context, in EpisodeAppendInput) error {
 	payload, err := json.Marshal(in)
 	if err != nil {
@@ -335,15 +378,20 @@ func (w *FileWAL) Enqueue(_ context.Context, in EpisodeAppendInput) error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	f, err := os.OpenFile(w.dataPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return fmt.Errorf("agentapi: observe WAL: open data: %w", err)
+	if w.dataFile == nil {
+		f, err := os.OpenFile(w.dataPath,
+			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return fmt.Errorf("agentapi: observe WAL: open data: %w", err)
+		}
+		w.dataFile = f
 	}
-	defer f.Close()
-	if _, err := f.Write(append(payload, '\n')); err != nil {
+	if _, err := w.dataFile.Write(append(payload, '\n')); err != nil {
+		w.discardDataFileLocked()
 		return fmt.Errorf("agentapi: observe WAL: write: %w", err)
 	}
-	if err := f.Sync(); err != nil {
+	if err := w.dataFile.Sync(); err != nil {
+		w.discardDataFileLocked()
 		return fmt.Errorf("agentapi: observe WAL: fsync: %w", err)
 	}
 	d := w.depth.Add(1)
@@ -355,6 +403,19 @@ func (w *FileWAL) Enqueue(_ context.Context, in EpisodeAppendInput) error {
 	default:
 	}
 	return nil
+}
+
+// discardDataFileLocked closes and nils the kept-open data
+// file handle so the next Enqueue gets a fresh open.  Caller
+// MUST hold `mu`.  Errors from Close are ignored — the caller
+// is already returning a write/fsync error and forcing a
+// reopen is the recovery action.
+func (w *FileWAL) discardDataFileLocked() {
+	if w.dataFile == nil {
+		return
+	}
+	_ = w.dataFile.Close()
+	w.dataFile = nil
 }
 
 // Depth returns the current number of pending entries.  Safe
@@ -502,28 +563,54 @@ func (w *FileWAL) StartFlusher(writer EpisodeAppender, tick time.Duration) {
 // Safe to call before StartFlusher (in which case Stop is a
 // no-op). Idempotent.  Use Close instead during normal
 // shutdown — Close stops the flusher AND releases the lock
-// file.
+// file (and the kept-open data file handle).
 func (w *FileWAL) Stop() {
+	_ = w.stopAndWait()
+}
+
+// stopAndWait runs the Stop logic and reports whether the
+// flusher actually exited within the deadline (true) or the
+// 5-second wait timed out (false).  Close uses the bool to
+// decide whether it is safe to close the kept-open data file
+// handle under `mu`: a Drain stuck on a stuck downstream
+// writer still holds `mu`, and waiting on it during shutdown
+// would convert the bounded deadline into an indefinite hang.
+func (w *FileWAL) stopAndWait() bool {
 	w.stopOnce.Do(func() {
 		close(w.stopCh)
 	})
 	// Only wait when a flusher is actually running, otherwise
 	// doneCh would never close and we'd burn the timeout.
 	if !w.flusherUp.Load() {
-		return
+		return true
 	}
 	select {
 	case <-w.doneCh:
-	case <-time.After(5 * time.Second):
+		return true
+	case <-time.After(stopWaitDeadline):
 		// Best-effort — a stuck writer should not block
 		// shutdown indefinitely.
+		return false
 	}
 }
 
-// Close stops the flusher (if running) and releases the lock
-// file.  Idempotent: safe to call multiple times.
+// Close stops the flusher (if running), releases the kept-
+// open data file handle, and releases the lock file.
+// Idempotent: safe to call multiple times.
+//
+// If the flusher's bounded shutdown deadline is exceeded
+// (a Drain stuck on a downstream writer keeps `mu` held),
+// the data file handle is NOT closed here — taking `mu`
+// would turn the bounded shutdown into an indefinite hang.
+// The OS reclaims the FD at process exit; lock-file cleanup
+// always runs so a restart can re-acquire the directory.
 func (w *FileWAL) Close() error {
-	w.Stop()
+	flusherStopped := w.stopAndWait()
+	if flusherStopped {
+		w.mu.Lock()
+		w.discardDataFileLocked()
+		w.mu.Unlock()
+	}
 	return w.releaseLock()
 }
 
@@ -641,6 +728,12 @@ func (w *FileWAL) writeOffsetLocked(offset int64) error {
 // compactLocked truncates the data file + resets the offset
 // to 0.  Called when offset >= file size (everything
 // drained).  Caller MUST hold w.mu.
+//
+// The kept-open append-only `dataFile` handle remains valid
+// across this call: O_APPEND on Linux positions writes at
+// the current EOF atomically per-write, so a subsequent
+// Enqueue after a truncate-to-0 lands at offset 0 as
+// expected.  No reopen is required.
 func (w *FileWAL) compactLocked() error {
 	if err := os.Truncate(w.dataPath, 0); err != nil {
 		if !os.IsNotExist(err) {

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // Length is the byte length of a fingerprint. It is the SHA-256
@@ -174,18 +175,51 @@ var ErrEmptySignature = errors.New(
 // fingerprint linked to the old by a `renamed_to` Edge.
 var ErrEmptySHA = errors.New("fingerprint: from_sha must be non-empty")
 
+// ErrEmbeddedNUL is returned when NodeFingerprint or
+// EdgeFingerprint is called with a string field that contains a
+// NUL (`\x00`) byte. NUL is reserved as the framing delimiter
+// between variable-length string fields in the hash pre-image
+// (see NodeFingerprint / EdgeFingerprint doc comments); allowing
+// NUL inside a field would re-introduce the ambiguous-pre-image
+// failure mode and silently degrade G2.
+//
+// In practice no valid `kind`, `canonical_signature`, or
+// `from_sha` contains NUL — they are human-readable identifiers
+// and lowercase hex SHAs — so the check is defence-in-depth
+// against a bug at the dispatcher layer feeding raw bytes into
+// these helpers.
+var ErrEmbeddedNUL = errors.New(
+	"fingerprint: string field contains reserved NUL byte (\\x00)",
+)
+
 // NodeFingerprint computes the 32-byte G2 fingerprint of a Node
-// per architecture.md §1.3:
+// per architecture.md §1.3.
 //
-//	sha256( repo_id ‖ kind ‖ canonical_signature ‖ from_sha )
+// The hash pre-image is:
 //
-// where `‖` is byte-string concatenation. The exact byte encoding
-// of each field is documented in the package overview (doc.go).
+//	sha256( repo_id ‖ kind ‖ 0x00 ‖ canonical_signature ‖ 0x00 ‖ from_sha )
+//
+// where `‖` is byte-string concatenation. `repo_id` is the raw
+// 16-byte UUID and needs no separator because its length is
+// fixed. A single NUL byte (`0x00`) terminates each variable-
+// length string field so the (kind, canonical_signature, from_sha)
+// boundaries are unambiguous regardless of the individual field
+// lengths.
+//
+// Without these separators, distinct logical tuples could share a
+// byte-identical pre-image and therefore an identical fingerprint
+// — e.g. (kind="method", sig="pkg.Foo()a", sha="bc") and
+// (kind="method", sig="pkg.Foo()", sha="abc") would both produce
+// the byte string "methodpkg.Foo()abc" and collide on the hash.
+// That class of collision would silently violate G2's
+// "fingerprint uniquely identifies a logical entity" invariant.
 //
 // The function is deterministic: identical inputs always produce
 // byte-identical output. Validation rejects empty `kind`,
-// `canonical_signature`, and `from_sha` because each represents a
-// G2 invariant the schema assumes is non-empty.
+// `canonical_signature`, and `from_sha` (each is a G2 invariant
+// the schema assumes is non-empty) and rejects any string field
+// that contains a NUL byte (NUL is reserved as the framing
+// delimiter; see ErrEmbeddedNUL).
 func NodeFingerprint(
 	repoID RepoID,
 	kind string,
@@ -201,10 +235,23 @@ func NodeFingerprint(
 	if fromSHA == "" {
 		return Sum{}, ErrEmptySHA
 	}
+	if strings.IndexByte(kind, 0) >= 0 {
+		return Sum{}, fmt.Errorf("%w (field: kind)", ErrEmbeddedNUL)
+	}
+	if strings.IndexByte(canonicalSignature, 0) >= 0 {
+		return Sum{}, fmt.Errorf(
+			"%w (field: canonical_signature)", ErrEmbeddedNUL,
+		)
+	}
+	if strings.IndexByte(fromSHA, 0) >= 0 {
+		return Sum{}, fmt.Errorf("%w (field: from_sha)", ErrEmbeddedNUL)
+	}
 	h := sha256.New()
 	_, _ = h.Write(repoID[:])
 	_, _ = h.Write([]byte(kind))
+	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(canonicalSignature))
+	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(fromSHA))
 	var out Sum
 	copy(out[:], h.Sum(nil))
@@ -212,11 +259,22 @@ func NodeFingerprint(
 }
 
 // EdgeFingerprint computes the 32-byte G2 fingerprint of an Edge
-// per architecture.md §1.3:
+// per architecture.md §1.3.
 //
-//	sha256( repo_id ‖ kind ‖ src_fingerprint ‖ dst_fingerprint ‖ from_sha )
+// The hash pre-image is:
 //
-// where `‖` is byte-string concatenation.
+//	sha256( repo_id ‖ kind ‖ 0x00 ‖ src_fingerprint ‖ dst_fingerprint ‖ from_sha )
+//
+// where `‖` is byte-string concatenation. `repo_id` (16 bytes)
+// and `src_fingerprint` / `dst_fingerprint` (32 bytes each) are
+// fixed-length and need no separator; their boundaries are fixed
+// by their known lengths. The single NUL byte after `kind`
+// disambiguates the kind→src boundary (kind is variable-length,
+// so without the separator the same byte string could parse as
+// either a longer kind with shorter following fields or vice
+// versa). `from_sha` appears last so the dst→from_sha boundary is
+// fixed by dst's known length and no trailing separator is
+// required.
 //
 // `src` and `dst` MUST be the fingerprints of the Node rows the
 // edge connects (NOT the node UUIDs) — keying the edge identity
@@ -242,9 +300,16 @@ func EdgeFingerprint(
 	if dst.IsZero() {
 		return Sum{}, errors.New("fingerprint: dst fingerprint must be non-zero")
 	}
+	if strings.IndexByte(kind, 0) >= 0 {
+		return Sum{}, fmt.Errorf("%w (field: kind)", ErrEmbeddedNUL)
+	}
+	if strings.IndexByte(fromSHA, 0) >= 0 {
+		return Sum{}, fmt.Errorf("%w (field: from_sha)", ErrEmbeddedNUL)
+	}
 	h := sha256.New()
 	_, _ = h.Write(repoID[:])
 	_, _ = h.Write([]byte(kind))
+	_, _ = h.Write([]byte{0})
 	_, _ = h.Write(src[:])
 	_, _ = h.Write(dst[:])
 	_, _ = h.Write([]byte(fromSHA))

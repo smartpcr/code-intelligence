@@ -186,9 +186,16 @@ type MethodDecl struct {
 	// `attrs_json["calls_raw"]` so consumers can still see
 	// what the parser observed before the resolver filter,
 	// including names that will be stitched up by the
-	// later cross-file resolver workstream. Order is source
-	// order with duplicates preserved so call-frequency
-	// metrics can be derived downstream.
+	// later cross-file resolver workstream. Order is the
+	// source order of the first occurrence of each call
+	// target; duplicates are removed (all four parsers --
+	// the TS/JS and Python scanners as well as the
+	// tree-sitter variants -- dedupe in insertion order)
+	// so a method that calls `helper()` ten times produces
+	// a single `static_calls` edge rather than ten. Call-
+	// frequency metrics cannot be derived from this slice;
+	// downstream consumers that need them must walk
+	// `BodySource` directly.
 	Calls []string
 	// ReceiverCalls is the list of receiver-qualified call
 	// targets the parser extracted: `this.foo()` in TS/JS,
@@ -198,6 +205,9 @@ type MethodDecl struct {
 	// evaluator finding #5). Receiver-qualified calls cannot
 	// be confused with sibling-class methods, so resolution
 	// never drops them on ambiguity (unlike bare `Calls`).
+	// Like `Calls`, the slice is in source order of first
+	// occurrence with duplicates removed; one edge per
+	// distinct target.
 	ReceiverCalls []string
 	// MemberAccesses records every receiver-qualified field
 	// access the parser found inside the body. Reads and

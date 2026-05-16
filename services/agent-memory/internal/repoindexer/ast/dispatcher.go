@@ -168,7 +168,13 @@ func buildExtMap(parsers []LanguageParser) map[string]LanguageParser {
 // on parse-only failures so one malformed file does not abort
 // the ingest. It returns a non-nil error ONLY for unrecoverable
 // failures (writer errors, IO errors on `ev.Open`).
-func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent) error {
+//
+// The returned EmitResult carries the TouchedNodes list the
+// Stage 3.4 delta handler uses to compute its retire-set: one
+// entry per Class / Method / Block Node ensured during this
+// call. The list is best-effort on error -- callers MUST NOT
+// trust it for correctness decisions when err != nil.
+func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent) (repoindexer.EmitResult, error) {
 	logger := d.logger.With(
 		slog.String("op", "ast.emit_file"),
 		slog.String("rel_path", ev.RelPath),
@@ -179,12 +185,12 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 	parser := d.selectParser(ev.RelPath, ev.LanguageHints)
 	if parser == nil {
 		logger.Debug("ast.dispatch.skip", slog.String("reason", "no_parser"))
-		return nil
+		return repoindexer.EmitResult{}, nil
 	}
 
 	src, err := readEvent(ev)
 	if err != nil {
-		return fmt.Errorf("ast: read %s: %w", ev.RelPath, err)
+		return repoindexer.EmitResult{}, fmt.Errorf("ast: read %s: %w", ev.RelPath, err)
 	}
 
 	result, err := safeParse(parser, ev.RelPath, src)
@@ -193,19 +199,21 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 			slog.String("language", parser.Language()),
 			slog.String("error", err.Error()),
 		)
-		return nil
+		return repoindexer.EmitResult{}, nil
 	}
 
-	if err := d.emit(ctx, ev, parser, result, src, logger); err != nil {
-		return err
+	touched, err := d.emit(ctx, ev, parser, result, src, logger)
+	if err != nil {
+		return repoindexer.EmitResult{TouchedNodes: touched}, err
 	}
 	logger.Debug("ast.dispatch.ok",
 		slog.String("language", parser.Language()),
 		slog.Int("classes", len(result.Classes)),
 		slog.Int("methods", len(result.Methods)),
 		slog.Int("imports", len(result.Imports)),
+		slog.Int("touched_nodes", len(touched)),
 	)
-	return nil
+	return repoindexer.EmitResult{TouchedNodes: touched}, nil
 }
 
 // selectParser returns the parser the dispatcher will use for
@@ -317,19 +325,27 @@ func (d *Dispatcher) emit(
 	result ParseResult,
 	src []byte,
 	logger *slog.Logger,
-) error {
+) ([]repoindexer.TouchedNode, error) {
 	// classNodeID and methodNodeID build the local-symbol
 	// tables pass 2 resolves against. Keys are the parser's
 	// QualifiedName (the dotted path within the file).
 	classNodeID := make(map[string]string, len(result.Classes))
 	methodNodeID := make(map[string]string, len(result.Methods))
 
+	// touched accumulates every Node the dispatcher ensures
+	// during this call so EmitFile can return the list to the
+	// delta handler's retire-set computation. Capacity is a
+	// best-effort upper bound — Block subdivision can push the
+	// real count higher; the slice grows on demand.
+	touched := make([]repoindexer.TouchedNode, 0,
+		len(result.Classes)+len(result.Methods))
+
 	// Pass 0: `imports` edges (external modules only).
 	// Relative imports (`./`, `../`) are deferred -- they
 	// resolve to in-repo files that the cross-file resolver
 	// will stitch in a later story (per rubber-duck #3).
 	if err := d.emitImportsEdges(ctx, ev, parser, result.Imports, logger); err != nil {
-		return err
+		return touched, err
 	}
 
 	// Pass 1a: insert classes + `contains` (file->class).
@@ -345,9 +361,16 @@ func (d *Dispatcher) emit(
 			AttrsJSON:          attrs,
 		})
 		if err != nil {
-			return fmt.Errorf("ast: insert class %s: %w", c.QualifiedName, err)
+			return touched, fmt.Errorf("ast: insert class %s: %w", c.QualifiedName, err)
 		}
 		classNodeID[c.QualifiedName] = rec.NodeID
+		touched = append(touched, repoindexer.TouchedNode{
+			NodeID:             rec.NodeID,
+			Kind:               "class",
+			CanonicalSignature: sig,
+			ParentNodeID:       ev.FileNodeID,
+			Inserted:           rec.Inserted,
+		})
 		if _, err := d.writer.InsertEdge(ctx, graphwriter.EdgeInput{
 			RepoID:    ev.RepoID,
 			Kind:      "contains",
@@ -355,7 +378,7 @@ func (d *Dispatcher) emit(
 			DstNodeID: rec.NodeID,
 			FromSHA:   ev.SHA,
 		}); err != nil {
-			return fmt.Errorf("ast: insert file->class contains: %w", err)
+			return touched, fmt.Errorf("ast: insert file->class contains: %w", err)
 		}
 	}
 
@@ -381,9 +404,16 @@ func (d *Dispatcher) emit(
 			AttrsJSON:          attrs,
 		})
 		if err != nil {
-			return fmt.Errorf("ast: insert method %s: %w", m.QualifiedName, err)
+			return touched, fmt.Errorf("ast: insert method %s: %w", m.QualifiedName, err)
 		}
 		methodNodeID[m.QualifiedName] = rec.NodeID
+		touched = append(touched, repoindexer.TouchedNode{
+			NodeID:             rec.NodeID,
+			Kind:               "method",
+			CanonicalSignature: sig,
+			ParentNodeID:       parentID,
+			Inserted:           rec.Inserted,
+		})
 		if _, err := d.writer.InsertEdge(ctx, graphwriter.EdgeInput{
 			RepoID:    ev.RepoID,
 			Kind:      "contains",
@@ -391,7 +421,7 @@ func (d *Dispatcher) emit(
 			DstNodeID: rec.NodeID,
 			FromSHA:   ev.SHA,
 		}); err != nil {
-			return fmt.Errorf("ast: insert %s->method contains: %w", parentKind, err)
+			return touched, fmt.Errorf("ast: insert %s->method contains: %w", parentKind, err)
 		}
 
 		// Stage 3.3 §9.6a publish hook: the method's Node row
@@ -432,7 +462,7 @@ func (d *Dispatcher) emit(
 			Content:            content,
 			SignatureOnly:      signatureOnly,
 		}, logger); err != nil {
-			return err
+			return touched, err
 		}
 
 		// Pass 1c: blocks for this method.
@@ -448,9 +478,16 @@ func (d *Dispatcher) emit(
 				AttrsJSON:          bAttrs,
 			})
 			if err != nil {
-				return fmt.Errorf("ast: insert block %s#%d: %w",
+				return touched, fmt.Errorf("ast: insert block %s#%d: %w",
 					m.QualifiedName, b.Ordinal, err)
 			}
+			touched = append(touched, repoindexer.TouchedNode{
+				NodeID:             brec.NodeID,
+				Kind:               "block",
+				CanonicalSignature: bsig,
+				ParentNodeID:       rec.NodeID,
+				Inserted:           brec.Inserted,
+			})
 			if _, err := d.writer.InsertEdge(ctx, graphwriter.EdgeInput{
 				RepoID:    ev.RepoID,
 				Kind:      "contains",
@@ -458,7 +495,7 @@ func (d *Dispatcher) emit(
 				DstNodeID: brec.NodeID,
 				FromSHA:   ev.SHA,
 			}); err != nil {
-				return fmt.Errorf("ast: insert method->block contains: %w", err)
+				return touched, fmt.Errorf("ast: insert method->block contains: %w", err)
 			}
 
 			// Publish hook: block Node + contains edge are
@@ -488,7 +525,7 @@ func (d *Dispatcher) emit(
 				CanonicalSignature: bsig,
 				Content:            content,
 			}, logger); err != nil {
-				return err
+				return touched, err
 			}
 		}
 	}
@@ -508,7 +545,7 @@ func (d *Dispatcher) emit(
 				DstNodeID: dst,
 				FromSHA:   ev.SHA,
 			}); err != nil {
-				return fmt.Errorf("ast: insert extends %s->%s: %w",
+				return touched, fmt.Errorf("ast: insert extends %s->%s: %w",
 					c.QualifiedName, target, err)
 			}
 		}
@@ -524,7 +561,7 @@ func (d *Dispatcher) emit(
 				DstNodeID: dst,
 				FromSHA:   ev.SHA,
 			}); err != nil {
-				return fmt.Errorf("ast: insert implements %s->%s: %w",
+				return touched, fmt.Errorf("ast: insert implements %s->%s: %w",
 					c.QualifiedName, target, err)
 			}
 		}
@@ -566,7 +603,7 @@ func (d *Dispatcher) emit(
 				continue
 			}
 			if err := emitCall(dstID); err != nil {
-				return fmt.Errorf("ast: insert receiver static_calls %s->%s.%s: %w",
+				return touched, fmt.Errorf("ast: insert receiver static_calls %s->%s.%s: %w",
 					m.QualifiedName, m.EnclosingClass, callee, err)
 			}
 		}
@@ -577,7 +614,7 @@ func (d *Dispatcher) emit(
 				continue
 			}
 			if err := emitCall(dstID); err != nil {
-				return fmt.Errorf("ast: insert static_calls %s->%s: %w",
+				return touched, fmt.Errorf("ast: insert static_calls %s->%s: %w",
 					m.QualifiedName, callee, err)
 			}
 		}
@@ -612,7 +649,7 @@ func (d *Dispatcher) emit(
 				FromSHA:   ev.SHA,
 				AttrsJSON: memberEdgeAttrs(parser.Language(), reads),
 			}); err != nil {
-				return fmt.Errorf("ast: insert reads %s->%s: %w",
+				return touched, fmt.Errorf("ast: insert reads %s->%s: %w",
 					m.QualifiedName, m.EnclosingClass, err)
 			}
 		}
@@ -625,14 +662,14 @@ func (d *Dispatcher) emit(
 				FromSHA:   ev.SHA,
 				AttrsJSON: memberEdgeAttrs(parser.Language(), writes),
 			}); err != nil {
-				return fmt.Errorf("ast: insert writes %s->%s: %w",
+				return touched, fmt.Errorf("ast: insert writes %s->%s: %w",
 					m.QualifiedName, m.EnclosingClass, err)
 			}
 		}
 	}
 
 	_ = logger // structured logs from sub-helpers if needed in the future
-	return nil
+	return touched, nil
 }
 
 // emitImportsEdges materialises each non-relative import as

@@ -8,8 +8,8 @@ import (
 // TestAll_parsesEveryEmbeddedFile confirms every .sql file
 // embedded under //go:embed is parseable and emits a non-empty
 // up body. It also asserts the lexicographic sort produces the
-// implementation-plan.md Stage 1.2 + 1.3 + 1.4 + 2.2 order
-// (0001 .. 0006a then 0007 .. 0014 then 0015 .. 0017).
+// implementation-plan.md Stage 1.2 + 1.3 + 1.4 + 2.2 + 3.4 order
+// (0001 .. 0006a then 0006b then 0007 .. 0014 then 0015 .. 0017).
 func TestAll_parsesEveryEmbeddedFile(t *testing.T) {
 	t.Parallel()
 	all, err := All()
@@ -22,6 +22,8 @@ func TestAll_parsesEveryEmbeddedFile(t *testing.T) {
 	wantVersions := []string{
 		// Stage 1.2 structural set.
 		"0001", "0002", "0003", "0004", "0005", "0006", "0006a",
+		// Stage 3.4 delta handler — ingest_jobs.affected_node_count column.
+		"0006b",
 		// Stage 1.3 episodic + concept set.
 		"0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014",
 		// Stage 1.4 embedding-publish + role-grants set.
@@ -183,6 +185,10 @@ func TestAll_filenamesMatchPlannedSet(t *testing.T) {
 		"0005_trace_observation.sql": true,
 		"0006_repo_event.sql":        true,
 		"0006a_ingest_jobs.sql":      true,
+		// Stage 3.4 delta handler — adds the affected_node_count
+		// column to ingest_jobs so the publish-retry path can
+		// monotonically persist the per-run high-water mark.
+		"0006b_ingest_jobs_affected_node_count.sql": true,
 		// Stage 1.3 episodic + concept set.
 		"0007_episode.sql":                   true,
 		"0008_episode_update.sql":            true,

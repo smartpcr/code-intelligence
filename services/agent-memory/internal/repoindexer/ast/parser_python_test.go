@@ -38,7 +38,7 @@ def format_greeting(prefix, name):
 `
 	fw := newFakeWriter()
 	d := NewDispatcher(fw)
-	if err := d.EmitFile(context.Background(), makeEvent("svc/hello.py", src)); err != nil {
+	if _, err := d.EmitFile(context.Background(), makeEvent("svc/hello.py", src)); err != nil {
 		t.Fatalf("EmitFile: %v", err)
 	}
 

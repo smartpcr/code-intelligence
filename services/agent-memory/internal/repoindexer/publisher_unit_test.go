@@ -62,6 +62,84 @@ func TestEvent_MarshalPayload_rejectsEmptyKind(t *testing.T) {
 	}
 }
 
+// TestEvent_MarshalPayload_deltaShape pins the on-the-wire JSON
+// format the pg_notify payload uses for `repo.delta_ingested`
+// events. Downstream subscribers (Stage 4 EmbeddingIndex /
+// consolidator) decode this — a silent rename of from_sha /
+// to_sha / affected_node_count would break them without any
+// Go-side compile error. The shape mirrors the full-ingested
+// envelope plus three additive fields.
+func TestEvent_MarshalPayload_deltaShape(t *testing.T) {
+	t.Parallel()
+	ev := Event{
+		Kind:              EventKindRepoDeltaIngested,
+		RepoID:            "00000000-0000-0000-0000-000000000002",
+		SHA:               "to-sha-value",
+		JobID:             "99999999-2222-3333-4444-555555555555",
+		Time:              time.Date(2024, 5, 1, 10, 11, 12, 0, time.UTC),
+		FromSHA:           "from-sha-value",
+		ToSHA:             "to-sha-value",
+		AffectedNodeCount: 42,
+	}
+	got, err := ev.MarshalPayload()
+	if err != nil {
+		t.Fatalf("MarshalPayload: %v", err)
+	}
+	var back map[string]any
+	if err := json.Unmarshal([]byte(got), &back); err != nil {
+		t.Fatalf("round-trip unmarshal: %v\npayload: %s", err, got)
+	}
+	for k, want := range map[string]string{
+		"kind":     EventKindRepoDeltaIngested,
+		"repo_id":  "00000000-0000-0000-0000-000000000002",
+		"sha":      "to-sha-value",
+		"job_id":   "99999999-2222-3333-4444-555555555555",
+		"from_sha": "from-sha-value",
+		"to_sha":   "to-sha-value",
+	} {
+		if back[k] != want {
+			t.Errorf("payload[%q] = %v, want %s", k, back[k], want)
+		}
+	}
+	// JSON numbers round-trip as float64. The closed contract
+	// is that affected_node_count is a non-negative integer.
+	if v, ok := back["affected_node_count"].(float64); !ok || int(v) != 42 {
+		t.Errorf("payload.affected_node_count = %v (%T), want 42",
+			back["affected_node_count"], back["affected_node_count"])
+	}
+}
+
+// TestEvent_MarshalPayload_fullShape_noDeltaFields locks in the
+// back-compat guarantee that `repo.registered` /
+// `repo.full_ingested` payloads do NOT carry from_sha / to_sha /
+// affected_node_count. The omitempty tags on those fields are
+// the load-bearing primitive; this test fails loudly if a future
+// edit drops them.
+func TestEvent_MarshalPayload_fullShape_noDeltaFields(t *testing.T) {
+	t.Parallel()
+	ev := Event{
+		Kind:   EventKindRepoFullIngested,
+		RepoID: "00000000-0000-0000-0000-000000000003",
+		SHA:    "deadbeef",
+		JobID:  "11111111-2222-3333-4444-555555555555",
+		Time:   time.Date(2024, 5, 1, 10, 11, 12, 0, time.UTC),
+	}
+	got, err := ev.MarshalPayload()
+	if err != nil {
+		t.Fatalf("MarshalPayload: %v", err)
+	}
+	var back map[string]any
+	if err := json.Unmarshal([]byte(got), &back); err != nil {
+		t.Fatalf("round-trip unmarshal: %v", err)
+	}
+	for _, k := range []string{"from_sha", "to_sha", "affected_node_count"} {
+		if _, present := back[k]; present {
+			t.Errorf("full-mode payload must NOT carry %q field; got %v",
+				k, back[k])
+		}
+	}
+}
+
 // TestRecordingPublisher_capturesAllPublishedEvents is a sanity
 // test for the testhook publisher used by the worker integration
 // tests. Pinning behaviour here keeps the integration tests

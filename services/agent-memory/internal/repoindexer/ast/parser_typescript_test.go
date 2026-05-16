@@ -57,7 +57,7 @@ function formatGreeting(prefix: string, name: string): string {
 `
 	fw := newFakeWriter()
 	d := NewDispatcher(fw)
-	if err := d.EmitFile(context.Background(), makeEvent("src/hello.ts", src)); err != nil {
+	if _, err := d.EmitFile(context.Background(), makeEvent("src/hello.ts", src)); err != nil {
 		t.Fatalf("EmitFile: %v", err)
 	}
 

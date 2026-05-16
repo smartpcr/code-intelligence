@@ -587,41 +587,57 @@ func (f *Flusher) Run(ctx context.Context, every time.Duration) error {
 // findStuckPublishRows runs the §9.6a-aware scan.  Returns
 // the rows whose latest `embedding_publish_event` is either
 // `failed` (older than `failedAgeThreshold`) OR `queued`
-// (older than `queuedAgeThreshold`).  Uses the
-// `(publish_id, created_at DESC)` index from migration 0015
-// for the latest-event probe; the inner `DISTINCT ON` is
-// strictly necessary because PostgreSQL's planner cannot
-// otherwise prove the latest event is the qualifying event.
+// (older than `queuedAgeThreshold`).
+//
+// Query shape: LATERAL skip-scan, NOT a CTE-with-DISTINCT-ON.
+// The earlier shape wrapped every event row in a
+// `WITH latest AS (SELECT DISTINCT ON (publish_id) ...)`
+// barrier plus a sibling `MAX(attempt_index) GROUP BY publish_id`
+// CTE.  PostgreSQL cannot push the outer `event_kind` /
+// `latest_at` filter through either barrier, so every flush
+// cycle (default 30s) paid a full-table sort + HashAggregate
+// over `embedding_publish_event` even with an empty backlog,
+// holding a shared lock that competed with the publisher's
+// append path.  Pruning recent events *inside* the CTE would
+// be a correctness regression: a `published` or
+// `vector_written` event written within the last
+// `max(failedAgeThreshold, queuedAgeThreshold)` would drop
+// out of the scan, the `DISTINCT ON` would then promote the
+// older `queued` / `failed` event to "latest", and the
+// flusher would falsely re-drive an already-terminal row.
+// The LATERAL shape preserves "latest event per publish_id"
+// semantics by probing the partitioned
+// `embedding_publish_event_publish_created_idx` index from
+// migration 0015 with `LIMIT 1` per publish — O(P · log E)
+// instead of O(E · log E), and an empty backlog stays empty
+// because the outer WHERE filters drop the probe result
+// before any extra work is done.
+//
+// `max_attempt` is still a `MAX(attempt_index)` aggregate
+// (NOT "the latest event's attempt_index") so an
+// out-of-order insert (clock skew, manually backfilled
+// legacy row, future batched-insert path) cannot regress
+// the supersede attempt_index below the true high water
+// mark.  See rubber-duck #b on supersede-attempt-index.
+// The aggregate runs only for publish rows that survived
+// the latest-event filter — typically O(events-per-publish)
+// per stuck row, a handful of index entries.
 //
 // Joins `node` (non-partitioned, indexed on `node_id`) to
 // surface `kind`, `repo_id`, and `canonical_signature` into
 // the `ContentLookup` the resolver receives.  Without the
 // JOIN the resolver would have to re-issue the same lookup
 // per scanned row, which would hammer `node` in proportion
-// to backlog depth.
+// to backlog depth.  The INNER JOIN on `node` also enforces
+// `p.node_id IS NOT NULL` structurally (concept-targeted
+// publishes are routed through their own flusher), letting
+// the planner pick the `embedding_publish_node_id_idx`
+// partial index for the driving scan.
 //
 // Bounded by `scanLimit` so a long backlog drains across
 // multiple Flush calls rather than monopolising any one.
 func (f *Flusher) findStuckPublishRows(ctx context.Context) ([]stuckPublishRow, error) {
 	const q = `
-		WITH latest AS (
-		    SELECT DISTINCT ON (e.publish_id)
-		        e.publish_id,
-		        e.event_kind,
-		        e.created_at AS latest_at
-		    FROM embedding_publish_event e
-		    ORDER BY e.publish_id, e.created_at DESC, e.event_id DESC
-		),
-		max_attempts AS (
-		    -- max() aggregate (NOT "the latest event's attempt_index")
-		    -- so an out-of-order insert (clock skew, manually backfilled
-		    -- legacy row, future batched-insert path) cannot regress
-		    -- the supersede attempt_index below the true high water
-		    -- mark.  See rubber-duck #b on supersede-attempt-index.
-		    SELECT e.publish_id, MAX(e.attempt_index) AS max_attempt
-		    FROM embedding_publish_event e
-		    GROUP BY e.publish_id
-		)
 		SELECT
 		    p.publish_id::text,
 		    coalesce(p.node_id::text, ''),
@@ -632,9 +648,19 @@ func (f *Flusher) findStuckPublishRows(ctx context.Context) ([]stuckPublishRow, 
 		    n.repo_id::text,
 		    n.canonical_signature
 		FROM embedding_publish p
-		JOIN latest       l  ON l.publish_id  = p.publish_id
-		JOIN max_attempts ma ON ma.publish_id = p.publish_id
-		JOIN node         n  ON n.node_id     = p.node_id
+		JOIN node n ON n.node_id = p.node_id
+		JOIN LATERAL (
+		    SELECT e.event_kind, e.created_at AS latest_at
+		    FROM embedding_publish_event e
+		    WHERE e.publish_id = p.publish_id
+		    ORDER BY e.created_at DESC, e.event_id DESC
+		    LIMIT 1
+		) l ON true
+		JOIN LATERAL (
+		    SELECT MAX(e.attempt_index) AS max_attempt
+		    FROM embedding_publish_event e
+		    WHERE e.publish_id = p.publish_id
+		) ma ON true
 		WHERE p.node_id IS NOT NULL
 		  AND (
 		      (l.event_kind = 'failed' AND l.latest_at < $1)

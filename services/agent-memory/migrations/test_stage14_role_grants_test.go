@@ -26,11 +26,16 @@ package migrations_test
 // ALTER, opens a fresh connection as the app role, runs the
 // scenario, then reverts the role to NOLOGIN.
 //
-// Concurrency: the cluster-wide app role is shared. Within one
-// `go test ./migrations` invocation the tests run sequentially
-// (Go's default), so the LOGIN flip is contained. The
-// migrations package is the only one that touches
-// agent_memory_app, so cross-package races are not a concern.
+// Concurrency: the cluster-wide `agent_memory_app` role is
+// shared. Within one `go test ./migrations` invocation the tests
+// run sequentially (Go's default), so the LOGIN flip is
+// contained. Stage 2.1 introduced a second test package
+// (`internal/graphwriter`) that also flips this role; both call
+// sites now acquire `testpglock.AcquireAppRoleLogin` (a
+// session-level pg_advisory_lock keyed on the same constant)
+// BEFORE the LOGIN ALTER and release it AFTER the NOLOGIN
+// revert, so cross-package races during `go test ./...` are
+// serialised at the cluster level rather than left to chance.
 //
 // As with the other tests in this package, the file is skipped
 // cleanly when AGENT_MEMORY_PG_URL is unset (developer laptop
@@ -48,6 +53,8 @@ import (
 	"testing"
 
 	"github.com/lib/pq" // *pq.Error gives us SQLSTATE strings
+
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/testpglock"
 )
 
 // pgErrCodeInsufficientPrivilege is the SQLSTATE the per-test
@@ -103,6 +110,29 @@ func openAppRoleDB(
 	ctx, cancel := context.WithTimeout(context.Background(), testDBTimeout)
 	defer cancel()
 
+	// Cross-package serialisation: take the shared
+	// pg_advisory_lock before we flip the role to LOGIN. The
+	// lock owns its own *sql.DB on a session-pinned
+	// connection, so it does NOT borrow from ownerDB's pool
+	// (capped at 1 connection here) and cannot deadlock the
+	// subsequent ALTER ROLE statements.
+	releaseLock, err := testpglock.AcquireAppRoleLogin(ctx, base)
+	if err != nil {
+		t.Fatalf("acquire app-role login lock: %v", err)
+	}
+	// On the failure path, runtime.Goexit (triggered by
+	// t.Fatalf) unwinds deferred functions before terminating
+	// the goroutine, so the lock is released even though the
+	// caller never sees the returned cleanup closure.
+	// On the success path, success = true silences this guard
+	// and the returned cleanup func owns the release.
+	success := false
+	defer func() {
+		if !success {
+			releaseLock()
+		}
+	}()
+
 	// pq.QuoteLiteral handles the single-quote escaping for the
 	// password literal. ALTER ROLE in PostgreSQL does not
 	// support parameter binding for password values, so the
@@ -154,6 +184,7 @@ func openAppRoleDB(
 		t.Fatalf("SET search_path on app-role session: %v", err)
 	}
 
+	success = true
 	cleanup := func() {
 		_ = appDB.Close()
 		// Best-effort revert. Even if this fails (e.g. owner
@@ -164,6 +195,10 @@ func openAppRoleDB(
 		defer c2()
 		_, _ = ownerDB.ExecContext(ctx2,
 			`ALTER ROLE agent_memory_app WITH NOLOGIN`)
+		// Release the cross-package advisory lock AFTER the
+		// NOLOGIN revert so the next acquirer never observes
+		// this test's LOGIN state.
+		releaseLock()
 	}
 	return appDB, cleanup
 }

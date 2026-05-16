@@ -1,15 +1,15 @@
 // Package agentapi: gRPC server adapter for the §6.4 recall
-// verb AND the §6.1.2 observe verb.
+// AND §6.5 expand verbs.
 //
-// Stage 5.1 mandates the gRPC service skeleton in
+// Stage 5.1 first mandated that the gRPC service in
 // `proto/agent.proto` actually be CALLABLE (evaluator iter-1
 // #1: "The gRPC service is not actually registered or
-// callable"). This file owns the translation between the
+// callable"); Stage 5.3 extended that surface with the
+// `Expand` RPC. This file owns the translation between the
 // `agentpb.AgentService` surface and the in-process
-// `*agentapi.Service` (recall) + `*agentapi.ObserveService`
-// (observe). The binary composition root
-// (`cmd/agent-api/main.go`) constructs both and registers
-// the server on the running `*grpc.Server`.
+// `*agentapi.Service` for BOTH verbs. The binary composition
+// root (`cmd/agent-api/main.go`) constructs both and
+// registers the server on the running `*grpc.Server`.
 //
 // Why a separate adapter (not pollute Service)
 // --------------------------------------------
@@ -36,20 +36,19 @@
 //     (server-side fault; the recall handler degrades to a
 //     snapshot internally and only returns a hard error when
 //     the snapshot fallback itself is unwired).
-//   - `Observe` validation sentinels (HumanCorrected,
-//     DegradedRecallContextRoleForbidden, InvalidObservationRole,
-//     InvalidObservationTarget, InvalidOutcome, MissingRepoID/
-//     SessionID/TraceID/Action/ContextID, InvalidJSON,
-//     ContextNotFound) → `codes.InvalidArgument`.
-//   - `Observe` ErrEpisodicLogUnavailable WITHOUT a WAL wired
-//     → `codes.Unavailable` (caller should retry).
-//   - Any other `Observe` error → `codes.Internal`.
-//   - `Expand` / `Summarize` → `codes.Unimplemented`
-//     (the placeholder body shapes belong to Stages 5.3 /
-//     5.4). The embedded `UnimplementedAgentServiceServer`
-//     already returns these codes, but we re-export tiny
-//     stubs below so future implementers know exactly
-//     where to plug in.
+//   - `Observe` / `Summarize` → `codes.Unimplemented` (the
+//     placeholder body shapes belong to Stages 5.2 / 5.4).
+//     The embedded `UnimplementedAgentServiceServer` returns
+//     `codes.Unimplemented` for both; this file does NOT
+//     declare explicit stub methods today. When Stages 5.2 /
+//     5.4 land, the implementers will add `func (s *GRPCServer)
+//     Observe(...)` / `Summarize(...)` here to override the
+//     embedded defaults.
+//   - `Expand` → real implementation (Stage 5.3). Errors
+//     map to: `ErrInvalidExpand*` → `codes.InvalidArgument`,
+//     `ErrExpandUnavailable` → `codes.Unimplemented`,
+//     `graphreader.ErrNotFound` → `codes.NotFound`,
+//     anything else → `codes.Internal`.
 package agentapi
 
 import (
@@ -61,6 +60,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphreader"
 	agentpb "github.com/smartpcr/code-intelligence/services/agent-memory/proto/agent"
 )
 
@@ -248,33 +248,84 @@ func recallErrorToStatus(err error) error {
 	return status.Error(codes.Internal, fmt.Sprintf("agent.recall: %v", err))
 }
 
-// observeErrorToStatus maps the observe handler's sentinel
-// errors onto gRPC status codes. Validation sentinels map to
-// InvalidArgument (caller-correctable); a missing WAL on a
-// partition outage maps to Unavailable (the caller should
-// retry); everything else is Internal.
-func observeErrorToStatus(err error) error {
-	switch {
-	case errors.Is(err, ErrHumanCorrectedNotAllowed),
-		errors.Is(err, ErrDegradedRecallContextRoleForbidden),
-		errors.Is(err, ErrInvalidObservationRole),
-		errors.Is(err, ErrInvalidObservationTarget),
-		errors.Is(err, ErrInvalidOutcome),
-		errors.Is(err, ErrMissingRepoID),
-		errors.Is(err, ErrMissingSessionID),
-		errors.Is(err, ErrMissingTraceID),
-		errors.Is(err, ErrMissingAction),
-		errors.Is(err, ErrMissingContextID),
-		errors.Is(err, ErrInvalidJSON),
-		errors.Is(err, ErrContextNotFound):
-		return status.Error(codes.InvalidArgument, err.Error())
-	case errors.Is(err, ErrEpisodicLogUnavailable):
-		// Reaches here ONLY when no WAL was wired (the WAL
-		// fallback path turns this into a non-error
-		// degraded response). The caller should retry.
-		return status.Error(codes.Unavailable, err.Error())
+// Expand implements `agentpb.AgentServiceServer.Expand`.
+// Translates the proto request into an `ExpandRequest`,
+// invokes `Service.Expand`, then projects the response onto
+// `agentpb.ExpandResponse`.
+//
+// Error mapping:
+//
+//   - `ErrInvalidExpandNodeID` / `ErrInvalidExpandDirection`
+//     / `ErrInvalidExpandDepth` → `codes.InvalidArgument`
+//     (caller-correctable).
+//   - `ErrExpandUnavailable` → `codes.Unimplemented` (the
+//     binary has not been wired with an EdgeWalker; a clean
+//     Unimplemented is friendlier than a vague Internal).
+//   - `graphreader.ErrNotFound` (root node missing) →
+//     `codes.NotFound`.
+//   - Anything else → `codes.Internal`.
+func (g *GRPCServer) Expand(ctx context.Context, req *agentpb.ExpandRequest) (*agentpb.ExpandResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "agent.expand: nil request")
 	}
-	return status.Error(codes.Internal, fmt.Sprintf("agent.observe: %v", err))
+	in := ExpandRequest{
+		NodeID:    req.GetNodeId(),
+		Direction: req.GetDirection(),
+		Depth:     int(req.GetDepth()),
+		RepoID:    req.GetRepoId(),
+	}
+	resp, err := g.svc.Expand(ctx, in)
+	if err != nil {
+		return nil, expandErrorToStatus(err)
+	}
+
+	out := &agentpb.ExpandResponse{
+		RootNodeId:     resp.RootNodeID,
+		ContextId:      resp.ContextID,
+		Degraded:       resp.Degraded,
+		DegradedReason: resp.DegradedReason,
+		Truncated:      resp.Truncated,
+	}
+	out.Edges = make([]*agentpb.EdgeCard, 0, len(resp.Edges))
+	for _, e := range resp.Edges {
+		out.Edges = append(out.Edges, &agentpb.EdgeCard{
+			EdgeId:           e.EdgeID,
+			RepoId:           e.RepoID,
+			Kind:             e.Kind,
+			SrcNodeId:        e.SrcNodeID,
+			DstNodeId:        e.DstNodeID,
+			ObservationCount: e.ObservationCount,
+		})
+	}
+	out.Nodes = make([]*agentpb.NodeCard, 0, len(resp.Nodes))
+	for _, n := range resp.Nodes {
+		out.Nodes = append(out.Nodes, &agentpb.NodeCard{
+			NodeId:             n.NodeID,
+			RepoId:             n.RepoID,
+			Kind:               n.Kind,
+			CanonicalSignature: n.CanonicalSignature,
+			Score:              n.Score,
+			PointId:            n.PointID,
+		})
+	}
+	return out, nil
+}
+
+// expandErrorToStatus maps domain errors from `Service.Expand`
+// onto gRPC status codes. Mirrors `recallErrorToStatus` so a
+// new sentinel does not silently drop to `codes.Unknown`.
+func expandErrorToStatus(err error) error {
+	switch {
+	case errors.Is(err, ErrInvalidExpandNodeID),
+		errors.Is(err, ErrInvalidExpandDirection),
+		errors.Is(err, ErrInvalidExpandDepth):
+		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, ErrExpandUnavailable):
+		return status.Error(codes.Unimplemented, err.Error())
+	case errors.Is(err, graphreader.ErrNotFound):
+		return status.Error(codes.NotFound, err.Error())
+	}
+	return status.Error(codes.Internal, fmt.Sprintf("agent.expand: %v", err))
 }
 
 // clampInt32 saturates `n` into the int32 range. Used for

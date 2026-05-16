@@ -1,12 +1,21 @@
 // agent.proto -- gRPC IDL for the Agent Surface (tech-spec §8.5).
 //
-// Stage 5.1 of implementation-plan.md ships the IDL for the
-// `agent.recall` verb plus skeleton placeholders for the
-// `agent.observe`, `agent.expand`, and `agent.summarize` verbs
-// owned by Stages 5.2 / 5.3 / 5.4. Generated Go bindings will
-// land alongside the protoc tooling pin in a follow-up; for
-// now this file is the canonical contract that
-// `cmd/agent-api/main.go` mTLS server speaks.
+// As of Stage 5.3 this file ships the IDL AND checked-in Go
+// bindings for two verbs:
+//   * `agent.recall`  -- Stage 5.1, §6.4 read path. Fully wired
+//     in `cmd/agent-api/main.go`; see `internal/agentapi/recall.go`.
+//   * `agent.expand`  -- Stage 5.3, §6.5 structural-walk path.
+//     Fully wired in `cmd/agent-api/main.go`; see
+//     `internal/agentapi/expand.go`.
+// The two remaining verbs are still skeleton placeholders so the
+// gRPC server can register a single stable service descriptor today;
+// the body shapes will firm up as their owning stages land:
+//   * `agent.observe`   -- Stage 5.2 (Observe request/response body).
+//   * `agent.summarize` -- Stage 5.4 (Summarize request/response body).
+// The protoc tooling pin (`protoc-gen-go v1.36.11`,
+// `protoc-gen-go-grpc v1.5.1`) and the `make proto` regen target
+// landed alongside Stage 5.3 — see `services/agent-memory/Makefile`
+// and the proto-drift CI gate in `.github/workflows/agent-memory-ci.yml`.
 //
 // Transport contract (tech-spec §8.5):
 //   * gRPC over HTTP/2.
@@ -33,7 +42,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.5.1
 // - protoc             v7.34.1
-// source: proto/agent.proto
+// source: agent.proto
 
 package agentpb
 
@@ -84,8 +93,16 @@ type AgentServiceClient interface {
 	// deterministic even when the writer is later replayed
 	// from the §7.5 WAL).
 	Observe(ctx context.Context, in *ObserveRequest, opts ...grpc.CallOption) (*ObserveResponse, error)
-	// Expand walks structural edges from a node id; owned by
-	// Stage 5.3. Placeholder.
+	// Expand is the §6.5 structural-walk path: BFS over
+	// `static_calls` / `observed_calls` edges from a seed node
+	// in a requested direction (callees | callers), up to a
+	// configurable depth (default 5, hard ceiling 10), with
+	// hot-path ranking (DESC observation_count, hop ASC,
+	// edge_id ASC), node + edge budget clamping at the
+	// per-service ceiling, a RecallContextLog row appended
+	// with verb='expand', and the same `graph_store_unavailable`
+	// closed-set degraded-fallback path as `agent.recall`.
+	// See `internal/agentapi/expand.go.Service.Expand`.
 	Expand(ctx context.Context, in *ExpandRequest, opts ...grpc.CallOption) (*ExpandResponse, error)
 	// Summarize materialises a neighborhood card into a
 	// natural-language summary; owned by Stage 5.4. Placeholder.
@@ -168,8 +185,16 @@ type AgentServiceServer interface {
 	// deterministic even when the writer is later replayed
 	// from the §7.5 WAL).
 	Observe(context.Context, *ObserveRequest) (*ObserveResponse, error)
-	// Expand walks structural edges from a node id; owned by
-	// Stage 5.3. Placeholder.
+	// Expand is the §6.5 structural-walk path: BFS over
+	// `static_calls` / `observed_calls` edges from a seed node
+	// in a requested direction (callees | callers), up to a
+	// configurable depth (default 5, hard ceiling 10), with
+	// hot-path ranking (DESC observation_count, hop ASC,
+	// edge_id ASC), node + edge budget clamping at the
+	// per-service ceiling, a RecallContextLog row appended
+	// with verb='expand', and the same `graph_store_unavailable`
+	// closed-set degraded-fallback path as `agent.recall`.
+	// See `internal/agentapi/expand.go.Service.Expand`.
 	Expand(context.Context, *ExpandRequest) (*ExpandResponse, error)
 	// Summarize materialises a neighborhood card into a
 	// natural-language summary; owned by Stage 5.4. Placeholder.
@@ -314,5 +339,5 @@ var AgentService_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "proto/agent.proto",
+	Metadata: "agent.proto",
 }

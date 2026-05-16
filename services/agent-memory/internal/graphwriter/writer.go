@@ -371,7 +371,7 @@ func (w *Writer) EnsureCommit(ctx context.Context, in CommitInput) (rec CommitRe
 		return CommitRecord{}, errors.New("graphwriter: EnsureCommit: empty sha")
 	}
 	if in.CommittedAt.IsZero() {
-		in.CommittedAt = w.now()
+		return CommitRecord{}, errors.New("graphwriter: EnsureCommit: zero committed_at")
 	}
 
 	// `parent_sha` column is nullable; map empty Go string -> SQL NULL.

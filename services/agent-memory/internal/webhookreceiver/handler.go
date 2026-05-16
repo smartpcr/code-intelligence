@@ -383,6 +383,15 @@ func extractRepoID(path string) (string, bool) {
 // the caller. This is intentional defence-in-depth: a fail-open
 // posture under DB outage would let an attacker exploit a
 // momentary `pg_bouncer` blip to land a fake event.
+//
+// Secret lifetime: `lookupSecret` returns a freshly-allocated
+// []byte so we can `clear()` the cleartext bytes as soon as
+// the HMAC has been computed and compared. This shortens the
+// window in which a memory-read primitive (core dump,
+// /proc/pid/mem, future swap-to-disk) could harvest the
+// secret on a long-lived process. The hmac.Hash retains only
+// derived ipad/opad state, not the raw secret, and goes out
+// of scope at function return.
 func (h *Handler) verifySignature(ctx context.Context, repoID, header string, body []byte) bool {
 	// Strip the `sha256=` prefix; case-insensitive on the
 	// prefix per GitHub's published example (real-world
@@ -407,13 +416,18 @@ func (h *Handler) verifySignature(ctx context.Context, repoID, header string, bo
 		)
 		return false
 	}
-	if secret == "" {
+	// Zero the cleartext on every return path -- including the
+	// "no such repo" branch below. `clear` on a nil/empty slice
+	// is a documented no-op (Go 1.21+), so the defer is safe to
+	// register before the length check.
+	defer clear(secret)
+	if len(secret) == 0 {
 		// Either the repo is not registered OR mgmt.register
 		// has not yet been called for it. Same uniform reject.
 		return false
 	}
 
-	mac := hmac.New(sha256.New, []byte(secret))
+	mac := hmac.New(sha256.New, secret)
 	_, _ = mac.Write(body) // hash.Hash.Write never returns an error
 	expected := mac.Sum(nil)
 
@@ -426,17 +440,27 @@ func (h *Handler) verifySignature(ctx context.Context, repoID, header string, bo
 	return hmac.Equal(expected, provided)
 }
 
-// lookupSecret returns the per-repo HMAC secret. Returns an
-// empty string with nil error when the repo is unknown so the
+// lookupSecret returns the per-repo HMAC secret. Returns a
+// nil slice with nil error when the repo is unknown so the
 // caller does not have to distinguish sql.ErrNoRows from other
 // DB errors -- only true DB outages propagate as a non-nil
 // error.
-func (h *Handler) lookupSecret(ctx context.Context, repoID string) (string, error) {
+//
+// The secret is returned as []byte (not string) so the caller
+// can `clear()` the underlying buffer once the HMAC has been
+// computed. database/sql guarantees that Scan into *[]byte
+// produces a freshly-allocated copy of the column bytes (see
+// the database/sql package docs on Rows.Scan), so mutating /
+// zeroing the returned slice is safe and does not corrupt any
+// driver-internal state. This is defence-in-depth against a
+// memory-read primitive harvesting accumulated secrets from
+// the GC heap of a long-running process.
+func (h *Handler) lookupSecret(ctx context.Context, repoID string) ([]byte, error) {
 	const q = `SELECT webhook_secret FROM repo_webhook_secret WHERE repo_id = $1::uuid`
-	var secret string
+	var secret []byte
 	err := h.db.QueryRowContext(ctx, q, repoID).Scan(&secret)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
+		return nil, nil
 	}
 	if err != nil {
 		// Includes the case where `repoID` is not a valid UUID:
@@ -446,9 +470,9 @@ func (h *Handler) lookupSecret(ctx context.Context, repoID string) (string, erro
 		// We still log the error at WARN level inside verify so
 		// a flood of malformed requests is observable.
 		if isInvalidUUIDError(err) {
-			return "", nil
+			return nil, nil
 		}
-		return "", err
+		return nil, err
 	}
 	return secret, nil
 }

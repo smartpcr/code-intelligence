@@ -14,7 +14,18 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/lib/pq"
 )
+
+// pgErrCodeInvalidTextRepresentation is the SQLSTATE PostgreSQL
+// returns when a text value can not be cast to the requested
+// type (class 22, code P02). For this package the canonical
+// trigger is the `$1::uuid` cast in `lookupSecret` against a
+// non-UUID URL segment. Pulled out as a constant so the
+// classifier and any future test fixture share the same literal
+// rather than scattering "22P02" through the code.
+const pgErrCodeInvalidTextRepresentation = "22P02"
 
 // DefaultMaxBodyBytes caps the inbound webhook body so a
 // pre-auth attacker cannot exhaust memory before signature
@@ -465,10 +476,11 @@ func (h *Handler) lookupSecret(ctx context.Context, repoID string) ([]byte, erro
 	if err != nil {
 		// Includes the case where `repoID` is not a valid UUID:
 		// PostgreSQL returns SQLSTATE 22P02 (invalid_text_repr)
-		// rather than no-rows. We treat that the same as "no
-		// such repo" so a malformed URL is still a uniform 401.
-		// We still log the error at WARN level inside verify so
-		// a flood of malformed requests is observable.
+		// on the `$1::uuid` cast rather than no-rows. We treat
+		// that the same as "no such repo" so a malformed URL is
+		// still a uniform 401. We still log the error at WARN
+		// level inside verify so a flood of malformed requests
+		// is observable.
 		if isInvalidUUIDError(err) {
 			return nil, nil
 		}
@@ -477,23 +489,48 @@ func (h *Handler) lookupSecret(ctx context.Context, repoID string) ([]byte, erro
 	return secret, nil
 }
 
-// isInvalidUUIDError matches PostgreSQL SQLSTATE 22P02
-// (`invalid_text_representation`) on the
-// `$1::uuid` cast -- the diagnostic carries the column type
-// in the error message. We classify it as "no such repo" so
-// non-UUID URL paths return 401 the same way a UUID-shaped
-// but unknown id does.
+// isInvalidUUIDError reports whether `err` is a PostgreSQL
+// invalid-text-representation diagnostic (SQLSTATE 22P02). For
+// this package the only practical trigger is the `$1::uuid`
+// cast in `lookupSecret` failing on a non-UUID URL segment; we
+// classify the cast failure as "no such repo" so a non-UUID URL
+// path returns 401 the same way a UUID-shaped but unknown id
+// does, instead of leaking a 500.
 //
-// String matching is robust enough here -- pq always renders
-// 22P02 with the literal `invalid input syntax for type uuid`
-// substring; we look for the lower-case form to avoid pulling
-// in `lib/pq`'s typed error just for this one classification.
+// Classification is done by SQLSTATE, NOT by substring matching
+// on the error message. The wire-protocol SQLSTATE is stable
+// across PostgreSQL versions and server `lc_messages` locales,
+// whereas the rendered message ("invalid input syntax for type
+// uuid") is English-only and has drifted historically. Two
+// driver shapes are accepted so this function does not need to
+// change if the package ever migrates from `lib/pq` to `pgx`:
+//
+//   - `*pq.Error` exposes the SQLSTATE on its `Code` field.
+//     This is the primary path -- it is what `database/sql`
+//     surfaces today via the registered `postgres` driver.
+//   - Any error satisfying `interface{ SQLState() string }` is
+//     also matched. `*pgconn.PgError` (pgx v5) implements this
+//     interface, so a future driver swap keeps working without
+//     a re-classification edit here.
+//
+// Returns false for `nil`, for non-Postgres errors, and for
+// Postgres errors with a different SQLSTATE -- those propagate
+// to the caller as opaque 500s, which is the correct behaviour
+// (an unexpected DB error should not be silently downgraded to
+// 401 "unauthorized").
 func isInvalidUUIDError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "invalid input syntax for type uuid")
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return string(pqErr.Code) == pgErrCodeInvalidTextRepresentation
+	}
+	var stateErr interface{ SQLState() string }
+	if errors.As(err, &stateErr) {
+		return stateErr.SQLState() == pgErrCodeInvalidTextRepresentation
+	}
+	return false
 }
 
 // enqueue writes the `repo_event` audit row and the

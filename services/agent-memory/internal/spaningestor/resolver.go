@@ -631,9 +631,17 @@ func (r *Resolver) attachBlock(
 //	1 candidate, sig empty       → (cand, ReasonNameMatched)
 //	1 candidate, sig set         → see signature-match policy below
 //	>1 candidates, sig empty     → (nil, ReasonAmbiguousName)
-//	>1 candidates, sig set       → filter by ParamSignature equality;
-//	                               1 survivor → (it, ReasonNameMatched);
-//	                               0 / >1 survivors → (nil, ReasonSignatureMismatch / ReasonAmbiguousName)
+//	>1 candidates, sig set       → partition into KNOWN (non-empty
+//	                               ParamSignature) and UNKNOWN
+//	                               (empty ParamSignature) buckets;
+//	                               filter KNOWN by ParamSignature
+//	                               equality:
+//	                                 1 KNOWN survivor → (it, ReasonNameMatched)
+//	                                 >1 KNOWN survivors → (nil, ReasonAmbiguousName)
+//	                                 0 KNOWN survivors → fall back
+//	                                   to UNKNOWN bucket (see
+//	                                   empty-ParamSignature fallback
+//	                                   policy below).
 //
 // Signature-match policy on a unique candidate
 // --------------------------------------------
@@ -649,6 +657,50 @@ func (r *Resolver) attachBlock(
 // extract one), accepting the unique candidate is correct — the
 // signature attribute is the disambiguator-of-last-resort, not a
 // blocker on its own.
+//
+// Empty-ParamSignature fallback policy (multi-candidate)
+// ------------------------------------------------------
+// In the multi-candidate branch a candidate's empty
+// `ParamSignature` means the AST pass did not extract its
+// parameter list — NOT that its parameter list is genuinely
+// empty.  Such candidates therefore CANNOT be ruled out by a
+// `signatureMatches` comparison: we simply have nothing to
+// compare against.  An earlier version of this function
+// silently discarded them in the filter loop, which made the
+// correct overload unreachable whenever its params failed to
+// extract — the resolver then returned `ReasonSignatureMismatch`
+// even though the actual mismatch was a graph-quality issue,
+// not a span-quality one.
+//
+// We instead partition into two buckets and treat the UNKNOWN
+// bucket as best-effort fallback survivors:
+//
+//   - KNOWN matches take precedence: if any candidate's
+//     non-empty `ParamSignature` matches `sig`, the UNKNOWN
+//     bucket is ignored.  This favours precision when we have
+//     ground truth on the candidate side.
+//   - When 0 KNOWN candidates match (every non-empty
+//     `ParamSignature` was a mismatch), the UNKNOWN bucket
+//     becomes the only remaining plausible set:
+//       - 1 UNKNOWN → accept it as `ReasonNameMatched` (mirrors
+//         the single-candidate empty-param policy: the only
+//         candidate we couldn't rule out is the best remaining
+//         guess).
+//       - >1 UNKNOWN → `ReasonAmbiguousName` — multiple
+//         indistinguishable candidates remain.
+//       - 0 UNKNOWN → `ReasonSignatureMismatch` — every
+//         candidate had a concrete `ParamSignature` and none
+//         matched.
+//
+// Note on `ReasonAmbiguousName` vs `ReasonSignatureMismatch`:
+// when every candidate's `ParamSignature` is empty (no
+// signatures to compare against), we report `AmbiguousName`
+// rather than `SignatureMismatch` because the resolver never
+// actually performed a signature comparison.  The span
+// outcome is unresolved either way (so `span_unresolved_total`
+// is unchanged), but the reason label is a more faithful
+// diagnostic for operators reading the unresolved-reason
+// breakdown.
 func chooseMethod(cands []MethodCandidate, sig string) (*MethodCandidate, ResolutionReason) {
 	if len(cands) == 0 {
 		return nil, ReasonNoNameMatch
@@ -670,9 +722,16 @@ func chooseMethod(cands []MethodCandidate, sig string) (*MethodCandidate, Resolu
 	if sig == "" {
 		return nil, ReasonAmbiguousName
 	}
+	// Partition candidates so that empty-`ParamSignature` entries
+	// (which cannot be ruled out by `signatureMatches`) are kept
+	// as best-effort fallback survivors rather than silently
+	// discarded — see the empty-ParamSignature fallback policy
+	// above for why.
 	var matched []MethodCandidate
+	var unknown []MethodCandidate
 	for _, c := range cands {
 		if c.ParamSignature == "" {
+			unknown = append(unknown, c)
 			continue
 		}
 		if signatureMatches(c.ParamSignature, sig) {
@@ -681,7 +740,27 @@ func chooseMethod(cands []MethodCandidate, sig string) (*MethodCandidate, Resolu
 	}
 	switch len(matched) {
 	case 0:
-		return nil, ReasonSignatureMismatch
+		// No KNOWN candidate matched.  Fall back to the UNKNOWN
+		// bucket: empty-`ParamSignature` candidates couldn't be
+		// ruled out by signature comparison, so they're the only
+		// remaining plausible matches.
+		switch len(unknown) {
+		case 0:
+			// Every candidate had a concrete `ParamSignature`
+			// and none matched.  Genuine signature mismatch.
+			return nil, ReasonSignatureMismatch
+		case 1:
+			// Exactly one candidate we couldn't rule out —
+			// mirror the single-candidate empty-param policy.
+			only := unknown[0]
+			return &only, ReasonNameMatched
+		default:
+			// Multiple indistinguishable empty-param
+			// candidates remain; report ambiguous rather than
+			// sig-mismatch because no signature comparison
+			// actually rejected anything.
+			return nil, ReasonAmbiguousName
+		}
 	case 1:
 		only := matched[0]
 		return &only, ReasonNameMatched

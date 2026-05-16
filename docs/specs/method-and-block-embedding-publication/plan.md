@@ -154,7 +154,7 @@ which mandates "a new `'queued'` event row, never an update").
 | `point_id`                  | `uuid_v5(NS_EMBEDDING_PUBLISH, publish_id)` | reused from input row            |
 | `target_id`, `target_kind`  | from the just-committed Node  | reused from input row            |
 | `embedding_model_version`   | from `EmbeddingModel.Version()` at insert time | **always reused as-is.** If it no longer matches the active version, the reader's published-filter silently drops the hit (§9.6). The model-upgrade supersede flow — *new* `EmbeddingPublish` at the active version plus a `superseded` event on the prior `publish_id` — is **owned by the bulk re-embed driver and is out of scope here**. The flusher in this stage **never** mints a new `EmbeddingPublish`. |
-| `attempt_index` (on event)  | `1`                           | reserved inside a short Tx-A that takes `pg_advisory_xact_lock(LockKeyForRetry(publish_id))` (64-bit `hashtextextended` per §"`PublishNew` at-most-once contract" / step-4), re-reads the latest event for the `publish_id`, no-ops if latest is `published` / `superseded` (so a racing loser cannot regress a successful publish), otherwise inserts `queued@max+1` and commits. Subsequent `vector_written` / `failed` / `published` events for that attempt are committed in separate short transactions **without** the advisory lock — uniqueness on `(publish_id, attempt_index, event_kind)` is enough because the `attempt_index` was already reserved in Tx-A. External embed + Qdrant calls run **outside** any DB transaction. See §"Transaction scope" and §"No regression on race" below for the rationale. |
+| `attempt_index` (on event)  | `1`                           | reserved inside a short Tx-A that takes `pg_advisory_xact_lock(LockKeyForRetry(publish_id))` (64-bit `hashtextextended` per §"`PublishNew` at-most-once contract" / step-4), re-reads the latest event for the `publish_id`, no-ops if latest is `published` / `superseded` (so a racing loser cannot regress a successful publish), otherwise inserts `queued@max+1` and commits. Subsequent `vector_written` / `failed` / `published` events for that attempt are committed in separate short transactions **without** the advisory lock. These follow-on inserts are safe **not** because the DB enforces uniqueness on `(publish_id, attempt_index, event_kind)` — migration 0015 deliberately does **not** add such a constraint (its PK is `(event_id, created_at)` with `event_id = gen_random_uuid()`) — but because the single in-process goroutine that committed Tx-A is the **sole owner of that `attempt_index`** and no other writer can know about it. See §"Why no DB uniqueness on `(publish_id, attempt_index, event_kind)` is required" below for the full code-level ownership argument. External embed + Qdrant calls run **outside** any DB transaction. See §"Transaction scope" and §"No regression on race" below for the rationale. |
 | `EmbeddingPublish` row      | **inserted**                  | **not inserted**                 |
 
 This is what makes the retry path duplication-free: there is one and
@@ -201,13 +201,87 @@ transactions per attempt, with external I/O strictly between them:
    flusher's `vector_written` staleness predicate (next section)
    re-drives it at `attempt_index+1`. Tx-C does **not** re-take the
    advisory lock — the `attempt_index` was already reserved in Tx-A
-   and the `(publish_id, attempt_index, event_kind)` triple is
-   unique, so a concurrent flusher that already reserved
-   `attempt_index+1` cannot collide with Tx-C's `published@N`.
+   by this same goroutine, and the publisher's code-level ownership
+   of that `attempt_index` (no other writer reserved it) is what
+   prevents collisions. The DB itself does **not** enforce
+   uniqueness on `(publish_id, attempt_index, event_kind)`; see
+   §"Why no DB uniqueness on `(publish_id, attempt_index, event_kind)`
+   is required" below.
 
 The advisory-lock window is therefore bounded by the **Tx-A**
 duration only — a single SELECT + 1–2 INSERTs — never by Qdrant
 latency.
+
+### Why no DB uniqueness on `(publish_id, attempt_index, event_kind)` is required
+
+Iteration 4 of this plan asserted that Tx-B / Tx-C could run
+without the advisory lock because the DB would reject a duplicate
+`(publish_id, attempt_index, event_kind)` row. That claim was
+**wrong**: `services/agent-memory/migrations/0015_embedding_publish.sql`
+declares `embedding_publish_event` with `PRIMARY KEY
+(event_id, created_at)` where `event_id` defaults to
+`gen_random_uuid()`, plus a non-negative `attempt_index` CHECK and
+a `(publish_id, created_at DESC)` index. There is **no** unique
+index on `(publish_id, attempt_index, event_kind)` and **none is
+being added by this stage**. (Adding one is possible but would
+have to include the `created_at` partition key per PostgreSQL's
+rule, which means it would not enforce global uniqueness anyway —
+two `vector_written@N` rows at different `created_at` would both
+succeed. So a partial unique index is not a sound mitigation
+either.)
+
+The correctness argument is therefore **code-level attempt
+ownership**, not a DB constraint:
+
+1. **Reservation is single-writer.** Inside Tx-A, exactly one
+   goroutine holds `pg_advisory_xact_lock(LockKeyForRetry(
+   publish_id))` (or `LockKeyForPublishNew(...)` for the very
+   first attempt). It reads `max(attempt_index)` for that
+   `publish_id`, computes `attempt_index = max+1`, INSERTs
+   `queued@max+1`, and commits. No other Tx-A can read the same
+   max because they are blocked on the lock; once Tx-A commits
+   they read a higher max and reserve `max+2`. So at any instant
+   **at most one goroutine in the cluster believes it owns
+   `(publish_id, attempt_index)`**.
+2. **Tx-B / Tx-C are linear continuations of that one goroutine.**
+   The publisher inserts `vector_written@attempt_index` (or
+   `failed@attempt_index`) in Tx-B and, on success,
+   `published@attempt_index` in Tx-C. There is **no other writer
+   that knows the value of `attempt_index` it owns** — the value
+   lives only in the goroutine's stack frame between Tx-A commit
+   and Tx-C commit. A concurrent flusher / publisher that grabs
+   the lock after Tx-A commits will read the new max
+   (`= attempt_index`) and reserve `attempt_index+1`, never
+   `attempt_index`.
+3. **Process crash between Tx-A and Tx-C is safe.** If the
+   process owning `attempt_index = N` crashes after `Tx-B`
+   inserts `vector_written@N` and before Tx-C inserts
+   `published@N`, the value `N` is permanently abandoned. A
+   future flusher reads `max(attempt_index) = N` and reserves
+   `N+1`. The crashed-process state for `attempt_index = N`
+   simply never gets a `published@N` row, which is exactly the
+   stale-`vector_written` case the flusher's predicate (step-8)
+   recovers via `attempt_index+1`. Two attempts may share a
+   `publish_id`, but **never** the same `(publish_id,
+   attempt_index)` tuple, so each attempt's event chain is
+   distinct.
+4. **What this argument does NOT defend against.** A bug inside
+   `publisher.go` that calls `InsertPublishEvent` twice for the
+   same `(publish_id, attempt_index, event_kind)` from the same
+   goroutine, or two goroutines somehow holding the same
+   reservation, would not be caught by the DB. Step-5's unit
+   tests (assertion (f) "no UPDATE or DELETE" + assertion (g)
+   "two concurrent `RetryExisting` calls never produce duplicate
+   `attempt_index`") and step-11 Scenario F (concurrent flushers)
+   are the test-level safety net. If operations want a
+   belt-and-braces DB constraint, the right place to add one is
+   a **separate migration** in
+   `phase-foundation-and-schema/stage-embedding-state-log-migrations-and-roles`
+   adding `UNIQUE (publish_id, attempt_index, event_kind, created_at)`
+   on `embedding_publish_event` — explicitly out of scope here
+   (the partition-key requirement and the resulting weakened
+   semantics need their own design pass), but the writer protocol
+   would not change at all if that migration later landed.
 
 ### No regression on race (monotonic `published` + `RetryExisting` eligibility re-check)
 
@@ -622,16 +696,19 @@ the file count for that PR (≤ 20 enforced server-side).
       starts immediately after Tx-A has reserved the attempt and
       committed the initial `queued@attempt_index`. It runs the
       external embed + `UpsertPoint` call, then Tx-B (no advisory
-      lock — uniqueness of
-      `(publish_id, attempt_index, event_kind)` is enough), then
-      `FetchPoint`, then Tx-C. If `FetchPoint` fails or the process
-      crashes after `vector_written`, the row is picked up by the
-      flusher's `vector_written` staleness predicate (step-8) and
-      re-driven at `attempt_index+1`. Tx-B / Tx-C of attempt N may
-      interleave with Tx-A / Tx-B / Tx-C of attempt N+1 from a
-      racing flusher — the monotonic-`published` reader filter and
-      flusher predicate (plan §"No regression on race") absorb the
-      interleaving without regression.
+      lock — the goroutine that committed Tx-A is the sole owner
+      of `attempt_index`, so no other writer can produce a
+      colliding `vector_written@N` / `failed@N` row; see plan
+      §"Why no DB uniqueness on `(publish_id, attempt_index,
+      event_kind)` is required" for the full code-level argument),
+      then `FetchPoint`, then Tx-C. If `FetchPoint` fails or the
+      process crashes after `vector_written`, the row is picked up
+      by the flusher's `vector_written` staleness predicate
+      (step-8) and re-driven at `attempt_index+1`. Tx-B / Tx-C of
+      attempt N may interleave with Tx-A / Tx-B / Tx-C of attempt
+      N+1 from a racing flusher — the monotonic-`published` reader
+      filter and flusher predicate (plan §"No regression on race")
+      absorb the interleaving without regression.
 
   Implementation note: the SELECT in PublishNew's Tx-A rides the
   partial `embedding_publish_node_id_idx` (or `…_concept_version_id_idx`)
@@ -703,30 +780,56 @@ the file count for that PR (≤ 20 enforced server-side).
   whose `created_at` is older than `AM_PUBLISH_RAW_STALENESS`
   (proposed 60 s) — see plan §"Stale `vector_written`" for why this
   third state must be flushed too. **All three eligibility branches
-  additionally require `NOT (EXISTS published AND NOT EXISTS
-  superseded)`** on the `publish_id` so that a row whose `published@N`
-  has already landed (even with later `vector_written@N+1` chains
-  from a racing retry) is **not** re-driven again — wasted Qdrant
-  work, harmless to correctness because the reader's monotonic-
-  `published` filter (step-9) already keeps the row visible. LATERAL
-  JOIN on the `(publish_id, created_at DESC)` index from §8.7.2 for
-  the latest event; EXISTS checks on the partial `(publish_id) WHERE
-  event_kind IN ('published','superseded')` index. The flusher calls
-  `publisher.RetryExisting(ctx, publish)` with each eligible row.
-  The flusher **passes the existing `EmbeddingPublish` row**, never a
-  `Node`, so `publish_id` + `point_id` + `target_id` +
-  `embedding_model_version` are reused. Each new attempt appends an
-  event chain with `attempt_index = max(prior) + 1`, never an UPDATE,
-  never a duplicate `EmbeddingPublish`. Integration test uses a fake
-  Qdrant that fails once then succeeds and asserts the row reaches
-  `'published'` with `attempt_index = 2`, and that the count of
-  `EmbeddingPublish` rows for that target is still 1. A second
-  integration test exercises the `vector_written` staleness path (see
-  step-11 Scenario E). A third integration test exercises the
-  no-redundant-flush path: after `published@1` lands, even an
-  artificially-stale `vector_written@2` chain does **not** trigger
-  another flusher attempt (asserts the `NOT EXISTS published` clause
-  on the eligibility predicate).
+  additionally require BOTH (i) `NOT EXISTS (… event_kind =
+  'superseded' …)`** on the `publish_id` (terminal dead-letter — a
+  superseded row must never be re-driven, otherwise the flusher
+  would append a fresh `queued / vector_written / published` chain
+  *after* the supersede event, leaving the log in a contradictory
+  state; rubber-duck finding 1) **AND (ii) `NOT (EXISTS published
+  AND NOT EXISTS superseded)`** on the `publish_id` (a row that
+  already reached `published` must not be re-driven — wasted
+  Qdrant work; harmless to correctness because the reader's
+  monotonic-`published` filter (step-9) already keeps the row
+  visible). These two clauses are deliberately spelled out
+  separately even though `(ii)` implies the published-side of
+  `(i)` whenever a `published` event exists: spelling them
+  separately makes the "no INSERTs after a `superseded` event" log
+  invariant **explicit at the flusher layer**, so an
+  implementation that copies the predicate cannot accidentally
+  drop the superseded guard while preserving the published one.
+  LATERAL JOIN on the `(publish_id, created_at DESC)` index from
+  §8.7.2 for the latest event; EXISTS checks ride the partial
+  `(publish_id) WHERE event_kind IN ('published','superseded')`
+  index. The flusher calls `publisher.RetryExisting(ctx, publish)`
+  with each eligible row. The flusher **passes the existing
+  `EmbeddingPublish` row** (never a `Node`), so `publish_id` +
+  `point_id` + `target_id` + `embedding_model_version` are reused.
+  Each new attempt appends an event chain with
+  `attempt_index = max(prior) + 1`, never an UPDATE, never a
+  duplicate `EmbeddingPublish`. **Integration tests (four
+  cases — matched 1:1 with the YAML):**
+    1. Fake Qdrant fails once then succeeds; row reaches
+       `'published'` with `attempt_index = 2`, and the count of
+       `EmbeddingPublish` rows for that target is still 1.
+    2. `UpsertPoint` succeeds but `FetchPoint` errors once; after
+       the staleness window the flusher re-drives the row to
+       `published@2` via the `vector_written` predicate
+       (step-11 Scenario E).
+    3. **No-redundant-flush after `published`.** After `published@1`
+       lands, an artificially-stale `vector_written@2` chain (from
+       a concurrent race that lost) does **not** trigger another
+       flusher attempt — asserts the `NOT (EXISTS published AND
+       NOT EXISTS superseded)` clause filters the row out.
+    4. **No-reflush after `superseded`.** Pre-insert a
+       `superseded` event on a `publish_id` whose latest
+       pre-supersede event was `'failed@1'` past the standard
+       backoff (the row would be eligible under the latest-event
+       check alone). Assert the flusher's `NOT EXISTS superseded`
+       clause filters the row out and no `RetryExisting` call is
+       issued. This proves clause `(i)` independently of
+       clause `(ii)`, and pairs with the inside-Tx-A safety net
+       exercised by step-11 Scenario I for direct/administrative
+       callers that bypass the flusher.
 
 ### Stage 3: Read-side filter and verification
 
@@ -873,18 +976,25 @@ the file count for that PR (≤ 20 enforced server-side).
     partial UNIQUE index — which is unimplementable against
     migration 0015 (see §"`PublishNew` at-most-once contract" for
     why).
-    (i) **`RetryExisting` terminal-superseded guard.** A test
-    pre-inserts a `superseded` event on a `publish_id` whose latest
-    pre-supersede event was `failed@1` (no `published` ever
-    landed). The flusher polls and decides this row is eligible by
-    the legacy `latest = failed past backoff` predicate; the test
-    asserts that `RetryExisting`'s **first** Tx-A guard
-    (`EXISTS superseded`) fires and produces **zero** INSERTs —
-    proving the rubber-duck finding 1 fix. The flusher's own
-    eligibility predicate (step-8) should already filter this row
-    out before invoking RetryExisting; this scenario exercises the
-    inside-Tx-A safety net for paths that bypass the flusher (e.g.
-    direct administrative `RetryExisting` calls).
+    (i) **`RetryExisting` terminal-superseded guard (direct-call
+    safety net).** Pre-insert a `superseded` event on a `publish_id`
+    whose latest pre-supersede event was `failed@1` (no `published`
+    ever landed). **Invoke `RetryExisting(ctx, publish)` directly**
+    — bypassing the flusher entirely, to simulate an
+    administrative/manual retry or any future call site that does
+    not go through the flusher's eligibility predicate. Assert that
+    `RetryExisting`'s **first** Tx-A guard (`EXISTS superseded`)
+    fires and produces **zero** INSERTs — proving the rubber-duck
+    finding 1 fix at the publisher layer. The flusher's own
+    eligibility predicate (step-8 integration test 4) already
+    filters this row out *before* invoking `RetryExisting`, so the
+    two tests are complementary, not duplicative: step-8 test 4
+    proves the flusher never asks `RetryExisting` to retry a
+    superseded row, and this Scenario I proves `RetryExisting`
+    itself refuses the work even when asked directly. There is no
+    "legacy predicate" path — both layers refuse the row; this
+    test exists purely for the inside-Tx-A safety net contract on
+    direct callers.
 
 ## Out of scope
 
@@ -980,6 +1090,76 @@ the file count for that PR (≤ 20 enforced server-side).
   Tx-A (e.g. 2 s) so a broken connection cannot stall the advisory
   lock indefinitely? Rubber-duck finding 7 — likely yes, with the
   exact value tuned during operational shakeout. Not a blocker.
+
+## Prior feedback resolution (iteration 5)
+
+Direct response to iteration 4's `## Still needs improvement` list,
+one item per evaluator finding. Iteration 4's resolution section is
+preserved below for traceability but the active list (the one the
+evaluator should grade against) is **this** §"Prior feedback
+resolution (iteration 5)" subsection immediately below.
+
+### Prior feedback resolution
+
+1. **ADDRESSED — false `(publish_id, attempt_index, event_kind)`
+   uniqueness claim removed; code-level attempt ownership argument
+   added.** The evaluator correctly noted that migration 0015's
+   `embedding_publish_event` table has PK `(event_id, created_at)`
+   with `event_id = gen_random_uuid()` plus only the nonneg
+   `attempt_index` CHECK and the `(publish_id, created_at DESC)`
+   index — there is no DB-level uniqueness on
+   `(publish_id, attempt_index, event_kind)`, so the iter-4 claim
+   that Tx-B / Tx-C are safe "because uniqueness on that triple is
+   enough" was wrong. Three callsites were rewritten to drop the
+   schema-uniqueness claim and replace it with a code-level
+   attempt-ownership argument: (a) the §"Identity contract"
+   `attempt_index` table row, (b) the §"Transaction scope" Tx-C
+   bullet, and (c) the step-5 inner-core `publishCore` bullet.
+   A new dedicated subsection §"Why no DB uniqueness on
+   `(publish_id, attempt_index, event_kind)` is required" was
+   added between §"Transaction scope" and §"No regression on
+   race" giving the full four-point argument: (i) Tx-A's advisory
+   lock makes reservation single-writer, (ii) Tx-B / Tx-C are
+   linear continuations of the same goroutine, (iii) crash safety
+   leaves the abandoned `attempt_index` permanently orphaned and
+   the flusher picks up `attempt_index+1`, (iv) what the argument
+   does NOT defend against (in-process bugs — covered by step-5
+   unit tests and step-11 Scenario F). Explicit forward note:
+   adding a DB unique index later is possible but would have to
+   include `created_at` (partition key rule), which weakens its
+   semantics — that's why it's not being added here, and adding
+   one later would require zero protocol changes.
+2. **ADDRESSED — `plan.md` step-8 now mirrors `work-items.yaml`
+   step-background-flusher's two explicit eligibility clauses
+   plus the superseded-no-reflush test.** The flusher eligibility
+   predicate is now spelled out as BOTH (i) `NOT EXISTS (…
+   superseded …)` AND (ii) `NOT (EXISTS published AND NOT
+   EXISTS superseded)`, with the design rationale for spelling
+   them as two clauses rather than one (so an implementation
+   cannot accidentally drop the superseded guard while preserving
+   the published one). The integration-test list is expanded from
+   3 to 4 cases, with the new test 4 (no-reflush after
+   `superseded`) pre-inserting a `superseded` event on a
+   `failed@1`-past-backoff `publish_id` and asserting the
+   flusher's `NOT EXISTS superseded` clause filters the row out
+   before any `RetryExisting` call is issued. This matches
+   `work-items.yaml` lines 259-293 verbatim in intent.
+3. **ADDRESSED — Scenario I rewritten to remove the
+   "legacy predicate" contradiction.** The prior wording said
+   "the flusher polls and decides this row is eligible by the
+   legacy `latest = failed past backoff` predicate; the test
+   asserts that RetryExisting's first Tx-A guard fires" — which
+   internally contradicted step-8's eligibility predicate that
+   already filters superseded rows. Scenario I now explicitly
+   states the test **invokes `RetryExisting(ctx, publish)`
+   directly** (bypassing the flusher) to simulate an
+   administrative/manual retry or any future call site that does
+   not go through the flusher's predicate, and adds that
+   Scenario I and step-8 test 4 are **complementary** (step-8
+   proves the flusher never asks RetryExisting to retry a
+   superseded row; Scenario I proves RetryExisting itself
+   refuses the work even when asked directly). The word
+   "legacy" is removed entirely.
 
 ## Prior feedback resolution (iteration 4)
 

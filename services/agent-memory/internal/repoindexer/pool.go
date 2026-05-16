@@ -144,7 +144,15 @@ func (p *Pool) Workers() []*Worker {
 // finish so the caller does not leak goroutines.
 //
 // `ctx` cancellation signals every worker to stop; the pool
-// returns ctx.Err() in that case.
+// returns ctx.Err() in that case. Both `context.Canceled`
+// (caller-driven cancel) and `context.DeadlineExceeded`
+// (parent-imposed deadline) collapse to the same outcome —
+// the worker's returned error is suppressed (since it is
+// merely a downstream reaction to the parent ctx going Done)
+// and `ctx.Err()` is returned instead. The guard is expressed
+// as `ctx.Err() == nil` so that any future ctx-driven exit
+// reason (e.g. errors wrapping the cause) is handled uniformly
+// without needing to enumerate sentinel values.
 func (p *Pool) Run(ctx context.Context) error {
 	var (
 		wg      sync.WaitGroup
@@ -156,7 +164,7 @@ func (p *Pool) Run(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := w.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			if err := w.Run(ctx); err != nil && ctx.Err() == nil {
 				errOnce.Do(func() { firstE = err })
 			}
 		}()

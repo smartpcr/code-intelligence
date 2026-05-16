@@ -1,12 +1,13 @@
 // Package agentapi: gRPC server adapter for the §6.4 recall
-// verb.
+// verb AND the §6.1.2 observe verb.
 //
 // Stage 5.1 mandates the gRPC service skeleton in
 // `proto/agent.proto` actually be CALLABLE (evaluator iter-1
 // #1: "The gRPC service is not actually registered or
 // callable"). This file owns the translation between the
 // `agentpb.AgentService` surface and the in-process
-// `*agentapi.Service`. The binary composition root
+// `*agentapi.Service` (recall) + `*agentapi.ObserveService`
+// (observe). The binary composition root
 // (`cmd/agent-api/main.go`) constructs both and registers
 // the server on the running `*grpc.Server`.
 //
@@ -35,9 +36,17 @@
 //     (server-side fault; the recall handler degrades to a
 //     snapshot internally and only returns a hard error when
 //     the snapshot fallback itself is unwired).
-//   - `Observe` / `Expand` / `Summarize` → `codes.Unimplemented`
-//     (the placeholder body shapes belong to Stages 5.2 /
-//     5.3 / 5.4). The embedded `UnimplementedAgentServiceServer`
+//   - `Observe` validation sentinels (HumanCorrected,
+//     DegradedRecallContextRoleForbidden, InvalidObservationRole,
+//     InvalidObservationTarget, InvalidOutcome, MissingRepoID/
+//     SessionID/TraceID/Action/ContextID, InvalidJSON,
+//     ContextNotFound) → `codes.InvalidArgument`.
+//   - `Observe` ErrEpisodicLogUnavailable WITHOUT a WAL wired
+//     → `codes.Unavailable` (caller should retry).
+//   - Any other `Observe` error → `codes.Internal`.
+//   - `Expand` / `Summarize` → `codes.Unimplemented`
+//     (the placeholder body shapes belong to Stages 5.3 /
+//     5.4). The embedded `UnimplementedAgentServiceServer`
 //     already returns these codes, but we re-export tiny
 //     stubs below so future implementers know exactly
 //     where to plug in.
@@ -45,6 +54,7 @@ package agentapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -54,9 +64,10 @@ import (
 	agentpb "github.com/smartpcr/code-intelligence/services/agent-memory/proto/agent"
 )
 
-// GRPCServer adapts `*Service` onto `agentpb.AgentServiceServer`.
-// Construct with `NewGRPCServer`; register on a
-// `*grpc.Server` with `agentpb.RegisterAgentServiceServer`.
+// GRPCServer adapts `*Service` AND `*ObserveService` onto
+// `agentpb.AgentServiceServer`. Construct with `NewGRPCServer`;
+// register on a `*grpc.Server` with
+// `agentpb.RegisterAgentServiceServer`.
 type GRPCServer struct {
 	// UnimplementedAgentServiceServer satisfies the gRPC
 	// forward-compatibility requirement: future verbs added
@@ -65,18 +76,38 @@ type GRPCServer struct {
 	// `codes.Unimplemented` for any unhandled method.
 	agentpb.UnimplementedAgentServiceServer
 
-	svc *Service
+	svc     *Service
+	observe *ObserveService
+}
+
+// GRPCOption configures a GRPCServer.
+type GRPCOption func(*GRPCServer)
+
+// WithObserveService plumbs the Stage 5.2 observe handler.
+// Without it `AgentService.Observe` falls through to the
+// embedded `UnimplementedAgentServiceServer` and returns
+// `codes.Unimplemented` — the legacy Stage 5.1 behaviour. The
+// production composition root always wires one.
+func WithObserveService(o *ObserveService) GRPCOption {
+	return func(g *GRPCServer) {
+		g.observe = o
+	}
 }
 
 // NewGRPCServer constructs the gRPC adapter. A nil `svc`
 // panics — the binary composition root MUST wire a real
 // service, and a half-wired server is worse than a fail-fast
-// crash.
-func NewGRPCServer(svc *Service) *GRPCServer {
+// crash. The observe handler is optional (see
+// `WithObserveService`).
+func NewGRPCServer(svc *Service, opts ...GRPCOption) *GRPCServer {
 	if svc == nil {
 		panic("agentapi: NewGRPCServer: nil *Service")
 	}
-	return &GRPCServer{svc: svc}
+	g := &GRPCServer{svc: svc}
+	for _, opt := range opts {
+		opt(g)
+	}
+	return g
 }
 
 // Recall implements `agentpb.AgentServiceServer.Recall`.
@@ -140,6 +171,63 @@ func (g *GRPCServer) Recall(ctx context.Context, req *agentpb.RecallRequest) (*a
 	return out, nil
 }
 
+// Observe implements `agentpb.AgentServiceServer.Observe`.
+// Translates the proto request shape into an in-process
+// `ObserveRequest`, invokes `ObserveService.Observe`, and
+// projects the response onto `agentpb.ObserveResponse`. When
+// no ObserveService is wired the method falls through to the
+// embedded `UnimplementedAgentServiceServer.Observe` (returns
+// codes.Unimplemented).
+func (g *GRPCServer) Observe(ctx context.Context, req *agentpb.ObserveRequest) (*agentpb.ObserveResponse, error) {
+	if g.observe == nil {
+		return g.UnimplementedAgentServiceServer.Observe(ctx, req)
+	}
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "agent.observe: nil request")
+	}
+	refs := make([]ObservationRef, 0, len(req.GetObservationRefs()))
+	for _, r := range req.GetObservationRefs() {
+		if r == nil {
+			// Defence-in-depth: a nil entry in a repeated
+			// field would dereference as zero-value below,
+			// which would surface as an "unknown role"
+			// validation error that does not name the
+			// specific architectural confusion. Reject up-
+			// front so the caller sees a precise message.
+			return nil, status.Errorf(codes.InvalidArgument,
+				"agent.observe: observation_refs[] contains a nil entry")
+		}
+		refs = append(refs, ObservationRef{
+			Role:      r.GetRole(),
+			NodeID:    r.GetNodeId(),
+			EdgeID:    r.GetEdgeId(),
+			ConceptID: r.GetConceptId(),
+			Weight:    r.GetWeight(),
+		})
+	}
+	in := ObserveRequest{
+		RepoID:          req.GetRepoId(),
+		SessionID:       req.GetSessionId(),
+		TraceID:         req.GetTraceId(),
+		ActionJSON:      json.RawMessage(req.GetActionJson()),
+		Outcome:         req.GetOutcome(),
+		SignalJSON:      json.RawMessage(req.GetSignalJson()),
+		ContextID:       req.GetContextId(),
+		ObservationRefs: refs,
+		EpisodeGroupID:  req.GetEpisodeGroupId(),
+	}
+	resp, err := g.observe.Observe(ctx, in)
+	if err != nil {
+		return nil, observeErrorToStatus(err)
+	}
+	return &agentpb.ObserveResponse{
+		EpisodeId:      resp.EpisodeID,
+		EpisodeGroupId: resp.EpisodeGroupID,
+		Degraded:       resp.Degraded,
+		DegradedReason: resp.DegradedReason,
+	}, nil
+}
+
 // recallErrorToStatus maps domain errors from `Service.Recall`
 // onto the gRPC status codes the agent caller can pattern-
 // match against. Centralised here so adding a new domain
@@ -158,6 +246,35 @@ func recallErrorToStatus(err error) error {
 	// error reaching here is either a misconfigured binary
 	// (no snapshot wired) or an embedder failure.
 	return status.Error(codes.Internal, fmt.Sprintf("agent.recall: %v", err))
+}
+
+// observeErrorToStatus maps the observe handler's sentinel
+// errors onto gRPC status codes. Validation sentinels map to
+// InvalidArgument (caller-correctable); a missing WAL on a
+// partition outage maps to Unavailable (the caller should
+// retry); everything else is Internal.
+func observeErrorToStatus(err error) error {
+	switch {
+	case errors.Is(err, ErrHumanCorrectedNotAllowed),
+		errors.Is(err, ErrDegradedRecallContextRoleForbidden),
+		errors.Is(err, ErrInvalidObservationRole),
+		errors.Is(err, ErrInvalidObservationTarget),
+		errors.Is(err, ErrInvalidOutcome),
+		errors.Is(err, ErrMissingRepoID),
+		errors.Is(err, ErrMissingSessionID),
+		errors.Is(err, ErrMissingTraceID),
+		errors.Is(err, ErrMissingAction),
+		errors.Is(err, ErrMissingContextID),
+		errors.Is(err, ErrInvalidJSON),
+		errors.Is(err, ErrContextNotFound):
+		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, ErrEpisodicLogUnavailable):
+		// Reaches here ONLY when no WAL was wired (the WAL
+		// fallback path turns this into a non-error
+		// degraded response). The caller should retry.
+		return status.Error(codes.Unavailable, err.Error())
+	}
+	return status.Error(codes.Internal, fmt.Sprintf("agent.observe: %v", err))
 }
 
 // clampInt32 saturates `n` into the int32 range. Used for

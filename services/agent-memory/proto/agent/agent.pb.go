@@ -528,22 +528,163 @@ func (x *RecallResponse) GetFiltered() int32 {
 	return 0
 }
 
-// Placeholder request / response messages for the other Agent
-// Surface verbs. They are defined here so the gRPC server can
-// register a single service descriptor today; the body shapes
-// will firm up as Stages 5.2 / 5.3 / 5.4 land.
-type ObserveRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ContextId     string                 `protobuf:"bytes,1,opt,name=context_id,json=contextId,proto3" json:"context_id,omitempty"`
-	Outcome       string                 `protobuf:"bytes,2,opt,name=outcome,proto3" json:"outcome,omitempty"`
-	Actor         string                 `protobuf:"bytes,3,opt,name=actor,proto3" json:"actor,omitempty"`
+// ObservationRef is one entry of `agent.observe.observation_refs[]`
+// (architecture.md §6.1.2). Each ref maps onto exactly one
+// `observation` row (§5.3.3). The caller MUST set the target
+// field that matches the role (e.g. `role=node_hit` requires
+// `node_id`); the server enforces the role/target pairing as
+// part of validation and rejects the call with INVALID_ARGUMENT
+// when the pairing is wrong.
+//
+// The `role` is one of the closed-set `observation_role` ENUM
+// members EXCEPT `degraded_recall_context` — that role is
+// reserved for the server-side auto-stamp path (§6.1.2). A
+// caller-supplied `role=degraded_recall_context` is rejected
+// with INVALID_ARGUMENT per C23.
+type ObservationRef struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Role      string                 `protobuf:"bytes,1,opt,name=role,proto3" json:"role,omitempty"`
+	NodeId    string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	EdgeId    string                 `protobuf:"bytes,3,opt,name=edge_id,json=edgeId,proto3" json:"edge_id,omitempty"`
+	ConceptId string                 `protobuf:"bytes,4,opt,name=concept_id,json=conceptId,proto3" json:"concept_id,omitempty"`
+	// weight is the caller-supplied "how much did this element
+	// contribute to the action" measure (§5.3.3). Unbounded —
+	// the schema does not pin a range — but the production
+	// reranker treats it as a [0.0, 1.0] contribution and
+	// operators expect that scale.
+	Weight        float64 `protobuf:"fixed64,5,opt,name=weight,proto3" json:"weight,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
+func (x *ObservationRef) Reset() {
+	*x = ObservationRef{}
+	mi := &file_proto_agent_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ObservationRef) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ObservationRef) ProtoMessage() {}
+
+func (x *ObservationRef) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_agent_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ObservationRef.ProtoReflect.Descriptor instead.
+func (*ObservationRef) Descriptor() ([]byte, []int) {
+	return file_proto_agent_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *ObservationRef) GetRole() string {
+	if x != nil {
+		return x.Role
+	}
+	return ""
+}
+
+func (x *ObservationRef) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *ObservationRef) GetEdgeId() string {
+	if x != nil {
+		return x.EdgeId
+	}
+	return ""
+}
+
+func (x *ObservationRef) GetConceptId() string {
+	if x != nil {
+		return x.ConceptId
+	}
+	return ""
+}
+
+func (x *ObservationRef) GetWeight() float64 {
+	if x != nil {
+		return x.Weight
+	}
+	return 0
+}
+
+// ObserveRequest is the wire shape for `agent.observe`
+// (architecture.md §6.1.2). The verb writes one `Episode`
+// row plus one `Observation` row per `observation_refs[]`
+// entry in a single transaction. See `internal/agentapi/observe.go`
+// for the canonical Go contract.
+//
+// Closed-set rules:
+//   - outcome MUST be one of {success, failure, refused,
+//     degraded}. `human_corrected` is reserved for
+//     `mgmt.feedback` (§6.2.2) — supplying it on observe is
+//     rejected with INVALID_ARGUMENT per C15.
+//   - observation_refs[*].role MUST be one of {node_hit,
+//     edge_hit, call_edge_hit, concept_hit}. `degraded_recall_context`
+//     is server-only per C23.
+type ObserveRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// context_id ties the Episode back to the recall snapshot
+	// the agent consumed (architecture.md §6.1.2). REQUIRED for
+	// `outcome != feedback` per the §5.3.1 schema CHECK.
+	ContextId string `protobuf:"bytes,1,opt,name=context_id,json=contextId,proto3" json:"context_id,omitempty"`
+	// outcome is the closed-set `outcome` ENUM literal
+	// (architecture.md §5.3.1). See the message-level closed-set
+	// rules above for the rejection contract.
+	Outcome string `protobuf:"bytes,2,opt,name=outcome,proto3" json:"outcome,omitempty"`
+	// actor is the legacy field carried over from the Stage 5.1
+	// placeholder. The §6.1.2 schema does not name a separate
+	// `actor` column on `Episode` — `kind='agent'` is always the
+	// surrogate. Retained on the wire for backward-compat; the
+	// server ignores it.
+	Actor string `protobuf:"bytes,3,opt,name=actor,proto3" json:"actor,omitempty"`
+	// repo_id (textual UUID) names the repo whose recall this
+	// Episode is paired with. REQUIRED.
+	RepoId string `protobuf:"bytes,4,opt,name=repo_id,json=repoId,proto3" json:"repo_id,omitempty"`
+	// session_id is the agent's per-conversation correlation id
+	// (free-form text). REQUIRED.
+	SessionId string `protobuf:"bytes,5,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	// trace_id is the per-action trace correlation id (free-form
+	// text). REQUIRED.
+	TraceId string `protobuf:"bytes,6,opt,name=trace_id,json=traceId,proto3" json:"trace_id,omitempty"`
+	// action_json is the structured action the agent took, stored
+	// verbatim on `Episode.action jsonb`. REQUIRED, MUST be valid
+	// JSON.
+	ActionJson []byte `protobuf:"bytes,7,opt,name=action_json,json=actionJson,proto3" json:"action_json,omitempty"`
+	// signal_json is the optional reward / training signal the
+	// agent surfaced (architecture.md §5.3.1). Stored verbatim on
+	// `Episode.signal_json jsonb`. Empty or zero-length omits the
+	// column.
+	SignalJson []byte `protobuf:"bytes,8,opt,name=signal_json,json=signalJson,proto3" json:"signal_json,omitempty"`
+	// observation_refs[] is the rank-ordered list of refs that
+	// become `Observation` rows (one per ref). May be empty (an
+	// Episode with no Observations is legal).
+	ObservationRefs []*ObservationRef `protobuf:"bytes,9,rep,name=observation_refs,json=observationRefs,proto3" json:"observation_refs,omitempty"`
+	// episode_group_id (textual UUID) is the optional group id
+	// the agent uses to correlate a multi-step plan. When empty
+	// the server mints a fresh group id.
+	EpisodeGroupId string `protobuf:"bytes,10,opt,name=episode_group_id,json=episodeGroupId,proto3" json:"episode_group_id,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
 func (x *ObserveRequest) Reset() {
 	*x = ObserveRequest{}
-	mi := &file_proto_agent_proto_msgTypes[5]
+	mi := &file_proto_agent_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -555,7 +696,7 @@ func (x *ObserveRequest) String() string {
 func (*ObserveRequest) ProtoMessage() {}
 
 func (x *ObserveRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[5]
+	mi := &file_proto_agent_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -568,7 +709,7 @@ func (x *ObserveRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ObserveRequest.ProtoReflect.Descriptor instead.
 func (*ObserveRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{5}
+	return file_proto_agent_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *ObserveRequest) GetContextId() string {
@@ -592,18 +733,81 @@ func (x *ObserveRequest) GetActor() string {
 	return ""
 }
 
+func (x *ObserveRequest) GetRepoId() string {
+	if x != nil {
+		return x.RepoId
+	}
+	return ""
+}
+
+func (x *ObserveRequest) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+func (x *ObserveRequest) GetTraceId() string {
+	if x != nil {
+		return x.TraceId
+	}
+	return ""
+}
+
+func (x *ObserveRequest) GetActionJson() []byte {
+	if x != nil {
+		return x.ActionJson
+	}
+	return nil
+}
+
+func (x *ObserveRequest) GetSignalJson() []byte {
+	if x != nil {
+		return x.SignalJson
+	}
+	return nil
+}
+
+func (x *ObserveRequest) GetObservationRefs() []*ObservationRef {
+	if x != nil {
+		return x.ObservationRefs
+	}
+	return nil
+}
+
+func (x *ObserveRequest) GetEpisodeGroupId() string {
+	if x != nil {
+		return x.EpisodeGroupId
+	}
+	return ""
+}
+
+// ObserveResponse is the wire shape for `agent.observe`.
+// `episode_id` is durable across the WAL fallback: the
+// pre-minted id surfaces on the response BEFORE the row is
+// guaranteed to be in the partition, and the eventually-
+// flushed `Episode` row carries the same id (architecture.md
+// §7.5).
 type ObserveResponse struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	EpisodeId      string                 `protobuf:"bytes,1,opt,name=episode_id,json=episodeId,proto3" json:"episode_id,omitempty"`
-	Degraded       bool                   `protobuf:"varint,2,opt,name=degraded,proto3" json:"degraded,omitempty"`
-	DegradedReason string                 `protobuf:"bytes,3,opt,name=degraded_reason,json=degradedReason,proto3" json:"degraded_reason,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	EpisodeId string                 `protobuf:"bytes,1,opt,name=episode_id,json=episodeId,proto3" json:"episode_id,omitempty"`
+	Degraded  bool                   `protobuf:"varint,2,opt,name=degraded,proto3" json:"degraded,omitempty"`
+	// degraded_reason is one of the §C22 closed-set values:
+	//   - episodic_log_unavailable  — Episode partition offline; WAL fallback engaged.
+	//   - consolidator_backpressure — Episode written; Consolidator queue full.
+	//
+	// Empty when degraded=false.
+	DegradedReason string `protobuf:"bytes,3,opt,name=degraded_reason,json=degradedReason,proto3" json:"degraded_reason,omitempty"`
+	// episode_group_id echoes the resolved group id (server-
+	// generated when the caller left the request field empty).
+	EpisodeGroupId string `protobuf:"bytes,4,opt,name=episode_group_id,json=episodeGroupId,proto3" json:"episode_group_id,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ObserveResponse) Reset() {
 	*x = ObserveResponse{}
-	mi := &file_proto_agent_proto_msgTypes[6]
+	mi := &file_proto_agent_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -615,7 +819,7 @@ func (x *ObserveResponse) String() string {
 func (*ObserveResponse) ProtoMessage() {}
 
 func (x *ObserveResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[6]
+	mi := &file_proto_agent_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -628,7 +832,7 @@ func (x *ObserveResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ObserveResponse.ProtoReflect.Descriptor instead.
 func (*ObserveResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{6}
+	return file_proto_agent_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ObserveResponse) GetEpisodeId() string {
@@ -652,6 +856,13 @@ func (x *ObserveResponse) GetDegradedReason() string {
 	return ""
 }
 
+func (x *ObserveResponse) GetEpisodeGroupId() string {
+	if x != nil {
+		return x.EpisodeGroupId
+	}
+	return ""
+}
+
 type ExpandRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
@@ -663,7 +874,7 @@ type ExpandRequest struct {
 
 func (x *ExpandRequest) Reset() {
 	*x = ExpandRequest{}
-	mi := &file_proto_agent_proto_msgTypes[7]
+	mi := &file_proto_agent_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -675,7 +886,7 @@ func (x *ExpandRequest) String() string {
 func (*ExpandRequest) ProtoMessage() {}
 
 func (x *ExpandRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[7]
+	mi := &file_proto_agent_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -688,7 +899,7 @@ func (x *ExpandRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExpandRequest.ProtoReflect.Descriptor instead.
 func (*ExpandRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{7}
+	return file_proto_agent_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ExpandRequest) GetNodeId() string {
@@ -724,7 +935,7 @@ type ExpandResponse struct {
 
 func (x *ExpandResponse) Reset() {
 	*x = ExpandResponse{}
-	mi := &file_proto_agent_proto_msgTypes[8]
+	mi := &file_proto_agent_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -736,7 +947,7 @@ func (x *ExpandResponse) String() string {
 func (*ExpandResponse) ProtoMessage() {}
 
 func (x *ExpandResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[8]
+	mi := &file_proto_agent_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -749,7 +960,7 @@ func (x *ExpandResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExpandResponse.ProtoReflect.Descriptor instead.
 func (*ExpandResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{8}
+	return file_proto_agent_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ExpandResponse) GetEdges() []*EdgeCard {
@@ -790,7 +1001,7 @@ type SummarizeRequest struct {
 
 func (x *SummarizeRequest) Reset() {
 	*x = SummarizeRequest{}
-	mi := &file_proto_agent_proto_msgTypes[9]
+	mi := &file_proto_agent_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -802,7 +1013,7 @@ func (x *SummarizeRequest) String() string {
 func (*SummarizeRequest) ProtoMessage() {}
 
 func (x *SummarizeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[9]
+	mi := &file_proto_agent_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -815,7 +1026,7 @@ func (x *SummarizeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SummarizeRequest.ProtoReflect.Descriptor instead.
 func (*SummarizeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{9}
+	return file_proto_agent_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *SummarizeRequest) GetNodeId() string {
@@ -844,7 +1055,7 @@ type SummarizeResponse struct {
 
 func (x *SummarizeResponse) Reset() {
 	*x = SummarizeResponse{}
-	mi := &file_proto_agent_proto_msgTypes[10]
+	mi := &file_proto_agent_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -856,7 +1067,7 @@ func (x *SummarizeResponse) String() string {
 func (*SummarizeResponse) ProtoMessage() {}
 
 func (x *SummarizeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[10]
+	mi := &file_proto_agent_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -869,7 +1080,7 @@ func (x *SummarizeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SummarizeResponse.ProtoReflect.Descriptor instead.
 func (*SummarizeResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{10}
+	return file_proto_agent_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *SummarizeResponse) GetSummaryMd() string {
@@ -940,17 +1151,36 @@ const file_proto_agent_proto_rawDesc = "" +
 	"\bdegraded\x18\x06 \x01(\bR\bdegraded\x12'\n" +
 	"\x0fdegraded_reason\x18\a \x01(\tR\x0edegradedReason\x12!\n" +
 	"\fover_fetched\x18\b \x01(\x05R\voverFetched\x12\x1a\n" +
-	"\bfiltered\x18\t \x01(\x05R\bfiltered\"_\n" +
+	"\bfiltered\x18\t \x01(\x05R\bfiltered\"\x8d\x01\n" +
+	"\x0eObservationRef\x12\x12\n" +
+	"\x04role\x18\x01 \x01(\tR\x04role\x12\x17\n" +
+	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x17\n" +
+	"\aedge_id\x18\x03 \x01(\tR\x06edgeId\x12\x1d\n" +
+	"\n" +
+	"concept_id\x18\x04 \x01(\tR\tconceptId\x12\x16\n" +
+	"\x06weight\x18\x05 \x01(\x01R\x06weight\"\xe3\x02\n" +
 	"\x0eObserveRequest\x12\x1d\n" +
 	"\n" +
 	"context_id\x18\x01 \x01(\tR\tcontextId\x12\x18\n" +
 	"\aoutcome\x18\x02 \x01(\tR\aoutcome\x12\x14\n" +
-	"\x05actor\x18\x03 \x01(\tR\x05actor\"u\n" +
+	"\x05actor\x18\x03 \x01(\tR\x05actor\x12\x17\n" +
+	"\arepo_id\x18\x04 \x01(\tR\x06repoId\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x05 \x01(\tR\tsessionId\x12\x19\n" +
+	"\btrace_id\x18\x06 \x01(\tR\atraceId\x12\x1f\n" +
+	"\vaction_json\x18\a \x01(\fR\n" +
+	"actionJson\x12\x1f\n" +
+	"\vsignal_json\x18\b \x01(\fR\n" +
+	"signalJson\x12C\n" +
+	"\x10observation_refs\x18\t \x03(\v2\x18.agent.v1.ObservationRefR\x0fobservationRefs\x12(\n" +
+	"\x10episode_group_id\x18\n" +
+	" \x01(\tR\x0eepisodeGroupId\"\x9f\x01\n" +
 	"\x0fObserveResponse\x12\x1d\n" +
 	"\n" +
 	"episode_id\x18\x01 \x01(\tR\tepisodeId\x12\x1a\n" +
 	"\bdegraded\x18\x02 \x01(\bR\bdegraded\x12'\n" +
-	"\x0fdegraded_reason\x18\x03 \x01(\tR\x0edegradedReason\"\\\n" +
+	"\x0fdegraded_reason\x18\x03 \x01(\tR\x0edegradedReason\x12(\n" +
+	"\x10episode_group_id\x18\x04 \x01(\tR\x0eepisodeGroupId\"\\\n" +
 	"\rExpandRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1c\n" +
 	"\tdirection\x18\x02 \x01(\tR\tdirection\x12\x14\n" +
@@ -990,38 +1220,40 @@ func file_proto_agent_proto_rawDescGZIP() []byte {
 	return file_proto_agent_proto_rawDescData
 }
 
-var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_proto_agent_proto_goTypes = []any{
 	(*RecallRequest)(nil),     // 0: agent.v1.RecallRequest
 	(*NodeCard)(nil),          // 1: agent.v1.NodeCard
 	(*EdgeCard)(nil),          // 2: agent.v1.EdgeCard
 	(*ConceptCard)(nil),       // 3: agent.v1.ConceptCard
 	(*RecallResponse)(nil),    // 4: agent.v1.RecallResponse
-	(*ObserveRequest)(nil),    // 5: agent.v1.ObserveRequest
-	(*ObserveResponse)(nil),   // 6: agent.v1.ObserveResponse
-	(*ExpandRequest)(nil),     // 7: agent.v1.ExpandRequest
-	(*ExpandResponse)(nil),    // 8: agent.v1.ExpandResponse
-	(*SummarizeRequest)(nil),  // 9: agent.v1.SummarizeRequest
-	(*SummarizeResponse)(nil), // 10: agent.v1.SummarizeResponse
+	(*ObservationRef)(nil),    // 5: agent.v1.ObservationRef
+	(*ObserveRequest)(nil),    // 6: agent.v1.ObserveRequest
+	(*ObserveResponse)(nil),   // 7: agent.v1.ObserveResponse
+	(*ExpandRequest)(nil),     // 8: agent.v1.ExpandRequest
+	(*ExpandResponse)(nil),    // 9: agent.v1.ExpandResponse
+	(*SummarizeRequest)(nil),  // 10: agent.v1.SummarizeRequest
+	(*SummarizeResponse)(nil), // 11: agent.v1.SummarizeResponse
 }
 var file_proto_agent_proto_depIdxs = []int32{
 	1,  // 0: agent.v1.RecallResponse.nodes:type_name -> agent.v1.NodeCard
 	2,  // 1: agent.v1.RecallResponse.edges:type_name -> agent.v1.EdgeCard
 	3,  // 2: agent.v1.RecallResponse.concepts:type_name -> agent.v1.ConceptCard
-	2,  // 3: agent.v1.ExpandResponse.edges:type_name -> agent.v1.EdgeCard
-	0,  // 4: agent.v1.AgentService.Recall:input_type -> agent.v1.RecallRequest
-	5,  // 5: agent.v1.AgentService.Observe:input_type -> agent.v1.ObserveRequest
-	7,  // 6: agent.v1.AgentService.Expand:input_type -> agent.v1.ExpandRequest
-	9,  // 7: agent.v1.AgentService.Summarize:input_type -> agent.v1.SummarizeRequest
-	4,  // 8: agent.v1.AgentService.Recall:output_type -> agent.v1.RecallResponse
-	6,  // 9: agent.v1.AgentService.Observe:output_type -> agent.v1.ObserveResponse
-	8,  // 10: agent.v1.AgentService.Expand:output_type -> agent.v1.ExpandResponse
-	10, // 11: agent.v1.AgentService.Summarize:output_type -> agent.v1.SummarizeResponse
-	8,  // [8:12] is the sub-list for method output_type
-	4,  // [4:8] is the sub-list for method input_type
-	4,  // [4:4] is the sub-list for extension type_name
-	4,  // [4:4] is the sub-list for extension extendee
-	0,  // [0:4] is the sub-list for field type_name
+	5,  // 3: agent.v1.ObserveRequest.observation_refs:type_name -> agent.v1.ObservationRef
+	2,  // 4: agent.v1.ExpandResponse.edges:type_name -> agent.v1.EdgeCard
+	0,  // 5: agent.v1.AgentService.Recall:input_type -> agent.v1.RecallRequest
+	6,  // 6: agent.v1.AgentService.Observe:input_type -> agent.v1.ObserveRequest
+	8,  // 7: agent.v1.AgentService.Expand:input_type -> agent.v1.ExpandRequest
+	10, // 8: agent.v1.AgentService.Summarize:input_type -> agent.v1.SummarizeRequest
+	4,  // 9: agent.v1.AgentService.Recall:output_type -> agent.v1.RecallResponse
+	7,  // 10: agent.v1.AgentService.Observe:output_type -> agent.v1.ObserveResponse
+	9,  // 11: agent.v1.AgentService.Expand:output_type -> agent.v1.ExpandResponse
+	11, // 12: agent.v1.AgentService.Summarize:output_type -> agent.v1.SummarizeResponse
+	9,  // [9:13] is the sub-list for method output_type
+	5,  // [5:9] is the sub-list for method input_type
+	5,  // [5:5] is the sub-list for extension type_name
+	5,  // [5:5] is the sub-list for extension extendee
+	0,  // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_proto_agent_proto_init() }
@@ -1035,7 +1267,7 @@ func file_proto_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_agent_proto_rawDesc), len(file_proto_agent_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   11,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

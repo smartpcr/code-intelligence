@@ -240,6 +240,13 @@ type RecallResponse struct {
 	// Filtered is the number of candidates the §9.6a
 	// filter removed.  Equal to the increment of
 	// `recall_filter_unpublished_total` for this call.
+	// Computed as `len(pointIDs) - len(allowed)` so it
+	// reflects ONLY hits the filter examined and rejected
+	// for being unpublished — candidates with empty
+	// `PointID` (invalid Qdrant responses) are skipped
+	// before the filter runs and are deliberately NOT
+	// counted here, keeping the operator dashboard signal
+	// for "publish-state lag" clean.
 	// When `Filtered > 0 && len(Hits) < K`, the over-fetch
 	// budget was insufficient — operators should consider
 	// bumping `WithOverFetchMultiplier`.
@@ -371,6 +378,14 @@ func (s *Service) Recall(ctx context.Context, req RecallRequest) (RecallResponse
 	return RecallResponse{
 		Hits:        out,
 		OverFetched: len(candidates),
-		Filtered:    len(candidates) - len(allowed),
+		// Count only hits the filter actually examined and
+		// rejected — candidates with empty PointID were
+		// stripped before the filter call (see pointIDs
+		// build loop above), so subtracting from
+		// len(candidates) would conflate invalid Qdrant
+		// responses with genuinely unpublished vectors and
+		// pollute the recall_filter_unpublished_total
+		// operator signal (§9.6a read-side).
+		Filtered: len(pointIDs) - len(allowed),
 	}, nil
 }

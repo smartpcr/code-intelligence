@@ -759,12 +759,19 @@ func (s *Service) Recall(ctx context.Context, req RecallRequest) (RecallResponse
 	// Step 5 — rerank. v0 cold-start (cosine + structural
 	// distance) or the trained model when one exists. When no
 	// reranker is wired we keep the raw cosine order from
-	// Qdrant.
+	// Qdrant and propagate `Score` → `FinalScore` so the
+	// response projection below (which reads `c.FinalScore`)
+	// still surfaces a meaningful similarity number instead
+	// of the struct zero value.
 	ranked := candidates
 	rerankerVersion := ""
 	if s.reranker != nil {
 		ranked = s.reranker.Rank(candidates)
 		rerankerVersion = s.reranker.ModelVersion()
+	} else {
+		for i := range ranked {
+			ranked[i].FinalScore = ranked[i].Score
+		}
 	}
 
 	// Project ranked candidates onto the response shape.

@@ -1,7 +1,7 @@
 """
 reranker-sidecar: BERT-class cross-encoder training service.
 
-Stage 6.4 (impl-plan ┬º1110) mandates a "cross-encoder
+Stage 6.4 (impl-plan §1110) mandates a "cross-encoder
 BERT-class model (<= 200M params)" for the reranker. The Go
 binary at services/agent-memory/cmd/reranker-trainer/ pulls
 labelled positive/negative pairs from PostgreSQL and POSTs
@@ -19,7 +19,7 @@ architecture (unmaintainable). The HTTP sidecar boundary is
 the maintained seam.
 
 Model: `cross-encoder/ms-marco-MiniLM-L-12-v2` (~33M params,
-well under the 200M cap from ┬º6.4 step-3). The model is
+well under the 200M cap from §6.4 step-3). The model is
 loaded at startup and re-used across train calls so the
 cold-start cost amortises.
 
@@ -50,7 +50,7 @@ short-circuits when `<artifact_dir>/<version>/` already
 exists rather than re-fitting, so a retry after a sidecar
 restart returns the existing artifact URI without mutating
 the on-disk weights. The Go-side `reranker_model.version`
-UNIQUE-INSERT contract relies on this ΓÇö a publish retry
+UNIQUE-INSERT contract relies on this — a publish retry
 must not produce different bytes under the same handle.
 
 Configuration env vars:
@@ -76,7 +76,6 @@ import shutil
 import tempfile
 import threading
 import time
-import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -146,7 +145,7 @@ class LabelledPair(BaseModel):
     # Optional natural-language recall query the trainer
     # pulls from RecallContextLog.query_text. When present,
     # this is the SAME string `/rank` receives in its `query`
-    # field at recall time ΓÇö so the train-time and recall-
+    # field at recall time — so the train-time and recall-
     # time `_project_query` outputs match by construction
     # (iter-4 review item 3). Empty when the labelled pair
     # was synthesized from a correction without a recall
@@ -176,7 +175,7 @@ class TrainingInput(BaseModel):
 # item 1, refined iter-8 items 1+2): both `/train` (via
 # _flatten_pairs) and `/rank` MUST run their inputs through
 # the SAME projection functions defined below AND pass the
-# GRAPH IDENTIFIER (graph node_id / concept_id / edge_id ΓÇö
+# GRAPH IDENTIFIER (graph node_id / concept_id / edge_id —
 # NOT the Qdrant qdrant_point_id) as the document side so
 # the cross-encoder is fine-tuned and queried on byte-
 # identical document surfaces. See `_project_document`'s
@@ -202,7 +201,7 @@ _CANONICAL_KIND = {
     # `_canonical_kind("node_hit")` would pass through
     # unchanged and the per-role kind-only fallback in
     # `_flatten_pairs` would produce `node_hit` as a doc
-    # token instead of the canonical `method` ΓÇö which is what
+    # token instead of the canonical `method` — which is what
     # the rank side actually receives via the Candidate.Kind
     # field.
     "node_hit": "method",
@@ -262,12 +261,12 @@ def _project_query(
 def _project_document(kind: str, identifier: str) -> str:
     """Build the document side of the cross-encoder pair.
 
-    Format: `<canonical-kind> <identifier>` ΓÇö produced
+    Format: `<canonical-kind> <identifier>` — produced
     by prefixing the canonicalised kind exactly ONCE.
 
     INVARIANT (iter-7 review item 1, refined in iter-8
     review items 1+2): callers MUST pass a BARE GRAPH
-    identifier in `identifier` ΓÇö never a string that
+    identifier in `identifier` — never a string that
     already carries the kind prefix, and never the Qdrant
     `qdrant_point_id`. The graph-identifier contract is
     what makes `_flatten_pairs` (train) and `/rank`
@@ -293,7 +292,7 @@ def _project_document(kind: str, identifier: str) -> str:
         payload (`payload["node_id"]` for
         method/block/frontier, `payload["concept_id"]` for
         concept) and uses that as the wire envelope's
-        `point_id` field ΓÇö explicitly NOT the
+        `point_id` field — explicitly NOT the
         `Hit.PointID` which would be the
         `embedding_publish.qdrant_point_id` (a separately-
         minted UUID, see
@@ -306,11 +305,11 @@ def _project_document(kind: str, identifier: str) -> str:
     distinct ways:
 
       (a) pre-iter-7 / iter-5-style: `<kind> <payload_text>`
-          at rank vs `<kind> <seed_id>` at train ΓÇö
+          at rank vs `<kind> <seed_id>` at train —
           completely different token streams; or
       (b) iter-7-style (the bug iter-8 closes): `<kind>
           <qdrant_point_id>` at rank vs `<kind>
-          <graph_node_id>` at train ΓÇö same surface SHAPE
+          <graph_node_id>` at train — same surface SHAPE
           but different ID strings, because the publisher
           mints qdrant_point_ids separately from graph
           node_ids. The cross-encoder learned a
@@ -329,7 +328,7 @@ def _project_document(kind: str, identifier: str) -> str:
     that is a follow-up workstream rather than an iter-8
     fix. The current graph-id surface is honest about
     what the operator labels actually supervise:
-    `(query, graph_node_id) ΓåÆ relevant?`.
+    `(query, graph_node_id) → relevant?`.
 
     Returns the bare canonical kind when identifier is
     empty (degenerate fallback used by `_flatten_pairs`
@@ -352,7 +351,7 @@ def _project_document(kind: str, identifier: str) -> str:
 #           loaded across restarts or multiple versions.
 #   Item 2: `/train` mutated the singleton in place, so a
 #           repeat call with the same payload trained from
-#           already-mutated weights ΓÇö different bytes under
+#           already-mutated weights — different bytes under
 #           the same version, breaking the `reranker_model.
 #           version` UNIQUE-INSERT idempotency contract.
 #
@@ -370,7 +369,7 @@ def _project_document(kind: str, identifier: str) -> str:
 #     the hot checkpoints in memory across requests
 #     without unbounded growth.
 #
-# All loads still pay the 200M-param cap from ┬º6.4 step-3.
+# All loads still pay the 200M-param cap from §6.4 step-3.
 # ---------------------------------------------------------------------------
 
 
@@ -389,7 +388,7 @@ class ModelStore:
         self._artifact_dir = artifact_dir.resolve()
         self._lock = threading.Lock()
         self._ready = False
-        # base_param_count caches the result of the ┬º6.4
+        # base_param_count caches the result of the §6.4
         # step-3 200M cap check on the base model. Re-used
         # by /healthz so operators can confirm the loaded
         # backbone is in-bounds.
@@ -407,7 +406,7 @@ class ModelStore:
         the warm HF cache so cold-start cost amortises to
         ~200ms instead of 30s+ (HF download).
 
-        Also enforces the ┬º6.4 step-3 200M parameter cap on
+        Also enforces the §6.4 step-3 200M parameter cap on
         the base model. The cap-violation RuntimeError is
         raised OUTSIDE the introspection try/except so a
         broad `except` cannot swallow it (iter-3 review
@@ -463,7 +462,7 @@ class ModelStore:
         this model cannot mutate state visible to other
         requests. Combined with the deterministic seed
         in `fit_model()`, two /train calls with byte-
-        identical input produce byte-identical weights ΓÇö
+        identical input produce byte-identical weights —
         the idempotency contract the
         `reranker_model.version` UNIQUE-INSERT relies on
         (iter-4 review item 2).
@@ -486,7 +485,7 @@ class ModelStore:
         return a 400/404 without further wrapping.
 
         Iter-4 review item 1: this is the load path that
-        was missing ΓÇö without it, `/rank` could only ever
+        was missing — without it, `/rank` could only ever
         score with the singleton, so published artifacts
         across restarts/versions were dead bytes.
         """
@@ -544,7 +543,7 @@ def fit_model(  # type: ignore[no-untyped-def]
 ) -> dict:
     """Fit `model` (a sentence_transformers.CrossEncoder)
     against (query, document, label) triples. Returns the
-    ┬º6.4 required metric set:
+    §6.4 required metric set:
         - train_loss
         - eval_ndcg@k
         - rank-of-correct-node@k=20
@@ -556,7 +555,7 @@ def fit_model(  # type: ignore[no-untyped-def]
     idempotency the `reranker_model.version` UNIQUE-INSERT
     relies on. Enforced by:
       1. Caller passes a FRESH model from
-         `ModelStore.make_fresh_model()` ΓÇö no shared state.
+         `ModelStore.make_fresh_model()` — no shared state.
       2. Seeding python.random / numpy / torch / cuDNN with
          `seed` BEFORE the first fit step.
       3. `shuffle=False` on the DataLoader.
@@ -625,88 +624,39 @@ def fit_model(  # type: ignore[no-untyped-def]
 
 
 def save_model(model, dest_dir: Path) -> None:  # type: ignore[no-untyped-def]
-    """Save a fitted model to dest_dir using a two-phase
-    atomic rename: write to a sibling staging dir, move
-    any existing checkpoint aside into a sibling tombstone,
-    rename staging into place, then best-effort delete the
-    tombstone. Avoids leaving a half-written checkpoint
-    when a save crashes mid-flight (which would later be
-    silently loaded by /rank).
+    """Save a fitted model to dest_dir atomically: write
+    to a sibling staging dir, then move into place. Avoids
+    leaving a half-written checkpoint when a save crashes
+    mid-flight (which would later be silently loaded by
+    /rank).
 
-    Why two-phase and not just `shutil.rmtree(dest_dir)`
-    followed by `staging.rename(dest_dir)`: that sequence
-    has a non-atomic window. If the process is killed
-    between the rmtree and the rename, the original
-    checkpoint is gone AND no replacement is in place --
-    the next /rank against this version 404s. (`staging`
-    is the rename SOURCE, not a copy, so it does not
-    survive either.) Swapping the rmtree for `os.replace`
-    alone does NOT close the window, because POSIX
-    `rename(2)` refuses to overwrite a non-empty directory
-    (ENOTEMPTY/EEXIST), so we cannot atomically clobber
-    `dest_dir` with `staging` directly when a previous
-    checkpoint exists.
-
-    The two-phase scheme decomposes the swap into THREE
-    individually-atomic renames, none of which destroys
-    the previous checkpoint until the new one is fully in
-    place:
-
-      1. `model.save(staging)`               (filesystem writes)
-      2. `os.replace(dest_dir, tombstone)`   (atomic move-out)
-      3. `os.replace(staging, dest_dir)`     (atomic move-in)
-      4. `shutil.rmtree(tombstone)`          (best-effort cleanup)
-
-    A crash between (2) and (3) leaves `tombstone` holding
-    the previous checkpoint and `dest_dir` missing -- the
-    operator (or a subsequent successful save_model call,
-    which writes a fresh checkpoint at `dest_dir`) can
-    recover from or discard the tombstone without data
-    loss. A crash during (4) just leaks the tombstone
-    directory; the checkpoint at `dest_dir` is intact.
-
-    REQUIREMENT: `dest_dir.parent` must be a real
-    same-filesystem directory (not a mount boundary or
-    symlink crossing filesystems). `staging` and
-    `tombstone` are created as siblings of `dest_dir` via
-    `tempfile.mkdtemp(dir=dest_dir.parent)` / a uuid-named
-    path under `dest_dir.parent`, so both renames stay on
-    the same filesystem as `dest_dir` and are atomic on
-    POSIX (`rename(2)`).
-    """
+    Cross-filesystem note: `staging` is created via
+    `tempfile.mkdtemp(dir=dest_dir.parent)` so it is
+    nominally a sibling of `dest_dir` and `os.rename` would
+    succeed. However, a Linux deployment can place a bind
+    mount or a symlink under `dest_dir.parent` such that
+    the resolved target of the staging dir and the resolved
+    target of dest_dir end up on different filesystems —
+    `Path.rename` then raises `OSError(EXDEV)`. We use
+    `shutil.move`, which tries `os.rename` first (atomic
+    same-fs, the 99% path) and falls back to copy+delete
+    across filesystems. The same-fs atomicity guarantee is
+    therefore preserved in the common case, and the cross-fs
+    fallback is non-atomic but at least succeeds; we already
+    `rmtree(dest_dir)` immediately above, so the old
+    checkpoint is gone either way before the move starts."""
     dest_dir = dest_dir.resolve()
     dest_dir.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=str(dest_dir.parent)))
-    tombstone: Optional[Path] = None
     try:
         model.save(str(staging))
         if dest_dir.exists():
-            tombstone = dest_dir.parent / f".tombstone-{uuid.uuid4().hex}"
-            os.replace(str(dest_dir), str(tombstone))
-        os.replace(str(staging), str(dest_dir))
+            shutil.rmtree(dest_dir)
+        shutil.move(str(staging), str(dest_dir))
     except Exception:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
-        # If we moved dest_dir aside but failed to move
-        # staging in, restore the previous checkpoint from
-        # the tombstone before re-raising so the next /rank
-        # does not 404 on a checkpoint that successfully
-        # trained before this save attempt.
-        if tombstone is not None and tombstone.exists() and not dest_dir.exists():
-            try:
-                os.replace(str(tombstone), str(dest_dir))
-                tombstone = None
-            except OSError as restore_exc:
-                logger.warning(
-                    "failed to restore tombstone %s -> %s: %s",
-                    tombstone,
-                    dest_dir,
-                    restore_exc,
-                )
         raise
-    finally:
-        if tombstone is not None and tombstone.exists():
-            shutil.rmtree(tombstone, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -872,13 +822,13 @@ def make_app(config: SidecarConfig) -> FastAPI:
         graph id back out of the publisher's Qdrant payload
         (`payload["node_id"]` for method/block/frontier,
         `payload["concept_id"]` for concept) and sends THAT
-        as the wire envelope's `point_id` value ΓÇö the
+        as the wire envelope's `point_id` value — the
         sidecar never talks to Qdrant and only uses this
         field as a unique key. Training carries the SAME
         graph id via `LabelledPair.SeedNodeIDs` /
         `LabelledPair.SeedConceptIDs` (hydrated from
         `recall_context_log.node_ids` /
-        `recall_context_log.concept_ids` ΓÇö see
+        `recall_context_log.concept_ids` — see
         `internal/rerankertrainer/pairs.go`). The `text`
         field in this envelope is informational/diagnostic
         only (Go currently sets it equal to the graph id;
@@ -914,7 +864,7 @@ def make_app(config: SidecarConfig) -> FastAPI:
             # iter-8 NOTE: the wire `point_id` here carries
             # the GRAPH id (graph `node_id` for
             # method/block/frontier, `concept_id` for concept)
-            # ΓÇö NOT the Qdrant `qdrant_point_id`. Go's
+            # — NOT the Qdrant `qdrant_point_id`. Go's
             # `candidateGraphID` in
             # internal/agentapi/bert_sidecar_decoder.go reads
             # the graph id back out of the publisher payload
@@ -959,7 +909,7 @@ def _flatten_pairs(payload: TrainingInput) -> List[Tuple[str, str, float]]:
     Uses the SAME _project_query / _project_document helpers
     as the /rank endpoint AND emits one training example per
     seed identifier so the train-time AND rank-time documents
-    BOTH project from `(canonical_kind, graph_id)` ΓÇö the
+    BOTH project from `(canonical_kind, graph_id)` — the
     cross-encoder is fine-tuned and queried on the SAME
     `<canonical-kind> <graph_id>` surface shape (iter-8
     review item 1).
@@ -974,13 +924,13 @@ def _flatten_pairs(payload: TrainingInput) -> List[Tuple[str, str, float]]:
         `internal/rerankertrainer/pairs.go` from
         `recall_context_log.{node_ids, concept_ids,
         edge_ids}` (which the recall handler populated with
-        `resp.Nodes[i].NodeID` etc. ΓÇö see
+        `resp.Nodes[i].NodeID` etc. — see
         `internal/agentapi/recall.go:buildContextLogInput`).
       - At rank time the same graph id comes from the
         wire envelope's `point_id` field (back-compat name)
         which Go's `candidateGraphID` extracts from
         `Candidate.Payload["node_id"]` /
-        `Candidate.Payload["concept_id"]` ΓÇö the publisher
+        `Candidate.Payload["concept_id"]` — the publisher
         always writes these onto every Qdrant row.
 
     Both surfaces therefore project from
@@ -992,10 +942,10 @@ def _flatten_pairs(payload: TrainingInput) -> List[Tuple[str, str, float]]:
       - iter-5/6: projection helpers introduced; train
         projected `(episode_kind, joined observation
         roles)` while rank projected `(kind, candidate
-        text or point_id)` ΓÇö mismatched surfaces.
+        text or point_id)` — mismatched surfaces.
       - iter-7: Go-side `candidateText` reduced to bare
         `c.PointID` (the Qdrant qdrant_point_id) so the
-        token shape matched, but the IDs DIDN'T ΓÇö
+        token shape matched, but the IDs DIDN'T —
         production trains on graph node UUIDs while
         ranking carried qdrant point UUIDs.
       - iter-8 (current): Go-side `candidateGraphID`
@@ -1009,14 +959,14 @@ def _flatten_pairs(payload: TrainingInput) -> List[Tuple[str, str, float]]:
       1. ONE training example per seed_node_id +
          seed_concept_id + seed_edge_id (up to 8 each).
          Document = `_project_document(<canonical-kind>,
-         <graph_id>)` ΓÇö the EXACT shape `/rank` produces
+         <graph_id>)` — the EXACT shape `/rank` produces
          from `_project_document(candidate.kind,
          wire_point_id_which_is_the_graph_id)`. This is
          the dominant path: any labelled pair that came
          from a real recall has seeds, and the model
-         learns the same `(query, kind, graph_id)` ΓåÆ
+         learns the same `(query, kind, graph_id)` →
          score mapping at train and rank time.
-      2. Fallback when the pair has zero seeds (rare ΓÇö
+      2. Fallback when the pair has zero seeds (rare —
          degraded recalls, manually-injected pairs): one
          training example per observation, document =
          `_project_document(observation.role, "")` (the
@@ -1081,7 +1031,7 @@ def _derive_version(payload: TrainingInput, model_name: str, epochs: int) -> str
     shape but DIFFERENT natural-language queries cannot
     collide under the same `reranker_model.version`. The
     fingerprint bumps from `v2` to `v3` to make the schema
-    change visible ΓÇö pre-iter-6 versions and iter-6+
+    change visible — pre-iter-6 versions and iter-6+
     versions will never collide even on identical episode
     surfaces.
 

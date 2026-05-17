@@ -91,6 +91,18 @@ const DefaultJWKSRefreshFloor = 30 * time.Second
 // multi-gigabyte JSON blob.
 const DefaultJWKSMaxBytes int64 = 256 << 10 // 256 KiB
 
+// MinRSAModulusBits is the minimum acceptable RSA modulus
+// size, in bits, for a signing key surfaced via JWKS. 2048 is
+// the NIST SP 800-131A floor for RSA signature verification
+// and the long-standing industry minimum; smaller moduli
+// (e.g. 1024-bit, let alone factor-in-hours sizes like
+// 512-bit) are considered broken. JWKS URL must already be
+// https://, so this check is defense-in-depth against a
+// compromised or misconfigured IdP serving a short key that
+// would otherwise let an attacker factor the modulus and
+// forge token signatures.
+const MinRSAModulusBits = 2048
+
 // OIDCVerifier is a JWKS-backed JWT verifier for RS256 /
 // RS384 / RS512 tokens. Construct one per process; reuse
 // across requests. Zero-value fields take their respective
@@ -588,6 +600,9 @@ func (v *OIDCVerifier) refreshJWKS(ctx context.Context) error {
 //     accessible only by exhaustive enumeration)
 //   - empty / unparseable n / e
 //   - non-positive modulus
+//   - modulus shorter than MinRSAModulusBits (defense-in-depth
+//     against a JWKS endpoint that serves a factorable RSA key
+//     — see MinRSAModulusBits for rationale)
 //   - exponent <= 1, even (only odd exponents are usable for
 //     PKCS#1 v1.5 signature verification), or larger than fits
 //     in an int
@@ -615,6 +630,9 @@ func jwkToRSA(k jwksKey) (*rsa.PublicKey, error) {
 	n := new(big.Int).SetBytes(nb)
 	if n.Sign() <= 0 {
 		return nil, errors.New("jwkToRSA: n is non-positive")
+	}
+	if bits := n.BitLen(); bits < MinRSAModulusBits {
+		return nil, fmt.Errorf("jwkToRSA: modulus too small (%d bits, minimum %d)", bits, MinRSAModulusBits)
 	}
 	// Decode the exponent as a big-endian unsigned integer.
 	// The typical value is 65537 which fits in 24 bits.

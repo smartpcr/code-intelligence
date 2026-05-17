@@ -163,6 +163,7 @@ import (
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/embedding"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphreader"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/recallcontext"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/rerankertrainer"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/spaningestor"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
 	agentpb "github.com/smartpcr/code-intelligence/services/agent-memory/proto/agent"
@@ -226,14 +227,62 @@ func main() {
 		return agentapi.HealthState{Degraded: st.Degraded, Reason: st.Reason, Source: st.Source}, nil
 	})
 
-	// Stage 5.1: v0 cold-start reranker. The in-process,
-	// no-trained-model reranker keeps the recall path useful
-	// for the first deployment; later iters can swap it for
-	// a learned model loaded from the `reranker_model` table
-	// without touching this binary (the agentapi.Reranker
-	// interface is the contract).
-	reranker := agentapi.NewV0ColdStartReranker(nil)
-	logger.Info("agent-api.reranker", slog.String("model_version", reranker.ModelVersion()))
+	// Stage 5.1 + Stage 6.4 reranker wiring.
+	//
+	// The inner v0 cold-start reranker is the "no trained
+	// model yet" fallback. Stage 6.4 wraps it in a
+	// `PublishedReranker` that reads `reranker_model`
+	// (LatestPublishedArtifact, cache-free per impl-plan §1115
+	// so a fresh publish is visible on the very next request)
+	// and dispatches scoring through an ArtifactDecoder chain:
+	//
+	//   * LinearWeightsDecoder consumes `data:` URIs the
+	//     `LinearTrainer` inlines so the recall path can score
+	//     with the trained vector without out-of-process I/O.
+	//   * BertSidecarDecoder (only wired when
+	//     `AGENT_MEMORY_RERANKER_INFERENCE_ENDPOINT` is set)
+	//     dispatches `file://` URIs to the Python BERT
+	//     cross-encoder sidecar over HTTP — used by the
+	//     `SidecarTrainer` path.
+	//
+	// Without this wrapper, recall responses would never
+	// surface the trained `reranker_model.version` even after
+	// the trainer landed published rows — the published-row
+	// integration would be dead code.
+	v0 := agentapi.NewV0ColdStartReranker(nil)
+	pubSrc := agentapi.PublishedRerankerSourceFunc(func(ctx context.Context) (agentapi.PublishedArtifact, bool, error) {
+		a, ok, err := rerankertrainer.LatestPublishedArtifact(ctx, db)
+		if err != nil {
+			return agentapi.PublishedArtifact{}, false, err
+		}
+		if !ok {
+			return agentapi.PublishedArtifact{}, false, nil
+		}
+		return agentapi.PublishedArtifact{
+			Version:     a.Version,
+			ArtifactURI: a.ArtifactURI,
+			TrainedAt:   a.TrainedAt,
+		}, true, nil
+	})
+	decoderChildren := []agentapi.ArtifactDecoder{agentapi.NewLinearWeightsDecoder()}
+	if cfg.RerankerInferenceEndpoint != "" {
+		decoderChildren = append(decoderChildren, agentapi.NewBertSidecarDecoder(
+			cfg.RerankerInferenceEndpoint,
+			&agentapi.BertSidecarConfig{Timeout: cfg.RerankerInferenceTimeout},
+		))
+		logger.Info("agent-api.reranker.sidecar_wired",
+			slog.String("endpoint", cfg.RerankerInferenceEndpoint),
+			slog.Duration("timeout", cfg.RerankerInferenceTimeout))
+	}
+	reranker := agentapi.NewPublishedReranker(pubSrc, v0, agentapi.NewMultiArtifactDecoder(decoderChildren...))
+	// Log the inner v0 version (static) rather than the
+	// wrapper's ModelVersion() which would issue a DB lookup
+	// at startup. The wrapper advertises the trained version
+	// on every recall request via the rankWithVersion shim.
+	logger.Info("agent-api.reranker",
+		slog.String("inner_model_version", v0.ModelVersion()),
+		slog.Bool("published_wrapper", true),
+		slog.Bool("sidecar_decoder_wired", cfg.RerankerInferenceEndpoint != ""))
 
 	// Stage 5.1 Step-4: graph expansion adapter. The
 	// production expander wraps `*graphreader.Reader` (the
@@ -569,6 +618,29 @@ type config struct {
 	SummariserEndpoint string
 	SummariserModel    string
 	SummariserAPIKey   string
+
+	// Stage 5.2 agent.observe verb configuration. When set,
+	// the binary opens a `*agentapi.FileWAL` at this path so
+	// that an episodic-log writer outage degrades into the
+	// §7.5 fallback (`degraded_recall_context` Episode rows
+	// queued on disk and replayed when the writer recovers)
+	// instead of failing the agent caller. Recommended in
+	// production; optional in dev where the writer is
+	// expected to be stable.
+	WALDir string
+
+	// Stage 6.4 reranker inference (BERT cross-encoder sidecar)
+	// configuration. When unset, the published-row wrapper
+	// still advertises the trained `reranker_model.version`
+	// for `data:` URI artifacts produced by the LinearTrainer
+	// (decoded in-process by LinearWeightsDecoder), but
+	// `file://` URIs from the SidecarTrainer cleanly fall back
+	// to the v0 cold-start scorer (the MultiArtifactDecoder
+	// chain returns `recognised=false` for the unwired scheme,
+	// which PublishedReranker handles per its documented
+	// fallback contract).
+	RerankerInferenceEndpoint string
+	RerankerInferenceTimeout  time.Duration
 }
 
 func loadConfig() (config, error) {
@@ -585,6 +657,24 @@ func loadConfig() (config, error) {
 		SummariserEndpoint: os.Getenv("AGENT_MEMORY_SUMMARISER_ENDPOINT"),
 		SummariserModel:    os.Getenv("AGENT_MEMORY_SUMMARISER_MODEL"),
 		SummariserAPIKey:   os.Getenv("AGENT_MEMORY_SUMMARISER_API_KEY"),
+		WALDir:             os.Getenv("AGENT_MEMORY_WAL_DIR"),
+		// Stage 6.4 BERT sidecar endpoint. Unset → only the
+		// inline LinearWeightsDecoder is wired (file:// URIs
+		// from the sidecar trainer fall back to v0 in that
+		// deployment shape).
+		RerankerInferenceEndpoint: os.Getenv("AGENT_MEMORY_RERANKER_INFERENCE_ENDPOINT"),
+		// Stage 6.4 BERT sidecar per-call timeout. Make the
+		// default explicit at the config-struct boundary so a
+		// reader of `cfg.RerankerInferenceTimeout` always sees
+		// a meaningful Duration (instead of the implicit zero
+		// that BertSidecarConfig.Timeout would otherwise have
+		// resolved to DefaultBertSidecarTimeout inside the
+		// decoder). The env-var parse below still overrides
+		// this when AGENT_MEMORY_RERANKER_INFERENCE_TIMEOUT
+		// is set to a positive Duration; non-positive values
+		// are rejected so the explicit default cannot be
+		// silently zeroed back out.
+		RerankerInferenceTimeout: agentapi.DefaultBertSidecarTimeout,
 		// implementation-plan.md Stage 5.1 makes concept fan-out
 		// part of the production default mixed seed. Operators
 		// can still opt out by setting AGENT_MEMORY_ENABLE_CONCEPTS=false
@@ -620,6 +710,22 @@ func loadConfig() (config, error) {
 	if c.SummariserEndpoint != "" && c.SummariserModel == "" {
 		return c, errors.New(
 			"AGENT_MEMORY_SUMMARISER_ENDPOINT set without AGENT_MEMORY_SUMMARISER_MODEL: vendor model id is required")
+	}
+	// Stage 6.4: parse the optional sidecar per-call timeout.
+	// `time.ParseDuration` rejects unit-less values, so an
+	// operator typo like "750" (vs "750ms") fails fast at
+	// startup instead of silently degrading to an
+	// immediately-cancelled per-recall context (which would
+	// turn EVERY recall response into a sidecar fallback).
+	if v := os.Getenv("AGENT_MEMORY_RERANKER_INFERENCE_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return c, fmt.Errorf("AGENT_MEMORY_RERANKER_INFERENCE_TIMEOUT: %w", err)
+		}
+		if d <= 0 {
+			return c, fmt.Errorf("AGENT_MEMORY_RERANKER_INFERENCE_TIMEOUT must be > 0 (got %s)", v)
+		}
+		c.RerankerInferenceTimeout = d
 	}
 	return c, nil
 }
@@ -1692,4 +1798,208 @@ func newSummariserFromConfig(cfg config, logger *slog.Logger) (agentapi.Summaris
 	logger.Debug("agent-api.summarize.summariser.constructed",
 		slog.String("model_version", cli.ModelVersion()))
 	return cli, nil
+}
+
+// -- Stage 5.2: agent.observe wiring ---------------------------------
+//
+// The three helpers below (classifyEpisodicError,
+// newEpisodeAppenderFromDB, newContextResolverFromDB) were
+// originally landed by the agent.observe verb workstream
+// (PR #25, commit cc96404). They were silently dropped in a
+// subsequent feature/memory merge — the lossage was masked
+// by the iter-17 proto duplicate (`ObserveRequest`
+// redeclared) which short-circuited `go build ./...` before
+// these unresolved references could fire. Restored here so
+// the cmd/agent-api binary compiles end-to-end against the
+// observe service contract exposed in
+// `internal/agentapi/observe.go`. Behaviour matches the
+// original landed implementation byte-for-byte.
+
+// pgErrCodeConnectionExceptionPrefix is the SQLSTATE class
+// for connection-class failures (`Class 08 — Connection
+// Exception`). Any code matching this prefix maps onto
+// `ErrEpisodicLogUnavailable` — those are the failure modes
+// the §7.5 WAL fallback is designed to absorb.
+const pgErrCodeConnectionExceptionPrefix = "08"
+
+// pgErrCodeOperatorInterventionPrefix is the SQLSTATE class
+// for operator-intervention failures (`Class 57 — Operator
+// Intervention`), including 57P01 admin_shutdown and 57P03
+// cannot_connect_now (server in recovery). Indistinguishable
+// from a network-class outage from the caller's perspective,
+// so they also route through the WAL fallback.
+const pgErrCodeOperatorInterventionPrefix = "57P"
+
+// classifyEpisodicError maps a raw DB error into either
+// `agentapi.ErrEpisodicLogUnavailable` (for the connection-
+// class failures the §7.5 WAL is designed to absorb) or the
+// original error (for everything else — schema bugs and
+// CHECK violations MUST surface loudly so the operator
+// sees them).
+//
+// Conservatively scoped: a 42P01 (relation does not exist)
+// is a schema bug, NOT an outage; a 23xxx (constraint
+// violation) is a caller / data-model bug; both pass
+// through untouched.
+func classifyEpisodicError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, sql.ErrConnDone) {
+		return fmt.Errorf("%w: %v", agentapi.ErrEpisodicLogUnavailable, err)
+	}
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		return fmt.Errorf("%w: %v", agentapi.ErrEpisodicLogUnavailable, err)
+	}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		code := string(pqErr.Code)
+		if strings.HasPrefix(code, pgErrCodeConnectionExceptionPrefix) ||
+			strings.HasPrefix(code, pgErrCodeOperatorInterventionPrefix) {
+			return fmt.Errorf("%w: SQLSTATE %s %v",
+				agentapi.ErrEpisodicLogUnavailable, code, err)
+		}
+	}
+	return err
+}
+
+// newEpisodeAppenderFromDB returns an EpisodeAppender that
+// writes one Episode row + N Observation rows in a single
+// transaction against the writer-role DSN. Conn-class errors
+// are mapped to `agentapi.ErrEpisodicLogUnavailable` so the
+// Observe handler engages the WAL fallback; constraint /
+// schema errors propagate verbatim.
+//
+// The INSERT explicitly passes `episode_id` and `created_at`
+// (overriding the DB defaults) because both columns are
+// load-bearing for the §7.5 replay contract — the WAL
+// payload carries them so a recovery routes the row to the
+// originally-attempted partition.
+func newEpisodeAppenderFromDB(db *sql.DB, logger *slog.Logger) agentapi.EpisodeAppender {
+	return agentapi.EpisodeAppenderFunc(func(ctx context.Context, in agentapi.EpisodeAppendInput) error {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return classifyEpisodicError(fmt.Errorf("episode append: begin: %w", err))
+		}
+		defer func() {
+			_ = tx.Rollback()
+		}()
+
+		var (
+			signalArg   interface{}
+			contextID   interface{}
+			degradedRsn interface{}
+		)
+		if len(in.SignalJSON) > 0 {
+			signalArg = []byte(in.SignalJSON)
+		}
+		if in.ContextID != "" {
+			contextID = in.ContextID
+		}
+		// episode_degraded_reason_chk requires
+		// (degraded=true AND degraded_reason IS NOT NULL)
+		// OR (degraded=false AND degraded_reason IS NULL).
+		// Translate the Go empty string to SQL NULL so the
+		// happy path satisfies the CHECK.
+		if in.Degraded && in.DegradedReason != "" {
+			degradedRsn = in.DegradedReason
+		}
+
+		const episodeSQL = `
+			INSERT INTO episode (
+				episode_id, episode_group_id, repo_id, session_id, trace_id,
+				kind, context_id, action, signal_json, outcome,
+				degraded, degraded_reason, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6::episode_kind, $7, $8::jsonb, $9::jsonb, $10::outcome,
+				$11, $12::degraded_reason, $13)
+		`
+		if _, err := tx.ExecContext(ctx, episodeSQL,
+			in.EpisodeID, in.EpisodeGroupID, in.RepoID,
+			in.SessionID, in.TraceID, in.Kind,
+			contextID, []byte(in.ActionJSON), signalArg,
+			in.Outcome, in.Degraded, degradedRsn, in.CreatedAt,
+		); err != nil {
+			return classifyEpisodicError(fmt.Errorf("episode append: insert episode: %w", err))
+		}
+
+		const observationSQL = `
+			INSERT INTO observation (
+				observation_id, episode_id, role,
+				node_id, edge_id, concept_id, degraded_recall_context_id,
+				weight, created_at
+			) VALUES ($1, $2, $3::observation_role, $4, $5, $6, $7, $8, $9)
+		`
+		for i, obs := range in.Observations {
+			var (
+				nodeArg, edgeArg, conceptArg, degradedArg interface{}
+			)
+			if obs.NodeID != "" {
+				nodeArg = obs.NodeID
+			}
+			if obs.EdgeID != "" {
+				edgeArg = obs.EdgeID
+			}
+			if obs.ConceptID != "" {
+				conceptArg = obs.ConceptID
+			}
+			if obs.DegradedRecallContextID != "" {
+				degradedArg = obs.DegradedRecallContextID
+			}
+			if _, err := tx.ExecContext(ctx, observationSQL,
+				obs.ObservationID, in.EpisodeID, obs.Role,
+				nodeArg, edgeArg, conceptArg, degradedArg,
+				obs.Weight, obs.CreatedAt,
+			); err != nil {
+				return classifyEpisodicError(fmt.Errorf("episode append: insert observation[%d]: %w", i, err))
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			return classifyEpisodicError(fmt.Errorf("episode append: commit: %w", err))
+		}
+		logger.Debug("agent-api.observe.appended",
+			slog.String("episode_id", in.EpisodeID),
+			slog.Int("observations", len(in.Observations)))
+		return nil
+	})
+}
+
+// newContextResolverFromDB returns a ContextResolver that
+// reads `served_under_degraded` for the supplied `(repo_id,
+// context_id)` pair. The composite lookup defends against a
+// caller attaching their Episode to ANOTHER repo's
+// `recall_context_log` row — a bare-id lookup would let
+// repo A inherit repo B's degraded flag (and leak repo B's
+// recall lineage into repo A's `mgmt.read.episodes` view).
+// The closed-set `recall_context_log_repo_created_idx` makes
+// the composite lookup as cheap as the prior id-only
+// lookup.
+//
+// `sql.ErrNoRows` maps to `agentapi.ErrContextNotFound` so
+// the gRPC adapter surfaces `INVALID_ARGUMENT` to a caller
+// that supplied a bogus id (or a context_id that legitimately
+// belongs to a different repo). Connection failures propagate
+// verbatim — the resolver runs against the `_ro` pool which
+// is also exercised by the Recall path, so an outage here
+// is already visible on those metrics.
+func newContextResolverFromDB(db *sql.DB) agentapi.ContextResolver {
+	const query = `
+		SELECT served_under_degraded
+		FROM recall_context_log
+		WHERE context_id = $1 AND repo_id = $2
+		ORDER BY created_at DESC
+		LIMIT 1
+	`
+	return agentapi.ContextResolverFunc(func(ctx context.Context, repoID, contextID string) (bool, error) {
+		var degraded bool
+		err := db.QueryRowContext(ctx, query, contextID, repoID).Scan(&degraded)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, agentapi.ErrContextNotFound
+			}
+			return false, fmt.Errorf("context resolver: %w", err)
+		}
+		return degraded, nil
+	})
 }

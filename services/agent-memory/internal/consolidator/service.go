@@ -2,6 +2,7 @@ package consolidator
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -1125,14 +1126,23 @@ func (s *Service) scanEpisodes(
 			row.fingerprint = conceptFP
 		case "degraded_recall_context":
 			// No fingerprint column on recall_context_log;
-			// hash the recall_context_id uuid bytes as a
-			// fallback so the signature stays deterministic.
+			// hash the recall_context_id uuid text as a
+			// fallback so the signature stays deterministic
+			// AND the fingerprint preserves the 32-byte
+			// invariant the other roles produce (every
+			// node/edge/concept fingerprint is the 32-byte
+			// SHA-256 family per migrations 0003 / 0011).
+			// Keeping the width uniform here means any
+			// future CHECK constraint of the form
+			// `octet_length(fingerprint) = 32` on the
+			// observation/node tables stays satisfied.
 			// Cross-repo collisions on the same recall context
 			// are not architecturally meaningful (recall
 			// contexts are audit-scoped), so this fallback
 			// does not violate G6.
 			if degradedIDText.Valid {
-				row.fingerprint = []byte(degradedIDText.String)
+				sum := sha256.Sum256([]byte(degradedIDText.String))
+				row.fingerprint = sum[:]
 			}
 		}
 		ep.observations = append(ep.observations, row)

@@ -397,6 +397,20 @@ class ModelStore:
         # OrderedDict provides O(1) move-to-end for the LRU
         # eviction policy.
         self._cache: "OrderedDict[str, object]" = OrderedDict()
+        # _pending maps absolute path -> threading.Event signalled
+        # when the in-flight cold load for that key has finished
+        # (either populating _cache or failing). Under load, two
+        # concurrent /rank requests for the same cold artifact_uri
+        # would otherwise both miss the cache, both pay the
+        # ~200ms CrossEncoder(key) cost, and both insert -- wasting
+        # CPU/RAM and transiently exceeding LRU_CAPACITY. The
+        # sentinel collapses duplicate loads to one without
+        # serialising loads across DIFFERENT keys (the actual
+        # CrossEncoder() call still runs outside _cache_lock).
+        self._pending: "dict[str, threading.Event]" = {}
+        # _cache_lock guards _cache AND _pending. Reusing one lock
+        # keeps the "is it cached / is a load in flight / claim
+        # leadership" decision atomic in a single critical section.
         self._cache_lock = threading.Lock()
 
     def load_base(self) -> None:
@@ -517,24 +531,62 @@ class ModelStore:
             )
 
         key = str(candidate)
-        with self._cache_lock:
-            cached = self._cache.get(key)
-            if cached is not None:
-                # Hot path: move-to-end marks recently used.
+        # Cache lookup + in-flight-load detection runs in one
+        # critical section so two concurrent misses for the same
+        # `key` cannot both decide to load. The first miss claims
+        # leadership by inserting a fresh Event into _pending;
+        # subsequent misses for the SAME key find that event and
+        # wait on it instead of re-loading. Different keys still
+        # proceed independently because the lock is released
+        # before the CrossEncoder() call.
+        while True:
+            with self._cache_lock:
+                cached = self._cache.get(key)
+                if cached is not None:
+                    # Hot path: move-to-end marks recently used.
+                    self._cache.move_to_end(key)
+                    return cached
+                in_flight = self._pending.get(key)
+                if in_flight is None:
+                    # We are the loader for this key.
+                    load_event = threading.Event()
+                    self._pending[key] = load_event
+                    we_load = True
+                else:
+                    # Another request is already loading this key.
+                    load_event = in_flight
+                    we_load = False
+            if we_load:
+                break
+            # Wait for the in-flight load to finish, then re-check
+            # the cache. Looping (rather than returning the leader's
+            # model directly) keeps the LRU's move-to-end semantics
+            # correct AND handles the case where the leader's load
+            # raised -- waiters then naturally retry as fresh
+            # leaders on the next iteration.
+            load_event.wait()
+
+        try:
+            from sentence_transformers import CrossEncoder  # type: ignore
+
+            logger.info("loading checkpoint %s", key)
+            model = CrossEncoder(key)
+
+            with self._cache_lock:
+                self._cache[key] = model
                 self._cache.move_to_end(key)
-                return cached
-
-        from sentence_transformers import CrossEncoder  # type: ignore
-
-        logger.info("loading checkpoint %s", key)
-        model = CrossEncoder(key)
-
-        with self._cache_lock:
-            self._cache[key] = model
-            self._cache.move_to_end(key)
-            while len(self._cache) > self.LRU_CAPACITY:
-                evicted_key, _ = self._cache.popitem(last=False)
-                logger.info("evicted checkpoint %s from LRU", evicted_key)
+                while len(self._cache) > self.LRU_CAPACITY:
+                    evicted_key, _ = self._cache.popitem(last=False)
+                    logger.info("evicted checkpoint %s from LRU", evicted_key)
+        finally:
+            # ALWAYS clear the pending entry and wake waiters,
+            # whether the load succeeded or raised. If it raised,
+            # waiters loop back, find no cached entry and no
+            # pending entry, and become leaders for a retry --
+            # exactly what a transient model-load failure deserves.
+            with self._cache_lock:
+                self._pending.pop(key, None)
+            load_event.set()
         return model
 
 
@@ -1089,18 +1141,11 @@ def main() -> None:
 
     config = SidecarConfig.from_env()
     app = make_app(config)
-    # Split on the *last* colon so values like ":8088", "127.0.0.1:9000",
-    # ":9000", "0.0.0.0:8088", a bare port ("8088"), and bracketed IPv6
-    # ("[::1]:9000") all parse correctly. A missing host falls back to
-    # 0.0.0.0; a missing port falls back to 8088.
-    host, sep, port = config.listen_addr.rpartition(":")
-    if not sep:
-        # No colon present -- treat the whole value as a bare port.
-        port = host
-        host = ""
-    host = host or "0.0.0.0"
-    port = port or "8088"
-    uvicorn.run(app, host=host, port=int(port))
+    host, _, port = config.listen_addr.lstrip(":").partition(":")
+    if not port:
+        port = host or "8088"
+        host = "0.0.0.0"
+    uvicorn.run(app, host=host or "0.0.0.0", port=int(port))
 
 
 if __name__ == "__main__":

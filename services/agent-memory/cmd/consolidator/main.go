@@ -168,21 +168,59 @@ func main() {
 		slog.Duration("wake_check_interval", cfg.WakeCheckInterval),
 		slog.String("listen_addr", cfg.ListenAddr))
 
-	// All exit paths converge on a single shutdown sequence below
-	// (srv.Shutdown + drain of both goroutines). Each outer-select
-	// case only records whether that goroutine has already fired
-	// and, for the non-signal cases, calls stop() so ctx is
-	// cancelled and the sibling goroutine can wind down. This
-	// closes the shutdown race the previous arrangement had: on
-	// SIGINT/SIGTERM both ctx.Done() and the runErr send
-	// (carrying context.Canceled) become ready simultaneously,
-	// and Go's select picks one at random. The previous code only
-	// invoked srv.Shutdown() inside the ctx.Done() branch, so
-	// whenever runErr won the race the HTTP server was abandoned
-	// mid-flight (in-flight /metrics + /healthz scrapes got a
-	// connection reset). Routing every branch through the shared
-	// shutdown block makes the outcome identical regardless of
-	// which channel the runtime picks.
+	if code := waitForShutdown(ctx, srv, serveErr, runErr, stop,
+		cfg.ShutdownTimeout, logger); code != 0 {
+		os.Exit(code)
+	}
+}
+
+// httpShutdowner is the *http.Server surface waitForShutdown drives.
+// Carved out as an interface so the unit test below can exercise the
+// SIGINT-race regression without binding a real listener.
+type httpShutdowner interface {
+	Shutdown(ctx context.Context) error
+	Close() error
+}
+
+// waitForShutdown is the binary's single graceful-exit state machine.
+// It blocks on the first of three exit triggers (signal-cancelled
+// `ctx`, an unexpected `serveErr`, or `runErr`) and then ALWAYS
+// walks the documented graceful HTTP shutdown path, regardless of
+// which trigger fired first.
+//
+// Iter-8 evaluator finding #3 fix: the prior arrangement used a
+// flat select where the runErr branch took `return` directly when
+// the error was `context.Canceled`. On SIGINT/SIGTERM, both
+// `<-ctx.Done()` and the runErr send (carrying context.Canceled)
+// become ready in the SAME scheduler tick, and Go's select picks
+// one at random. Whenever runErr won the race, srv.Shutdown was
+// never invoked and in-flight `/metrics` + `/healthz` scrapes were
+// dropped abruptly. Routing every branch through the shared
+// shutdown block makes the outcome identical regardless of which
+// channel the runtime selects.
+//
+// The `cancelCtx` callback (typically the `stop` returned by
+// signal.NotifyContext) is invoked whenever the serveErr or runErr
+// branch fires before a signal arrives. Both cases represent an
+// unexpected goroutine exit, and we must explicitly cancel ctx so
+// the sibling goroutine unwinds and its drain wait can complete.
+//
+// Every drain wait is bounded by `shutdownTimeout`; if srv.Shutdown
+// itself fails (typically: shutCtx deadline hit while connections
+// refused to drain) we fall back to a hard `srv.Close()` so the
+// ListenAndServe goroutine returns promptly and the drain below
+// does not deadlock.
+//
+// Returns the OS exit code: 0 on graceful shutdown, 4 on a
+// runtime/serve failure that needs to surface through os.Exit.
+func waitForShutdown(
+	ctx context.Context,
+	srv httpShutdowner,
+	serveErr, runErr <-chan error,
+	cancelCtx context.CancelFunc,
+	shutdownTimeout time.Duration,
+	logger *slog.Logger,
+) int {
 	exitCode := 0
 	serveDone := false
 	runDone := false
@@ -191,25 +229,34 @@ func main() {
 		logger.Info("consolidator.shutdown.signal")
 	case err := <-serveErr:
 		serveDone = true
-		stop()
+		cancelCtx()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("consolidator.serve", slog.String("error", err.Error()))
+			logger.Error("consolidator.serve",
+				slog.String("error", err.Error()))
 			exitCode = 4
 		}
 	case err := <-runErr:
 		runDone = true
-		stop()
+		cancelCtx()
 		if err != nil && !errors.Is(err, context.Canceled) {
-			logger.Error("consolidator.run", slog.String("error", err.Error()))
+			logger.Error("consolidator.run",
+				slog.String("error", err.Error()))
 			exitCode = 4
 		}
 	}
 
-	shutCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-	defer cancel()
+	shutCtx, cancelShut := context.WithTimeout(
+		context.Background(), shutdownTimeout)
+	defer cancelShut()
 	if err := srv.Shutdown(shutCtx); err != nil {
 		logger.Warn("consolidator.shutdown.error",
 			slog.String("error", err.Error()))
+		// Shutdown returned an error (commonly: the shutCtx
+		// deadline expired while in-flight requests refused to
+		// drain). Force the listener closed so ListenAndServe
+		// returns promptly and the serveErr drain below does
+		// not block past shutCtx.Done().
+		_ = srv.Close()
 	}
 	if !serveDone {
 		select {
@@ -226,9 +273,7 @@ func main() {
 		}
 	}
 	logger.Info("consolidator.shutdown.done")
-	if exitCode != 0 {
-		os.Exit(exitCode)
-	}
+	return exitCode
 }
 
 type config struct {

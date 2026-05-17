@@ -100,8 +100,13 @@ type Options struct {
 	Logger *slog.Logger
 
 	// MaxBodyBytes caps the request body the handler will
-	// read. Zero means [DefaultMaxBodyBytes]; negative
-	// disables the cap (NOT recommended in production).
+	// read. Zero OR negative coerces to
+	// [DefaultMaxBodyBytes]; there is deliberately no
+	// "unlimited" escape hatch because every Stage 7.1
+	// verb body is operator-shape (< 1 KiB realistically)
+	// and an unbounded read is an OOM vector for an
+	// authenticated attacker — `ReadTimeout` alone does
+	// not bound total bytes within the timeout window.
 	MaxBodyBytes int64
 
 	// SecretGen overrides the function used to generate
@@ -159,7 +164,14 @@ func NewHandler(db *sql.DB, verifier TokenVerifier, resolver HeadResolver, opts 
 		logger = slog.Default()
 	}
 	maxBody := opts.MaxBodyBytes
-	if maxBody == 0 {
+	if maxBody <= 0 {
+		// Negative was previously a documented "disable
+		// the cap" escape hatch, but an authenticated
+		// attacker could exploit it to OOM the process
+		// via a multi-gigabyte (or slow-drip within
+		// ReadTimeout) body. Coerce to the default so a
+		// stale operator config can't reopen the
+		// vulnerability. See Options.MaxBodyBytes.
 		maxBody = DefaultMaxBodyBytes
 	}
 	clock := opts.Clock
@@ -899,8 +911,11 @@ func (h *Handler) loadRepo(ctx context.Context, repoID string) (repoURL, default
 
 // decodeJSONBody decodes the request body into `dst` and
 // returns false on any error after writing the appropriate
-// 4xx response. Imposes the configured body cap so a
-// pathological body cannot exhaust memory.
+// 4xx response. ALWAYS imposes the configured body cap so a
+// pathological body cannot exhaust memory; `h.maxBody` is
+// guaranteed positive by [NewHandler], which coerces
+// zero / negative [Options.MaxBodyBytes] to
+// [DefaultMaxBodyBytes].
 //
 // JSON shape rules:
 //
@@ -913,9 +928,7 @@ func (h *Handler) loadRepo(ctx context.Context, repoID string) (repoURL, default
 //     fields — required-field validation is the verb
 //     handler's job.
 func (h *Handler) decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) bool {
-	if h.maxBody > 0 {
-		r.Body = http.MaxBytesReader(w, r.Body, h.maxBody)
-	}
+	r.Body = http.MaxBytesReader(w, r.Body, h.maxBody)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		var mxErr *http.MaxBytesError

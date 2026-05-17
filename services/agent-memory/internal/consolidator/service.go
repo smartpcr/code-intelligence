@@ -1230,6 +1230,22 @@ func (s *Service) emitSyntheticPositives(
 // tick. A NULL cursor (brand-new cluster, no prior 'done' run)
 // degenerates to TRUE so the first tick scans every EU.
 //
+// The CTE also pre-filters `eu.new_outcome = 'human_corrected'`
+// purely as a planner hint: on busy clusters the vast majority
+// of EUs carry non-correction outcomes (success / timeout / …)
+// and are immediately discarded by the outer
+// `latest_eu.new_outcome = 'human_corrected'` predicate. The
+// pre-filter shrinks the eu_changes working set proportionally
+// to how rare corrections are without changing the candidate
+// set: if a parent's GLOBAL latest EU is 'human_corrected' AND
+// any EU on that parent is > cursor, then the latest EU itself
+// is necessarily > cursor (by definition of "latest") AND
+// carries 'human_corrected', so the parent enters eu_changes
+// via that same row. The LATERAL pick that follows still
+// reads the GLOBAL latest EU per parent — see the
+// "Latest-EU-state semantics" section below — so the
+// optimization is correctness-equivalent.
+//
 // Critically, the SYNTH PHASE ABORTS THE TICK on error (see
 // `runEmissionPhase` doc-block) — finalizeRun then writes
 // status='failed' and priorHighWater() (filters status='done')
@@ -1292,6 +1308,7 @@ func (s *Service) scanSyntheticCandidates(
 		    SELECT DISTINCT eu.episode_id
 		      FROM episode_update eu
 		     WHERE ($1::timestamptz IS NULL OR eu.created_at > $1::timestamptz)
+		       AND eu.new_outcome = 'human_corrected'::outcome
 		)
 		SELECT parent.episode_id::text,
 		       parent.episode_group_id::text,

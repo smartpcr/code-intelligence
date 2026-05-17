@@ -932,10 +932,24 @@ func (h *Handler) decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any
 //
 //   - Trim leading / trailing whitespace.
 //   - Require a non-empty value.
-//   - Require a parseable URL with a scheme (http / https /
-//     ssh / git+ssh) and a host. A bare path like `acme/svc`
-//     is rejected so the audit log never carries an
-//     unresolvable identifier.
+//   - Require a parseable URL with a scheme drawn from a
+//     closed allowlist (https / http / ssh / git+ssh / git)
+//     and a host. A bare path like `acme/svc` is rejected
+//     so the audit log never carries an unresolvable
+//     identifier.
+//
+// SECURITY: the scheme allowlist is a hard barrier against
+// git remote-helper transports — `ext::<command>`,
+// `transport::<inner>::<addr>`, `local::<path>`, etc. —
+// which instruct `git` (and therefore `git ls-remote`, which
+// the production [HeadResolver] in git_resolver.go shells
+// out to with the operator-supplied URL as an argv entry)
+// to execute arbitrary commands. Without this check an
+// authenticated operator could register
+// `repo_url=ext::sh -c '<payload>'` and trigger RCE inside
+// the agent-memory process the first time HEAD is resolved.
+// Adding a new transport to the allowlist requires a
+// matching security review — never broaden it casually.
 //
 // The handler does NOT touch URL case (some git hosts treat
 // the path as case-sensitive) and does NOT strip trailing
@@ -951,7 +965,18 @@ func normalizeRepoURL(raw string) (string, error) {
 		return "", fmt.Errorf("repo_url: %v", err)
 	}
 	if u.Scheme == "" {
-		return "", errors.New("repo_url: missing scheme (use https://, ssh://, or git@host:path)")
+		return "", errors.New("repo_url: missing scheme (use https://, http://, ssh://, git+ssh://, or git://)")
+	}
+	// Scheme allowlist — see the SECURITY note above. Go's
+	// `url.Parse` already lower-cases `u.Scheme`, so a
+	// literal-string switch is sufficient.
+	switch u.Scheme {
+	case "https", "http", "ssh", "git+ssh", "git":
+		// allowed
+	default:
+		return "", fmt.Errorf(
+			"repo_url: scheme %q is not allowed; use https, http, ssh, git+ssh, or git",
+			u.Scheme)
 	}
 	// SCP-style URLs (`git@host:path`) get parsed as a
 	// path-only URL with Scheme=="" — we already reject

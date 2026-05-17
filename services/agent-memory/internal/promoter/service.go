@@ -56,6 +56,35 @@ const (
 	// each retry re-runs the embed+upsert+confirm chain.
 	DefaultRetryBatchSize = 16
 
+	// DefaultMaxRetryAttempts is the per-publish hard cap on
+	// the number of retry attempts the Promoter will spend on
+	// a stalled embedding_publish row before abandoning it for
+	// the rest of its lifetime. Without this cap a permanently-
+	// failing publish (corrupt fingerprint payload, Qdrant
+	// schema mismatch, an embedding that consistently fails
+	// confirm, etc.) is re-queued every single tick, burning
+	// an embedder API call + a Qdrant upsert + DB writes per
+	// tick with zero chance of success — and crowds legitimate
+	// retries out of the RetryBatchSize budget.
+	//
+	// The cap is intentionally generous (10) so a transient
+	// outage of any single downstream (embedder, Qdrant, PG)
+	// has many ticks' worth of headroom to clear before a
+	// publish is given up on. Once a publish hits the cap, the
+	// row is left untouched in the database (latest event
+	// stays at whatever non-terminal state it was in) and
+	// surfaced as a TickResult.RetriesAbandoned increment
+	// plus a structured Error log per occurrence, so an
+	// operator can investigate the underlying poison row
+	// without the promoter wasting downstream call budget.
+	//
+	// 10 is the default rather than e.g. 3 because the
+	// embed → upsert → confirm chain has three independent
+	// failure surfaces; a row that fails once at each surface
+	// in alternating ticks should still complete inside the
+	// budget.
+	DefaultMaxRetryAttempts = 10
+
 	// PromoterAdvisoryLockKey is the cluster-wide bigint
 	// pg_try_advisory_lock key the Promoter uses to serialise
 	// its tick across replicas. The numeric value is the
@@ -173,6 +202,14 @@ type Config struct {
 	// DefaultRetryBatchSize.
 	RetryBatchSize int
 
+	// MaxRetryAttempts is the per-publish hard cap on retry
+	// attempts. Once a stalled publish row's
+	// max(attempt_index) reaches this value, processRetries
+	// stops re-queueing it (the row is logged at Error level
+	// and counted in TickResult.RetriesAbandoned). Zero or
+	// negative falls back to DefaultMaxRetryAttempts (10).
+	MaxRetryAttempts int
+
 	// AdvisoryLockKey is the bigint key the Service uses for
 	// pg_try_advisory_lock-based cross-replica serialisation.
 	// Zero falls back to PromoterAdvisoryLockKey. Tests
@@ -245,6 +282,9 @@ func New(db *sql.DB, embedder embedding.Embedder, qdrant embedding.Qdrant, cfg C
 	if cfg.RetryBatchSize <= 0 {
 		cfg.RetryBatchSize = DefaultRetryBatchSize
 	}
+	if cfg.MaxRetryAttempts <= 0 {
+		cfg.MaxRetryAttempts = DefaultMaxRetryAttempts
+	}
 	if cfg.AdvisoryLockKey == 0 {
 		cfg.AdvisoryLockKey = PromoterAdvisoryLockKey
 	}
@@ -304,6 +344,18 @@ type TickResult struct {
 	// RetriesAttempted is the count of stalled publishes the
 	// retry phase picked up on this tick.
 	RetriesAttempted uint64
+
+	// RetriesAbandoned is the count of stalled publishes the
+	// retry phase REFUSED to pick up on this tick because
+	// their existing max(attempt_index) had reached
+	// Config.MaxRetryAttempts. Each abandoned row is also
+	// surfaced as a structured `promoter.retry_abandoned`
+	// Error log so the operator can locate the poison row
+	// without scraping metrics. A row that crosses the cap is
+	// left untouched in the DB (its latest event_kind stays
+	// where it was) so a future manual recovery can re-drive
+	// it after the underlying defect is fixed.
+	RetriesAbandoned uint64
 
 	// ConceptsPromoted is the count of publish chains that
 	// reached the terminal `published` event on this tick.
@@ -463,6 +515,7 @@ func (s *Service) Tick(ctx context.Context) (TickResult, error) {
 		slog.Uint64("candidates_pending", result.CandidatesPending),
 		slog.Uint64("candidates_evaluated", result.CandidatesEvaluated),
 		slog.Uint64("retries_attempted", result.RetriesAttempted),
+		slog.Uint64("retries_abandoned", result.RetriesAbandoned),
 		slog.Uint64("orphans_pending", result.OrphansPending),
 		slog.Uint64("orphans_recovered", result.OrphansRecovered),
 		slog.Uint64("concepts_promoted", result.ConceptsPromoted),
@@ -555,6 +608,7 @@ func (s *Service) Run(ctx context.Context) error {
 		slog.Duration("tick_timeout", s.cfg.TickTimeout),
 		slog.Int("candidate_batch_size", s.cfg.CandidateBatchSize),
 		slog.Int("retry_batch_size", s.cfg.RetryBatchSize),
+		slog.Int("max_retry_attempts", s.cfg.MaxRetryAttempts),
 		slog.Int64("advisory_lock_key", s.cfg.AdvisoryLockKey))
 
 	if _, err := s.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -1411,6 +1465,34 @@ func (s *Service) processRetries(ctx context.Context, conn *sql.Conn, runID stri
 				slog.String("publish_id", st.publishID),
 				slog.String("publish_model", st.publishModel),
 				slog.String("current_model", currentModel))
+			continue
+		}
+
+		// Per-publish retry-budget gate. Without this cap a
+		// permanently-failing row (corrupt fingerprint payload,
+		// Qdrant schema mismatch, embedding that consistently
+		// fails confirm, etc.) would be re-queued every tick
+		// forever — burning an embedder API call + Qdrant
+		// upsert + DB writes per tick AND crowding healthy
+		// retries out of the RetryBatchSize budget. The check
+		// runs BEFORE the RetriesAttempted increment and the
+		// `queued` event insert so an abandoned row produces
+		// zero side-effects beyond the structured Error log +
+		// the in-memory TickResult.RetriesAbandoned counter.
+		// The row itself is left untouched (its latest
+		// event_kind stays where it was), so a future manual
+		// recovery can re-drive the chain once the underlying
+		// defect is fixed.
+		if st.maxAttempt >= s.cfg.MaxRetryAttempts {
+			result.RetriesAbandoned++
+			s.logger.Error("promoter.retry_abandoned",
+				slog.String("run_id", runID),
+				slog.String("publish_id", st.publishID),
+				slog.String("concept_id", st.conceptID),
+				slog.String("concept_version_id", st.conceptVersionID),
+				slog.String("latest_event", st.latestEvent),
+				slog.Int("max_attempt", st.maxAttempt),
+				slog.Int("max_retry_attempts", s.cfg.MaxRetryAttempts))
 			continue
 		}
 

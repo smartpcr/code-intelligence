@@ -36,19 +36,21 @@
 //     (server-side fault; the recall handler degrades to a
 //     snapshot internally and only returns a hard error when
 //     the snapshot fallback itself is unwired).
-//   - `Observe` / `Summarize` → `codes.Unimplemented` (the
-//     placeholder body shapes belong to Stages 5.2 / 5.4).
-//     The embedded `UnimplementedAgentServiceServer` returns
-//     `codes.Unimplemented` for both; this file does NOT
-//     declare explicit stub methods today. When Stages 5.2 /
-//     5.4 land, the implementers will add `func (s *GRPCServer)
-//     Observe(...)` / `Summarize(...)` here to override the
-//     embedded defaults.
-//   - `Expand` → real implementation (Stage 5.3). Errors
-//     map to: `ErrInvalidExpand*` → `codes.InvalidArgument`,
-//     `ErrExpandUnavailable` → `codes.Unimplemented`,
-//     `graphreader.ErrNotFound` → `codes.NotFound`,
-//     anything else → `codes.Internal`.
+//   - `Observe` / `Expand` → `codes.Unimplemented`
+//     (the placeholder body shapes belong to Stages 5.2 /
+//     5.3). The embedded `UnimplementedAgentServiceServer`
+//     already returns these codes, but we re-export tiny
+//     stubs below so future implementers know exactly
+//     where to plug in.
+//   - `Summarize` → mapped per `summarizeErrorToStatus`
+//     (Stage 5.4). Missing/ambiguous target, repo_id
+//     requirements, repo mismatch, max_tokens range →
+//     `codes.InvalidArgument`. Target not found →
+//     `codes.NotFound`. `ErrSummarizeUnconfigured` →
+//     `codes.Unimplemented` so a partially-wired binary
+//     surfaces the same signal as a binary that hasn't
+//     deployed Stage 5.4 yet. Anything else →
+//     `codes.Internal`.
 package agentapi
 
 import (
@@ -341,4 +343,83 @@ func clampInt32(n int) int {
 		return 0
 	}
 	return n
+}
+
+// Summarize implements `agentpb.AgentServiceServer.Summarize`.
+// Translates the proto request shape into a
+// `SummarizeRequest`, invokes `Service.Summarize`, then
+// projects the response onto `agentpb.SummarizeResponse`.
+//
+// Stage 5.4 status-code policy (mirrors `recallErrorToStatus`):
+//
+//   - nil request                     → `codes.InvalidArgument`
+//   - `ErrSummarizeMissingTarget`     → `codes.InvalidArgument`
+//   - `ErrSummarizeAmbiguousTarget`   → `codes.InvalidArgument`
+//   - `ErrSummarizeRepoIDRequired`    → `codes.InvalidArgument`
+//   - `ErrSummarizeRepoMismatch`      → `codes.InvalidArgument`
+//   - `ErrSummarizeMaxTokensRange`    → `codes.InvalidArgument`
+//   - `ErrSummarizeTargetNotFound`    → `codes.NotFound`
+//   - `ErrSummarizeUnconfigured`      → `codes.Unimplemented`
+//   - parent ctx cancelled/expired    → `codes.Canceled` /
+//                                       `codes.DeadlineExceeded`
+//   - anything else                   → `codes.Internal`
+func (g *GRPCServer) Summarize(ctx context.Context, req *agentpb.SummarizeRequest) (*agentpb.SummarizeResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "agent.summarize: nil request")
+	}
+	in := SummarizeRequest{
+		NodeID:    req.GetNodeId(),
+		ConceptID: req.GetConceptId(),
+		RepoID:    req.GetRepoId(),
+		MaxTokens: int(req.GetMaxTokens()),
+	}
+	resp, err := g.svc.Summarize(ctx, in)
+	if err != nil {
+		return nil, summarizeErrorToStatus(err)
+	}
+	out := &agentpb.SummarizeResponse{
+		SummaryMd:      resp.SummaryMD,
+		ContextId:      resp.ContextID,
+		Degraded:       resp.Degraded,
+		DegradedReason: resp.DegradedReason,
+		TargetKind:     resp.TargetKind,
+		TargetId:       resp.TargetID,
+	}
+	if len(resp.Citations) > 0 {
+		out.Citations = make([]*agentpb.Citation, 0, len(resp.Citations))
+		for _, c := range resp.Citations {
+			out.Citations = append(out.Citations, &agentpb.Citation{
+				NodeId:    c.NodeID,
+				EdgeId:    c.EdgeID,
+				ConceptId: c.ConceptID,
+				EpisodeId: c.EpisodeID,
+				Snippet:   c.Snippet,
+			})
+		}
+	}
+	return out, nil
+}
+
+// summarizeErrorToStatus maps the Stage 5.4 sentinels +
+// caller-cancellation signals onto gRPC status codes.
+// Centralised here so adding a new sentinel does not
+// silently drop to `codes.Unknown`.
+func summarizeErrorToStatus(err error) error {
+	switch {
+	case errors.Is(err, ErrSummarizeMissingTarget),
+		errors.Is(err, ErrSummarizeAmbiguousTarget),
+		errors.Is(err, ErrSummarizeRepoIDRequired),
+		errors.Is(err, ErrSummarizeRepoMismatch),
+		errors.Is(err, ErrSummarizeMaxTokensRange):
+		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, ErrSummarizeTargetNotFound):
+		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, ErrSummarizeUnconfigured):
+		return status.Error(codes.Unimplemented, err.Error())
+	case errors.Is(err, context.Canceled):
+		return status.Error(codes.Canceled, err.Error())
+	case errors.Is(err, context.DeadlineExceeded):
+		return status.Error(codes.DeadlineExceeded, err.Error())
+	}
+	return status.Error(codes.Internal, fmt.Sprintf("agent.summarize: %v", err))
 }

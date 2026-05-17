@@ -1,21 +1,15 @@
 // agent.proto -- gRPC IDL for the Agent Surface (tech-spec §8.5).
 //
-// As of Stage 5.3 this file ships the IDL AND checked-in Go
-// bindings for two verbs:
-//   * `agent.recall`  -- Stage 5.1, §6.4 read path. Fully wired
-//     in `cmd/agent-api/main.go`; see `internal/agentapi/recall.go`.
-//   * `agent.expand`  -- Stage 5.3, §6.5 structural-walk path.
-//     Fully wired in `cmd/agent-api/main.go`; see
-//     `internal/agentapi/expand.go`.
-// The two remaining verbs are still skeleton placeholders so the
-// gRPC server can register a single stable service descriptor today;
-// the body shapes will firm up as their owning stages land:
-//   * `agent.observe`   -- Stage 5.2 (Observe request/response body).
-//   * `agent.summarize` -- Stage 5.4 (Summarize request/response body).
-// The protoc tooling pin (`protoc-gen-go v1.36.11`,
-// `protoc-gen-go-grpc v1.5.1`) and the `make proto` regen target
-// landed alongside Stage 5.3 — see `services/agent-memory/Makefile`
-// and the proto-drift CI gate in `.github/workflows/agent-memory-ci.yml`.
+// Stage 5.1 of implementation-plan.md ships the IDL for the
+// `agent.recall` verb plus skeleton placeholders for the
+// `agent.observe` and `agent.expand` verbs owned by Stages
+// 5.2 / 5.3. Stage 5.4 (this iter) lands the full
+// `agent.summarize` verb shape (`SummarizeRequest` /
+// `SummarizeResponse` / `Citation`) wired through
+// `internal/agentapi/summarize.go`. Generated Go bindings
+// for all verbs are produced via the protoc tooling pin;
+// this file is the canonical contract that
+// `cmd/agent-api/main.go` mTLS server speaks.
 //
 // Transport contract (tech-spec §8.5):
 //   * gRPC over HTTP/2.
@@ -104,8 +98,19 @@ type AgentServiceClient interface {
 	// closed-set degraded-fallback path as `agent.recall`.
 	// See `internal/agentapi/expand.go.Service.Expand`.
 	Expand(ctx context.Context, in *ExpandRequest, opts ...grpc.CallOption) (*ExpandResponse, error)
-	// Summarize materialises a neighborhood card into a
-	// natural-language summary; owned by Stage 5.4. Placeholder.
+	// Summarize materialises a neighborhood card (node target)
+	// or a concept card + its `concept_support` rows (concept
+	// target) into a natural-language summary. Implemented in
+	// Stage 5.4. The verb invokes an LLM `Summariser` (the
+	// production adapter speaks the OpenAI-compatible HTTPS
+	// contract), caps the call at a 5 s defence-in-depth
+	// budget, and falls back to a deterministic Markdown
+	// template stamped with `degraded_reason=
+	// summariser_unavailable` (or `reranker_model_stale` when
+	// the reranker training is >7 d old) when the LLM is
+	// unavailable. The handler also durably appends a
+	// `recall_context_log(verb='summarize')` audit row keyed
+	// by the returned `context_id`.
 	Summarize(ctx context.Context, in *SummarizeRequest, opts ...grpc.CallOption) (*SummarizeResponse, error)
 }
 
@@ -196,8 +201,19 @@ type AgentServiceServer interface {
 	// closed-set degraded-fallback path as `agent.recall`.
 	// See `internal/agentapi/expand.go.Service.Expand`.
 	Expand(context.Context, *ExpandRequest) (*ExpandResponse, error)
-	// Summarize materialises a neighborhood card into a
-	// natural-language summary; owned by Stage 5.4. Placeholder.
+	// Summarize materialises a neighborhood card (node target)
+	// or a concept card + its `concept_support` rows (concept
+	// target) into a natural-language summary. Implemented in
+	// Stage 5.4. The verb invokes an LLM `Summariser` (the
+	// production adapter speaks the OpenAI-compatible HTTPS
+	// contract), caps the call at a 5 s defence-in-depth
+	// budget, and falls back to a deterministic Markdown
+	// template stamped with `degraded_reason=
+	// summariser_unavailable` (or `reranker_model_stale` when
+	// the reranker training is >7 d old) when the LLM is
+	// unavailable. The handler also durably appends a
+	// `recall_context_log(verb='summarize')` audit row keyed
+	// by the returned `context_id`.
 	Summarize(context.Context, *SummarizeRequest) (*SummarizeResponse, error)
 	mustEmbedUnimplementedAgentServiceServer()
 }

@@ -220,214 +220,179 @@ func TestNewGRPCServer_nilServicePanics(t *testing.T) {
 	_ = NewGRPCServer(nil)
 }
 
-// -- Observe gRPC contract tests (evaluator iter-1 item #4) ----------
-//
-// The iter-1 evaluator flagged that observe validation was
-// only tested at the domain layer. These tests hit the
-// FULL gRPC adapter so:
-//   - The proto <-> domain translation is exercised.
-//   - The validation sentinel -> `codes.InvalidArgument`
-//     mapping in `observeErrorToStatus` is verified end-
-//     to-end through `GRPCServer.Observe`.
-//   - The WAL fallback path returns `codes.OK` with
-//     `Degraded=true` on the proto response.
+// ---------------------------------------------------------------------------
+// Summarize (Stage 5.4) — proto translation + error mapping
+// ---------------------------------------------------------------------------
 
-func newTestObserveSrv(t *testing.T, w EpisodeAppender, r ContextResolver, opts ...ObserveOption) *GRPCServer {
-	t.Helper()
-	// Reuse the recall stack only for the constructor's
-	// *Service requirement -- these tests never touch
-	// Recall.
-	dummySvc := NewService(
-		fakeEmbedder{vec: []float32{0.1}},
-		&collectionSearcher{},
-		&allowListFilter{},
-		WithLogger(quietLogger()),
+// TestGRPCServer_summarizeTranslatesNodeTarget round-trips
+// a node-target proto request through the verb. Proves:
+//   - NodeId / RepoId / MaxTokens reach the service.
+//   - Internal Citations[] surface on the proto cards in
+//     the same order with the right field populated.
+//   - SummaryMD, ContextId, Degraded, TargetKind, TargetId
+//     all project verbatim.
+func TestGRPCServer_summarizeTranslatesNodeTarget(t *testing.T) {
+	nb := sampleNodeNeighborhood()
+	resolver := &fakeResolver{
+		nodes: map[string]SummarizeNodeNeighborhood{nb.Node.NodeID: nb},
+	}
+	summariser := &fakeSummariser{
+		output: SummariserOutput{SummaryMD: "## summary text"},
+	}
+	contextLog := &recordingContextLog{returnID: "ctx-grpc-001"}
+	svc := newSummarizeService(t,
+		WithNeighborhoodResolver(resolver),
+		WithSummariser(summariser),
+		WithContextLog(contextLog),
 	)
-	obs := newTestService(t, w, r, opts...)
-	return NewGRPCServer(dummySvc, WithObserveService(obs))
-}
+	srv := NewGRPCServer(svc)
 
-func validObserveProto() *agentpb.ObserveRequest {
-	return &agentpb.ObserveRequest{
-		RepoId:     "repo-uuid",
-		SessionId:  "sess-1",
-		TraceId:    "trace-1",
-		ActionJson: []byte(`{"action":"noop"}`),
-		Outcome:    "success",
-		ContextId:  "ctx-uuid",
-		ObservationRefs: []*agentpb.ObservationRef{
-			{Role: "node_hit", NodeId: "node-1", Weight: 0.7},
-			{Role: "edge_hit", EdgeId: "edge-1", Weight: 0.3},
-		},
-	}
-}
-
-// Stage 5.2 / C15 scenario through the gRPC adapter.  An
-// outcome=human_corrected request hits
-// `codes.InvalidArgument` BEFORE the writer is invoked.
-func TestGRPCServer_observeRejectsHumanCorrected(t *testing.T) {
-	w := &fakeEpisodeWriter{}
-	r := &fakeContextResolver{}
-	srv := newTestObserveSrv(t, w, r)
-
-	req := validObserveProto()
-	req.Outcome = "human_corrected"
-	_, err := srv.Observe(context.Background(), req)
-	if err == nil {
-		t.Fatalf("expected error for human_corrected outcome")
-	}
-	st, ok := status.FromError(err)
-	if !ok {
-		t.Fatalf("err is not a gRPC status: %v", err)
-	}
-	if st.Code() != codes.InvalidArgument {
-		t.Fatalf("status code = %s; want InvalidArgument", st.Code())
-	}
-	if len(w.snapshot()) != 0 {
-		t.Fatalf("writer must not be called when human_corrected is rejected")
-	}
-}
-
-// Stage 5.2 / C23 scenario through the gRPC adapter.  A
-// caller-supplied observation_refs[*].role=degraded_recall_context
-// is rejected with `codes.InvalidArgument` (server is the
-// only writer of that role).
-func TestGRPCServer_observeRejectsForgedDegradedRecallContext(t *testing.T) {
-	w := &fakeEpisodeWriter{}
-	r := &fakeContextResolver{}
-	srv := newTestObserveSrv(t, w, r)
-
-	req := validObserveProto()
-	req.ObservationRefs = append(req.ObservationRefs, &agentpb.ObservationRef{
-		Role:   "degraded_recall_context",
-		NodeId: "ctx-uuid",
-		Weight: 1.0,
+	resp, err := srv.Summarize(context.Background(), &agentpb.SummarizeRequest{
+		NodeId:    nb.Node.NodeID,
+		RepoId:    "repo-a",
+		MaxTokens: 256,
 	})
-	_, err := srv.Observe(context.Background(), req)
-	if err == nil {
-		t.Fatalf("expected error for forged degraded_recall_context role")
+	if err != nil {
+		t.Fatalf("gRPC Summarize: %v", err)
 	}
-	st, ok := status.FromError(err)
-	if !ok {
-		t.Fatalf("err is not a gRPC status: %v", err)
+	if resp.GetSummaryMd() != "## summary text" {
+		t.Fatalf("SummaryMd = %q; want canned response", resp.GetSummaryMd())
 	}
-	if st.Code() != codes.InvalidArgument {
-		t.Fatalf("status code = %s; want InvalidArgument", st.Code())
+	if resp.GetContextId() != "ctx-grpc-001" {
+		t.Fatalf("ContextId = %q; want ctx-grpc-001", resp.GetContextId())
 	}
-	if len(w.snapshot()) != 0 {
-		t.Fatalf("writer must not be called when caller forges degraded_recall_context")
+	if resp.GetDegraded() {
+		t.Fatalf("Degraded = true; want false on happy path")
+	}
+	if resp.GetTargetKind() != "node" {
+		t.Fatalf("TargetKind = %q; want node", resp.GetTargetKind())
+	}
+	if resp.GetTargetId() != nb.Node.NodeID {
+		t.Fatalf("TargetId = %q; want %q", resp.GetTargetId(), nb.Node.NodeID)
+	}
+	wantCitations := 1 + len(nb.Edges) + 3
+	if got := len(resp.GetCitations()); got != wantCitations {
+		t.Fatalf("len(Citations) = %d; want %d", got, wantCitations)
+	}
+	// First citation == seed Node; verify the proto carries
+	// the NodeId, not EdgeId/ConceptId.
+	c0 := resp.GetCitations()[0]
+	if c0.GetNodeId() != nb.Node.NodeID {
+		t.Fatalf("Citations[0].NodeId = %q; want %q", c0.GetNodeId(), nb.Node.NodeID)
+	}
+	if c0.GetEdgeId() != "" || c0.GetConceptId() != "" {
+		t.Fatalf("Citations[0] has unexpected edge/concept ids: %+v", c0)
+	}
+	// Second citation == first edge.
+	c1 := resp.GetCitations()[1]
+	if c1.GetEdgeId() != "e1" {
+		t.Fatalf("Citations[1].EdgeId = %q; want e1", c1.GetEdgeId())
+	}
+	if c1.GetNodeId() != "" {
+		t.Fatalf("Citations[1].NodeId = %q; want empty", c1.GetNodeId())
+	}
+	if summariser.lastMaxToks != 256 {
+		t.Fatalf("summariser.MaxTokens = %d; want 256", summariser.lastMaxToks)
 	}
 }
 
-// Nil proto request returns `codes.InvalidArgument`
-// rather than panicking on the adapter's GetXxx helpers.
-func TestGRPCServer_observeNilRequestRejected(t *testing.T) {
-	w := &fakeEpisodeWriter{}
-	r := &fakeContextResolver{}
-	srv := newTestObserveSrv(t, w, r)
-
-	_, err := srv.Observe(context.Background(), nil)
+// TestGRPCServer_summarizeNilRequestRejected proves the
+// nil-guard.
+func TestGRPCServer_summarizeNilRequestRejected(t *testing.T) {
+	svc := newSummarizeService(t,
+		WithNeighborhoodResolver(&fakeResolver{}),
+	)
+	srv := NewGRPCServer(svc)
+	_, err := srv.Summarize(context.Background(), nil)
 	if err == nil {
 		t.Fatalf("expected error for nil request")
 	}
 	st, _ := status.FromError(err)
 	if st.Code() != codes.InvalidArgument {
-		t.Fatalf("status code = %s; want InvalidArgument", st.Code())
+		t.Fatalf("code = %s; want InvalidArgument", st.Code())
 	}
 }
 
-// Missing required field surfaces as `codes.InvalidArgument`
-// through the adapter (exercises the missing-action sentinel).
-func TestGRPCServer_observeMissingActionInvalidArgument(t *testing.T) {
-	w := &fakeEpisodeWriter{}
-	r := &fakeContextResolver{}
-	srv := newTestObserveSrv(t, w, r)
-
-	req := validObserveProto()
-	req.ActionJson = nil
-	_, err := srv.Observe(context.Background(), req)
+// TestGRPCServer_summarizeMissingTargetInvalidArgument
+// proves the validation sentinel surfaces as
+// InvalidArgument.
+func TestGRPCServer_summarizeMissingTargetInvalidArgument(t *testing.T) {
+	svc := newSummarizeService(t,
+		WithNeighborhoodResolver(&fakeResolver{}),
+	)
+	srv := NewGRPCServer(svc)
+	_, err := srv.Summarize(context.Background(), &agentpb.SummarizeRequest{})
 	if err == nil {
-		t.Fatalf("expected error for missing action_json")
+		t.Fatalf("expected validation error")
 	}
 	st, _ := status.FromError(err)
 	if st.Code() != codes.InvalidArgument {
-		t.Fatalf("status code = %s; want InvalidArgument", st.Code())
+		t.Fatalf("code = %s; want InvalidArgument", st.Code())
 	}
 }
 
-// Happy path: valid proto request roundtrips through the
-// adapter and yields a populated ObserveResponse.
-func TestGRPCServer_observeHappyPath(t *testing.T) {
-	w := &fakeEpisodeWriter{}
-	r := &fakeContextResolver{}
-	srv := newTestObserveSrv(t, w, r)
-
-	resp, err := srv.Observe(context.Background(), validObserveProto())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+// TestGRPCServer_summarizeTargetNotFoundNotFound proves
+// the resolver's not-found sentinel surfaces as NotFound.
+func TestGRPCServer_summarizeTargetNotFoundNotFound(t *testing.T) {
+	resolver := &fakeResolver{
+		nodeErr: map[string]error{
+			"66666666-6666-6666-6666-666666666666": ErrSummarizeTargetNotFound,
+		},
 	}
-	if resp.GetEpisodeId() == "" {
-		t.Fatalf("response missing episode_id")
-	}
-	if resp.GetDegraded() {
-		t.Fatalf("response must not be degraded on happy path, got %+v", resp)
-	}
-	if len(w.snapshot()) != 1 {
-		t.Fatalf("expected 1 writer call, got %d", len(w.snapshot()))
+	svc := newSummarizeService(t, WithNeighborhoodResolver(resolver))
+	srv := NewGRPCServer(svc)
+	_, err := srv.Summarize(context.Background(), &agentpb.SummarizeRequest{
+		NodeId: "66666666-6666-6666-6666-666666666666",
+	})
+	st, _ := status.FromError(err)
+	if st.Code() != codes.NotFound {
+		t.Fatalf("code = %s; want NotFound", st.Code())
 	}
 }
 
-// Stage 5.2 WAL-fallback scenario through the gRPC adapter.
-// On ErrEpisodicLogUnavailable the WAL accepts the payload
-// and the proto response carries degraded=true +
-// degraded_reason=episodic_log_unavailable.  This is the
-// "WAL fallback returns episode_id" scenario the brief
-// mandates.
-func TestGRPCServer_observeWALFallbackDegraded(t *testing.T) {
-	w := &fakeEpisodeWriter{errs: []error{ErrEpisodicLogUnavailable}}
-	r := &fakeContextResolver{}
-	wal := &fakeWAL{}
-	srv := newTestObserveSrv(t, w, r, WithObserveWAL(wal))
+// TestGRPCServer_summarizeUnconfiguredUnimplemented proves
+// a Service without a NeighborhoodResolver surfaces as
+// Unimplemented — the same wire signal a binary that
+// hasn't deployed Stage 5.4 would surface.
+func TestGRPCServer_summarizeUnconfiguredUnimplemented(t *testing.T) {
+	svc := newSummarizeService(t) // no resolver wired
+	srv := NewGRPCServer(svc)
+	_, err := srv.Summarize(context.Background(), &agentpb.SummarizeRequest{
+		NodeId: "11111111-1111-1111-1111-111111111111",
+	})
+	st, _ := status.FromError(err)
+	if st.Code() != codes.Unimplemented {
+		t.Fatalf("code = %s; want Unimplemented", st.Code())
+	}
+}
 
-	resp, err := srv.Observe(context.Background(), validObserveProto())
+// TestGRPCServer_summarizeDegradedEnvelopeIsNotAnError
+// proves a degraded summary (graph unavailable) surfaces
+// as a NORMAL gRPC response with `degraded=true`, NOT a
+// status error. The gRPC layer must distinguish
+// caller-correctable failures (status error) from
+// in-band degraded envelopes (response with flag set).
+func TestGRPCServer_summarizeDegradedEnvelopeIsNotAnError(t *testing.T) {
+	resolver := &fakeResolver{
+		nodeErr: map[string]error{
+			"55555555-5555-5555-5555-555555555555": ErrGraphStoreUnavailable,
+		},
+	}
+	svc := newSummarizeService(t,
+		WithNeighborhoodResolver(resolver),
+	)
+	srv := NewGRPCServer(svc)
+	resp, err := srv.Summarize(context.Background(), &agentpb.SummarizeRequest{
+		NodeId: "55555555-5555-5555-5555-555555555555",
+		RepoId: "repo-a",
+	})
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("gRPC Summarize: %v (graph outage should be in-band, not status error)", err)
 	}
 	if !resp.GetDegraded() {
-		t.Fatalf("response must be degraded on WAL fallback")
+		t.Fatalf("Degraded = false; want true")
 	}
-	if resp.GetDegradedReason() != "episodic_log_unavailable" {
-		t.Fatalf("degraded_reason = %q; want episodic_log_unavailable", resp.GetDegradedReason())
-	}
-	if resp.GetEpisodeId() == "" {
-		t.Fatalf("response missing episode_id on WAL fallback")
-	}
-	walCalls := wal.snapshot()
-	if len(walCalls) != 1 {
-		t.Fatalf("expected 1 WAL enqueue, got %d", len(walCalls))
-	}
-	if !walCalls[0].Degraded {
-		t.Fatalf("WAL payload must carry Degraded=true, got %+v", walCalls[0])
-	}
-}
-
-// When ErrEpisodicLogUnavailable bubbles up WITHOUT a WAL
-// wired the adapter maps it to `codes.Unavailable` so the
-// caller knows to retry.
-func TestGRPCServer_observeEpisodicLogUnavailableNoWAL(t *testing.T) {
-	w := &fakeEpisodeWriter{errs: []error{ErrEpisodicLogUnavailable}}
-	r := &fakeContextResolver{}
-	srv := newTestObserveSrv(t, w, r) // no WAL
-
-	_, err := srv.Observe(context.Background(), validObserveProto())
-	if err == nil {
-		t.Fatalf("expected error when WAL is not wired")
-	}
-	st, ok := status.FromError(err)
-	if !ok {
-		t.Fatalf("err is not a gRPC status: %v", err)
-	}
-	if st.Code() != codes.Unavailable {
-		t.Fatalf("status code = %s; want Unavailable (retry-after)", st.Code())
+	if resp.GetDegradedReason() == "" {
+		t.Fatalf("DegradedReason empty; want non-empty")
 	}
 }

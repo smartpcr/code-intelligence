@@ -16,30 +16,34 @@
 // Configuration (env vars; no flags)
 // ----------------------------------
 //
-//	AGENT_MEMORY_PG_URL                          postgres:// DSN (REQUIRED).
-//	                                             MUST connect as a role with
-//	                                             INSERT+SELECT on concept,
-//	                                             concept_version, concept_support,
-//	                                             episode, observation,
-//	                                             INSERT+SELECT+UPDATE on
-//	                                             consolidator_run, AND
-//	                                             INSERT+SELECT+UPDATE on
-//	                                             concept_candidate_support
-//	                                             (the iter-4 staging table from
-//	                                             migration 0021 used by
-//	                                             emitGroupCandidatePath -- reads
-//	                                             pending rows, inserts per-tick
-//	                                             contributions, and updates
-//	                                             promoted_to_concept_id at
-//	                                             promotion time). Migration 0016
-//	                                             covers the original
-//	                                             `agent_memory_app` grant set;
-//	                                             migration 0021 carries its own
-//	                                             explicit GRANT block for the
-//	                                             new staging table because
-//	                                             0016's `GRANT ON ALL TABLES IN
-//	                                             SCHEMA` is point-in-time
-//	                                             (tech-spec §8.7.4).
+// AGENT_MEMORY_PG_URL is the postgres:// DSN (REQUIRED). The
+// role it authenticates as MUST hold the following per-table
+// grants (the full enumeration; the package-level doc.go
+// "Role / required DB grants" section is the canonical
+// reference):
+//
+//	concept                     INSERT, SELECT
+//	concept_version             INSERT, SELECT
+//	concept_support             INSERT, SELECT
+//	concept_candidate_support   INSERT, SELECT, UPDATE   (iter-4 staging table)
+//	consolidator_run            INSERT, SELECT, UPDATE   (lifecycle row)
+//	episode                     SELECT                   (delta scan)
+//	observation                 SELECT                   (signature inputs)
+//
+// The `concept_candidate_support` grant set is the iter-4
+// staging table from migration 0021 used by
+// `emitGroupCandidatePath` (SELECT pending rows, INSERT
+// per-tick contributions, UPDATE `promoted_to_concept_id` at
+// promotion time). `consolidator_run` similarly needs all
+// three (INSERT for openRun, SELECT for priorHighWater,
+// UPDATE for finalizeRun). Migration 0016 covers the original
+// `agent_memory_app` grant set; migration 0021 carries its
+// own explicit GRANT block for the new staging table because
+// 0016's `GRANT ON ALL TABLES IN SCHEMA` is point-in-time
+// (tech-spec §8.7.4).
+//
+// All other env vars:
+//
 //	AGENT_MEMORY_CONSOLIDATOR_THRESHOLD          Minimum cumulative positive
 //	                                             support count required to
 //	                                             crystallise a Concept for the
@@ -164,33 +168,66 @@ func main() {
 		slog.Duration("wake_check_interval", cfg.WakeCheckInterval),
 		slog.String("listen_addr", cfg.ListenAddr))
 
+	// All exit paths converge on a single shutdown sequence below
+	// (srv.Shutdown + drain of both goroutines). Each outer-select
+	// case only records whether that goroutine has already fired
+	// and, for the non-signal cases, calls stop() so ctx is
+	// cancelled and the sibling goroutine can wind down. This
+	// closes the shutdown race the previous arrangement had: on
+	// SIGINT/SIGTERM both ctx.Done() and the runErr send
+	// (carrying context.Canceled) become ready simultaneously,
+	// and Go's select picks one at random. The previous code only
+	// invoked srv.Shutdown() inside the ctx.Done() branch, so
+	// whenever runErr won the race the HTTP server was abandoned
+	// mid-flight (in-flight /metrics + /healthz scrapes got a
+	// connection reset). Routing every branch through the shared
+	// shutdown block makes the outcome identical regardless of
+	// which channel the runtime picks.
+	exitCode := 0
+	serveDone := false
+	runDone := false
 	select {
 	case <-ctx.Done():
 		logger.Info("consolidator.shutdown.signal")
-		shutCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-		defer cancel()
-		if err := srv.Shutdown(shutCtx); err != nil {
-			logger.Warn("consolidator.shutdown.error",
-				slog.String("error", err.Error()))
+	case err := <-serveErr:
+		serveDone = true
+		stop()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("consolidator.serve", slog.String("error", err.Error()))
+			exitCode = 4
 		}
-		<-serveErr
+	case err := <-runErr:
+		runDone = true
+		stop()
+		if err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("consolidator.run", slog.String("error", err.Error()))
+			exitCode = 4
+		}
+	}
+
+	shutCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shutCtx); err != nil {
+		logger.Warn("consolidator.shutdown.error",
+			slog.String("error", err.Error()))
+	}
+	if !serveDone {
+		select {
+		case <-serveErr:
+		case <-shutCtx.Done():
+			logger.Warn("consolidator.shutdown.serve_timeout")
+		}
+	}
+	if !runDone {
 		select {
 		case <-runErr:
 		case <-shutCtx.Done():
 			logger.Warn("consolidator.shutdown.run_timeout")
 		}
-		logger.Info("consolidator.shutdown.done")
-		return
-	case err := <-serveErr:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("consolidator.serve", slog.String("error", err.Error()))
-			os.Exit(4)
-		}
-	case err := <-runErr:
-		if err != nil && !errors.Is(err, context.Canceled) {
-			logger.Error("consolidator.run", slog.String("error", err.Error()))
-			os.Exit(4)
-		}
+	}
+	logger.Info("consolidator.shutdown.done")
+	if exitCode != 0 {
+		os.Exit(exitCode)
 	}
 }
 

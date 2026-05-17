@@ -97,18 +97,35 @@
 //   - It does NOT touch the `embedding_publish*` tables. The
 //     Concept embedding is written by the Concept Promoter.
 //
-// Role
-// ----
-// The `*sql.DB` MUST authenticate as a role with INSERT + SELECT
-// on `concept`, `concept_version`, `concept_support`, `episode`,
-// `observation`, INSERT + SELECT + UPDATE on `consolidator_run`,
-// AND INSERT + SELECT + UPDATE on `concept_candidate_support`
-// (the latter is the iter-4 staging table added in migration 0021;
-// emitGroupCandidatePath reads pending rows, inserts new per-tick
-// contributions, and updates `promoted_to_concept_id` at promotion
-// time). Migration 0016 covers the original grant set for the
-// `agent_memory_app` role; migration 0021 includes its own explicit
-// `GRANT INSERT, SELECT, UPDATE ON concept_candidate_support` block
-// because 0016's `GRANT ... ON ALL TABLES IN SCHEMA` is point-in-time
-// and does NOT cover tables created in later migrations.
+// Role / required DB grants
+// -------------------------
+// The `*sql.DB` MUST authenticate as a role with the following
+// per-table grants (the full enumeration; every table the worker
+// touches is listed here so a `grep -F "concept_candidate_support"`
+// or `grep -F "consolidator_run"` against the package finds the
+// dependency in one place):
+//
+//	concept                     INSERT, SELECT
+//	concept_version             INSERT, SELECT
+//	concept_support             INSERT, SELECT
+//	concept_candidate_support   INSERT, SELECT, UPDATE  (iter-4 staging table)
+//	consolidator_run            INSERT, SELECT, UPDATE  (lifecycle row)
+//	episode                     SELECT                  (delta scan)
+//	observation                 SELECT                  (signature inputs)
+//
+// `concept_candidate_support` is the iter-4 durable staging
+// table added in migration 0021. Stage 6.1's
+// `emitGroupCandidatePath` reads pending rows (SELECT), inserts
+// per-tick contributions (INSERT), and updates
+// `promoted_to_concept_id` at promotion time (UPDATE), so all
+// three privileges are required on this single table.
+// `consolidator_run` similarly needs INSERT (openRun), SELECT
+// (priorHighWater), and UPDATE (finalizeRun).
+//
+// Migration 0016 covers the original grant set for the
+// `agent_memory_app` role; migration 0021 ships its own
+// explicit `GRANT INSERT, SELECT, UPDATE ON concept_candidate_support`
+// block because 0016's `GRANT ... ON ALL TABLES IN SCHEMA` is
+// point-in-time and does NOT cover tables created in later
+// migrations.
 package consolidator

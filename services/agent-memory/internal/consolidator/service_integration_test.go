@@ -1268,3 +1268,414 @@ func TestTick_pendingSigDoesNotPinCursor(t *testing.T) {
 		t.Fatalf("expected 3 pending candidate_support rows (sig-B only); got %d", pendingCount)
 	}
 }
+
+// ────────────────────────────────────────────────────────────
+// Iter-5 evaluator finding #3 regression test: promoteWithDedup
+// MUST be exercised directly against live PostgreSQL, not just
+// via sqlmock unit tests. These two scenarios pin the exact
+// invariants the prior iter-4 inline body broke:
+//
+//  1. CONFLICT PATH appends version_index = prev+1, NOT 0.
+//     Iter-4 bug: when a concurrent producer had already
+//     created the concept with v=0, the inline promotion
+//     blindly INSERTed another version_index=0 which violated
+//     concept_version_concept_version_uidx. The helper now
+//     reads the latest version_index and appends prev+1.
+//
+//  2. WITHIN-LOCKED DEDUP drains every locked candidate row
+//     even when (episode, node) duplicates would resolve to a
+//     single concept_support insert. Rubber-duck iter-5
+//     blocking #1: if the helper UPDATEd only the rows it
+//     INSERTed concept_support for, the duplicate candidates
+//     would stay pending forever and be re-locked on every
+//     subsequent tick.
+//
+// Both tests construct candidate_support rows directly (vs.
+// driving emitGroup with seeded Episodes) so the helper is
+// exercised in isolation -- a regression in promoteWithDedup
+// cannot be masked by emitGroup's dispatch logic.
+// ────────────────────────────────────────────────────────────
+
+// seedConcept directly INSERTs a concept row with the given
+// fingerprint and returns its concept_id. Used by the
+// promoteWithDedup integration tests to set up the
+// "conflict / known concept" precondition.
+func seedConcept(ctx context.Context, t *testing.T, db *sql.DB, fp []byte, name string) string {
+	t.Helper()
+	var id string
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO concept (fingerprint, name, description_md)
+		VALUES ($1::bytea, $2, 'seeded by promoteWithDedup integration test')
+		RETURNING concept_id::text
+	`, fp, name).Scan(&id); err != nil {
+		t.Fatalf("seed concept: %v", err)
+	}
+	return id
+}
+
+// seedConceptVersion directly INSERTs a concept_version row
+// against an existing concept. Used to engineer the "concept
+// already has a v=0" precondition for the conflict path test.
+func seedConceptVersion(
+	ctx context.Context, t *testing.T, db *sql.DB,
+	conceptID, runID string, versionIndex, support, negative int,
+) string {
+	t.Helper()
+	confidence := 0.5
+	if support+negative > 0 {
+		confidence = float64(support) / float64(support+negative)
+	}
+	band := "low"
+	switch {
+	case confidence >= 0.7:
+		band = "high"
+	case confidence >= 0.3:
+		band = "medium"
+	}
+	var id string
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO concept_version
+		    (concept_id, version_index, confidence, confidence_band,
+		     support_count, negative_count, producer, producer_run_id)
+		VALUES ($1::uuid, $2, $3, $4::concept_band,
+		        $5, $6, 'consolidator'::producer, $7::uuid)
+		RETURNING concept_version_id::text
+	`, conceptID, versionIndex, confidence, band, support, negative, runID,
+	).Scan(&id); err != nil {
+		t.Fatalf("seed concept_version: %v", err)
+	}
+	return id
+}
+
+// openConsolidatorRun INSERTs a fresh consolidator_run row
+// directly (bypassing Service.openRun so the test owns the
+// runID lifecycle). Returns the runID. The row is left in
+// StatusRunning state; tests that want it finalised must
+// UPDATE explicitly.
+func openConsolidatorRun(ctx context.Context, t *testing.T, db *sql.DB) string {
+	t.Helper()
+	var id string
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO consolidator_run (started_at, status)
+		VALUES (now(), 'running')
+		RETURNING run_id::text
+	`).Scan(&id); err != nil {
+		t.Fatalf("open consolidator_run: %v", err)
+	}
+	return id
+}
+
+// insertCandidateSupport directly INSERTs a concept_candidate_support
+// row with promoted_to_concept_id NULL. Returns the new
+// candidate_support_id. Used to set up the locked-candidate
+// preconditions for promoteWithDedup tests.
+func insertCandidateSupport(
+	ctx context.Context, t *testing.T, db *sql.DB,
+	signature []byte, repoID, episodeID string, nodeID *string, polarity string,
+) string {
+	t.Helper()
+	var id string
+	if nodeID == nil {
+		if err := db.QueryRowContext(ctx, `
+			INSERT INTO concept_candidate_support
+			    (signature, repo_id, episode_id, polarity)
+			VALUES ($1::bytea, $2::uuid, $3::uuid, $4::polarity)
+			RETURNING candidate_support_id::text
+		`, signature, repoID, episodeID, polarity).Scan(&id); err != nil {
+			t.Fatalf("insert candidate_support (no-node): %v", err)
+		}
+		return id
+	}
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO concept_candidate_support
+		    (signature, repo_id, node_id, episode_id, polarity)
+		VALUES ($1::bytea, $2::uuid, $3::uuid, $4::uuid, $5::polarity)
+		RETURNING candidate_support_id::text
+	`, signature, repoID, *nodeID, episodeID, polarity).Scan(&id); err != nil {
+		t.Fatalf("insert candidate_support: %v", err)
+	}
+	return id
+}
+
+// TestPromoteWithDedup_conflictPathAppendsNextVersion is the
+// iter-5 evaluator #3 finding regression test against live
+// PostgreSQL. Setup: concept exists with v=0 sup=5 already;
+// candidate_support has 5 NEW positive episodes for the same
+// signature. promoteWithDedup must append v=1 sup=10 (NOT
+// v=0 again), insert 5 concept_support rows, and mark all 5
+// candidate rows promoted. A regression that reintroduces the
+// "blindly insert version_index=0" bug crashes here on the
+// concept_version unique-index violation.
+func TestPromoteWithDedup_conflictPathAppendsNextVersion(t *testing.T) {
+	fix := openConsolFixture(t)
+	defer fix.cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), intTestDBTimeout)
+	defer cancel()
+
+	repoID := seedRepo(ctx, t, fix.db, "scenPD-conf")
+	contextID := seedRecallContext(ctx, t, fix.db, repoID)
+	nodeID := seedNode(ctx, t, fix.db, repoID, randomFingerprint(t), "node-PD-conf")
+
+	signature := deterministicFingerprint("promoteWithDedup-conflict-path")
+
+	// Open the precondition consolidator_run row first so the
+	// seeded concept_version's producer_run_id has a valid FK.
+	precondRunID := openConsolidatorRun(ctx, t, fix.db)
+
+	// Pre-seed the concept WITH a v=0 (simulates the iter-4
+	// race: a sibling producer crystallised the concept while
+	// our candidate set was sub-threshold).
+	conceptID := seedConcept(ctx, t, fix.db, signature, "concept-PD-conf")
+	_ = seedConceptVersion(ctx, t, fix.db, conceptID, precondRunID, 0, 5, 0)
+
+	// Seed 5 candidate rows pointing at NEW episodes (different
+	// from any in the existing concept_support set -- the
+	// concept_support table is empty for this concept since we
+	// seeded the version without backing supports; that is the
+	// adversarial case the helper must still handle).
+	newEpisodeIDs := make([]string, 5)
+	candidateIDs := make([]string, 5)
+	for i := 0; i < 5; i++ {
+		newEpisodeIDs[i] = seedEpisode(ctx, t, fix.db, repoID, contextID, nodeID)
+		nid := nodeID
+		candidateIDs[i] = insertCandidateSupport(
+			ctx, t, fix.db, signature, repoID, newEpisodeIDs[i], &nid, "positive")
+	}
+
+	// Open the runID under which promoteWithDedup will write
+	// the new version + supports.
+	runID := openConsolidatorRun(ctx, t, fix.db)
+	svc := newConsolService(t, fix.db, 10)
+
+	tx, err := fix.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Lock the candidate rows the same way emitGroupCandidatePath
+	// would have, so promoteWithDedup sees them in the locked set.
+	locked := lockPendingCandidatesTx(ctx, t, tx, signature)
+	if len(locked) != 5 {
+		t.Fatalf("locked %d candidate rows; want 5", len(locked))
+	}
+
+	vv, ss, perr := svc.promoteWithDedup(ctx, tx, runID, conceptID, locked,
+		hex.EncodeToString(signature))
+	if perr != nil {
+		t.Fatalf("promoteWithDedup: %v", perr)
+	}
+	if vv != 1 {
+		t.Fatalf("versionsAppended: got %d want 1", vv)
+	}
+	if ss != 5 {
+		t.Fatalf("supportsAppended: got %d want 5", ss)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	// Verify the new version has version_index=1 (prev+1), NOT 0.
+	idx, sup, neg := mustReadLatestConceptVersion(ctx, t, fix.db, conceptID)
+	if idx != 1 {
+		t.Fatalf("version_index: got %d want 1 (iter-4 bug bound this to 0)", idx)
+	}
+	if sup != 10 {
+		t.Fatalf("support_count: got %d want 10 (prev 5 + delta 5)", sup)
+	}
+	if neg != 0 {
+		t.Fatalf("negative_count: got %d want 0", neg)
+	}
+
+	// Both concept_version rows must exist (v=0 and v=1).
+	if n := mustCountVersions(ctx, t, fix.db, conceptID); n != 2 {
+		t.Fatalf("expected 2 concept_version rows after promotion; got %d", n)
+	}
+
+	// Exactly 5 concept_support rows inserted for the new episodes.
+	var supCount int
+	if err := fix.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM concept_support WHERE concept_id = $1::uuid`,
+		conceptID,
+	).Scan(&supCount); err != nil {
+		t.Fatalf("count concept_support: %v", err)
+	}
+	if supCount != 5 {
+		t.Fatalf("expected 5 concept_support rows; got %d", supCount)
+	}
+
+	// All 5 candidate rows must be marked promoted (pending=0).
+	var pending int
+	if err := fix.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM concept_candidate_support
+		 WHERE signature = $1::bytea
+		   AND promoted_to_concept_id IS NULL
+	`, signature).Scan(&pending); err != nil {
+		t.Fatalf("count pending: %v", err)
+	}
+	if pending != 0 {
+		t.Fatalf("expected 0 pending candidate_support after promotion; got %d", pending)
+	}
+}
+
+// TestPromoteWithDedup_drainsAllLockedRowsEvenWithDuplicates
+// pins the rubber-duck iter-5 blocking #1 contract against
+// live PostgreSQL. Setup: fresh concept (no prior version,
+// no existing supports); 3 candidate_support rows for the
+// SAME (episode, node) pair (which is legal -- the candidate
+// table has no UNIQUE constraint, and a race-with-self could
+// produce duplicate pending rows). After promoteWithDedup:
+//   - exactly 1 concept_version (v=0, sup=1 -- per-EPISODE
+//     deduplication squashes the 3 rows down to 1).
+//   - exactly 1 concept_support row (the deduped pair).
+//   - all 3 candidate rows marked promoted (none left pending).
+// A regression where the helper UPDATEs only the rows it
+// inserted concept_support for would leave 2 candidate rows
+// permanently stuck pending.
+func TestPromoteWithDedup_drainsAllLockedRowsEvenWithDuplicates(t *testing.T) {
+	fix := openConsolFixture(t)
+	defer fix.cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), intTestDBTimeout)
+	defer cancel()
+
+	repoID := seedRepo(ctx, t, fix.db, "scenPD-dup")
+	contextID := seedRecallContext(ctx, t, fix.db, repoID)
+	nodeID := seedNode(ctx, t, fix.db, repoID, randomFingerprint(t), "node-PD-dup")
+	episodeID := seedEpisode(ctx, t, fix.db, repoID, contextID, nodeID)
+
+	signature := deterministicFingerprint("promoteWithDedup-within-locked-dedup")
+
+	// Pre-seed the concept fresh (no version yet). Distinct
+	// fingerprint from the conflict-path test so the two
+	// integration tests cannot interfere when run in parallel
+	// against the same fixture (each test owns its schema, but
+	// belt-and-braces).
+	conceptID := seedConcept(ctx, t, fix.db, signature, "concept-PD-dup")
+
+	// Three candidate rows for the SAME (episode, node) pair.
+	nid := nodeID
+	candidateIDs := []string{
+		insertCandidateSupport(ctx, t, fix.db, signature, repoID, episodeID, &nid, "positive"),
+		insertCandidateSupport(ctx, t, fix.db, signature, repoID, episodeID, &nid, "positive"),
+		insertCandidateSupport(ctx, t, fix.db, signature, repoID, episodeID, &nid, "positive"),
+	}
+
+	runID := openConsolidatorRun(ctx, t, fix.db)
+	svc := newConsolService(t, fix.db, 10)
+
+	tx, err := fix.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	locked := lockPendingCandidatesTx(ctx, t, tx, signature)
+	if len(locked) != 3 {
+		t.Fatalf("locked %d candidate rows; want 3", len(locked))
+	}
+
+	vv, ss, perr := svc.promoteWithDedup(ctx, tx, runID, conceptID, locked,
+		hex.EncodeToString(signature))
+	if perr != nil {
+		t.Fatalf("promoteWithDedup: %v", perr)
+	}
+	if vv != 1 {
+		t.Fatalf("versionsAppended: got %d want 1", vv)
+	}
+	if ss != 1 {
+		t.Fatalf("supportsAppended: got %d want 1 (deduped from 3 locked rows)", ss)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	// version_index=0 with support_count=1 (NOT 3 -- per-EPISODE
+	// dedup squashes the duplicates).
+	idx, sup, neg := mustReadLatestConceptVersion(ctx, t, fix.db, conceptID)
+	if idx != 0 || sup != 1 || neg != 0 {
+		t.Fatalf("expected v=0 sup=1 neg=0 (within-locked dedup); got v=%d sup=%d neg=%d",
+			idx, sup, neg)
+	}
+
+	// Exactly 1 concept_support row (NOT 3).
+	var supCount int
+	if err := fix.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM concept_support WHERE concept_id = $1::uuid`,
+		conceptID,
+	).Scan(&supCount); err != nil {
+		t.Fatalf("count concept_support: %v", err)
+	}
+	if supCount != 1 {
+		t.Fatalf("expected 1 concept_support row (within-locked dedup); got %d", supCount)
+	}
+
+	// CRITICAL: all 3 candidate rows must be marked promoted
+	// even though only 1 concept_support row was inserted. The
+	// rubber-duck #1 blocker is precisely this: the helper
+	// must drain the ENTIRE locked set so duplicates do not
+	// stay pending forever.
+	var pending int
+	if err := fix.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM concept_candidate_support
+		 WHERE signature = $1::bytea
+		   AND promoted_to_concept_id IS NULL
+	`, signature).Scan(&pending); err != nil {
+		t.Fatalf("count pending after drain: %v", err)
+	}
+	if pending != 0 {
+		t.Fatalf("expected 0 pending candidate_support after drain (rubber-duck #1); got %d (%d duplicates stranded)",
+			pending, pending)
+	}
+
+	// And every original candidate row must reference conceptID
+	// in promoted_to_concept_id (not NULL, not some other concept).
+	for _, cid := range candidateIDs {
+		var pcid sql.NullString
+		if err := fix.db.QueryRowContext(ctx, `
+			SELECT promoted_to_concept_id::text
+			  FROM concept_candidate_support
+			 WHERE candidate_support_id = $1::uuid
+		`, cid).Scan(&pcid); err != nil {
+			t.Fatalf("read promoted_to_concept_id for %s: %v", cid, err)
+		}
+		if !pcid.Valid || pcid.String != conceptID {
+			t.Fatalf("candidate %s: promoted_to_concept_id=%v want %s", cid, pcid, conceptID)
+		}
+	}
+}
+
+// lockPendingCandidatesTx is the test-side equivalent of the
+// Step C3 query in emitGroupCandidatePath: SELECT ... FOR UPDATE
+// the pending candidate_support rows for a signature. Returns a
+// []candidateRow ordered by insertion order (candidate_support_id
+// is a v4 UUID so ORDER BY id is meaningless; we rely on the
+// natural row order from a single connection's tx scan).
+func lockPendingCandidatesTx(ctx context.Context, t *testing.T, tx *sql.Tx, signature []byte) []candidateRow {
+	t.Helper()
+	rows, err := tx.QueryContext(ctx, `
+		SELECT candidate_support_id::text,
+		       repo_id::text,
+		       node_id::text,
+		       episode_id::text,
+		       polarity::text
+		  FROM concept_candidate_support
+		 WHERE signature = $1::bytea AND promoted_to_concept_id IS NULL
+		 FOR UPDATE
+	`, signature)
+	if err != nil {
+		t.Fatalf("lock candidate_support: %v", err)
+	}
+	defer rows.Close()
+	var out []candidateRow
+	for rows.Next() {
+		var r candidateRow
+		if err := rows.Scan(&r.id, &r.repoID, &r.nodeID, &r.episodeID, &r.polarity); err != nil {
+			t.Fatalf("scan candidate_support: %v", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate candidate_support: %v", err)
+	}
+	return out
+}

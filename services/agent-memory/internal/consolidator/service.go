@@ -76,6 +76,59 @@ const (
 	ConsolidatorAdvisoryLockKey int64 = 0x434F4E534F4C4944
 )
 
+// ────────────────────────────────────────────────────────────
+// consolidator_run.status lifecycle (CANONICAL REFERENCE)
+// ────────────────────────────────────────────────────────────
+//
+// Every Tick OPENs a consolidator_run row with status=Running
+// and finalises it with EXACTLY ONE of the three terminal
+// statuses below. The status column has NO CHECK constraint in
+// migration 0012 precisely so new values (e.g. LockSkipped --
+// added in iter-3 to fix the cursor-regression finding) can be
+// introduced without a schema change. The priorHighWater query
+// uses StatusDone as a HARD FILTER (`WHERE status='done'`) so
+// only normal completions ever influence the next Tick's
+// cursor -- a tick that finalised with StatusLockSkipped or
+// StatusFailed MUST NOT advance or regress the effective
+// high-water mark.
+//
+// These constants are referenced from every site that writes,
+// reads, or documents a status string. A `grep -F "StatusDone"`
+// (etc.) finds every dependency; the convergence-killer rule
+// is that no magic string `"done"` / `"failed"` / `"lock_skipped"`
+// / `"running"` survives outside this block AND the SQL literal
+// in priorHighWater (which has to be a SQL literal because Go
+// can't interpolate identifiers into a WHERE clause without a
+// query-builder layer the package deliberately does not adopt).
+const (
+	// StatusRunning is written by openRun on the in-flight
+	// consolidator_run row.
+	StatusRunning = "running"
+
+	// StatusDone is the success terminal status. Only rows
+	// with status=StatusDone influence the next Tick's
+	// priorHighWater cursor (priorHighWater filters
+	// `WHERE cr.status = 'done'`).
+	StatusDone = "done"
+
+	// StatusLockSkipped is the terminal status used when
+	// pg_try_advisory_lock returns FALSE (another consolidator
+	// instance holds the lock). The tick is a no-op: no
+	// scan, no emission, the prior cursor is inherited
+	// verbatim, and the row is EXCLUDED from priorHighWater.
+	// Distinct from StatusDone so a skipped run can never
+	// regress the effective cursor (iter-3 evaluator's #2
+	// finding fix).
+	StatusLockSkipped = "lock_skipped"
+
+	// StatusFailed is the terminal status written by the
+	// deferred cleanup path when any step after openRun
+	// returns an error. Like StatusLockSkipped, EXCLUDED
+	// from priorHighWater so a failed tick does not regress
+	// the cursor.
+	StatusFailed = "failed"
+)
+
 // Config is the env-derived (or programmatic) configuration the
 // Service consumes. Construct via `Config{...}` literal and
 // pass to `New`; missing optional fields fall back to the
@@ -216,14 +269,18 @@ type TickResult struct {
 	// LockSkipped is true when pg_try_advisory_lock returned
 	// false (another consolidator instance holds the lock).
 	// In that case the tick is a no-op: the run row is opened
-	// and finalised with status='lock_skipped' (NOT 'done')
-	// and episode_high_water_mark inherited from the prior
-	// 'done' run (or NULL if none), per the lifecycle invariant
-	// that every opened run row MUST be finalised. The
-	// 'lock_skipped' status is what makes the next Tick's
-	// priorHighWater filter (`WHERE status='done'`) ignore this
-	// row -- the iter-3 evaluator's #2 fix: a skipped run's
-	// stale mark must NOT regress the effective cursor.
+	// and finalised with status=StatusLockSkipped (NOT
+	// StatusDone) and episode_high_water_mark inherited from
+	// the prior StatusDone run (or NULL if none), per the
+	// lifecycle invariant that every opened run row MUST be
+	// finalised. The StatusLockSkipped value is what makes
+	// the next Tick's priorHighWater filter
+	// (`WHERE cr.status = 'done'`) ignore this row -- a
+	// skipped run's stale mark MUST NOT regress the effective
+	// cursor. See the "consolidator_run.status lifecycle"
+	// constant block at the top of this file for the full
+	// enumeration of terminal statuses (StatusDone,
+	// StatusLockSkipped, StatusFailed).
 	LockSkipped bool
 }
 
@@ -257,13 +314,16 @@ type tickSnapshot struct {
 //
 //  3. Acquire pg_try_advisory_lock on a dedicated session
 //     connection; if not acquired, finalise the run row with
-//     status='lock_skipped' (NOT 'done' -- iter-3 evaluator's
-//     #2 fix) and the prior mark inherited (another
-//     consolidator instance is in flight; we MUST NOT clobber
-//     its progress mark, and we MUST NOT let our row become
-//     eligible as the next Tick's priorHighWater either --
-//     priorHighWater's `WHERE status='done'` filter excludes
-//     'lock_skipped' rows precisely for this reason).
+//     status=StatusLockSkipped (NOT StatusDone -- iter-3
+//     evaluator's #2 fix) and the prior mark inherited
+//     (another consolidator instance is in flight; we MUST
+//     NOT clobber its progress mark, and we MUST NOT let our
+//     row become eligible as the next Tick's priorHighWater
+//     either -- priorHighWater's `WHERE cr.status = 'done'`
+//     filter excludes StatusLockSkipped rows precisely for
+//     this reason). See the "consolidator_run.status
+//     lifecycle" constant block at the top of this file
+//     for the canonical enumeration.
 //
 //  4. DELTA-scan episode + observation since the prior mark
 //     ((created_at, episode_id) > (prior_created_at, prior_id)),
@@ -336,7 +396,7 @@ func (s *Service) Tick(ctx context.Context) (TickResult, error) {
 		}
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer closeCancel()
-		if ferr := s.finalizeRun(closeCtx, runID, nil, "failed"); ferr != nil {
+		if ferr := s.finalizeRun(closeCtx, runID, nil, StatusFailed); ferr != nil {
 			s.logger.Warn("consolidator.finalize_failed",
 				slog.String("run_id", runID),
 				slog.String("error", ferr.Error()))
@@ -373,27 +433,27 @@ func (s *Service) Tick(ctx context.Context) (TickResult, error) {
 
 	// Step 6: finalize the run row.
 	//
-	// STATUS:
-	//   - lock_skipped: the advisory lock was held by another
-	//     concurrent Tick (different replica or test fixture).
-	//     We DID NOT advance the cursor; this row exists for
-	//     operator observability but MUST NOT influence the
-	//     next Tick's priorHighWater (see priorHighWater's
-	//     `WHERE status='done'` filter). This is the iter-3
-	//     evaluator's #2 finding -- a lock-skipped Tick that
-	//     wrote status='done' with the STALE prior mark would
-	//     regress the cursor under finished_at-ordered prior
-	//     mark selection. The free-text status column was
-	//     intentionally left without a CHECK constraint in
-	//     migration 0012 precisely so new status values like
-	//     'lock_skipped' can be added without a schema change.
-	//   - done: normal Tick completion (may have advanced the
-	//     cursor or simply inherited the prior mark when no
-	//     new Episodes were scanned).
-	//   - failed: any error path; the deferred cleanup above
-	//     handles this case.
+	// STATUS RESOLUTION (the canonical lifecycle is the
+	// "consolidator_run.status lifecycle" constant block at
+	// the top of this file -- StatusRunning -> {StatusDone,
+	// StatusLockSkipped, StatusFailed}):
+	//   - StatusLockSkipped: the advisory lock was held by
+	//     another concurrent Tick (different replica or test
+	//     fixture). We DID NOT advance the cursor; this row
+	//     exists for operator observability but MUST NOT
+	//     influence the next Tick's priorHighWater (see
+	//     priorHighWater's `WHERE cr.status = 'done'`
+	//     filter). The iter-3 evaluator's #2 finding fix --
+	//     a lock-skipped Tick that wrote StatusDone with the
+	//     STALE prior mark would regress the cursor under
+	//     finished_at-ordered prior mark selection.
+	//   - StatusDone: normal Tick completion (may have
+	//     advanced the cursor or simply inherited the prior
+	//     mark when no new Episodes were scanned).
+	//   - StatusFailed: any error path; the deferred cleanup
+	//     above handles this case.
 	//
-	// MARK RESOLUTION (when status='done'):
+	// MARK RESOLUTION (when finalStatus == StatusDone):
 	//   - emission produced a newMarkID -> use it (real progress).
 	//   - emission skipped or zero new episodes -> inherit the
 	//     prior mark so the run row's mark column remains
@@ -408,9 +468,9 @@ func (s *Service) Tick(ctx context.Context) (TickResult, error) {
 	case snap.priorMarkID != "":
 		markPtr = &snap.priorMarkID
 	}
-	finalStatus := "done"
+	finalStatus := StatusDone
 	if snap.lockSkipped {
-		finalStatus = "lock_skipped"
+		finalStatus = StatusLockSkipped
 	}
 	if err := s.finalizeRun(tickCtx, runID, markPtr, finalStatus); err != nil {
 		s.metrics.IncErrors()
@@ -620,19 +680,20 @@ func (s *Service) Run(ctx context.Context) error {
 // finished run's high-water mark. The wake-after-N loop uses
 // this to decide whether to fire an early tick.
 //
-// When no prior 'done' run with a non-NULL mark exists (e.g.
-// the binary's initial Tick() finalised with mark=NULL because
-// the cluster was empty at the time, then writers seeded a
-// batch of fresh Episodes), this method falls back to a
-// total-count: every Episode in the database is "unconsumed"
-// by any prior run, so it MUST contribute to the wake-after-N
-// trigger. The iter-3 evaluator's #1 finding flagged the
-// previous "return 0" fallback as the root cause of
-// TestRun_wakeAfterNEpisodes never firing a wake-tick: the
-// initial Tick wrote a NULL mark on the empty cluster, then
-// the subsequent wake-checks saw priorMarkID=="" and returned
-// 0, so the wake branch never crossed WakeAfterNEpisodes
-// regardless of how many new Episodes the test seeded.
+// When no prior StatusDone run with a non-NULL mark exists
+// (e.g. the binary's initial Tick() finalised with mark=NULL
+// because the cluster was empty at the time, then writers
+// seeded a batch of fresh Episodes), this method falls back
+// to a total-count: every Episode in the database is
+// "unconsumed" by any prior run, so it MUST contribute to
+// the wake-after-N trigger. The iter-3 evaluator's #1
+// finding flagged the previous "return 0" fallback as the
+// root cause of TestRun_wakeAfterNEpisodes never firing a
+// wake-tick: the initial Tick wrote a NULL mark on the empty
+// cluster, then the subsequent wake-checks saw
+// priorMarkID=="" and returned 0, so the wake branch never
+// crossed WakeAfterNEpisodes regardless of how many new
+// Episodes the test seeded.
 func (s *Service) unconsumedEpisodeCount(ctx context.Context) (uint64, error) {
 	priorMarkID, priorMarkCreatedAt, err := s.priorHighWater(ctx)
 	if err != nil {
@@ -640,8 +701,8 @@ func (s *Service) unconsumedEpisodeCount(ctx context.Context) (uint64, error) {
 	}
 	var n uint64
 	if priorMarkID == "" {
-		// No prior 'done' run with non-NULL mark: every Episode
-		// is "unconsumed" by definition. Count all rows.
+		// No prior StatusDone run with non-NULL mark: every
+		// Episode is "unconsumed" by definition. Count all rows.
 		if err := s.db.QueryRowContext(ctx,
 			`SELECT count(*) FROM episode`,
 		).Scan(&n); err != nil {
@@ -661,28 +722,33 @@ func (s *Service) unconsumedEpisodeCount(ctx context.Context) (uint64, error) {
 
 // openRun INSERTs a fresh consolidator_run row in its own
 // transaction and returns its run_id. Per the plan, status is
-// explicitly set to 'running' (not the schema default 'pending')
-// so any operator inspecting `consolidator_run` while a tick is
-// in flight sees the expected lifecycle phase.
+// explicitly set to StatusRunning (not the schema default
+// 'pending') so any operator inspecting `consolidator_run`
+// while a tick is in flight sees the expected lifecycle phase.
+// The status string literal mirrors StatusRunning; the SQL
+// VALUES list keeps the literal because parameterising a
+// single fixed identifier into VALUES would not improve
+// clarity (and a `grep -F "running"` against this file finds
+// both the constant and this literal).
 func (s *Service) openRun(ctx context.Context) (string, error) {
 	var id string
 	err := s.db.QueryRowContext(ctx, `
 		INSERT INTO consolidator_run (started_at, status)
-		VALUES (now(), 'running')
+		VALUES (now(), '`+StatusRunning+`')
 		RETURNING run_id::text
 	`).Scan(&id)
 	return id, err
 }
 
 // finalizeRun UPDATEs the consolidator_run row to its terminal
-// shape. mark may be nil (no progress -- 'failed' before any
-// episode was scanned, or a brand-new lock-skipped tick with
-// no prior mark). status is one of {'done', 'lock_skipped',
-// 'failed'} per the lifecycle contract. priorHighWater
-// filters to status='done' so only normal completions
-// influence the next Tick's cursor (iter-3 evaluator's #2
-// finding fix: lock-skipped writes MUST NOT regress the
-// effective cursor).
+// shape. mark may be nil (no progress -- StatusFailed before
+// any episode was scanned, or a brand-new StatusLockSkipped
+// tick with no prior mark). status MUST be one of
+// {StatusDone, StatusLockSkipped, StatusFailed} per the
+// lifecycle contract. priorHighWater filters to StatusDone so
+// only normal completions influence the next Tick's cursor
+// (iter-3 evaluator's #2 finding fix: lock-skipped writes
+// MUST NOT regress the effective cursor).
 func (s *Service) finalizeRun(ctx context.Context, runID string, mark *string, status string) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE consolidator_run
@@ -694,12 +760,22 @@ func (s *Service) finalizeRun(ctx context.Context, runID string, mark *string, s
 	return err
 }
 
-// priorHighWater resolves the most-recent 'done' run's
+// priorHighWater resolves the most-recent StatusDone run's
 // episode_high_water_mark to (id, created_at). Returns ("",
-// zero time, nil) when (a) no prior 'done' run exists, (b) the
-// prior run's mark column is NULL (e.g. a lock-skipped tick on
-// an empty cluster), or (c) the mark UUID does not resolve to
-// any episode row (stale pointer; tolerated).
+// zero time, nil) when (a) no prior StatusDone run exists,
+// (b) the prior run's mark column is NULL (e.g. a tick on an
+// empty cluster that finalised StatusDone with no mark), or
+// (c) the mark UUID does not resolve to any episode row
+// (stale pointer; tolerated).
+//
+// The `WHERE cr.status = 'done'` filter HARD-EXCLUDES rows
+// finalised as StatusLockSkipped or StatusFailed so a
+// no-op or errored tick never regresses the effective
+// cursor (iter-3 evaluator's #2 finding fix). The SQL
+// literal 'done' mirrors the StatusDone constant; both
+// MUST stay in sync (a `grep -F "'done'"` finds this
+// single SQL site, and `grep -F "StatusDone"` finds every
+// Go-side reference).
 //
 // The JOIN to episode is what gives us created_at (consolidator_run
 // only stores the uuid). LIMIT 1 + ORDER BY finished_at DESC
@@ -713,7 +789,7 @@ func (s *Service) priorHighWater(ctx context.Context) (markID string, createdAt 
 		SELECT cr.episode_high_water_mark::text, e.created_at
 		  FROM consolidator_run cr
 		  LEFT JOIN episode e ON e.episode_id = cr.episode_high_water_mark
-		 WHERE cr.status = 'done'
+		 WHERE cr.status = '`+StatusDone+`'
 		   AND cr.episode_high_water_mark IS NOT NULL
 		 ORDER BY cr.finished_at DESC
 		 LIMIT 1

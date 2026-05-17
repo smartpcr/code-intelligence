@@ -386,6 +386,38 @@ type tickSnapshot struct {
 // and continues so transient PostgreSQL hiccups do not crash
 // the binary.
 //
+// PARTIAL SYNTH-PHASE FAILURE OBSERVABILITY
+// -----------------------------------------
+// emitSyntheticPositives commits each candidate synth Episode
+// in its OWN transaction (insertSyntheticPositiveAndMirror).
+// If candidate N+1 fails after candidates 1..N committed,
+// runEmissionPhase stores the partial counts into
+// snap.syntheticPositivesCreated / .syntheticObservationsMirrored
+// BEFORE propagating the error. The synth-phase NOT-EXISTS gate
+// (insertSyntheticPositiveAndMirror's WHERE NOT EXISTS plus the
+// partial UNIQUE from migration 0013) prevents the next tick
+// from re-emitting those committed synths, which means the next
+// tick will NOT bump the counter for that work either -- so we
+// MUST push the partial counts into the Prometheus counters on
+// the emission error path here, otherwise
+// consolidator_synthetic_positives_created_total and
+// consolidator_synthetic_observations_mirrored_total would be
+// permanently short by the partial count. The partial counts
+// are also Warn-logged alongside the error so operators have
+// inline visibility without correlating against the metric.
+//
+// EpisodesScanned is deliberately NOT pushed on the error path
+// even though snap.scanned may be populated (when processOnce
+// succeeded and synth failed): the retry tick re-scans the same
+// Episode window (the cursor stays at the prior 'done' mark per
+// the §6.1 priorHighWater status filter), so double-counting
+// would weaken the "correlate with cursor progress / table
+// cardinality" interpretation of the counter. The
+// concept/version/support counters likewise are bumped INSIDE
+// emitGroup per-group commit (see service.go:1808-1814) so they
+// are correctly captured even when a LATER group fails -- no
+// error-path push needed for those.
+//
 // DEADLOCK PREVENTION
 // -------------------
 // Step 6's UPDATE goes through the pool (s.db.ExecContext),
@@ -446,6 +478,28 @@ func (s *Service) Tick(ctx context.Context) (TickResult, error) {
 	// deadlock fix.
 	if err := s.runEmissionPhase(tickCtx, runID, &snap); err != nil {
 		s.metrics.IncErrors()
+		// PARTIAL SYNTH-PHASE FAILURE OBSERVABILITY (see
+		// Tick doc header). emitSyntheticPositives commits
+		// each synth in its own tx and runEmissionPhase
+		// stores the partial counts into snap BEFORE
+		// propagating the error. Push them into the
+		// Prometheus counters NOW because the retry tick's
+		// NOT-EXISTS gate prevents the already-committed
+		// synths from being counted again -- without this
+		// the metric would be permanently short by the
+		// partial count. Also mirror into TickResult so a
+		// caller / test inspecting the returned value sees
+		// what was committed before the failure (Run() today
+		// ignores the result on error, but tests do not).
+		s.metrics.AddSyntheticPositivesCreated(snap.syntheticPositivesCreated)
+		s.metrics.AddSyntheticObservationsMirrored(snap.syntheticObservationsMirrored)
+		result.SyntheticPositivesCreated = snap.syntheticPositivesCreated
+		result.SyntheticObservationsMirrored = snap.syntheticObservationsMirrored
+		s.logger.Warn("consolidator.tick.emission_failed",
+			slog.String("run_id", runID),
+			slog.String("error", err.Error()),
+			slog.Uint64("synthetic_positives_created", snap.syntheticPositivesCreated),
+			slog.Uint64("synthetic_observations_mirrored", snap.syntheticObservationsMirrored))
 		return result, fmt.Errorf("consolidator: emission: %w", err)
 	}
 

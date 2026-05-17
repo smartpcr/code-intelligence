@@ -15,24 +15,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-
-	"github.com/lib/pq"
-)
-
-// PostgreSQL SQLSTATE codes referenced by the handler's error
-// classifiers. Pinning these as named constants instead of
-// scattering magic strings makes the intent legible and lets
-// reviewers cross-check against
-// https://www.postgresql.org/docs/current/errcodes-appendix.html.
-const (
-	// pgCodeInvalidTextRepresentation (`22P02`) is raised by
-	// the `$1::uuid` cast when the input is not a valid UUID.
-	pgCodeInvalidTextRepresentation = "22P02"
-	// pgCodeForeignKeyViolation (`23503`) is raised when an
-	// INSERT / UPDATE references a parent row that no longer
-	// exists -- in this handler, a register / ingest race
-	// against a concurrent repo delete.
-	pgCodeForeignKeyViolation = "23503"
 )
 
 // Route paths for the Stage 7.1 verbs. The trailing-resource
@@ -100,13 +82,8 @@ type Options struct {
 	Logger *slog.Logger
 
 	// MaxBodyBytes caps the request body the handler will
-	// read. Zero OR negative coerces to
-	// [DefaultMaxBodyBytes]; there is deliberately no
-	// "unlimited" escape hatch because every Stage 7.1
-	// verb body is operator-shape (< 1 KiB realistically)
-	// and an unbounded read is an OOM vector for an
-	// authenticated attacker — `ReadTimeout` alone does
-	// not bound total bytes within the timeout window.
+	// read. Zero means [DefaultMaxBodyBytes]; negative
+	// disables the cap (NOT recommended in production).
 	MaxBodyBytes int64
 
 	// SecretGen overrides the function used to generate
@@ -164,14 +141,7 @@ func NewHandler(db *sql.DB, verifier TokenVerifier, resolver HeadResolver, opts 
 		logger = slog.Default()
 	}
 	maxBody := opts.MaxBodyBytes
-	if maxBody <= 0 {
-		// Negative was previously a documented "disable
-		// the cap" escape hatch, but an authenticated
-		// attacker could exploit it to OOM the process
-		// via a multi-gigabyte (or slow-drip within
-		// ReadTimeout) body. Coerce to the default so a
-		// stale operator config can't reopen the
-		// vulnerability. See Options.MaxBodyBytes.
+	if maxBody == 0 {
 		maxBody = DefaultMaxBodyBytes
 	}
 	clock := opts.Clock
@@ -911,11 +881,8 @@ func (h *Handler) loadRepo(ctx context.Context, repoID string) (repoURL, default
 
 // decodeJSONBody decodes the request body into `dst` and
 // returns false on any error after writing the appropriate
-// 4xx response. ALWAYS imposes the configured body cap so a
-// pathological body cannot exhaust memory; `h.maxBody` is
-// guaranteed positive by [NewHandler], which coerces
-// zero / negative [Options.MaxBodyBytes] to
-// [DefaultMaxBodyBytes].
+// 4xx response. Imposes the configured body cap so a
+// pathological body cannot exhaust memory.
 //
 // JSON shape rules:
 //
@@ -928,7 +895,9 @@ func (h *Handler) loadRepo(ctx context.Context, repoID string) (repoURL, default
 //     fields — required-field validation is the verb
 //     handler's job.
 func (h *Handler) decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, h.maxBody)
+	if h.maxBody > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, h.maxBody)
+	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		var mxErr *http.MaxBytesError
@@ -1009,10 +978,20 @@ func normalizeRepoURL(raw string) (string, error) {
 			"repo_url: scheme %q is not allowed; use https, http, ssh, git+ssh, or git",
 			u.Scheme)
 	}
-	// SCP-style URLs (`git@host:path`) get parsed as a
-	// path-only URL with Scheme=="" — we already reject
-	// those above. A real git host URL has either a Host
-	// (https://) or an Opaque path (ssh://user@host/path).
+	// SCP-style URLs (`git@host:path`) fail url.Parse
+	// outright with "first path segment in URL cannot
+	// contain colon" — `@` is not a valid scheme
+	// character, so the parser bails out before
+	// returning a *url.URL — and the err check above
+	// rejects them. This block is the defence against
+	// scheme-only inputs (e.g. `https:`, `https://`) and
+	// opaque-form inputs (`git:opaque`,
+	// `ssh:user@host/path` without `//`) that pass the
+	// allowlist switch but carry no Host. Every
+	// allowlisted scheme is hierarchical, so a
+	// legitimate Git URL always sets u.Host; the Opaque
+	// allowance is kept so a future rfc3986-opaque form
+	// of an allowlisted scheme is not silently dropped.
 	if u.Host == "" && u.Opaque == "" {
 		return "", errors.New("repo_url: missing host")
 	}
@@ -1085,70 +1064,14 @@ func (h *Handler) handleResolverError(w http.ResponseWriter, r *http.Request, op
 	)
 }
 
-// hasPGSQLState reports whether `err` wraps a `*pq.Error`
-// whose `Code` equals `code`. This is the robust, locale-
-// independent path: `pq.Error.Code` is the raw five-character
-// SQLSTATE the server returned, so it survives database
-// locale changes and English-message rewording across PG
-// versions. Returns false on a nil error or on any error
-// that does not unwrap to a `*pq.Error`.
-func hasPGSQLState(err error, code string) bool {
-	if err == nil {
-		return false
-	}
-	var pqErr *pq.Error
-	if errors.As(err, &pqErr) {
-		return string(pqErr.Code) == code
-	}
-	return false
-}
-
-// hasSQLStateSubstring is the cross-driver fallback for
-// `hasPGSQLState`. Some drivers (notably `pgx` via the
-// `database/sql` stdlib bridge) format their errors as
-// `"... (SQLSTATE 22P02)"` without satisfying the `*pq.Error`
-// type assertion. The substring search is case-insensitive
-// because the canonical PostgreSQL spelling is upper-case
-// `SQLSTATE` but tests and re-wrapping layers sometimes
-// lower-case the entire error string.
-func hasSQLStateSubstring(err error, code string) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "sqlstate "+strings.ToLower(code))
-}
-
 // isInvalidUUIDError matches the PostgreSQL SQLSTATE 22P02
 // (`invalid_text_representation`) error that the `$1::uuid`
-// cast produces when the input is not a valid UUID.
-//
-// Classification order is deliberate:
-//
-//  1. Typed `*pq.Error` Code check -- the production path
-//     under `lib/pq`. Locale- and version-independent.
-//  2. `SQLSTATE 22P02` substring -- catches `pgx` via the
-//     stdlib bridge (which embeds the SQLSTATE in its
-//     `Error()` text) and any wrapper that preserves the
-//     SQLSTATE marker.
-//  3. English-message substring -- last-resort fallback for
-//     test mocks that synthesise an error via
-//     `errors.New("...")` without the typed struct or
-//     SQLSTATE marker. Fragile, kept only because removing
-//     it would force every test to import `lib/pq`.
-//
-// Copied in spirit from internal/webhookreceiver.isInvalid-
-// UUIDError; kept local to avoid a cross-package internal
-// dependency.
+// cast produces when the input is not a valid UUID. Copied
+// in spirit from internal/webhookreceiver.isInvalidUUIDError;
+// kept local to avoid a cross-package internal dependency.
 func isInvalidUUIDError(err error) bool {
 	if err == nil {
 		return false
-	}
-	if hasPGSQLState(err, pgCodeInvalidTextRepresentation) {
-		return true
-	}
-	if hasSQLStateSubstring(err, pgCodeInvalidTextRepresentation) {
-		return true
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "invalid input syntax for type uuid")
@@ -1156,30 +1079,21 @@ func isInvalidUUIDError(err error) bool {
 
 // isForeignKeyViolation matches PostgreSQL SQLSTATE 23503
 // (`foreign_key_violation`). Used to map a delete-during-
-// register race onto a 404 instead of a 500.
-//
-// Classification order mirrors `isInvalidUUIDError` -- see
-// that docstring for the rationale. The typed `*pq.Error`
-// check is the primary, locale-independent path; the
-// `SQLSTATE 23503` substring covers `pgx` via the stdlib
-// bridge; the English-text fallback catches mocked
-// `errors.New(...)` errors in unit tests.
+// register race onto a 404 instead of a 500. We look at
+// the error message text rather than pull in `lib/pq`'s
+// typed error struct so the helper works with any
+// pq-compatible driver (lib/pq, pgx via stdlib).
 func isForeignKeyViolation(err error) bool {
 	if err == nil {
 		return false
 	}
-	if hasPGSQLState(err, pgCodeForeignKeyViolation) {
-		return true
-	}
-	if hasSQLStateSubstring(err, pgCodeForeignKeyViolation) {
-		return true
-	}
+	msg := strings.ToLower(err.Error())
 	// pq formats: `pq: insert or update on table "repo_event"
 	// violates foreign key constraint ...`. pgx/stdlib:
 	// similar shape with the `foreign key constraint`
 	// substring.
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "foreign key constraint")
+	return strings.Contains(msg, "foreign key constraint") ||
+		strings.Contains(msg, "sqlstate 23503")
 }
 
 // -----------------------------------------------------------

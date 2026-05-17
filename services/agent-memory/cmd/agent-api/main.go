@@ -663,6 +663,18 @@ func loadConfig() (config, error) {
 		// from the sidecar trainer fall back to v0 in that
 		// deployment shape).
 		RerankerInferenceEndpoint: os.Getenv("AGENT_MEMORY_RERANKER_INFERENCE_ENDPOINT"),
+		// Stage 6.4 BERT sidecar per-call timeout. Make the
+		// default explicit at the config-struct boundary so a
+		// reader of `cfg.RerankerInferenceTimeout` always sees
+		// a meaningful Duration (instead of the implicit zero
+		// that BertSidecarConfig.Timeout would otherwise have
+		// resolved to DefaultBertSidecarTimeout inside the
+		// decoder). The env-var parse below still overrides
+		// this when AGENT_MEMORY_RERANKER_INFERENCE_TIMEOUT
+		// is set to a positive Duration; non-positive values
+		// are rejected so the explicit default cannot be
+		// silently zeroed back out.
+		RerankerInferenceTimeout: agentapi.DefaultBertSidecarTimeout,
 		// implementation-plan.md Stage 5.1 makes concept fan-out
 		// part of the production default mixed seed. Operators
 		// can still opt out by setting AGENT_MEMORY_ENABLE_CONCEPTS=false

@@ -36,7 +36,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.5.1
 // - protoc             v7.34.1
-// source: proto/agent.proto
+// source: agent.proto
 
 package agentpb
 
@@ -75,11 +75,28 @@ type AgentServiceClient interface {
 	// and durably append a RecallContextLog row before
 	// returning.
 	Recall(ctx context.Context, in *RecallRequest, opts ...grpc.CallOption) (*RecallResponse, error)
-	// Observe is the agent's outcome-record path; owned by
-	// Stage 5.2. Placeholder so the IDL surface is complete.
+	// Observe is the §6.1.2 agent outcome-record path. The
+	// server validates the request (rejects
+	// outcome=human_corrected and caller-supplied
+	// observation_refs[].role=degraded_recall_context),
+	// auto-stamps an extra
+	// observation when the supplied context_id resolves to a
+	// degraded recall row, transactionally appends one
+	// Episode + N Observation rows to the EpisodicLog, and
+	// returns the pre-minted episode_id (so the response is
+	// deterministic even when the writer is later replayed
+	// from the §7.5 WAL).
 	Observe(ctx context.Context, in *ObserveRequest, opts ...grpc.CallOption) (*ObserveResponse, error)
-	// Expand walks structural edges from a node id; owned by
-	// Stage 5.3. Placeholder.
+	// Expand is the §6.5 structural-walk path: BFS over
+	// `static_calls` / `observed_calls` edges from a seed node
+	// in a requested direction (callees | callers), up to a
+	// configurable depth (default 5, hard ceiling 10), with
+	// hot-path ranking (DESC observation_count, hop ASC,
+	// edge_id ASC), node + edge budget clamping at the
+	// per-service ceiling, a RecallContextLog row appended
+	// with verb='expand', and the same `graph_store_unavailable`
+	// closed-set degraded-fallback path as `agent.recall`.
+	// See `internal/agentapi/expand.go.Service.Expand`.
 	Expand(ctx context.Context, in *ExpandRequest, opts ...grpc.CallOption) (*ExpandResponse, error)
 	// Summarize materialises a neighborhood card (node target)
 	// or a concept card + its `concept_support` rows (concept
@@ -161,11 +178,28 @@ type AgentServiceServer interface {
 	// and durably append a RecallContextLog row before
 	// returning.
 	Recall(context.Context, *RecallRequest) (*RecallResponse, error)
-	// Observe is the agent's outcome-record path; owned by
-	// Stage 5.2. Placeholder so the IDL surface is complete.
+	// Observe is the §6.1.2 agent outcome-record path. The
+	// server validates the request (rejects
+	// outcome=human_corrected and caller-supplied
+	// observation_refs[].role=degraded_recall_context),
+	// auto-stamps an extra
+	// observation when the supplied context_id resolves to a
+	// degraded recall row, transactionally appends one
+	// Episode + N Observation rows to the EpisodicLog, and
+	// returns the pre-minted episode_id (so the response is
+	// deterministic even when the writer is later replayed
+	// from the §7.5 WAL).
 	Observe(context.Context, *ObserveRequest) (*ObserveResponse, error)
-	// Expand walks structural edges from a node id; owned by
-	// Stage 5.3. Placeholder.
+	// Expand is the §6.5 structural-walk path: BFS over
+	// `static_calls` / `observed_calls` edges from a seed node
+	// in a requested direction (callees | callers), up to a
+	// configurable depth (default 5, hard ceiling 10), with
+	// hot-path ranking (DESC observation_count, hop ASC,
+	// edge_id ASC), node + edge budget clamping at the
+	// per-service ceiling, a RecallContextLog row appended
+	// with verb='expand', and the same `graph_store_unavailable`
+	// closed-set degraded-fallback path as `agent.recall`.
+	// See `internal/agentapi/expand.go.Service.Expand`.
 	Expand(context.Context, *ExpandRequest) (*ExpandResponse, error)
 	// Summarize materialises a neighborhood card (node target)
 	// or a concept card + its `concept_support` rows (concept
@@ -321,5 +355,5 @@ var AgentService_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "proto/agent.proto",
+	Metadata: "agent.proto",
 }

@@ -1,8 +1,10 @@
 // Command agent-api is the long-running process that serves
-// the §6.4 agent recall path (and, in future workstreams,
-// the observe / expand / summarize primitives).  This iter
-// ships the RECALL composition only — the HTTP/MCP routing
-// layer is Stage 4 work owned by a separate workstream.
+// the §6.4 agent recall path AND the §6.5 agent expand path
+// (and, in future workstreams, the observe / summarize
+// primitives). As of Stage 5.3 this binary ships the RECALL
+// and EXPAND compositions wired against real production
+// dependencies — the HTTP/MCP routing layer is Stage 4 work
+// owned by a separate workstream.
 //
 // Why a process exists today (resolves evaluator iter-2
 // finding #4 "no agent.recall path calls [RecallFilter]
@@ -14,15 +16,24 @@
 // exists and works — the recall service is not just a
 // test-only struct.
 //
-// Stage 5.1 wiring (this iter): the binary additionally
+// Stage 5.1 + Stage 5.3 wiring (this iter): the binary
 // plumbs the v0 cold-start reranker, the inline snapshot
 // fallback reader (`recall_context_log` rehydration), and
 // the inline RecallContextLog appender so a full happy-path
-// + degraded recall cycle works end-to-end. The gRPC
-// transport skeleton is registered behind mTLS per
-// tech-spec §8.5 when the `AGENT_MEMORY_AGENT_GRPC_*` env
-// vars are set; without them the binary remains a
-// foreground composition-root validator.
+// + degraded recall cycle works end-to-end. For the Stage
+// 5.3 `agent.expand` verb the binary additionally wires
+// `agentapi.NewGraphReaderEdgeWalker(gReader)` (for
+// outbound/inbound call-edge BFS), the observation counter
+// (for hot-path ranking), and the dedicated expand snapshot
+// source (for the degraded fallback that rehydrates the
+// most recent `recall_context_log` row with `verb='expand'`
+// keyed by repo + node + direction) — see the
+// `Stage 5.3 Step-7` block in `main` for the exact options.
+// The gRPC transport registers both `Recall` and `Expand`
+// behind mTLS per tech-spec §8.5 when the
+// `AGENT_MEMORY_AGENT_GRPC_*` env vars are set; without
+// them the binary remains a foreground composition-root
+// validator.
 //
 // Configuration (env vars; no flags)
 // ----------------------------------
@@ -78,8 +89,16 @@
 //	                                    lands.
 //	AGENT_MEMORY_AGENT_GRPC_ADDR        (optional) bind address
 //	                                    for the mTLS gRPC server
-//	                                    skeleton (tech-spec §8.5).
-//	                                    Requires the three TLS
+//	                                    that serves the §6.4
+//	                                    `Recall` (Stage 5.1) and
+//	                                    §6.5 `Expand` (Stage 5.3)
+//	                                    RPCs (tech-spec §8.5).
+//	                                    `Observe` (Stage 5.2) and
+//	                                    `Summarize` (Stage 5.4)
+//	                                    are registered as
+//	                                    `Unimplemented` stubs until
+//	                                    their respective workstreams
+//	                                    land. Requires the three TLS
 //	                                    env vars below; absence
 //	                                    disables the listener.
 //	AGENT_MEMORY_AGENT_GRPC_TLS_CERT    server certificate path.
@@ -278,6 +297,18 @@ func main() {
 	// underlying graph store is down.
 	snapshot := newSnapshotSourceFromDB(db, gReader, obsCounter, logger)
 
+	// Stage 5.3 Step-7: degraded snapshot source for the
+	// `agent.expand` verb. Walks `recall_context_log` rows
+	// keyed by (repo, node_id, direction, verb='expand')
+	// and rehydrates the recorded Node / Edge cards
+	// through GraphReader (mirrors `newSnapshotSourceFromDB`
+	// for the recall verb). Resolves evaluator iter-1 #1
+	// (the production binary was not wiring the new expand
+	// dependencies, so the gRPC `Expand` path returned
+	// `ErrExpandUnavailable` even with all infrastructure
+	// present).
+	expandSnapshot := newExpandSnapshotSourceFromDB(db, gReader, obsCounter, logger)
+
 	opts := []agentapi.Option{
 		agentapi.WithLogger(logger),
 		agentapi.WithHealthSource(healthSource),
@@ -286,6 +317,18 @@ func main() {
 		agentapi.WithExpansionDepth(1),
 		agentapi.WithSnapshotFallback(snapshot),
 		agentapi.WithConceptsEnabled(cfg.EnableConcepts),
+		// Stage 5.3 expand verb wiring (evaluator iter-1 #1).
+		// `EdgeWalker` and the observation counter use the
+		// same GraphReader / trace_observation infrastructure
+		// the recall verb already binds, so the two verbs
+		// share a single failure-domain. `ExpandSnapshot`
+		// gives the verb a degraded fallback so a graph
+		// outage does not promote to a hard 500 — it
+		// degrades to the most recent recorded expansion
+		// for the (repo, node, direction) tuple.
+		agentapi.WithEdgeWalker(agentapi.NewGraphReaderEdgeWalker(gReader)),
+		agentapi.WithExpandObservationCounter(obsCounter),
+		agentapi.WithExpandSnapshot(expandSnapshot),
 	}
 	if contextLog != nil {
 		opts = append(opts, agentapi.WithContextLog(contextLog))
@@ -330,6 +373,65 @@ func main() {
 
 	service := agentapi.NewService(embedder, qclient, filter, opts...)
 
+	// Stage 5.2: agent.observe verb composition. Requires
+	// the writer-role DSN (same one used by the
+	// RecallContextLog appender above) to INSERT Episode +
+	// Observation rows. WAL fallback is wired when
+	// AGENT_MEMORY_WAL_DIR is set so a partition outage
+	// degrades gracefully instead of failing the agent
+	// caller (architecture.md §7.5). Without either env
+	// var the Observe gRPC method returns Unimplemented /
+	// Unavailable respectively.
+	var observeSvc *agentapi.ObserveService
+	var observeWAL *agentapi.FileWAL
+	if appDB != nil {
+		episodeWriter := newEpisodeAppenderFromDB(appDB, logger.With(slog.String("comp", "episode-writer")))
+		// The resolver runs over the `_ro` pool so it does
+		// not contend with writer transactions.
+		contextResolver := newContextResolverFromDB(db)
+		observeOpts := []agentapi.ObserveOption{
+			agentapi.WithObserveLogger(logger.With(slog.String("comp", "observe"))),
+		}
+		var observeMetrics *agentapi.Metrics
+		if cfg.WALDir != "" {
+			observeMetrics = &agentapi.Metrics{}
+			wal, err := agentapi.NewFileWAL(cfg.WALDir, agentapi.FileWALOptions{
+				Metrics: observeMetrics,
+				Logger:  logger.With(slog.String("comp", "observe-wal")),
+			})
+			if err != nil {
+				logger.Error("agent-api.observe.wal_open_failed",
+					slog.String("dir", cfg.WALDir),
+					slog.String("error", err.Error()))
+				os.Exit(3)
+			}
+			observeWAL = wal
+			// The flusher uses the same writer the synchronous
+			// path uses — a recovered partition catches up by
+			// re-attempting the original INSERT verbatim.
+			observeWAL.StartFlusher(episodeWriter, 0)
+			observeOpts = append(observeOpts,
+				agentapi.WithObserveWAL(observeWAL),
+				agentapi.WithObserveMetrics(observeMetrics))
+			logger.Info("agent-api.observe.wal_wired",
+				slog.String("dir", cfg.WALDir),
+				slog.Int64("initial_depth", observeWAL.Depth()))
+		} else {
+			logger.Warn("agent-api.observe.wal_disabled",
+				slog.String("hint", "set AGENT_MEMORY_WAL_DIR to enable the §7.5 episodic-log fallback"))
+		}
+		observeSvc = agentapi.NewObserveService(episodeWriter, contextResolver, observeOpts...)
+		logger.Info("agent-api.observe.wired")
+	} else {
+		logger.Warn("agent-api.observe.disabled",
+			slog.String("hint", "set AGENT_MEMORY_PG_APP_URL to enable agent.observe"))
+	}
+	defer func() {
+		if observeWAL != nil {
+			_ = observeWAL.Close()
+		}
+	}()
+
 	logger.Info("agent-api.ready",
 		slog.String("qdrant_url", cfg.QdrantURL),
 		slog.Bool("stub_embedder", cfg.AllowStubEmbedder),
@@ -347,6 +449,29 @@ func main() {
 		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok"))
+		})
+		// `/metrics` exposes the Prometheus text-format
+		// `observe_wal_buffer_depth` gauge mandated by the
+		// implementation plan §5.2. We hand-roll the
+		// text format instead of pulling in
+		// prometheus/client_golang because this binary
+		// exports exactly one metric and the Prometheus
+		// text format is intentionally trivial. The
+		// handler ALWAYS responds — depth reports 0 when
+		// no WAL is wired — so an operator's `curl
+		// /metrics | grep observe_wal_buffer_depth`
+		// works regardless of whether the WAL is
+		// configured (resolves evaluator iter-1 item #3).
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+			var depth int64
+			if observeWAL != nil {
+				depth = observeWAL.Depth()
+			}
+			w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "# HELP observe_wal_buffer_depth Number of EpisodeAppendInput payloads buffered in the agent.observe WAL awaiting replay.\n")
+			fmt.Fprintf(w, "# TYPE observe_wal_buffer_depth gauge\n")
+			fmt.Fprintf(w, "observe_wal_buffer_depth %d\n", depth)
 		})
 		srv := &http.Server{
 			Addr:              cfg.HealthAddr,
@@ -387,7 +512,11 @@ func main() {
 			os.Exit(2)
 		}
 		grpcSrv = grpc.NewServer(grpc.Creds(creds))
-		agentpb.RegisterAgentServiceServer(grpcSrv, agentapi.NewGRPCServer(service))
+		grpcOpts := []agentapi.GRPCOption{}
+		if observeSvc != nil {
+			grpcOpts = append(grpcOpts, agentapi.WithObserveService(observeSvc))
+		}
+		agentpb.RegisterAgentServiceServer(grpcSrv, agentapi.NewGRPCServer(service, grpcOpts...))
 		// reflection lets `grpcurl` / `evans` introspect the
 		// listener for smoke-testing the mTLS handshake
 		// without a generated client.
@@ -412,6 +541,7 @@ func main() {
 		// service still has to be referenced so its
 		// composition is exercised at startup.
 		_ = service
+		_ = observeSvc
 	}
 
 	<-ctx.Done()
@@ -945,6 +1075,160 @@ func classifyGraphStoreError(err error, op string) error {
 		return fmt.Errorf("%s: %w", op, agentapi.ErrGraphStoreUnavailable)
 	}
 	return fmt.Errorf("%s: %w", op, err)
+}
+
+// expandSnapshotGraphReader is the narrow subset of
+// `*graphreader.Reader` the expand snapshot source actually
+// uses. Defined as an interface so the unit test in
+// `expand_snapshot_test.go` can swap in a fake without
+// standing up a real pgxpool (evaluator iter-2 #3 — the
+// production snapshot reader was untested before this
+// refactor).
+type expandSnapshotGraphReader interface {
+	GetNode(ctx context.Context, nodeID string, opts graphreader.ReaderOptions) (graphreader.Node, error)
+	GetEdge(ctx context.Context, edgeID string, opts graphreader.ReaderOptions) (graphreader.Edge, error)
+}
+
+// newExpandSnapshotSourceFromDB returns the production
+// `agentapi.ExpandSnapshotSource` for the agent.expand
+// verb. It looks up the most recent NON-DEGRADED
+// `recall_context_log` row for the (repo, node, direction)
+// tuple AND rehydrates the recorded Node / Edge ids
+// through GraphReader so the degraded envelope carries
+// real card metadata instead of bare id arrays.
+//
+// Why a separate query from `newSnapshotSourceFromDB` —
+// the recall verb's snapshot is keyed by repo only, whereas
+// expand snapshots additionally depend on the seed node id
+// AND the requested direction (architecture.md §6.1.3).
+// The two queries share the same hydration policy
+// (IncludeRetired=true, soft-fail on per-id ErrNotFound,
+// connection-class errors mapped to
+// ErrGraphStoreUnavailable) so a single operator runbook
+// covers both.
+//
+// Returns `agentapi.ErrNoExpandSnapshot` when:
+//   - the repo / node / direction tuple has no prior
+//     non-degraded expand row (cold start), OR
+//   - `repoID` is not a well-formed UUID (mirror of the
+//     recall snapshot source's malformed-id soft fail),
+//     so a misshapen request degrades to an empty envelope
+//     rather than the generic SQL error branch.
+func newExpandSnapshotSourceFromDB(
+	db *sql.DB,
+	gReader expandSnapshotGraphReader,
+	obsCounter agentapi.EdgeObservationCounter,
+	logger *slog.Logger,
+) agentapi.ExpandSnapshotSource {
+	return agentapi.ExpandSnapshotSourceFunc(func(
+		ctx context.Context, repoID, nodeID, direction string,
+	) (agentapi.ExpandSnapshot, error) {
+		if _, parseErr := fingerprint.ParseRepoID(repoID); parseErr != nil {
+			logger.Warn("agent-api.expand_snapshot.repo_id_malformed",
+				slog.String("repo_id", repoID),
+				slog.String("error", parseErr.Error()))
+			return agentapi.ExpandSnapshot{}, agentapi.ErrNoExpandSnapshot
+		}
+		if nodeID == "" {
+			return agentapi.ExpandSnapshot{}, agentapi.ErrNoExpandSnapshot
+		}
+
+		// `query_json` is the same shape `appendExpandContextLog`
+		// writes: `{node_id, direction, depth, max_nodes,
+		// max_edges, truncated, repo_id}`. We pin on node_id +
+		// direction so a Service.Expand call serves from the
+		// most recent prior expansion of that exact (node,
+		// direction) tuple.
+		const q = `
+SELECT context_id::text,
+       (SELECT COALESCE(array_agg(x::text), ARRAY[]::text[]) FROM unnest(node_ids) AS x),
+       (SELECT COALESCE(array_agg(x::text), ARRAY[]::text[]) FROM unnest(edge_ids) AS x)
+  FROM recall_context_log
+ WHERE repo_id = $1
+   AND verb = 'expand'
+   AND query_json->>'node_id' = $2
+   AND query_json->>'direction' = $3
+   AND served_under_degraded = false
+ ORDER BY created_at DESC
+ LIMIT 1`
+		var (
+			snap    agentapi.ExpandSnapshot
+			nodeIDs pgTextArray
+			edgeIDs pgTextArray
+		)
+		row := db.QueryRowContext(ctx, q, repoID, nodeID, direction)
+		if err := row.Scan(&snap.ContextID, &nodeIDs, &edgeIDs); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return agentapi.ExpandSnapshot{}, agentapi.ErrNoExpandSnapshot
+			}
+			return agentapi.ExpandSnapshot{}, fmt.Errorf(
+				"expand_snapshot: scan: %w", err)
+		}
+		snap.RootNodeID = nodeID
+
+		readerOpts := graphreader.ReaderOptions{IncludeRetired: true}
+		for _, id := range nodeIDs {
+			n, err := gReader.GetNode(ctx, id, readerOpts)
+			if err != nil {
+				if errors.Is(err, graphreader.ErrNotFound) {
+					logger.Warn("agent-api.expand_snapshot.node_missing",
+						slog.String("node_id", id))
+					continue
+				}
+				return agentapi.ExpandSnapshot{}, classifyGraphStoreError(
+					err, "expand_snapshot.node")
+			}
+			snap.Nodes = append(snap.Nodes, agentapi.NodeHit{
+				NodeID:             n.NodeID,
+				RepoID:             n.RepoID,
+				Kind:               n.Kind,
+				CanonicalSignature: n.CanonicalSignature,
+			})
+		}
+		for _, id := range edgeIDs {
+			e, err := gReader.GetEdge(ctx, id, readerOpts)
+			if err != nil {
+				if errors.Is(err, graphreader.ErrNotFound) {
+					logger.Warn("agent-api.expand_snapshot.edge_missing",
+						slog.String("edge_id", id))
+					continue
+				}
+				return agentapi.ExpandSnapshot{}, classifyGraphStoreError(
+					err, "expand_snapshot.edge")
+			}
+			snap.Edges = append(snap.Edges, agentapi.EdgeHit{
+				EdgeID:    e.EdgeID,
+				RepoID:    e.RepoID,
+				Kind:      e.Kind,
+				SrcNodeID: e.SrcNodeID,
+				DstNodeID: e.DstNodeID,
+			})
+		}
+		// Populate observation_count on the snapshot edges
+		// — same soft-fail policy as the recall snapshot
+		// (counts stay zero if the trace_observation query
+		// fails; the rest of the snapshot is already the
+		// load-bearing signal).
+		if obsCounter != nil && len(snap.Edges) > 0 {
+			ids := make([]string, 0, len(snap.Edges))
+			for _, e := range snap.Edges {
+				if e.EdgeID != "" {
+					ids = append(ids, e.EdgeID)
+				}
+			}
+			if counts, err := obsCounter.CountByEdgeIDs(ctx, ids); err == nil {
+				for i := range snap.Edges {
+					if c, ok := counts[snap.Edges[i].EdgeID]; ok {
+						snap.Edges[i].ObservationCount = c
+					}
+				}
+			} else {
+				logger.Warn("agent-api.expand_snapshot.observation_counts",
+					slog.String("error", err.Error()))
+			}
+		}
+		return snap, nil
+	})
 }
 
 // pgTextArray scans a Postgres `text[]` column into a Go

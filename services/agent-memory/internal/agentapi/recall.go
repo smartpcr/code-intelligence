@@ -3,14 +3,14 @@
 // path, which is the canonical read counterpart to the
 // embedding publisher (`internal/embedding/publisher.go`):
 //
-//   1. The publisher writes every Method / Block embedding to
-//      Qdrant AND records a §9.6a state log in PostgreSQL.
-//   2. The recall service (this file) accepts a natural-
-//      language query, embeds it, searches Qdrant, and
-//      filters the candidate hits through
-//      `embedding.RecallFilter` so any vector that has NOT
-//      reached the §9.6a `published` terminal state is
-//      excluded from the answer.
+//  1. The publisher writes every Method / Block embedding to
+//     Qdrant AND records a §9.6a state log in PostgreSQL.
+//  2. The recall service (this file) accepts a natural-
+//     language query, embeds it, searches Qdrant, and
+//     filters the candidate hits through
+//     `embedding.RecallFilter` so any vector that has NOT
+//     reached the §9.6a `published` terminal state is
+//     excluded from the answer.
 //
 // The filter step is the §9.6a read-side invariant that
 // tech-spec.md §8.7.1 names: "An EmbeddingPublish row that
@@ -139,10 +139,12 @@ type HealthState struct {
 	Source   string
 }
 
-// Service is the §6.4 recall implementation.  Construct via
-// `NewService`; `Recall` is the only exported method today.
-// Future Stage-4 work will add `Observe` / `Expand` /
-// `Summarize` to this struct.
+// Service is the §6.4 recall + §6.5 expand implementation.
+// Construct via `NewService`; the exported verbs today are
+// `Recall` (Stage 5.1, §6.4 — defined in this file) and
+// `Expand` (Stage 5.3, §6.5 — defined in `expand.go`).
+// Future stages will add `Observe` (Stage 5.2) and
+// `Summarize` (Stage 5.4) to this same struct.
 //
 // Stage 5.1 dependencies
 // ----------------------
@@ -159,6 +161,13 @@ type HealthState struct {
 //   - `conceptsEnabled` plumbs the §7.8 mixed seed (Method +
 //     Block + Concept fan-out).
 //
+// Stage 5.3 dependencies (agent.expand)
+// -------------------------------------
+// `Expand` is independently wired by three `With*` options
+// (`WithEdgeWalker`, `WithExpandObservationCounter`,
+// `WithExpandSnapshot`); see `Service.Expand` in `expand.go`
+// for the full request/response contract and the per-option
+// degraded-fallback behaviour.
 // All optionals default to "off" so existing test fixtures
 // (which assemble the three core deps only) continue to see
 // the legacy two-step behaviour; production wiring in

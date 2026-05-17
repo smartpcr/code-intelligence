@@ -26,11 +26,16 @@ import (
 var ErrNotFound = errors.New("graphreader: row not found")
 
 // MaxListLimit caps every list-style read (ListNodes,
-// ListEdgesFrom) at ten thousand rows. Without this bound a repo
-// with tens of thousands of Nodes — or a pathological file Node
-// with thousands of `contains` edges — would stream every row
-// into the reader's address space on every `agent.recall` /
-// `mgmt.read.*` request, which is the hot path the cap defends.
+// ListEdgesFrom, ListEdgesTo) at ten thousand rows. Without this
+// bound a repo with tens of thousands of Nodes — or a pathological
+// file Node with thousands of `contains` edges, or a popular
+// callee Node with thousands of inbound `static_calls` edges —
+// would stream every row into the reader's address space on every
+// `agent.recall` / `agent.expand` / `mgmt.read.*` request, which
+// is the hot path the cap defends. The inbound (`ListEdgesTo`)
+// path applies the SAME clamp via `appendLimit` so caller-fan-in
+// scans (e.g. `agent.expand(direction='callers')`) cannot bypass
+// the cap.
 //
 // The cap is BOTH the default (applied when a caller passes
 // `Limit <= 0`) AND the maximum (caller-supplied values above
@@ -54,10 +59,10 @@ const MaxListLimit = 10_000
 // MaxListLimit for the cap policy.
 //
 // Pulled out as a standalone helper so the same clamp rule is
-// shared by `ListNodes` (which reads `ListNodesFilter.Limit`)
-// and `ListEdgesFrom` (which reads `ReaderOptions.Limit`); a
-// future cursor-pagination patch will reuse it for the per-page
-// fetch size.
+// shared by `ListNodes` (which reads `ListNodesFilter.Limit`),
+// `ListEdgesFrom`, and `ListEdgesTo` (both of which read
+// `ReaderOptions.Limit`); a future cursor-pagination patch will
+// reuse it for the per-page fetch size.
 func normaliseLimit(requested int) int {
 	if requested <= 0 || requested > MaxListLimit {
 		return MaxListLimit
@@ -117,10 +122,11 @@ type ReaderOptions struct {
 	// (risk §9.13).
 	IncludeRetired bool
 
-	// Limit caps the number of rows returned by `ListEdgesFrom`.
-	// It is the "analogous option" — alongside the
+	// Limit caps the number of rows returned by `ListEdgesFrom`
+	// and `ListEdgesTo` (the outbound and inbound edge-listing
+	// entry points). It is the "analogous option" — alongside the
 	// `ListNodesFilter.Limit` field consumed by `ListNodes` —
-	// that bounds the two list-style entry points.
+	// that bounds the list-style entry points.
 	//
 	// Clamping policy (shared with `ListNodesFilter.Limit`):
 	//
@@ -128,14 +134,16 @@ type ReaderOptions struct {
 	//   * `0 < Limit <= MaxListLimit` → used as-is
 	//   * `Limit > MaxListLimit`   → `MaxListLimit` (clamped)
 	//
-	// Honoured only by `ListEdgesFrom`. `GetNode` and `GetEdge`
-	// are single-row lookups so `Limit` is meaningless there;
-	// `NeighborhoodCard` is a 1-hop scan whose fan-out is
-	// bounded by the seed Node's outbound degree, so it ignores
-	// this field today (a defensive cap on the card's edge scan
-	// is tracked as a follow-up — see doc.go). `ListNodes`
-	// reads `ListNodesFilter.Limit` instead so per-call list
-	// shape is configured next to the rest of the list filter.
+	// Honoured by `ListEdgesFrom` AND `ListEdgesTo` — both apply
+	// the same `appendLimit` helper so caller-fan-in (inbound)
+	// and callee-fan-out (outbound) scans share one cap. `GetNode`
+	// and `GetEdge` are single-row lookups so `Limit` is
+	// meaningless there; `NeighborhoodCard` is a 1-hop scan whose
+	// fan-out is bounded by the seed Node's outbound degree, so it
+	// ignores this field today (a defensive cap on the card's edge
+	// scan is tracked as a follow-up — see doc.go). `ListNodes`
+	// reads `ListNodesFilter.Limit` instead so per-call list shape
+	// is configured next to the rest of the list filter.
 	Limit int
 }
 
@@ -262,6 +270,37 @@ func (r *Reader) ListEdgesFrom(
 	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("graphreader: ListEdgesFrom query: %w", err)
+	}
+	defer rows.Close()
+	return scanEdgeRows(rows, opts.IncludeRetired)
+}
+
+// ListEdgesTo is the inbound mirror of ListEdgesFrom: it
+// returns every Edge whose `dst_node_id` matches `dstNodeID`.
+// Used by `agent.expand(direction='callers')` to walk the
+// call chain backwards from a target Node (architecture.md
+// §6.1.3).
+//
+// Retirement, kind-filter, ordering, and limit semantics are
+// IDENTICAL to ListEdgesFrom — see that function's doc for
+// the full contract. The two methods share `selectEdgesToQuery`
+// / `selectEdgesFromQuery` so any divergence shows up as a
+// query.go change rather than a silent contract drift.
+func (r *Reader) ListEdgesTo(
+	ctx context.Context, dstNodeID string, kinds []string, opts ReaderOptions,
+) ([]Edge, error) {
+	if dstNodeID == "" {
+		return nil, errors.New("graphreader: ListEdgesTo: empty dst_node_id")
+	}
+	if err := validateEdgeKinds(kinds); err != nil {
+		return nil, err
+	}
+
+	query, args := selectEdgesToQuery(dstNodeID, kinds, opts.IncludeRetired)
+	query, args = appendLimit(query, args, opts.Limit)
+	rows, err := r.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("graphreader: ListEdgesTo query: %w", err)
 	}
 	defer rows.Close()
 	return scanEdgeRows(rows, opts.IncludeRetired)

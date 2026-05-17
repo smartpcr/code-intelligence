@@ -1012,22 +1012,24 @@ func defaultSecretGen() (string, error) {
 // the matching response. Centralised so the register and
 // ingest verbs apply identical classification rules.
 //
-// Callers MUST check `err != nil` before delegating here.
-// Reaching this function with a nil err is a programmer
-// error — not an upstream outage — so we log at ERROR (so
-// the bug is loud in observability) and respond 500
-// `internal_error` rather than masking the bug as a 502
-// `head_resolver_unavailable`. Surfacing the bug as a 502
-// would (a) blame the resolver for our own bad routing, and
-// (b) leave the structured log carrying `error="<nil>"`,
-// which is useless for triage.
+// MUST be called only when the resolver returned a non-nil
+// error. Both call sites in this package already guard with
+// `if err != nil` — a nil err reaching this function is a
+// programmer bug, not an upstream outage. We surface that
+// bug with a 500 + ERROR-level log rather than emitting a
+// misleading 502 "head resolver unavailable" envelope that
+// would misattribute the fault to the resolver upstream and
+// hide the defect behind a plausible-looking response.
 func (h *Handler) handleResolverError(w http.ResponseWriter, r *http.Request, op, repoURL string, err error) {
 	if err == nil {
-		h.logger.Error("mgmtapi."+op+".resolver_nil_error",
+		// Programmer bug: a success path reached the error
+		// handler. Log at ERROR (not WARN) so it surfaces
+		// on the operator's bug-radar instead of looking
+		// like a transient resolver hiccup.
+		h.logger.Error("mgmtapi."+op+".resolver_error_called_with_nil",
 			slog.String("op", op),
 			slog.String("repo_url", repoURL),
 			slog.String("path", r.URL.Path),
-			slog.String("bug", "handleResolverError called with nil err; caller routed a non-error path into the error sink"),
 		)
 		writeJSONError(w, http.StatusInternalServerError, "internal_error",
 			"internal error")

@@ -588,9 +588,9 @@ func (s *Service) openRun(ctx context.Context) (string, error) {
 	var id string
 	err := s.db.QueryRowContext(ctx, `
 		INSERT INTO promoter_run (started_at, status)
-		VALUES (now(), '`+StatusRunning+`')
+		VALUES (now(), $1)
 		RETURNING run_id::text
-	`).Scan(&id)
+	`, StatusRunning).Scan(&id)
 	return id, err
 }
 

@@ -39,10 +39,12 @@ const (
 )
 
 // errModeNotImplemented is returned by the dispatcher for
-// `delta` and `manual` jobs in Stage 3.1. Stages 3.4/3.5 swap
-// in real handlers; the worker treats the error as a terminal
-// failure so the queue does not livelock on jobs it cannot
-// process.
+// `manual` jobs only — Stage 3.4 wired the `delta` handler so
+// `delta` jobs no longer surface this error. `manual` mode
+// remains a placeholder for Stage 3.5 (webhook receiver) /
+// future operator-triggered re-index workstreams; the worker
+// treats the error as a terminal failure so the queue does not
+// livelock on jobs it cannot process.
 var errModeNotImplemented = errors.New("repoindexer: handler mode not implemented in this stage")
 
 // ErrNoJob is the sentinel claim() returns when no pending
@@ -159,6 +161,26 @@ type WorkerOptions struct {
 	// point the row is marked `failed` for operator triage.
 	// Zero means use `DefaultMaxAttempts`.
 	MaxAttempts int
+	// Differ is the Stage 3.4 delta-mode dependency that
+	// enumerates (path, status, prev_path) entries between
+	// two SHAs of the same repo. Required when the worker is
+	// expected to process `delta` jobs; full-only deployments
+	// may leave it nil (the dispatcher returns a descriptive
+	// error when a delta job arrives without a Differ wired,
+	// instead of panicking — silent panics inside a worker
+	// goroutine take down the whole pool). Tests inject
+	// `&InMemoryDeltaDiffer{}`; production passes
+	// `&GitDeltaDiffer{MirrorDir: ws.Root()}`.
+	Differ DeltaDiffer
+	// Retirer is the Stage 3.4 delta-mode dependency that
+	// writes `node_retirement` / `edge_retirement` rows for
+	// removed / renamed entities. Required when the worker is
+	// expected to process `delta` jobs; full mode never
+	// retires so full-only deployments may leave it nil.
+	// Wrap a `*retirement.Service` with
+	// `NewRetirementAdapter` for production wiring; tests
+	// supply a fake satisfying the `Retirer` interface.
+	Retirer Retirer
 }
 
 // DefaultMaxAttempts is the operator default for
@@ -193,6 +215,8 @@ type Worker struct {
 	materializer Materializer
 	emitter      ASTEmitter
 	publisher    EventPublisher
+	differ       DeltaDiffer
+	retirer      Retirer
 
 	workerID    string
 	pollEvery   time.Duration
@@ -258,6 +282,8 @@ func NewWorker(db *sql.DB, writer *graphwriter.Writer, opts WorkerOptions) *Work
 		materializer: opts.Materializer,
 		emitter:      emitter,
 		publisher:    opts.Publisher,
+		differ:       opts.Differ,
+		retirer:      opts.Retirer,
 		workerID:     workerID,
 		pollEvery:    pollEvery,
 		maxAttempts:  maxAttempts,
@@ -456,7 +482,7 @@ func (w *Worker) processClaimed(ctx context.Context, job Job) {
 		}
 		return
 	}
-	if err := w.markDoneAndPublish(ctx, job, summary); err != nil {
+	if err := w.markDoneAndPublishAny(ctx, job, summary); err != nil {
 		// The publish + done-transition atomic tx failed.
 		// Per the publisher contract, NEITHER the events
 		// nor the status='done' transition committed (or
@@ -523,14 +549,46 @@ func (w *Worker) processClaimed(ctx context.Context, job Job) {
 	}
 }
 
-func (w *Worker) dispatch(ctx context.Context, job Job) (FullSummary, error) {
+// dispatchResult is the sum-type return of dispatch — every
+// mode-specific handler produces a value satisfying this
+// interface. The publish step (markDoneAndPublishAny) uses a
+// type switch to pick the right per-mode publication path.
+type dispatchResult interface {
+	mode() Mode
+}
+
+func (FullSummary) mode() Mode  { return ModeFull }
+func (DeltaSummary) mode() Mode { return ModeDelta }
+
+func (w *Worker) dispatch(ctx context.Context, job Job) (dispatchResult, error) {
 	switch job.Mode {
 	case ModeFull:
 		return w.runFull(ctx, job)
-	case ModeDelta, ModeManual:
-		return FullSummary{}, fmt.Errorf("%w: %s", errModeNotImplemented, job.Mode)
+	case ModeDelta:
+		if w.differ == nil || w.retirer == nil {
+			return nil, fmt.Errorf("repoindexer: delta job %s requires Differ and Retirer to be configured on the Worker", job.JobID)
+		}
+		return w.runDelta(ctx, job)
+	case ModeManual:
+		return nil, fmt.Errorf("%w: %s", errModeNotImplemented, job.Mode)
 	default:
-		return FullSummary{}, fmt.Errorf("repoindexer: unknown mode %q", job.Mode)
+		return nil, fmt.Errorf("repoindexer: unknown mode %q", job.Mode)
+	}
+}
+
+// markDoneAndPublishAny routes the publish step based on the
+// concrete handler summary. Splitting on type rather than on the
+// job's Mode column avoids drift between the two: the handler's
+// own return type is the source of truth for which event family
+// fires.
+func (w *Worker) markDoneAndPublishAny(ctx context.Context, job Job, summary dispatchResult) error {
+	switch s := summary.(type) {
+	case FullSummary:
+		return w.markDoneAndPublish(ctx, job, s)
+	case DeltaSummary:
+		return w.markDoneAndPublishDelta(ctx, job, s)
+	default:
+		return fmt.Errorf("repoindexer: markDoneAndPublishAny: unsupported summary type %T", summary)
 	}
 }
 
@@ -689,6 +747,134 @@ func (w *Worker) markDoneAndPublish(ctx context.Context, job Job, summary FullSu
 		slog.Int("emitter_calls", summary.EmitterCalls),
 		slog.Bool("commit_inserted", summary.CommitInserted),
 		slog.Bool("first_successful_ingest", firstSuccessfulIngest),
+	)
+	return nil
+}
+
+// markDoneAndPublishDelta is the delta-mode sibling of
+// markDoneAndPublish. It commits the `repo.delta_ingested` event
+// AND the status='done' transition in a single tx, identical
+// atomic-publish semantics. Unlike the full path, delta does NOT
+// emit repo.registered (the repo is by definition already
+// registered if a delta job arrived) and does NOT emit
+// repo.full_ingested.
+//
+// Event payload populates FromSHA, ToSHA, and
+// AffectedNodeCount (computed by runDelta from the logical
+// delta — inserted nodes + retired nodes + renamed_to edges).
+// The handler does not include retired edges in the count
+// because the brief defines "affected NODE count" (edges are
+// derived).
+func (w *Worker) markDoneAndPublishDelta(ctx context.Context, job Job, summary DeltaSummary) (err error) {
+	// Evaluator iter-2 finding #5 — persist `affected_node_count`
+	// MONOTONICALLY BEFORE the publish-tx so retries cannot
+	// shrink the published value.
+	//
+	// Failure mode addressed:
+	//   1. First attempt: runDelta mutates the graph (retires N
+	//      nodes, inserts M); DeltaSummary.AffectedNodeCount()
+	//      reports N+M; markDoneAndPublishDelta begins tx;
+	//      publisher.PublishTx hits a transient broker outage
+	//      and returns error; tx rolls back; processClaimed
+	//      requeues the row to status='pending'.
+	//   2. Retry: runDelta re-enters, but the mutations are
+	//      mostly no-ops (rows already retired; emitter sees
+	//      the same fingerprints). The retry's
+	//      DeltaSummary.AffectedNodeCount() is therefore much
+	//      smaller than the first attempt's. Publishing the
+	//      smaller value would lie to downstream consumers.
+	//
+	// Mitigation:
+	//   - Before begin-tx, run an autocommit UPDATE that sets
+	//     `affected_node_count = GREATEST(stored, current_run)`
+	//     and RETURNS the post-update value.
+	//   - Use the RETURNED value (not summary.AffectedNodeCount())
+	//     in the published event AND in the structured log.
+	//   - The UPDATE is intentionally OUTSIDE the publish tx so
+	//     a rollback of the publish tx does NOT roll back the
+	//     persisted high-water mark.
+	//
+	// Remaining gap (documented, not closed in this iter):
+	//   - If the worker process crashes between the graph
+	//     mutations in runDelta and the GREATEST UPDATE here,
+	//     the next attempt's count will reflect only the
+	//     replay-residue. Closing this would require wrapping
+	//     mutations + persist + publish in a single tx, which
+	//     in turn requires reshaping RetirementService /
+	//     GraphWriter to take an outer tx — out of scope for
+	//     Stage 3.4.
+	currentCount := summary.AffectedNodeCount()
+	var persistedCount int
+	if err := w.db.QueryRowContext(ctx, `
+		UPDATE ingest_jobs
+		   SET affected_node_count = GREATEST(COALESCE(affected_node_count, 0), $1)
+		 WHERE job_id = $2
+		RETURNING affected_node_count
+	`, currentCount, job.JobID).Scan(&persistedCount); err != nil {
+		return fmt.Errorf("repoindexer: mark_done(delta) persist affected_node_count: %w", err)
+	}
+
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("repoindexer: mark_done(delta) begin: %w", err)
+	}
+	rollback := true
+	defer func() {
+		if rollback {
+			_ = tx.Rollback()
+		}
+	}()
+
+	repoIDStr := job.RepoID.String()
+	now := w.now().UTC()
+
+	ev := Event{
+		Kind:              EventKindRepoDeltaIngested,
+		RepoID:            repoIDStr,
+		SHA:               job.ToSHA,
+		FromSHA:           job.FromSHA,
+		ToSHA:             job.ToSHA,
+		AffectedNodeCount: persistedCount,
+		JobID:             job.JobID,
+		Time:              now,
+	}
+	if pErr := w.publisher.PublishTx(ctx, tx, ev); pErr != nil {
+		w.logger.Error("repoindexer.worker.publish_failed",
+			slog.String("op", "publish_completion"),
+			slog.String("kind", EventKindRepoDeltaIngested),
+			slog.String("job_id", job.JobID),
+			slog.String("error", pErr.Error()),
+		)
+		return fmt.Errorf("repoindexer: publish %s: %w", EventKindRepoDeltaIngested, pErr)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE ingest_jobs SET status='done' WHERE job_id=$1`, job.JobID,
+	); err != nil {
+		return fmt.Errorf("repoindexer: mark_done(delta) update: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("repoindexer: mark_done(delta) commit: %w", err)
+	}
+	rollback = false
+
+	w.logger.Info("repoindexer.worker.done.delta",
+		slog.String("op", "mark_done.delta"),
+		slog.String("worker_id", w.workerID),
+		slog.String("job_id", job.JobID),
+		slog.String("repo_id", repoIDStr),
+		slog.String("from_sha", job.FromSHA),
+		slog.String("to_sha", job.ToSHA),
+		slog.Int("nodes_emitted", summary.NodesEmitted),
+		slog.Int("nodes_retired", summary.NodesRetired),
+		slog.Int("edges_retired", summary.EdgesRetired),
+		slog.Int("renamed_to_edges", summary.RenamedToEdgesInserted),
+		slog.Int("files_added", summary.FilesAdded),
+		slog.Int("files_modified", summary.FilesModified),
+		slog.Int("files_deleted", summary.FilesDeleted),
+		slog.Int("files_renamed", summary.FilesRenamed),
+		slog.Int("affected_node_count_current_run", currentCount),
+		slog.Int("affected_node_count_persisted", persistedCount),
 	)
 	return nil
 }
@@ -982,7 +1168,10 @@ func (w *Worker) runFull(ctx context.Context, job Job) (FullSummary, error) {
 		}
 
 		// Delegate Class/Method/Block emission to Stage 3.2.
-		emErr := w.emitter.EmitFile(ctx, EmitFileEvent{
+		// EmitResult is discarded here because full ingest
+		// builds the graph from scratch; only the delta path
+		// in Stage 3.4 needs the touched-nodes list.
+		_, emErr := w.emitter.EmitFile(ctx, EmitFileEvent{
 			RepoID:        job.RepoID,
 			RepoURL:       repoURL,
 			SHA:           job.ToSHA,

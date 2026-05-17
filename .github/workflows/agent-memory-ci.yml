@@ -89,6 +89,50 @@ jobs:
         # runners where CGO is available.
         run: make test-race
 
+      - name: Install protoc compiler
+        # `make proto` needs the protoc binary; the Go protoc
+        # plugins themselves are installed by `make proto-tools`
+        # in the next step. Pin protoc to the exact version
+        # whose name appears in the checked-in `.pb.go` files'
+        # `// versions:` header (currently `v7.34.1` — the
+        # `libprotoc 34.1` release in the v3-dropped numbering).
+        # Using `arduino/setup-protoc` (instead of apt-get, which
+        # ships an older 3.21.x and would diff the version
+        # header on every CI run) keeps the proto-drift gate
+        # below from chasing tooling-version noise.
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "34.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: make proto-tools
+        # Install pinned `protoc-gen-go` and `protoc-gen-go-grpc`
+        # binaries into `$GOPATH/bin` so `make proto` can find
+        # them in `$PATH`. Versions are pinned in the Makefile
+        # to match the `// versions:` header in the checked-in
+        # generated files.
+        run: |
+          make proto-tools
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: make proto && verify generated bindings are in sync
+        # Regenerate `proto/agent/*.pb.go` from `proto/agent.proto`
+        # and fail CI if the working tree shows any diff — that
+        # means a contributor edited the .proto IDL without
+        # running `make proto`, leaving the checked-in bindings
+        # stale. Together with `make proto-tools` (pinned plugin
+        # versions) this is the structural gate against generated
+        # binding drift (resolves iter-8 evaluator finding #1).
+        run: |
+          set -euo pipefail
+          make proto
+          if ! git diff --quiet -- proto/agent/; then
+            echo "::error::generated proto bindings are out of sync with proto/agent.proto"
+            echo "::error::run \`make proto\` locally and commit the regenerated files"
+            git --no-pager diff -- proto/agent/
+            exit 1
+          fi
+
   pre-commit:
     name: pre-commit hooks
     runs-on: ubuntu-latest

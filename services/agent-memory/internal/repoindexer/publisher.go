@@ -47,6 +47,18 @@ const (
 	// that don't care about cold-vs-replay subscribe to this
 	// kind and ignore `repo.registered`.
 	EventKindRepoFullIngested = "repo.full_ingested"
+	// EventKindRepoDeltaIngested fires on EVERY successful
+	// delta-mode completion (Stage 3.4). The payload carries
+	// `from_sha`, `to_sha`, and `affected_node_count` so
+	// downstream EmbeddingIndex / consolidator / recall workers
+	// can decide which incremental work to run. `sha` is set
+	// to `to_sha` for back-compat with consumers that only
+	// inspect the legacy field. Unlike `repo.registered`, this
+	// event does NOT predicate on first-done -- a successful
+	// delta job fires the event on every retry/replay (since
+	// the worker only reaches the publish step when the entire
+	// delta batch -- emits + retirements -- committed).
+	EventKindRepoDeltaIngested = "repo.delta_ingested"
 )
 
 // EventPublisher publishes Repo Indexer lifecycle events. The
@@ -85,12 +97,34 @@ type EventPublisher interface {
 // JSON wire format is stable (lower-snake-case field names)
 // so downstream subscribers can decode without depending on
 // this Go module.
+//
+// Stage 3.4 added FromSHA / ToSHA / AffectedNodeCount for the
+// `repo.delta_ingested` payload. They are `omitempty` so the
+// `repo.registered` and `repo.full_ingested` payloads stay
+// byte-for-byte identical to Stage 3.1 -- only delta events
+// carry the new fields. The legacy `sha` field is kept and
+// set to `to_sha` on delta events for back-compat with
+// consumers that only inspect the closed Stage 3.1 set.
 type Event struct {
 	Kind   string    `json:"kind"`
 	RepoID string    `json:"repo_id"`
 	SHA    string    `json:"sha"`
 	JobID  string    `json:"job_id"`
 	Time   time.Time `json:"time"`
+
+	// FromSHA / ToSHA are set on `repo.delta_ingested` events.
+	// FromSHA is the prior committed SHA the delta diffed
+	// against; ToSHA is the new SHA the delta brought the repo
+	// to (== SHA for back-compat).
+	FromSHA string `json:"from_sha,omitempty"`
+	ToSHA   string `json:"to_sha,omitempty"`
+
+	// AffectedNodeCount is the count of Nodes the delta either
+	// emitted (new / re-emitted under a new SHA) OR retired
+	// (tombstoned via the retirement service). Downstream
+	// schedulers use it to size their incremental work. Zero
+	// (omitted) on non-delta events.
+	AffectedNodeCount int `json:"affected_node_count,omitempty"`
 }
 
 // MarshalPayload renders the event to the JSON payload the

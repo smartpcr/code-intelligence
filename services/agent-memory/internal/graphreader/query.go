@@ -250,6 +250,44 @@ func selectEdgesFromQuery(srcNodeID string, kinds []string, includeRetired bool)
 	`, args
 }
 
+// selectEdgesToQuery is the inbound analogue of
+// selectEdgesFromQuery: pivots on `e.dst_node_id` so the
+// `agent.expand(direction='callers')` walker can pull the
+// edges whose destination is the supplied node. Shares the
+// edge-kind filter, retirement-aware projection, and stable
+// `kind, edge_id` ordering with the outbound query so a
+// future schema change to one half cannot silently drift the
+// other.
+//
+// Parameter shape: $1 = dst_node_id (text), $N = kinds
+// (text[]).
+func selectEdgesToQuery(dstNodeID string, kinds []string, includeRetired bool) (string, []any) {
+	args := []any{dstNodeID}
+	var kindClause string
+	if len(kinds) > 0 {
+		args = append(args, kinds)
+		kindClause = fmt.Sprintf(" AND e.kind::text = ANY($%d::text[])", len(args))
+	}
+	if includeRetired {
+		return `
+			SELECT ` + edgeProjectionWithRetirement + `
+			FROM edge e
+			LEFT JOIN edge_retirement er ON er.edge_id = e.edge_id
+			WHERE e.dst_node_id = $1` + kindClause + `
+			ORDER BY e.kind, e.edge_id
+		`, args
+	}
+	return `
+		SELECT ` + edgeProjectionCurrent + `
+		FROM edge e
+		WHERE e.dst_node_id = $1` + kindClause + `
+		AND NOT EXISTS (
+			SELECT 1 FROM edge_retirement er WHERE er.edge_id = e.edge_id
+		)
+		ORDER BY e.kind, e.edge_id
+	`, args
+}
+
 // selectNodesQuery returns the SQL + parameter slice for
 // ListNodes. Per-field filters compose into AND clauses; the
 // `kinds` slice expands into `ANY($N::text[])` matched against

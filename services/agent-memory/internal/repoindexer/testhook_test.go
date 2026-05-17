@@ -63,16 +63,46 @@ func (r *recordingEventPublisher) events() []Event {
 // worker integration tests. Records each EmitFile call so the
 // test can assert "one EmitFile per File Node" without depending
 // on a real parser.
+//
+// Stage 3.4 added EmitResult to the interface; the recording
+// emitter returns an empty EmitResult by default so existing
+// full-mode tests keep passing. Delta-mode tests that need a
+// non-empty TouchedNodes list inject a `Result` value here.
 type recordingASTEmitter struct {
 	mu    sync.Mutex
 	calls []EmitFileEvent
+	// Result is returned verbatim from every EmitFile call so
+	// delta-mode tests can stage what the dispatcher "touched"
+	// for the file. The zero value yields an empty TouchedNodes
+	// list which is what full-mode tests expect.
+	Result EmitResult
+	// ResultByPath optionally overrides Result per RelPath so a
+	// single emitter can simulate distinct TouchedNodes lists
+	// for distinct files in the same EmitFile sequence. The map
+	// is consulted before Result; on miss Result is used.
+	ResultByPath map[string]EmitResult
+	// EmitErr, when non-nil, is returned as the EmitFile error
+	// from the FIRST call only. Subsequent calls succeed with
+	// Result. Used by tests that want to assert "the worker
+	// surfaces EmitFile errors as job failures".
+	EmitErr error
 }
 
-func (r *recordingASTEmitter) EmitFile(_ context.Context, ev EmitFileEvent) error {
+func (r *recordingASTEmitter) EmitFile(_ context.Context, ev EmitFileEvent) (EmitResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, ev)
-	return nil
+	if r.EmitErr != nil {
+		err := r.EmitErr
+		r.EmitErr = nil
+		return EmitResult{}, err
+	}
+	if r.ResultByPath != nil {
+		if res, ok := r.ResultByPath[ev.RelPath]; ok {
+			return res, nil
+		}
+	}
+	return r.Result, nil
 }
 
 func (r *recordingASTEmitter) events() []EmitFileEvent {

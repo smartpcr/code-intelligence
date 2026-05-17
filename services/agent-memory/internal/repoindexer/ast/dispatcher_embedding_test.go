@@ -68,7 +68,7 @@ func TestDispatcher_EmbeddingPublisher_FiresForMethodsAndBlocks(t *testing.T) {
 	d := NewDispatcher(fw, WithEmbeddingPublisher(rp))
 
 	src := "class Foo { bar() { return 1; } baz() { if (true) { return 2; } } }"
-	if err := d.EmitFile(context.Background(), makeEvent("src/a.ts", src)); err != nil {
+	if _, err := d.EmitFile(context.Background(), makeEvent("src/a.ts", src)); err != nil {
 		t.Fatalf("EmitFile: %v", err)
 	}
 
@@ -129,7 +129,7 @@ func TestDispatcher_EmbeddingPublisher_PublishesAfterContainsEdge(t *testing.T) 
 	d := NewDispatcher(fw, WithEmbeddingPublisher(publisher))
 
 	src := "class Foo { bar() { return 1; } }"
-	if err := d.EmitFile(context.Background(), makeEvent("src/a.ts", src)); err != nil {
+	if _, err := d.EmitFile(context.Background(), makeEvent("src/a.ts", src)); err != nil {
 		t.Fatalf("EmitFile: %v", err)
 	}
 
@@ -180,7 +180,7 @@ func TestDispatcher_EmbeddingPublisher_RecordedFailedIsTolerated(t *testing.T) {
 		// dispatcher CONTINUED after the first method's
 		// recorded-failed publish.
 		src := "class Foo { bar() { return 1; } baz() { return 2; } }"
-		err := d.EmitFile(context.Background(), makeEvent("src/a.ts", src))
+		_, err := d.EmitFile(context.Background(), makeEvent("src/a.ts", src))
 		if err != nil {
 			t.Fatalf("EmitFile should swallow ErrPublishRecordedFailed; got %v", err)
 		}
@@ -198,7 +198,7 @@ func TestDispatcher_EmbeddingPublisher_RecordedFailedIsTolerated(t *testing.T) {
 		d := NewDispatcher(fw, WithEmbeddingPublisher(rp))
 
 		src := "class Foo { bar() { return 1; } baz() { return 2; } }"
-		err := d.EmitFile(context.Background(), makeEvent("src/a.ts", src))
+		_, err := d.EmitFile(context.Background(), makeEvent("src/a.ts", src))
 		if err == nil {
 			t.Fatalf("EmitFile should propagate non-recorded errors; got nil")
 		}
@@ -213,7 +213,7 @@ func TestDispatcher_EmbeddingPublisher_DefaultIsNoOp(t *testing.T) {
 	fw := newFakeWriter()
 	d := NewDispatcher(fw) // no WithEmbeddingPublisher
 	src := "class Foo { bar() { return 1; } }"
-	if err := d.EmitFile(context.Background(), makeEvent("src/a.ts", src)); err != nil {
+	if _, err := d.EmitFile(context.Background(), makeEvent("src/a.ts", src)); err != nil {
 		t.Fatalf("EmitFile (no publisher): %v", err)
 	}
 }

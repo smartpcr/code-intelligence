@@ -206,17 +206,28 @@ message RecallResponse {
   int32 filtered = 9;
 }
 
-// Placeholder request / response messages for the Observe
-// and Expand verbs. They are defined here so the gRPC server
-// can register a single service descriptor today; the body
-// shapes will firm up as Stages 5.2 / 5.3 land. The Stage 5.4
-// `Summarize{Request,Response}` + `Citation` messages below
-// are NOT placeholders — they carry the full Stage 5.4 wire
-// contract that `internal/agentapi/summarize.go` consumes.
-message ObserveRequest {
-  string context_id = 1;
-  string outcome = 2;
-  string actor = 3;
+// ObservationRef is the wire shape for a single
+// `observation_refs[]` entry on `ObserveRequest`. It mirrors
+// the `internal/agentapi/observe.go.ObservationRef` Go
+// contract that `grpc_server.go` converts to / from.
+//
+// Closed-set rules:
+//   - `role` MUST be one of {node_hit, edge_hit,
+//     call_edge_hit, concept_hit}. `degraded_recall_context`
+//     is server-only per C23 and is REJECTED on the wire.
+//   - Exactly one of {node_id, edge_id, concept_id} MUST be
+//     set, and it MUST match the role:
+//       * role=node_hit                       → node_id
+//       * role=edge_hit / call_edge_hit       → edge_id
+//       * role=concept_hit                    → concept_id
+//   - `weight` is the optional reward signal carried back
+//     onto the `Observation.weight` column; defaults to 0.
+message ObservationRef {
+  string role = 1;
+  string node_id = 2;
+  string edge_id = 3;
+  string concept_id = 4;
+  double weight = 5;
 }
 
 // ObserveRequest is the wire shape for `agent.observe`

@@ -330,6 +330,56 @@ func expandErrorToStatus(err error) error {
 	return status.Error(codes.Internal, fmt.Sprintf("agent.expand: %v", err))
 }
 
+// observeErrorToStatus maps domain errors from `Service.Observe`
+// onto gRPC status codes. Mirrors `recallErrorToStatus` /
+// `expandErrorToStatus` so a new sentinel does not silently
+// drop to `codes.Unknown`.
+//
+// Closed-set sentinels:
+//   - C15 (`ErrHumanCorrectedNotAllowed`) — caller tried to
+//     emit a reserved outcome; surface as InvalidArgument so
+//     the caller can replay with a permitted outcome.
+//   - C23 (`ErrDegradedRecallContextRoleForbidden`) —
+//     caller-supplied `observation_refs[*].role` is the
+//     server-only `degraded_recall_context` role; surface as
+//     InvalidArgument.
+//   - The role / target / outcome / required-field /
+//     payload-shape sentinels are likewise caller-correctable
+//     so they surface as InvalidArgument with the sentinel
+//     wrapped so `errors.Is` round-trips through the gRPC
+//     status message string.
+//   - `ErrContextNotFound` — the supplied `context_id` does
+//     not exist; surface as NotFound so the caller can drop
+//     the attachment and replay.
+//   - `ErrEpisodicLogUnavailable` — the episodic log writer
+//     is down; surface as Unavailable so the caller can
+//     retry with backoff. The handler's WAL path is the
+//     primary recovery surface (the verb still SUCCEEDS
+//     when a WAL is wired); this status is only reached
+//     when no WAL is wired and the log path hard-fails.
+//   - Anything else — `codes.Internal`.
+func observeErrorToStatus(err error) error {
+	switch {
+	case errors.Is(err, ErrHumanCorrectedNotAllowed),
+		errors.Is(err, ErrDegradedRecallContextRoleForbidden),
+		errors.Is(err, ErrInvalidObservationRole),
+		errors.Is(err, ErrInvalidObservationTarget),
+		errors.Is(err, ErrInvalidOutcome),
+		errors.Is(err, ErrMissingRepoID),
+		errors.Is(err, ErrMissingSessionID),
+		errors.Is(err, ErrMissingTraceID),
+		errors.Is(err, ErrMissingAction),
+		errors.Is(err, ErrMissingContextID),
+		errors.Is(err, ErrInvalidJSON):
+		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, ErrContextNotFound):
+		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, ErrEpisodicLogUnavailable):
+		return status.Error(codes.Unavailable, err.Error())
+	}
+	return status.Error(codes.Internal, fmt.Sprintf("agent.observe: %v", err))
+}
+
 // clampInt32 saturates `n` into the int32 range. Used for
 // the observability counters where a future repo with >2B
 // candidates is mathematically possible but operationally

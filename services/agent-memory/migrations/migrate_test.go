@@ -35,9 +35,12 @@ func TestAll_parsesEveryEmbeddedFile(t *testing.T) {
 		"0018",
 		// Stage 4.2 Span Ingestor: degraded-state + solo-method aggregate.
 		"0019", "0020",
+		// Stage 6.1 Consolidator iter-4: durable candidate-support staging
+		// for sub-threshold accumulation across ticks (see migration header).
+		"0021",
 	}
 	if len(all) != len(wantVersions) {
-		t.Fatalf("All() returned %d migrations, want %d (Stage 1.2 + 1.3 + 1.4 + 2.2 + 3.4 + 3.5 + 4.2 set)",
+		t.Fatalf("All() returned %d migrations, want %d (Stage 1.2 + 1.3 + 1.4 + 2.2 + 3.4 + 3.5 + 4.2 + 6.1 set)",
 			len(all), len(wantVersions))
 	}
 	for i, w := range wantVersions {
@@ -213,6 +216,8 @@ func TestAll_filenamesMatchPlannedSet(t *testing.T) {
 		// Stage 4.2 Span Ingestor cross-process backpressure + root-span aggregate.
 		"0019_repo_health.sql":              true,
 		"0020_method_solo_observation.sql":  true,
+		// Stage 6.1 Consolidator iter-4 durable candidate-support staging.
+		"0021_concept_candidate.sql": true,
 	}
 	all, err := All()
 	if err != nil {

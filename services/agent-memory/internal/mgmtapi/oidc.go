@@ -120,8 +120,15 @@ type OIDCVerifier struct {
 	// means a default client with a 10s timeout.
 	HTTPClient *http.Client
 
-	// Clock is the time source used for exp / nbf
-	// validation. nil means time.Now.
+	// Clock is the time source for ALL time-dependent
+	// verifier decisions: exp / nbf claim validation, JWKS
+	// cache TTL freshness, and the unknown-kid refresh
+	// floor. nil means time.Now. Tests that need
+	// deterministic behaviour around cache expiry or token
+	// expiration set this to a controlled clock; all three
+	// subsystems then observe the same notion of "now",
+	// preventing split-clock skew between token validation
+	// and cache freshness.
 	Clock func() time.Time
 
 	// Leeway is the tolerance for clock skew when checking
@@ -315,11 +322,7 @@ func (v *OIDCVerifier) Verify(ctx context.Context, raw string) (string, error) {
 		return "", fmt.Errorf("%w: payload json: %v", ErrTokenInvalid, err)
 	}
 
-	clk := v.Clock
-	if clk == nil {
-		clk = time.Now
-	}
-	now := clk()
+	now := v.now()
 
 	if claims.Iss == "" || claims.Iss != v.Issuer {
 		return "", fmt.Errorf("%w: iss %q does not match expected issuer", ErrTokenInvalid, claims.Iss)
@@ -450,8 +453,12 @@ func (v *OIDCVerifier) lookupKey(ctx context.Context, kid string) (*rsa.PublicKe
 	// Throttle: if we refreshed very recently and the kid
 	// still isn't there, treat as an invalid token rather
 	// than retry the network. This is the negative-cache
-	// guard against random-kid traffic.
-	if !v.fetchedAt.IsZero() && time.Since(v.fetchedAt) < v.refreshFloor() {
+	// guard against random-kid traffic. We compare against
+	// the `fetched` snapshot captured above under v.mu (not
+	// a fresh read of v.fetchedAt) so the throttle decision
+	// stays consistent with the cache-freshness re-check
+	// and avoids an unlocked field read.
+	if !fetched.IsZero() && v.now().Sub(fetched) < v.refreshFloor() {
 		if ok {
 			return key, nil
 		}
@@ -470,8 +477,27 @@ func (v *OIDCVerifier) lookupKey(ctx context.Context, kid string) (*rsa.PublicKe
 	return key, nil
 }
 
+// now returns the verifier's notion of the current time. It
+// honours v.Clock when set, otherwise falls back to time.Now.
+// Centralising this fallback ensures every time-dependent
+// decision in the verifier (token exp / nbf, JWKS cache TTL,
+// unknown-kid refresh floor) observes a single, consistent
+// clock — tests with a frozen v.Clock can therefore exercise
+// cache-expiry behaviour deterministically, and any deployment
+// where v.Clock diverges from wall time (clock-skew tests,
+// fault injection) keeps token validation and cache freshness
+// in agreement.
+func (v *OIDCVerifier) now() time.Time {
+	if v.Clock != nil {
+		return v.Clock()
+	}
+	return time.Now()
+}
+
 // cacheFresh reports whether a JWKS document fetched at
-// `fetched` is still within the cache TTL window.
+// `fetched` is still within the cache TTL window. Uses
+// v.now() so a custom v.Clock controls cache expiry as well
+// as token claim validation.
 func (v *OIDCVerifier) cacheFresh(fetched time.Time) bool {
 	if fetched.IsZero() {
 		return false
@@ -480,7 +506,7 @@ func (v *OIDCVerifier) cacheFresh(fetched time.Time) bool {
 	if ttl <= 0 {
 		ttl = DefaultJWKSCacheTTL
 	}
-	return time.Since(fetched) < ttl
+	return v.now().Sub(fetched) < ttl
 }
 
 // refreshFloor returns the minimum interval between two
@@ -547,7 +573,7 @@ func (v *OIDCVerifier) refreshJWKS(ctx context.Context) error {
 	if len(keys) == 0 {
 		return fmt.Errorf("%w: jwks contained no usable RSA signing keys", ErrVerifierUnavailable)
 	}
-	now := time.Now()
+	now := v.now()
 	v.mu.Lock()
 	v.keys = keys
 	v.fetchedAt = now

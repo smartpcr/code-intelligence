@@ -1011,16 +1011,33 @@ func defaultSecretGen() (string, error) {
 // handleResolverError maps a HeadResolver-returned error onto
 // the matching response. Centralised so the register and
 // ingest verbs apply identical classification rules.
+//
+// Callers MUST check `err != nil` before delegating here.
+// Reaching this function with a nil err is a programmer
+// error — not an upstream outage — so we log at ERROR (so
+// the bug is loud in observability) and respond 500
+// `internal_error` rather than masking the bug as a 502
+// `head_resolver_unavailable`. Surfacing the bug as a 502
+// would (a) blame the resolver for our own bad routing, and
+// (b) leave the structured log carrying `error="<nil>"`,
+// which is useless for triage.
 func (h *Handler) handleResolverError(w http.ResponseWriter, r *http.Request, op, repoURL string, err error) {
+	if err == nil {
+		h.logger.Error("mgmtapi."+op+".resolver_nil_error",
+			slog.String("op", op),
+			slog.String("repo_url", repoURL),
+			slog.String("path", r.URL.Path),
+			slog.String("bug", "handleResolverError called with nil err; caller routed a non-error path into the error sink"),
+		)
+		writeJSONError(w, http.StatusInternalServerError, "internal_error",
+			"internal error")
+		return
+	}
 	switch {
 	case errors.Is(err, ErrHeadResolverUnknownRef):
 		writeJSONError(w, http.StatusBadRequest, "unknown_ref",
 			"default branch was not found on the remote")
-	case errors.Is(err, ErrHeadResolverUnavailable), err == nil:
-		// `err == nil` here is a defence-in-depth fallback
-		// — if a caller routes a non-error path into this
-		// function we still produce a 502 so the operator
-		// has a sensible signal.
+	case errors.Is(err, ErrHeadResolverUnavailable):
 		writeJSONError(w, http.StatusBadGateway, "head_resolver_unavailable",
 			"head resolver is unavailable; retry shortly")
 	default:
@@ -1031,19 +1048,8 @@ func (h *Handler) handleResolverError(w http.ResponseWriter, r *http.Request, op
 		slog.String("op", op),
 		slog.String("repo_url", repoURL),
 		slog.String("path", r.URL.Path),
-		slog.String("error", errToString(err)),
+		slog.String("error", err.Error()),
 	)
-}
-
-// errToString safely renders an error for structured logging.
-// Returns the literal `"<nil>"` for a nil error so a stray
-// log line that includes the error attribute regardless of
-// nilness still produces a parseable record.
-func errToString(err error) string {
-	if err == nil {
-		return "<nil>"
-	}
-	return err.Error()
 }
 
 // isInvalidUUIDError matches the PostgreSQL SQLSTATE 22P02

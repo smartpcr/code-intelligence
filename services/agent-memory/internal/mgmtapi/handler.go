@@ -760,9 +760,37 @@ func (h *Handler) handleIngestDelta(w http.ResponseWriter, r *http.Request, rawR
 		return
 	}
 
+	// Verify the repo exists BEFORE the INSERT so an unknown
+	// id returns a clean 404 driven by sql.ErrNoRows rather
+	// than relying on isForeignKeyViolation's substring
+	// match against the driver's FK-violation message — that
+	// string-match is fragile across pq / pgx versions and a
+	// formatting change would silently downgrade a 404 to a
+	// 500. The post-INSERT FK check below is retained as
+	// defence-in-depth for the (vanishingly unlikely) repo-
+	// deleted-between-loadRepo-and-INSERT race, mirroring the
+	// handleIngest pattern.
+	if _, _, _, err := h.loadRepo(ctx, rawRepoID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSONError(w, http.StatusNotFound, "repo_not_found",
+				"no repo with the supplied repo_id")
+			return
+		}
+		h.logger.Error("mgmtapi.ingest_delta.load_repo_failed",
+			slog.String("op", "ingest_delta"),
+			slog.String("repo_id", rawRepoID),
+			slog.String("error", err.Error()),
+		)
+		writeJSONError(w, http.StatusInternalServerError, "internal_error", "internal error")
+		return
+	}
+
 	resp, err := h.executeIngestDelta(ctx, rawRepoID, from, to)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) || isForeignKeyViolation(err) {
+			// Repo was deleted between loadRepo and the
+			// INSERT (unlikely but possible). Surface 404
+			// instead of 500.
 			writeJSONError(w, http.StatusNotFound, "repo_not_found",
 				"no repo with the supplied repo_id")
 			return

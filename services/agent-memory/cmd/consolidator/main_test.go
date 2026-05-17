@@ -298,7 +298,7 @@ func TestWriteMetrics_zeroState(t *testing.T) {
 	writeMetrics(rec, m)
 	body := rec.Body.String()
 
-	// All six counters render with zero value.
+	// All counters render with zero value.
 	for _, name := range []string{
 		consolidator.MetricConsolidatorRunsTotal,
 		consolidator.MetricConsolidatorErrorsTotal,
@@ -306,6 +306,8 @@ func TestWriteMetrics_zeroState(t *testing.T) {
 		consolidator.MetricConsolidatorConceptsCreatedTotal,
 		consolidator.MetricConsolidatorVersionsAppendedTotal,
 		consolidator.MetricConsolidatorSupportsAppendedTotal,
+		consolidator.MetricConsolidatorSyntheticPositivesCreatedTotal,
+		consolidator.MetricConsolidatorSyntheticObservationsMirroredTotal,
 	} {
 		requireExposition(t, body, name, "counter")
 		if v := parseMetric(t, body, name); v != "0" {
@@ -333,6 +335,8 @@ func TestWriteMetrics_seededCountersRender(t *testing.T) {
 	m.AddConceptsCreated(2)
 	m.AddVersionsAppended(5)
 	m.AddSupportsAppended(11)
+	m.AddSyntheticPositivesCreated(7)
+	m.AddSyntheticObservationsMirrored(13)
 	m.SetEpisodeLag(2500 * time.Millisecond)
 
 	rec := httptest.NewRecorder()
@@ -340,12 +344,14 @@ func TestWriteMetrics_seededCountersRender(t *testing.T) {
 	body := rec.Body.String()
 
 	want := map[string]string{
-		consolidator.MetricConsolidatorRunsTotal:             "3",
-		consolidator.MetricConsolidatorErrorsTotal:           "1",
-		consolidator.MetricConsolidatorEpisodesScannedTotal:  "17",
-		consolidator.MetricConsolidatorConceptsCreatedTotal:  "2",
-		consolidator.MetricConsolidatorVersionsAppendedTotal: "5",
-		consolidator.MetricConsolidatorSupportsAppendedTotal: "11",
+		consolidator.MetricConsolidatorRunsTotal:                          "3",
+		consolidator.MetricConsolidatorErrorsTotal:                        "1",
+		consolidator.MetricConsolidatorEpisodesScannedTotal:               "17",
+		consolidator.MetricConsolidatorConceptsCreatedTotal:               "2",
+		consolidator.MetricConsolidatorVersionsAppendedTotal:              "5",
+		consolidator.MetricConsolidatorSupportsAppendedTotal:              "11",
+		consolidator.MetricConsolidatorSyntheticPositivesCreatedTotal:     "7",
+		consolidator.MetricConsolidatorSyntheticObservationsMirroredTotal: "13",
 		// "%g" formatting on 2.5 prints as "2.5"; this guards
 		// against a regression that switched the gauge to e.g.
 		// integer formatting or millisecond units.

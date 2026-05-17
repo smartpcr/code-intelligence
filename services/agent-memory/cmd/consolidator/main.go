@@ -391,12 +391,14 @@ func openPG(ctx context.Context, cfg config, logger *slog.Logger) (*sql.DB, erro
 func writeMetrics(w http.ResponseWriter, m *consolidator.Metrics) {
 	snap := m.Snapshot()
 	helps := map[string]string{
-		consolidator.MetricConsolidatorRunsTotal:             "Consolidator Tick invocations since binary start (success or failure).",
-		consolidator.MetricConsolidatorErrorsTotal:           "Consolidator Tick invocations that surfaced a non-nil error since binary start.",
-		consolidator.MetricConsolidatorEpisodesScannedTotal:  "Episode rows the Consolidator has cumulatively scanned across all ticks.",
-		consolidator.MetricConsolidatorConceptsCreatedTotal:  "Concept rows the Consolidator has INSERTed (first-time crystallisations).",
-		consolidator.MetricConsolidatorVersionsAppendedTotal: "ConceptVersion rows the Consolidator has appended across all ticks.",
-		consolidator.MetricConsolidatorSupportsAppendedTotal: "concept_support rows the Consolidator has appended across all ticks.",
+		consolidator.MetricConsolidatorRunsTotal:                          "Consolidator Tick invocations since binary start (success or failure).",
+		consolidator.MetricConsolidatorErrorsTotal:                        "Consolidator Tick invocations that surfaced a non-nil error since binary start.",
+		consolidator.MetricConsolidatorEpisodesScannedTotal:               "Episode rows the Consolidator has cumulatively scanned across all ticks.",
+		consolidator.MetricConsolidatorConceptsCreatedTotal:               "Concept rows the Consolidator has INSERTed (first-time crystallisations).",
+		consolidator.MetricConsolidatorVersionsAppendedTotal:              "ConceptVersion rows the Consolidator has appended across all ticks.",
+		consolidator.MetricConsolidatorSupportsAppendedTotal:              "concept_support rows the Consolidator has appended across all ticks.",
+		consolidator.MetricConsolidatorSyntheticPositivesCreatedTotal:     "synthetic_positive Episodes the Consolidator has emitted across all ticks (Stage 6.3 operator-correction auto-promotion / architecture §7.7 step 4). Bumped per successful INSERT only -- no-op candidates filtered by the WHERE NOT EXISTS gate do not increment.",
+		consolidator.MetricConsolidatorSyntheticObservationsMirroredTotal: "observation rows the Consolidator has copied from agent parent Episodes onto their synthetic_positive child Episodes across all ticks (Stage 6.3).",
 	}
 	// Stable iteration order so a scrape-vs-scrape diff is
 	// deterministic.
@@ -407,6 +409,8 @@ func writeMetrics(w http.ResponseWriter, m *consolidator.Metrics) {
 		consolidator.MetricConsolidatorConceptsCreatedTotal,
 		consolidator.MetricConsolidatorVersionsAppendedTotal,
 		consolidator.MetricConsolidatorSupportsAppendedTotal,
+		consolidator.MetricConsolidatorSyntheticPositivesCreatedTotal,
+		consolidator.MetricConsolidatorSyntheticObservationsMirroredTotal,
 	}
 	for _, name := range counterOrder {
 		_, _ = fmt.Fprintf(w, "# HELP %s %s\n", name, helps[name])

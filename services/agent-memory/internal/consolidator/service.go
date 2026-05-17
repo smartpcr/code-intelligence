@@ -283,6 +283,29 @@ type TickResult struct {
 	// enumeration of terminal statuses (StatusDone,
 	// StatusLockSkipped, StatusFailed).
 	LockSkipped bool
+
+	// SyntheticPositivesCreated is the count of
+	// `kind='synthetic_positive'` Episode rows this tick
+	// INSERTed under the Stage 6.3 operator-correction auto-
+	// promotion flow (architecture §7.7 step 4). One per
+	// parent agent Episode that gained a `human_corrected`
+	// EpisodeUpdate plus a feedback Episode carrying
+	// `corrected_action` since the parent's last
+	// synthetic_positive (or since forever, if none exists).
+	// Candidates filtered by the WHERE NOT EXISTS gate (race
+	// with a sibling replica that beat us to the insert) do
+	// NOT count -- this number measures REAL work done by
+	// this tick.
+	SyntheticPositivesCreated uint64
+
+	// SyntheticObservationsMirrored is the count of
+	// `observation` rows this tick copied from agent parent
+	// Episodes onto their synthetic_positive child Episodes
+	// (Stage 6.3 / architecture §7.7 step 4 / C17). One per
+	// mirrored row; the per-synth fan-out for this tick is
+	// recoverable as
+	// `SyntheticObservationsMirrored / SyntheticPositivesCreated`.
+	SyntheticObservationsMirrored uint64
 }
 
 // tickSnapshot captures the in-flight tick's mutable state so
@@ -290,15 +313,17 @@ type TickResult struct {
 // every field is meaningful only at the point where it is
 // inspected on the return path.
 type tickSnapshot struct {
-	priorMarkID        string
-	priorMarkCreatedAt time.Time
-	newMarkID          string
-	newMarkCreatedAt   time.Time
-	lockSkipped        bool
-	scanned            uint64
-	conceptsCreated    uint64
-	versionsAppended   uint64
-	supportsAppended   uint64
+	priorMarkID                   string
+	priorMarkCreatedAt            time.Time
+	newMarkID                     string
+	newMarkCreatedAt              time.Time
+	lockSkipped                   bool
+	scanned                       uint64
+	conceptsCreated               uint64
+	versionsAppended              uint64
+	supportsAppended              uint64
+	syntheticPositivesCreated     uint64
+	syntheticObservationsMirrored uint64
 }
 
 // Tick runs ONE consolidation pass. The lifecycle is:
@@ -430,7 +455,11 @@ func (s *Service) Tick(ctx context.Context) (TickResult, error) {
 	result.ConceptsCreated = snap.conceptsCreated
 	result.VersionsAppended = snap.versionsAppended
 	result.SupportsAppended = snap.supportsAppended
+	result.SyntheticPositivesCreated = snap.syntheticPositivesCreated
+	result.SyntheticObservationsMirrored = snap.syntheticObservationsMirrored
 	s.metrics.AddEpisodesScanned(snap.scanned)
+	s.metrics.AddSyntheticPositivesCreated(snap.syntheticPositivesCreated)
+	s.metrics.AddSyntheticObservationsMirrored(snap.syntheticObservationsMirrored)
 
 	// Step 6: finalize the run row.
 	//
@@ -497,7 +526,9 @@ func (s *Service) Tick(ctx context.Context) (TickResult, error) {
 		slog.Uint64("episodes_scanned", snap.scanned),
 		slog.Uint64("concepts_created", snap.conceptsCreated),
 		slog.Uint64("versions_appended", snap.versionsAppended),
-		slog.Uint64("supports_appended", snap.supportsAppended))
+		slog.Uint64("supports_appended", snap.supportsAppended),
+		slog.Uint64("synthetic_positives_created", snap.syntheticPositivesCreated),
+		slog.Uint64("synthetic_observations_mirrored", snap.syntheticObservationsMirrored))
 
 	return result, nil
 }
@@ -554,6 +585,42 @@ func (s *Service) runEmissionPhase(ctx context.Context, runID string, snap *tick
 	snap.conceptsCreated = conceptsCreated
 	snap.versionsAppended = versionsAppended
 	snap.supportsAppended = supportsAppended
+
+	// Stage 6.3 operator-correction auto-promotion. Runs
+	// BEFORE the deferred advisory-unlock fires (defers are
+	// LIFO; the `_ = conn.Close()` defer is registered
+	// FIRST so it runs LAST -- meaning conn + lock are both
+	// live here). Scoping inside runEmissionPhase keeps the
+	// per-tick scope under the cluster-wide advisory lock so
+	// two replicas cannot race the WHERE-NOT-EXISTS gate.
+	//
+	// Failure handling: synth-phase errors PROPAGATE OUT of
+	// runEmissionPhase so the surrounding Tick finalises
+	// status='failed' instead of 'done'. priorHighWater
+	// filters status='done' only, so a failed synth phase
+	// leaves the prior cursor in place and the next Tick
+	// re-scans the EpisodeUpdate window (the
+	// `latest_eu.created_at > $priorMarkCreatedAt` predicate
+	// in scanSyntheticCandidates would otherwise skip the
+	// unprocessed EU forever once the cursor advanced past
+	// it -- see service.go scanSyntheticCandidates doc and
+	// doc.go "Why aborting on synth-phase failure" for the
+	// long-form rationale). processOnce's concept-promotion
+	// writes are committed by promoteWithDedup before we get
+	// here and are idempotent on re-scan (the dedup ledger in
+	// promoteWithDedup skips already-promoted candidate
+	// rows), so the redundant re-scan cost on the next tick
+	// is bounded and benign.
+	syntheticPositivesCreated, syntheticObservationsMirrored, synthErr :=
+		s.emitSyntheticPositives(ctx, conn, runID, snap)
+	snap.syntheticPositivesCreated = syntheticPositivesCreated
+	snap.syntheticObservationsMirrored = syntheticObservationsMirrored
+	if synthErr != nil {
+		s.logger.Warn("consolidator.synthetic_positive.failed",
+			slog.String("run_id", runID),
+			slog.String("error", synthErr.Error()))
+		return fmt.Errorf("emit synthetic positives: %w", synthErr)
+	}
 	return nil
 }
 
@@ -1027,6 +1094,423 @@ func (s *Service) processOnce(
 	return newMarkID, newMarkCreatedAt, scanned, conceptsCreated, versionsAppended, supportsAppended, nil
 }
 
+// syntheticCandidate is one parent agent Episode that earned a
+// synthetic_positive Episode this tick. Populated by
+// scanSyntheticCandidates (one row per parent.episode_id).
+type syntheticCandidate struct {
+	parentEpisodeID      string
+	parentEpisodeGroupID string
+	parentRepoID         string
+	parentSessionID      string
+	parentTraceID        string
+	parentContextID      string
+	feedbackEpisodeID    string
+	correctedActionJSON  []byte
+}
+
+// emitSyntheticPositives is the Stage 6.3 operator-correction
+// auto-promotion phase. For each parent agent Episode that
+// recently received an EpisodeUpdate(new_outcome='human_corrected')
+// and now has a feedback Episode carrying `corrected_action`,
+// it emits exactly one `kind='synthetic_positive'` Episode that
+// copies the parent's `context_id`, replaces the parent's
+// `action` with the operator's `corrected_action`, sets
+// `outcome='success'` (positive polarity per architecture
+// §5.3.1 / §7.7 step 4), and mirrors the parent's Observation
+// rows onto the synth via INSERT...SELECT.
+//
+// Idempotency layers (defence in depth)
+// -------------------------------------
+//  1. NOT EXISTS gate in the candidate query: parents that
+//     already have a synthetic_positive child are filtered out
+//     before any INSERT is attempted.
+//  2. WHERE NOT EXISTS inside each per-candidate INSERT: a
+//     concurrent sibling (theoretically impossible under the
+//     advisory lock, but kept as defence in depth) that beat
+//     us to the insert causes RETURNING to yield zero rows;
+//     the observation mirror is then skipped.
+//  3. Partial UNIQUE index from migration 0013 on
+//     (synthesized_from_feedback_episode_id, created_at) WHERE
+//     kind='synthetic_positive': a same-tick race that bypasses
+//     layers 1+2 (e.g. transaction-snapshot trick) raises
+//     SQLSTATE 23505, which we log and skip.
+//
+// created_at floor
+// ----------------
+// The synth's `created_at` is `GREATEST(clock_timestamp(),
+// max(newMark, priorMark) + 1µs)`. Without the floor, a synth
+// inserted at the same millisecond as the tick's new high-
+// water mark could tie under the `(created_at, episode_id) >
+// cursor` predicate the next tick uses for its delta scan,
+// causing the synth to be skipped from the support
+// crystallisation flow. The +1µs guarantees strict
+// monotonicity even on coarse-clock platforms.
+//
+// Lock scope
+// ----------
+// Runs on the pinned `*sql.Conn` from runEmissionPhase, so the
+// session-level advisory lock acquired at the top of that
+// function serialises this work across replicas. Per-candidate
+// transactions BEGIN/COMMIT on `conn` and therefore inherit
+// the same session-level lock.
+//
+// Error handling
+// --------------
+// Returns the counts that DID succeed plus the first error
+// encountered. The caller (runEmissionPhase) PROPAGATES the
+// error up to Tick, which finalises the run as status='failed'.
+// priorHighWater() filters status='done' only, so a failed
+// synth phase leaves the prior cursor in place and the next
+// tick's `eu_changes` CTE re-scans the un-promoted EUs. This
+// is what makes the shared Episode cursor a safe
+// "since last run" proxy for the EU window — see doc.go
+// "Why aborting on synth-phase failure is safe".
+func (s *Service) emitSyntheticPositives(
+	ctx context.Context,
+	conn *sql.Conn,
+	runID string,
+	snap *tickSnapshot,
+) (created uint64, mirrored uint64, err error) {
+	candidates, err := s.scanSyntheticCandidates(ctx, conn, snap.priorMarkCreatedAt)
+	if err != nil {
+		return 0, 0, fmt.Errorf("scan candidates: %w", err)
+	}
+	if len(candidates) == 0 {
+		return 0, 0, nil
+	}
+
+	// Floor for synth.created_at so the next tick's delta
+	// scan picks the synth up (see function header).
+	var floor sql.NullTime
+	if !snap.newMarkCreatedAt.IsZero() {
+		floor = sql.NullTime{Time: snap.newMarkCreatedAt, Valid: true}
+	}
+	if !snap.priorMarkCreatedAt.IsZero() && (!floor.Valid || snap.priorMarkCreatedAt.After(floor.Time)) {
+		floor = sql.NullTime{Time: snap.priorMarkCreatedAt, Valid: true}
+	}
+
+	for _, cand := range candidates {
+		c, m, perr := s.insertSyntheticPositiveAndMirror(ctx, conn, runID, cand, floor)
+		if perr != nil {
+			// Return WHAT WAS DONE plus the first error so
+			// the caller can record partial progress on
+			// metrics. Stopping on first error matches the
+			// emitGroup convention -- subsequent candidates
+			// are likely to hit the same DB-level issue.
+			return created, mirrored, fmt.Errorf("emit synthetic_positive for parent %s: %w", cand.parentEpisodeID, perr)
+		}
+		created += c
+		mirrored += m
+	}
+	return created, mirrored, nil
+}
+
+// scanSyntheticCandidates returns the parent agent Episodes
+// eligible for synthetic_positive promotion this tick.
+//
+// EU-driven query
+// ---------------
+// The query DRIVES from `episode_update` (the `eu_changes`
+// CTE), not from `episode parent`. This honours the
+// implementation-plan §6.3 spec text "scan EpisodeUpdate rows
+// since the last run for new_outcome='human_corrected'": the
+// outermost relation IS the EpisodeUpdate stream, restricted
+// by the cursor predicate, and parent + feedback + latest-EU
+// lookups hang off it via JOIN. This shape also gives the
+// planner a chance to prune `episode_update` partitions by the
+// `created_at > $cursor` predicate at the leaves.
+//
+// "Since-last-run" semantics + failure recovery
+// ----------------------------------------------
+// priorMarkCreatedAt is the prior 'done' ConsolidatorRun's
+// `episode_high_water_mark.created_at` (the same cursor
+// processOnce uses for its Episode delta scan). The
+// `eu.created_at > $1` filter inside `eu_changes` bounds the
+// EU scan to rows newly visible since the last successful
+// tick. A NULL cursor (brand-new cluster, no prior 'done' run)
+// degenerates to TRUE so the first tick scans every EU.
+//
+// Critically, the SYNTH PHASE ABORTS THE TICK on error (see
+// `runEmissionPhase` doc-block) — finalizeRun then writes
+// status='failed' and priorHighWater() (filters status='done')
+// returns the PREVIOUS 'done' mark on the next tick, so the
+// EU cursor effectively does NOT advance until a tick
+// successfully emits all eligible synths. That ROLLBACK-ON-
+// FAILURE is what makes the shared Episode cursor a safe
+// "since last run" proxy for the EU window: any EU left
+// unprocessed by a failed synth phase is re-scanned by the
+// next tick's CTE (the cursor stays put).
+//
+// Latest-EU-state semantics
+// -------------------------
+// Inside the candidate row, the `latest_eu` LATERAL pick reads
+// the GLOBAL latest EU per parent (ORDER BY created_at DESC,
+// update_id DESC LIMIT 1) — not the latest within the cursor
+// window — because the architecturally meaningful "current
+// status" of a parent is its latest EU's new_outcome regardless
+// of when that EU was filed. A parent whose latest EU within
+// the cursor window is 'human_corrected' but whose GLOBAL
+// latest EU was later flipped to 'success' MUST NOT be
+// promoted; the global latest-EU pick enforces that
+// invariant.
+//
+// Other filters
+// -------------
+//   - `parent.kind = 'agent'`: the architecture allows synth
+//     promotion only from agent Episodes (feedback / synth
+//     parents are excluded by spec).
+//   - `parent.context_id IS NOT NULL`: the synth MUST carry a
+//     context_id (episode_context_id_required_unless_feedback_chk).
+//   - LATERAL pick of the LATEST feedback Episode (by created_at
+//     DESC, episode_id DESC tiebreak) with `corrected_action
+//     IS NOT NULL`: if the operator filed multiple corrections,
+//     the most recent one wins. We require corrected_action to
+//     be non-null so the synth's `action` JSONB is well-formed.
+//   - `NOT EXISTS (synthetic_positive on parent)`: idempotency
+//     gate. Even with the cursor filter, this catches the
+//     edge case where a prior tick happened to commit a synth
+//     concurrently (e.g. a sibling replica that beat us to
+//     the advisory lock between our cursor read and our
+//     INSERT).
+//
+// Ordering
+// --------
+// ORDER BY parent.created_at, parent.episode_id keeps emission
+// order deterministic so test diff output and operator log
+// scraping are stable.
+func (s *Service) scanSyntheticCandidates(
+	ctx context.Context,
+	conn *sql.Conn,
+	priorMarkCreatedAt time.Time,
+) ([]syntheticCandidate, error) {
+	var cursor sql.NullTime
+	if !priorMarkCreatedAt.IsZero() {
+		cursor = sql.NullTime{Time: priorMarkCreatedAt, Valid: true}
+	}
+	rows, err := conn.QueryContext(ctx, `
+		WITH eu_changes AS (
+		    SELECT DISTINCT eu.episode_id
+		      FROM episode_update eu
+		     WHERE ($1::timestamptz IS NULL OR eu.created_at > $1::timestamptz)
+		)
+		SELECT parent.episode_id::text,
+		       parent.episode_group_id::text,
+		       parent.repo_id::text,
+		       parent.session_id,
+		       parent.trace_id,
+		       parent.context_id::text,
+		       feedback.episode_id::text,
+		       feedback.corrected_action
+		  FROM eu_changes
+		  JOIN episode parent ON parent.episode_id = eu_changes.episode_id
+		  JOIN LATERAL (
+		      SELECT eu.new_outcome,
+		             eu.created_at
+		        FROM episode_update eu
+		       WHERE eu.episode_id = parent.episode_id
+		       ORDER BY eu.created_at DESC, eu.update_id DESC
+		       LIMIT 1
+		  ) latest_eu ON TRUE
+		  JOIN LATERAL (
+		      SELECT f.episode_id,
+		             f.corrected_action,
+		             f.created_at
+		        FROM episode f
+		       WHERE f.kind = 'feedback'::episode_kind
+		         AND f.parent_episode_id = parent.episode_id
+		         AND f.corrected_action IS NOT NULL
+		       ORDER BY f.created_at DESC, f.episode_id DESC
+		       LIMIT 1
+		  ) feedback ON TRUE
+		 WHERE parent.kind = 'agent'::episode_kind
+		   AND parent.context_id IS NOT NULL
+		   AND latest_eu.new_outcome = 'human_corrected'::outcome
+		   AND NOT EXISTS (
+		       SELECT 1 FROM episode synth
+		        WHERE synth.kind = 'synthetic_positive'::episode_kind
+		          AND synth.synthesized_from_parent_episode_id = parent.episode_id
+		   )
+		 ORDER BY parent.created_at, parent.episode_id
+	`, cursor)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []syntheticCandidate
+	for rows.Next() {
+		var c syntheticCandidate
+		if err := rows.Scan(
+			&c.parentEpisodeID,
+			&c.parentEpisodeGroupID,
+			&c.parentRepoID,
+			&c.parentSessionID,
+			&c.parentTraceID,
+			&c.parentContextID,
+			&c.feedbackEpisodeID,
+			&c.correctedActionJSON,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// insertSyntheticPositiveAndMirror runs the per-candidate
+// transaction: INSERT the synth Episode (with WHERE NOT EXISTS
+// gate), then INSERT the parent's Observation rows onto the
+// synth. Returns (1, mirroredCount, nil) on success,
+// (0, 0, nil) on no-op (race lost or already exists at INSERT
+// time), or (0, 0, err) on a DB error other than SQLSTATE
+// 23505 (which we treat as a successful no-op for the partial
+// UNIQUE belt-and-suspenders gate from migration 0013).
+//
+// Transaction scope
+// -----------------
+// The synth INSERT and observation mirror are wrapped in the
+// SAME transaction so the schema-level invariant "every
+// synth has the parent's observation set" is preserved even
+// if the mirror fails mid-stream. A partial-mirror commit
+// would otherwise leave an "orphan" synth observable in
+// concept_support pipelines without its supporting
+// observation rows.
+func (s *Service) insertSyntheticPositiveAndMirror(
+	ctx context.Context,
+	conn *sql.Conn,
+	runID string,
+	cand syntheticCandidate,
+	floor sql.NullTime,
+) (created uint64, mirrored uint64, err error) {
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// INSERT...SELECT...WHERE NOT EXISTS yields zero rows
+	// when a concurrent insert already created the synth.
+	// RETURNING captures the synth's episode_id + created_at
+	// so we know whether to mirror observations (skip on
+	// zero RETURNING rows).
+	var synthEpisodeID string
+	var synthCreatedAt time.Time
+	rowErr := tx.QueryRowContext(ctx, `
+		INSERT INTO episode (
+		    episode_group_id, repo_id, session_id, trace_id, kind,
+		    synthesized_from_parent_episode_id,
+		    synthesized_from_feedback_episode_id,
+		    context_id, action, outcome, created_at
+		)
+		SELECT $1::uuid, $2::uuid, $3, $4, 'synthetic_positive'::episode_kind,
+		       $5::uuid, $6::uuid, $7::uuid, $8::jsonb, 'success'::outcome,
+		       GREATEST(
+		           clock_timestamp(),
+		           COALESCE($9::timestamptz + interval '1 microsecond', '-infinity'::timestamptz)
+		       )
+		 WHERE NOT EXISTS (
+		     SELECT 1 FROM episode synth
+		      WHERE synth.kind = 'synthetic_positive'::episode_kind
+		        AND synth.synthesized_from_parent_episode_id = $5::uuid
+		 )
+		 RETURNING episode_id::text, created_at
+	`,
+		cand.parentEpisodeGroupID,
+		cand.parentRepoID,
+		cand.parentSessionID,
+		cand.parentTraceID,
+		cand.parentEpisodeID,
+		cand.feedbackEpisodeID,
+		cand.parentContextID,
+		cand.correctedActionJSON,
+		floor,
+	).Scan(&synthEpisodeID, &synthCreatedAt)
+	if rowErr != nil {
+		if errors.Is(rowErr, sql.ErrNoRows) {
+			// Race lost (or a manual seed slipped in between
+			// our candidate scan and this insert). Commit
+			// the empty tx and report no work done.
+			if cerr := tx.Commit(); cerr != nil {
+				err = fmt.Errorf("commit empty tx: %w", cerr)
+				return 0, 0, err
+			}
+			s.logger.Info("consolidator.synthetic_positive.skipped_existing",
+				slog.String("run_id", runID),
+				slog.String("parent_episode_id", cand.parentEpisodeID),
+				slog.String("feedback_episode_id", cand.feedbackEpisodeID))
+			return 0, 0, nil
+		}
+		var pqErr *pq.Error
+		if errors.As(rowErr, &pqErr) && pqErr.Code == "23505" {
+			// Partial UNIQUE from migration 0013 fired --
+			// same-tick race on (synthesized_from_feedback_
+			// episode_id, created_at). Treat as a no-op
+			// equivalent to the WHERE-NOT-EXISTS skip
+			// above.
+			if cerr := tx.Rollback(); cerr != nil {
+				s.logger.Warn("consolidator.synthetic_positive.rollback_failed",
+					slog.String("run_id", runID),
+					slog.String("error", cerr.Error()))
+			}
+			s.logger.Info("consolidator.synthetic_positive.skipped_unique",
+				slog.String("run_id", runID),
+				slog.String("parent_episode_id", cand.parentEpisodeID),
+				slog.String("feedback_episode_id", cand.feedbackEpisodeID))
+			// Reset err so the deferred rollback (which we
+			// already called) does not double-fire.
+			err = nil
+			return 0, 0, nil
+		}
+		err = fmt.Errorf("insert synth: %w", rowErr)
+		return 0, 0, err
+	}
+
+	// Mirror the parent's Observation rows. Single
+	// INSERT...SELECT keeps the transaction round-trip
+	// count flat regardless of the parent's observation
+	// fan-out. RowsAffected gives us the per-synth mirror
+	// count for the metric.
+	res, mErr := tx.ExecContext(ctx, `
+		INSERT INTO observation (
+		    episode_id, role, node_id, edge_id, concept_id,
+		    degraded_recall_context_id, weight
+		)
+		SELECT $1::uuid, role, node_id, edge_id, concept_id,
+		       degraded_recall_context_id, weight
+		  FROM observation
+		 WHERE episode_id = $2::uuid
+	`, synthEpisodeID, cand.parentEpisodeID)
+	if mErr != nil {
+		err = fmt.Errorf("mirror observations: %w", mErr)
+		return 0, 0, err
+	}
+	mirroredRows, _ := res.RowsAffected()
+	if mirroredRows < 0 {
+		mirroredRows = 0
+	}
+
+	if cerr := tx.Commit(); cerr != nil {
+		err = fmt.Errorf("commit synth tx: %w", cerr)
+		return 0, 0, err
+	}
+
+	s.logger.Info("consolidator.synthetic_positive.created",
+		slog.String("run_id", runID),
+		slog.String("parent_episode_id", cand.parentEpisodeID),
+		slog.String("feedback_episode_id", cand.feedbackEpisodeID),
+		slog.String("synth_episode_id", synthEpisodeID),
+		slog.Time("synth_created_at", synthCreatedAt),
+		slog.Int64("observations_mirrored", mirroredRows))
+	return 1, uint64(mirroredRows), nil
+}
+
 // scanEpisodes runs the DELTA LEFT JOIN over the partitioned
 // episode + observation tables since the prior (cursor)
 // high-water mark, JOINs to node/edge/concept to fetch the
@@ -1184,17 +1668,17 @@ const nullNodeSentinel = "<<NULL>>"
 //   - CONCEPT EXISTS (today's idempotent append path):
 //     1.  SELECT ... FOR UPDATE on the existing Concept row.
 //     2.  SELECT existing (episode_id, node_id) pairs already in
-//         concept_support for this concept -- both for dedup of
-//         the support rows AND for filtering "already counted"
-//         episodes out of the cumulative count.
+//     concept_support for this concept -- both for dedup of
+//     the support rows AND for filtering "already counted"
+//     episodes out of the cumulative count.
 //     3.  Classify group episodes into NEW vs DUPLICATE. Polarity
-//         counts (delta_pos / delta_neg) are per-EPISODE not
-//         per-(episode, node), so an Episode with 3 node hits adds
-//         +1 to support_count, not +3 (the iter-2 finding #4
-//         second point).
+//     counts (delta_pos / delta_neg) are per-EPISODE not
+//     per-(episode, node), so an Episode with 3 node hits adds
+//     +1 to support_count, not +3 (the iter-2 finding #4
+//     second point).
 //     4.  Read latest ConceptVersion. cumulative = prev + delta.
 //     5.  Idempotency check + INSERT ConceptVersion when the
-//         cumulative tuple differs from the prior version.
+//     cumulative tuple differs from the prior version.
 //     6.  INSERT concept_support per (NEW episode, node) tuple.
 //     7.  COMMIT.
 //
@@ -1206,34 +1690,34 @@ const nullNodeSentinel = "<<NULL>>"
 //     are persisted in concept_candidate_support (migration
 //     0021). On every Tick:
 //     C1. SELECT existing pending candidate_support pairs for
-//         this signature (Go-side dedup).
+//     this signature (Go-side dedup).
 //     C2. INSERT new (Episode, Node, polarity) candidate_support
-//         rows for THIS TICK's episodes.
+//     rows for THIS TICK's episodes.
 //     C3. SELECT candidate_support_id, repo_id, node_id,
-//         episode_id, polarity FROM the pending set FOR UPDATE
-//         (locks the stable promotion set against any concurrent
-//         inserter -- defence in depth under the global
-//         advisory lock).
+//     episode_id, polarity FROM the pending set FOR UPDATE
+//     (locks the stable promotion set against any concurrent
+//     inserter -- defence in depth under the global
+//     advisory lock).
 //     C4. cumulative_pos = COUNT(DISTINCT episode_id WHERE
-//         polarity='positive') over the locked set; same per-
-//         EPISODE shape as the conceptKnown path.
+//     polarity='positive') over the locked set; same per-
+//     EPISODE shape as the conceptKnown path.
 //     C5. THRESHOLD GATE: cumulative_pos < Threshold -> RECHECK
-//         whether a concept appeared concurrently (defence under
-//         relaxed-lock); if so drain pending via
-//         promoteWithDedup, else COMMIT (the new candidate
-//         rows persist; processOnce advances the cursor
-//         regardless -- candidate state is durable, not
-//         cursor-pinned).
+//     whether a concept appeared concurrently (defence under
+//     relaxed-lock); if so drain pending via
+//     promoteWithDedup, else COMMIT (the new candidate
+//     rows persist; processOnce advances the cursor
+//     regardless -- candidate state is durable, not
+//     cursor-pinned).
 //     C6. PROMOTE: INSERT concept (ON CONFLICT DO NOTHING),
-//         on conflict re-SELECT the winner FOR UPDATE, then
-//         delegate to promoteWithDedup (which handles BOTH the
-//         fresh-concept and conflict-winner cases under one
-//         idempotent dedup-aware path -- iter-5 evaluator #3
-//         fix: the prior code blindly inserted version_index=0
-//         in the conflict case, which violated the
-//         concept_version unique index when the winner already
-//         had v=0). promoteWithDedup also marks every locked
-//         candidate_support row promoted. COMMIT.
+//     on conflict re-SELECT the winner FOR UPDATE, then
+//     delegate to promoteWithDedup (which handles BOTH the
+//     fresh-concept and conflict-winner cases under one
+//     idempotent dedup-aware path -- iter-5 evaluator #3
+//     fix: the prior code blindly inserted version_index=0
+//     in the conflict case, which violated the
+//     concept_version unique index when the winner already
+//     had v=0). promoteWithDedup also marks every locked
+//     candidate_support row promoted. COMMIT.
 //
 // NOTE (deferred drain in the conceptKnown path): if a sibling
 // actor created a Concept for a signature while this consolidator

@@ -1,21 +1,15 @@
 // agent.proto -- gRPC IDL for the Agent Surface (tech-spec §8.5).
 //
-// As of Stage 5.3 this file ships the IDL AND checked-in Go
-// bindings for two verbs:
-//   * `agent.recall`  -- Stage 5.1, §6.4 read path. Fully wired
-//     in `cmd/agent-api/main.go`; see `internal/agentapi/recall.go`.
-//   * `agent.expand`  -- Stage 5.3, §6.5 structural-walk path.
-//     Fully wired in `cmd/agent-api/main.go`; see
-//     `internal/agentapi/expand.go`.
-// The two remaining verbs are still skeleton placeholders so the
-// gRPC server can register a single stable service descriptor today;
-// the body shapes will firm up as their owning stages land:
-//   * `agent.observe`   -- Stage 5.2 (Observe request/response body).
-//   * `agent.summarize` -- Stage 5.4 (Summarize request/response body).
-// The protoc tooling pin (`protoc-gen-go v1.36.11`,
-// `protoc-gen-go-grpc v1.5.1`) and the `make proto` regen target
-// landed alongside Stage 5.3 — see `services/agent-memory/Makefile`
-// and the proto-drift CI gate in `.github/workflows/agent-memory-ci.yml`.
+// Stage 5.1 of implementation-plan.md ships the IDL for the
+// `agent.recall` verb plus skeleton placeholders for the
+// `agent.observe` and `agent.expand` verbs owned by Stages
+// 5.2 / 5.3. Stage 5.4 (this iter) lands the full
+// `agent.summarize` verb shape (`SummarizeRequest` /
+// `SummarizeResponse` / `Citation`) wired through
+// `internal/agentapi/summarize.go`. Generated Go bindings
+// for all verbs are produced via the protoc tooling pin;
+// this file is the canonical contract that
+// `cmd/agent-api/main.go` mTLS server speaks.
 //
 // Transport contract (tech-spec §8.5):
 //   * gRPC over HTTP/2.
@@ -82,8 +76,19 @@ service AgentService {
   // See `internal/agentapi/expand.go.Service.Expand`.
   rpc Expand(ExpandRequest) returns (ExpandResponse);
 
-  // Summarize materialises a neighborhood card into a
-  // natural-language summary; owned by Stage 5.4. Placeholder.
+  // Summarize materialises a neighborhood card (node target)
+  // or a concept card + its `concept_support` rows (concept
+  // target) into a natural-language summary. Implemented in
+  // Stage 5.4. The verb invokes an LLM `Summariser` (the
+  // production adapter speaks the OpenAI-compatible HTTPS
+  // contract), caps the call at a 5 s defence-in-depth
+  // budget, and falls back to a deterministic Markdown
+  // template stamped with `degraded_reason=
+  // summariser_unavailable` (or `reranker_model_stale` when
+  // the reranker training is >7 d old) when the LLM is
+  // unavailable. The handler also durably appends a
+  // `recall_context_log(verb='summarize')` audit row keyed
+  // by the returned `context_id`.
   rpc Summarize(SummarizeRequest) returns (SummarizeResponse);
 }
 
@@ -202,12 +207,12 @@ message RecallResponse {
 }
 
 // Placeholder request / response messages for the Observe
-// (Stage 5.2) and Summarize (Stage 5.4) verbs. They are
-// defined here so the gRPC server can register a single
-// service descriptor today; the body shapes will firm up
-// as Stages 5.2 / 5.4 land. Stage 5.3 (ExpandRequest /
-// ExpandResponse, below) is fully implemented and has its
-// own field-level documentation.
+// and Expand verbs. They are defined here so the gRPC server
+// can register a single service descriptor today; the body
+// shapes will firm up as Stages 5.2 / 5.3 land. The Stage 5.4
+// `Summarize{Request,Response}` + `Citation` messages below
+// are NOT placeholders — they carry the full Stage 5.4 wire
+// contract that `internal/agentapi/summarize.go` consumes.
 message ObserveRequest {
   string context_id = 1;
   string outcome = 2;
@@ -360,13 +365,75 @@ message ExpandResponse {
   bool truncated = 7;
 }
 
+// SummarizeRequest is the input shape for `agent.summarize`
+// (architecture.md §6.1.4). Exactly one of `node_id` /
+// `concept_id` MUST be supplied; both empty or both set
+// is rejected with INVALID_ARGUMENT. `repo_id` is REQUIRED
+// when `concept_id` is set (concepts have no inherent repo
+// scope per architecture §5.5.1 + **G6**); for `node_id`
+// requests `repo_id` MAY be empty and is then derived from
+// the seed Node's repo. When supplied for a `node_id`
+// request, it MUST match the seed Node's repo.
 message SummarizeRequest {
   string node_id = 1;
   string concept_id = 2;
+  // max_tokens caps the summariser's output budget. Values
+  // <= 0 default to 512; values > 4096 are clamped server-
+  // side so a single summarize call cannot saturate the
+  // shared LLM endpoint.
+  int32 max_tokens = 3;
+  // repo_id scopes the RecallContextLog row written for
+  // this summarize. See the message-level doc above for
+  // the per-target requirement.
+  string repo_id = 4;
 }
+
+// Citation is one provenance entry the summariser surfaces
+// alongside `summary_md`. Exactly one of `node_id` /
+// `edge_id` / `concept_id` / `episode_id` is populated per
+// citation; the optional `snippet` carries a short excerpt
+// the agent caller can render inline. Mirrors
+// architecture.md §6.1.4 `SummarizeResponse.citations`.
+//
+// `episode_id` is populated when the citation references a
+// `concept_support` row whose support source is an episode
+// (Stage 5.4 concept-target citations — e2e-scenarios.md
+// "summary cites resolved nodes" concept branch).
+message Citation {
+  string node_id = 1;
+  string edge_id = 2;
+  string concept_id = 3;
+  string snippet = 4;
+  string episode_id = 5;
+}
+
+// SummarizeResponse is the §6.1.4 envelope.
+//
+//   * `context_id` is the durable RecallContextLog row id
+//     the verb appended for this call (architecture §5.4.1,
+//     Stage 5.4 brief).
+//   * `target_kind` is "node" | "concept"; `target_id` is
+//     the same id the caller passed in `node_id` /
+//     `concept_id`. These echo the request so a caller that
+//     muxes many requests onto one stream can disambiguate
+//     without retaining the request payload.
+//   * `citations[]` carry the proof-of-reachability ids
+//     (every entry is reachable from `target_id` in the
+//     structural graph) per the Stage 5.4 acceptance
+//     scenario "summary cites resolved nodes".
+//   * `degraded` / `degraded_reason` use the §C22 closed
+//     set augmented with `summariser_unavailable` (new in
+//     Stage 5.4) and the existing `reranker_model_stale`.
+//     The Stage 5.4 brief pins `reranker_model_stale` for
+//     the case where the latest reranker run is older than
+//     7 days; `summariser_unavailable` covers a fresh-
+//     reranker-but-timed-out summariser.
 message SummarizeResponse {
   string summary_md = 1;
   string context_id = 2;
   bool degraded = 3;
   string degraded_reason = 4;
+  string target_kind = 5;
+  string target_id = 6;
+  repeated Citation citations = 7;
 }

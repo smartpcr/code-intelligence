@@ -24,7 +24,7 @@ import (
 const DefaultGitTimeout = 15 * time.Second
 
 // GitLsRemoteResolver implements [HeadResolver] by invoking
-// `git ls-remote --refs --heads <repo_url> <branch>` and
+// `git ls-remote --refs --heads -- <repo_url> <branch>` and
 // parsing the resulting SHA out of the matching `refs/heads/…`
 // line.
 //
@@ -117,7 +117,21 @@ func (r *GitLsRemoteResolver) Resolve(ctx context.Context, repoURL, defaultBranc
 	// / refs/pull/* / refs/notes/* etc never appear. Passing
 	// the branch name as a refspec further reduces network
 	// bytes — the remote only sends matching refs.
-	args := []string{"ls-remote", "--refs", "--heads", repoURL, branch}
+	//
+	// SECURITY: the `--` separator is REQUIRED here. Even
+	// though exec.CommandContext avoids shell expansion, git
+	// itself interprets any positional argument that starts
+	// with `-` as a flag — so a `repoURL` like
+	// `--upload-pack=cmd` (defeating the scheme allowlist
+	// via some future URL form) or a `branch` like
+	// `--upload-pack=cmd` (normalizeRef only trims
+	// whitespace) would otherwise be parsed as options and
+	// could trigger remote-code execution on the SSH path or
+	// other unintended git behaviour. The `--` terminator
+	// forces git to treat every subsequent token as a
+	// positional argument. This is standard git-safety
+	// practice for any user-supplied repo or refspec.
+	args := []string{"ls-remote", "--refs", "--heads", "--", repoURL, branch}
 
 	var stdout, stderr []byte
 	if r.runCmd != nil {

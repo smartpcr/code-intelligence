@@ -1,7 +1,7 @@
 """
 reranker-sidecar: BERT-class cross-encoder training service.
 
-Stage 6.4 (impl-plan §1110) mandates a "cross-encoder
+Stage 6.4 (impl-plan ┬º1110) mandates a "cross-encoder
 BERT-class model (<= 200M params)" for the reranker. The Go
 binary at services/agent-memory/cmd/reranker-trainer/ pulls
 labelled positive/negative pairs from PostgreSQL and POSTs
@@ -19,7 +19,7 @@ architecture (unmaintainable). The HTTP sidecar boundary is
 the maintained seam.
 
 Model: `cross-encoder/ms-marco-MiniLM-L-12-v2` (~33M params,
-well under the 200M cap from §6.4 step-3). The model is
+well under the 200M cap from ┬º6.4 step-3). The model is
 loaded at startup and re-used across train calls so the
 cold-start cost amortises.
 
@@ -50,7 +50,7 @@ short-circuits when `<artifact_dir>/<version>/` already
 exists rather than re-fitting, so a retry after a sidecar
 restart returns the existing artifact URI without mutating
 the on-disk weights. The Go-side `reranker_model.version`
-UNIQUE-INSERT contract relies on this — a publish retry
+UNIQUE-INSERT contract relies on this ΓÇö a publish retry
 must not produce different bytes under the same handle.
 
 Configuration env vars:
@@ -145,7 +145,7 @@ class LabelledPair(BaseModel):
     # Optional natural-language recall query the trainer
     # pulls from RecallContextLog.query_text. When present,
     # this is the SAME string `/rank` receives in its `query`
-    # field at recall time — so the train-time and recall-
+    # field at recall time ΓÇö so the train-time and recall-
     # time `_project_query` outputs match by construction
     # (iter-4 review item 3). Empty when the labelled pair
     # was synthesized from a correction without a recall
@@ -175,7 +175,7 @@ class TrainingInput(BaseModel):
 # item 1, refined iter-8 items 1+2): both `/train` (via
 # _flatten_pairs) and `/rank` MUST run their inputs through
 # the SAME projection functions defined below AND pass the
-# GRAPH IDENTIFIER (graph node_id / concept_id / edge_id —
+# GRAPH IDENTIFIER (graph node_id / concept_id / edge_id ΓÇö
 # NOT the Qdrant qdrant_point_id) as the document side so
 # the cross-encoder is fine-tuned and queried on byte-
 # identical document surfaces. See `_project_document`'s
@@ -201,7 +201,7 @@ _CANONICAL_KIND = {
     # `_canonical_kind("node_hit")` would pass through
     # unchanged and the per-role kind-only fallback in
     # `_flatten_pairs` would produce `node_hit` as a doc
-    # token instead of the canonical `method` — which is what
+    # token instead of the canonical `method` ΓÇö which is what
     # the rank side actually receives via the Candidate.Kind
     # field.
     "node_hit": "method",
@@ -261,12 +261,12 @@ def _project_query(
 def _project_document(kind: str, identifier: str) -> str:
     """Build the document side of the cross-encoder pair.
 
-    Format: `<canonical-kind> <identifier>` — produced
+    Format: `<canonical-kind> <identifier>` ΓÇö produced
     by prefixing the canonicalised kind exactly ONCE.
 
     INVARIANT (iter-7 review item 1, refined in iter-8
     review items 1+2): callers MUST pass a BARE GRAPH
-    identifier in `identifier` — never a string that
+    identifier in `identifier` ΓÇö never a string that
     already carries the kind prefix, and never the Qdrant
     `qdrant_point_id`. The graph-identifier contract is
     what makes `_flatten_pairs` (train) and `/rank`
@@ -292,7 +292,7 @@ def _project_document(kind: str, identifier: str) -> str:
         payload (`payload["node_id"]` for
         method/block/frontier, `payload["concept_id"]` for
         concept) and uses that as the wire envelope's
-        `point_id` field — explicitly NOT the
+        `point_id` field ΓÇö explicitly NOT the
         `Hit.PointID` which would be the
         `embedding_publish.qdrant_point_id` (a separately-
         minted UUID, see
@@ -305,11 +305,11 @@ def _project_document(kind: str, identifier: str) -> str:
     distinct ways:
 
       (a) pre-iter-7 / iter-5-style: `<kind> <payload_text>`
-          at rank vs `<kind> <seed_id>` at train —
+          at rank vs `<kind> <seed_id>` at train ΓÇö
           completely different token streams; or
       (b) iter-7-style (the bug iter-8 closes): `<kind>
           <qdrant_point_id>` at rank vs `<kind>
-          <graph_node_id>` at train — same surface SHAPE
+          <graph_node_id>` at train ΓÇö same surface SHAPE
           but different ID strings, because the publisher
           mints qdrant_point_ids separately from graph
           node_ids. The cross-encoder learned a
@@ -328,7 +328,7 @@ def _project_document(kind: str, identifier: str) -> str:
     that is a follow-up workstream rather than an iter-8
     fix. The current graph-id surface is honest about
     what the operator labels actually supervise:
-    `(query, graph_node_id) → relevant?`.
+    `(query, graph_node_id) ΓåÆ relevant?`.
 
     Returns the bare canonical kind when identifier is
     empty (degenerate fallback used by `_flatten_pairs`
@@ -351,7 +351,7 @@ def _project_document(kind: str, identifier: str) -> str:
 #           loaded across restarts or multiple versions.
 #   Item 2: `/train` mutated the singleton in place, so a
 #           repeat call with the same payload trained from
-#           already-mutated weights — different bytes under
+#           already-mutated weights ΓÇö different bytes under
 #           the same version, breaking the `reranker_model.
 #           version` UNIQUE-INSERT idempotency contract.
 #
@@ -369,7 +369,7 @@ def _project_document(kind: str, identifier: str) -> str:
 #     the hot checkpoints in memory across requests
 #     without unbounded growth.
 #
-# All loads still pay the 200M-param cap from §6.4 step-3.
+# All loads still pay the 200M-param cap from ┬º6.4 step-3.
 # ---------------------------------------------------------------------------
 
 
@@ -388,7 +388,7 @@ class ModelStore:
         self._artifact_dir = artifact_dir.resolve()
         self._lock = threading.Lock()
         self._ready = False
-        # base_param_count caches the result of the §6.4
+        # base_param_count caches the result of the ┬º6.4
         # step-3 200M cap check on the base model. Re-used
         # by /healthz so operators can confirm the loaded
         # backbone is in-bounds.
@@ -406,7 +406,7 @@ class ModelStore:
         the warm HF cache so cold-start cost amortises to
         ~200ms instead of 30s+ (HF download).
 
-        Also enforces the §6.4 step-3 200M parameter cap on
+        Also enforces the ┬º6.4 step-3 200M parameter cap on
         the base model. The cap-violation RuntimeError is
         raised OUTSIDE the introspection try/except so a
         broad `except` cannot swallow it (iter-3 review
@@ -462,7 +462,7 @@ class ModelStore:
         this model cannot mutate state visible to other
         requests. Combined with the deterministic seed
         in `fit_model()`, two /train calls with byte-
-        identical input produce byte-identical weights —
+        identical input produce byte-identical weights ΓÇö
         the idempotency contract the
         `reranker_model.version` UNIQUE-INSERT relies on
         (iter-4 review item 2).
@@ -485,7 +485,7 @@ class ModelStore:
         return a 400/404 without further wrapping.
 
         Iter-4 review item 1: this is the load path that
-        was missing — without it, `/rank` could only ever
+        was missing ΓÇö without it, `/rank` could only ever
         score with the singleton, so published artifacts
         across restarts/versions were dead bytes.
         """
@@ -543,7 +543,7 @@ def fit_model(  # type: ignore[no-untyped-def]
 ) -> dict:
     """Fit `model` (a sentence_transformers.CrossEncoder)
     against (query, document, label) triples. Returns the
-    §6.4 required metric set:
+    ┬º6.4 required metric set:
         - train_loss
         - eval_ndcg@k
         - rank-of-correct-node@k=20
@@ -555,7 +555,7 @@ def fit_model(  # type: ignore[no-untyped-def]
     idempotency the `reranker_model.version` UNIQUE-INSERT
     relies on. Enforced by:
       1. Caller passes a FRESH model from
-         `ModelStore.make_fresh_model()` — no shared state.
+         `ModelStore.make_fresh_model()` ΓÇö no shared state.
       2. Seeding python.random / numpy / torch / cuDNN with
          `seed` BEFORE the first fit step.
       3. `shuffle=False` on the DataLoader.
@@ -625,26 +625,9 @@ def fit_model(  # type: ignore[no-untyped-def]
 
 def save_model(model, dest_dir: Path) -> None:  # type: ignore[no-untyped-def]
     """Save a fitted model to dest_dir atomically: write
-    to a sibling staging dir, then move into place. Avoids
-    leaving a half-written checkpoint when a save crashes
-    mid-flight (which would later be silently loaded by
-    /rank).
-
-    Cross-filesystem note: `staging` is created via
-    `tempfile.mkdtemp(dir=dest_dir.parent)` so it is
-    nominally a sibling of `dest_dir` and `os.rename` would
-    succeed. However, a Linux deployment can place a bind
-    mount or a symlink under `dest_dir.parent` such that
-    the resolved target of the staging dir and the resolved
-    target of dest_dir end up on different filesystems —
-    `Path.rename` then raises `OSError(EXDEV)`. We use
-    `shutil.move`, which tries `os.rename` first (atomic
-    same-fs, the 99% path) and falls back to copy+delete
-    across filesystems. The same-fs atomicity guarantee is
-    therefore preserved in the common case, and the cross-fs
-    fallback is non-atomic but at least succeeds; we already
-    `rmtree(dest_dir)` immediately above, so the old
-    checkpoint is gone either way before the move starts."""
+    to a sibling staging dir, then rename. Avoids leaving
+    a half-written checkpoint when a save crashes mid-flight
+    (which would later be silently loaded by /rank)."""
     dest_dir = dest_dir.resolve()
     dest_dir.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=str(dest_dir.parent)))
@@ -652,7 +635,7 @@ def save_model(model, dest_dir: Path) -> None:  # type: ignore[no-untyped-def]
         model.save(str(staging))
         if dest_dir.exists():
             shutil.rmtree(dest_dir)
-        shutil.move(str(staging), str(dest_dir))
+        staging.rename(dest_dir)
     except Exception:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
@@ -822,13 +805,13 @@ def make_app(config: SidecarConfig) -> FastAPI:
         graph id back out of the publisher's Qdrant payload
         (`payload["node_id"]` for method/block/frontier,
         `payload["concept_id"]` for concept) and sends THAT
-        as the wire envelope's `point_id` value — the
+        as the wire envelope's `point_id` value ΓÇö the
         sidecar never talks to Qdrant and only uses this
         field as a unique key. Training carries the SAME
         graph id via `LabelledPair.SeedNodeIDs` /
         `LabelledPair.SeedConceptIDs` (hydrated from
         `recall_context_log.node_ids` /
-        `recall_context_log.concept_ids` — see
+        `recall_context_log.concept_ids` ΓÇö see
         `internal/rerankertrainer/pairs.go`). The `text`
         field in this envelope is informational/diagnostic
         only (Go currently sets it equal to the graph id;
@@ -864,7 +847,7 @@ def make_app(config: SidecarConfig) -> FastAPI:
             # iter-8 NOTE: the wire `point_id` here carries
             # the GRAPH id (graph `node_id` for
             # method/block/frontier, `concept_id` for concept)
-            # — NOT the Qdrant `qdrant_point_id`. Go's
+            # ΓÇö NOT the Qdrant `qdrant_point_id`. Go's
             # `candidateGraphID` in
             # internal/agentapi/bert_sidecar_decoder.go reads
             # the graph id back out of the publisher payload
@@ -909,7 +892,7 @@ def _flatten_pairs(payload: TrainingInput) -> List[Tuple[str, str, float]]:
     Uses the SAME _project_query / _project_document helpers
     as the /rank endpoint AND emits one training example per
     seed identifier so the train-time AND rank-time documents
-    BOTH project from `(canonical_kind, graph_id)` — the
+    BOTH project from `(canonical_kind, graph_id)` ΓÇö the
     cross-encoder is fine-tuned and queried on the SAME
     `<canonical-kind> <graph_id>` surface shape (iter-8
     review item 1).
@@ -924,13 +907,13 @@ def _flatten_pairs(payload: TrainingInput) -> List[Tuple[str, str, float]]:
         `internal/rerankertrainer/pairs.go` from
         `recall_context_log.{node_ids, concept_ids,
         edge_ids}` (which the recall handler populated with
-        `resp.Nodes[i].NodeID` etc. — see
+        `resp.Nodes[i].NodeID` etc. ΓÇö see
         `internal/agentapi/recall.go:buildContextLogInput`).
       - At rank time the same graph id comes from the
         wire envelope's `point_id` field (back-compat name)
         which Go's `candidateGraphID` extracts from
         `Candidate.Payload["node_id"]` /
-        `Candidate.Payload["concept_id"]` — the publisher
+        `Candidate.Payload["concept_id"]` ΓÇö the publisher
         always writes these onto every Qdrant row.
 
     Both surfaces therefore project from
@@ -942,10 +925,10 @@ def _flatten_pairs(payload: TrainingInput) -> List[Tuple[str, str, float]]:
       - iter-5/6: projection helpers introduced; train
         projected `(episode_kind, joined observation
         roles)` while rank projected `(kind, candidate
-        text or point_id)` — mismatched surfaces.
+        text or point_id)` ΓÇö mismatched surfaces.
       - iter-7: Go-side `candidateText` reduced to bare
         `c.PointID` (the Qdrant qdrant_point_id) so the
-        token shape matched, but the IDs DIDN'T —
+        token shape matched, but the IDs DIDN'T ΓÇö
         production trains on graph node UUIDs while
         ranking carried qdrant point UUIDs.
       - iter-8 (current): Go-side `candidateGraphID`
@@ -959,14 +942,14 @@ def _flatten_pairs(payload: TrainingInput) -> List[Tuple[str, str, float]]:
       1. ONE training example per seed_node_id +
          seed_concept_id + seed_edge_id (up to 8 each).
          Document = `_project_document(<canonical-kind>,
-         <graph_id>)` — the EXACT shape `/rank` produces
+         <graph_id>)` ΓÇö the EXACT shape `/rank` produces
          from `_project_document(candidate.kind,
          wire_point_id_which_is_the_graph_id)`. This is
          the dominant path: any labelled pair that came
          from a real recall has seeds, and the model
-         learns the same `(query, kind, graph_id)` →
+         learns the same `(query, kind, graph_id)` ΓåÆ
          score mapping at train and rank time.
-      2. Fallback when the pair has zero seeds (rare —
+      2. Fallback when the pair has zero seeds (rare ΓÇö
          degraded recalls, manually-injected pairs): one
          training example per observation, document =
          `_project_document(observation.role, "")` (the
@@ -1031,7 +1014,7 @@ def _derive_version(payload: TrainingInput, model_name: str, epochs: int) -> str
     shape but DIFFERENT natural-language queries cannot
     collide under the same `reranker_model.version`. The
     fingerprint bumps from `v2` to `v3` to make the schema
-    change visible — pre-iter-6 versions and iter-6+
+    change visible ΓÇö pre-iter-6 versions and iter-6+
     versions will never collide even on identical episode
     surfaces.
 
@@ -1106,11 +1089,18 @@ def main() -> None:
 
     config = SidecarConfig.from_env()
     app = make_app(config)
-    host, _, port = config.listen_addr.lstrip(":").partition(":")
-    if not port:
-        port = host or "8088"
-        host = "0.0.0.0"
-    uvicorn.run(app, host=host or "0.0.0.0", port=int(port))
+    # Split on the *last* colon so values like ":8088", "127.0.0.1:9000",
+    # ":9000", "0.0.0.0:8088", a bare port ("8088"), and bracketed IPv6
+    # ("[::1]:9000") all parse correctly. A missing host falls back to
+    # 0.0.0.0; a missing port falls back to 8088.
+    host, sep, port = config.listen_addr.rpartition(":")
+    if not sep:
+        # No colon present -- treat the whole value as a bare port.
+        port = host
+        host = ""
+    host = host or "0.0.0.0"
+    port = port or "8088"
+    uvicorn.run(app, host=host, port=int(port))
 
 
 if __name__ == "__main__":

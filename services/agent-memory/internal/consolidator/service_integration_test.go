@@ -18,6 +18,15 @@ package consolidator
 //   * Sub-threshold is a no-op            -- TestTick_subThresholdIsNoOp
 //   * Wake-after-N fires early tick       -- TestRun_wakeAfterNEpisodes
 //
+// Implementation-plan.md Stage 6.3 acceptance scenarios
+// (operator-correction auto-promotion, arch §7.7 step 4):
+//
+//   * "correction yields one synthetic positive"            -- TestTick_correctionYieldsSyntheticPositive
+//   * "synthetic positive copies context"                   -- TestTick_syntheticPositiveCopiesContextAndObservations
+//   * "restart does not duplicate"                          -- TestTick_restartDoesNotDuplicateSyntheticPositive
+//   * "partial UNIQUE rejects same-tuple duplicate"        -- TestTick_partialUniqueRejectsSameTupleDuplicate
+//   * "superseding EU blocks promotion (latest-state)"      -- TestTick_supersedingEpisodeUpdateBlocksPromotion
+//
 // Every scenario seeds its own per-test schema (CREATE SCHEMA
 // + SET search_path) and runs the entire migration chain so the
 // Consolidator exercises the production schema shape, including
@@ -38,7 +47,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/migrations"
 )
@@ -1529,6 +1538,7 @@ func TestPromoteWithDedup_conflictPathAppendsNextVersion(t *testing.T) {
 //     deduplication squashes the 3 rows down to 1).
 //   - exactly 1 concept_support row (the deduped pair).
 //   - all 3 candidate rows marked promoted (none left pending).
+//
 // A regression where the helper UPDATEs only the rows it
 // inserted concept_support for would leave 2 candidate rows
 // permanently stuck pending.
@@ -1678,4 +1688,774 @@ func lockPendingCandidatesTx(ctx context.Context, t *testing.T, tx *sql.Tx, sign
 		t.Fatalf("iterate candidate_support: %v", err)
 	}
 	return out
+}
+
+// ────────────────────────────────────────────────────────────
+// Stage 6.3 helpers: feedback Episode + EpisodeUpdate seeders.
+//
+// The §7.3 wire flow that the Stage 6.3 acceptance scenarios
+// drive end-to-end:
+//
+//     mgmt.feedback(parent_id, outcome=human_corrected,
+//                   corrected_action={...})
+//       ├── writes a kind='feedback' Episode with
+//       │     parent_episode_id = parent_id,
+//       │     outcome='human_corrected',
+//       │     corrected_action=<JSONB>.
+//       └── writes an EpisodeUpdate on the parent agent Episode
+//             with new_outcome='human_corrected'.
+//
+// The Consolidator's Stage 6.3 scan then matches (parent, EU,
+// feedback) and emits one synthetic_positive Episode per parent.
+//
+// mgmt.feedback stand-in
+// ----------------------
+// The mgmt.feedback HTTP/RPC handler is owned by Stage 5.2
+// (cmd/mgmt-api/main.go) and is NOT yet implemented in this
+// repository: a grep -F "mgmt.feedback" against the source
+// tree finds only architectural references (architecture.md,
+// implementation-plan.md, agentapi/observe.go's
+// "outcome=human_corrected is reserved for mgmt.feedback"
+// rejection guard, plus this package's doc.go + service.go
+// scan-side reads). Until that handler lands, the Stage 6.3
+// integration tests substitute `submitOperatorFeedback` below,
+// which performs the IDENTICAL two writes the handler will
+// perform in production — feedback Episode + EpisodeUpdate —
+// wrapped in a single SQL transaction so the test exercises
+// the same atomicity boundary the handler will enforce.
+//
+// When the Stage 5.2 mgmt.feedback handler lands, this helper
+// should be replaced with a call to that handler's Go client
+// (or its in-process equivalent) and the seedFeedbackEpisode /
+// seedHumanCorrectedEpisodeUpdate primitives below can be
+// removed. The tests below intentionally call
+// submitOperatorFeedback (not the raw primitives) so the swap
+// is a single-file edit when that workstream is done.
+// ────────────────────────────────────────────────────────────
+
+// submitOperatorFeedback is the test-side stand-in for the
+// future mgmt.feedback handler (Stage 5.2). It writes the two
+// rows the handler will write in production — a kind='feedback'
+// Episode and an episode_update row marking the parent as
+// human_corrected — INSIDE A SINGLE TRANSACTION. The
+// Consolidator's Stage 6.3 scan does not see either row until
+// the COMMIT, matching the atomicity guarantee mgmt.feedback
+// will provide.
+//
+// Returns the feedback Episode's UUID (string) so the test can
+// assert that synth.synthesized_from_feedback_episode_id points
+// at this specific row.
+func submitOperatorFeedback(
+	ctx context.Context, t *testing.T, db *sql.DB,
+	repoID, parentEpisodeID string, correctedAction string,
+) (feedbackEpisodeID string) {
+	t.Helper()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("submitOperatorFeedback: begin tx: %v", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	if err = tx.QueryRowContext(ctx, `
+		INSERT INTO episode
+		    (episode_group_id, repo_id, session_id, trace_id, kind,
+		     parent_episode_id, action, outcome, corrected_action)
+		VALUES (gen_random_uuid(), $1::uuid, $2, $3, 'feedback'::episode_kind,
+		        $4::uuid, '{"op":"feedback"}'::jsonb, 'human_corrected'::outcome,
+		        $5::jsonb)
+		RETURNING episode_id::text
+	`, repoID, "sess-fb-"+randomHex(t, 4), "trace-fb-"+randomHex(t, 4),
+		parentEpisodeID, correctedAction).Scan(&feedbackEpisodeID); err != nil {
+		t.Fatalf("submitOperatorFeedback: insert feedback episode: %v", err)
+	}
+	if _, err = tx.ExecContext(ctx, `
+		INSERT INTO episode_update
+		    (episode_id, new_outcome, note, actor)
+		VALUES ($1::uuid, 'human_corrected'::outcome, $2, 'operator'::actor)
+	`, parentEpisodeID, "stage-6.3-correction"); err != nil {
+		t.Fatalf("submitOperatorFeedback: insert episode_update: %v", err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatalf("submitOperatorFeedback: commit: %v", err)
+	}
+	return feedbackEpisodeID
+}
+
+// seedFeedbackEpisode inserts a kind='feedback' Episode whose
+// parent_episode_id points at parentEpisodeID. Sets
+// outcome='human_corrected' and corrected_action to the JSONB
+// payload supplied (so the Consolidator's candidate scan
+// matches via corrected_action IS NOT NULL). Context is NULL
+// per the §5.3.1 contract that feedback Episodes may omit
+// context_id. Returns the feedback Episode's UUID as text.
+//
+// Retained as a primitive that submitOperatorFeedback above
+// composes inside its single-transaction envelope. Tests that
+// need to seed feedback and EU separately (e.g. to simulate a
+// partial mgmt.feedback failure where the EU lands but the
+// feedback Episode does not) call this directly; otherwise
+// they call submitOperatorFeedback.
+func seedFeedbackEpisode(
+	ctx context.Context, t *testing.T, db *sql.DB,
+	repoID, parentEpisodeID string, correctedAction string,
+) string {
+	t.Helper()
+	var epID string
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO episode
+		    (episode_group_id, repo_id, session_id, trace_id, kind,
+		     parent_episode_id, action, outcome, corrected_action)
+		VALUES (gen_random_uuid(), $1::uuid, $2, $3, 'feedback'::episode_kind,
+		        $4::uuid, '{"op":"feedback"}'::jsonb, 'human_corrected'::outcome,
+		        $5::jsonb)
+		RETURNING episode_id::text
+	`, repoID, "sess-fb-"+randomHex(t, 4), "trace-fb-"+randomHex(t, 4),
+		parentEpisodeID, correctedAction).Scan(&epID); err != nil {
+		t.Fatalf("seed feedback episode: %v", err)
+	}
+	return epID
+}
+
+// seedHumanCorrectedEpisodeUpdate inserts an episode_update row
+// flipping parentEpisodeID's effective outcome to
+// 'human_corrected'. actor='operator' is the enum value
+// migration 0001 defines for human-driven changes (the actor
+// enum has exactly three values: operator | consolidator |
+// system — see migrations/0001_enums.sql lines 86-91). The
+// note is a non-secret marker the candidate scan does not
+// read.
+func seedHumanCorrectedEpisodeUpdate(
+	ctx context.Context, t *testing.T, db *sql.DB,
+	parentEpisodeID string,
+) {
+	t.Helper()
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO episode_update
+		    (episode_id, new_outcome, note, actor)
+		VALUES ($1::uuid, 'human_corrected'::outcome, $2, 'operator'::actor)
+	`, parentEpisodeID, "stage-6.3-correction"); err != nil {
+		t.Fatalf("seed episode_update: %v", err)
+	}
+}
+
+// seedSupersedingEpisodeUpdate inserts an episode_update row
+// whose new_outcome supersedes a prior human_corrected EU
+// (e.g. operator changed their mind, or an automated retry
+// succeeded and a 'success' EU was filed afterwards). Used by
+// the Stage 6.3 "latest EU wins" coverage to assert the
+// candidate scan picks the LATEST EU per parent, not any
+// historical 'human_corrected' row.
+//
+// Forces the new row's `created_at` to `max(prior.created_at)
+// + 1 microsecond` via SQL (instead of relying on a Go-side
+// wall-clock sleep) so the `latest_eu` LATERAL pick is
+// deterministic across CI hosts with coarse system clocks.
+// The production query breaks ties by `update_id DESC`, but
+// strictly-greater `created_at` is the primary ordering and
+// the cheaper guarantee.
+func seedSupersedingEpisodeUpdate(
+	ctx context.Context, t *testing.T, db *sql.DB,
+	parentEpisodeID string, newOutcome string,
+) {
+	t.Helper()
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO episode_update
+		    (episode_id, new_outcome, note, actor, created_at)
+		VALUES (
+		    $1::uuid,
+		    $2::outcome,
+		    'stage-6.3-supersede',
+		    'operator'::actor,
+		    (SELECT max(created_at) + interval '1 microsecond'
+		       FROM episode_update
+		      WHERE episode_id = $1::uuid)
+		)
+	`, parentEpisodeID, newOutcome); err != nil {
+		t.Fatalf("seed superseding episode_update: %v", err)
+	}
+}
+
+// mustCountSyntheticPositives returns the number of
+// kind='synthetic_positive' Episode rows in the schema.
+func mustCountSyntheticPositives(ctx context.Context, t *testing.T, db *sql.DB) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRowContext(ctx, `
+SELECT count(*) FROM episode
+ WHERE kind = 'synthetic_positive'::episode_kind
+`).Scan(&n); err != nil {
+		t.Fatalf("count synthetic_positive: %v", err)
+	}
+	return n
+}
+
+// mustCountSyntheticPositivesForParent returns the count of
+// synthetic_positive Episodes whose
+// synthesized_from_parent_episode_id matches parentEpisodeID.
+// This is the per-parent invariant the spec calls out:
+// "exactly one synthetic_positive per parent agent Episode".
+func mustCountSyntheticPositivesForParent(
+	ctx context.Context, t *testing.T, db *sql.DB,
+	parentEpisodeID string,
+) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRowContext(ctx, `
+SELECT count(*) FROM episode
+ WHERE kind = 'synthetic_positive'::episode_kind
+   AND synthesized_from_parent_episode_id = $1::uuid
+`, parentEpisodeID).Scan(&n); err != nil {
+		t.Fatalf("count synthetic_positive for parent: %v", err)
+	}
+	return n
+}
+
+// syntheticPositiveSnapshot reads the lone synthetic_positive
+// Episode for a given parent so the test can assert on its
+// shape (context copy, action substitution, provenance pointers).
+type syntheticPositiveSnapshot struct {
+	episodeID            string
+	contextID            string
+	actionJSON           string
+	outcome              string
+	correctedActionIsNul bool
+	parentEpisodeID      string
+	feedbackEpisodeID    string
+	createdAt            time.Time
+}
+
+func mustReadSyntheticPositiveForParent(
+	ctx context.Context, t *testing.T, db *sql.DB,
+	parentEpisodeID string,
+) syntheticPositiveSnapshot {
+	t.Helper()
+	var snap syntheticPositiveSnapshot
+	var actionJSON []byte
+	var correctedActionJSON sql.NullString
+	if err := db.QueryRowContext(ctx, `
+SELECT episode_id::text,
+       context_id::text,
+       action::text,
+       outcome::text,
+       corrected_action::text,
+       synthesized_from_parent_episode_id::text,
+       synthesized_from_feedback_episode_id::text,
+       created_at
+  FROM episode
+ WHERE kind = 'synthetic_positive'::episode_kind
+   AND synthesized_from_parent_episode_id = $1::uuid
+`, parentEpisodeID).Scan(
+		&snap.episodeID,
+		&snap.contextID,
+		&actionJSON,
+		&snap.outcome,
+		&correctedActionJSON,
+		&snap.parentEpisodeID,
+		&snap.feedbackEpisodeID,
+		&snap.createdAt,
+	); err != nil {
+		t.Fatalf("read synthetic_positive: %v", err)
+	}
+	snap.actionJSON = string(actionJSON)
+	snap.correctedActionIsNul = !correctedActionJSON.Valid
+	return snap
+}
+
+// observationFingerprint captures the targeting columns of an
+// observation row. The Stage 6.3 mirror copies (role, node_id,
+// edge_id, concept_id, degraded_recall_context_id, weight) per
+// C17; the test compares parent vs synth observation sets via
+// this struct's value equality.
+type observationFingerprint struct {
+	role                    string
+	nodeID                  sql.NullString
+	edgeID                  sql.NullString
+	conceptID               sql.NullString
+	degradedRecallContextID sql.NullString
+	weight                  float64
+}
+
+func mustListObservationFingerprints(
+	ctx context.Context, t *testing.T, db *sql.DB,
+	episodeID string,
+) []observationFingerprint {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, `
+SELECT role::text,
+       node_id::text,
+       edge_id::text,
+       concept_id::text,
+       degraded_recall_context_id::text,
+       weight
+  FROM observation
+ WHERE episode_id = $1::uuid
+ ORDER BY role, node_id, edge_id, concept_id, degraded_recall_context_id, weight
+`, episodeID)
+	if err != nil {
+		t.Fatalf("list observation fingerprints: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []observationFingerprint
+	for rows.Next() {
+		var fp observationFingerprint
+		if err := rows.Scan(&fp.role, &fp.nodeID, &fp.edgeID, &fp.conceptID, &fp.degradedRecallContextID, &fp.weight); err != nil {
+			t.Fatalf("scan observation fingerprint: %v", err)
+		}
+		out = append(out, fp)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate observation fingerprints: %v", err)
+	}
+	return out
+}
+
+// observationFingerprintsEqual is a strict equality predicate
+// across the SORTED slices returned by
+// mustListObservationFingerprints. Length mismatch OR any
+// per-column difference at the same index returns false. Used
+// by the C17 mirror assertion.
+func observationFingerprintsEqual(a, b []observationFingerprint) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ────────────────────────────────────────────────────────────
+// Stage 6.3 scenario A: correction yields one synthetic positive.
+//
+// implementation-plan.md §6.3 line 1080:
+//   "Given mgmt.feedback(parent_id, outcome=human_corrected,
+//    corrected_action={...}) was just accepted, When the next
+//    Consolidator tick runs, Then exactly one Episode row with
+//    kind='synthetic_positive',
+//    synthesized_from_feedback_episode_id=<feedback_id>,
+//    synthesized_from_parent_episode_id=<parent_id> exists."
+// ────────────────────────────────────────────────────────────
+
+func TestTick_correctionYieldsSyntheticPositive(t *testing.T) {
+	fix := openConsolFixture(t)
+	defer fix.cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), intTestDBTimeout)
+	defer cancel()
+
+	repoID := seedRepo(ctx, t, fix.db, "stage63a")
+	contextID := seedRecallContext(ctx, t, fix.db, repoID)
+	nodeID := seedNode(ctx, t, fix.db, repoID, randomFingerprint(t), "node-stage63a")
+
+	parentEpisodeID := seedEpisode(ctx, t, fix.db, repoID, contextID, nodeID)
+	// E2E §7.3: drive the wire flow via the mgmt.feedback
+	// stand-in. The helper writes the feedback Episode AND the
+	// EpisodeUpdate inside one tx, exactly as the future
+	// Stage 5.2 handler will.
+	feedbackEpisodeID := submitOperatorFeedback(ctx, t, fix.db, repoID, parentEpisodeID, `{"op":"corrected","why":"operator"}`)
+
+	svc := newConsolService(t, fix.db, 1)
+	res, err := svc.Tick(ctx)
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if res.LockSkipped {
+		t.Fatalf("did not expect lock-skip on a fresh schema; tick=%+v", res)
+	}
+	if res.SyntheticPositivesCreated != 1 {
+		t.Fatalf("expected 1 synthetic_positive created, got %d (tick=%+v)", res.SyntheticPositivesCreated, res)
+	}
+	// Parent had 1 node_hit observation; mirror should have
+	// copied exactly that one row.
+	if res.SyntheticObservationsMirrored != 1 {
+		t.Fatalf("expected 1 synthetic_observations_mirrored, got %d", res.SyntheticObservationsMirrored)
+	}
+
+	if n := mustCountSyntheticPositives(ctx, t, fix.db); n != 1 {
+		t.Fatalf("expected exactly 1 synthetic_positive in schema, got %d", n)
+	}
+	if n := mustCountSyntheticPositivesForParent(ctx, t, fix.db, parentEpisodeID); n != 1 {
+		t.Fatalf("expected exactly 1 synthetic_positive for parent, got %d", n)
+	}
+
+	snap := mustReadSyntheticPositiveForParent(ctx, t, fix.db, parentEpisodeID)
+	if snap.parentEpisodeID != parentEpisodeID {
+		t.Fatalf("synth.synthesized_from_parent_episode_id mismatch: got %s want %s", snap.parentEpisodeID, parentEpisodeID)
+	}
+	if snap.feedbackEpisodeID != feedbackEpisodeID {
+		t.Fatalf("synth.synthesized_from_feedback_episode_id mismatch: got %s want %s", snap.feedbackEpisodeID, feedbackEpisodeID)
+	}
+	if snap.outcome != "success" {
+		t.Fatalf("synth.outcome should be 'success' for positive polarity, got %q", snap.outcome)
+	}
+	if !snap.correctedActionIsNul {
+		t.Fatalf("synth.corrected_action must be NULL (outcome=success), got non-NULL")
+	}
+	// action == corrected_action (G7).
+	if !strings.Contains(snap.actionJSON, `"corrected"`) {
+		t.Fatalf("synth.action should mirror corrected_action JSON; got %q", snap.actionJSON)
+	}
+
+	// Metrics surface mirrors the result fields.
+	if got := svc.Metrics().SyntheticPositivesCreatedTotal(); got != 1 {
+		t.Fatalf("metric consolidator_synthetic_positives_created_total: got %d want 1", got)
+	}
+	if got := svc.Metrics().SyntheticObservationsMirroredTotal(); got != 1 {
+		t.Fatalf("metric consolidator_synthetic_observations_mirrored_total: got %d want 1", got)
+	}
+}
+
+// ────────────────────────────────────────────────────────────
+// Stage 6.3 scenario B: synthetic positive copies context +
+// observations.
+//
+// implementation-plan.md §6.3 line 1087:
+//   "Given the parent Episode has context_id=X, When the
+//    synthetic positive is emitted, Then its context_id is also
+//    X and its Observation rows reference the same nodes/edges/
+//    concepts as the parent's."
+// ────────────────────────────────────────────────────────────
+
+func TestTick_syntheticPositiveCopiesContextAndObservations(t *testing.T) {
+	fix := openConsolFixture(t)
+	defer fix.cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), intTestDBTimeout)
+	defer cancel()
+
+	repoID := seedRepo(ctx, t, fix.db, "stage63b")
+	contextID := seedRecallContext(ctx, t, fix.db, repoID)
+	// Parent observes TWO distinct nodes so the mirror copies
+	// more than one row -- a single-row mirror could mask a
+	// `LIMIT 1` regression in the INSERT...SELECT statement.
+	nodeA := seedNode(ctx, t, fix.db, repoID, randomFingerprint(t), "node-A-stage63b")
+	nodeB := seedNode(ctx, t, fix.db, repoID, randomFingerprint(t), "node-B-stage63b")
+
+	parentEpisodeID := seedEpisode(ctx, t, fix.db, repoID, contextID, nodeA)
+	// Add a second observation on the parent so the mirror
+	// copies 2 rows.
+	if _, err := fix.db.ExecContext(ctx, `
+		INSERT INTO observation (episode_id, role, node_id, weight)
+		VALUES ($1::uuid, 'node_hit'::observation_role, $2::uuid, 0.5)
+	`, parentEpisodeID, nodeB); err != nil {
+		t.Fatalf("seed second observation: %v", err)
+	}
+
+	// E2E §7.3: drive via the mgmt.feedback stand-in.
+	_ = submitOperatorFeedback(ctx, t, fix.db, repoID, parentEpisodeID, `{"op":"corrected"}`)
+
+	svc := newConsolService(t, fix.db, 1)
+	res, err := svc.Tick(ctx)
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if res.SyntheticPositivesCreated != 1 {
+		t.Fatalf("expected 1 synthetic_positive, got %d", res.SyntheticPositivesCreated)
+	}
+	if res.SyntheticObservationsMirrored != 2 {
+		t.Fatalf("expected 2 mirrored observations, got %d", res.SyntheticObservationsMirrored)
+	}
+
+	snap := mustReadSyntheticPositiveForParent(ctx, t, fix.db, parentEpisodeID)
+	if snap.contextID != contextID {
+		t.Fatalf("synth.context_id must mirror parent's context_id; got %s want %s", snap.contextID, contextID)
+	}
+
+	parentObs := mustListObservationFingerprints(ctx, t, fix.db, parentEpisodeID)
+	synthObs := mustListObservationFingerprints(ctx, t, fix.db, snap.episodeID)
+	if !observationFingerprintsEqual(parentObs, synthObs) {
+		t.Fatalf("mirror C17 violated: parent observations differ from synth observations\nparent: %+v\nsynth:  %+v", parentObs, synthObs)
+	}
+}
+
+// ────────────────────────────────────────────────────────────
+// Stage 6.3 scenario C: restart does not duplicate.
+//
+// implementation-plan.md §6.3 line 1092:
+//   "Given the Consolidator crashes after writing the synthetic
+//    positive but before finalising the open ConsolidatorRun row
+//    (the row exists with status='running'), When it restarts
+//    and reprocesses the same EpisodeUpdate, Then the partial
+//    UNIQUE index rejects the duplicate and no second synthetic
+//    positive row exists."
+//
+// We simulate the spec's crash-before-finalize precisely:
+//   1. Seed parent + run submitOperatorFeedback (so feedback EU
+//      lands).
+//   2. Manually INSERT the synth Episode + mirror parent's
+//      observation onto it (representing "synth was written").
+//   3. Manually INSERT an open consolidator_run row at
+//      status='running' (representing "crashed before
+//      finalising"). The Consolidator's priorHighWater()
+//      excludes this row (filters status='done' only) so the
+//      restart tick sees an EMPTY cursor and a fully-populated
+//      EU.
+//   4. Run Tick. The candidate scan's NOT EXISTS gate sees
+//      the pre-existing synth and yields ZERO candidates.
+//   5. Assert there is still exactly ONE synth (no duplicate)
+//      and the original synth's episode_id is preserved.
+// ────────────────────────────────────────────────────────────
+
+func TestTick_restartDoesNotDuplicateSyntheticPositive(t *testing.T) {
+	fix := openConsolFixture(t)
+	defer fix.cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), intTestDBTimeout)
+	defer cancel()
+
+	repoID := seedRepo(ctx, t, fix.db, "stage63c")
+	contextID := seedRecallContext(ctx, t, fix.db, repoID)
+	nodeID := seedNode(ctx, t, fix.db, repoID, randomFingerprint(t), "node-stage63c")
+
+	parentEpisodeID := seedEpisode(ctx, t, fix.db, repoID, contextID, nodeID)
+	feedbackEpisodeID := submitOperatorFeedback(ctx, t, fix.db, repoID, parentEpisodeID, `{"op":"corrected"}`)
+
+	// Step 2: pre-existing synth Episode (representing the row
+	// the pre-crash tick had already committed). The INSERT
+	// mirrors what insertSyntheticPositiveAndMirror would write:
+	// kind='synthetic_positive', context copied, action =
+	// corrected_action, both provenance pointers populated,
+	// outcome='success'.
+	var preCrashSynthID string
+	var preCrashSynthCreatedAt time.Time
+	if err := fix.db.QueryRowContext(ctx, `
+		INSERT INTO episode (
+		    episode_group_id, repo_id, session_id, trace_id, kind,
+		    synthesized_from_parent_episode_id,
+		    synthesized_from_feedback_episode_id,
+		    context_id, action, outcome
+		)
+		SELECT gen_random_uuid(), parent.repo_id, parent.session_id,
+		       parent.trace_id, 'synthetic_positive'::episode_kind,
+		       parent.episode_id, $1::uuid, parent.context_id,
+		       '{"op":"pre-crash-synth"}'::jsonb, 'success'::outcome
+		  FROM episode parent
+		 WHERE parent.episode_id = $2::uuid
+		RETURNING episode_id::text, created_at
+	`, feedbackEpisodeID, parentEpisodeID).Scan(&preCrashSynthID, &preCrashSynthCreatedAt); err != nil {
+		t.Fatalf("seed pre-crash synth: %v", err)
+	}
+	// Mirror parent observation onto the pre-crash synth so the
+	// schema-level "every synth has its parent's observation set"
+	// invariant holds end-to-end.
+	if _, err := fix.db.ExecContext(ctx, `
+		INSERT INTO observation (episode_id, role, node_id, weight)
+		SELECT $1::uuid, role, node_id, weight
+		  FROM observation
+		 WHERE episode_id = $2::uuid
+	`, preCrashSynthID, parentEpisodeID); err != nil {
+		t.Fatalf("seed pre-crash synth observations: %v", err)
+	}
+
+	// Step 3: open consolidator_run at status='running' (no
+	// finished_at, no episode_high_water_mark) — exactly the row
+	// the pre-crash openRun() would have committed before the
+	// crash. priorHighWater filters status='done', so this row
+	// is INVISIBLE to the restart tick's cursor lookup.
+	var openRunID string
+	if err := fix.db.QueryRowContext(ctx, `
+		INSERT INTO consolidator_run (started_at, status)
+		VALUES (now() - interval '5 seconds', 'running')
+		RETURNING run_id::text
+	`).Scan(&openRunID); err != nil {
+		t.Fatalf("seed open consolidator_run: %v", err)
+	}
+
+	// Sanity: the open run is the only run on disk, and it is
+	// status='running' (not 'done'). priorHighWater MUST treat
+	// this as a brand-new cluster.
+	if n := mustCountConsolidatorRuns(ctx, t, fix.db, "running"); n != 1 {
+		t.Fatalf("expected 1 open consolidator_run at status='running', got %d", n)
+	}
+
+	// Step 4: restart-tick. Synth phase scans candidates with
+	// (a) cursor=NULL (no prior 'done' run), so the cursor
+	// predicate degenerates to TRUE, and (b) NOT EXISTS gate
+	// firing on the pre-crash synth.
+	svc := newConsolService(t, fix.db, 1)
+	res, err := svc.Tick(ctx)
+	if err != nil {
+		t.Fatalf("restart Tick: %v", err)
+	}
+	if res.SyntheticPositivesCreated != 0 {
+		t.Fatalf("restart tick must NOT emit a duplicate synth; got %d created", res.SyntheticPositivesCreated)
+	}
+	if res.SyntheticObservationsMirrored != 0 {
+		t.Fatalf("restart tick must NOT mirror duplicate observations; got %d mirrored", res.SyntheticObservationsMirrored)
+	}
+
+	// Step 5: schema invariant -- still exactly one synth for the
+	// parent, and it is the SAME row we seeded pre-crash.
+	if n := mustCountSyntheticPositives(ctx, t, fix.db); n != 1 {
+		t.Fatalf("expected 1 synthetic_positive across the restart, got %d", n)
+	}
+	if n := mustCountSyntheticPositivesForParent(ctx, t, fix.db, parentEpisodeID); n != 1 {
+		t.Fatalf("expected 1 synthetic_positive for parent across the restart, got %d", n)
+	}
+	postRestart := mustReadSyntheticPositiveForParent(ctx, t, fix.db, parentEpisodeID)
+	if postRestart.episodeID != preCrashSynthID {
+		t.Fatalf("restart synth_id mismatch: pre-crash=%s post=%s (Consolidator must NOT delete-and-reinsert)", preCrashSynthID, postRestart.episodeID)
+	}
+	if !postRestart.createdAt.Equal(preCrashSynthCreatedAt) {
+		t.Fatalf("restart synth.created_at mismatch: pre-crash=%s post=%s", preCrashSynthCreatedAt, postRestart.createdAt)
+	}
+
+	// Step 6: the synth-emission counter MUST NOT have been
+	// bumped on the restart tick (no real INSERT happened).
+	if got := svc.Metrics().SyntheticPositivesCreatedTotal(); got != 0 {
+		t.Fatalf("restart-tick metric consolidator_synthetic_positives_created_total: got %d want 0", got)
+	}
+}
+
+// ────────────────────────────────────────────────────────────
+// Stage 6.3 partial-UNIQUE proof: the migration 0013 partial
+// UNIQUE index on
+// `(synthesized_from_feedback_episode_id, created_at) WHERE
+// kind='synthetic_positive'` rejects any second synth that
+// shares the SAME KEY TUPLE as an existing one. Note this is
+// NOT a "same wall-clock tick" assertion: the Consolidator's
+// production INSERT uses `clock_timestamp()`, so two
+// service-driven INSERTs for the same parent get different
+// created_at values and would not collide on the partial
+// UNIQUE alone — the application-level NOT EXISTS gate is the
+// primary cross-time defence. This test exercises ONLY the
+// migration 0013 layer: a force-INSERT with an explicit
+// created_at that matches the existing row's.
+//
+// implementation-plan.md §6.3 line 1071 (third bullet):
+//   "Rely on the partial UNIQUE index from migration 0013
+//    (§9.8) to prevent double-emission on restart."
+//
+// The Consolidator's three-layer idempotency contract:
+//   - Layer 1 (cursor + NOT EXISTS in candidate scan).
+//   - Layer 2 (WHERE NOT EXISTS in the INSERT).
+//   - Layer 3 (partial UNIQUE in migration 0013). <- this test
+// ────────────────────────────────────────────────────────────
+
+func TestTick_partialUniqueRejectsSameTupleDuplicate(t *testing.T) {
+	fix := openConsolFixture(t)
+	defer fix.cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), intTestDBTimeout)
+	defer cancel()
+
+	repoID := seedRepo(ctx, t, fix.db, "stage63d")
+	contextID := seedRecallContext(ctx, t, fix.db, repoID)
+	nodeID := seedNode(ctx, t, fix.db, repoID, randomFingerprint(t), "node-stage63d")
+
+	parentEpisodeID := seedEpisode(ctx, t, fix.db, repoID, contextID, nodeID)
+	feedbackEpisodeID := submitOperatorFeedback(ctx, t, fix.db, repoID, parentEpisodeID, `{"op":"corrected"}`)
+
+	// Insert the first synth (the "well-behaved" one). Capture
+	// its created_at so we can force the second INSERT to
+	// collide on the partial UNIQUE key tuple
+	// (synthesized_from_feedback_episode_id, created_at).
+	var firstSynthCreatedAt time.Time
+	if err := fix.db.QueryRowContext(ctx, `
+		INSERT INTO episode (
+		    episode_group_id, repo_id, session_id, trace_id, kind,
+		    synthesized_from_parent_episode_id,
+		    synthesized_from_feedback_episode_id,
+		    context_id, action, outcome
+		)
+		SELECT gen_random_uuid(), parent.repo_id, parent.session_id,
+		       parent.trace_id, 'synthetic_positive'::episode_kind,
+		       parent.episode_id, $1::uuid, parent.context_id,
+		       '{"op":"first-synth"}'::jsonb, 'success'::outcome
+		  FROM episode parent
+		 WHERE parent.episode_id = $2::uuid
+		RETURNING created_at
+	`, feedbackEpisodeID, parentEpisodeID).Scan(&firstSynthCreatedAt); err != nil {
+		t.Fatalf("seed first synth: %v", err)
+	}
+
+	// Force the second synth to share the FIRST synth's
+	// created_at (same wall-clock microsecond). The partial
+	// UNIQUE in migration 0013 keys on
+	// (synthesized_from_feedback_episode_id, created_at) WHERE
+	// kind='synthetic_positive', so this collision MUST raise
+	// SQLSTATE 23505.
+	_, dupErr := fix.db.ExecContext(ctx, `
+		INSERT INTO episode (
+		    episode_group_id, repo_id, session_id, trace_id, kind,
+		    synthesized_from_parent_episode_id,
+		    synthesized_from_feedback_episode_id,
+		    context_id, action, outcome, created_at
+		)
+		SELECT gen_random_uuid(), parent.repo_id, parent.session_id,
+		       parent.trace_id, 'synthetic_positive'::episode_kind,
+		       parent.episode_id, $1::uuid, parent.context_id,
+		       '{"op":"duplicate-synth"}'::jsonb, 'success'::outcome, $3::timestamptz
+		  FROM episode parent
+		 WHERE parent.episode_id = $2::uuid
+	`, feedbackEpisodeID, parentEpisodeID, firstSynthCreatedAt)
+	if dupErr == nil {
+		t.Fatalf("expected partial UNIQUE on (synthesized_from_feedback_episode_id, created_at) to reject same-tuple duplicate; got nil error")
+	}
+	var pqErr *pq.Error
+	if !errors.As(dupErr, &pqErr) {
+		t.Fatalf("expected *pq.Error from duplicate INSERT; got %T (%v)", dupErr, dupErr)
+	}
+	// SQLSTATE 23505 is the unique_violation class; the only
+	// UNIQUE-shaped constraint on the synth provenance tuple in
+	// this schema is migration 0013's
+	// episode_synthetic_positive_feedback_uidx, so 23505 from
+	// this query MUST be that index firing.
+	if pqErr.Code != "23505" {
+		t.Fatalf("expected SQLSTATE 23505 (unique_violation) from partial UNIQUE; got SQLSTATE %s (%s)", pqErr.Code, pqErr.Message)
+	}
+
+	// After the rejected duplicate, the table still has exactly
+	// one synth -- the partial UNIQUE held the line.
+	if n := mustCountSyntheticPositives(ctx, t, fix.db); n != 1 {
+		t.Fatalf("expected 1 synthetic_positive after partial-UNIQUE rejection, got %d", n)
+	}
+}
+
+// ────────────────────────────────────────────────────────────
+// Stage 6.3 latest-EU-state proof: a parent whose LATEST EU is
+// NOT human_corrected (e.g. an operator filed human_corrected
+// and then a superseding EU flipped it back to 'success') MUST
+// NOT be promoted to synthetic_positive. The candidate scan's
+// LATERAL LIMIT 1 + new_outcome='human_corrected' predicate
+// enforces this; without it (the iter-1 EXISTS clause) the
+// candidate would still match.
+//
+// implementation-plan.md §6.3 (line 1060) refers to "scan
+// EpisodeUpdate rows since the last run for
+// new_outcome='human_corrected'"; the package doc.go and
+// architecture §5.3.2 establish that EUs are append-only and
+// "current status" is the LATEST EU's new_outcome.
+// ────────────────────────────────────────────────────────────
+
+func TestTick_supersedingEpisodeUpdateBlocksPromotion(t *testing.T) {
+	fix := openConsolFixture(t)
+	defer fix.cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), intTestDBTimeout)
+	defer cancel()
+
+	repoID := seedRepo(ctx, t, fix.db, "stage63e")
+	contextID := seedRecallContext(ctx, t, fix.db, repoID)
+	nodeID := seedNode(ctx, t, fix.db, repoID, randomFingerprint(t), "node-stage63e")
+
+	parentEpisodeID := seedEpisode(ctx, t, fix.db, repoID, contextID, nodeID)
+	_ = submitOperatorFeedback(ctx, t, fix.db, repoID, parentEpisodeID, `{"op":"corrected"}`)
+	// Operator retracted: file a superseding EU that flips
+	// new_outcome back to 'success'. The latest_eu LATERAL pick
+	// now lands on this row, NOT the prior human_corrected EU.
+	seedSupersedingEpisodeUpdate(ctx, t, fix.db, parentEpisodeID, "success")
+
+	svc := newConsolService(t, fix.db, 1)
+	res, err := svc.Tick(ctx)
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if res.SyntheticPositivesCreated != 0 {
+		t.Fatalf("parent's latest EU is 'success' (not 'human_corrected'); expected 0 synths, got %d", res.SyntheticPositivesCreated)
+	}
+	if n := mustCountSyntheticPositives(ctx, t, fix.db); n != 0 {
+		t.Fatalf("schema-level: expected 0 synthetic_positive rows after retraction, got %d", n)
+	}
 }

@@ -70,6 +70,29 @@ const (
 	// Episode); a positive value indicates the Consolidator
 	// has fallen behind the writers.
 	MetricConsolidatorEpisodeLag = "consolidator_episode_lag"
+
+	// MetricConsolidatorSyntheticPositivesCreatedTotal counts
+	// the `synthetic_positive` Episodes the Consolidator has
+	// emitted across the binary's lifetime, one per parent
+	// Episode newly marked `human_corrected` via EpisodeUpdate
+	// (Stage 6.3 / architecture §7.7 step 4). NOT bumped when
+	// a candidate is skipped because a prior tick already
+	// emitted the synth for that parent — only successful
+	// INSERTs increment this counter, so a flat counter
+	// signal means "no operator corrections this window",
+	// not "the synth phase is broken".
+	MetricConsolidatorSyntheticPositivesCreatedTotal = "consolidator_synthetic_positives_created_total"
+
+	// MetricConsolidatorSyntheticObservationsMirroredTotal
+	// counts the `observation` rows the synthetic-positive
+	// mirror step has appended (architecture §7.7 step 4 /
+	// G7 / C17). One row per parent-Episode Observation
+	// successfully copied onto the synth Episode. Used by
+	// operators to verify the mirror flow is preserving the
+	// parent's observation set when the synth episode count
+	// alone (above) does not give signal on the per-synth
+	// observation-set width.
+	MetricConsolidatorSyntheticObservationsMirroredTotal = "consolidator_synthetic_observations_mirrored_total"
 )
 
 // Metrics is the package's atomic-counter surface. Construct
@@ -91,6 +114,21 @@ type Metrics struct {
 	// into the gauge. We clamp negative reads to zero in
 	// LagSeconds for the operator-facing exposition.
 	episodeLagNanos atomic.Int64
+
+	// syntheticPositivesCreated counts every Stage 6.3
+	// `synthetic_positive` Episode this binary has emitted.
+	// Bumped exactly once per successful INSERT (no-op
+	// candidates that the WHERE NOT EXISTS gate filters
+	// silently are NOT counted -- the counter measures
+	// real work).
+	syntheticPositivesCreated atomic.Uint64
+
+	// syntheticObservationsMirrored counts every Observation
+	// row the synth phase has copied from a parent agent
+	// Episode onto its synth child. Bumped per mirrored
+	// row, so the per-synth fan-out is recoverable as
+	// `syntheticObservationsMirrored / syntheticPositivesCreated`.
+	syntheticObservationsMirrored atomic.Uint64
 }
 
 // NewMetrics returns a zero-initialised Metrics. The gauge
@@ -149,6 +187,30 @@ func (m *Metrics) AddSupportsAppended(n uint64) {
 	m.supportsAppended.Add(n)
 }
 
+// AddSyntheticPositivesCreated adds n to the
+// synthetic-positives-created counter. Called by
+// Service.emitSyntheticPositives once per successful
+// synthetic_positive Episode INSERT (Stage 6.3). No-op
+// candidates filtered by the WHERE NOT EXISTS gate do NOT
+// bump this counter.
+func (m *Metrics) AddSyntheticPositivesCreated(n uint64) {
+	if n == 0 {
+		return
+	}
+	m.syntheticPositivesCreated.Add(n)
+}
+
+// AddSyntheticObservationsMirrored adds n to the
+// synthetic-observations-mirrored counter. Called by
+// Service.emitSyntheticPositives once per emission with the
+// parent's observation row count.
+func (m *Metrics) AddSyntheticObservationsMirrored(n uint64) {
+	if n == 0 {
+		return
+	}
+	m.syntheticObservationsMirrored.Add(n)
+}
+
 // SetEpisodeLag sets the lag gauge. Called by Service.Tick at
 // the end of a successful run; the value is the wall-clock
 // delta between `max(Episode.created_at)` and the new
@@ -192,6 +254,18 @@ func (m *Metrics) SupportsAppendedTotal() uint64 {
 	return m.supportsAppended.Load()
 }
 
+// SyntheticPositivesCreatedTotal returns the
+// consolidator_synthetic_positives_created_total value.
+func (m *Metrics) SyntheticPositivesCreatedTotal() uint64 {
+	return m.syntheticPositivesCreated.Load()
+}
+
+// SyntheticObservationsMirroredTotal returns the
+// consolidator_synthetic_observations_mirrored_total value.
+func (m *Metrics) SyntheticObservationsMirroredTotal() uint64 {
+	return m.syntheticObservationsMirrored.Load()
+}
+
 // EpisodeLag returns the current lag as a time.Duration. May
 // be negative under the rare partial-failure case described in
 // the SetEpisodeLag doc; LagSeconds clamps to zero for the
@@ -223,11 +297,13 @@ func (m *Metrics) LagSeconds() float64 {
 // does exactly that.
 func (m *Metrics) Snapshot() map[string]uint64 {
 	return map[string]uint64{
-		MetricConsolidatorRunsTotal:             m.runs.Load(),
-		MetricConsolidatorErrorsTotal:           m.errors.Load(),
-		MetricConsolidatorEpisodesScannedTotal:  m.episodesScanned.Load(),
-		MetricConsolidatorConceptsCreatedTotal:  m.conceptsCreated.Load(),
-		MetricConsolidatorVersionsAppendedTotal: m.versionsAppended.Load(),
-		MetricConsolidatorSupportsAppendedTotal: m.supportsAppended.Load(),
+		MetricConsolidatorRunsTotal:                          m.runs.Load(),
+		MetricConsolidatorErrorsTotal:                        m.errors.Load(),
+		MetricConsolidatorEpisodesScannedTotal:               m.episodesScanned.Load(),
+		MetricConsolidatorConceptsCreatedTotal:               m.conceptsCreated.Load(),
+		MetricConsolidatorVersionsAppendedTotal:              m.versionsAppended.Load(),
+		MetricConsolidatorSupportsAppendedTotal:              m.supportsAppended.Load(),
+		MetricConsolidatorSyntheticPositivesCreatedTotal:     m.syntheticPositivesCreated.Load(),
+		MetricConsolidatorSyntheticObservationsMirroredTotal: m.syntheticObservationsMirrored.Load(),
 	}
 }

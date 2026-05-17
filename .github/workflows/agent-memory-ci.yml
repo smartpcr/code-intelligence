@@ -1,0 +1,258 @@
+name: agent-memory CI
+
+# Runs on every PR that touches the agent-memory service tree or any
+# of the workstream branches that converge into `feature/memory`.
+# Implementation-plan.md Stage 1.1 requires the full `make
+# lint/build/test` triple to pass plus a `docker compose up -d` +
+# healthcheck sweep over the three local dependencies.
+
+on:
+  pull_request:
+    branches:
+      - feature/memory
+      - "ws/code-intelligence-AGENT-MEMORY/**"
+    paths:
+      - "services/agent-memory/**"
+      - ".github/workflows/agent-memory-ci.yml"
+      - ".editorconfig"
+      - ".pre-commit-config.yaml"
+      - ".yamllint.yaml"
+  push:
+    branches:
+      - feature/memory
+      - "ws/code-intelligence-AGENT-MEMORY/**"
+    paths:
+      - "services/agent-memory/**"
+      - ".github/workflows/agent-memory-ci.yml"
+      - ".editorconfig"
+      - ".pre-commit-config.yaml"
+      - ".yamllint.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-memory-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-build-test:
+    name: lint + build + test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/agent-memory
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/agent-memory/go.mod
+          # cache-dependency-path requires go.sum to exist; the
+          # scaffold has no third-party deps yet so we skip the
+          # explicit cache key and let setup-go's default kick in.
+          cache: true
+
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.61.0
+          working-directory: services/agent-memory
+          # `install-only: true` makes the action install the binary
+          # and prime its cache without invoking `golangci-lint run`.
+          # The actual lint pass is driven by `make lint` below so
+          # local dev and CI exercise the exact same Makefile path
+          # exactly once per build.
+          install-only: true
+          install-mode: binary
+          skip-cache: false
+
+      - name: make lint
+        run: make lint
+
+      - name: make build
+        run: make build
+
+      - name: make test
+        # Acceptance scenario "CI green on empty tree" calls out
+        # `make lint && make build && make test`; we run the
+        # portable `test` target first so a regression there is
+        # caught before the race-detector pass.
+        run: make test
+
+      - name: make test-race
+        # `make test` is portable (no `-race`); `make test-race`
+        # adds the race detector and is what we run on Linux
+        # runners where CGO is available.
+        run: make test-race
+
+      - name: Install protoc compiler
+        # `make proto` needs the protoc binary; the Go protoc
+        # plugins themselves are installed by `make proto-tools`
+        # in the next step. Pin protoc to the exact version
+        # whose name appears in the checked-in `.pb.go` files'
+        # `// versions:` header (currently `v7.34.1` — the
+        # `libprotoc 34.1` release in the v3-dropped numbering).
+        # Using `arduino/setup-protoc` (instead of apt-get, which
+        # ships an older 3.21.x and would diff the version
+        # header on every CI run) keeps the proto-drift gate
+        # below from chasing tooling-version noise.
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "34.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: make proto-tools
+        # Install pinned `protoc-gen-go` and `protoc-gen-go-grpc`
+        # binaries into `$GOPATH/bin` so `make proto` can find
+        # them in `$PATH`. Versions are pinned in the Makefile
+        # to match the `// versions:` header in the checked-in
+        # generated files.
+        run: |
+          make proto-tools
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: make proto && verify generated bindings are in sync
+        # Regenerate `proto/agent/*.pb.go` from `proto/agent.proto`
+        # and fail CI if the working tree shows any diff — that
+        # means a contributor edited the .proto IDL without
+        # running `make proto`, leaving the checked-in bindings
+        # stale. Together with `make proto-tools` (pinned plugin
+        # versions) this is the structural gate against generated
+        # binding drift (resolves iter-8 evaluator finding #1).
+        run: |
+          set -euo pipefail
+          make proto
+          if ! git diff --quiet -- proto/agent/; then
+            echo "::error::generated proto bindings are out of sync with proto/agent.proto"
+            echo "::error::run \`make proto\` locally and commit the regenerated files"
+            git --no-pager diff -- proto/agent/
+            exit 1
+          fi
+
+  pre-commit:
+    name: pre-commit hooks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/agent-memory/go.mod
+          cache: true
+
+      - name: Run pre-commit
+        uses: pre-commit/action@v3.0.1
+
+  integration-stack:
+    name: docker compose stack healthchecks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/agent-memory
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/agent-memory/go.mod
+          cache: true
+
+      - name: docker compose up
+        working-directory: services/agent-memory/deploy/local
+        run: docker compose up -d --build
+
+      - name: Wait for healthchecks
+        working-directory: services/agent-memory/deploy/local
+        # Poll `docker inspect` for the Health.Status field on each
+        # of the three containers. Bail out after 60s -- per
+        # implementation-plan.md Stage 1.1 test scenario "local
+        # stack healthchecks" the SLA is "up to 60 s".
+        run: |
+          set -euo pipefail
+          containers="agent_memory_postgres agent_memory_qdrant agent_memory_otel"
+          deadline=$(( $(date +%s) + 60 ))
+          while :; do
+            all_healthy=true
+            for c in $containers; do
+              status=$(docker inspect -f '{{.State.Health.Status}}' "$c" 2>/dev/null || echo "missing")
+              echo "  $c -> $status"
+              if [ "$status" != "healthy" ]; then
+                all_healthy=false
+              fi
+            done
+            if $all_healthy; then
+              echo "all three containers are healthy"
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::healthchecks did not converge within 60s"
+              docker compose ps
+              docker compose logs --tail=200
+              exit 1
+            fi
+            sleep 3
+          done
+          docker compose ps
+
+      - name: Probe external service endpoints
+        # The otel-collector-contrib image is distroless, so its
+        # container HEALTHCHECK can only smoke-test the binary --
+        # it cannot reach the :13133 health_check listener from
+        # inside the container. Re-probe each public endpoint from
+        # the runner host so we actually exercise the listeners
+        # called out in implementation-plan.md Stage 1.1
+        # ("`pg_isready`, Qdrant `/healthz`, OTel `:13133`").
+        run: |
+          set -euo pipefail
+          echo "==> pg_isready"
+          docker exec agent_memory_postgres pg_isready -U agent_memory -d agent_memory
+          echo "==> Qdrant /healthz"
+          curl -fsS --max-time 5 http://localhost:6333/healthz
+          echo ""
+          echo "==> OTel :13133"
+          curl -fsS --max-time 5 http://localhost:13133/ -o /dev/null -w "HTTP %{http_code}\n"
+
+      - name: Assert PostgreSQL extensions present
+        working-directory: services/agent-memory/deploy/local
+        # Stage 1.1 test scenario: "PostgreSQL extensions present".
+        # Must show both `pgcrypto` and `pg_partman` in pg_extension.
+        run: |
+          set -euo pipefail
+          out=$(docker exec agent_memory_postgres \
+            psql -U agent_memory -d agent_memory -At \
+            -c "SELECT extname FROM pg_extension ORDER BY extname")
+          echo "$out"
+          echo "$out" | grep -qx pgcrypto || { echo "::error::pgcrypto missing"; exit 1; }
+          echo "$out" | grep -qx pg_partman || { echo "::error::pg_partman missing"; exit 1; }
+
+      - name: make test (against live stack)
+        env:
+          AGENT_MEMORY_PG_URL: postgres://agent_memory:agent_memory@localhost:5432/agent_memory?sslmode=disable
+          AGENT_MEMORY_QDRANT_URL: http://localhost:6333
+          AGENT_MEMORY_OTEL_ENDPOINT: localhost:4317
+        run: make test
+
+      - name: make test-race (against live stack)
+        env:
+          AGENT_MEMORY_PG_URL: postgres://agent_memory:agent_memory@localhost:5432/agent_memory?sslmode=disable
+          AGENT_MEMORY_QDRANT_URL: http://localhost:6333
+          AGENT_MEMORY_OTEL_ENDPOINT: localhost:4317
+        run: make test-race
+
+      - name: docker compose down
+        if: always()
+        working-directory: services/agent-memory/deploy/local
+        run: docker compose down -v

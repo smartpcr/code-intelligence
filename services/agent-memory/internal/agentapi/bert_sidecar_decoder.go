@@ -110,6 +110,32 @@ const BertSidecarURIPrefix = "file://"
 // integration tests against a slower mock.
 const DefaultBertSidecarTimeout = 750 * time.Millisecond
 
+// bertSidecarMaxResponseBytes caps the size of the per-recall
+// /rank response body the decoder will buffer into memory
+// before decoding. The success payload is shaped like
+// `{"scored":[{"point_id":"<graph-id>","score":0.91}, ...]}`
+// — roughly ~80 bytes per scored entry — so 4 MiB admits
+// tens of thousands of scored rows, well beyond any realistic
+// recall fan-out, while preventing a misbehaving or
+// compromised sidecar from streaming an unbounded response
+// body that would OOM the agent-api process. Mirrors the
+// defence-in-depth caps elsewhere in this repository:
+//   - rerankertrainer.SidecarTrainer.MaxResponseBytes (train-time
+//     side of the same sidecar wire, 16 MiB default).
+//   - openAIMaxResponseBytes in summarize_openai.go (1 MiB).
+//   - the 4 MiB cap on the qdrant search response in
+//     internal/embedding/qdrant.go.
+//
+// On overflow, json.Decoder sees the stream end mid-token and
+// returns an unexpected-EOF error from Decode — which the
+// caller surfaces as a normal sidecar failure, falling back to
+// V0 ordering via the existing Rank() lossy contract (or
+// returning the error to RankErr / RankWithQueryErr so the
+// PublishedReranker wrapper pins reranker_model_version to the
+// cold-start scorer). That is the same graceful-degradation
+// path used for any other malformed response.
+const bertSidecarMaxResponseBytes = 4 << 20
+
 // BertSidecarConfig configures the decoder. Nil-valued
 // fields take the documented defaults.
 type BertSidecarConfig struct {
@@ -447,8 +473,16 @@ func (r *bertSidecarReranker) callSidecar(ctx context.Context, query string, can
 		return nil, fmt.Errorf("agentapi: bert sidecar: status %d: %s", resp.StatusCode, string(snippet))
 	}
 
+	// Bound the response body size BEFORE decoding so a
+	// misbehaving or compromised sidecar cannot OOM the
+	// agent-api process by streaming a multi-GB body into
+	// json.Decoder. The train-time side already bounds with
+	// rerankertrainer.SidecarTrainer.MaxResponseBytes; this
+	// is the matching defence on the recall path. See
+	// bertSidecarMaxResponseBytes (4 MiB) for the cap rationale
+	// and the graceful-degradation behaviour on overflow.
 	var decoded bertRankResponse
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, bertSidecarMaxResponseBytes)).Decode(&decoded); err != nil {
 		return nil, fmt.Errorf("agentapi: bert sidecar: decode response: %w", err)
 	}
 	if len(decoded.Scored) == 0 {

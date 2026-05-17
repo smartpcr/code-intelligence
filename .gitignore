@@ -32,6 +32,16 @@ services/agent-memory/cmd/**/agent-memory.exe
 services/agent-memory/cmd/**/*-linux
 services/agent-memory/cmd/**/*-darwin
 services/agent-memory/cmd/**/*-windows.exe
+# Catch `go build ./cmd/<name>` invocations from the service
+# root (which emit `services/agent-memory/<name>` /
+# `services/agent-memory/<name>.exe` instead of landing under
+# the cmd subdir).
+services/agent-memory/*.exe
+services/agent-memory/concept-promoter
+services/agent-memory/consolidator
+services/agent-memory/repoindexer
+services/agent-memory/trace-log-pruner
+services/agent-memory/span-ingestor
 
 # Go workspace files -- the monorepo uses a single module per
 # service rather than a `go.work` file.

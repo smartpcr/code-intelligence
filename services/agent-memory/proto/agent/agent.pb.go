@@ -531,25 +531,36 @@ func (x *RecallResponse) GetFiltered() int32 {
 	return 0
 }
 
-// Placeholder request / response messages for the Observe
-// and Expand verbs. They are defined here so the gRPC server
-// can register a single service descriptor today; the body
-// shapes will firm up as Stages 5.2 / 5.3 land. The Stage 5.4
-// `Summarize{Request,Response}` + `Citation` messages below
-// are NOT placeholders — they carry the full Stage 5.4 wire
-// contract that `internal/agentapi/summarize.go` consumes.
-type ObserveRequest struct {
+// ObservationRef is the wire shape for a single
+// `observation_refs[]` entry on `ObserveRequest`. It mirrors
+// the `internal/agentapi/observe.go.ObservationRef` Go
+// contract that `grpc_server.go` converts to / from.
+//
+// Closed-set rules:
+//   - `role` MUST be one of {node_hit, edge_hit,
+//     call_edge_hit, concept_hit}. `degraded_recall_context`
+//     is server-only per C23 and is REJECTED on the wire.
+//   - Exactly one of {node_id, edge_id, concept_id} MUST be
+//     set, and it MUST match the role:
+//   - role=node_hit                       → node_id
+//   - role=edge_hit / call_edge_hit       → edge_id
+//   - role=concept_hit                    → concept_id
+//   - `weight` is the optional reward signal carried back
+//     onto the `Observation.weight` column; defaults to 0.
+type ObservationRef struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	ContextId     string                 `protobuf:"bytes,1,opt,name=context_id,json=contextId,proto3" json:"context_id,omitempty"`
-	Outcome       string                 `protobuf:"bytes,2,opt,name=outcome,proto3" json:"outcome,omitempty"`
-	Actor         string                 `protobuf:"bytes,3,opt,name=actor,proto3" json:"actor,omitempty"`
+	Role          string                 `protobuf:"bytes,1,opt,name=role,proto3" json:"role,omitempty"`
+	NodeId        string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	EdgeId        string                 `protobuf:"bytes,3,opt,name=edge_id,json=edgeId,proto3" json:"edge_id,omitempty"`
+	ConceptId     string                 `protobuf:"bytes,4,opt,name=concept_id,json=conceptId,proto3" json:"concept_id,omitempty"`
+	Weight        float64                `protobuf:"fixed64,5,opt,name=weight,proto3" json:"weight,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ObservationRef) Reset() {
 	*x = ObservationRef{}
-	mi := &file_proto_agent_proto_msgTypes[5]
+	mi := &file_agent_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -561,7 +572,7 @@ func (x *ObservationRef) String() string {
 func (*ObservationRef) ProtoMessage() {}
 
 func (x *ObservationRef) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[5]
+	mi := &file_agent_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -574,7 +585,7 @@ func (x *ObservationRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ObservationRef.ProtoReflect.Descriptor instead.
 func (*ObservationRef) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{5}
+	return file_agent_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *ObservationRef) GetRole() string {
@@ -674,7 +685,7 @@ type ObserveRequest struct {
 
 func (x *ObserveRequest) Reset() {
 	*x = ObserveRequest{}
-	mi := &file_agent_proto_msgTypes[5]
+	mi := &file_agent_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -686,7 +697,7 @@ func (x *ObserveRequest) String() string {
 func (*ObserveRequest) ProtoMessage() {}
 
 func (x *ObserveRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[5]
+	mi := &file_agent_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -699,7 +710,7 @@ func (x *ObserveRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ObserveRequest.ProtoReflect.Descriptor instead.
 func (*ObserveRequest) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{5}
+	return file_agent_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *ObserveRequest) GetContextId() string {
@@ -797,7 +808,7 @@ type ObserveResponse struct {
 
 func (x *ObserveResponse) Reset() {
 	*x = ObserveResponse{}
-	mi := &file_agent_proto_msgTypes[6]
+	mi := &file_agent_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -809,7 +820,7 @@ func (x *ObserveResponse) String() string {
 func (*ObserveResponse) ProtoMessage() {}
 
 func (x *ObserveResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[6]
+	mi := &file_agent_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -822,7 +833,7 @@ func (x *ObserveResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ObserveResponse.ProtoReflect.Descriptor instead.
 func (*ObserveResponse) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{6}
+	return file_agent_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ObserveResponse) GetEpisodeId() string {
@@ -842,6 +853,13 @@ func (x *ObserveResponse) GetDegraded() bool {
 func (x *ObserveResponse) GetDegradedReason() string {
 	if x != nil {
 		return x.DegradedReason
+	}
+	return ""
+}
+
+func (x *ObserveResponse) GetEpisodeGroupId() string {
+	if x != nil {
+		return x.EpisodeGroupId
 	}
 	return ""
 }
@@ -866,15 +884,39 @@ type ExpandRequest struct {
 	//   - depth < 0 is REJECTED with INVALID_ARGUMENT.
 	//   - depth > the hard ceiling (10) is clamped down
 	//     server-side per the §8.3 RPS budget.
-	Depth         int32  `protobuf:"varint,3,opt,name=depth,proto3" json:"depth,omitempty"`
-	RepoId        string `protobuf:"bytes,4,opt,name=repo_id,json=repoId,proto3" json:"repo_id,omitempty"`
+	Depth  int32  `protobuf:"varint,3,opt,name=depth,proto3" json:"depth,omitempty"`
+	RepoId string `protobuf:"bytes,4,opt,name=repo_id,json=repoId,proto3" json:"repo_id,omitempty"`
+	// max_nodes / max_edges are the per-call payload caps.
+	// Mirrors `MaxNodes` / `MaxEdges` on the Go
+	// `ExpandRequest` (`internal/agentapi/expand.go`). The
+	// server contract is:
+	//   - <= 0 selects the package-level defaults
+	//     (`DefaultExpandMaxNodes` = 200,
+	//     `DefaultExpandMaxEdges` = 400).
+	//   - A POSITIVE value larger than the per-service
+	//     effective ceiling (the `WithExpandMaxNodes` /
+	//     `WithExpandMaxEdges` operator override if set,
+	//     else the package default) is CLAMPED DOWN to
+	//     that ceiling to keep the §8.3 RPS budget safe
+	//     AND to bound the `bfsExpand` map preallocations
+	//     (a caller asking for a million edges gets the
+	//     configured cap, not a million-edge response).
+	//   - A POSITIVE value SMALLER than the ceiling is
+	//     honoured verbatim — callers use this to request
+	//     a tighter budget than the server default.
+	//
+	// When the BFS exhausts either cap with work still
+	// remaining, `ExpandResponse.truncated` is set so the
+	// caller knows the answer is partial.
+	MaxNodes      int32 `protobuf:"varint,5,opt,name=max_nodes,json=maxNodes,proto3" json:"max_nodes,omitempty"`
+	MaxEdges      int32 `protobuf:"varint,6,opt,name=max_edges,json=maxEdges,proto3" json:"max_edges,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ExpandRequest) Reset() {
 	*x = ExpandRequest{}
-	mi := &file_agent_proto_msgTypes[7]
+	mi := &file_agent_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -886,7 +928,7 @@ func (x *ExpandRequest) String() string {
 func (*ExpandRequest) ProtoMessage() {}
 
 func (x *ExpandRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[7]
+	mi := &file_agent_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -899,7 +941,7 @@ func (x *ExpandRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExpandRequest.ProtoReflect.Descriptor instead.
 func (*ExpandRequest) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{7}
+	return file_agent_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ExpandRequest) GetNodeId() string {
@@ -928,6 +970,20 @@ func (x *ExpandRequest) GetRepoId() string {
 		return x.RepoId
 	}
 	return ""
+}
+
+func (x *ExpandRequest) GetMaxNodes() int32 {
+	if x != nil {
+		return x.MaxNodes
+	}
+	return 0
+}
+
+func (x *ExpandRequest) GetMaxEdges() int32 {
+	if x != nil {
+		return x.MaxEdges
+	}
+	return 0
 }
 
 type ExpandResponse struct {
@@ -960,7 +1016,7 @@ type ExpandResponse struct {
 
 func (x *ExpandResponse) Reset() {
 	*x = ExpandResponse{}
-	mi := &file_agent_proto_msgTypes[8]
+	mi := &file_agent_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -972,7 +1028,7 @@ func (x *ExpandResponse) String() string {
 func (*ExpandResponse) ProtoMessage() {}
 
 func (x *ExpandResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[8]
+	mi := &file_agent_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -985,7 +1041,7 @@ func (x *ExpandResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExpandResponse.ProtoReflect.Descriptor instead.
 func (*ExpandResponse) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{8}
+	return file_agent_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ExpandResponse) GetEdges() []*EdgeCard {
@@ -1016,6 +1072,27 @@ func (x *ExpandResponse) GetDegradedReason() string {
 	return ""
 }
 
+func (x *ExpandResponse) GetRootNodeId() string {
+	if x != nil {
+		return x.RootNodeId
+	}
+	return ""
+}
+
+func (x *ExpandResponse) GetNodes() []*NodeCard {
+	if x != nil {
+		return x.Nodes
+	}
+	return nil
+}
+
+func (x *ExpandResponse) GetTruncated() bool {
+	if x != nil {
+		return x.Truncated
+	}
+	return false
+}
+
 // SummarizeRequest is the input shape for `agent.summarize`
 // (architecture.md §6.1.4). Exactly one of `node_id` /
 // `concept_id` MUST be supplied; both empty or both set
@@ -1044,7 +1121,7 @@ type SummarizeRequest struct {
 
 func (x *SummarizeRequest) Reset() {
 	*x = SummarizeRequest{}
-	mi := &file_agent_proto_msgTypes[9]
+	mi := &file_agent_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1056,7 +1133,7 @@ func (x *SummarizeRequest) String() string {
 func (*SummarizeRequest) ProtoMessage() {}
 
 func (x *SummarizeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[9]
+	mi := &file_agent_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1069,7 +1146,7 @@ func (x *SummarizeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SummarizeRequest.ProtoReflect.Descriptor instead.
 func (*SummarizeRequest) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{9}
+	return file_agent_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *SummarizeRequest) GetNodeId() string {
@@ -1124,7 +1201,7 @@ type Citation struct {
 
 func (x *Citation) Reset() {
 	*x = Citation{}
-	mi := &file_proto_agent_proto_msgTypes[10]
+	mi := &file_agent_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1136,7 +1213,7 @@ func (x *Citation) String() string {
 func (*Citation) ProtoMessage() {}
 
 func (x *Citation) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[10]
+	mi := &file_agent_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1149,7 +1226,7 @@ func (x *Citation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Citation.ProtoReflect.Descriptor instead.
 func (*Citation) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{10}
+	return file_agent_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *Citation) GetNodeId() string {
@@ -1223,7 +1300,7 @@ type SummarizeResponse struct {
 
 func (x *SummarizeResponse) Reset() {
 	*x = SummarizeResponse{}
-	mi := &file_proto_agent_proto_msgTypes[11]
+	mi := &file_agent_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1235,7 +1312,7 @@ func (x *SummarizeResponse) String() string {
 func (*SummarizeResponse) ProtoMessage() {}
 
 func (x *SummarizeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_agent_proto_msgTypes[11]
+	mi := &file_agent_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1248,7 +1325,7 @@ func (x *SummarizeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SummarizeResponse.ProtoReflect.Descriptor instead.
 func (*SummarizeResponse) Descriptor() ([]byte, []int) {
-	return file_proto_agent_proto_rawDescGZIP(), []int{11}
+	return file_agent_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *SummarizeResponse) GetSummaryMd() string {
@@ -1300,7 +1377,7 @@ func (x *SummarizeResponse) GetCitations() []*Citation {
 	return nil
 }
 
-var File_proto_agent_proto protoreflect.FileDescriptor
+var File_agent_proto protoreflect.FileDescriptor
 
 const file_agent_proto_rawDesc = "" +
 	"\n" +
@@ -1368,18 +1445,25 @@ const file_agent_proto_rawDesc = "" +
 	"\n" +
 	"episode_id\x18\x01 \x01(\tR\tepisodeId\x12\x1a\n" +
 	"\bdegraded\x18\x02 \x01(\bR\bdegraded\x12'\n" +
-	"\x0fdegraded_reason\x18\x03 \x01(\tR\x0edegradedReason\"u\n" +
+	"\x0fdegraded_reason\x18\x03 \x01(\tR\x0edegradedReason\x12(\n" +
+	"\x10episode_group_id\x18\x04 \x01(\tR\x0eepisodeGroupId\"\xaf\x01\n" +
 	"\rExpandRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1c\n" +
 	"\tdirection\x18\x02 \x01(\tR\tdirection\x12\x14\n" +
 	"\x05depth\x18\x03 \x01(\x05R\x05depth\x12\x17\n" +
-	"\arepo_id\x18\x04 \x01(\tR\x06repoId\"\x88\x02\n" +
+	"\arepo_id\x18\x04 \x01(\tR\x06repoId\x12\x1b\n" +
+	"\tmax_nodes\x18\x05 \x01(\x05R\bmaxNodes\x12\x1b\n" +
+	"\tmax_edges\x18\x06 \x01(\x05R\bmaxEdges\"\x88\x02\n" +
 	"\x0eExpandResponse\x12(\n" +
 	"\x05edges\x18\x01 \x03(\v2\x12.agent.v1.EdgeCardR\x05edges\x12\x1d\n" +
 	"\n" +
 	"context_id\x18\x02 \x01(\tR\tcontextId\x12\x1a\n" +
 	"\bdegraded\x18\x03 \x01(\bR\bdegraded\x12'\n" +
-	"\x0fdegraded_reason\x18\x04 \x01(\tR\x0edegradedReason\"\x82\x01\n" +
+	"\x0fdegraded_reason\x18\x04 \x01(\tR\x0edegradedReason\x12 \n" +
+	"\froot_node_id\x18\x05 \x01(\tR\n" +
+	"rootNodeId\x12(\n" +
+	"\x05nodes\x18\x06 \x03(\v2\x12.agent.v1.NodeCardR\x05nodes\x12\x1c\n" +
+	"\ttruncated\x18\a \x01(\bR\ttruncated\"\x82\x01\n" +
 	"\x10SummarizeRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1d\n" +
 	"\n" +
@@ -1424,40 +1508,43 @@ func file_agent_proto_rawDescGZIP() []byte {
 	return file_agent_proto_rawDescData
 }
 
-var file_proto_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
-var file_proto_agent_proto_goTypes = []any{
+var file_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_agent_proto_goTypes = []any{
 	(*RecallRequest)(nil),     // 0: agent.v1.RecallRequest
 	(*NodeCard)(nil),          // 1: agent.v1.NodeCard
 	(*EdgeCard)(nil),          // 2: agent.v1.EdgeCard
 	(*ConceptCard)(nil),       // 3: agent.v1.ConceptCard
 	(*RecallResponse)(nil),    // 4: agent.v1.RecallResponse
-	(*ObserveRequest)(nil),    // 5: agent.v1.ObserveRequest
-	(*ObserveResponse)(nil),   // 6: agent.v1.ObserveResponse
-	(*ExpandRequest)(nil),     // 7: agent.v1.ExpandRequest
-	(*ExpandResponse)(nil),    // 8: agent.v1.ExpandResponse
-	(*SummarizeRequest)(nil),  // 9: agent.v1.SummarizeRequest
-	(*Citation)(nil),          // 10: agent.v1.Citation
-	(*SummarizeResponse)(nil), // 11: agent.v1.SummarizeResponse
+	(*ObservationRef)(nil),    // 5: agent.v1.ObservationRef
+	(*ObserveRequest)(nil),    // 6: agent.v1.ObserveRequest
+	(*ObserveResponse)(nil),   // 7: agent.v1.ObserveResponse
+	(*ExpandRequest)(nil),     // 8: agent.v1.ExpandRequest
+	(*ExpandResponse)(nil),    // 9: agent.v1.ExpandResponse
+	(*SummarizeRequest)(nil),  // 10: agent.v1.SummarizeRequest
+	(*Citation)(nil),          // 11: agent.v1.Citation
+	(*SummarizeResponse)(nil), // 12: agent.v1.SummarizeResponse
 }
 var file_agent_proto_depIdxs = []int32{
 	1,  // 0: agent.v1.RecallResponse.nodes:type_name -> agent.v1.NodeCard
 	2,  // 1: agent.v1.RecallResponse.edges:type_name -> agent.v1.EdgeCard
 	3,  // 2: agent.v1.RecallResponse.concepts:type_name -> agent.v1.ConceptCard
-	2,  // 3: agent.v1.ExpandResponse.edges:type_name -> agent.v1.EdgeCard
-	10, // 4: agent.v1.SummarizeResponse.citations:type_name -> agent.v1.Citation
-	0,  // 5: agent.v1.AgentService.Recall:input_type -> agent.v1.RecallRequest
-	5,  // 6: agent.v1.AgentService.Observe:input_type -> agent.v1.ObserveRequest
-	7,  // 7: agent.v1.AgentService.Expand:input_type -> agent.v1.ExpandRequest
-	9,  // 8: agent.v1.AgentService.Summarize:input_type -> agent.v1.SummarizeRequest
-	4,  // 9: agent.v1.AgentService.Recall:output_type -> agent.v1.RecallResponse
-	6,  // 10: agent.v1.AgentService.Observe:output_type -> agent.v1.ObserveResponse
-	8,  // 11: agent.v1.AgentService.Expand:output_type -> agent.v1.ExpandResponse
-	11, // 12: agent.v1.AgentService.Summarize:output_type -> agent.v1.SummarizeResponse
-	9,  // [9:13] is the sub-list for method output_type
-	5,  // [5:9] is the sub-list for method input_type
-	5,  // [5:5] is the sub-list for extension type_name
-	5,  // [5:5] is the sub-list for extension extendee
-	0,  // [0:5] is the sub-list for field type_name
+	5,  // 3: agent.v1.ObserveRequest.observation_refs:type_name -> agent.v1.ObservationRef
+	2,  // 4: agent.v1.ExpandResponse.edges:type_name -> agent.v1.EdgeCard
+	1,  // 5: agent.v1.ExpandResponse.nodes:type_name -> agent.v1.NodeCard
+	11, // 6: agent.v1.SummarizeResponse.citations:type_name -> agent.v1.Citation
+	0,  // 7: agent.v1.AgentService.Recall:input_type -> agent.v1.RecallRequest
+	6,  // 8: agent.v1.AgentService.Observe:input_type -> agent.v1.ObserveRequest
+	8,  // 9: agent.v1.AgentService.Expand:input_type -> agent.v1.ExpandRequest
+	10, // 10: agent.v1.AgentService.Summarize:input_type -> agent.v1.SummarizeRequest
+	4,  // 11: agent.v1.AgentService.Recall:output_type -> agent.v1.RecallResponse
+	7,  // 12: agent.v1.AgentService.Observe:output_type -> agent.v1.ObserveResponse
+	9,  // 13: agent.v1.AgentService.Expand:output_type -> agent.v1.ExpandResponse
+	12, // 14: agent.v1.AgentService.Summarize:output_type -> agent.v1.SummarizeResponse
+	11, // [11:15] is the sub-list for method output_type
+	7,  // [7:11] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_agent_proto_init() }
@@ -1471,7 +1558,7 @@ func file_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agent_proto_rawDesc), len(file_agent_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   12,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

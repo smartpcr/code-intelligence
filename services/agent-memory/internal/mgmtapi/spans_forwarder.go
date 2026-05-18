@@ -138,11 +138,35 @@ type HTTPSpanForwarder struct {
 	// [ErrForwarderNotConfigured].
 	URL string
 	// Client is the HTTP client used for outbound POSTs.
-	// Nil falls back to a 10-second-timeout default.
+	// Nil falls back to the package-level
+	// [defaultHTTPSpanForwardClient] (10-second timeout)
+	// so connections — and the underlying http.Transport's
+	// keep-alive pool — are reused across Forward calls.
 	Client *http.Client
 	// Timeout overrides Client.Timeout when non-zero.
 	Timeout time.Duration
 }
+
+// defaultHTTPSpanForwardClient is the shared fallback used
+// when an [HTTPSpanForwarder] is constructed without an
+// explicit Client (e.g. `&HTTPSpanForwarder{URL: ...}` in
+// tests or in the default `buildSpanForwarder` wiring).
+//
+// Sharing a SINGLE [http.Client] — and therefore a single
+// [http.Transport] with its keep-alive connection pool —
+// across both forwarder instances AND every Forward call is
+// the whole point: under production load (one POST per span
+// batch) we want repeat POSTs to the same downstream OTLP
+// receiver to reuse the existing TCP+TLS session instead of
+// paying a fresh handshake per call. A prior draft allocated
+// `&http.Client{Timeout: 10 * time.Second}` inside Forward
+// every time `f.Client == nil`, which created a brand-new
+// http.Transport (with an empty pool) per call and silently
+// disabled connection reuse — caught in code review.
+//
+// The timeout matches what that prior draft used so behavior
+// for nil-Client callers is preserved.
+var defaultHTTPSpanForwardClient = &http.Client{Timeout: 10 * time.Second}
 
 // Forward implements [SpanForwarder]. Posts the entire body
 // in exactly one HTTP call.
@@ -158,7 +182,13 @@ func (f *HTTPSpanForwarder) Forward(ctx context.Context, batch SpansBatch) error
 	}
 	client := f.Client
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		// Use the package-level shared client so the
+		// underlying http.Transport's connection pool is
+		// reused across Forward calls (and across
+		// HTTPSpanForwarder instances). Allocating a fresh
+		// http.Client here would force a TCP+TLS handshake
+		// per POST under load.
+		client = defaultHTTPSpanForwardClient
 	}
 	if f.Timeout > 0 {
 		// Per-call deadline beats Client.Timeout when set;

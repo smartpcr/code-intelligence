@@ -249,6 +249,43 @@ func parseLimitParam(raw string) (int, bool, string) {
 	return n, true, ""
 }
 
+// ilikePatternEscaper escapes the three meta-characters
+// PostgreSQL's `ILIKE` operator interprets inside a pattern
+// when the default backslash escape is in effect:
+//
+//   - `\` is the escape character itself (per PG docs:
+//     "the default escape character is the backslash"), so a
+//     literal backslash in the operator-supplied substring
+//     must be doubled — otherwise an input ending in `\` would
+//     silently consume the closing `%` wildcard we wrap around
+//     the pattern and produce a confusing match.
+//   - `%` matches zero-or-more characters.
+//   - `_` matches exactly one character.
+//
+// Without this escape an operator typing `my_repo` into the
+// `filter` query parameter would match `my` + ANY char +
+// `repo` (e.g. `myXrepo`), which is surprising and arguably
+// a correctness bug — the parameter is documented as a
+// "substring", not "pattern". The replacement set deliberately
+// includes `\` so a future caller that explicitly opts into
+// `ILIKE ... ESCAPE` (or a Postgres configuration with a
+// different default) stays correct.
+//
+// Order in NewReplacer does not matter for correctness here:
+// `NewReplacer` matches against the ORIGINAL input string at
+// each position, never re-processing the replacement text, so
+// the `\` we inject as part of escaping `%` and `_` is not
+// itself re-escaped.
+var ilikePatternEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// escapeILIKEPattern returns `s` with PostgreSQL `ILIKE`
+// meta-characters escaped (see [ilikePatternEscaper]). Use
+// this on any operator-supplied substring BEFORE wrapping it
+// with surrounding `%` wildcards.
+func escapeILIKEPattern(s string) string {
+	return ilikePatternEscaper.Replace(s)
+}
+
 // parseCSVEnumList splits a comma-separated query value into
 // trimmed tokens, validating each against `allowed`. Empty
 // raw → (nil, true, ""). On any token outside `allowed`
@@ -380,6 +417,13 @@ func (h *Handler) handleReadRepos(w http.ResponseWriter, r *http.Request) {
 	// Optional `filter` — a free-form ILIKE substring against
 	// repo.url. Keeps the spec's `mgmt.read.repos(filter?)`
 	// arg minimally honoured without a query builder.
+	//
+	// The substring is escaped via [escapeILIKEPattern] before
+	// being wrapped with `%` wildcards so the operator-typed
+	// value is treated as a LITERAL substring. Without this,
+	// `_` and `%` in the input would silently behave as
+	// PostgreSQL ILIKE wildcards (e.g. `my_repo` would match
+	// `myXrepo`).
 	filter := strings.TrimSpace(r.URL.Query().Get("filter"))
 
 	const baseQ = `
@@ -406,7 +450,7 @@ func (h *Handler) handleReadRepos(w http.ResponseWriter, r *http.Request) {
 	args := []any{}
 	q := baseQ
 	if filter != "" {
-		args = append(args, "%"+filter+"%")
+		args = append(args, "%"+escapeILIKEPattern(filter)+"%")
 		q += " WHERE r.url ILIKE $1"
 	}
 	q += " ORDER BY r.created_at DESC LIMIT " + strconv.Itoa(limit)

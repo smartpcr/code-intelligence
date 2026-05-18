@@ -163,12 +163,15 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	_ "github.com/lib/pq"
 
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/degraded"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/mgmtapi"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/spaningestor"
 )
 
 func main() {
@@ -208,10 +211,48 @@ func main() {
 		os.Exit(2)
 	}
 	ingestSpansMetrics := mgmtapi.NewIngestSpansMetrics()
+	// Stage 8.1 — Degraded-mode contract wiring for the mgmt
+	// read path. A single per-verb counter is shared across
+	// every `mgmt.read.*` verb (architecture §6.3 row "mgmt.*
+	// reads"). The HealthSource adapter bridges the
+	// agentapi-side `spaningestor.NewPGHealthSource` (per-repo
+	// `repo_health` query) into the mgmt-side
+	// `MgmtHealthSource` shape, projecting the closed-set
+	// reason (empty string when the row is healthy). The
+	// fault injector is intentionally nil in production: it
+	// is a test-only seam wired by the §13 contract tests.
+	//
+	// Empty repoID — global-scope mgmt verbs (mgmt.read.repos,
+	// mgmt.read.observations, mgmt.read.concepts,
+	// mgmt.read.trace_observation) do not carry a `repo_id`
+	// filter; they read across the table. For those verbs the
+	// adapter scans `repo_health` for ANY currently-degraded
+	// repo and returns the highest-priority closed-set reason
+	// it finds. This is the iter-3 fix for evaluator finding
+	// #4: an operator probing global-scope verbs MUST be able
+	// to surface a real production health degradation, not
+	// just an injected one.
+	mgmtDegradedCounter := degraded.NewCounter()
+	healthSource := spaningestor.NewPGHealthSource(db)
+	mgmtHealthSource := mgmtapi.MgmtHealthSourceFunc(func(ctx context.Context, verb, repoID string) (string, error) {
+		if repoID == "" {
+			return queryGlobalDegradedReason(ctx, db)
+		}
+		st, err := healthSource.HealthForRepo(ctx, repoID)
+		if err != nil {
+			return "", err
+		}
+		if !st.Degraded {
+			return "", nil
+		}
+		return st.Reason, nil
+	})
 	handler := mgmtapi.NewHandler(db, verifier, resolver, mgmtapi.Options{
-		Logger:             logger,
-		SpanForwarder:      spanForwarder,
-		IngestSpansMetrics: ingestSpansMetrics,
+		Logger:               logger,
+		SpanForwarder:        spanForwarder,
+		IngestSpansMetrics:   ingestSpansMetrics,
+		DegradedHealthSource: mgmtHealthSource,
+		DegradedMetric:       mgmtDegradedCounter,
 	})
 
 	mux := http.NewServeMux()
@@ -220,7 +261,12 @@ func main() {
 	mux.Handle("/v1/episodes", handler)
 	mux.Handle("/v1/episodes/", handler)
 	mux.Handle("/v1/spans", handler)
-	mux.Handle("/metrics", mgmtapi.NewPrometheusMetricsHandler(ingestSpansMetrics))
+	// Stage 8.1 step 4 — compose ingest-spans + degraded
+	// metrics into a single `/metrics` response. The
+	// Prometheus parser tolerates two HELP/TYPE blocks for
+	// different metric names appearing in any order.
+	mux.Handle("/metrics", mgmtapi.NewCombinedMetricsHandler(
+		ingestSpansMetrics, mgmtDegradedCounter))
 	// Stage 7.5 -- mgmt.read.* GET endpoints. Each is a distinct
 	// top-level path so the Go ServeMux does NOT collapse them into
 	// /v1/. For the path-id endpoints (/v1/context/{id} etc.) we
@@ -302,6 +348,95 @@ func main() {
 		}
 		logger.Info("mgmt-api.serve.exit")
 	}
+}
+
+// queryGlobalDegradedReason runs the iter-3 / evaluator-#4
+// global-scope health probe. The mgmt verbs that read across
+// repos (mgmt.read.repos, mgmt.read.observations,
+// mgmt.read.concepts, mgmt.read.trace_observation) call the
+// `MgmtHealthSource` with an empty `repoID` because they have
+// no single repo to scope the probe to. This helper returns
+// the SINGLE highest-priority closed-set reason currently
+// surfaced anywhere in the fleet, matching the §8.1 overlay-
+// ordering table: a real outage (episodic_log / graph_store /
+// embedding_index) dominates a staleness or backpressure
+// signal so the operator sees the most severe degradation
+// across the fleet.
+//
+// The priority comparison is pushed into Postgres
+// (`ORDER BY <CASE priority expr> DESC LIMIT 1`) so the
+// query returns AT MOST ONE row regardless of how many repos
+// are degraded. The pre-fix shape streamed every degraded
+// row back and ranked them in Go, which became
+// O(degraded_repos) work per `mgmt.read.*` call and risked
+// turning the health probe into a bottleneck during the very
+// fleet-wide outage it is designed to surface (PR #42 review).
+//
+// Returns ("", nil) when no repo_health row is degraded
+// (the global healthy case). Returns ("", err) on a query
+// error so the caller can decide whether to log-and-pass
+// or hard-fail; the existing mgmt.read chokepoint treats
+// HealthSource errors as healthy + a Warn log so the
+// production §8.3 invariant ("mgmt reads never fail because
+// the health probe failed") holds.
+func queryGlobalDegradedReason(ctx context.Context, db *sql.DB) (string, error) {
+	var reason string
+	err := db.QueryRowContext(ctx, globalDegradedReasonQuery).Scan(&reason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("mgmt-api: global-health: %w", err)
+	}
+	return reason, nil
+}
+
+// globalDegradedReasonQuery is the package-init-time SQL
+// string queried by queryGlobalDegradedReason. The CASE WHEN
+// priority arms are generated from degraded.AllReasons() +
+// degraded.Priority() so the SQL stays in lockstep with the
+// §8.1 closed set defined in internal/degraded/reason.go —
+// adding a new reason there automatically participates in
+// the ordering without a second-source edit here. The
+// secondary sort on `degraded_reason::text` gives a stable
+// tiebreaker when two repos surface different reasons at the
+// same priority.
+var globalDegradedReasonQuery = buildGlobalDegradedReasonQuery()
+
+// buildGlobalDegradedReasonQuery constructs the
+// `SELECT ... ORDER BY CASE ... DESC LIMIT 1` query at init
+// time. Building the CASE expression once and reusing the
+// resulting string avoids per-call string assembly on every
+// global-scope mgmt.read.* call.
+//
+// SQL-injection safety: each reason literal is interpolated
+// with `'%s'`. The closed-set reasons are well-known
+// lower-case ASCII identifiers (`episodic_log_unavailable`,
+// `graph_store_unavailable`, …) so this is safe today; the
+// guard below fails-fast at package init if a future
+// addition to the closed set smuggles a single-quote /
+// backslash / NUL byte into the literal before the
+// malformed SQL can ever run.
+func buildGlobalDegradedReasonQuery() string {
+	var b strings.Builder
+	b.WriteString(`
+		SELECT degraded_reason::text
+		FROM repo_health
+		WHERE degraded = TRUE
+		  AND degraded_reason IS NOT NULL
+		ORDER BY CASE degraded_reason::text`)
+	for _, r := range degraded.AllReasons() {
+		if strings.ContainsAny(r, "'\\\x00") {
+			panic(fmt.Sprintf(
+				"mgmt-api: degraded reason %q contains a SQL-special character; "+
+					"extend buildGlobalDegradedReasonQuery to escape it", r))
+		}
+		fmt.Fprintf(&b, " WHEN '%s' THEN %d", r, degraded.Priority(r))
+	}
+	b.WriteString(` ELSE 0 END DESC, degraded_reason::text ASC
+		LIMIT 1
+	`)
+	return b.String()
 }
 
 // config is the env-derived configuration the binary uses.

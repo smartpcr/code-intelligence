@@ -115,8 +115,15 @@
 //	                                    summarize verb is wired but
 //	                                    the LLM is disabled; every
 //	                                    call surfaces the templated
-//	                                    fallback with
-//	                                    `degraded_reason=summariser_unavailable`.
+//	                                    fallback. Stage 8.1 closed
+//	                                    the wire reason to
+//	                                    `embedding_index_unavailable`
+//	                                    (the internal
+//	                                    `summariser_unavailable`
+//	                                    classifier is preserved in
+//	                                    the structured log
+//	                                    `degraded_reason_raw` field
+//	                                    for audit).
 //	AGENT_MEMORY_SUMMARISER_MODEL       (optional) Vendor model id
 //	                                    (e.g. `gpt-4o-mini`). Required
 //	                                    when AGENT_MEMORY_SUMMARISER_ENDPOINT
@@ -160,6 +167,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/agentapi"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/degraded"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/embedding"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphreader"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/recallcontext"
@@ -225,6 +233,35 @@ func main() {
 			return agentapi.HealthState{}, err
 		}
 		return agentapi.HealthState{Degraded: st.Degraded, Reason: st.Reason, Source: st.Source}, nil
+	})
+
+	// Stage 8.1 — Degraded-mode contract wiring (architecture
+	// §6.3 / §8.2 closed set / C22).  All four agent verbs
+	// (observe, recall, expand, summarize) share a single
+	// per-verb degraded counter — the operator dashboard
+	// aggregates by the `verb` + `reason` labels.  The fault
+	// injector is intentionally nil in production: it is a
+	// test-only seam wired by the §13 contract tests; leaving
+	// it nil here is what guarantees the production binary
+	// cannot be coerced into emitting an injected reason.
+	degradedCounter := degraded.NewCounter()
+	// Stage 8.1 — `consolidator_backpressure` source.  The
+	// `repo_health` table is the same per-repo health blob
+	// the recall path already consults via `NewPGHealthSource`
+	// above (see `healthSource` builder).  When that row
+	// surfaces `consolidator_backpressure`, the agent.observe
+	// path must STAMP the row before append AND still
+	// succeed (architecture §7.5 C24 invariant: observe never
+	// fails on consolidator pressure).  Reusing the same
+	// PG-backed health source keeps the lookup cheap (one
+	// indexed read per call) and avoids a second flag-store
+	// implementation.
+	consolidatorSource := agentapi.ConsolidatorBackpressureSourceFunc(func(ctx context.Context, repoID string) (bool, error) {
+		st, err := spaningestor.NewPGHealthSource(db).HealthForRepo(ctx, repoID)
+		if err != nil {
+			return false, err
+		}
+		return st.Degraded && st.Reason == degraded.ReasonConsolidatorBackpressure, nil
 	})
 
 	// Stage 5.1 + Stage 6.4 reranker wiring.
@@ -361,6 +398,10 @@ func main() {
 	opts := []agentapi.Option{
 		agentapi.WithLogger(logger),
 		agentapi.WithHealthSource(healthSource),
+		// Stage 8.1 — per-verb degraded counter shared across
+		// recall / expand / summarize.  Observe wires the
+		// same counter via WithObserveDegradedMetric below.
+		agentapi.WithDegradedMetric(degradedCounter),
 		agentapi.WithReranker(reranker),
 		agentapi.WithSeedExpander(expander),
 		agentapi.WithExpansionDepth(1),
@@ -440,6 +481,14 @@ func main() {
 		contextResolver := newContextResolverFromDB(db)
 		observeOpts := []agentapi.ObserveOption{
 			agentapi.WithObserveLogger(logger.With(slog.String("comp", "observe"))),
+			// Stage 8.1 — observe wires the shared per-verb
+			// counter AND the consolidator_backpressure
+			// probe so a sustained backpressure window is
+			// stamped on every Episode row + counted on the
+			// `agent.observe`/`consolidator_backpressure`
+			// metric series.  See architecture §7.5 C24.
+			agentapi.WithObserveDegradedMetric(degradedCounter),
+			agentapi.WithObserveConsolidatorBackpressure(consolidatorSource),
 		}
 		var observeMetrics *agentapi.Metrics
 		if cfg.WALDir != "" {
@@ -499,28 +548,41 @@ func main() {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok"))
 		})
-		// `/metrics` exposes the Prometheus text-format
+		// `/metrics` exposes BOTH the Prometheus text-format
 		// `observe_wal_buffer_depth` gauge mandated by the
-		// implementation plan §5.2. We hand-roll the
-		// text format instead of pulling in
-		// prometheus/client_golang because this binary
-		// exports exactly one metric and the Prometheus
-		// text format is intentionally trivial. The
-		// handler ALWAYS responds — depth reports 0 when
-		// no WAL is wired — so an operator's `curl
-		// /metrics | grep observe_wal_buffer_depth`
-		// works regardless of whether the WAL is
-		// configured (resolves evaluator iter-1 item #3).
-		mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		// implementation plan §5.2 AND the Stage 8.1 per-verb
+		// `agent_memory_degraded_total` counter that operators
+		// scrape into the §8.1 degraded dashboard (evaluator
+		// iter-3 finding #3). We hand-roll both bodies into a
+		// single response rather than pulling in
+		// prometheus/client_golang because this binary exports
+		// a tightly-bounded metric set and the Prometheus text
+		// format is intentionally trivial. The handler ALWAYS
+		// responds — depth reports 0 when no WAL is wired and
+		// the degraded counter pre-registers every closed-set
+		// (verb × reason) pair at zero so a `curl /metrics
+		// | grep agent_memory_degraded_total` works on a fresh
+		// binary that has never gone degraded.
+		degradedHandler := degraded.NewPrometheusHandler(degradedCounter)
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				w.Header().Set("Allow", "GET, HEAD")
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
 			var depth int64
 			if observeWAL != nil {
 				depth = observeWAL.Depth()
 			}
 			w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
+			if r.Method == http.MethodHead {
+				return
+			}
 			fmt.Fprintf(w, "# HELP observe_wal_buffer_depth Number of EpisodeAppendInput payloads buffered in the agent.observe WAL awaiting replay.\n")
 			fmt.Fprintf(w, "# TYPE observe_wal_buffer_depth gauge\n")
 			fmt.Fprintf(w, "observe_wal_buffer_depth %d\n", depth)
+			degradedHandler.Write(w)
 		})
 		srv := &http.Server{
 			Addr:              cfg.HealthAddr,

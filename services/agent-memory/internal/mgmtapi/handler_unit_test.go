@@ -213,6 +213,24 @@ func expectIngestDeltaNew(mock sqlmock.Sqlmock, repoID, fromSHA, toSHA, jobID, j
 	mock.ExpectCommit()
 }
 
+// expectLoadRepoOK queues the `SELECT url, default_branch,
+// current_head_sha FROM repo WHERE repo_id = $1::uuid` that
+// handleIngestDelta and handleIngest run BEFORE the
+// transactional INSERT, so an unknown repo_id returns a
+// clean 404 driven by sql.ErrNoRows instead of relying on
+// the post-INSERT FK-violation substring match.
+//
+// The helper returns a successful row (url, branch, head SHA)
+// so callers exercising the post-INSERT failure paths
+// (foreign-key violation, dbOutage) still reach the Begin →
+// INSERT → Rollback flow they were originally written for.
+func expectLoadRepoOK(mock sqlmock.Sqlmock, repoID, url, branch, headSHA string) {
+	mock.ExpectQuery(`SELECT url, default_branch, current_head_sha\s+FROM repo\s+WHERE repo_id = \$1::uuid`).
+		WithArgs(repoID).
+		WillReturnRows(sqlmock.NewRows([]string{"url", "default_branch", "current_head_sha"}).
+			AddRow(url, branch, headSHA))
+}
+
 // expectIngestDeltaDeduped queues the conflict path for a
 // SECOND identical ingest_delta call: the INSERT collides,
 // the handler SELECTs the existing job, and the tx commits
@@ -316,10 +334,14 @@ func TestIngestDelta_repeatedCall_returnsSameJobID_noSecondRepoEvent(t *testing.
 	h, mock, cleanup := newTestHandler(t)
 	defer cleanup()
 
-	// Call 1: new row, RepoEvent written.
+	// Call 1: new row, RepoEvent written. Each call funnels
+	// through loadRepo BEFORE Begin, so the SELECT is
+	// queued first in request order.
+	expectLoadRepoOK(mock, testRepoID, testRepoURL, testBranch, testHeadSHA)
 	expectIngestDeltaNew(mock, testRepoID, testFromSHA, testToSHA, "job-uuid-delta", "pending")
 	// Call 2: conflict, RepoEvent skipped, same job_id
 	// returned.
+	expectLoadRepoOK(mock, testRepoID, testRepoURL, testBranch, testHeadSHA)
 	expectIngestDeltaDeduped(mock, testRepoID, testFromSHA, testToSHA, "job-uuid-delta", "pending")
 
 	deltaPath := RouteRepos + "/" + testRepoID + ingestDeltaSuffix
@@ -711,6 +733,11 @@ func TestIngestDelta_foreignKeyViolation_returns404(t *testing.T) {
 	h, mock, cleanup := newTestHandler(t)
 	defer cleanup()
 
+	// handleIngestDelta runs the loadRepo precheck BEFORE
+	// Begin. Queue the SELECT to succeed so the test still
+	// covers the "repo deleted between precheck and insert"
+	// FK-violation race path the test was written for.
+	expectLoadRepoOK(mock, testRepoID, testRepoURL, testBranch, testHeadSHA)
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO ingest_jobs`).
 		WithArgs(testRepoID, testFromSHA, testToSHA).
@@ -731,6 +758,11 @@ func TestIngestDelta_dbOutage_returns500_noLeak(t *testing.T) {
 	h, mock, cleanup := newTestHandler(t)
 	defer cleanup()
 
+	// handleIngestDelta runs the loadRepo precheck BEFORE
+	// Begin; queue the SELECT to succeed so the simulated
+	// dbOutage hits the transactional INSERT (the path the
+	// test was written to cover) rather than the precheck.
+	expectLoadRepoOK(mock, testRepoID, testRepoURL, testBranch, testHeadSHA)
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO ingest_jobs`).
 		WithArgs(testRepoID, testFromSHA, testToSHA).

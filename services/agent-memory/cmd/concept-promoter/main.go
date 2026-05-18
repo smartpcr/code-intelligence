@@ -746,6 +746,7 @@ func writeMetrics(w http.ResponseWriter, m *promoter.Metrics) {
 		promoter.MetricPromoterPublishFailuresTotal:     "Publish chains the Promoter recorded a `failed` event for since binary start.",
 		promoter.MetricPromoterRetriesAttemptedTotal:    "Stalled embedding_publish rows the Promoter has re-driven via the retry phase since binary start.",
 		promoter.MetricPromoterOrphansRecoveredTotal:    "Orphaned promoted ConceptVersion rows (tx1 committed without tx2 sibling embedding_publish in a prior tick) the Promoter's orphan-recovery phase has converted into a published vector since binary start.",
+		promoter.MetricSnapshotPublishedTotal:           "Concept-side publish chains driven by the §7.4 mgmt.snapshot verb that reached the `published` event since binary start (classifier: any queued event whose details_json->>'source' is 'mgmt.snapshot').",
 	}
 	counterOrder := []string{
 		promoter.MetricPromoterRunsTotal,
@@ -756,6 +757,7 @@ func writeMetrics(w http.ResponseWriter, m *promoter.Metrics) {
 		promoter.MetricPromoterPublishFailuresTotal,
 		promoter.MetricPromoterRetriesAttemptedTotal,
 		promoter.MetricPromoterOrphansRecoveredTotal,
+		promoter.MetricSnapshotPublishedTotal,
 	}
 	for _, name := range counterOrder {
 		_, _ = fmt.Fprintf(w, "# HELP %s %s\n", name, helps[name])

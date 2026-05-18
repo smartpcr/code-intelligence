@@ -71,6 +71,18 @@ const (
 	// tick-after-tick. Evaluator-2 finding #1.
 	MetricPromoterOrphansRecoveredTotal = "promoter_orphans_recovered_total"
 
+	// MetricSnapshotPublishedTotal counts concept-side
+	// publish chains driven by a §7.4 `mgmt.snapshot`
+	// enqueue that reached the terminal `published` event.
+	// Mirrors the embedding-side counter the repoindexer
+	// exposes (`snapshot_published_total`) -- the name is
+	// shared on purpose so a Prometheus scrape across the
+	// two binaries reports a single converged value. The
+	// classifier (`runAttempt`) looks for ANY queued event
+	// on the publish whose `details_json->>'source'` equals
+	// `mgmt.snapshot`.
+	MetricSnapshotPublishedTotal = "snapshot_published_total"
+
 	// MetricPromoterOrphansPending is a per-tick gauge of
 	// orphaned promoted ConceptVersion rows the
 	// orphan-recovery scan returned BEFORE the per-orphan
@@ -102,6 +114,7 @@ type Metrics struct {
 	publishFailures     atomic.Uint64
 	retriesAttempted    atomic.Uint64
 	orphansRecovered    atomic.Uint64
+	snapshotPublished   atomic.Uint64
 	candidatesPending   atomic.Int64
 	orphansPending      atomic.Int64
 }
@@ -177,6 +190,18 @@ func (m *Metrics) AddOrphansRecovered(n uint64) {
 	m.orphansRecovered.Add(n)
 }
 
+// AddSnapshotPublished adds n to the snapshot-published
+// counter.  Called by Service.runAttempt once per concept
+// publish that reached `published` AND was originally
+// enqueued by the §7.4 mgmt.snapshot handler (detected via
+// the queued-event `source` marker).
+func (m *Metrics) AddSnapshotPublished(n uint64) {
+	if n == 0 {
+		return
+	}
+	m.snapshotPublished.Add(n)
+}
+
 // SetCandidatesPending sets the candidates-pending gauge.
 // Called by Service.Tick after the threshold query returns
 // (BEFORE the per-Concept recheck loop).
@@ -231,6 +256,12 @@ func (m *Metrics) OrphansRecoveredTotal() uint64 {
 	return m.orphansRecovered.Load()
 }
 
+// SnapshotPublishedTotal returns the snapshot_published_total
+// value contributed by the concept-side publish path.
+func (m *Metrics) SnapshotPublishedTotal() uint64 {
+	return m.snapshotPublished.Load()
+}
+
 // CandidatesPending returns the current promoter_candidates_pending gauge value.
 func (m *Metrics) CandidatesPending() int64 {
 	return m.candidatesPending.Load()
@@ -263,5 +294,6 @@ func (m *Metrics) Snapshot() map[string]uint64 {
 		MetricPromoterPublishFailuresTotal:     m.publishFailures.Load(),
 		MetricPromoterRetriesAttemptedTotal:    m.retriesAttempted.Load(),
 		MetricPromoterOrphansRecoveredTotal:    m.orphansRecovered.Load(),
+		MetricSnapshotPublishedTotal:           m.snapshotPublished.Load(),
 	}
 }

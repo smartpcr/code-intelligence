@@ -203,6 +203,7 @@ func expectRegisterIdempotent(mock sqlmock.Sqlmock, repoID, repoURL, branch, hea
 // expectIngestDeltaNew queues the four-statement enqueue path
 // for the FIRST identical ingest_delta call.
 func expectIngestDeltaNew(mock sqlmock.Sqlmock, repoID, fromSHA, toSHA, jobID, jobState string) {
+	expectLoadRepo(mock, repoID)
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO ingest_jobs \(repo_id, mode, from_sha, to_sha\)`).
 		WithArgs(repoID, fromSHA, toSHA).
@@ -218,6 +219,7 @@ func expectIngestDeltaNew(mock sqlmock.Sqlmock, repoID, fromSHA, toSHA, jobID, j
 // the handler SELECTs the existing job, and the tx commits
 // WITHOUT a new repo_event row.
 func expectIngestDeltaDeduped(mock sqlmock.Sqlmock, repoID, fromSHA, toSHA, jobID, jobState string) {
+	expectLoadRepo(mock, repoID)
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO ingest_jobs \(repo_id, mode, from_sha, to_sha\)`).
 		WithArgs(repoID, fromSHA, toSHA).
@@ -226,6 +228,19 @@ func expectIngestDeltaDeduped(mock sqlmock.Sqlmock, repoID, fromSHA, toSHA, jobI
 		WithArgs(repoID, fromSHA, toSHA).
 		WillReturnRows(sqlmock.NewRows([]string{"job_id", "status"}).AddRow(jobID, jobState))
 	mock.ExpectCommit()
+}
+
+// expectLoadRepo queues the SELECT the handler emits to verify
+// the repo exists before issuing the verb-specific INSERTs.
+// Stage 7.1 verbs that take a {repo_id} path segment all run
+// this probe (handleIngest / handleIngestDelta / handleSnapshot)
+// so the 404 path is driven by sql.ErrNoRows rather than a
+// brittle FK-violation substring match on the INSERT result.
+func expectLoadRepo(mock sqlmock.Sqlmock, repoID string) {
+	mock.ExpectQuery(`SELECT url, default_branch, current_head_sha\s+FROM repo`).
+		WithArgs(repoID).
+		WillReturnRows(sqlmock.NewRows([]string{"url", "default_branch", "current_head_sha"}).
+			AddRow(testRepoURL, testBranch, testHeadSHA))
 }
 
 // -----------------------------------------------------------
@@ -711,6 +726,7 @@ func TestIngestDelta_foreignKeyViolation_returns404(t *testing.T) {
 	h, mock, cleanup := newTestHandler(t)
 	defer cleanup()
 
+	expectLoadRepo(mock, testRepoID)
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO ingest_jobs`).
 		WithArgs(testRepoID, testFromSHA, testToSHA).
@@ -731,6 +747,7 @@ func TestIngestDelta_dbOutage_returns500_noLeak(t *testing.T) {
 	h, mock, cleanup := newTestHandler(t)
 	defer cleanup()
 
+	expectLoadRepo(mock, testRepoID)
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO ingest_jobs`).
 		WithArgs(testRepoID, testFromSHA, testToSHA).

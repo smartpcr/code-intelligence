@@ -210,14 +210,45 @@ type Publisher struct {
 	embedder Embedder
 	qdrant   Qdrant
 
-	logger *slog.Logger
-	now    func() time.Time
+	logger  *slog.Logger
+	now     func() time.Time
+	metrics PublisherMetrics
 
 	// newUUID is overridable so tests can pin deterministic
 	// publish_id / point_id values.  Production passes nil →
 	// uses `NewUUIDv4`.
 	newUUID func() (string, error)
 }
+
+// PublisherMetrics is the publisher-side metrics sink.  The
+// publisher calls a single method per snapshot-driven publish
+// that reaches the §9.6a terminal `published` event; the
+// composition root (`cmd/repoindexer/main.go`) wires an
+// implementation that exposes `snapshot_published_total` on
+// its `/metrics` endpoint so an operator can verify that the
+// Stage 7.4 snapshot verb's enqueued rows are draining.  A
+// nil hook is replaced by `NoOpPublisherMetrics{}` so the
+// hot-path never branches on nil.
+type PublisherMetrics interface {
+	// IncSnapshotPublished records that `n` snapshot-driven
+	// publishes reached the `published` event.  Snapshot-
+	// driven means the publish's queued-event log carries
+	// any event whose `details_json->>'source'` is
+	// `mgmt.snapshot` (the literal the §7.4 handler writes).
+	// Implementations MUST be safe for concurrent use; the
+	// publisher invokes this on every successful publish
+	// across all worker goroutines.
+	IncSnapshotPublished(n int)
+}
+
+// NoOpPublisherMetrics is the default `PublisherMetrics` the
+// publisher uses when the operator did not wire a metrics
+// sink.  All methods are no-ops so a binary without a
+// `/metrics` endpoint still publishes successfully.
+type NoOpPublisherMetrics struct{}
+
+// IncSnapshotPublished is the no-op default.
+func (NoOpPublisherMetrics) IncSnapshotPublished(int) {}
 
 // Option is the functional-options shape used to construct a
 // `Publisher` without bloating the constructor's positional
@@ -258,6 +289,21 @@ func WithUUIDFactory(fn func() (string, error)) Option {
 	}
 }
 
+// WithPublisherMetrics installs a `PublisherMetrics`
+// implementation.  The default is `NoOpPublisherMetrics{}`,
+// which is appropriate for binaries that do not need to
+// surface `snapshot_published_total`.  The §7.4 wiring
+// (`cmd/repoindexer/main.go`) passes an `InMemoryPublisherMetrics`
+// so a Prometheus scrape of the repoindexer's `/metrics`
+// endpoint observes the counter.
+func WithPublisherMetrics(m PublisherMetrics) Option {
+	return func(p *Publisher) {
+		if m != nil {
+			p.metrics = m
+		}
+	}
+}
+
 // NewPublisher constructs a Publisher.  Panics on nil `db`,
 // `embedder`, or `qdrant` — the publisher cannot operate
 // without any of them and a silent no-op would defeat the
@@ -279,6 +325,7 @@ func NewPublisher(db *sql.DB, embedder Embedder, qdrant Qdrant, opts ...Option) 
 		logger:   slog.Default(),
 		now:      time.Now,
 		newUUID:  NewUUIDv4,
+		metrics:  NoOpPublisherMetrics{},
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -583,14 +630,253 @@ func (p *Publisher) runAttempt(
 			ErrAttemptFailed, result.QdrantPointID, collection)
 	}
 
-	// Step 6: published event.
-	if err := p.insertEvent(ctx, result.PublishID, EventKindPublished,
-		result.AttemptIndex, nil); err != nil {
-		return result, fmt.Errorf("embedding: insert published: %w", err)
+	// Step 6: append `published` AND atomically supersede any
+	// prior-published row for the same target.  The work
+	// runs inside an explicit transaction guarded by a
+	// per-target advisory xact lock
+	// (`pg_advisory_xact_lock(hash('embedding_supersede_node:<node_id>'))`)
+	// — this lock is required for correctness, not just
+	// performance, because under READ COMMITTED two
+	// concurrent CTEs use independent MVCC snapshots and
+	// neither would see the other's uncommitted `cur`
+	// insert.  Without the lock, two same-target publishes
+	// would each insert `published` without superseding the
+	// other, leaving the §9.6a recall path
+	// (`latest.event_kind = 'published'`) double-counting.
+	//
+	// The strict-older race guard
+	// `(latest.created_at, latest.event_id) <
+	//  (cur.created_at, cur.event_id)` is retained as
+	// belt-and-suspenders defence: if a future writer
+	// bypasses the lock, the guard still prevents mutual
+	// supersede (a node will end with at MOST one `published`
+	// row, never zero).
+	//
+	// `details_json` on the new `superseded` events carries
+	// the `superseded_by_publish_id` so an operator can
+	// reconstruct the §9.6a chain via the event log alone.
+	supCount, err := p.insertPublishedAndSupersedePrior(ctx, result.PublishID,
+		req.NodeID, result.AttemptIndex)
+	if err != nil {
+		return result, fmt.Errorf("embedding: insert published+supersede: %w", err)
 	}
 	result.LastEventKind = EventKindPublished
+	if supCount > 0 {
+		p.logger.Info("embedding.publish_superseded_prior",
+			slog.String("publish_id", result.PublishID),
+			slog.String("node_id", req.NodeID),
+			slog.Int("superseded_count", supCount))
+	}
 	p.logAttempt("published", req, result)
+
+	// Snapshot-driven publishes increment the §7.4 progress
+	// counter so an operator can observe re-embed drain from
+	// the repoindexer's `/metrics` endpoint.  The classifier
+	// scans the publish's queued-event log for any row whose
+	// `details_json->>'source'` equals `mgmt.snapshot` (the
+	// literal `mgmtapi.buildSnapshotDetailsJSON` writes).  A
+	// `Retry`-written queued event omits the `source` field
+	// so the original snapshot marker is what we look for;
+	// the classifier therefore returns true even after one
+	// or more retries.
+	if snapshot, classifyErr := p.publishIsSnapshotDriven(ctx, result.PublishID); classifyErr != nil {
+		// A best-effort classifier failure is not a publish
+		// failure — the §9.6a chain already reached the
+		// terminal `published` event.  Log so an operator
+		// can diagnose any persistent counter divergence.
+		p.logger.Warn("embedding.publish_snapshot_classify_failed",
+			slog.String("publish_id", result.PublishID),
+			slog.String("error", classifyErr.Error()))
+	} else if snapshot {
+		p.metrics.IncSnapshotPublished(1)
+	}
 	return result, nil
+}
+
+// insertPublishedAndSupersedePrior runs the §9.6a step 6
+// "published + retroactive supersede" half in a single CTE
+// guarded by a per-target advisory xact lock so that two
+// same-target publishes are serialised at the supersede
+// boundary.  The lock is required for correctness, NOT just
+// performance: under PostgreSQL READ COMMITTED two concurrent
+// statements use independent MVCC snapshots, so without the
+// lock the `prior` SELECT in one tx cannot see the other tx's
+// uncommitted `cur` insert.  Both txs would then insert
+// `published` events and neither would supersede the other,
+// leaving TWO `published` rows in flight for the same
+// `node_id` — a defect the §9.6a recall path
+// (`latest.event_kind = 'published'`) would silently
+// double-count.
+//
+// The lock is acquired BEFORE the CTE runs, inside the same
+// transaction.  It is automatically released on COMMIT /
+// ROLLBACK, so there is no explicit unlock to leak on error.
+// The key is namespaced (`embedding_supersede_node:<uuid>`)
+// so that node-side and concept-side supersede domains never
+// collide on the shared `pg_locks` advisory key space — a node
+// UUID happening to equal a `concept_version_id` would still
+// receive its own lock.
+//
+// The `cur` and `sup` INSERTs use `clock_timestamp()` instead
+// of relying on the column default `now()` because `now()`
+// returns the TRANSACTION START timestamp, which for a tx
+// that waited on the advisory lock can be EARLIER than a
+// previously-committed publish.  Using wall-clock at insert
+// time keeps `(created_at, event_id)` monotonic with actual
+// append order and makes the strict-older race guard
+// (`(latest.created_at, latest.event_id) < (cur...)`) hold as
+// belt-and-suspenders defence in depth: even if the lock were
+// bypassed by a future writer, the guard prevents mutual
+// supersede.
+//
+// Returns the number of prior-published rows retired by this
+// call (0 on a fresh node, ≥1 on a snapshot or out-of-band
+// re-publish).
+func (p *Publisher) insertPublishedAndSupersedePrior(
+	ctx context.Context,
+	publishID, nodeID string,
+	attempt int,
+) (int, error) {
+	const cteQuery = `
+		WITH cur AS (
+			INSERT INTO embedding_publish_event
+			    (publish_id, event_kind, attempt_index, details_json, created_at)
+			VALUES ($1::uuid, 'published'::embedding_publish_event_kind, $3, NULL, clock_timestamp())
+			RETURNING publish_id, event_id, created_at
+		),
+		prior AS (
+			SELECT p.publish_id,
+			       coalesce(
+			           (SELECT max(ee.attempt_index)
+			              FROM embedding_publish_event ee
+			             WHERE ee.publish_id = p.publish_id),
+			           0
+			       ) AS max_attempt
+			  FROM embedding_publish p
+			  CROSS JOIN LATERAL (
+			      SELECT epe.event_kind, epe.event_id, epe.created_at
+			        FROM embedding_publish_event epe
+			       WHERE epe.publish_id = p.publish_id
+			       ORDER BY epe.created_at DESC, epe.event_id DESC
+			       LIMIT 1
+			  ) latest
+			 WHERE p.node_id = $2::uuid
+			   AND p.publish_id <> $1::uuid
+			   AND latest.event_kind = 'published'
+			   AND (latest.created_at,  latest.event_id)
+			       < ((SELECT created_at FROM cur), (SELECT event_id FROM cur))
+		),
+		sup AS (
+			INSERT INTO embedding_publish_event
+			    (publish_id, event_kind, attempt_index, details_json, created_at)
+			SELECT publish_id,
+			       'superseded'::embedding_publish_event_kind,
+			       max_attempt,
+			       jsonb_build_object(
+			           'superseded_by_publish_id', $1::uuid,
+			           'source', 'publisher.runAttempt'
+			       ),
+			       clock_timestamp()
+			  FROM prior
+			RETURNING publish_id
+		)
+		SELECT (SELECT count(*) FROM cur)::bigint AS published_count,
+		       (SELECT count(*) FROM sup)::bigint AS superseded_count
+	`
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("publish+supersede begin: %w", err)
+	}
+	// Rollback on error is a no-op after a successful Commit
+	// per database/sql contract.  This unconditional defer
+	// guarantees the conn is released even when a panic
+	// unwinds through the function.
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+		SupersedeLockKey(SupersedeLockDomainNode, nodeID),
+	); err != nil {
+		return 0, fmt.Errorf("publish+supersede acquire lock: %w", err)
+	}
+
+	var publishedCount, supersededCount int64
+	if err := tx.QueryRowContext(ctx, cteQuery, publishID, nodeID, attempt).
+		Scan(&publishedCount, &supersededCount); err != nil {
+		return 0, fmt.Errorf("publish+supersede CTE: %w", err)
+	}
+	if publishedCount != 1 {
+		// The CTE inserts unconditionally; the only way to
+		// see 0 here would be a violated UNIQUE constraint
+		// the publish_event table does not declare, so this
+		// is defence-in-depth.
+		return int(supersededCount), fmt.Errorf(
+			"publish+supersede CTE: published_count=%d (want 1)", publishedCount)
+	}
+	if err := tx.Commit(); err != nil {
+		return int(supersededCount), fmt.Errorf("publish+supersede commit: %w", err)
+	}
+	return int(supersededCount), nil
+}
+
+// SupersedeLockDomain enumerates the per-target advisory-lock
+// namespaces.  Each call to `insertPublishedAndSupersedePrior`
+// hashes a `<domain>:<id>` string into PostgreSQL's bigint
+// advisory-lock key space so the two writers (node-side and
+// concept-side) can never collide even when a node UUID
+// happens to equal a `concept_version_id`.  The promoter
+// package imports `SupersedeLockDomainConcept` so both
+// writers obey the SAME `embedding_supersede_<domain>:<uuid>`
+// literal in `pg_locks` (visible to operator triage).
+type SupersedeLockDomain string
+
+const (
+	SupersedeLockDomainNode    SupersedeLockDomain = "embedding_supersede_node"
+	SupersedeLockDomainConcept SupersedeLockDomain = "embedding_supersede_concept"
+)
+
+// SupersedeLockKey returns the namespaced string that the
+// xact lock hashes into `pg_locks`.  Centralising the format
+// here keeps the publisher (node-side) and promoter
+// (concept-side) callers in lockstep on the literal — a
+// future operator inspecting `pg_locks` sees the same
+// `embedding_supersede_<domain>:<uuid>` pattern across both
+// writers.
+func SupersedeLockKey(domain SupersedeLockDomain, id string) string {
+	return string(domain) + ":" + id
+}
+
+// publishIsSnapshotDriven returns true when the publish's
+// queued-event log carries ANY event whose
+// `details_json->>'source'` equals `mgmt.snapshot`.  That
+// classifier is robust against `Publisher.Retry` rewriting
+// the latest queued event (the retry path omits the `source`
+// field — `marshalQueuedDetails` writes only `content` /
+// `signature_only` / `embedding_model_version` — so a fresh
+// LATEST-event scan would miss snapshot-driven publishes that
+// went through any retries; the EXISTS scan instead checks
+// the FULL event log for the original snapshot marker).
+//
+// The mgmt.snapshot handler's
+// `mgmtapi.buildSnapshotDetailsJSON` is the only writer that
+// sets the `source` field today; any future enqueuer that
+// also wants to flip this counter must use the same literal.
+func (p *Publisher) publishIsSnapshotDriven(ctx context.Context, publishID string) (bool, error) {
+	const q = `
+		SELECT EXISTS (
+			SELECT 1
+			  FROM embedding_publish_event
+			 WHERE publish_id = $1::uuid
+			   AND event_kind = 'queued'
+			   AND details_json IS NOT NULL
+			   AND details_json->>'source' = 'mgmt.snapshot'
+		)
+	`
+	var snapshot bool
+	if err := p.db.QueryRowContext(ctx, q, publishID).Scan(&snapshot); err != nil {
+		return false, fmt.Errorf("classify snapshot-driven: %w", err)
+	}
+	return snapshot, nil
 }
 
 func (p *Publisher) validateRequest(req PublishRequest) error {
@@ -710,6 +996,17 @@ type queuedEventDetails struct {
 	Content               string `json:"content"`
 	SignatureOnly         bool   `json:"signature_only"`
 	EmbeddingModelVersion string `json:"embedding_model_version"`
+	// Source is an OPTIONAL marker the publisher does not
+	// write — the §7.4 mgmt.snapshot handler
+	// (mgmtapi.buildSnapshotDetailsJSON) sets it to
+	// `mgmt.snapshot` so a downstream resolver can identify
+	// the enqueuing source and apply the snapshot-fallback
+	// content lookup (see PublishEventContentResolver.Resolve).
+	// `omitempty` keeps the publisher's queued JSON unchanged
+	// (no spurious `"source":""` on the publisher write
+	// path) so the snapshot marker is the only thing that
+	// ever flows through this field.
+	Source string `json:"source,omitempty"`
 }
 
 // QueuedDetailsKey is the JSONB top-level key set the resolver

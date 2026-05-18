@@ -57,6 +57,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -121,8 +122,10 @@ func main() {
 		}
 	}
 
+	publisherMetrics := newInMemoryPublisherMetrics()
 	publisher := embedding.NewPublisher(db, embedder, qdrant,
-		embedding.WithLogger(logger))
+		embedding.WithLogger(logger),
+		embedding.WithPublisherMetrics(publisherMetrics))
 
 	gw := graphwriter.New(db, logger)
 
@@ -177,6 +180,41 @@ func main() {
 			slog.Duration("every", cfg.FlushEvery))
 	}
 
+	// Stage 7.4: expose `snapshot_published_total` on a tiny
+	// HTTP `/metrics` endpoint so a Prometheus scrape of the
+	// repoindexer can observe re-embed drain progress.  The
+	// counter is incremented by the publisher whenever a
+	// publish chain it drove reached `published` AND was
+	// originally enqueued by the mgmt.snapshot handler
+	// (`details_json->>'source'` = `mgmt.snapshot`).  Without
+	// the listener the counter would be invisible to scrapes
+	// even though the publisher is dutifully updating it.
+	if cfg.MetricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+			writeRepoindexerMetrics(w, publisherMetrics)
+		})
+		srv := &http.Server{
+			Addr:              cfg.MetricsAddr,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Warn("repoindexer.metrics_listen",
+					slog.String("error", err.Error()))
+			}
+		}()
+		go func() {
+			<-ctx.Done()
+			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutCtx)
+		}()
+		logger.Info("repoindexer.metrics.started",
+			slog.String("addr", cfg.MetricsAddr))
+	}
+
 	logger.Info("repoindexer.start",
 		slog.String("worker_id", cfg.WorkerID),
 		slog.Duration("poll_every", cfg.PollEvery),
@@ -202,6 +240,14 @@ type config struct {
 	PollEvery         time.Duration
 	FlushEvery        time.Duration
 	AllowStubEmbedder bool
+	// MetricsAddr is the ":port" or "host:port" the
+	// /metrics listener binds to.  Empty disables the
+	// listener entirely (the publisher still increments
+	// `snapshot_published_total` in memory; only the scrape
+	// shape is gated).  Default `:8088` is one above the
+	// concept-promoter's default `:8087` so the two
+	// binaries can co-locate on a developer laptop.
+	MetricsAddr string
 }
 
 func loadConfig() (config, error) {
@@ -212,6 +258,7 @@ func loadConfig() (config, error) {
 		WorkerID:     os.Getenv("AGENT_MEMORY_WORKER_ID"),
 		PollEvery:    1 * time.Second,
 		FlushEvery:   30 * time.Second,
+		MetricsAddr:  ":8088",
 	}
 	if c.PGURL == "" {
 		return c, errors.New("AGENT_MEMORY_PG_URL is required")
@@ -239,6 +286,9 @@ func loadConfig() (config, error) {
 			return c, fmt.Errorf("AGENT_MEMORY_ALLOW_STUB_EMBEDDER: %w", err)
 		}
 		c.AllowStubEmbedder = b
+	}
+	if v, ok := os.LookupEnv("AGENT_MEMORY_METRICS_ADDR"); ok {
+		c.MetricsAddr = v
 	}
 	if c.WorkerID == "" {
 		host, _ := os.Hostname()
@@ -308,4 +358,60 @@ func (t *apiKeyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		rt = http.DefaultTransport
 	}
 	return rt.RoundTrip(clone)
+}
+
+// inMemoryPublisherMetrics is the repoindexer's in-process
+// `embedding.PublisherMetrics` implementation.  Backed by a
+// single sync/atomic counter so the worker goroutines + the
+// HTTP scrape goroutine can read concurrently without locks.
+// The counter is monotonically increasing and never reset --
+// a Prometheus collector that diff's between scrapes is the
+// canonical consumer.
+//
+// Exposed via `/metrics` as `snapshot_published_total`,
+// matching the metric name the mgmt-api binary surfaces on
+// its own `/metrics` endpoint.  A scrape across both
+// processes therefore reports a single aggregate value (the
+// scrape-side aggregation is the operator's choice).
+type inMemoryPublisherMetrics struct {
+	snapshotPublished atomic.Int64
+}
+
+func newInMemoryPublisherMetrics() *inMemoryPublisherMetrics {
+	return &inMemoryPublisherMetrics{}
+}
+
+// IncSnapshotPublished implements embedding.PublisherMetrics.
+// Negative or zero arguments are ignored so a buggy caller
+// cannot drive the counter backwards.
+func (m *inMemoryPublisherMetrics) IncSnapshotPublished(n int) {
+	if n <= 0 {
+		return
+	}
+	m.snapshotPublished.Add(int64(n))
+}
+
+// SnapshotPublishedTotal returns the current counter value.
+// Exposed for the `/metrics` handler so the binary does not
+// reach into the unexported field directly.
+func (m *inMemoryPublisherMetrics) SnapshotPublishedTotal() int64 {
+	return m.snapshotPublished.Load()
+}
+
+// writeRepoindexerMetrics emits the Prometheus text-format
+// payload for the repoindexer's /metrics endpoint.  Today
+// only `snapshot_published_total` is exposed because the
+// rest of the §9.6a flusher / publisher metrics are still
+// captured via structured logs (see flusher.go's Stats); a
+// future workstream can extend this handler when those
+// counters are added to the publisher / flusher interfaces.
+//
+// The HELP / TYPE lines follow Prometheus conventions so a
+// scrape collector can interpret the counter without
+// out-of-band configuration.
+func writeRepoindexerMetrics(w http.ResponseWriter, m *inMemoryPublisherMetrics) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	fmt.Fprint(w, "# HELP snapshot_published_total Successful re-embed publishes driven by the §7.4 mgmt.snapshot verb (repoindexer side; counts publish chains whose queued event details_json carried source=mgmt.snapshot AND reached the published terminal event).\n")
+	fmt.Fprint(w, "# TYPE snapshot_published_total counter\n")
+	fmt.Fprintf(w, "snapshot_published_total %d\n", m.SnapshotPublishedTotal())
 }

@@ -1763,10 +1763,29 @@ func (s *Service) runAttempt(ctx context.Context, conn *sql.Conn, state publishS
 			state.pointID, embedding.CollectionConcept)
 	}
 
-	// Step 6: published event.
-	if err := s.insertEvent(ctx, conn, state.publishID, embedding.EventKindPublished,
-		state.attemptIndex, nil); err != nil {
-		return embedding.EventKindVectorWritten, fmt.Errorf("promoter: insert published: %w", err)
+	// Step 6: published event AND atomic supersede of any
+	// prior-published row for the same concept_version_id.
+	// Mirrors the publisher's same-target supersede path
+	// (see internal/embedding/publisher.go) including the
+	// per-target advisory xact lock guard
+	// (`pg_advisory_xact_lock(hash('embedding_supersede_concept:<version_id>'))`)
+	// — that lock is required for correctness, not just
+	// performance, because READ COMMITTED would otherwise
+	// let two concurrent CTEs miss each other's uncommitted
+	// `cur` inserts (independent MVCC snapshots) and leave
+	// two `published` events as the latest event for the
+	// same target.  The strict-older race-guard predicate
+	// is retained as belt-and-suspenders defence.
+	supCount, err := s.insertPublishedAndSupersedePrior(ctx, conn,
+		state.publishID, state.versionID, state.attemptIndex)
+	if err != nil {
+		return embedding.EventKindVectorWritten, fmt.Errorf("promoter: insert published+supersede: %w", err)
+	}
+	if supCount > 0 {
+		s.logger.Info("promoter.published_superseded_prior",
+			slog.String("publish_id", state.publishID),
+			slog.String("concept_version_id", state.versionID),
+			slog.Int("superseded_count", supCount))
 	}
 	s.logger.Info("promoter.published",
 		slog.String("publish_id", state.publishID),
@@ -1774,7 +1793,153 @@ func (s *Service) runAttempt(ctx context.Context, conn *sql.Conn, state publishS
 		slog.String("concept_id", state.conceptID),
 		slog.Int("attempt", state.attemptIndex),
 		slog.String("mode", state.mode))
+
+	// Snapshot-driven publishes increment `snapshot_published_total`
+	// (shared metric name with the embedding-side publisher).
+	// Best-effort classification: a failure here does NOT
+	// turn a successful publish into a failed one.
+	if snap, cErr := s.publishIsSnapshotDriven(ctx, conn, state.publishID); cErr != nil {
+		s.logger.Warn("promoter.snapshot_classify_failed",
+			slog.String("publish_id", state.publishID),
+			slog.String("error", cErr.Error()))
+	} else if snap {
+		s.metrics.AddSnapshotPublished(1)
+	}
 	return embedding.EventKindPublished, nil
+}
+
+// insertPublishedAndSupersedePrior runs the concept-side §9.6a
+// step 6 — appending the `published` event AND atomically
+// superseding every OTHER concept-side publish row for the
+// same `concept_version_id` whose latest event is `published`
+// AND was inserted strictly before the new `published` event.
+//
+// Mirrors the embedding-side
+// `Publisher.insertPublishedAndSupersedePrior` so the two
+// writers leave byte-identical event-log shapes AND obey the
+// same per-target advisory-lock discipline.  The lock is
+// required for correctness: under READ COMMITTED, two
+// concurrent statements use independent MVCC snapshots, so
+// without the lock two same-target concept publishes could
+// both insert `published` without superseding each other,
+// leaving the §9.6a recall path with two latest events that
+// are `published` for the same `concept_version_id`.
+//
+// The transaction is opened on the supplied `conn` (the
+// session-pinned conn that already holds the tick's
+// `pg_try_advisory_lock` for cross-replica serialisation).
+// The xact lock acquired inside this sub-transaction is
+// disjoint from the session-level lock (different key, different
+// scope) and releases automatically on COMMIT / ROLLBACK.
+//
+// `clock_timestamp()` is used for the `published` and
+// `superseded` inserts so the `(created_at, event_id)`
+// ordering reflects ACTUAL append order; the column default
+// `now()` would otherwise resolve to the sub-tx's start
+// timestamp which can predate a publish that committed while
+// we were waiting on the lock.
+func (s *Service) insertPublishedAndSupersedePrior(
+	ctx context.Context,
+	conn *sql.Conn,
+	publishID, versionID string,
+	attempt int,
+) (int, error) {
+	const cteQuery = `
+		WITH cur AS (
+			INSERT INTO embedding_publish_event
+			    (publish_id, event_kind, attempt_index, details_json, created_at)
+			VALUES ($1::uuid, 'published'::embedding_publish_event_kind, $3, NULL, clock_timestamp())
+			RETURNING publish_id, event_id, created_at
+		),
+		prior AS (
+			SELECT p.publish_id,
+			       coalesce(
+			           (SELECT max(ee.attempt_index)
+			              FROM embedding_publish_event ee
+			             WHERE ee.publish_id = p.publish_id),
+			           0
+			       ) AS max_attempt
+			  FROM embedding_publish p
+			  CROSS JOIN LATERAL (
+			      SELECT epe.event_kind, epe.event_id, epe.created_at
+			        FROM embedding_publish_event epe
+			       WHERE epe.publish_id = p.publish_id
+			       ORDER BY epe.created_at DESC, epe.event_id DESC
+			       LIMIT 1
+			  ) latest
+			 WHERE p.concept_version_id = $2::uuid
+			   AND p.publish_id        <> $1::uuid
+			   AND latest.event_kind    = 'published'
+			   AND (latest.created_at,  latest.event_id)
+			       < ((SELECT created_at FROM cur), (SELECT event_id FROM cur))
+		),
+		sup AS (
+			INSERT INTO embedding_publish_event
+			    (publish_id, event_kind, attempt_index, details_json, created_at)
+			SELECT publish_id,
+			       'superseded'::embedding_publish_event_kind,
+			       max_attempt,
+			       jsonb_build_object(
+			           'superseded_by_publish_id', $1::uuid,
+			           'source', 'promoter.runAttempt'
+			       ),
+			       clock_timestamp()
+			  FROM prior
+			RETURNING publish_id
+		)
+		SELECT (SELECT count(*) FROM cur)::bigint AS published_count,
+		       (SELECT count(*) FROM sup)::bigint AS superseded_count
+	`
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("publish+supersede begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+		embedding.SupersedeLockKey(embedding.SupersedeLockDomainConcept, versionID),
+	); err != nil {
+		return 0, fmt.Errorf("publish+supersede acquire lock: %w", err)
+	}
+
+	var publishedCount, supersededCount int64
+	if err := tx.QueryRowContext(ctx, cteQuery, publishID, versionID, attempt).
+		Scan(&publishedCount, &supersededCount); err != nil {
+		return 0, fmt.Errorf("publish+supersede CTE: %w", err)
+	}
+	if publishedCount != 1 {
+		return int(supersededCount), fmt.Errorf(
+			"publish+supersede CTE: published_count=%d (want 1)", publishedCount)
+	}
+	if err := tx.Commit(); err != nil {
+		return int(supersededCount), fmt.Errorf("publish+supersede commit: %w", err)
+	}
+	return int(supersededCount), nil
+}
+
+// publishIsSnapshotDriven returns true when the publish's
+// queued-event log carries ANY event whose
+// `details_json->>'source'` equals `mgmt.snapshot`.  Mirrors
+// the embedding-side classifier so the two writers agree on
+// what counts as "snapshot-driven" for the
+// `snapshot_published_total` counter.
+func (s *Service) publishIsSnapshotDriven(ctx context.Context, conn *sql.Conn, publishID string) (bool, error) {
+	const q = `
+		SELECT EXISTS (
+			SELECT 1
+			  FROM embedding_publish_event
+			 WHERE publish_id = $1::uuid
+			   AND event_kind = 'queued'
+			   AND details_json IS NOT NULL
+			   AND details_json->>'source' = 'mgmt.snapshot'
+		)
+	`
+	var snapshot bool
+	if err := conn.QueryRowContext(ctx, q, publishID).Scan(&snapshot); err != nil {
+		return false, fmt.Errorf("classify snapshot-driven: %w", err)
+	}
+	return snapshot, nil
 }
 
 // insertEvent appends a single embedding_publish_event row.

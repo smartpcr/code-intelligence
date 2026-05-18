@@ -38,6 +38,15 @@ const (
 	// `ingestSuffix` since `/ingest` is a strict prefix of
 	// `/ingest_delta` only after a literal `_`.
 	ingestDeltaSuffix = "/ingest_delta"
+
+	// snapshotSuffix is the trailing path segment for
+	// `mgmt.snapshot` (architecture.md §6.2.1) per
+	// implementation-plan Stage 7.4. The handler treats the
+	// path as analogous to /ingest -- repo-scoped, async
+	// enqueue -- but the protocol it kicks is the §9.6a
+	// append-only EmbeddingPublish protocol rather than the
+	// ingest_jobs queue used by /ingest{,_delta}.
+	snapshotSuffix = "/snapshot"
 )
 
 // DefaultMaxBodyBytes caps the inbound JSON body so a
@@ -100,6 +109,39 @@ type Options struct {
 	// Go-side clock does NOT shift DB columns; tests that
 	// need a frozen log timestamp inject one.
 	Clock func() time.Time
+
+	// ActiveEmbeddingModelVersion is the
+	// `embedding_model_version` value mgmt.snapshot tags
+	// onto every new EmbeddingPublish row it enqueues
+	// (tech-spec §9.6 / §9.6a). The composition root reads
+	// this from configuration (env var
+	// `AGENT_MEMORY_EMBEDDING_MODEL_VERSION` in the
+	// production cmd/mgmt-api binary). An empty value is a
+	// configuration error and causes mgmt.snapshot to
+	// return 503 -- per the rubber-duck review, we DO NOT
+	// expose this as an operator-overridable request field
+	// because callers could otherwise enqueue publishes for
+	// a model the rest of the system does not consider
+	// active, producing vectors recall would never surface.
+	ActiveEmbeddingModelVersion string
+
+	// Metrics is the sink mgmt.snapshot uses to expose the
+	// `snapshot_pending_total` /
+	// `snapshot_published_total` counters mandated by
+	// implementation-plan Stage 7.4. Nil defaults to
+	// [NoOpMetrics] so call sites do not need a nil-check.
+	// The production composition root wires
+	// [InMemoryMetrics] and serves it via the binary's
+	// /metrics endpoint.
+	Metrics Metrics
+
+	// NewUUID overrides the function used to generate the
+	// per-snapshot tracking UUID written into the
+	// `details_json` of every queued EmbeddingPublishEvent
+	// emitted by mgmt.snapshot. Defaults to a crypto-quality
+	// random uuid. Tests override to get deterministic
+	// snapshot ids without touching crypto/rand.
+	NewUUID func() (string, error)
 }
 
 // Handler is the Management API HTTP handler. Construct one
@@ -113,6 +155,20 @@ type Handler struct {
 	maxBody   int64
 	secretGen func() (string, error)
 	clock     func() time.Time
+
+	// activeEmbeddingModelVersion is the value
+	// mgmt.snapshot tags onto each freshly-enqueued
+	// EmbeddingPublish row (tech-spec §9.6a). Empty means
+	// snapshot is disabled (returns 503).
+	activeEmbeddingModelVersion string
+
+	// metrics is the snapshot-progress counter sink. Never
+	// nil after NewHandler -- defaults to NoOpMetrics.
+	metrics Metrics
+
+	// newUUID produces the per-snapshot tracking uuid
+	// written into each queued event's details_json.
+	newUUID func() (string, error)
 
 	// mux is the http.Handler the public ServeHTTP delegates
 	// to after auth. Constructed in NewHandler so route
@@ -152,14 +208,25 @@ func NewHandler(db *sql.DB, verifier TokenVerifier, resolver HeadResolver, opts 
 	if secretGen == nil {
 		secretGen = defaultSecretGen
 	}
+	metrics := opts.Metrics
+	if metrics == nil {
+		metrics = NoOpMetrics{}
+	}
+	newUUID := opts.NewUUID
+	if newUUID == nil {
+		newUUID = defaultNewUUID
+	}
 	h := &Handler{
-		db:        db,
-		verifier:  verifier,
-		resolver:  resolver,
-		logger:    logger,
-		maxBody:   maxBody,
-		secretGen: secretGen,
-		clock:     clock,
+		db:                          db,
+		verifier:                    verifier,
+		resolver:                    resolver,
+		logger:                      logger,
+		maxBody:                     maxBody,
+		secretGen:                   secretGen,
+		clock:                       clock,
+		activeEmbeddingModelVersion: opts.ActiveEmbeddingModelVersion,
+		metrics:                     metrics,
+		newUUID:                     newUUID,
 	}
 	// Build the inner mux. The outer ServeHTTP runs auth
 	// FIRST so we wrap this once. Method gating happens
@@ -188,15 +255,16 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// /v1/repos               -> register
-	// /v1/repos/{id}/ingest   -> ingest
+	// /v1/repos                  -> register
+	// /v1/repos/{id}/ingest      -> ingest
 	// /v1/repos/{id}/ingest_delta -> ingest_delta
+	// /v1/repos/{id}/snapshot    -> snapshot
 	switch {
 	case r.URL.Path == RouteRepos, r.URL.Path == RouteRepos+"/":
 		h.handleRegister(w, r)
 		return
 	case strings.HasPrefix(r.URL.Path, RouteRepos+"/"):
-		repoID, suffix, ok := extractIngestPath(r.URL.Path)
+		repoID, suffix, ok := extractRepoSuffix(r.URL.Path)
 		if !ok {
 			writeJSONError(w, http.StatusNotFound, "not_found",
 				"unknown management API route")
@@ -207,6 +275,8 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
 			h.handleIngest(w, r, repoID)
 		case ingestDeltaSuffix:
 			h.handleIngestDelta(w, r, repoID)
+		case snapshotSuffix:
+			h.handleSnapshot(w, r, repoID)
 		default:
 			writeJSONError(w, http.StatusNotFound, "not_found",
 				"unknown management API route")
@@ -218,19 +288,24 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// extractIngestPath parses `/v1/repos/{repo_id}/ingest` or
-// `/v1/repos/{repo_id}/ingest_delta`. Returns the raw repo_id
-// string and the suffix (`/ingest` or `/ingest_delta`). The
-// repo_id is NOT validated as a UUID here — that's the verb
-// handler's job so 400 / 404 attribution stays clean.
+// extractRepoSuffix parses `/v1/repos/{repo_id}/{verb}`. Returns
+// the raw repo_id string and the matched suffix (`/ingest`,
+// `/ingest_delta`, or `/snapshot`). The repo_id is NOT
+// validated as a UUID here -- that's the verb handler's job
+// so 400 / 404 attribution stays clean.
 //
-// Returns ok=false for any path that does not match either
-// shape exactly.
-func extractIngestPath(path string) (repoID, suffix string, ok bool) {
+// Returns ok=false for any path that does not match a known
+// suffix exactly. Longer suffixes (`/ingest_delta`) MUST be
+// matched before their proper prefix (`/ingest`), so the
+// candidate list is ordered longest-first.
+func extractRepoSuffix(path string) (repoID, suffix string, ok bool) {
 	rest := strings.TrimPrefix(path, RouteRepos+"/")
-	// Match the longest suffix first: `/ingest_delta` is a
-	// strict superset of `/ingest`.
-	for _, s := range []string{ingestDeltaSuffix, ingestSuffix} {
+	// Longest suffix first: `/ingest_delta` is a strict
+	// superset of `/ingest`. `/snapshot` cannot be confused
+	// with either of those but we keep the list ordered so a
+	// future verb like `/snapshot_full` would naturally slot
+	// in ahead of `/snapshot`.
+	for _, s := range []string{ingestDeltaSuffix, ingestSuffix, snapshotSuffix} {
 		if strings.HasSuffix(rest, s) {
 			id := strings.TrimSuffix(rest, s)
 			// Reject extra path segments like
@@ -244,6 +319,18 @@ func extractIngestPath(path string) (repoID, suffix string, ok bool) {
 		}
 	}
 	return "", "", false
+}
+
+// extractIngestPath is the pre-Stage-7.4 name for
+// [extractRepoSuffix] preserved as a thin wrapper for any
+// external callers / tests written before the snapshot verb
+// landed.
+//
+// Deprecated: use [extractRepoSuffix] -- this alias exists
+// only to keep older tests building; new code should call
+// the canonical name.
+func extractIngestPath(path string) (repoID, suffix string, ok bool) {
+	return extractRepoSuffix(path)
 }
 
 // -----------------------------------------------------------
@@ -1044,6 +1131,29 @@ func defaultSecretGen() (string, error) {
 		return "", fmt.Errorf("crypto/rand: %w", err)
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+// defaultNewUUID returns a fresh RFC 4122 v4 UUID string. We
+// build the value Go-side (instead of calling
+// `gen_random_uuid()` in SQL) so the snapshot handler can
+// surface the id in its HTTP response before the DB
+// transaction commits, and so the same id can be threaded
+// into every queued event's `details_json` payload through a
+// single placeholder parameter. crypto/rand failures are
+// surfaced as 500 by the caller; we never silently fall back
+// to math/rand because the resulting collision-prone id would
+// undermine the operator-tracking guarantee the snapshot_id
+// represents.
+func defaultNewUUID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("crypto/rand: %w", err)
+	}
+	// RFC 4122 §4.4: set version (v4) and variant bits.
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
 
 // handleResolverError maps a HeadResolver-returned error onto

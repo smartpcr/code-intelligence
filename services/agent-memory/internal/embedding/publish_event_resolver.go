@@ -134,6 +134,44 @@ func (r *PublishEventContentResolver) Resolve(ctx context.Context, lookup Conten
 			"embedding: PublishEventContentResolver: decode details_json for publish_id %s: %w",
 			lookup.PublishID, err)
 	}
+
+	// Snapshot-driven rows carry no `content` field in their
+	// queued snapshot — the §7.4 mgmt.snapshot handler writes
+	// `{snapshot_id, source, embedding_model_version}` only
+	// because the snapshot enqueuer has no source bytes
+	// in-process.  The §9.6a re-embed contract still needs
+	// real content for the Embedder call, so before refusing
+	// an empty-content snapshot we attempt a fallback lookup
+	// against the SAME `node_id`: find the most recent
+	// `queued` event with non-empty content whose owning
+	// publish reached `published`.  That guarantees the
+	// fallback content is the version the recall path is
+	// currently serving — exactly the body the snapshot
+	// wants to re-embed under the active model.
+	//
+	// We keep the snapshot row's model metadata: the model-
+	// drift checks below compare against `rowModel`, which
+	// is the snapshot publish's recorded version (== current
+	// embedder by construction).  Only `Content` and
+	// `SignatureOnly` are copied from the fallback row.
+	//
+	// The `source` field is decoded from the same
+	// `queuedEventDetails` struct (omitempty so the
+	// publisher's normal-path queued events do not write
+	// `source` at all and the field stays empty there).
+	if snap.Content == "" {
+		if snap.Source == snapshotSource {
+			fallback, ferr := r.resolveSnapshotFallback(ctx, lookup)
+			if ferr != nil {
+				return PublishRequest{}, fmt.Errorf(
+					"embedding: PublishEventContentResolver: empty content in queued snapshot "+
+						"for publish_id %s; fallback lookup failed: %w",
+					lookup.PublishID, ferr)
+			}
+			snap.Content = fallback.Content
+			snap.SignatureOnly = fallback.SignatureOnly
+		}
+	}
 	if snap.Content == "" {
 		// An empty content snapshot means the publisher
 		// recorded the queued event with no body — a
@@ -191,4 +229,68 @@ func (r *PublishEventContentResolver) Resolve(ctx context.Context, lookup Conten
 		Content:            snap.Content,
 		SignatureOnly:      snap.SignatureOnly,
 	}, nil
+}
+
+// snapshotSource is the literal `details_json->>'source'`
+// value the §7.4 mgmt.snapshot handler writes (see
+// `internal/mgmtapi/handler_snapshot.go::buildSnapshotDetailsJSON`).
+// Resolver-side classifier scans for this exact string to
+// distinguish snapshot-enqueued queued events (which never
+// carry content) from publisher-written queued events (which
+// always do).
+const snapshotSource = "mgmt.snapshot"
+
+// resolveSnapshotFallback finds the most recent `queued`
+// event with non-empty content whose owning `embedding_publish`
+// row (a) targets the SAME `node_id` as the snapshot row, (b)
+// is NOT the snapshot row itself, and (c) reached the §9.6a
+// `published` terminal event (its latest event_kind is
+// `published`).  The latest-published predicate ensures we
+// only fall back to content that was actually served by the
+// recall path, never to content from a failed or in-flight
+// publish.
+//
+// The lateral subquery uses the canonical (created_at DESC,
+// event_id DESC) tie-break shared by the rest of the §9.6a
+// machinery (publisher.go's supersede CTE, flusher.go's
+// stuck-row scan, promoter.go's selectStalled).
+func (r *PublishEventContentResolver) resolveSnapshotFallback(
+	ctx context.Context,
+	lookup ContentLookup,
+) (queuedEventDetails, error) {
+	const q = `
+		SELECT e.details_json::text
+		  FROM embedding_publish_event e
+		  JOIN embedding_publish      p ON p.publish_id = e.publish_id
+		  CROSS JOIN LATERAL (
+		      SELECT epe.event_kind
+		        FROM embedding_publish_event epe
+		       WHERE epe.publish_id = p.publish_id
+		       ORDER BY epe.created_at DESC, epe.event_id DESC
+		       LIMIT 1
+		  ) latest
+		 WHERE p.node_id              = $1::uuid
+		   AND p.publish_id          <> $2::uuid
+		   AND e.event_kind           = 'queued'
+		   AND e.details_json         IS NOT NULL
+		   AND coalesce(e.details_json->>'content', '') <> ''
+		   AND latest.event_kind      = 'published'
+		 ORDER BY e.created_at DESC, e.event_id DESC
+		 LIMIT 1
+	`
+	var raw string
+	err := r.db.QueryRowContext(ctx, q, lookup.NodeID, lookup.PublishID).Scan(&raw)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return queuedEventDetails{}, fmt.Errorf(
+				"no prior published row for node_id %s carries content the snapshot can re-embed",
+				lookup.NodeID)
+		}
+		return queuedEventDetails{}, fmt.Errorf("scan fallback details_json: %w", err)
+	}
+	var snap queuedEventDetails
+	if err := json.Unmarshal([]byte(raw), &snap); err != nil {
+		return queuedEventDetails{}, fmt.Errorf("decode fallback details_json: %w", err)
+	}
+	return snap, nil
 }

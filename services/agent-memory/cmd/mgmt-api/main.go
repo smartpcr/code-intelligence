@@ -176,8 +176,32 @@ func main() {
 		logger.Error("mgmt-api.resolver", slog.String("error", err.Error()))
 		os.Exit(2)
 	}
+
+	// The Metrics sink is constructed BEFORE the handler so
+	// the /metrics endpoint and mgmt.snapshot can share the
+	// same atomic counter instance. NewInMemoryMetrics is
+	// cheap (zero-valued atomics); no allocation pressure.
+	// A missing AGENT_MEMORY_EMBEDDING_MODEL_VERSION is NOT
+	// fatal at boot -- it only fails mgmt.snapshot with a
+	// 503 at call time, so an operator can roll out the rest
+	// of the management surface (register / ingest /
+	// ingest_delta) before pinning the embedding model.
+	if cfg.EmbeddingModelVersion == "" {
+		logger.Warn("mgmt-api.embedding_model_version.unset",
+			slog.String("env", "AGENT_MEMORY_EMBEDDING_MODEL_VERSION"),
+			slog.String("warning",
+				"mgmt.snapshot will return 503 until this is set"),
+		)
+	} else {
+		logger.Info("mgmt-api.embedding_model_version",
+			slog.String("active", cfg.EmbeddingModelVersion),
+		)
+	}
+	metrics := mgmtapi.NewInMemoryMetrics()
 	handler := mgmtapi.NewHandler(db, verifier, resolver, mgmtapi.Options{
-		Logger: logger,
+		Logger:                      logger,
+		ActiveEmbeddingModelVersion: cfg.EmbeddingModelVersion,
+		Metrics:                     metrics,
 	})
 
 	mux := http.NewServeMux()
@@ -186,6 +210,35 @@ func main() {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+	// `/metrics` exposes the Prometheus text-format counters
+	// implementation-plan §7.4 calls out for the snapshot
+	// verb: `snapshot_pending_total` is incremented by the
+	// mgmt.snapshot handler on every successful enqueue, and
+	// `snapshot_published_total` is incremented by the
+	// EmbeddingIndex writer (Repo Indexer / Concept
+	// Promoter) once a snapshot-driven publish reaches
+	// `event_kind='published'`. The mgmt-api process owns
+	// only the `pending` side; the `published` counter is
+	// exposed so an operator scraping THIS binary still sees
+	// a stable shape (value will be 0 here -- the worker
+	// publishes the matching value at its own /metrics).
+	//
+	// We hand-roll the Prometheus text format instead of
+	// pulling in prometheus/client_golang because this
+	// binary exports exactly two counters and the
+	// Prometheus text format is intentionally trivial
+	// (mirrors cmd/agent-api/main.go).
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		pending, published := metrics.Snapshot()
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "# HELP snapshot_pending_total Cumulative EmbeddingPublish rows enqueued by mgmt.snapshot since process start.\n")
+		fmt.Fprintf(w, "# TYPE snapshot_pending_total counter\n")
+		fmt.Fprintf(w, "snapshot_pending_total %d\n", pending)
+		fmt.Fprintf(w, "# HELP snapshot_published_total Cumulative snapshot-driven publishes the EmbeddingIndex writer reported as published (0 on this binary; the worker is the source of truth).\n")
+		fmt.Fprintf(w, "# TYPE snapshot_published_total counter\n")
+		fmt.Fprintf(w, "snapshot_published_total %d\n", published)
 	})
 
 	srv := &http.Server{
@@ -272,6 +325,15 @@ type config struct {
 	HeadResolverGitPath   string
 	HeadResolverTimeout   time.Duration
 	HeadResolverStaticSHA string
+
+	// EmbeddingModelVersion is the active model version the
+	// mgmt.snapshot verb tags onto every newly enqueued
+	// EmbeddingPublish row (tech-spec §9.6 / §9.6a). Read
+	// from AGENT_MEMORY_EMBEDDING_MODEL_VERSION. Empty is
+	// non-fatal at boot (snapshot returns 503 until set)
+	// so the rest of the management surface can roll out
+	// independently.
+	EmbeddingModelVersion string
 }
 
 // loadConfig reads the binary's configuration from the
@@ -296,6 +358,7 @@ func loadConfig() (config, error) {
 		HeadResolverGitPath:   os.Getenv("AGENT_MEMORY_HEAD_RESOLVER_GIT_PATH"),
 		HeadResolverStaticSHA: os.Getenv("AGENT_MEMORY_HEAD_RESOLVER_STATIC_SHA"),
 		ResolverMode:          os.Getenv("AGENT_MEMORY_HEAD_RESOLVER"),
+		EmbeddingModelVersion: os.Getenv("AGENT_MEMORY_EMBEDDING_MODEL_VERSION"),
 		ReadTimeout:           30 * time.Second,
 		WriteTimeout:          30 * time.Second,
 		ShutdownTimeout:       30 * time.Second,

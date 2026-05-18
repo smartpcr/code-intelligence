@@ -37,6 +37,29 @@ package spaningestor
 // supplies; spans whose service is not registered are
 // dropped with a counter increment (NOT a 4xx) so an unknown
 // service can't 4xx-flood the receiver.
+//
+// Routing precedence (mgmt-api replay support)
+// --------------------------------------------
+// Stage 7.2 wires a `mgmt.ingest_spans` verb (POST /v1/spans on
+// the mgmt-api binary) that forwards verified batches to this
+// receiver. Those batches carry an explicit `repo_id` that
+// MUST NOT be erased by the registered service.name lookup
+// (the operator may be replaying spans whose service.name is
+// not in the registry). To honor the explicit override the
+// receiver consults three independent routing hooks in this
+// order, and picks the first one that produces a non-empty
+// repo_id:
+//
+//  1. `X-Mgmt-Repo-ID` HTTP request header  (applies to all
+//     ResourceSpans entries in the request — the operator is
+//     asserting "every span in this body belongs to that repo")
+//  2. `mgmt.repo_id` resource attribute     (per-ResourceSpans)
+//  3. `service.name` resource attribute → [ServiceNameToRepoID]
+//
+// The header / attribute repo_id MUST be a 36-char hyphenated
+// UUID; malformed values are ignored and the receiver falls
+// through to the next hook so a typo can't drop a whole batch
+// into an arbitrary repo.
 
 import (
 	"context"
@@ -46,13 +69,63 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	"google.golang.org/protobuf/proto"
 )
+
+// MgmtRepoIDHeader is the HTTP request header the mgmt-api span
+// forwarder sets to override the per-ResourceSpans service.name
+// → repo_id lookup. When present and parseable as a UUID, the
+// receiver routes EVERY span in the request to that repo
+// regardless of any service.name or mgmt.repo_id attributes.
+// See file header §"Routing precedence (mgmt-api replay support)".
+const MgmtRepoIDHeader = "X-Mgmt-Repo-ID"
+
+// MgmtRepoIDResourceAttr is the per-ResourceSpans resource
+// attribute key the mgmt-api forwarder injects so a Collector
+// receiving a mgmt replay can route the batch back to the
+// originating repo without operator-side service.name registry
+// configuration. Recognised by the receiver with precedence
+// LOWER than [MgmtRepoIDHeader] but HIGHER than service.name
+// lookup. See file header §"Routing precedence (mgmt-api replay support)".
+const MgmtRepoIDResourceAttr = "mgmt.repo_id"
+
+// MgmtReplayServiceNamePrefix is the prefix the mgmt-api
+// forwarder synthesises on the per-batch `service.name`
+// resource attribute (e.g. "mgmt-api-replay/<repo_id>"). When
+// the [ServiceNameToRepoID] lookup misses but the service.name
+// carries this prefix, the receiver falls back to the suffix
+// (UUID-validated) as the repo_id. Operators who want to
+// disable this convention can leave it as-is — it only fires
+// when no other routing hook resolved the batch.
+const MgmtReplayServiceNamePrefix = "mgmt-api-replay/"
+
+// reUUIDStrict matches the canonical 8-4-4-4-12 lower-case
+// hyphenated UUID textual form. Used to validate the
+// header / resource-attribute repo_id overrides so a typo
+// can't poison the routing decision.
+var reUUIDStrict = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// validatedRepoID returns s when it parses as a UUID and ""
+// otherwise. Used by the routing-precedence hooks so a typoed
+// header / attribute is treated as "not supplied" rather than
+// silently mis-routing the batch.
+func validatedRepoID(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if !reUUIDStrict.MatchString(strings.ToLower(s)) {
+		return ""
+	}
+	return strings.ToLower(s)
+}
 
 // ServiceNameToRepoID maps an OTel `service.name` (or
 // `service.namespace`) to the `repo_id` (textual UUID) the
@@ -183,7 +256,13 @@ func (r *OTLPReceiver) handleTraces(w http.ResponseWriter, req *http.Request) {
 	// resolve correctly. The OTLP/HTTP payload may contain
 	// spans from multiple services in one POST; we emit one
 	// batch per (repo_id) so the per-batch invariants hold.
+	//
+	// Routing precedence: see file header §"Routing precedence
+	// (mgmt-api replay support)". The X-Mgmt-Repo-ID header, if
+	// present and UUID-valid, applies to EVERY ResourceSpans
+	// entry — the operator is asserting body-level ownership.
 	perRepo := make(map[string][]ObservationSpan)
+	headerRepoID := validatedRepoID(req.Header.Get(MgmtRepoIDHeader))
 	if encoding == "protobuf" {
 		var payload coltracepb.ExportTraceServiceRequest
 		if err := proto.Unmarshal(body, &payload); err != nil {
@@ -191,11 +270,10 @@ func (r *OTLPReceiver) handleTraces(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		for _, rs := range payload.GetResourceSpans() {
-			serviceName := lookupResourceAttrProto(rs.GetResource(), "service.name")
-			repoID := r.serviceToRepoID(serviceName)
+			repoID := r.resolveRepoIDProto(rs.GetResource(), headerRepoID)
 			if repoID == "" {
 				r.logger.Debug("spaningestor.otlp.unknown_service",
-					slog.String("service_name", serviceName))
+					slog.String("service_name", lookupResourceAttrProto(rs.GetResource(), "service.name")))
 				continue
 			}
 			for _, ss := range rs.GetScopeSpans() {
@@ -211,11 +289,10 @@ func (r *OTLPReceiver) handleTraces(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		for _, rs := range payload.ResourceSpans {
-			serviceName := lookupResourceAttr(rs.Resource.Attributes, "service.name")
-			repoID := r.serviceToRepoID(serviceName)
+			repoID := r.resolveRepoIDJSON(rs.Resource.Attributes, headerRepoID)
 			if repoID == "" {
 				r.logger.Debug("spaningestor.otlp.unknown_service",
-					slog.String("service_name", serviceName))
+					slog.String("service_name", lookupResourceAttr(rs.Resource.Attributes, "service.name")))
 				continue
 			}
 			for _, ss := range rs.ScopeSpans {
@@ -347,6 +424,68 @@ func lookupResourceAttr(attrs []otlpKeyValue, key string) string {
 	for _, a := range attrs {
 		if a.Key == key {
 			return a.Value.StringValue
+		}
+	}
+	return ""
+}
+
+// resolveRepoIDJSON applies the documented routing precedence
+// to a single OTLP/HTTP-JSON ResourceSpans entry:
+//
+//  1. headerRepoID (already UUID-validated by caller; "" when
+//     absent / malformed). When set, returned as-is so the
+//     header-level override wins across the whole request.
+//  2. `mgmt.repo_id` resource attribute (per-ResourceSpans).
+//     UUID-validated; ignored when malformed so a typo doesn't
+//     mis-route a batch.
+//  3. `service.name` → [ServiceNameToRepoID] lookup.
+//  4. service.name prefix fallback: if the service.name has
+//     the [MgmtReplayServiceNamePrefix] and the suffix parses
+//     as a UUID, that UUID is the repo_id. This lets an
+//     operator wire the mgmt-api forwarder against a Span
+//     Ingestor whose registry is unaware of the replay prefix.
+//
+// Returns "" when no hook resolves; the caller treats that as
+// "unknown service" and drops the ResourceSpans entry with a
+// counter increment.
+func (r *OTLPReceiver) resolveRepoIDJSON(attrs []otlpKeyValue, headerRepoID string) string {
+	if headerRepoID != "" {
+		return headerRepoID
+	}
+	if id := validatedRepoID(lookupResourceAttr(attrs, MgmtRepoIDResourceAttr)); id != "" {
+		return id
+	}
+	serviceName := lookupResourceAttr(attrs, "service.name")
+	if id := r.serviceToRepoID(serviceName); id != "" {
+		return id
+	}
+	if strings.HasPrefix(serviceName, MgmtReplayServiceNamePrefix) {
+		if id := validatedRepoID(strings.TrimPrefix(serviceName, MgmtReplayServiceNamePrefix)); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+// resolveRepoIDProto mirrors [resolveRepoIDJSON] for the
+// OTLP/HTTP-protobuf branch of [handleTraces]. Kept as a
+// receiver method (rather than a free function) so the
+// [ServiceNameToRepoID] lookup is shared via the same
+// closure both encodings consult.
+func (r *OTLPReceiver) resolveRepoIDProto(res *resourcepb.Resource, headerRepoID string) string {
+	if headerRepoID != "" {
+		return headerRepoID
+	}
+	if id := validatedRepoID(lookupResourceAttrProto(res, MgmtRepoIDResourceAttr)); id != "" {
+		return id
+	}
+	serviceName := lookupResourceAttrProto(res, "service.name")
+	if id := r.serviceToRepoID(serviceName); id != "" {
+		return id
+	}
+	if strings.HasPrefix(serviceName, MgmtReplayServiceNamePrefix) {
+		if id := validatedRepoID(strings.TrimPrefix(serviceName, MgmtReplayServiceNamePrefix)); id != "" {
+			return id
 		}
 	}
 	return ""

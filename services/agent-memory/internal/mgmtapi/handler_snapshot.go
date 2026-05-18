@@ -59,6 +59,30 @@ package mgmtapi
 // via the `concept_version.promoted = true` predicate
 // because the Concept Promoter unsets `promoted` when it
 // retires a version.
+//
+// Prior-publish hygiene
+// ---------------------
+// The snapshot enqueuer has no source bytes in-process, so
+// the queued event it writes carries an EMPTY `content`
+// field. The §9.6a flusher's `PublishEventContentResolver`
+// fills that gap by looking up the most recent published
+// row for the same target via `resolveSnapshotFallback`
+// (see `internal/embedding/publish_event_resolver.go`). For
+// targets that have NEVER been published, that fallback
+// has nothing to inherit and the publish would stay
+// permanently queued: the flusher's stuck-row scan keeps
+// re-picking it tick after tick, the resolver keeps
+// failing, and `embedding.flusher.resolve_failed` log
+// noise accumulates forever (the flusher leaves the row
+// untouched on `ResolveErrors`, so `latest_at` never moves
+// forward past `queuedAgeThreshold`). Both CTEs therefore
+// add an `EXISTS (SELECT 1 FROM embedding_publish ep ...)`
+// predicate so the snapshot only targets ids that already
+// have at least one publish row the resolver can fall back
+// to. The first-time embed of a brand-new node / concept
+// is the responsibility of the Repo Indexer / Concept
+// Promoter ingest path -- snapshot is a re-embed verb, not
+// an initial-embed verb.
 
 import (
 	"context"
@@ -81,6 +105,17 @@ import (
 //
 // Anti-join `node_retirement` keeps retired nodes out of the
 // queued publish set (rubber-duck item #2 / G5).
+//
+// `EXISTS (SELECT 1 FROM embedding_publish ep WHERE
+// ep.node_id = n.node_id)` keeps nodes that have NEVER been
+// published out of the queued publish set, because the
+// resolver's content-fallback lookup
+// (`resolveSnapshotFallback`) needs at least one prior
+// publish row to inherit content from; without this filter
+// the snapshot would seed permanently-stuck queued rows
+// that waste flusher cycles every retry tick. The
+// `embedding_publish_node_id_idx` partial index makes the
+// probe O(log N).
 const insertNodePublishesSQL = `
 		WITH src AS (
 			SELECT n.node_id
@@ -89,6 +124,10 @@ const insertNodePublishesSQL = `
 			WHERE n.repo_id = $1::uuid
 			  AND n.kind IN ('method'::node_kind, 'block'::node_kind)
 			  AND nr.node_id IS NULL
+			  AND EXISTS (
+			      SELECT 1 FROM embedding_publish ep
+			       WHERE ep.node_id = n.node_id
+			  )
 		),
 		ins AS (
 			INSERT INTO embedding_publish
@@ -114,6 +153,18 @@ const insertNodePublishesSQL = `
 // publishes. `cv.promoted = true` keeps the snapshot from
 // re-embedding versions the Concept Promoter has already
 // retired off the recall path.
+//
+// `EXISTS (SELECT 1 FROM embedding_publish ep WHERE
+// ep.concept_version_id = cv.concept_version_id)` mirrors
+// the node-side prior-publish gate. In practice
+// `cv.promoted = true` already implies a Promoter-written
+// publish row by construction (the promoter writes both in
+// the same transaction), but the explicit predicate is
+// defence-in-depth against a future code path that flips
+// `promoted` without seeding a publish, and keeps the two
+// CTEs symmetric for the next reader. The
+// `embedding_publish_concept_version_id_idx` partial index
+// keeps the probe O(log N).
 const insertConceptPublishesSQL = `
 		WITH src AS (
 			SELECT DISTINCT cv.concept_version_id
@@ -121,6 +172,10 @@ const insertConceptPublishesSQL = `
 			JOIN concept_support cs USING (concept_version_id)
 			WHERE cs.repo_id = $1::uuid
 			  AND cv.promoted = true
+			  AND EXISTS (
+			      SELECT 1 FROM embedding_publish ep
+			       WHERE ep.concept_version_id = cv.concept_version_id
+			  )
 		),
 		ins AS (
 			INSERT INTO embedding_publish
@@ -316,6 +371,13 @@ func (h *Handler) handleSnapshot(w http.ResponseWriter, r *http.Request, rawRepo
 // promoted-Concept targets) as a successful no-op: 202 with
 // publish_count = 0. Logging upstream still records the call
 // so operator forensics can prove the snapshot was attempted.
+// "Empty" here ALSO subsumes the case where the repo has
+// nodes / promoted concepts but none of them have ever been
+// published (see the prior-publish hygiene note in the
+// package doc): those targets are deliberately excluded by
+// the EXISTS predicate inside [insertNodePublishesSQL] /
+// [insertConceptPublishesSQL] because the §7.4 fallback
+// resolver has no prior content to inherit from.
 func (h *Handler) executeSnapshot(ctx context.Context, repoID, modelVersion, snapshotID string) (snapshotCounts, error) {
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -335,6 +397,13 @@ func (h *Handler) executeSnapshot(ctx context.Context, repoID, modelVersion, sna
 	// (architecture.md §5.2.4); the unique index on
 	// node_retirement.node_id (migration 0004) keeps this
 	// O(log N) per probe.
+	//
+	// The `EXISTS (SELECT 1 FROM embedding_publish ...)`
+	// predicate excludes never-previously-published nodes
+	// so the snapshot does not seed permanently-stuck
+	// queued rows the §7.4 fallback resolver cannot
+	// satisfy. See the prior-publish hygiene note in the
+	// package doc.
 	//
 	// The outer SELECT count(*) returns the row count of the
 	// LAST CTE (`ev`) -- equal to the number of queued
@@ -366,6 +435,12 @@ func (h *Handler) executeSnapshot(ctx context.Context, repoID, modelVersion, sna
 	// promoted -- if the Concept Promoter has retired it,
 	// it is already off the recall path and re-embedding it
 	// would waste work.
+	//
+	// The `EXISTS (SELECT 1 FROM embedding_publish ...)`
+	// predicate is the concept-side mirror of the node-side
+	// prior-publish gate (defence-in-depth; today every
+	// `promoted = true` row already has a Promoter-written
+	// publish row in the same transaction).
 	//
 	// See [insertConceptPublishesSQL] for the package-level
 	// literal.

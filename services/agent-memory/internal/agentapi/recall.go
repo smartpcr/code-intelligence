@@ -207,6 +207,27 @@ type Service struct {
 	neighborhood      NeighborhoodResolver
 	rerankerFreshness RerankerFreshnessSource
 	summariserTimeout time.Duration
+
+	// Stage 5.3 (agent.expand verb) optional dependencies
+	// wired by `WithEdgeWalker` / `WithExpandObservationCounter`
+	// / `WithExpandMaxDepth` / `WithExpandMaxNodes` /
+	// `WithExpandMaxEdges` / `WithExpandSnapshot` /
+	// `WithExpandEdgeKinds`. See `expand.go` for the per-field
+	// contract. Without `edgeWalker` the `Expand` verb returns
+	// `ErrExpandUnavailable` so a binary that wires only the
+	// recall verb sees a clean "not configured" signal rather
+	// than a runtime nil-deref. The `expandMax*` knobs default
+	// to the package constants (`DefaultExpandDepth=5`,
+	// `DefaultExpandMaxNodes=200`, `DefaultExpandMaxEdges=400`)
+	// when zero so the legacy "core deps only" fixtures still
+	// produce a bounded walk.
+	edgeWalker        EdgeWalker
+	expandObsCounter  EdgeObservationCounter
+	expandMaxDepth    int
+	expandMaxNodes    int
+	expandMaxEdges    int
+	expandSnapshot    ExpandSnapshotSource
+	expandEdgeKinds   []string
 }
 
 // Option configures a `Service`.
@@ -700,6 +721,16 @@ func (s *Service) Recall(ctx context.Context, req RecallRequest) (RecallResponse
 		if s.reranker != nil {
 			resp.RerankerModelVersion = s.reranker.ModelVersion()
 		}
+		// Stage 6.4 step 5: apply the stale-model gate on
+		// the empty-candidates path too. Without this, an
+		// otherwise-healthy empty response would NEVER
+		// surface `reranker_model_stale` — the freshness
+		// signal would only fire on the happy-path return,
+		// which an empty result set never reaches. Priority
+		// rule #1 inside applyRerankerStaleness preserves
+		// any pre-existing degraded reason set by
+		// populateDegraded above.
+		s.applyRerankerStaleness(ctx, &resp)
 		s.appendContextLog(ctx, req, &resp, kinds)
 		return resp, nil
 	}
@@ -789,11 +820,20 @@ func (s *Service) Recall(ctx context.Context, req RecallRequest) (RecallResponse
 	// response projection below (which reads `c.FinalScore`)
 	// still surfaces a meaningful similarity number instead
 	// of the struct zero value.
+	//
+	// Stage 6.4: the trained-scorer path uses `rankWithVersion`
+	// which atomically pins ordering + advertised version to a
+	// single PublishedRerankerSource read AND threads the
+	// recall query through to QueryAwareFallibleReranker
+	// implementations (the BERT cross-encoder sidecar) so the
+	// scoring surface matches the trainer's `[CLS] query [SEP]
+	// candidate [SEP]` distribution. Without this threading
+	// the cross-encoder would score on candidate-only text
+	// and silently regress NDCG.
 	ranked := candidates
 	rerankerVersion := ""
 	if s.reranker != nil {
-		ranked = s.reranker.Rank(candidates)
-		rerankerVersion = s.reranker.ModelVersion()
+		ranked, rerankerVersion = rankWithVersion(ctx, s.reranker, req.Query, candidates)
 	} else {
 		for i := range ranked {
 			ranked[i].FinalScore = ranked[i].Score
@@ -838,6 +878,13 @@ func (s *Service) Recall(ctx context.Context, req RecallRequest) (RecallResponse
 		RerankerModelVersion: rerankerVersion,
 	}
 	s.populateDegraded(ctx, req, &resp)
+	// Stage 6.4 step 5: stale-model gate. MUST fire AFTER
+	// populateDegraded (so a hard degraded reason like
+	// `graph_store_unavailable` wins per priority rule #1)
+	// and BEFORE appendContextLog (so the persisted log row
+	// records the final degraded state observed by the
+	// caller).
+	s.applyRerankerStaleness(ctx, &resp)
 	s.appendContextLog(ctx, req, &resp, kinds)
 	return resp, nil
 }
@@ -1145,6 +1192,14 @@ func (s *Service) degradedFallback(
 		if s.reranker != nil {
 			resp.RerankerModelVersion = s.reranker.ModelVersion()
 		}
+		// Stage 6.4 step 5: apply the stale-model gate for
+		// symmetry with the happy path. Priority rule #1
+		// preserves the hard degraded reason already set
+		// above, so this is a defensive no-op here — but
+		// keeping the call site lets a future refactor that
+		// drops the upfront `Degraded=true` not silently
+		// regress the staleness signal.
+		s.applyRerankerStaleness(ctx, &resp)
 		s.appendContextLogDegraded(ctx, req, &resp, kinds)
 		return resp, nil
 	}
@@ -1165,6 +1220,14 @@ func (s *Service) degradedFallback(
 			},
 		})
 	}
+	// Stage 6.4 step 5: stale-model gate on the successful
+	// snapshot-degraded fallback too. Same rationale as the
+	// no-snapshot branch above — priority rule #1 makes this
+	// a defensive no-op while the hard reason is set, but
+	// keeping both call sites in lockstep avoids the kind of
+	// "fixed one branch, missed the other" regression that
+	// triggered iter-19 feedback item #4.
+	s.applyRerankerStaleness(ctx, &resp)
 	s.appendContextLogDegraded(ctx, req, &resp, kinds)
 	return resp, nil
 }

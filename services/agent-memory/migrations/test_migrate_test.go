@@ -168,6 +168,10 @@ func TestUp_appliesEntireStage12_andEveryExpectedObjectExists(t *testing.T) {
 		"recall_context_log",
 		"concept", "concept_version", "concept_support",
 		"consolidator_run", "promoter_run", "reranker_model",
+		// Stage 6.1 iter-4 follow-on: durable sub-threshold
+		// candidate support staging for the Consolidator
+		// (0021_concept_candidate.sql).
+		"concept_candidate_support",
 		// Stage 1.4 embedding-publish state-log pair.
 		"embedding_publish", "embedding_publish_event",
 		// Stage 3.5 per-repo HMAC secret (Webhook Receiver).

@@ -50,6 +50,13 @@
 //	0019_repo_health.sql              -- repo_health (UPSERT-grantable; degraded_reason ENUM column)
 //	0020_method_solo_observation.sql  -- method_solo_observation (UPSERT-grantable; root-span destination aggregate)
 //
+// Stage 6.1 iter-4 adds the durable sub-threshold candidate
+// support staging table the Consolidator uses to accumulate
+// per-signature support across ticks without pinning the
+// high-water mark:
+//
+//	0021_concept_candidate.sql        -- concept_candidate_support (UPDATE-grantable; promoted_to_concept_id flag in lieu of DELETE)
+//
 // Later stages append more files; the migrator picks them up by
 // sorted filename so the lexicographic order matches the apply
 // order.

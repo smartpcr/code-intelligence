@@ -198,6 +198,8 @@ func main() {
 			Addr:              cfg.MetricsAddr,
 			Handler:           mux,
 			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			WriteTimeout:      10 * time.Second,
 		}
 		go func() {
 			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

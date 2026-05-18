@@ -40,8 +40,8 @@ const otelSpanIDHexLen = 16
 
 // forbiddenSpanFields is the closed set of JSON keys / OTel
 // attribute keys whose presence on the `mgmt.ingest_spans`
-// payload is a §6.2.2 protocol violation. These belong on
-// `mgmt.feedback`, NOT on spans (see architecture.md §6.2.2).
+// payload is a ┬º6.2.2 protocol violation. These belong on
+// `mgmt.feedback`, NOT on spans (see architecture.md ┬º6.2.2).
 // Checked at EVERY semantic level: root, resourceSpans,
 // resource, resource attributes, scopeSpans, scope, scope
 // attributes, span, span attributes.
@@ -65,23 +65,23 @@ type IngestSpansResponse struct {
 }
 
 // handleIngestSpans implements `POST /v1/spans`
-// (`mgmt.ingest_spans`). See architecture.md §6.2.1 / §6.2.2
+// (`mgmt.ingest_spans`). See architecture.md ┬º6.2.1 / ┬º6.2.2
 // and implementation-plan.md Stage 7.2 for the contract.
 //
 // Error precedence (fail-fast on first match):
-//  1. Content-Type guard → 415 unsupported_media_type.
-//  2. Body cap + JSON parse → 413 / 400.
+//  1. Content-Type guard ΓåÆ 415 unsupported_media_type.
+//  2. Body cap + JSON parse ΓåÆ 413 / 400.
 //  3. Forbidden field (`outcome`, `corrected_action`) at
 //     ANY level (root / resourceSpans / resource / resource
 //     attributes / scopeSpans / scope / scope attributes /
-//     span / span attributes) → 400 forbidden_field.
+//     span / span attributes) ΓåÆ 400 forbidden_field.
 //  4. OTel schema validation (trace_id, span_id, valid
-//     start/end timestamps, hex shape) → 400
+//     start/end timestamps, hex shape) ΓåÆ 400
 //     validation_failed.
 //  5. Unknown service (any resource group whose
 //     `service.name` does not resolve via the configured
-//     [ServiceNameToRepoID]) → 400 unknown_service.
-//  6. Forwarder error → 502 forward_failed or 503
+//     [ServiceNameToRepoID]) ΓåÆ 400 unknown_service.
+//  6. Forwarder error ΓåÆ 502 forward_failed or 503
 //     forwarder_not_configured.
 //
 // On the happy path: the ORIGINAL validated body bytes are
@@ -200,7 +200,7 @@ func (h *Handler) handleForwardError(w http.ResponseWriter, err error, counts ma
 // application/json variant (parameters such as charset are
 // allowed; case is canonicalised). An empty value is also
 // accepted to keep the door open for OTel exporters that
-// omit Content-Type — the body is still parsed as JSON, so a
+// omit Content-Type ΓÇö the body is still parsed as JSON, so a
 // malformed body produces a 400 invalid_json downstream.
 //
 // Other content types (text/plain, application/x-protobuf,
@@ -300,7 +300,7 @@ func (e *spanValidationError) Error() string { return e.message }
 // semantic level so:
 //   - Forbidden keys (`outcome`, `corrected_action`) are
 //     visible BEFORE any typed decode silently drops them.
-//   - The original body bytes are NEVER modified — we
+//   - The original body bytes are NEVER modified ΓÇö we
 //     re-decode subtrees but the request body remains the
 //     ground truth for forwarding.
 //   - Non-string OTLP attribute values (intValue, boolValue,
@@ -318,16 +318,27 @@ func (h *Handler) validateSpansPayload(w http.ResponseWriter, body []byte) (map[
 
 	// Iter-4 structural fix: deep recursive scan of the
 	// ENTIRE decoded JSON tree. Catches forbidden fields at
-	// ANY nesting depth — including nested OTLP shapes the
+	// ANY nesting depth ΓÇö including nested OTLP shapes the
 	// structured walker does not explicitly traverse
 	// (`span.status`, nested `kvlistValue` KeyValue entries,
 	// custom non-OTel sibling objects). This is the
 	// canonical implementation of the implementation-plan
-	// §7.2 wording "reject any payload containing an
+	// ┬º7.2 wording "reject any payload containing an
 	// `outcome` or `corrected_action` field". The
 	// downstream structured forbidden-key checks remain as
 	// defense-in-depth.
-	if vErr := h.deepForbiddenScan(body); vErr != nil {
+	//
+	// We pass the already-decoded `root` (a
+	// `map[string]json.RawMessage` view) rather than the
+	// raw body bytes so the scan does NOT re-parse the
+	// payload into a fully materialised `any` tree. For a
+	// payload at the 4 MiB body cap that second parse
+	// roughly doubled peak heap, because every nested
+	// string/number/bool leaf got boxed into a Go
+	// interface; the lazy json.RawMessage walk only
+	// decodes object/array spines on the descent path and
+	// leaves scalar leaves as raw bytes.
+	if vErr := h.deepForbiddenScan(root); vErr != nil {
 		h.writeValidationFailure(w, vErr)
 		return nil, 0, false
 	}
@@ -416,7 +427,7 @@ func (h *Handler) validateResourceSpans(raw json.RawMessage, resIdx int) (string
 		}
 	}
 
-	// Walk scopeSpans → scope + scope attributes + spans.
+	// Walk scopeSpans ΓåÆ scope + scope attributes + spans.
 	totalSpans := 0
 	if scopeRaw, ok := rs["scopeSpans"]; ok && len(scopeRaw) > 0 && string(scopeRaw) != "null" {
 		var scopeSpans []json.RawMessage
@@ -439,7 +450,7 @@ func (h *Handler) validateResourceSpans(raw json.RawMessage, resIdx int) (string
 
 	// Resolve repo_id only when the resource actually had
 	// spans. An empty resource group with zero spans is
-	// allowed even if its service.name doesn't map — there
+	// allowed even if its service.name doesn't map ΓÇö there
 	// is no data to attribute and rejecting it would be
 	// overly strict.
 	if totalSpans == 0 {
@@ -523,7 +534,7 @@ func validateScopeSpans(raw json.RawMessage, resIdx, ssIdx int) (int, *spanValid
 	return count, nil
 }
 
-// validateSpan runs the §6.2.2 OTel schema checks against a
+// validateSpan runs the ┬º6.2.2 OTel schema checks against a
 // raw span JSON message AND checks the span object + its
 // attributes for forbidden field names.
 //
@@ -591,7 +602,7 @@ func validateSpan(raw json.RawMessage, resIdx, ssIdx, spIdx int) *spanValidation
 		}
 	}
 	// Iter-4: W3C trace-context (and OTel) reserve the
-	// all-zero trace_id as the "invalid trace" sentinel —
+	// all-zero trace_id as the "invalid trace" sentinel ΓÇö
 	// it must never appear in an exported payload. The
 	// `isLowerHex` check above passes "000...0" because it
 	// is technically lower-case hex; this explicit reject
@@ -621,7 +632,7 @@ func validateSpan(raw json.RawMessage, resIdx, ssIdx, spIdx int) *spanValidation
 		}
 	}
 	// Iter-4: same sentinel rule for span_id. The all-zero
-	// span_id is reserved for "no span" — only legitimate
+	// span_id is reserved for "no span" ΓÇö only legitimate
 	// as the implicit parent of a root span. Reject it on
 	// the span_id field where it must be a real identifier.
 	if isAllZeroHex(typed.SpanID) {
@@ -668,22 +679,22 @@ func validateSpan(raw json.RawMessage, resIdx, ssIdx, spIdx int) *spanValidation
 		}
 	}
 
-	// Span attributes — forbidden-key check.
+	// Span attributes ΓÇö forbidden-key check.
 	if _, vErr := walkAttributes(keys["attributes"], "", loc+".attributes"); vErr != nil {
 		return vErr
 	}
 
-	// Span `events` — each event object AND its attributes
+	// Span `events` ΓÇö each event object AND its attributes
 	// are walked for forbidden keys. OTel `SpanEvent` is
 	// `{timeUnixNano, name, attributes, droppedAttributesCount}`
-	// — a payload smuggling `outcome` as either the event
+	// ΓÇö a payload smuggling `outcome` as either the event
 	// object key OR an event-attribute key would otherwise
-	// bypass the §6.2.2 contract.
+	// bypass the ┬º6.2.2 contract.
 	if vErr := walkEventsOrLinks(keys["events"], loc+".events", "event"); vErr != nil {
 		return vErr
 	}
 
-	// Span `links` — same treatment. OTel `SpanLink` is
+	// Span `links` ΓÇö same treatment. OTel `SpanLink` is
 	// `{traceId, spanId, traceState, attributes, droppedAttributesCount,
 	// flags}`.
 	if vErr := walkEventsOrLinks(keys["links"], loc+".links", "link"); vErr != nil {
@@ -750,7 +761,7 @@ func walkEventsOrLinks(raw json.RawMessage, where, kind string) *spanValidationE
 //  2. Any OTel `KeyValue` whose `key` STRING VALUE equals a
 //     forbidden name. OTel attribute names are encoded as
 //     the string value of a JSON field called `"key"`, not
-//     as JSON object keys — so the pure-JSON-key check
+//     as JSON object keys ΓÇö so the pure-JSON-key check
 //     above is necessary but not sufficient. This second
 //     leg catches forbidden attribute names anywhere
 //     KeyValue lists appear, including nested in
@@ -762,23 +773,28 @@ func walkEventsOrLinks(raw json.RawMessage, where, kind string) *spanValidationE
 // field in a multi-MB OTLP body.
 //
 // This is the iter-4 structural fix for the
-// implementation-plan.md §7.2 wording "reject any payload
-// containing an `outcome` or `corrected_action` field" —
+// implementation-plan.md ┬º7.2 wording "reject any payload
+// containing an `outcome` or `corrected_action` field" ΓÇö
 // previous iterations enumerated specific OTLP levels and
 // missed `span.status` and nested kvlistValue cases.
-func (h *Handler) deepForbiddenScan(body []byte) *spanValidationError {
-	var v any
-	if err := json.Unmarshal(body, &v); err != nil {
-		// Already handled by the structured-decode path —
-		// don't double-emit an error here.
-		return nil
-	}
-	if path, key, found := containsForbiddenKey(v, ""); found {
+//
+// Memory note: this walker reuses the
+// `map[string]json.RawMessage` view the caller already
+// decoded from the body. It NEVER materialises the full
+// payload as an `any` tree, so scalar leaves
+// (strings, numbers, booleans, null) remain as raw bytes
+// and are not boxed into Go interfaces. On a payload at
+// the 4 MiB body cap this avoids roughly doubling peak
+// heap relative to a `json.Unmarshal(body, &any)` scan.
+// Only object / array spines on the current descent path
+// are decoded one level at a time.
+func (h *Handler) deepForbiddenScan(root map[string]json.RawMessage) *spanValidationError {
+	if path, key, found := containsForbiddenKeyMap(root, ""); found {
 		return &spanValidationError{
 			httpStatus: http.StatusBadRequest,
 			code:       "forbidden_field",
 			message: fmt.Sprintf(
-				"validation: forbidden field %q found at %s; %q and %q are not allowed on mgmt.ingest_spans — see architecture.md §6.2.2 (these belong on mgmt.feedback)",
+				"validation: forbidden field %q found at %s; %q and %q are not allowed on mgmt.ingest_spans ΓÇö see architecture.md ┬º6.2.2 (these belong on mgmt.feedback)",
 				key, path, "outcome", "corrected_action"),
 			metricStatus: SpanStatusRejectedForbiddenField,
 		}
@@ -789,53 +805,126 @@ func (h *Handler) deepForbiddenScan(body []byte) *spanValidationError {
 // containsForbiddenKey is the recursive worker behind
 // [deepForbiddenScan]. It returns
 // `(jsonPath, offendingKey, true)` on the first hit and
-// `("", "", false)` otherwise. Object key iteration is
-// alphabetically sorted so that error messages are
-// deterministic across the Go runtime's randomised map
-// iteration order (otherwise the same input could produce
-// different paths run-to-run, breaking test stability).
-func containsForbiddenKey(v any, path string) (string, string, bool) {
-	switch x := v.(type) {
-	case map[string]any:
-		// Sorted-key iteration for determinism.
-		keys := make([]string, 0, len(x))
-		for k := range x {
-			keys = append(keys, k)
+// `("", "", false)` otherwise.
+//
+// The walker is "lazy" in the json.RawMessage sense:
+// it peeks the first non-whitespace byte of `raw` and only
+// pays for a full json.Unmarshal when that byte is `{` or
+// `[`. Scalar leaves (strings, numbers, booleans, null)
+// short-circuit immediately, which is the property that
+// keeps peak heap bounded on a 4 MiB OTLP body.
+func containsForbiddenKey(raw json.RawMessage, path string) (string, string, bool) {
+	first, ok := firstNonSpaceByte(raw)
+	if !ok {
+		return "", "", false
+	}
+	switch first {
+	case '{':
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			// json.Unmarshal validated the parent during
+			// the caller's decode, so a well-formed
+			// subtree here should always re-decode. If
+			// it somehow does not, defer to the
+			// structured decoder for the actual error.
+			return "", "", false
 		}
-		sort.Strings(keys)
-
-		// Pass 1: JSON object keys. Catches `outcome` as
-		// a literal object field at any depth.
-		for _, k := range keys {
-			if _, bad := forbiddenSpanFields[k]; bad {
-				return joinJSONPath(path, k), k, true
-			}
+		return containsForbiddenKeyMap(obj, path)
+	case '[':
+		var arr []json.RawMessage
+		if err := json.Unmarshal(raw, &arr); err != nil {
+			return "", "", false
 		}
-
-		// Pass 2: KeyValue shape. OTLP encodes attribute
-		// names as the STRING VALUE of a `"key"` JSON field.
-		if rawKey, ok := x["key"]; ok {
-			if ks, isStr := rawKey.(string); isStr {
-				if _, bad := forbiddenSpanFields[ks]; bad {
-					return joinJSONPath(path, "key"), ks, true
-				}
-			}
-		}
-
-		// Pass 3: recurse into values.
-		for _, k := range keys {
-			if p, key, ok := containsForbiddenKey(x[k], joinJSONPath(path, k)); ok {
-				return p, key, ok
-			}
-		}
-	case []any:
-		for i, item := range x {
+		for i, item := range arr {
 			if p, key, ok := containsForbiddenKey(item, fmt.Sprintf("%s[%d]", path, i)); ok {
 				return p, key, ok
 			}
 		}
 	}
 	return "", "", false
+}
+
+// containsForbiddenKeyMap is the per-object pass. Split
+// out from [containsForbiddenKey] so [deepForbiddenScan]
+// can reuse the already-decoded root map without paying
+// for an extra round-trip through json.RawMessage.
+//
+// Object key iteration is alphabetically sorted so that
+// error messages are deterministic across the Go runtime's
+// randomised map iteration order (otherwise the same input
+// could produce different paths run-to-run, breaking test
+// stability).
+func containsForbiddenKeyMap(obj map[string]json.RawMessage, path string) (string, string, bool) {
+	keys := make([]string, 0, len(obj))
+	for k := range obj {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Pass 1: JSON object keys. Catches `outcome` as
+	// a literal object field at any depth.
+	for _, k := range keys {
+		if _, bad := forbiddenSpanFields[k]; bad {
+			return joinJSONPath(path, k), k, true
+		}
+	}
+
+	// Pass 2: KeyValue shape. OTLP encodes attribute
+	// names as the STRING VALUE of a `"key"` JSON field.
+	// We only pay for the unquote when the raw bytes
+	// actually look like a JSON string (cheap first-byte
+	// check), so non-string `key` values short-circuit.
+	if rawKey, ok := obj["key"]; ok {
+		if ks, isStr := decodeJSONString(rawKey); isStr {
+			if _, bad := forbiddenSpanFields[ks]; bad {
+				return joinJSONPath(path, "key"), ks, true
+			}
+		}
+	}
+
+	// Pass 3: recurse into values. Sorted-key iteration
+	// keeps the JSON path of the first violation stable.
+	for _, k := range keys {
+		if p, key, ok := containsForbiddenKey(obj[k], joinJSONPath(path, k)); ok {
+			return p, key, ok
+		}
+	}
+	return "", "", false
+}
+
+// firstNonSpaceByte returns the first byte of `raw` that
+// is not JSON whitespace (space, tab, CR, LF), along with
+// a boolean indicating whether such a byte exists. Used
+// by [containsForbiddenKey] and [decodeJSONString] to
+// classify a json.RawMessage subtree by its leading
+// structural character without paying for a full decode
+// of scalar leaves.
+func firstNonSpaceByte(raw json.RawMessage) (byte, bool) {
+	for _, b := range raw {
+		if b != ' ' && b != '\t' && b != '\n' && b != '\r' {
+			return b, true
+		}
+	}
+	return 0, false
+}
+
+// decodeJSONString returns the unquoted string value of a
+// json.RawMessage iff its leading non-whitespace byte is
+// `"`. Other shapes (numbers, booleans, null, objects,
+// arrays) return `("", false)` without a decode, which is
+// what keeps the OTel `KeyValue.key` check cheap when the
+// `key` field happens to be a non-string value (rare, but
+// possible for malformed exporters).
+func decodeJSONString(raw json.RawMessage) (string, bool) {
+	first, ok := firstNonSpaceByte(raw)
+	if !ok || first != '"' {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", false
+	}
+	return s, true
 }
 
 // joinJSONPath concatenates a JSON-path base with a child
@@ -851,7 +940,7 @@ func joinJSONPath(base, seg string) string {
 // typedSpanForValidation is the narrow typed view used to
 // validate OTel schema fields. Decoded from the raw span
 // JSON but DELIBERATELY does not model the full OTel span
-// shape — the original bytes carry all data on the forward
+// shape ΓÇö the original bytes carry all data on the forward
 // path; this struct only exists to type-check the handful
 // of fields the validator cares about.
 type typedSpanForValidation struct {
@@ -898,7 +987,7 @@ func (s *otlpJSONUint64) UnmarshalJSON(b []byte) error {
 // message (e.g. "resourceSpans[0].resource").
 //
 // Operator note: a legitimate use of an attribute key named
-// `outcome` at the resource level is still rejected — the
+// `outcome` at the resource level is still rejected ΓÇö the
 // architecture intentionally namespaces these keys to
 // `mgmt.feedback`. Pick a different attribute name (e.g.
 // `service.outcome`) if you need related semantics on a span.
@@ -908,7 +997,7 @@ func forbiddenKeyCheck(obj map[string]json.RawMessage, where string) *spanValida
 			return &spanValidationError{
 				httpStatus:   http.StatusBadRequest,
 				code:         "forbidden_field",
-				message:      fmt.Sprintf("validation: %s: %q is not allowed on mgmt.ingest_spans; see architecture.md §6.2.2 (belongs on mgmt.feedback)", where, k),
+				message:      fmt.Sprintf("validation: %s: %q is not allowed on mgmt.ingest_spans; see architecture.md ┬º6.2.2 (belongs on mgmt.feedback)", where, k),
 				metricStatus: SpanStatusRejectedForbiddenField,
 			}
 		}
@@ -922,7 +1011,7 @@ func forbiddenKeyCheck(obj map[string]json.RawMessage, where string) *spanValida
 // `wantKey` is empty).
 //
 // Crucially: we only walk attribute KEYS (always strings per
-// OTel KeyValue.key), NEVER the typed value union — so
+// OTel KeyValue.key), NEVER the typed value union ΓÇö so
 // non-string OTLP values (intValue, boolValue, doubleValue,
 // arrayValue, kvlistValue, bytesValue) are preserved intact
 // on the forward path because we never touch them. This is
@@ -960,7 +1049,7 @@ func walkAttributes(raw json.RawMessage, wantKey, where string) (string, *spanVa
 			return "", &spanValidationError{
 				httpStatus:   http.StatusBadRequest,
 				code:         "forbidden_field",
-				message:      fmt.Sprintf("validation: %s[%d]: attribute key %q is not allowed on mgmt.ingest_spans; see architecture.md §6.2.2 (belongs on mgmt.feedback)", where, i, attr.Key),
+				message:      fmt.Sprintf("validation: %s[%d]: attribute key %q is not allowed on mgmt.ingest_spans; see architecture.md ┬º6.2.2 (belongs on mgmt.feedback)", where, i, attr.Key),
 				metricStatus: SpanStatusRejectedForbiddenField,
 			}
 		}

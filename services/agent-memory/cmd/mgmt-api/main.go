@@ -5,6 +5,16 @@
 //	POST /v1/repos                       mgmt.register
 //	POST /v1/repos/{repo_id}/ingest      mgmt.ingest
 //	POST /v1/repos/{repo_id}/ingest_delta mgmt.ingest_delta
+//	POST /v1/spans                       mgmt.ingest_spans (Stage 7.2)
+//
+// It also exposes operator endpoints:
+//
+//	GET  /healthz                        liveness probe
+//	GET  /metrics                        Prometheus text-format
+//	                                     exposition of the Stage
+//	                                     7.2 mandated
+//	                                     `mgmt_ingest_spans_total{repo_id,status}`
+//	                                     counter.
 //
 // The handler itself lives in internal/mgmtapi; this binary is
 // the composition root that wires up PostgreSQL, TLS, the OIDC
@@ -115,6 +125,45 @@
 //	                                             timeout (default 30s).
 //	AGENT_MEMORY_SHUTDOWN_TIMEOUT                graceful-shutdown
 //	                                             budget (default 30s).
+//	AGENT_MEMORY_SPAN_FORWARD_URL                OTLP/HTTP endpoint
+//	                                             the `mgmt.ingest_spans`
+//	                                             verb forwards
+//	                                             validated batches
+//	                                             to (e.g.
+//	                                             `https://span-ingestor:4318/v1/traces`).
+//	                                             When unset, the
+//	                                             verb returns 503
+//	                                             `forwarder_not_configured`
+//	                                             on every call -- a
+//	                                             deliberate fail-
+//	                                             CLOSED so a
+//	                                             half-deployed
+//	                                             mgmt-api never
+//	                                             silently drops
+//	                                             spans.
+//	AGENT_MEMORY_SPAN_FORWARD_TIMEOUT            per-forward
+//	                                             deadline (default
+//	                                             10s).
+//	AGENT_MEMORY_SPAN_SERVICE_MAP                comma-separated
+//	                                             `service.name=repo_uuid`
+//	                                             pairs the
+//	                                             `mgmt.ingest_spans`
+//	                                             verb uses to map
+//	                                             OTel `service.name`
+//	                                             attributes to
+//	                                             `repo_id`s
+//	                                             (example:
+//	                                             `worker-a=550e8400-...,worker-b=6ba7b810-...`).
+//	                                             Unmapped names
+//	                                             cause the verb to
+//	                                             count
+//	                                             `mgmt_ingest_spans_total{status="unknown_service"}`
+//	                                             and reject 400.
+//	                                             Empty map => every
+//	                                             span is rejected;
+//	                                             use the empty
+//	                                             config only for
+//	                                             smoke tests.
 //
 // Exit codes
 // ----------
@@ -137,6 +186,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -176,16 +226,40 @@ func main() {
 		logger.Error("mgmt-api.resolver", slog.String("error", err.Error()))
 		os.Exit(2)
 	}
+	spanForwarder := buildSpanForwarder(cfg, logger)
+	spanMetrics := mgmtapi.NewDefaultSpanMetrics()
 	handler := mgmtapi.NewHandler(db, verifier, resolver, mgmtapi.Options{
-		Logger: logger,
+		Logger:        logger,
+		SpanForwarder: spanForwarder,
+		SpanMetrics:   spanMetrics,
+		SpanLookup:    staticSpanLookup(cfg.SpanServiceMap),
 	})
 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/repos", handler)
 	mux.Handle("/v1/repos/", handler)
+	mux.Handle("/v1/spans", handler)
+	mux.Handle("/v1/spans/", handler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+	// `/metrics` exposes the Stage 7.2 mandated
+	// `mgmt_ingest_spans_total{repo_id, status}` counter in
+	// the Prometheus text-format. We hand-roll the format
+	// (matching the existing `cmd/agent-api/main.go`
+	// pattern) instead of importing prometheus/client_golang
+	// because this binary exposes a single counter family
+	// and the text format is intentionally trivial. HELP
+	// and TYPE are always emitted so the scrape works on a
+	// freshly-started binary before any traffic.
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		if _, err := spanMetrics.WritePrometheus(w); err != nil {
+			logger.Warn("mgmt-api.metrics.write_failed",
+				slog.String("error", err.Error()))
+		}
 	})
 
 	srv := &http.Server{
@@ -272,6 +346,11 @@ type config struct {
 	HeadResolverGitPath   string
 	HeadResolverTimeout   time.Duration
 	HeadResolverStaticSHA string
+
+	// Span ingest verb wiring (Stage 7.2).
+	SpanForwardURL     string
+	SpanForwardTimeout time.Duration
+	SpanServiceMap     map[string]string // service.name -> repo_id
 }
 
 // loadConfig reads the binary's configuration from the
@@ -296,6 +375,8 @@ func loadConfig() (config, error) {
 		HeadResolverGitPath:   os.Getenv("AGENT_MEMORY_HEAD_RESOLVER_GIT_PATH"),
 		HeadResolverStaticSHA: os.Getenv("AGENT_MEMORY_HEAD_RESOLVER_STATIC_SHA"),
 		ResolverMode:          os.Getenv("AGENT_MEMORY_HEAD_RESOLVER"),
+		SpanForwardURL:        os.Getenv("AGENT_MEMORY_SPAN_FORWARD_URL"),
+		SpanForwardTimeout:    10 * time.Second,
 		ReadTimeout:           30 * time.Second,
 		WriteTimeout:          30 * time.Second,
 		ShutdownTimeout:       30 * time.Second,
@@ -388,6 +469,20 @@ func loadConfig() (config, error) {
 			return c, fmt.Errorf("AGENT_MEMORY_HEAD_RESOLVER_TIMEOUT: %w", err)
 		}
 		c.HeadResolverTimeout = d
+	}
+	if v := os.Getenv("AGENT_MEMORY_SPAN_FORWARD_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return c, fmt.Errorf("AGENT_MEMORY_SPAN_FORWARD_TIMEOUT: %w", err)
+		}
+		c.SpanForwardTimeout = d
+	}
+	if v := os.Getenv("AGENT_MEMORY_SPAN_SERVICE_MAP"); v != "" {
+		m, err := parseSpanServiceMap(v)
+		if err != nil {
+			return c, fmt.Errorf("AGENT_MEMORY_SPAN_SERVICE_MAP: %w", err)
+		}
+		c.SpanServiceMap = m
 	}
 	if v := os.Getenv("AGENT_MEMORY_ALLOW_PLAINTEXT"); v != "" {
 		b, err := strconv.ParseBool(v)
@@ -482,6 +577,95 @@ func buildResolver(cfg config, logger *slog.Logger) (mgmtapi.HeadResolver, error
 	default:
 		return nil, fmt.Errorf("unknown resolver mode %q", cfg.ResolverMode)
 	}
+}
+
+// buildSpanForwarder wires the [mgmtapi.SpanForwarder] selected
+// by the config. When AGENT_MEMORY_SPAN_FORWARD_URL is unset the
+// helper returns nil; NewHandler then installs its fail-CLOSED
+// default ([mgmtapi.ErrForwarderNotConfigured]) so every
+// `POST /v1/spans` call returns 503 and the operator can dashboard
+// the misconfiguration distinctly from a real upstream outage.
+// A previous draft returned a silent no-op here, which would have
+// served 202 while dropping every span -- caught by design review.
+func buildSpanForwarder(cfg config, logger *slog.Logger) mgmtapi.SpanForwarder {
+	if cfg.SpanForwardURL == "" {
+		logger.Warn("mgmt-api.span_forwarder.not_configured",
+			slog.String("warning",
+				"AGENT_MEMORY_SPAN_FORWARD_URL is unset; "+
+					"POST /v1/spans will fail-closed with 503 "+
+					"`forwarder_not_configured` on every call"),
+		)
+		return nil
+	}
+	logger.Info("mgmt-api.span_forwarder.http",
+		slog.String("url", cfg.SpanForwardURL),
+		slog.Duration("timeout", cfg.SpanForwardTimeout),
+		slog.Int("service_map_size", len(cfg.SpanServiceMap)),
+	)
+	return &mgmtapi.HTTPSpanForwarder{
+		URL:     cfg.SpanForwardURL,
+		Timeout: cfg.SpanForwardTimeout,
+	}
+}
+
+// staticSpanLookup returns a [mgmtapi.ServiceNameToRepoID]
+// closure backed by the parsed AGENT_MEMORY_SPAN_SERVICE_MAP.
+// Unmapped names yield the empty string -- the handler counts
+// `mgmt_ingest_spans_total{repo_id="", status="unknown_service"}`
+// and rejects the call 400.
+//
+// A nil/empty map yields a lookup that always returns "" --
+// safe (every span is rejected), and intentional: leave the
+// env var unset to smoke-test the unknown-service path.
+func staticSpanLookup(m map[string]string) mgmtapi.ServiceNameToRepoID {
+	if len(m) == 0 {
+		return func(string) string { return "" }
+	}
+	// Defensive copy so a later config reload can't mutate
+	// what an in-flight request reads.
+	cp := make(map[string]string, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return func(name string) string { return cp[name] }
+}
+
+// parseSpanServiceMap parses
+//
+//	"worker-a=550e8400-e29b-41d4-a716-446655440000,worker-b=6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+//
+// into map["worker-a"] = "550e8400-...". Whitespace around
+// keys and values is trimmed; empty entries are skipped so
+// trailing commas are tolerated. Returns an error on a
+// malformed entry (no "=", empty key, empty value, or
+// duplicate key) so an operator typo fails the boot loudly
+// rather than silently dropping spans for a worker whose
+// mapping was lost.
+func parseSpanServiceMap(s string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, raw := range strings.Split(s, ",") {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		eq := strings.IndexByte(entry, '=')
+		if eq <= 0 || eq == len(entry)-1 {
+			return nil, fmt.Errorf("malformed entry %q (want service.name=repo_id)", entry)
+		}
+		k := strings.TrimSpace(entry[:eq])
+		v := strings.TrimSpace(entry[eq+1:])
+		if k == "" {
+			return nil, fmt.Errorf("malformed entry %q (empty service.name)", entry)
+		}
+		if v == "" {
+			return nil, fmt.Errorf("malformed entry %q (empty repo_id)", entry)
+		}
+		if _, dup := out[k]; dup {
+			return nil, fmt.Errorf("duplicate service.name %q", k)
+		}
+		out[k] = v
+	}
+	return out, nil
 }
 
 // openPG opens a *sql.DB against cfg.PGURL with conservative

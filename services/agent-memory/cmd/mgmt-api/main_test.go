@@ -298,6 +298,118 @@ func TestBuildResolver_staticOptIn(t *testing.T) {
 	}
 }
 
+// -----------------------------------------------------------
+// Span ingest verb wiring (Stage 7.2).
+// -----------------------------------------------------------
+
+// TestParseSpanServiceMap_happyPath -- a single well-formed
+// entry parses into a one-key map.
+func TestParseSpanServiceMap_happyPath(t *testing.T) {
+	m, err := parseSpanServiceMap("worker-a=550e8400-e29b-41d4-a716-446655440000")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got := m["worker-a"]; got != "550e8400-e29b-41d4-a716-446655440000" {
+		t.Errorf("map[worker-a] = %q, want the supplied UUID", got)
+	}
+	if len(m) != 1 {
+		t.Errorf("len(map) = %d, want 1", len(m))
+	}
+}
+
+// TestParseSpanServiceMap_multiEntry_tolerantOfSpaces_and_trailingComma --
+// real ops use comma-separated lists that may grow trailing
+// whitespace or commas; the parser must accept those without
+// failing the boot.
+func TestParseSpanServiceMap_multiEntry_tolerantOfSpaces_and_trailingComma(t *testing.T) {
+	in := " worker-a = repo-1 , worker-b = repo-2 ,"
+	m, err := parseSpanServiceMap(in)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if m["worker-a"] != "repo-1" || m["worker-b"] != "repo-2" {
+		t.Errorf("map = %+v, want {worker-a:repo-1, worker-b:repo-2}", m)
+	}
+}
+
+// TestParseSpanServiceMap_malformed -- operator typos must
+// fail the boot loudly; silently dropping spans for a typo
+// would be a Sev2 surprise in prod.
+func TestParseSpanServiceMap_malformed(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"no equals", "worker-a"},
+		{"empty key", "=repo-1"},
+		{"empty value", "worker-a="},
+		{"duplicate key", "worker-a=repo-1,worker-a=repo-2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parseSpanServiceMap(tc.in); err == nil {
+				t.Errorf("parseSpanServiceMap(%q) err = nil, want non-nil", tc.in)
+			}
+		})
+	}
+}
+
+// TestStaticSpanLookup_emptyMap_returnsEmpty -- the
+// nil/empty map case must return "" for every name so the
+// handler classifies the call as unknown_service rather than
+// panicking on a nil dereference.
+func TestStaticSpanLookup_emptyMap_returnsEmpty(t *testing.T) {
+	lk := staticSpanLookup(nil)
+	if got := lk("worker-a"); got != "" {
+		t.Errorf("lk(worker-a) = %q, want empty string", got)
+	}
+}
+
+// TestStaticSpanLookup_defensiveCopy -- mutating the input
+// map after closure construction must NOT affect the
+// closure; in-flight requests would otherwise observe a
+// torn map mid-call.
+func TestStaticSpanLookup_defensiveCopy(t *testing.T) {
+	src := map[string]string{"worker-a": "repo-1"}
+	lk := staticSpanLookup(src)
+	src["worker-a"] = "MUTATED"
+	src["worker-b"] = "INJECTED"
+	if got := lk("worker-a"); got != "repo-1" {
+		t.Errorf("lk(worker-a) = %q, want repo-1 (mutation leaked into closure)", got)
+	}
+	if got := lk("worker-b"); got != "" {
+		t.Errorf("lk(worker-b) = %q, want empty (injection leaked into closure)", got)
+	}
+}
+
+// TestBuildSpanForwarder_emptyURL_returnsNil -- when the
+// forward URL is unset the helper returns nil so NewHandler
+// installs its fail-CLOSED default. A previous draft returned
+// a silent no-op here, which would have 202'd while dropping
+// every span -- caught by design review and explicitly tested
+// here so the regression can never sneak back in.
+func TestBuildSpanForwarder_emptyURL_returnsNil(t *testing.T) {
+	cfg := config{SpanForwardURL: ""}
+	f := buildSpanForwarder(cfg, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	if f != nil {
+		t.Fatalf("forwarder = %T, want nil so the handler installs its fail-closed default", f)
+	}
+}
+
+// TestBuildSpanForwarder_setURL_returnsHTTPForwarder -- the
+// happy path returns a real HTTP forwarder configured with
+// the URL + timeout from config.
+func TestBuildSpanForwarder_setURL_returnsHTTPForwarder(t *testing.T) {
+	cfg := config{
+		SpanForwardURL:     "https://span-ingestor.local:4318/v1/traces",
+		SpanForwardTimeout: 5_000_000_000, // 5s
+	}
+	f := buildSpanForwarder(cfg, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	if f == nil {
+		t.Fatalf("forwarder = nil, want non-nil")
+	}
+}
+
 // validSHA returns a 40-char lower-case hex string suitable
 // for AGENT_MEMORY_HEAD_RESOLVER_STATIC_SHA.
 func validSHA() string {

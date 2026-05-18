@@ -86,6 +86,14 @@ type Options struct {
 	// disables the cap (NOT recommended in production).
 	MaxBodyBytes int64
 
+	// MaxSpansBodyBytes caps the request body the
+	// `POST /v1/spans` handler will read. Independent from
+	// [Options.MaxBodyBytes] because a normal OTLP/HTTP
+	// payload is much larger than an operator-shape
+	// register/ingest request. Zero means
+	// [DefaultSpansMaxBodyBytes]; negative disables the cap.
+	MaxSpansBodyBytes int64
+
 	// SecretGen overrides the function used to generate
 	// per-repo webhook HMAC secrets. Defaults to a
 	// crypto/rand-backed implementation that produces
@@ -100,6 +108,37 @@ type Options struct {
 	// Go-side clock does NOT shift DB columns; tests that
 	// need a frozen log timestamp inject one.
 	Clock func() time.Time
+
+	// SpanForwarder is the downstream the Stage 7.2
+	// `mgmt.ingest_spans` verb hands validated batches to.
+	// Nil falls back to [notConfiguredForwarder] — the
+	// handler then responds 503 with
+	// `forwarder_not_configured` so a binary started
+	// without a real downstream cannot silently 202 every
+	// span call. Production wires an [HTTPSpanForwarder]
+	// pointing at the Span Ingestor's OTLP/HTTP endpoint.
+	SpanForwarder SpanForwarder
+
+	// SpanMetrics records the
+	// `mgmt_ingest_spans_total{repo_id,status}` counter
+	// (architecture.md §8.3, implementation-plan.md §7.2).
+	// Nil falls back to a no-op recorder so a fresh
+	// deployment without metrics wiring still serves traffic.
+	SpanMetrics SpanMetrics
+
+	// SpanLookup maps an OTel `service.name` to the
+	// `repo_id` the downstream Span Ingestor expects. Nil
+	// means "every service is unknown"; the handler then
+	// REJECTS any resource group whose service.name does
+	// not resolve with HTTP 400 `unknown_service` (fail-
+	// fast — see `spans_handler.go` validateResourceSpans).
+	// Empty resource groups (zero spans) are tolerated as
+	// no-ops regardless of service.name. The cmd binary
+	// supplies a static-map / DB-backed implementation;
+	// the matching shape on the public OTLP receiver
+	// (internal/spaningestor) is kept duplicate-by-design
+	// to avoid a cross-package dependency.
+	SpanLookup ServiceNameToRepoID
 }
 
 // Handler is the Management API HTTP handler. Construct one
@@ -113,6 +152,15 @@ type Handler struct {
 	maxBody   int64
 	secretGen func() (string, error)
 	clock     func() time.Time
+
+	// Stage 7.2 mgmt.ingest_spans dependencies. All
+	// optional: nil-safe defaults keep the existing Stage
+	// 7.1 verb tests unchanged. See Options for the
+	// per-field contract.
+	maxSpansBody  int64
+	spanForwarder SpanForwarder
+	spanMetrics   SpanMetrics
+	spanLookup    ServiceNameToRepoID
 
 	// mux is the http.Handler the public ServeHTTP delegates
 	// to after auth. Constructed in NewHandler so route
@@ -152,14 +200,26 @@ func NewHandler(db *sql.DB, verifier TokenVerifier, resolver HeadResolver, opts 
 	if secretGen == nil {
 		secretGen = defaultSecretGen
 	}
+	maxSpansBody := opts.MaxSpansBodyBytes
+	if maxSpansBody == 0 {
+		maxSpansBody = DefaultSpansMaxBodyBytes
+	}
+	spanMetrics := opts.SpanMetrics
+	if spanMetrics == nil {
+		spanMetrics = noopSpanMetrics{}
+	}
 	h := &Handler{
-		db:        db,
-		verifier:  verifier,
-		resolver:  resolver,
-		logger:    logger,
-		maxBody:   maxBody,
-		secretGen: secretGen,
-		clock:     clock,
+		db:            db,
+		verifier:      verifier,
+		resolver:      resolver,
+		logger:        logger,
+		maxBody:       maxBody,
+		secretGen:     secretGen,
+		clock:         clock,
+		maxSpansBody:  maxSpansBody,
+		spanForwarder: opts.SpanForwarder,
+		spanMetrics:   spanMetrics,
+		spanLookup:    opts.SpanLookup,
 	}
 	// Build the inner mux. The outer ServeHTTP runs auth
 	// FIRST so we wrap this once. Method gating happens
@@ -191,6 +251,7 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
 	// /v1/repos               -> register
 	// /v1/repos/{id}/ingest   -> ingest
 	// /v1/repos/{id}/ingest_delta -> ingest_delta
+	// /v1/spans               -> ingest_spans (Stage 7.2)
 	switch {
 	case r.URL.Path == RouteRepos, r.URL.Path == RouteRepos+"/":
 		h.handleRegister(w, r)
@@ -211,6 +272,9 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusNotFound, "not_found",
 				"unknown management API route")
 		}
+		return
+	case r.URL.Path == RouteSpans, r.URL.Path == RouteSpans+"/":
+		h.handleIngestSpans(w, r)
 		return
 	default:
 		writeJSONError(w, http.StatusNotFound, "not_found",

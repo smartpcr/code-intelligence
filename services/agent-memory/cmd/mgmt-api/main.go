@@ -217,9 +217,29 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/v1/repos", handler)
 	mux.Handle("/v1/repos/", handler)
+	mux.Handle("/v1/episodes", handler)
 	mux.Handle("/v1/episodes/", handler)
 	mux.Handle("/v1/spans", handler)
 	mux.Handle("/metrics", mgmtapi.NewPrometheusMetricsHandler(ingestSpansMetrics))
+	// Stage 7.5 -- mgmt.read.* GET endpoints. Each is a distinct
+	// top-level path so the Go ServeMux does NOT collapse them into
+	// /v1/. For the path-id endpoints (/v1/context/{id} etc.) we
+	// register BOTH the bare path AND the trailing-slash form so
+	// requests to the bare path are answered directly by the
+	// authenticated handler with a typed JSON 404 envelope rather
+	// than the ServeMux 301 redirect to the trailing-slash form
+	// (the redirect drops Authorization headers on a re-issued
+	// GET and confuses CLI tooling).
+	mux.Handle("/v1/commits", handler)
+	mux.Handle("/v1/observations", handler)
+	mux.Handle("/v1/concepts", handler)
+	mux.Handle("/v1/concept_supports", handler)
+	mux.Handle("/v1/context", handler)
+	mux.Handle("/v1/context/", handler)
+	mux.Handle("/v1/graph_node", handler)
+	mux.Handle("/v1/graph_node/", handler)
+	mux.Handle("/v1/trace_observation", handler)
+	mux.Handle("/v1/trace_observation/", handler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))

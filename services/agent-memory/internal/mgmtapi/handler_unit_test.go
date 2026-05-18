@@ -755,14 +755,17 @@ func TestRoute_wrongMethod_returns405(t *testing.T) {
 	defer cleanup()
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, RouteRepos, nil)
+	// /v1/repos is dual-verb in Stage 7.5 (GET = list, POST =
+	// register); use PUT to assert the 405 envelope with the
+	// precise Allow header.
+	r := httptest.NewRequest(http.MethodPut, RouteRepos, nil)
 	r.Header.Set(AuthorizationHeader, "Bearer "+testToken)
 	h.ServeHTTP(w, r)
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405. body=%q", w.Code, w.Body.String())
 	}
-	if got := w.Header().Get("Allow"); got != http.MethodPost {
-		t.Errorf("Allow = %q, want POST", got)
+	if got := w.Header().Get("Allow"); got != "GET, POST" {
+		t.Errorf("Allow = %q, want %q", got, "GET, POST")
 	}
 }
 

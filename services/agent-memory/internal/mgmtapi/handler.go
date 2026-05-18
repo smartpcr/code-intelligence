@@ -216,19 +216,112 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // route dispatches an authenticated request to the right verb
 // handler. Method gating + path parsing live here so every
 // verb shares the same 404 / 405 envelopes.
+//
+// Method dispatch:
+//   - GET  paths under Stage 7.5 (see read.go) hit
+//     handleRead, which serves the `mgmt.read.*` verbs.
+//   - POST paths fall through to the Stage 7.1 / 7.3 write
+//     verbs (register, ingest, ingest_delta, feedback).
+//   - Any other method on a known path returns 405 with an
+//     Allow header listing the verbs the route supports;
+//     unknown paths return 404.
+//
+// The bare `/v1/repos` and `/v1/episodes` paths are dual-verb:
+// POST writes (register / -- Stage 7.3 reserves bare episodes
+// for future use), GET reads (list repos / list episodes).
+// The sub-resource paths (`/v1/repos/{id}/ingest{,_delta}`,
+// `/v1/episodes/{id}/feedback`) remain POST-only.
 func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed",
-			fmt.Sprintf("method %s not allowed; use POST", r.Method))
+	switch r.Method {
+	case http.MethodGet:
+		h.routeRead(w, r)
+		return
+	case http.MethodPost:
+		h.routeWrite(w, r)
+		return
+	default:
+		h.writeMethodNotAllowed(w, r)
 		return
 	}
+}
 
-	// /v1/repos                            -> register
-	// /v1/repos/{id}/ingest                -> ingest
-	// /v1/repos/{id}/ingest_delta          -> ingest_delta
-	// /v1/episodes/{parent_id}/feedback    -> feedback (Stage 7.3)
-	// /v1/spans                            -> ingest_spans (Stage 7.2)
+// routeRead dispatches a GET request to the right Stage 7.5
+// read handler. Returns 404 on an unknown path, 405 on a path
+// that exists but only supports POST (e.g. /v1/repos/{id}/ingest).
+//
+// The bare `/v1/context`, `/v1/graph_node`, and
+// `/v1/trace_observation` paths (no trailing `{id}` segment)
+// return a typed JSON 404 rather than the `http.ServeMux`
+// trailing-slash 301: both shapes are registered with the
+// mux so every GET hits this handler.
+func (h *Handler) routeRead(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	switch {
+	case path == RouteRepos, path == RouteRepos+"/":
+		h.handleListRepos(w, r)
+	case path == RouteEpisodes, path == RouteEpisodes+"/":
+		h.handleListEpisodes(w, r)
+	case path == RouteCommits, path == RouteCommits+"/":
+		h.handleListCommits(w, r)
+	case path == RouteObservations, path == RouteObservations+"/":
+		h.handleListObservations(w, r)
+	case path == RouteConcepts, path == RouteConcepts+"/":
+		h.handleListConcepts(w, r)
+	case path == RouteConceptSupports, path == RouteConceptSupports+"/":
+		h.handleListConceptSupports(w, r)
+	case path == RouteContext, path == RouteContext+"/":
+		writeJSONError(w, http.StatusNotFound, "context_id_required",
+			"context_id path segment is required: GET /v1/context/{context_id}")
+	case strings.HasPrefix(path, RouteContext+"/"):
+		id, ok := extractTrailingPathID(RouteContext, path)
+		if !ok {
+			writeJSONError(w, http.StatusNotFound, "not_found",
+				"unknown management API route")
+			return
+		}
+		h.handleReadContext(w, r, id)
+	case path == RouteGraphNode, path == RouteGraphNode+"/":
+		writeJSONError(w, http.StatusNotFound, "node_id_required",
+			"node_id path segment is required: GET /v1/graph_node/{node_id}")
+	case strings.HasPrefix(path, RouteGraphNode+"/"):
+		id, ok := extractTrailingPathID(RouteGraphNode, path)
+		if !ok {
+			writeJSONError(w, http.StatusNotFound, "not_found",
+				"unknown management API route")
+			return
+		}
+		h.handleReadGraphNode(w, r, id)
+	case path == RouteTraceObservation, path == RouteTraceObservation+"/":
+		writeJSONError(w, http.StatusNotFound, "edge_id_required",
+			"edge_id path segment is required: GET /v1/trace_observation/{edge_id}")
+	case strings.HasPrefix(path, RouteTraceObservation+"/"):
+		id, ok := extractTrailingPathID(RouteTraceObservation, path)
+		if !ok {
+			writeJSONError(w, http.StatusNotFound, "not_found",
+				"unknown management API route")
+			return
+		}
+		h.handleReadTraceObservation(w, r, id)
+	case strings.HasPrefix(path, RouteRepos+"/"),
+		strings.HasPrefix(path, RouteEpisodes+"/"):
+		// Known sub-resource path but read is not supported
+		// there in Stage 7.5 (only POST writes land at
+		// /v1/repos/{id}/ingest and /v1/episodes/{id}/feedback).
+		h.writeMethodNotAllowed(w, r)
+	default:
+		writeJSONError(w, http.StatusNotFound, "not_found",
+			"unknown management API route")
+	}
+}
+
+// routeWrite dispatches a POST request to the Stage 7.1 / 7.3
+// write handlers. Mirrors the pre-Stage-7.5 routing tree.
+//
+//   - /v1/repos                            -> register
+//   - /v1/repos/{id}/ingest                -> ingest
+//   - /v1/repos/{id}/ingest_delta          -> ingest_delta
+//   - /v1/episodes/{parent_id}/feedback    -> feedback (Stage 7.3)
+func (h *Handler) routeWrite(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == RouteSpans, r.URL.Path == RouteSpans+"/":
 		h.handleIngestSpans(w, r)
@@ -272,6 +365,68 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotFound, "not_found",
 			"unknown management API route")
 	}
+}
+
+// writeMethodNotAllowed emits the 405 envelope with an Allow
+// header listing every method the route accepts. Stage 7.5
+// introduces dual-verb routes (GET + POST) for /v1/repos and
+// /v1/episodes; every other Stage 7.5 read route is GET-only;
+// every Stage 7.1 / 7.3 write sub-resource is POST-only.
+func (h *Handler) writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
+	allow := allowedMethodsForPath(r.URL.Path)
+	if allow == "" {
+		// Unknown route -- 404 takes precedence over 405.
+		writeJSONError(w, http.StatusNotFound, "not_found",
+			"unknown management API route")
+		return
+	}
+	w.Header().Set("Allow", allow)
+	writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed",
+		fmt.Sprintf("method %s not allowed; use %s", r.Method, allow))
+}
+
+// allowedMethodsForPath returns the comma-joined Allow header
+// value for `path`, or "" when the path is unknown. Used by
+// [writeMethodNotAllowed] to surface a precise 405 envelope
+// without duplicating the route table.
+func allowedMethodsForPath(path string) string {
+	switch {
+	case path == RouteRepos, path == RouteRepos+"/":
+		return "GET, POST"
+	case path == RouteEpisodes, path == RouteEpisodes+"/":
+		return "GET, POST"
+	case path == RouteCommits, path == RouteCommits+"/",
+		path == RouteObservations, path == RouteObservations+"/",
+		path == RouteConcepts, path == RouteConcepts+"/",
+		path == RouteConceptSupports, path == RouteConceptSupports+"/":
+		return http.MethodGet
+	case strings.HasPrefix(path, RouteContext+"/"):
+		if _, ok := extractTrailingPathID(RouteContext, path); ok {
+			return http.MethodGet
+		}
+		return ""
+	case strings.HasPrefix(path, RouteGraphNode+"/"):
+		if _, ok := extractTrailingPathID(RouteGraphNode, path); ok {
+			return http.MethodGet
+		}
+		return ""
+	case strings.HasPrefix(path, RouteTraceObservation+"/"):
+		if _, ok := extractTrailingPathID(RouteTraceObservation, path); ok {
+			return http.MethodGet
+		}
+		return ""
+	case strings.HasPrefix(path, RouteRepos+"/"):
+		if _, _, ok := extractIngestPath(path); ok {
+			return http.MethodPost
+		}
+		return ""
+	case strings.HasPrefix(path, RouteEpisodes+"/"):
+		if _, _, ok := extractEpisodeFeedbackPath(path); ok {
+			return http.MethodPost
+		}
+		return ""
+	}
+	return ""
 }
 
 // extractIngestPath parses `/v1/repos/{repo_id}/ingest` or

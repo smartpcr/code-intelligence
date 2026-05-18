@@ -272,3 +272,219 @@ func TestOTLPStringInt_unmarshalsBothShapes(t *testing.T) {
 // ensure http import compiles after edits; trivial use.
 var _ = fmt.Sprintf
 var _ = context.Background
+
+// -----------------------------------------------------------
+// Routing precedence (mgmt-api replay support)
+//
+// The HTTP receiver must honor an explicit `repo_id` override
+// from EITHER the X-Mgmt-Repo-ID header OR a `mgmt.repo_id`
+// resource attribute, so the mgmt-api forwarder's batches can
+// be routed without operator-side service.name registry
+// configuration. The service.name lookup remains the fallback.
+// -----------------------------------------------------------
+
+const altRepoUUIDForOTLP = "22222222-3333-4444-5555-666666666666"
+
+// buildOTLPBodyWithResourceAttrs lets a test override the
+// resource attributes (e.g. add `mgmt.repo_id`) without the
+// service.name baseline that `buildOTLPRequestBody` hard-codes.
+func buildOTLPBodyWithResourceAttrs(t *testing.T, resourceAttrs []map[string]any, traceID, spanID string) []byte {
+	t.Helper()
+	payload := map[string]any{
+		"resourceSpans": []map[string]any{
+			{
+				"resource": map[string]any{"attributes": resourceAttrs},
+				"scopeSpans": []map[string]any{
+					{
+						"spans": []map[string]any{
+							{
+								"traceId":           traceID,
+								"spanId":            spanID,
+								"startTimeUnixNano": "1700000000000000000",
+								"endTimeUnixNano":   "1700000000010000000",
+								"name":              "doStuff",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	return body
+}
+
+func TestOTLPReceiver_mgmtRepoIDHeader_overridesServiceLookup(t *testing.T) {
+	lookup, _ := seedResolverWithCallChain(t)
+	resolver := New(lookup, NewMetrics(), discardLogger())
+	writer := newFakeTraceWriter()
+	ing := NewIngestor(resolver, writer, nil, Config{QueueDepth: 16}, discardLogger())
+	// Receiver knows nothing about the service name — without
+	// the header the batch would be dropped as unknown.
+	rcv := newTestOTLPReceiver(t, ing, map[string]string{})
+
+	body := buildOTLPRequestBody(t, "unknown-svc", "trace-h", "span-h", nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(MgmtRepoIDHeader, repoUUIDForOTLP)
+	rr := httptest.NewRecorder()
+	rcv.handleTraces(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	select {
+	case batch := <-ing.queue:
+		if batch.RepoID != repoUUIDForOTLP {
+			t.Errorf("batch.RepoID = %q, want %q (from header)", batch.RepoID, repoUUIDForOTLP)
+		}
+	default:
+		t.Fatalf("queue empty; expected a batch routed via X-Mgmt-Repo-ID")
+	}
+}
+
+func TestOTLPReceiver_mgmtRepoIDResourceAttr_overridesServiceLookup(t *testing.T) {
+	lookup, _ := seedResolverWithCallChain(t)
+	resolver := New(lookup, NewMetrics(), discardLogger())
+	writer := newFakeTraceWriter()
+	ing := NewIngestor(resolver, writer, nil, Config{QueueDepth: 16}, discardLogger())
+	rcv := newTestOTLPReceiver(t, ing, map[string]string{})
+
+	body := buildOTLPBodyWithResourceAttrs(t, []map[string]any{
+		{"key": "service.name", "value": map[string]any{"stringValue": "unknown-svc"}},
+		{"key": MgmtRepoIDResourceAttr, "value": map[string]any{"stringValue": repoUUIDForOTLP}},
+	}, "trace-a", "span-a")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	rcv.handleTraces(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	select {
+	case batch := <-ing.queue:
+		if batch.RepoID != repoUUIDForOTLP {
+			t.Errorf("batch.RepoID = %q, want %q (from resource attr)", batch.RepoID, repoUUIDForOTLP)
+		}
+	default:
+		t.Fatalf("queue empty; expected a batch routed via mgmt.repo_id attr")
+	}
+}
+
+func TestOTLPReceiver_mgmtRepoIDHeader_precedesResourceAttr(t *testing.T) {
+	lookup, _ := seedResolverWithCallChain(t)
+	resolver := New(lookup, NewMetrics(), discardLogger())
+	writer := newFakeTraceWriter()
+	ing := NewIngestor(resolver, writer, nil, Config{QueueDepth: 16}, discardLogger())
+	rcv := newTestOTLPReceiver(t, ing, map[string]string{})
+
+	// Resource attr says altRepoUUID; header says repoUUID.
+	// Header MUST win (explicit operator override).
+	body := buildOTLPBodyWithResourceAttrs(t, []map[string]any{
+		{"key": "service.name", "value": map[string]any{"stringValue": "unknown-svc"}},
+		{"key": MgmtRepoIDResourceAttr, "value": map[string]any{"stringValue": altRepoUUIDForOTLP}},
+	}, "trace-p", "span-p")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(MgmtRepoIDHeader, repoUUIDForOTLP)
+	rr := httptest.NewRecorder()
+	rcv.handleTraces(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	select {
+	case batch := <-ing.queue:
+		if batch.RepoID != repoUUIDForOTLP {
+			t.Errorf("batch.RepoID = %q, want %q (header wins)", batch.RepoID, repoUUIDForOTLP)
+		}
+	default:
+		t.Fatalf("queue empty; expected a batch routed via header")
+	}
+}
+
+func TestOTLPReceiver_mgmtReplayServiceNamePrefix_resolvesRepoID(t *testing.T) {
+	lookup, _ := seedResolverWithCallChain(t)
+	resolver := New(lookup, NewMetrics(), discardLogger())
+	writer := newFakeTraceWriter()
+	ing := NewIngestor(resolver, writer, nil, Config{QueueDepth: 16}, discardLogger())
+	rcv := newTestOTLPReceiver(t, ing, map[string]string{})
+
+	body := buildOTLPRequestBody(t,
+		MgmtReplayServiceNamePrefix+repoUUIDForOTLP,
+		"trace-pfx", "span-pfx", nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	rcv.handleTraces(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	select {
+	case batch := <-ing.queue:
+		if batch.RepoID != repoUUIDForOTLP {
+			t.Errorf("batch.RepoID = %q, want %q (from service.name prefix)",
+				batch.RepoID, repoUUIDForOTLP)
+		}
+	default:
+		t.Fatalf("queue empty; expected a batch routed via service.name prefix")
+	}
+}
+
+func TestOTLPReceiver_malformedMgmtRepoIDHeader_falls_back(t *testing.T) {
+	lookup, _ := seedResolverWithCallChain(t)
+	resolver := New(lookup, NewMetrics(), discardLogger())
+	writer := newFakeTraceWriter()
+	ing := NewIngestor(resolver, writer, nil, Config{QueueDepth: 16}, discardLogger())
+	// service.name DOES resolve, so a malformed header must
+	// fall through to the next hook rather than poison routing.
+	rcv := newTestOTLPReceiver(t, ing, map[string]string{"good-svc": repoUUIDForOTLP})
+
+	body := buildOTLPRequestBody(t, "good-svc", "trace-mf", "span-mf", nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(MgmtRepoIDHeader, "not-a-uuid")
+	rr := httptest.NewRecorder()
+	rcv.handleTraces(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	select {
+	case batch := <-ing.queue:
+		if batch.RepoID != repoUUIDForOTLP {
+			t.Errorf("batch.RepoID = %q, want %q (fallback to service.name)",
+				batch.RepoID, repoUUIDForOTLP)
+		}
+	default:
+		t.Fatalf("queue empty; expected fallback routing to succeed")
+	}
+}
+
+func TestValidatedRepoID(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"   ", ""},
+		{"not-a-uuid", ""},
+		{repoUUIDForOTLP, repoUUIDForOTLP},
+		{strings.ToUpper(repoUUIDForOTLP), repoUUIDForOTLP},
+		{"  " + repoUUIDForOTLP + "  ", repoUUIDForOTLP},
+		// Length-correct hex but wrong group sizes — rejected.
+		{"111111112222333344445555555555555555", ""},
+	}
+	for _, tc := range cases {
+		if got := validatedRepoID(tc.in); got != tc.want {
+			t.Errorf("validatedRepoID(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

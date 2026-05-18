@@ -100,6 +100,25 @@ type Options struct {
 	// Go-side clock does NOT shift DB columns; tests that
 	// need a frozen log timestamp inject one.
 	Clock func() time.Time
+
+	// SpanForwarder is the optional sink the
+	// `mgmt.ingest_spans` (Stage 7.2) verb uses to push
+	// verified span batches onto the Span Ingestor input
+	// queue. When nil, POST /v1/spans returns 501 Not
+	// Implemented so a fresh deployment fails loud at the
+	// first request instead of silently dropping spans.
+	// Production wires an HTTP-backed forwarder; tests pass
+	// an in-memory fake.
+	SpanForwarder SpanForwarder
+
+	// IngestSpansMetrics is the optional metrics ledger
+	// backing the `mgmt_ingest_spans_total` counter
+	// (implementation-plan.md Stage 7.2). When nil, a fresh
+	// instance is allocated so the counter is always
+	// available; callers that want to scrape the counter
+	// MUST supply their own instance and retain a reference
+	// to it.
+	IngestSpansMetrics *IngestSpansMetrics
 }
 
 // Handler is the Management API HTTP handler. Construct one
@@ -113,6 +132,17 @@ type Handler struct {
 	maxBody   int64
 	secretGen func() (string, error)
 	clock     func() time.Time
+
+	// spanForwarder backs the Stage 7.2 mgmt.ingest_spans
+	// verb. Nil when the operator did not opt-in; the
+	// handler returns 501 on POST /v1/spans in that case.
+	spanForwarder SpanForwarder
+
+	// spansMetrics is the per-(status, repo_id) counter
+	// ledger backing the `mgmt_ingest_spans_total` metric.
+	// Always non-nil after NewHandler (the constructor
+	// allocates a default instance when Options omits one).
+	spansMetrics *IngestSpansMetrics
 
 	// mux is the http.Handler the public ServeHTTP delegates
 	// to after auth. Constructed in NewHandler so route
@@ -152,14 +182,20 @@ func NewHandler(db *sql.DB, verifier TokenVerifier, resolver HeadResolver, opts 
 	if secretGen == nil {
 		secretGen = defaultSecretGen
 	}
+	spansMetrics := opts.IngestSpansMetrics
+	if spansMetrics == nil {
+		spansMetrics = NewIngestSpansMetrics()
+	}
 	h := &Handler{
-		db:        db,
-		verifier:  verifier,
-		resolver:  resolver,
-		logger:    logger,
-		maxBody:   maxBody,
-		secretGen: secretGen,
-		clock:     clock,
+		db:            db,
+		verifier:      verifier,
+		resolver:      resolver,
+		logger:        logger,
+		maxBody:       maxBody,
+		secretGen:     secretGen,
+		clock:         clock,
+		spanForwarder: opts.SpanForwarder,
+		spansMetrics:  spansMetrics,
 	}
 	// Build the inner mux. The outer ServeHTTP runs auth
 	// FIRST so we wrap this once. Method gating happens
@@ -287,6 +323,9 @@ func (h *Handler) routeRead(w http.ResponseWriter, r *http.Request) {
 //   - /v1/episodes/{parent_id}/feedback    -> feedback (Stage 7.3)
 func (h *Handler) routeWrite(w http.ResponseWriter, r *http.Request) {
 	switch {
+	case r.URL.Path == RouteSpans, r.URL.Path == RouteSpans+"/":
+		h.handleIngestSpans(w, r)
+		return
 	case r.URL.Path == RouteRepos, r.URL.Path == RouteRepos+"/":
 		h.handleRegister(w, r)
 		return

@@ -6,6 +6,10 @@
 //	POST /v1/repos/{repo_id}/ingest               mgmt.ingest
 //	POST /v1/repos/{repo_id}/ingest_delta         mgmt.ingest_delta
 //	POST /v1/episodes/{parent_episode_id}/feedback mgmt.feedback (Stage 7.3)
+//	POST /v1/spans                                mgmt.ingest_spans (Stage 7.2)
+//	GET  /metrics                                 Prometheus exposition for
+//	                                              mgmt_ingest_spans_total{repo_id,status}
+//	GET  /healthz                                 liveness
 //
 // The handler itself lives in internal/mgmtapi; this binary is
 // the composition root that wires up PostgreSQL, TLS, the OIDC
@@ -110,6 +114,27 @@
 //	                                             static HEAD resolver.
 //	                                             REQUIRED when
 //	                                             AGENT_MEMORY_HEAD_RESOLVER=static.
+//	AGENT_MEMORY_SPAN_INGESTOR_URL               OTLP/HTTP base URL of
+//	                                             the Span Ingestor. When
+//	                                             set, POST /v1/spans
+//	                                             forwards verified
+//	                                             canonical OTLP batches
+//	                                             to <BASE>/v1/traces.
+//	                                             When unset, the verb
+//	                                             returns 501
+//	                                             span_forwarder_unavailable
+//	                                             (loud-fail; never
+//	                                             silently drops spans).
+//	AGENT_MEMORY_SPAN_INGESTOR_PATH              override the OTLP
+//	                                             traces sub-path
+//	                                             (default `/v1/traces`).
+//	AGENT_MEMORY_SPAN_INGESTOR_TIMEOUT           per-batch forward
+//	                                             timeout (default 30s).
+//	AGENT_MEMORY_SPAN_INGESTOR_SERVICE_PREFIX    prefix for the
+//	                                             injected service.name
+//	                                             routing attribute
+//	                                             (default
+//	                                             `mgmt-api-replay/`).
 //	AGENT_MEMORY_READ_TIMEOUT                    per-request read
 //	                                             timeout (default 30s).
 //	AGENT_MEMORY_WRITE_TIMEOUT                   per-request write
@@ -177,8 +202,16 @@ func main() {
 		logger.Error("mgmt-api.resolver", slog.String("error", err.Error()))
 		os.Exit(2)
 	}
+	spanForwarder, err := buildSpanForwarder(cfg, logger)
+	if err != nil {
+		logger.Error("mgmt-api.span_forwarder", slog.String("error", err.Error()))
+		os.Exit(2)
+	}
+	ingestSpansMetrics := mgmtapi.NewIngestSpansMetrics()
 	handler := mgmtapi.NewHandler(db, verifier, resolver, mgmtapi.Options{
-		Logger: logger,
+		Logger:             logger,
+		SpanForwarder:      spanForwarder,
+		IngestSpansMetrics: ingestSpansMetrics,
 	})
 
 	mux := http.NewServeMux()
@@ -186,6 +219,8 @@ func main() {
 	mux.Handle("/v1/repos/", handler)
 	mux.Handle("/v1/episodes", handler)
 	mux.Handle("/v1/episodes/", handler)
+	mux.Handle("/v1/spans", handler)
+	mux.Handle("/metrics", mgmtapi.NewPrometheusMetricsHandler(ingestSpansMetrics))
 	// Stage 7.5 -- mgmt.read.* GET endpoints. Each is a distinct
 	// top-level path so the Go ServeMux does NOT collapse them into
 	// /v1/. For the path-id endpoints (/v1/context/{id} etc.) we
@@ -244,6 +279,7 @@ func main() {
 		slog.Bool("plaintext", cfg.AllowPlaintext),
 		slog.String("verifier", cfg.AuthMode),
 		slog.String("resolver", cfg.ResolverMode),
+		slog.String("span_forwarder", cfg.SpanForwarderMode),
 	)
 
 	select {
@@ -294,6 +330,13 @@ type config struct {
 	HeadResolverGitPath   string
 	HeadResolverTimeout   time.Duration
 	HeadResolverStaticSHA string
+
+	// Span forwarder selection.
+	SpanForwarderMode         string // "http" when AGENT_MEMORY_SPAN_INGESTOR_URL is set, else "disabled"
+	SpanIngestorURL           string
+	SpanIngestorPath          string
+	SpanIngestorTimeout       time.Duration
+	SpanIngestorServicePrefix string
 }
 
 // loadConfig reads the binary's configuration from the
@@ -306,23 +349,27 @@ type config struct {
 // fake SHA).
 func loadConfig() (config, error) {
 	c := config{
-		PGURL:                 os.Getenv("AGENT_MEMORY_PG_URL"),
-		ListenAddr:            os.Getenv("AGENT_MEMORY_LISTEN_ADDR"),
-		TLSCertFile:           os.Getenv("AGENT_MEMORY_TLS_CERT_FILE"),
-		TLSKeyFile:            os.Getenv("AGENT_MEMORY_TLS_KEY_FILE"),
-		OIDCIssuer:            os.Getenv("AGENT_MEMORY_OIDC_ISSUER"),
-		OIDCAudience:          os.Getenv("AGENT_MEMORY_OIDC_AUDIENCE"),
-		OIDCJWKSURL:           os.Getenv("AGENT_MEMORY_OIDC_JWKS_URL"),
-		OIDCDevToken:          os.Getenv("AGENT_MEMORY_OIDC_DEV_TOKEN"),
-		OIDCDevSubject:        os.Getenv("AGENT_MEMORY_OIDC_DEV_SUBJECT"),
-		HeadResolverGitPath:   os.Getenv("AGENT_MEMORY_HEAD_RESOLVER_GIT_PATH"),
-		HeadResolverStaticSHA: os.Getenv("AGENT_MEMORY_HEAD_RESOLVER_STATIC_SHA"),
-		ResolverMode:          os.Getenv("AGENT_MEMORY_HEAD_RESOLVER"),
-		ReadTimeout:           30 * time.Second,
-		WriteTimeout:          30 * time.Second,
-		ShutdownTimeout:       30 * time.Second,
-		HeadResolverTimeout:   mgmtapi.DefaultGitTimeout,
-		OIDCJWKSTTL:           mgmtapi.DefaultJWKSCacheTTL,
+		PGURL:                     os.Getenv("AGENT_MEMORY_PG_URL"),
+		ListenAddr:                os.Getenv("AGENT_MEMORY_LISTEN_ADDR"),
+		TLSCertFile:               os.Getenv("AGENT_MEMORY_TLS_CERT_FILE"),
+		TLSKeyFile:                os.Getenv("AGENT_MEMORY_TLS_KEY_FILE"),
+		OIDCIssuer:                os.Getenv("AGENT_MEMORY_OIDC_ISSUER"),
+		OIDCAudience:              os.Getenv("AGENT_MEMORY_OIDC_AUDIENCE"),
+		OIDCJWKSURL:               os.Getenv("AGENT_MEMORY_OIDC_JWKS_URL"),
+		OIDCDevToken:              os.Getenv("AGENT_MEMORY_OIDC_DEV_TOKEN"),
+		OIDCDevSubject:            os.Getenv("AGENT_MEMORY_OIDC_DEV_SUBJECT"),
+		HeadResolverGitPath:       os.Getenv("AGENT_MEMORY_HEAD_RESOLVER_GIT_PATH"),
+		HeadResolverStaticSHA:     os.Getenv("AGENT_MEMORY_HEAD_RESOLVER_STATIC_SHA"),
+		ResolverMode:              os.Getenv("AGENT_MEMORY_HEAD_RESOLVER"),
+		SpanIngestorURL:           os.Getenv("AGENT_MEMORY_SPAN_INGESTOR_URL"),
+		SpanIngestorPath:          os.Getenv("AGENT_MEMORY_SPAN_INGESTOR_PATH"),
+		SpanIngestorServicePrefix: os.Getenv("AGENT_MEMORY_SPAN_INGESTOR_SERVICE_PREFIX"),
+		ReadTimeout:               30 * time.Second,
+		WriteTimeout:              30 * time.Second,
+		ShutdownTimeout:           30 * time.Second,
+		SpanIngestorTimeout:       30 * time.Second,
+		HeadResolverTimeout:       mgmtapi.DefaultGitTimeout,
+		OIDCJWKSTTL:               mgmtapi.DefaultJWKSCacheTTL,
 	}
 	if c.PGURL == "" {
 		return c, errors.New("AGENT_MEMORY_PG_URL is required")
@@ -418,6 +465,18 @@ func loadConfig() (config, error) {
 		}
 		c.AllowPlaintext = b
 	}
+	if v := os.Getenv("AGENT_MEMORY_SPAN_INGESTOR_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return c, fmt.Errorf("AGENT_MEMORY_SPAN_INGESTOR_TIMEOUT: %w", err)
+		}
+		c.SpanIngestorTimeout = d
+	}
+	if c.SpanIngestorURL != "" {
+		c.SpanForwarderMode = "http"
+	} else {
+		c.SpanForwarderMode = "disabled"
+	}
 	if !c.AllowPlaintext {
 		if c.TLSCertFile == "" || c.TLSKeyFile == "" {
 			return c, errors.New(
@@ -504,6 +563,41 @@ func buildResolver(cfg config, logger *slog.Logger) (mgmtapi.HeadResolver, error
 	default:
 		return nil, fmt.Errorf("unknown resolver mode %q", cfg.ResolverMode)
 	}
+}
+
+// buildSpanForwarder constructs the production SpanForwarder from
+// cfg, returning nil when AGENT_MEMORY_SPAN_INGESTOR_URL is unset
+// (POST /v1/spans then responds 501 -- explicit "not configured"
+// is preferable to silently dropping spans). The forwarder posts
+// canonical OTLP/HTTP `ExportTraceServiceRequest` JSON to the
+// configured Span Ingestor and injects routing hints
+// (`mgmt.repo_id` resource attribute, `service.name` prefix, and
+// `X-Mgmt-Repo-ID` header) so downstream collectors can route
+// the batch back to the originating repo.
+func buildSpanForwarder(cfg config, logger *slog.Logger) (mgmtapi.SpanForwarder, error) {
+	if cfg.SpanIngestorURL == "" {
+		logger.Warn("mgmt-api.span_forwarder.disabled",
+			slog.String("warning",
+				"AGENT_MEMORY_SPAN_INGESTOR_URL not set; "+
+					"POST /v1/spans will return 501 span_forwarder_unavailable"))
+		return nil, nil
+	}
+	httpClient := &http.Client{Timeout: cfg.SpanIngestorTimeout}
+	f, err := mgmtapi.NewHTTPSpanForwarder(mgmtapi.HTTPSpanForwarderConfig{
+		BaseURL:           cfg.SpanIngestorURL,
+		Path:              cfg.SpanIngestorPath,
+		HTTPClient:        httpClient,
+		ServiceNamePrefix: cfg.SpanIngestorServicePrefix,
+		Logger:            logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("http span forwarder: %w", err)
+	}
+	logger.Info("mgmt-api.span_forwarder.http",
+		slog.String("target", f.TargetURL()),
+		slog.Duration("timeout", cfg.SpanIngestorTimeout),
+	)
+	return f, nil
 }
 
 // openPG opens a *sql.DB against cfg.PGURL with conservative

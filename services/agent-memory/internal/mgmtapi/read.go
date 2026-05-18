@@ -339,7 +339,17 @@ func (h *Handler) loadRepoHealth(ctx context.Context, repoID string) (repoHealth
 // `degraded` / `degraded_reason` envelope per §6.3. `degraded`
 // reflects the verb's repo-health derived view; `reason` is
 // the matching short string when degraded.
-func writeReadResponse[T any](w http.ResponseWriter, status int, payload T, degraded bool, reason string) {
+//
+// `logger` MUST be non-nil — callers are *Handler methods that
+// pass `h.logger`, which NewHandler defaults to `slog.Default()`
+// when no Options.Logger was supplied. The logger is here so an
+// encoder failure (e.g. a `json.Marshaler` panic or a closed
+// connection mid-write) lands in operator triage instead of
+// disappearing. By the time Encode fails the 200 status line
+// and headers are already on the wire, so the response body
+// will be truncated; without this log line a truncated read
+// would be invisible.
+func writeReadResponse[T any](logger *slog.Logger, w http.ResponseWriter, status int, payload T, degraded bool, reason string) {
 	env := DegradedEnvelope[T]{
 		Payload:        payload,
 		Degraded:       degraded,
@@ -348,11 +358,9 @@ func writeReadResponse[T any](w http.ResponseWriter, status int, payload T, degr
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(env); err != nil {
-		// Encoding errors land in the logger but the
-		// headers are already on the wire. Avoid the
-		// silent loss by returning fast — the caller can
-		// inspect the partial body in operator triage.
-		_ = err
+		logger.Error("mgmtapi.read.encode_failed",
+			slog.Int("status", status),
+			slog.String("error", err.Error()))
 	}
 }
 
@@ -495,7 +503,7 @@ func (h *Handler) handleReadRepos(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeReadResponse(w, http.StatusOK, out, anyDegraded, reason)
+	writeReadResponse(h.logger, w, http.StatusOK, out, anyDegraded, reason)
 }
 
 // -----------------------------------------------------------
@@ -589,7 +597,7 @@ func (h *Handler) handleReadCommits(w http.ResponseWriter, r *http.Request) {
 			slog.String("error", herr.Error()),
 			slog.String("repo_id", repoID))
 	}
-	writeReadResponse(w, http.StatusOK, out, health.Degraded, health.Reason)
+	writeReadResponse(h.logger, w, http.StatusOK, out, health.Degraded, health.Reason)
 }
 
 // -----------------------------------------------------------
@@ -794,7 +802,7 @@ func (h *Handler) handleReadEpisodes(w http.ResponseWriter, r *http.Request) {
 		degraded = health.Degraded
 		reason = health.Reason
 	}
-	writeReadResponse(w, http.StatusOK, out, degraded, reason)
+	writeReadResponse(h.logger, w, http.StatusOK, out, degraded, reason)
 }
 
 // -----------------------------------------------------------
@@ -905,7 +913,7 @@ func (h *Handler) handleReadObservations(w http.ResponseWriter, r *http.Request)
 			reason = health.Reason
 		}
 	}
-	writeReadResponse(w, http.StatusOK, out, degraded, reason)
+	writeReadResponse(h.logger, w, http.StatusOK, out, degraded, reason)
 }
 
 // -----------------------------------------------------------
@@ -1110,7 +1118,7 @@ func (h *Handler) handleReadContext(w http.ResponseWriter, r *http.Request, cont
 	// be guessing.
 	health, _ := h.loadRepoHealth(ctx, resp.RepoID)
 	degraded := health.Degraded || resp.ServedUnderDegraded
-	writeReadResponse(w, http.StatusOK, resp, degraded, health.Reason)
+	writeReadResponse(h.logger, w, http.StatusOK, resp, degraded, health.Reason)
 }
 
 // hydrateContextNodes resolves each node_id in `ids` (array
@@ -1354,7 +1362,7 @@ func (h *Handler) handleReadConcepts(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "internal_error", "internal error")
 		return
 	}
-	writeReadResponse(w, http.StatusOK, out, false, "")
+	writeReadResponse(h.logger, w, http.StatusOK, out, false, "")
 }
 
 // -----------------------------------------------------------
@@ -1463,7 +1471,7 @@ func (h *Handler) handleReadConceptSupports(w http.ResponseWriter, r *http.Reque
 		degraded = health.Degraded
 		reason = health.Reason
 	}
-	writeReadResponse(w, http.StatusOK, out, degraded, reason)
+	writeReadResponse(h.logger, w, http.StatusOK, out, degraded, reason)
 }
 
 // -----------------------------------------------------------
@@ -1737,7 +1745,7 @@ func (h *Handler) handleReadGraphNode(w http.ResponseWriter, r *http.Request, no
 	}
 
 	health, _ := h.loadRepoHealth(ctx, resp.RepoID)
-	writeReadResponse(w, http.StatusOK, resp, health.Degraded, health.Reason)
+	writeReadResponse(h.logger, w, http.StatusOK, resp, health.Degraded, health.Reason)
 }
 
 // -----------------------------------------------------------
@@ -1885,7 +1893,7 @@ func (h *Handler) handleReadTraceObservation(w http.ResponseWriter, r *http.Requ
 		degraded = health.Degraded
 		reason = health.Reason
 	}
-	writeReadResponse(w, http.StatusOK, resp, degraded, reason)
+	writeReadResponse(h.logger, w, http.StatusOK, resp, degraded, reason)
 }
 
 // queryEscape exists because handleReadEpisodes builds its

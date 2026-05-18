@@ -163,6 +163,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -354,13 +355,22 @@ func main() {
 // repos (mgmt.read.repos, mgmt.read.observations,
 // mgmt.read.concepts, mgmt.read.trace_observation) call the
 // `MgmtHealthSource` with an empty `repoID` because they have
-// no single repo to scope the probe to. This helper scans
-// `repo_health` for ANY currently-degraded repo and returns
-// the closed-set reason with the HIGHEST `degraded.Priority`,
-// matching the §8.1 overlay-ordering table: a real outage
-// (episodic_log / graph_store / embedding_index) dominates a
-// staleness or backpressure signal so the operator sees the
-// most severe degradation across the fleet.
+// no single repo to scope the probe to. This helper returns
+// the SINGLE highest-priority closed-set reason currently
+// surfaced anywhere in the fleet, matching the §8.1 overlay-
+// ordering table: a real outage (episodic_log / graph_store /
+// embedding_index) dominates a staleness or backpressure
+// signal so the operator sees the most severe degradation
+// across the fleet.
+//
+// The priority comparison is pushed into Postgres
+// (`ORDER BY <CASE priority expr> DESC LIMIT 1`) so the
+// query returns AT MOST ONE row regardless of how many repos
+// are degraded. The pre-fix shape streamed every degraded
+// row back and ranked them in Go, which became
+// O(degraded_repos) work per `mgmt.read.*` call and risked
+// turning the health probe into a bottleneck during the very
+// fleet-wide outage it is designed to surface (PR #42 review).
 //
 // Returns ("", nil) when no repo_health row is degraded
 // (the global healthy case). Returns ("", err) on a query
@@ -370,36 +380,63 @@ func main() {
 // production §8.3 invariant ("mgmt reads never fail because
 // the health probe failed") holds.
 func queryGlobalDegradedReason(ctx context.Context, db *sql.DB) (string, error) {
-	const q = `
-		SELECT COALESCE(degraded_reason::text, '')
-		FROM repo_health
-		WHERE degraded = TRUE
-		  AND degraded_reason IS NOT NULL
-	`
-	rows, err := db.QueryContext(ctx, q)
+	var reason string
+	err := db.QueryRowContext(ctx, globalDegradedReasonQuery).Scan(&reason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
 	if err != nil {
 		return "", fmt.Errorf("mgmt-api: global-health: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-	best := ""
-	bestPri := -1
-	for rows.Next() {
-		var r string
-		if err := rows.Scan(&r); err != nil {
-			return "", fmt.Errorf("mgmt-api: global-health scan: %w", err)
+	return reason, nil
+}
+
+// globalDegradedReasonQuery is the package-init-time SQL
+// string queried by queryGlobalDegradedReason. The CASE WHEN
+// priority arms are generated from degraded.AllReasons() +
+// degraded.Priority() so the SQL stays in lockstep with the
+// §8.1 closed set defined in internal/degraded/reason.go —
+// adding a new reason there automatically participates in
+// the ordering without a second-source edit here. The
+// secondary sort on `degraded_reason::text` gives a stable
+// tiebreaker when two repos surface different reasons at the
+// same priority.
+var globalDegradedReasonQuery = buildGlobalDegradedReasonQuery()
+
+// buildGlobalDegradedReasonQuery constructs the
+// `SELECT ... ORDER BY CASE ... DESC LIMIT 1` query at init
+// time. Building the CASE expression once and reusing the
+// resulting string avoids per-call string assembly on every
+// global-scope mgmt.read.* call.
+//
+// SQL-injection safety: each reason literal is interpolated
+// with `'%s'`. The closed-set reasons are well-known
+// lower-case ASCII identifiers (`episodic_log_unavailable`,
+// `graph_store_unavailable`, …) so this is safe today; the
+// guard below fails-fast at package init if a future
+// addition to the closed set smuggles a single-quote /
+// backslash / NUL byte into the literal before the
+// malformed SQL can ever run.
+func buildGlobalDegradedReasonQuery() string {
+	var b strings.Builder
+	b.WriteString(`
+		SELECT degraded_reason::text
+		FROM repo_health
+		WHERE degraded = TRUE
+		  AND degraded_reason IS NOT NULL
+		ORDER BY CASE degraded_reason::text`)
+	for _, r := range degraded.AllReasons() {
+		if strings.ContainsAny(r, "'\\\x00") {
+			panic(fmt.Sprintf(
+				"mgmt-api: degraded reason %q contains a SQL-special character; "+
+					"extend buildGlobalDegradedReasonQuery to escape it", r))
 		}
-		if r == "" {
-			continue
-		}
-		if p := degraded.Priority(r); p > bestPri {
-			best = r
-			bestPri = p
-		}
+		fmt.Fprintf(&b, " WHEN '%s' THEN %d", r, degraded.Priority(r))
 	}
-	if err := rows.Err(); err != nil {
-		return "", fmt.Errorf("mgmt-api: global-health rows: %w", err)
-	}
-	return best, nil
+	b.WriteString(` ELSE 0 END DESC, degraded_reason::text ASC
+		LIMIT 1
+	`)
+	return b.String()
 }
 
 // config is the env-derived configuration the binary uses.

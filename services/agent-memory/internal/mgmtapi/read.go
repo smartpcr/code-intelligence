@@ -1286,14 +1286,12 @@ func (h *Handler) handleReadConcepts(w http.ResponseWriter, r *http.Request) {
 		FROM concept c
 		LEFT JOIN latest_version v ON v.concept_id = c.concept_id
 	`)
-	args := []any{}
 	switch promoted {
 	case "true":
 		sb.WriteString(" WHERE COALESCE(v.promoted, false) = true")
 	case "false":
 		sb.WriteString(" WHERE COALESCE(v.promoted, false) = false")
 	}
-	_ = args
 	sb.WriteString(" ORDER BY c.created_at DESC LIMIT ")
 	sb.WriteString(strconv.Itoa(limit))
 

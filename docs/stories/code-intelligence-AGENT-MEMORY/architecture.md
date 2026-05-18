@@ -958,6 +958,18 @@ fixed and closed:
 `embedding_index_unavailable`, `reranker_model_stale`,
 `span_ingestor_backpressure`, `consolidator_backpressure`.
 
+**Note (Stage 8.1).** `agent.summarize` internally classifies a downed LLM
+endpoint as `summariser_unavailable` (`summarize.go:439`,
+`classifySummariserFailure`) so the verb's logs and the row-level
+`Episode.degraded_reason` audit field preserve the rich semantic. That
+classifier value is NOT in §8.2's closed set. The Stage 8.1 audit chokepoint
+(`internal/agentapi.applySummarizeDegradedContract`) translates
+`summariser_unavailable` to `embedding_index_unavailable` (both are
+"model-serving infrastructure unavailable" outages and share the operator
+triage path) before crossing the wire, so the closed contract still holds.
+Operators distinguish the two via the structured log field
+`degraded_reason_raw` emitted alongside the wire-level reason.
+
 ### 8.3 Reliability invariants
 
 - An `agent.observe` call **never** fails because the Consolidator is

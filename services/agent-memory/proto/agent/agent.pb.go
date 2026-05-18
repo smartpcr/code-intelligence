@@ -1278,13 +1278,18 @@ func (x *Citation) GetEpisodeId() string {
 //     (every entry is reachable from `target_id` in the
 //     structural graph) per the Stage 5.4 acceptance
 //     scenario "summary cites resolved nodes".
-//   - `degraded` / `degraded_reason` use the §C22 closed
-//     set augmented with `summariser_unavailable` (new in
-//     Stage 5.4) and the existing `reranker_model_stale`.
+//   - `degraded` / `degraded_reason` use the six-value
+//     §C22 closed set pinned by Stage 8.1 (no augmentation):
+//     `episodic_log_unavailable`, `graph_store_unavailable`,
+//     `embedding_index_unavailable`, `reranker_model_stale`,
+//     `span_ingestor_backpressure`, `consolidator_backpressure`.
 //     The Stage 5.4 brief pins `reranker_model_stale` for
 //     the case where the latest reranker run is older than
-//     7 days; `summariser_unavailable` covers a fresh-
-//     reranker-but-timed-out summariser.
+//     7 days. A summariser/LLM outage stamps the wire reason
+//     `embedding_index_unavailable` (Stage 8.1 wire-level
+//     normalisation of the internal `summariser_unavailable`
+//     classifier, which is preserved in the structured log
+//     `degraded_reason_raw` field for audit).
 type SummarizeResponse struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	SummaryMd      string                 `protobuf:"bytes,1,opt,name=summary_md,json=summaryMd,proto3" json:"summary_md,omitempty"`

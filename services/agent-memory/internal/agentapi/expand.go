@@ -517,7 +517,18 @@ func WithExpandEdgeKinds(kinds []string) Option {
 // emits an empty Edges/Nodes envelope with `Degraded=true`
 // (the "envelope-but-empty" cold-start case pinned by
 // `TestExpand_degradedEnvelopeWhenSnapshotMissing`).
-func (s *Service) Expand(ctx context.Context, req ExpandRequest) (ExpandResponse, error) {
+func (s *Service) Expand(ctx context.Context, req ExpandRequest) (resp ExpandResponse, err error) {
+	// Stage 8.1 — named returns + deferred wrap funnel every
+	// successful exit through the closed-set contract helper.
+	// On error we skip the helper (no metric / no overlay on
+	// a 500).
+	defer func() {
+		if err != nil {
+			return
+		}
+		resp, err = s.applyExpandDegradedContract(req.RepoID, resp)
+	}()
+
 	if req.NodeID == "" {
 		return ExpandResponse{}, ErrInvalidExpandNodeID
 	}
@@ -666,7 +677,7 @@ func (s *Service) Expand(ctx context.Context, req ExpandRequest) (ExpandResponse
 	sortExpandEdges(walkResult.edges, walkResult.edgeHops)
 
 	// Build the final response shape.
-	resp := ExpandResponse{
+	resp = ExpandResponse{
 		RootNodeID: rootNode.NodeID,
 		Edges:      walkResult.edges,
 		Nodes:      walkResult.nodes,

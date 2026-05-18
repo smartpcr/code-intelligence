@@ -15,7 +15,44 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/degraded"
 )
+
+// MgmtHealthSource is the cross-process degraded-state source
+// the `mgmt.read.*` verbs consult before emitting their
+// `DegradedEnvelope`. Returns the closed-set
+// `degraded_reason` (or empty string when the queried target
+// is healthy). The `repoID` argument is `""` for verbs that
+// don't carry a per-repo scope (`mgmt.read.repos`,
+// `mgmt.read.concepts`) — implementations SHOULD treat that
+// as "global health" and return the most-severe reason
+// observed across all repos.
+//
+// architecture.md §6.3 row "mgmt.* reads" allows every read
+// to surface a degraded envelope; the binary-level adapter in
+// `cmd/mgmt-api/main.go` wires
+// `spaningestor.NewPGHealthSource` so a per-repo
+// `repo_health.degraded=true` row stamps the corresponding
+// reason on the response.
+//
+// An error returned from this source MUST NOT fail the read
+// call — the chokepoint in `writeReadResponse` treats a
+// probe error as "healthy" and logs a Warn so a flaky
+// `repo_health` poll never blocks the operator UI.
+type MgmtHealthSource interface {
+	DegradedReason(ctx context.Context, verb, repoID string) (string, error)
+}
+
+// MgmtHealthSourceFunc adapts a plain function into the
+// MgmtHealthSource interface. Used by tests and by the
+// binary composition root.
+type MgmtHealthSourceFunc func(ctx context.Context, verb, repoID string) (string, error)
+
+// DegradedReason implements MgmtHealthSource.
+func (f MgmtHealthSourceFunc) DegradedReason(ctx context.Context, verb, repoID string) (string, error) {
+	return f(ctx, verb, repoID)
+}
 
 // Route paths for the Stage 7.1 verbs. The trailing-resource
 // segments (`/{id}/ingest`, `/{id}/ingest_delta`) are parsed
@@ -119,6 +156,39 @@ type Options struct {
 	// MUST supply their own instance and retain a reference
 	// to it.
 	IngestSpansMetrics *IngestSpansMetrics
+
+	// DegradedHealthSource — Stage 8.1 audit chokepoint.
+	// Optional cross-process degraded-state source the
+	// `mgmt.read.*` verbs consult before emitting their
+	// envelope; when the source reports the queried repo as
+	// degraded, the envelope is stamped with the closed-set
+	// reason. A nil source serves every read as `degraded
+	// =false` (the Stage 7.5 baseline). Production wires
+	// `spaningestor.NewPGHealthSource` (mirroring the agent
+	// path's wiring); the binary-level adapter bridges the
+	// `agent-memory/internal/spaningestor.HealthState` shape
+	// to the closed-set string.
+	DegradedHealthSource MgmtHealthSource
+
+	// DegradedFaultInjector — Stage 8.1 test seam. Optional
+	// per-verb fault injector that flips a `mgmt.read.*`
+	// response to a synthetic degraded state. Production
+	// binaries leave this nil; contract tests and the
+	// `mgmt.fault.inject` admin command wire a real value.
+	// The handler always runs `degraded.Enforce` against the
+	// final envelope so a non-closed reason produced by
+	// injection is caught (`writeReadResponse` returns 500
+	// rather than leaking the bad string to the wire).
+	DegradedFaultInjector degraded.FaultInjector
+
+	// DegradedMetric — Stage 8.1 per-verb counter. Optional
+	// ledger of `(verb, degraded_reason)` pairs the handler
+	// increments on every degraded response. A nil counter
+	// is a no-op. Production wires
+	// `degraded.NewCounter()` shared with the agent-memory
+	// gRPC service so the admin `mgmt.metrics` endpoint can
+	// surface a unified per-verb gauge.
+	DegradedMetric degraded.Metric
 }
 
 // Handler is the Management API HTTP handler. Construct one
@@ -143,6 +213,17 @@ type Handler struct {
 	// Always non-nil after NewHandler (the constructor
 	// allocates a default instance when Options omits one).
 	spansMetrics *IngestSpansMetrics
+
+	// degradedHealthSource — Stage 8.1 audit chokepoint;
+	// nil-safe in [writeReadResponse]. See
+	// [Options.DegradedHealthSource].
+	degradedHealthSource MgmtHealthSource
+	// degradedFaultInjector — Stage 8.1 test seam;
+	// nil-safe. See [Options.DegradedFaultInjector].
+	degradedFaultInjector degraded.FaultInjector
+	// degradedMetric — Stage 8.1 per-verb counter;
+	// nil-safe. See [Options.DegradedMetric].
+	degradedMetric degraded.Metric
 
 	// mux is the http.Handler the public ServeHTTP delegates
 	// to after auth. Constructed in NewHandler so route
@@ -187,15 +268,18 @@ func NewHandler(db *sql.DB, verifier TokenVerifier, resolver HeadResolver, opts 
 		spansMetrics = NewIngestSpansMetrics()
 	}
 	h := &Handler{
-		db:            db,
-		verifier:      verifier,
-		resolver:      resolver,
-		logger:        logger,
-		maxBody:       maxBody,
-		secretGen:     secretGen,
-		clock:         clock,
-		spanForwarder: opts.SpanForwarder,
-		spansMetrics:  spansMetrics,
+		db:                    db,
+		verifier:              verifier,
+		resolver:              resolver,
+		logger:                logger,
+		maxBody:               maxBody,
+		secretGen:             secretGen,
+		clock:                 clock,
+		spanForwarder:         opts.SpanForwarder,
+		spansMetrics:          spansMetrics,
+		degradedHealthSource:  opts.DegradedHealthSource,
+		degradedFaultInjector: opts.DegradedFaultInjector,
+		degradedMetric:        opts.DegradedMetric,
 	}
 	// Build the inner mux. The outer ServeHTTP runs auth
 	// FIRST so we wrap this once. Method gating happens
@@ -269,6 +353,13 @@ func (h *Handler) routeRead(w http.ResponseWriter, r *http.Request) {
 		h.handleListConcepts(w, r)
 	case path == RouteConceptSupports, path == RouteConceptSupports+"/":
 		h.handleListConceptSupports(w, r)
+	case path == RouteSpans, path == RouteSpans+"/":
+		// /v1/spans is POST-only (Stage 7.2 mgmt.ingest_spans).
+		// A GET here must return the standard 405 envelope,
+		// not the 404 the default branch would emit, so the
+		// operator sees "method not allowed" with an Allow
+		// header listing POST.
+		h.writeMethodNotAllowed(w, r)
 	case path == RouteContext, path == RouteContext+"/":
 		writeJSONError(w, http.StatusNotFound, "context_id_required",
 			"context_id path segment is required: GET /v1/context/{context_id}")
@@ -395,6 +486,9 @@ func allowedMethodsForPath(path string) string {
 		return "GET, POST"
 	case path == RouteEpisodes, path == RouteEpisodes+"/":
 		return "GET, POST"
+	case path == RouteSpans, path == RouteSpans+"/":
+		// Stage 7.2 mgmt.ingest_spans is POST-only.
+		return http.MethodPost
 	case path == RouteCommits, path == RouteCommits+"/",
 		path == RouteObservations, path == RouteObservations+"/",
 		path == RouteConcepts, path == RouteConcepts+"/",

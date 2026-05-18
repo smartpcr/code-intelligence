@@ -105,10 +105,15 @@ type AgentServiceClient interface {
 	// production adapter speaks the OpenAI-compatible HTTPS
 	// contract), caps the call at a 5 s defence-in-depth
 	// budget, and falls back to a deterministic Markdown
-	// template stamped with `degraded_reason=
-	// summariser_unavailable` (or `reranker_model_stale` when
-	// the reranker training is >7 d old) when the LLM is
-	// unavailable. The handler also durably appends a
+	// template when the LLM is unavailable. Stage 8.1 closed
+	// the wire envelope to the six §C22 reasons: a degraded
+	// summarize response stamps `degraded_reason=
+	// embedding_index_unavailable` (LLM/summariser outage) or
+	// `reranker_model_stale` (latest reranker training >7 d
+	// old). The internal `summariser_unavailable` classifier
+	// is preserved in the structured log `degraded_reason_raw`
+	// field for audit only; it never appears on the wire.
+	// The handler also durably appends a
 	// `recall_context_log(verb='summarize')` audit row keyed
 	// by the returned `context_id`.
 	Summarize(ctx context.Context, in *SummarizeRequest, opts ...grpc.CallOption) (*SummarizeResponse, error)
@@ -208,10 +213,15 @@ type AgentServiceServer interface {
 	// production adapter speaks the OpenAI-compatible HTTPS
 	// contract), caps the call at a 5 s defence-in-depth
 	// budget, and falls back to a deterministic Markdown
-	// template stamped with `degraded_reason=
-	// summariser_unavailable` (or `reranker_model_stale` when
-	// the reranker training is >7 d old) when the LLM is
-	// unavailable. The handler also durably appends a
+	// template when the LLM is unavailable. Stage 8.1 closed
+	// the wire envelope to the six §C22 reasons: a degraded
+	// summarize response stamps `degraded_reason=
+	// embedding_index_unavailable` (LLM/summariser outage) or
+	// `reranker_model_stale` (latest reranker training >7 d
+	// old). The internal `summariser_unavailable` classifier
+	// is preserved in the structured log `degraded_reason_raw`
+	// field for audit only; it never appears on the wire.
+	// The handler also durably appends a
 	// `recall_context_log(verb='summarize')` audit row keyed
 	// by the returned `context_id`.
 	Summarize(context.Context, *SummarizeRequest) (*SummarizeResponse, error)

@@ -1,13 +1,13 @@
 // Command repoindexer is the Stage 3.1 full-mode + Stage 3.3
 // EmbeddingIndex worker process per implementation-plan.md
-// §3.1 / §3.3 and tech-spec.md §9.6a.  It composes the
+// ┬º3.1 / ┬º3.3 and tech-spec.md ┬º9.6a.  It composes the
 // architecture-owned write side (graphwriter), the Stage 3.2
-// AST dispatcher, the Stage 3.3 §9.6a publisher, and the
+// AST dispatcher, the Stage 3.3 ┬º9.6a publisher, and the
 // Stage 3.3 background retry flusher into a single
 // long-running process.
 //
 // The composition mirrors `internal/embedding/doc.go`'s
-// "Production wiring" example verbatim — the binary is the
+// "Production wiring" example verbatim ΓÇö the binary is the
 // load-bearing demonstration that the publisher hook is
 // actually invoked by the worker (per evaluator iter-1
 // finding #5).  Without this main package the Stage 3.3
@@ -30,8 +30,8 @@
 //	                                 embedder is configured.  The
 //	                                 stub returns a fixed
 //	                                 zero-vector and IS NOT FIT
-//	                                 FOR PRODUCTION RECALL — it
-//	                                 exists so the §9.6a wiring
+//	                                 FOR PRODUCTION RECALL ΓÇö it
+//	                                 exists so the ┬º9.6a wiring
 //	                                 can be exercised end-to-end
 //	                                 before the embedding-model
 //	                                 workstream lands.  Production
@@ -102,7 +102,7 @@ func main() {
 	}
 	pingCancel()
 
-	// Construct the §9.6a wiring per
+	// Construct the ┬º9.6a wiring per
 	// internal/embedding/doc.go "Production wiring":
 	//   embedder + qdrant + db -> Publisher
 	//   Publisher -> AsASTPublisher -> WithEmbeddingPublisher
@@ -128,7 +128,7 @@ func main() {
 	// and that the publisher's post-publish hook increments
 	// when a publish supersedes a prior (i.e. the publish
 	// was enqueued by the mgmt.snapshot verb). Without this
-	// hook the snapshot_published_total counter the §6.2.1
+	// hook the snapshot_published_total counter the ┬º6.2.1
 	// observability contract requires would never advance.
 	snapMetrics := snapshot.NewMetrics()
 	publisher := embedding.NewPublisher(db, embedder, qdrant,
@@ -158,7 +158,7 @@ func main() {
 	// internal/repoindexer/diff.go); the Retirer wraps
 	// retirement.Service so the worker can write tombstones
 	// for removed / renamed Nodes. Both are required for
-	// delta jobs to dispatch — full-only deployments could
+	// delta jobs to dispatch ΓÇö full-only deployments could
 	// leave these nil, but production wiring always supplies
 	// them so a misrouted delta job surfaces as a job-level
 	// failure rather than silently sitting in `pending`.
@@ -176,7 +176,7 @@ func main() {
 		Logger:       logger,
 	})
 
-	// Optionally start the §9.6a background flusher.  The
+	// Optionally start the ┬º9.6a background flusher.  The
 	// resolver reads the persisted `queued`-event snapshot
 	// from `embedding_publish_event.details_json` so the
 	// long-running worker process does NOT need to keep
@@ -204,7 +204,7 @@ func main() {
 	// snapshot_published_total contribution. The listener
 	// runs in a background goroutine so a metrics-port
 	// bind failure does not block the publish/ingest
-	// worker — operators get a startup log line either way.
+	// worker ΓÇö operators get a startup log line either way.
 	startMetricsServer(ctx, cfg.MetricsListenAddr, snapMetrics, logger)
 
 	logger.Info("repoindexer.start",
@@ -292,8 +292,8 @@ func loadConfig() (config, error) {
 // startMetricsServer spins up an HTTP listener on `addr`
 // exposing /metrics (Prometheus text format) and /healthz.
 // Iter-2 fix #4: this is the binary surface for the
-// `snapshot_published_total` counter — without it a Prometheus
-// scrape from the §6.2.1 observability contract has nothing
+// `snapshot_published_total` counter ΓÇö without it a Prometheus
+// scrape from the ┬º6.2.1 observability contract has nothing
 // to read. The listener runs in a background goroutine; a
 // non-empty `addr` that fails to bind is logged but does not
 // abort the binary because the publish worker is the primary
@@ -314,9 +314,21 @@ func startMetricsServer(ctx context.Context, addr string, m *snapshot.Metrics, l
 		writeSnapshotMetrics(w, m)
 	})
 	srv := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
+		Addr:    addr,
+		Handler: mux,
+		// Mirror the hardening posture of the mgmt-api /
+		// span-ingestor / webhook-receiver listeners
+		// (ReadHeaderTimeout 10s, Read/WriteTimeout 30s).
+		// ReadHeaderTimeout alone mitigates slowloris header
+		// attacks but a client that sends a valid header and
+		// then drips the body — or reads /metrics output one
+		// byte at a time — can otherwise hold the goroutine
+		// open indefinitely. The /metrics + /healthz handlers
+		// here finish in well under a second so 30s is a
+		// generous safety net rather than a tight SLO.
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
 	}
 	go func() {
 		logger.Info("repoindexer.metrics.listen",
@@ -383,8 +395,8 @@ func selectEmbedder(cfg config, logger *slog.Logger) embedding.Embedder {
 
 // stubEmbedder is the local-development placeholder.  It
 // returns a fixed all-zeros vector and a stable model
-// version string.  The §9.6a contract treats this as a real
-// embedder for the purposes of the publish protocol — the
+// version string.  The ┬º9.6a contract treats this as a real
+// embedder for the purposes of the publish protocol ΓÇö the
 // row carries the stub model version, the recall path
 // surfaces the resulting vector, and a future operator can
 // trigger re-embedding by switching to a real Embedder

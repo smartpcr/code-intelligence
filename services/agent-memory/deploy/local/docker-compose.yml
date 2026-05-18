@@ -40,7 +40,14 @@ services:
       - "-c"
       - "pg_partman_bgw.dbname=agent_memory"
       - "-c"
-      - "pg_partman_bgw.interval=3600"
+      # Stage 8.2: pg_partman_bgw ticks every 10 minutes. This
+      # is the in-cluster fallback; the agent-memory
+      # partition-maintainer binary (cmd/partition-maintainer)
+      # owns the same cadence from the application side so a
+      # postgres restart that loses the bgw doesn't stall
+      # forward partition provisioning. Both paths are idempotent
+      # behind the partman advisory lock.
+      - "pg_partman_bgw.interval=600"
       - "-c"
       - "pg_partman_bgw.role=agent_memory"
     networks:
@@ -117,4 +124,78 @@ services:
       postgres:
         condition: service_healthy
       qdrant:
+        condition: service_healthy
+
+  # Stage 8.2: partition-maintainer is the application-side
+  # 10-minute pg_partman maintenance loop. It ticks every
+  # AGENT_MEMORY_PARTITION_MAINTENANCE_INTERVAL (default 10m),
+  # scrapes the partition_provision_lag gauge every
+  # AGENT_MEMORY_PARTITION_LAG_SCRAPE_INTERVAL (default 1m), and
+  # exposes both on :8087/metrics for the prometheus service
+  # below. The pg_partman_bgw configured on the postgres
+  # service is the in-cluster fallback for the same cadence;
+  # both paths are idempotent behind the partman advisory lock.
+  partition-maintainer:
+    container_name: agent_memory_partition_maintainer
+    build:
+      # The Go module root is `services/agent-memory/`, which
+      # is two levels up from this compose file. The Dockerfile
+      # is colocated with its cmd source for discoverability.
+      context: ../..
+      dockerfile: cmd/partition-maintainer/Dockerfile
+    image: agent-memory/partition-maintainer:dev
+    restart: unless-stopped
+    environment:
+      AGENT_MEMORY_PG_URL: "postgres://agent_memory:agent_memory@postgres:5432/agent_memory?sslmode=disable"
+      AGENT_MEMORY_PARTITION_MAINTENANCE_INTERVAL: "10m"
+      AGENT_MEMORY_PARTITION_LAG_SCRAPE_INTERVAL: "1m"
+      # Restrict the maintainer to the `public` schema so a
+      # leftover per-test schema in part_config does not turn
+      # into a maintenance loop against detached test parents.
+      AGENT_MEMORY_PARTITION_SCHEMA_FILTER: "public"
+      AGENT_MEMORY_LISTEN_ADDR: ":8087"
+    networks:
+      - agent_memory
+    ports:
+      - "8087:8087"
+    healthcheck:
+      # The maintainer binary serves `/healthz` on :8087 (see
+      # cmd/partition-maintainer/main.go). The runtime image is
+      # gcr.io/distroless/static-debian12:nonroot (no shell, no
+      # wget/curl), so we probe via the static busybox baked into
+      # the image (see cmd/partition-maintainer/Dockerfile -- same
+      # pattern as the qdrant / otel services in this stack).
+      test: ["CMD", "/busybox", "wget", "-q", "--spider", "http://127.0.0.1:8087/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Stage 8.2 §8.2 step 3: prometheus loads the partition-rotation
+  # alert rule and scrapes the maintainer. Operators wiring an
+  # external Prometheus stack can mirror the same rule_files /
+  # scrape_configs entries; this container exists so a local
+  # `docker compose up` reproduces the full alert path without
+  # extra setup.
+  prometheus:
+    container_name: agent_memory_prometheus
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=1d"
+      - "--web.listen-address=:9090"
+    networks:
+      - agent_memory
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+    depends_on:
+      partition-maintainer:
         condition: service_healthy

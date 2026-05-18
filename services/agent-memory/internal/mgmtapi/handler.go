@@ -100,19 +100,30 @@ type Options struct {
 	// Go-side clock does NOT shift DB columns; tests that
 	// need a frozen log timestamp inject one.
 	Clock func() time.Time
+
+	// Snapshotter wires the Stage 7.4 `mgmt.snapshot` verb.
+	// OPTIONAL: when nil the handler returns 503 +
+	// `snapshot_unavailable` on POST
+	// /v1/repos/{id}/snapshot rather than panicking. The
+	// production composition root in `cmd/mgmt-api/main.go`
+	// passes the concrete `*snapshot.Service`; binaries
+	// that omit the snapshot wiring (e.g. a minimal triage
+	// binary) leave this nil.
+	Snapshotter Snapshotter
 }
 
 // Handler is the Management API HTTP handler. Construct one
 // per process via [NewHandler]; the same handler is safe for
 // concurrent use across goroutines.
 type Handler struct {
-	db        *sql.DB
-	verifier  TokenVerifier
-	resolver  HeadResolver
-	logger    *slog.Logger
-	maxBody   int64
-	secretGen func() (string, error)
-	clock     func() time.Time
+	db          *sql.DB
+	verifier    TokenVerifier
+	resolver    HeadResolver
+	logger      *slog.Logger
+	maxBody     int64
+	secretGen   func() (string, error)
+	clock       func() time.Time
+	snapshotter Snapshotter
 
 	// mux is the http.Handler the public ServeHTTP delegates
 	// to after auth. Constructed in NewHandler so route
@@ -153,13 +164,14 @@ func NewHandler(db *sql.DB, verifier TokenVerifier, resolver HeadResolver, opts 
 		secretGen = defaultSecretGen
 	}
 	h := &Handler{
-		db:        db,
-		verifier:  verifier,
-		resolver:  resolver,
-		logger:    logger,
-		maxBody:   maxBody,
-		secretGen: secretGen,
-		clock:     clock,
+		db:          db,
+		verifier:    verifier,
+		resolver:    resolver,
+		logger:      logger,
+		maxBody:     maxBody,
+		secretGen:   secretGen,
+		clock:       clock,
+		snapshotter: opts.Snapshotter,
 	}
 	// Build the inner mux. The outer ServeHTTP runs auth
 	// FIRST so we wrap this once. Method gating happens
@@ -291,6 +303,16 @@ func (h *Handler) routeWrite(w http.ResponseWriter, r *http.Request) {
 		h.handleRegister(w, r)
 		return
 	case strings.HasPrefix(r.URL.Path, RouteRepos+"/"):
+		// Snapshot is matched FIRST because it has its own
+		// suffix; ingest / ingest_delta share the prefix
+		// `/ingest`. extractIngestPath cleanly rejects
+		// `/snapshot`, and extractSnapshotPath cleanly
+		// rejects `/ingest*`, so order is for clarity not
+		// correctness.
+		if repoID, _, ok := extractSnapshotPath(r.URL.Path); ok {
+			h.handleSnapshot(w, r, repoID)
+			return
+		}
 		repoID, suffix, ok := extractIngestPath(r.URL.Path)
 		if !ok {
 			writeJSONError(w, http.StatusNotFound, "not_found",

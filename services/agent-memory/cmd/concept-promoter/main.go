@@ -156,6 +156,7 @@ import (
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/embedding"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/promoter"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/snapshot"
 )
 
 func main() {
@@ -189,6 +190,15 @@ func main() {
 		}
 	}
 
+	// Iter-2 fix #4: instantiate the snapshot.Metrics
+	// counter this binary's /metrics endpoint exposes and
+	// that the promoter's post-publish hook increments
+	// when a concept publish supersedes a prior (i.e. the
+	// publish was enqueued by the mgmt.snapshot verb). The
+	// hook fires from `commitConceptPublishedWithSupersede`
+	// in internal/promoter/service.go after the tx commit;
+	// see iter-2 fix #3.
+	snapMetrics := snapshot.NewMetrics()
 	svc, err := promoter.New(db, embedder, qdrant, promoter.Config{
 		ConfidenceThreshold: cfg.ConfidenceThreshold,
 		SupportThreshold:    cfg.SupportThreshold,
@@ -196,7 +206,12 @@ func main() {
 		TickTimeout:         cfg.TickTimeout,
 		CandidateBatchSize:  cfg.CandidateBatchSize,
 		RetryBatchSize:      cfg.RetryBatchSize,
-	}, logger)
+	}, logger, promoter.WithPostPublishHook(func(ev embedding.PublishedEvent) {
+		if ev.SupersededPublishID == "" {
+			return
+		}
+		snapMetrics.IncPublished(1)
+	}))
 	if err != nil {
 		logger.Error("promoter.service", slog.String("error", err.Error()))
 		os.Exit(2)
@@ -209,7 +224,7 @@ func main() {
 	})
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		writeMetrics(w, svc.Metrics())
+		writeMetrics(w, svc.Metrics(), snapMetrics)
 	})
 
 	srv := &http.Server{
@@ -735,8 +750,17 @@ func (t *apiKeyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 // text-format. Matches the consolidator binary's writeMetrics
 // shape so the two binaries' /metrics endpoints parse
 // identically.
-func writeMetrics(w http.ResponseWriter, m *promoter.Metrics) {
-	snap := m.Snapshot()
+//
+// Iter-2 fix #4: also emits the snapshot_published_total
+// counter (sourced from the in-process snapshot.Metrics that
+// the promoter post-publish hook increments). The
+// snapshot_pending_total counter is intentionally 0 here —
+// pending++ is the mgmt-api binary's domain — so the
+// federated PromQL `sum(snapshot_published_total) /
+// sum(snapshot_pending_total)` yields the snapshot-completion
+// ratio across the whole deployment.
+func writeMetrics(w http.ResponseWriter, m *promoter.Metrics, snap *snapshot.Metrics) {
+	pSnap := m.Snapshot()
 	helps := map[string]string{
 		promoter.MetricPromoterRunsTotal:                "Promoter Tick invocations since binary start (success or failure).",
 		promoter.MetricPromoterErrorsTotal:              "Promoter Tick invocations that surfaced a non-nil error since binary start.",
@@ -760,7 +784,7 @@ func writeMetrics(w http.ResponseWriter, m *promoter.Metrics) {
 	for _, name := range counterOrder {
 		_, _ = fmt.Fprintf(w, "# HELP %s %s\n", name, helps[name])
 		_, _ = fmt.Fprintf(w, "# TYPE %s counter\n", name)
-		_, _ = fmt.Fprintf(w, "%s %d\n", name, snap[name])
+		_, _ = fmt.Fprintf(w, "%s %d\n", name, pSnap[name])
 	}
 	_, _ = fmt.Fprintf(w, "# HELP %s Number of candidate Concepts the Promoter's latest tick observed (latest ConceptVersion's confidence and support_count both above the configured thresholds, not yet promoted).\n",
 		promoter.MetricPromoterCandidatesPending)
@@ -770,4 +794,28 @@ func writeMetrics(w http.ResponseWriter, m *promoter.Metrics) {
 		promoter.MetricPromoterOrphansPending)
 	_, _ = fmt.Fprintf(w, "# TYPE %s gauge\n", promoter.MetricPromoterOrphansPending)
 	_, _ = fmt.Fprintf(w, "%s %d\n", promoter.MetricPromoterOrphansPending, m.OrphansPending())
+
+	// Snapshot counters — iter-2 fix #4. pending is always 0
+	// in this binary; published is incremented by the
+	// promoter's post-publish hook ONLY when the queued
+	// event for the just-published row carried
+	// `supersedes_publish_id` (i.e. the publish was
+	// enqueued by the mgmt.snapshot verb).
+	if snap == nil {
+		snap = snapshot.NewMetrics()
+	}
+	sSnap := snap.Snapshot()
+	snapHelps := map[string]string{
+		snapshot.MetricSnapshotPendingTotal:   "Cumulative snapshot targets enqueued by the mgmt.snapshot verb. Always 0 in the concept-promoter binary; reported here for scrape-symmetry.",
+		snapshot.MetricSnapshotPublishedTotal: "Cumulative concept-supersede publishes this binary completed. Incremented by the promoter post-publish hook only when the queued event carried supersedes_publish_id.",
+	}
+	snapOrder := []string{
+		snapshot.MetricSnapshotPendingTotal,
+		snapshot.MetricSnapshotPublishedTotal,
+	}
+	for _, name := range snapOrder {
+		_, _ = fmt.Fprintf(w, "# HELP %s %s\n", name, snapHelps[name])
+		_, _ = fmt.Fprintf(w, "# TYPE %s counter\n", name)
+		_, _ = fmt.Fprintf(w, "%s %d\n", name, sSnap[name])
+	}
 }

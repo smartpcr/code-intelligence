@@ -232,6 +232,19 @@ type Service struct {
 	// publish_id / point_id values. Production passes nil →
 	// uses embedding.NewUUIDv4.
 	newUUID func() (string, error)
+
+	// postPublishHook fires after a concept publish
+	// transitions to `published` (i.e. after the
+	// published-event commit in
+	// `commitConceptPublishedWithSupersede`). Optional —
+	// when nil the promoter is a no-op for downstream
+	// observers. Wired by the snapshot/§9.6a observer
+	// surface to increment `snapshot_published_total`.
+	// Panics inside a hook are caught and logged so a
+	// buggy observer cannot corrupt the §9.6a state
+	// machine. Iter-2 fix #3 mirrors the publisher hook
+	// for promoted-Concept publishes.
+	postPublishHook func(embedding.PublishedEvent)
 }
 
 // Option is the functional-options shape used to construct a
@@ -246,6 +259,30 @@ func WithUUIDFactory(fn func() (string, error)) Option {
 	return func(s *Service) {
 		if fn != nil {
 			s.newUUID = fn
+		}
+	}
+}
+
+// WithPostPublishHook installs an observer that fires AFTER
+// every successful transition to `published` for a promoted
+// Concept publish. The hook runs once per attempt with the
+// `embedding_publish_event` tx already committed — so an
+// observer reading from PG sees a consistent state. Panics
+// raised inside the hook are recovered and logged at
+// `promoter.publish.post_hook_panic`; they NEVER bubble up
+// into the runAttempt return value because §9.6a treats the
+// published-event commit as the irrevocable boundary. Pass
+// nil (or omit this option) to disable observation.
+//
+// Iter-2 fix #3: this is the concept-side mirror of
+// `embedding.WithPostPublishHook` so the snapshot verb's
+// `snapshot_published_total` counter can be incremented
+// from BOTH the node publisher (repoindexer binary) and the
+// concept promoter (concept-promoter binary).
+func WithPostPublishHook(fn func(embedding.PublishedEvent)) Option {
+	return func(s *Service) {
+		if fn != nil {
+			s.postPublishHook = fn
 		}
 	}
 }
@@ -1763,9 +1800,17 @@ func (s *Service) runAttempt(ctx context.Context, conn *sql.Conn, state publishS
 			state.pointID, embedding.CollectionConcept)
 	}
 
-	// Step 6: published event.
-	if err := s.insertEvent(ctx, conn, state.publishID, embedding.EventKindPublished,
-		state.attemptIndex, nil); err != nil {
+	// Step 6: published event + atomic supersede emission.
+	// Iter-2 fix #3: when this publish was enqueued by the
+	// snapshot verb (the queued event at attempt_index=0
+	// carries `supersedes_publish_id`), we MUST emit a
+	// `superseded` event for the prior publish in the same
+	// tx as the `published` event we are about to write.
+	// §9.6a forbids a reader from ever observing the new
+	// publish in `published` while the prior is still
+	// `published`.
+	supersededPriorID, err := s.commitConceptPublishedWithSupersede(ctx, conn, state.publishID, state.attemptIndex)
+	if err != nil {
 		return embedding.EventKindVectorWritten, fmt.Errorf("promoter: insert published: %w", err)
 	}
 	s.logger.Info("promoter.published",
@@ -1774,7 +1819,109 @@ func (s *Service) runAttempt(ctx context.Context, conn *sql.Conn, state publishS
 		slog.String("concept_id", state.conceptID),
 		slog.Int("attempt", state.attemptIndex),
 		slog.String("mode", state.mode))
+	// Post-publish observer hook — fired AFTER the tx
+	// commit, with panic-recover so a buggy observer cannot
+	// reach into the §9.6a state machine. Carries the prior
+	// publish_id so the snapshot metrics can attribute
+	// `snapshot_published_total++` only when an actual
+	// supersede happened (not on every concept publish).
+	if s.postPublishHook != nil {
+		ev := embedding.PublishedEvent{
+			PublishID:           state.publishID,
+			SupersededPublishID: supersededPriorID,
+			NodeID:              state.versionID,
+			Kind:                "concept",
+			ModelVersion:        state.modelVersion,
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					s.logger.Error("promoter.publish.post_hook_panic",
+						slog.String("publish_id", state.publishID),
+						slog.Any("recovered", r))
+				}
+			}()
+			s.postPublishHook(ev)
+		}()
+	}
 	return embedding.EventKindPublished, nil
+}
+
+// commitConceptPublishedWithSupersede mirrors
+// `embedding.Publisher.commitPublishedWithSupersede` for the
+// concept publish path. Runs on the supplied *sql.Conn (NOT
+// the pool) so the contained tx joins the per-run pinned
+// session that already holds the promoter's session-scoped
+// advisory lock — concurrent promoter runs are excluded at
+// the lock boundary, not by per-row gating.
+//
+// Atomicity contract: the `published` event for `publishID`
+// AND (when the snapshot-mint queued event carried
+// `supersedes_publish_id`) the `superseded` event for the
+// prior publish are written in ONE tx. Either both rows
+// land, or neither.
+//
+// Returns the prior publish_id when a supersede was emitted
+// (empty otherwise) so the caller can wire the
+// `postPublishHook` payload without re-querying.
+func (s *Service) commitConceptPublishedWithSupersede(
+	ctx context.Context,
+	conn *sql.Conn,
+	publishID string,
+	attempt int,
+) (supersededPublishID string, err error) {
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("begin concept-published-tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Probe the snapshot-mint queued event for a
+	// supersedes_publish_id key. When the publish was NOT
+	// enqueued by the snapshot verb the JSONB key is absent
+	// and the SELECT returns NULL → empty string here.
+	const probeQ = `
+		SELECT coalesce(details_json ->> 'supersedes_publish_id', '')
+		FROM embedding_publish_event
+		WHERE publish_id = $1
+		  AND event_kind = 'queued'
+		  AND attempt_index = 0
+		ORDER BY created_at ASC, event_id ASC
+		LIMIT 1
+	`
+	if err := tx.QueryRowContext(ctx, probeQ, publishID).Scan(&supersededPublishID); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("probe supersedes_publish_id: %w", err)
+		}
+		supersededPublishID = ""
+	}
+
+	const insertPublishedQ = `
+		INSERT INTO embedding_publish_event
+		    (publish_id, event_kind, attempt_index, details_json)
+		VALUES ($1::uuid, 'published'::embedding_publish_event_kind, $2, NULL)
+	`
+	if _, err := tx.ExecContext(ctx, insertPublishedQ, publishID, attempt); err != nil {
+		return "", fmt.Errorf("insert published: %w", err)
+	}
+
+	if supersededPublishID != "" {
+		const insertSupersededQ = `
+			INSERT INTO embedding_publish_event
+			    (publish_id, event_kind, attempt_index, details_json)
+			VALUES ($1::uuid, 'superseded'::embedding_publish_event_kind, 0, $2::jsonb)
+		`
+		body := fmt.Sprintf(`{"superseded_by_publish_id":%q}`, publishID)
+		if _, err := tx.ExecContext(ctx, insertSupersededQ, supersededPublishID, body); err != nil {
+			return "", fmt.Errorf("insert superseded for prior %s: %w",
+				supersededPublishID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("commit concept-published-tx: %w", err)
+	}
+	return supersededPublishID, nil
 }
 
 // insertEvent appends a single embedding_publish_event row.

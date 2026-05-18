@@ -80,3 +80,6 @@ Thumbs.db
 # ---------------------------------------------------------------
 services/agent-memory/deploy/local/data/
 services/agent-memory/deploy/local/**/_data/
+
+.worktree/
+.forge/

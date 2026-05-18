@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/promoter"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/snapshot"
 )
 
 // allPromoterEnv enumerates every env var loadConfig reads.
@@ -313,7 +314,7 @@ func requireExposition(t *testing.T, body, name, typ string) {
 func TestWriteMetrics_zeroState(t *testing.T) {
 	m := promoter.NewMetrics()
 	rec := httptest.NewRecorder()
-	writeMetrics(rec, m)
+	writeMetrics(rec, m, snapshot.NewMetrics())
 	body := rec.Body.String()
 
 	for _, name := range []string{
@@ -334,6 +335,22 @@ func TestWriteMetrics_zeroState(t *testing.T) {
 	if v := parseMetric(t, body, promoter.MetricPromoterCandidatesPending); v != "0" {
 		t.Errorf("candidates_pending gauge: got %s want 0", v)
 	}
+
+	// Iter-4 fix #3: snapshot counter exposition was wired in
+	// iter-2 (cmd/concept-promoter/main.go:798-820) but was
+	// not asserted by any test — a regression that dropped
+	// the HELP/TYPE lines or the value line would silently
+	// pass. Pin both snapshot counters here so the symmetric
+	// scrape contract stays enforceable from this binary.
+	for _, name := range []string{
+		snapshot.MetricSnapshotPendingTotal,
+		snapshot.MetricSnapshotPublishedTotal,
+	} {
+		requireExposition(t, body, name, "counter")
+		if v := parseMetric(t, body, name); v != "0" {
+			t.Errorf("snapshot metric %s: got %s want 0", name, v)
+		}
+	}
 }
 
 func TestWriteMetrics_seededCountersRender(t *testing.T) {
@@ -350,7 +367,7 @@ func TestWriteMetrics_seededCountersRender(t *testing.T) {
 	m.SetCandidatesPending(4)
 
 	rec := httptest.NewRecorder()
-	writeMetrics(rec, m)
+	writeMetrics(rec, m, snapshot.NewMetrics())
 	body := rec.Body.String()
 
 	want := map[string]string{
@@ -383,12 +400,88 @@ func TestWriteMetrics_helpAndTypeOrderingDeterministic(t *testing.T) {
 
 	render := func() string {
 		r := httptest.NewRecorder()
-		writeMetrics(r, m)
+		writeMetrics(r, m, snapshot.NewMetrics())
 		return r.Body.String()
 	}
 	a, b := render(), render()
 	if a != b {
 		t.Fatalf("writeMetrics output not deterministic:\nA:\n%s\nB:\n%s", a, b)
+	}
+}
+
+// TestWriteMetrics_snapshotCountersSeededRender is the iter-4
+// fix #3 acceptance gate. The iter-2 wiring at
+// cmd/concept-promoter/main.go:798-820 emits
+// snapshot_pending_total + snapshot_published_total in the
+// same exposition body as the promoter counters; without
+// this test, a regression that flipped the snap.Snapshot()
+// read order, used the wrong map key, or reordered the
+// snapOrder slice would silently break the cross-binary
+// federated view.
+//
+// Seed BOTH counters (even though the binary only ever
+// drives published itself — pending is set non-zero here
+// to verify the exposition path doesn't drop it for the
+// "always 0 in this binary" reason documented in main.go).
+func TestWriteMetrics_snapshotCountersSeededRender(t *testing.T) {
+	snap := snapshot.NewMetrics()
+	snap.IncPending(5)
+	snap.IncPublished(2)
+	snap.IncPublished(1)
+
+	m := promoter.NewMetrics()
+	rec := httptest.NewRecorder()
+	writeMetrics(rec, m, snap)
+	body := rec.Body.String()
+
+	want := map[string]string{
+		snapshot.MetricSnapshotPendingTotal:   "5",
+		snapshot.MetricSnapshotPublishedTotal: "3",
+	}
+	for name, expected := range want {
+		requireExposition(t, body, name, "counter")
+		if got := parseMetric(t, body, name); got != expected {
+			t.Errorf("snapshot metric %s: got %s want %s\nbody:\n%s",
+				name, got, expected, body)
+		}
+	}
+
+	// Iter-4 fix #3 ordering pin: snapshot_pending_total MUST
+	// appear before snapshot_published_total in the exposition
+	// body (snapOrder in main.go). Federated PromQL builders
+	// rely on this stable order.
+	pendingIdx := strings.Index(body, snapshot.MetricSnapshotPendingTotal+" ")
+	publishedIdx := strings.Index(body, snapshot.MetricSnapshotPublishedTotal+" ")
+	if pendingIdx < 0 || publishedIdx < 0 || pendingIdx > publishedIdx {
+		t.Errorf("snapshot ordering: pending @ %d, published @ %d (pending MUST come first)",
+			pendingIdx, publishedIdx)
+	}
+}
+
+// TestWriteMetrics_nilSnapshotMetrics_doesNotPanic pins the
+// defence-in-depth guard at cmd/concept-promoter/main.go:804-806
+// where `if snap == nil { snap = snapshot.NewMetrics() }`. A
+// /metrics scrape on a binary that didn't wire snapshot.Metrics
+// must still 200 with zero-valued snapshot counters instead of
+// nil-deref panicking.
+func TestWriteMetrics_nilSnapshotMetrics_doesNotPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("writeMetrics(..., nil-snapshot) panicked: %v", r)
+		}
+	}()
+	m := promoter.NewMetrics()
+	rec := httptest.NewRecorder()
+	writeMetrics(rec, m, nil)
+	body := rec.Body.String()
+	for _, name := range []string{
+		snapshot.MetricSnapshotPendingTotal,
+		snapshot.MetricSnapshotPublishedTotal,
+	} {
+		requireExposition(t, body, name, "counter")
+		if v := parseMetric(t, body, name); v != "0" {
+			t.Errorf("nil-snapshot metric %s: got %s want 0", name, v)
+		}
 	}
 }
 

@@ -6,10 +6,13 @@ package main
 // just the env-to-config glue.
 
 import (
+	"bytes"
 	"log/slog"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/snapshot"
 )
 
 func TestLoadConfig_missingPGURL(t *testing.T) {
@@ -319,5 +322,172 @@ func withEnv(t *testing.T, kv map[string]string) {
 			// these tests.
 			_ = v
 		}
+	}
+}
+
+// TestWriteSnapshotMetrics_zeroState verifies the /metrics
+// exposition format when no enqueues have happened yet.
+// Both counters MUST appear (Prometheus scrapers expect a
+// stable metric surface even when values are 0). Iter-2
+// fix #4 acceptance gate.
+func TestWriteSnapshotMetrics_zeroState(t *testing.T) {
+	buf := &bytes.Buffer{}
+	writeSnapshotMetrics(buf, snapshot.NewMetrics())
+	body := buf.String()
+	for _, want := range []string{
+		"# HELP " + snapshot.MetricSnapshotPendingTotal,
+		"# TYPE " + snapshot.MetricSnapshotPendingTotal + " counter",
+		snapshot.MetricSnapshotPendingTotal + " 0",
+		"# HELP " + snapshot.MetricSnapshotPublishedTotal,
+		"# TYPE " + snapshot.MetricSnapshotPublishedTotal + " counter",
+		snapshot.MetricSnapshotPublishedTotal + " 0",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\nbody:\n%s", want, body)
+		}
+	}
+}
+
+// TestWriteSnapshotMetrics_pendingIncremented verifies the
+// counter value actually flows through the exposition.
+func TestWriteSnapshotMetrics_pendingIncremented(t *testing.T) {
+	m := snapshot.NewMetrics()
+	m.IncPending(5)
+	m.IncPending(2)
+	buf := &bytes.Buffer{}
+	writeSnapshotMetrics(buf, m)
+	body := buf.String()
+	if !strings.Contains(body, snapshot.MetricSnapshotPendingTotal+" 7\n") {
+		t.Errorf("expected '%s 7' in body, got:\n%s",
+			snapshot.MetricSnapshotPendingTotal, body)
+	}
+}
+
+// TestWriteSnapshotMetrics_nilMetrics is the defence-in-depth
+// guard: a /metrics scrape on a binary that didn't wire up
+// snapshot must still 200 instead of nil-deref panicking.
+func TestWriteSnapshotMetrics_nilMetrics(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("writeSnapshotMetrics(nil) panicked: %v", r)
+		}
+	}()
+	buf := &bytes.Buffer{}
+	writeSnapshotMetrics(buf, nil)
+	body := buf.String()
+	if !strings.Contains(body, snapshot.MetricSnapshotPendingTotal+" 0") {
+		t.Errorf("nil-Metrics body did not expose pending counter: %s", body)
+	}
+}
+
+// TestWriteSnapshotMetrics_orderingDeterministic verifies the
+// fixed exposition order so Prometheus scrape diffs stay
+// human-readable.
+func TestWriteSnapshotMetrics_orderingDeterministic(t *testing.T) {
+	m := snapshot.NewMetrics()
+	m.IncPending(1)
+	render := func() string {
+		b := &bytes.Buffer{}
+		writeSnapshotMetrics(b, m)
+		return b.String()
+	}
+	a, b := render(), render()
+	if a != b {
+		t.Fatalf("writeSnapshotMetrics not deterministic:\nA:\n%s\nB:\n%s", a, b)
+	}
+	// pending must appear before published (federated query
+	// builders rely on this).
+	pendingIdx := strings.Index(a, snapshot.MetricSnapshotPendingTotal+" ")
+	publishedIdx := strings.Index(a, snapshot.MetricSnapshotPublishedTotal+" ")
+	if pendingIdx < 0 || publishedIdx < 0 || pendingIdx > publishedIdx {
+		t.Errorf("ordering: pending @ %d, published @ %d (pending must come first)", pendingIdx, publishedIdx)
+	}
+}
+
+// TestResolveSnapshotModelVersion pins the iter-3 operator
+// answer "model-version-source: both-with-derive-as-default".
+// Resolution order is:
+//
+//  1. Explicit `AGENT_MEMORY_EMBEDDING_MODEL_VERSION` wins.
+//  2. Derive from stub when AGENT_MEMORY_ALLOW_STUB_EMBEDDER.
+//  3. Empty → verb disabled.
+//
+// Regression test: a future change that flipped the
+// resolution order (so the derived stub value silently
+// overrode an operator-supplied explicit stamp) would be a
+// production-safety bug the snapshot verb's model-bump
+// runbook does not catch — that scenario is exactly what
+// this test guards against.
+func TestResolveSnapshotModelVersion(t *testing.T) {
+	cases := []struct {
+		name       string
+		cfg        config
+		wantStamp  string
+		wantSource string
+	}{
+		{
+			name:       "explicit_env_wins_over_stub",
+			cfg:        config{EmbeddingModelVersion: "openai-3-small@v2", AllowStubEmbedder: true},
+			wantStamp:  "openai-3-small@v2",
+			wantSource: "explicit_env",
+		},
+		{
+			name:       "explicit_env_no_stub",
+			cfg:        config{EmbeddingModelVersion: "openai-3-small@v2"},
+			wantStamp:  "openai-3-small@v2",
+			wantSource: "explicit_env",
+		},
+		{
+			name:       "derive_from_stub_when_env_empty",
+			cfg:        config{AllowStubEmbedder: true},
+			wantStamp:  "stub-zero-vector@v0",
+			wantSource: "derived_stub_embedder",
+		},
+		{
+			name:       "disabled_when_neither_configured",
+			cfg:        config{},
+			wantStamp:  "",
+			wantSource: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotStamp, gotSource := resolveSnapshotModelVersion(tc.cfg)
+			if gotStamp != tc.wantStamp {
+				t.Errorf("modelVersion = %q, want %q", gotStamp, tc.wantStamp)
+			}
+			if gotSource != tc.wantSource {
+				t.Errorf("source = %q, want %q", gotSource, tc.wantSource)
+			}
+		})
+	}
+}
+
+// TestParseAllowStubEmbedder is the focused unit test for the
+// tolerant boolean-env parser. Production deployments MUST
+// fail closed (return false) on unparseable input — a
+// production binary that accidentally interpreted "yeah ok"
+// as true would silently flip on the stub embedder.
+func TestParseAllowStubEmbedder(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"true", true},
+		{"True", true},
+		{"1", true},
+		{"false", false},
+		{"0", false},
+		{"", false},
+		{"  ", false},
+		{"yeah ok", false},
+		{" true ", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := parseAllowStubEmbedder(tc.in); got != tc.want {
+				t.Errorf("parseAllowStubEmbedder(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
 	}
 }

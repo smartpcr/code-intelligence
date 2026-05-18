@@ -696,9 +696,18 @@ func TestTick_happyPathPromotesOneCandidate(t *testing.T) {
 	mock.ExpectExec(`INSERT INTO embedding_publish_event`).
 		WithArgs("44444444-4444-4444-4444-444444444444", "vector_written", 0, nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Iter-2 fix #3: published-event commit is now wrapped
+	// in a tx by `commitConceptPublishedWithSupersede` —
+	// BEGIN, probe queued event for supersedes_publish_id
+	// (none here → empty), INSERT published, COMMIT.
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT coalesce\(details_json ->> 'supersedes_publish_id', ''\)`).
+		WithArgs("44444444-4444-4444-4444-444444444444").
+		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(""))
 	mock.ExpectExec(`INSERT INTO embedding_publish_event`).
-		WithArgs("44444444-4444-4444-4444-444444444444", "published", 0, nil).
+		WithArgs("44444444-4444-4444-4444-444444444444", 0).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	mock.ExpectExec(`pg_advisory_unlock`).
 		WithArgs(testLockKey).
@@ -883,9 +892,15 @@ func TestTick_retryPhaseResumesStalledPublish(t *testing.T) {
 	mock.ExpectExec(`INSERT INTO embedding_publish_event`).
 		WithArgs("55555555-5555-5555-5555-555555555555", "vector_written", 1, nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Iter-2 fix #3: tx-wrapped published-event commit.
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT coalesce\(details_json ->> 'supersedes_publish_id', ''\)`).
+		WithArgs("55555555-5555-5555-5555-555555555555").
+		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(""))
 	mock.ExpectExec(`INSERT INTO embedding_publish_event`).
-		WithArgs("55555555-5555-5555-5555-555555555555", "published", 1, nil).
+		WithArgs("55555555-5555-5555-5555-555555555555", 1).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	// Forward-phase scan: 0 fresh candidates (already
 	// handled in the retry).
@@ -1050,9 +1065,15 @@ func TestTick_orphanRecoveryDrivesOrphanedCVToPublished(t *testing.T) {
 	mock.ExpectExec(`INSERT INTO embedding_publish_event`).
 		WithArgs("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "vector_written", 0, nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Iter-2 fix #3: tx-wrapped published-event commit.
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT coalesce\(details_json ->> 'supersedes_publish_id', ''\)`).
+		WithArgs("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").
+		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(""))
 	mock.ExpectExec(`INSERT INTO embedding_publish_event`).
-		WithArgs("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "published", 0, nil).
+		WithArgs("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 0).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	// Retry-phase scan AFTER orphan recovery: 0 rows.
 	mock.ExpectQuery(`FROM embedding_publish ep`).
@@ -1545,9 +1566,15 @@ func TestTick_unpinnedHTTPEndToEndPromotesWithCachedModelVersion(t *testing.T) {
 	mock.ExpectExec(`INSERT INTO embedding_publish_event`).
 		WithArgs("44444444-4444-4444-4444-444444444444", "vector_written", 0, nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Iter-2 fix #3: tx-wrapped published-event commit.
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT coalesce\(details_json ->> 'supersedes_publish_id', ''\)`).
+		WithArgs("44444444-4444-4444-4444-444444444444").
+		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(""))
 	mock.ExpectExec(`INSERT INTO embedding_publish_event`).
-		WithArgs("44444444-4444-4444-4444-444444444444", "published", 0, nil).
+		WithArgs("44444444-4444-4444-4444-444444444444", 0).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	mock.ExpectExec(`pg_advisory_unlock`).
 		WithArgs(testLockKey).
@@ -1679,5 +1706,374 @@ func TestTick_unpinnedHTTPRetryEarlyReturnsOnEmptyStalls(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestCommitConceptPublishedWithSupersede_emitsSupersedeForPrior
+// is the focused unit test for iter-2 fix #3 — the concept-
+// publish supersede emission helper. When the queued event at
+// attempt_index=0 carries `supersedes_publish_id`, the helper
+// MUST emit a `superseded` event for that prior publish in
+// the same tx as the `published` event for the current
+// publish. Verifies (a) the probe SELECT runs, (b) the
+// published INSERT runs, (c) the superseded INSERT runs for
+// the prior, (d) the tx commits, (e) the returned
+// supersededPublishID matches the probed value, and (f) the
+// post-publish hook fires with the right payload.
+func TestCommitConceptPublishedWithSupersede_emitsSupersedeForPrior(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	const (
+		newPublishID   = "11111111-1111-1111-1111-111111111111"
+		priorPublishID = "22222222-2222-2222-2222-222222222222"
+	)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT coalesce\(details_json ->> 'supersedes_publish_id', ''\)`).
+		WithArgs(newPublishID).
+		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(priorPublishID))
+	mock.ExpectExec(`INSERT INTO embedding_publish_event[\s\S]+'published'::embedding_publish_event_kind`).
+		WithArgs(newPublishID, 0).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO embedding_publish_event[\s\S]+'superseded'::embedding_publish_event_kind`).
+		WithArgs(priorPublishID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	svc := &Service{db: db, logger: silentLogger()}
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("db.Conn: %v", err)
+	}
+	defer conn.Close()
+
+	got, err := svc.commitConceptPublishedWithSupersede(context.Background(), conn, newPublishID, 0)
+	if err != nil {
+		t.Fatalf("commitConceptPublishedWithSupersede: %v", err)
+	}
+	if got != priorPublishID {
+		t.Errorf("returned supersededPublishID = %q, want %q", got, priorPublishID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestCommitConceptPublishedWithSupersede_noSupersedeWhenAbsent
+// verifies the non-snapshot path: when the queued event has
+// no supersedes_publish_id, the helper inserts published only
+// (no superseded), commits, and returns empty.
+func TestCommitConceptPublishedWithSupersede_noSupersedeWhenAbsent(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	const newPublishID = "11111111-1111-1111-1111-111111111111"
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT coalesce\(details_json ->> 'supersedes_publish_id', ''\)`).
+		WithArgs(newPublishID).
+		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(""))
+	mock.ExpectExec(`INSERT INTO embedding_publish_event[\s\S]+'published'::embedding_publish_event_kind`).
+		WithArgs(newPublishID, 2).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// NO superseded insert expected.
+	mock.ExpectCommit()
+
+	svc := &Service{db: db, logger: silentLogger()}
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("db.Conn: %v", err)
+	}
+	defer conn.Close()
+
+	got, err := svc.commitConceptPublishedWithSupersede(context.Background(), conn, newPublishID, 2)
+	if err != nil {
+		t.Fatalf("commitConceptPublishedWithSupersede: %v", err)
+	}
+	if got != "" {
+		t.Errorf("returned supersededPublishID = %q, want empty", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestRunAttempt_postPublishHookFires_withSupersedeID is the
+// iter-3 fix #3 end-to-end test for the concept-side
+// post-publish hook. The iter-2 unit tests called the
+// `commitConceptPublishedWithSupersede` helper in isolation
+// but never installed `WithPostPublishHook` on the Service
+// or asserted the hook fired. This test drives the full
+// `runAttempt` chain (embed → upsert → vector_written →
+// confirm → committed-published+superseded) with a hook
+// installed and verifies the captured `PublishedEvent`
+// carries the SupersededPublishID returned by the helper.
+//
+// Behaviour pinned:
+//
+//   - Hook fires exactly once on the success path.
+//   - PublishID matches the publish being processed.
+//   - SupersededPublishID is the prior_publish_id the probe
+//     read out of the queued event's JSONB (i.e. the
+//     snapshot-mint discriminator round-trips end-to-end).
+//   - Kind == "concept" so the metrics consumer can route by
+//     publish kind without re-querying the row.
+//   - NodeID is the concept_version_id (the promoter reuses
+//     the field for routing-by-version downstream).
+//   - ModelVersion is the publishState's modelVersion (which
+//     matches what the promoter's run loop snapshots from
+//     the queued JSONB).
+//
+// Without this assertion `snapshot_published_total` for
+// concepts (which depends on SupersededPublishID being
+// non-empty) is silently unwired.
+func TestRunAttempt_postPublishHookFires_withSupersedeID(t *testing.T) {
+	db, mock, err := sqlmock.New(
+		sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp),
+		sqlmock.MonitorPingsOption(false),
+	)
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	const (
+		publishID      = "44444444-4444-4444-4444-444444444444"
+		priorPublishID = "55555555-5555-5555-5555-555555555555"
+		pointID        = "11111111-1111-1111-1111-111111111111"
+		conceptID      = "22222222-2222-2222-2222-222222222222"
+		versionID      = "33333333-3333-3333-3333-333333333333"
+	)
+
+	var (
+		captured     embedding.PublishedEvent
+		captureCount int
+		captureMu    sync.Mutex
+	)
+	hook := func(ev embedding.PublishedEvent) {
+		captureMu.Lock()
+		defer captureMu.Unlock()
+		captureCount++
+		captured = ev
+	}
+
+	emb := newFakeEmbedder("test@v1", 4)
+	qd := newFakeQdrant()
+	deterministicUUID := func() (string, error) { return pointID, nil }
+	svc, err := New(db, emb, qd, Config{
+		ConfidenceThreshold: 0.7,
+		SupportThreshold:    5,
+		RunInterval:         time.Second,
+		TickTimeout:         5 * time.Second,
+		CandidateBatchSize:  10,
+		RetryBatchSize:      10,
+		AdvisoryLockKey:     testLockKey,
+	}, silentLogger(),
+		WithUUIDFactory(deterministicUUID),
+		WithPostPublishHook(hook),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// runAttempt step 4c: vector_written event on the
+	// pool-pinned conn (sqlmock conn).
+	mock.ExpectExec(`INSERT INTO embedding_publish_event`).
+		WithArgs(publishID, "vector_written", 0, nil).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// runAttempt step 6: commitConceptPublishedWithSupersede.
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT coalesce\(details_json ->> 'supersedes_publish_id', ''\)`).
+		WithArgs(publishID).
+		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(priorPublishID))
+	mock.ExpectExec(`INSERT INTO embedding_publish_event[\s\S]+'published'::embedding_publish_event_kind`).
+		WithArgs(publishID, 0).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO embedding_publish_event[\s\S]+'superseded'::embedding_publish_event_kind`).
+		WithArgs(priorPublishID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("db.Conn: %v", err)
+	}
+	defer conn.Close()
+
+	// Pre-seed Qdrant so the runAttempt confirm step (Step
+	// 5) sees the point. We use a non-nil prefetchedVec so
+	// step 4a is skipped without needing an embedder stub.
+	state := publishState{
+		publishID:     publishID,
+		pointID:       pointID,
+		modelVersion:  "test@v1",
+		attemptIndex:  0,
+		mode:          "candidate",
+		conceptID:     conceptID,
+		versionID:     versionID,
+		fingerprint:   []byte{0xde, 0xad, 0xbe, 0xef},
+		prefetchedVec: []float32{0.25, 0.25, 0.25, 0.25},
+	}
+
+	last, err := svc.runAttempt(context.Background(), conn, state, "content-not-embedded-prefetched")
+	if err != nil {
+		t.Fatalf("runAttempt: %v", err)
+	}
+	if last != embedding.EventKindPublished {
+		t.Fatalf("runAttempt last event = %q, want %q", last, embedding.EventKindPublished)
+	}
+
+	captureMu.Lock()
+	defer captureMu.Unlock()
+	if captureCount != 1 {
+		t.Fatalf("post-publish hook fire count = %d, want 1 (the hook MUST fire exactly once on the success path)", captureCount)
+	}
+	if captured.PublishID != publishID {
+		t.Errorf("hook PublishID = %q, want %q", captured.PublishID, publishID)
+	}
+	if captured.SupersededPublishID != priorPublishID {
+		t.Errorf("hook SupersededPublishID = %q, want %q (the probed supersedes_publish_id MUST round-trip into the hook payload — without this, snapshot_published_total for concepts stays at 0 even when a snapshot supersede actually happened)", captured.SupersededPublishID, priorPublishID)
+	}
+	if captured.Kind != "concept" {
+		t.Errorf("hook Kind = %q, want %q", captured.Kind, "concept")
+	}
+	if captured.NodeID != versionID {
+		t.Errorf("hook NodeID = %q, want %q (concept-side NodeID is the concept_version_id)", captured.NodeID, versionID)
+	}
+	if captured.ModelVersion != "test@v1" {
+		t.Errorf("hook ModelVersion = %q, want %q", captured.ModelVersion, "test@v1")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+	if qd.upsertCount() != 1 {
+		t.Errorf("expected exactly 1 Qdrant upsert; got %d", qd.upsertCount())
+	}
+	if emb.callCount() != 0 {
+		t.Errorf("expected 0 Embed calls (prefetchedVec was supplied); got %d", emb.callCount())
+	}
+}
+
+// TestRunAttempt_postPublishHookFires_emptySupersedeOnNonSnapshot
+// pins the negative case: a publish that was NOT enqueued by
+// the snapshot verb (queued event carries no
+// supersedes_publish_id) MUST still fire the hook, but with
+// SupersededPublishID="". The cross-binary metrics consumer
+// uses the empty value as the signal to NOT bump
+// snapshot_published_total — without this assertion, a
+// regression that always returned a non-empty value (or
+// never fired the hook at all) would silently break the
+// counter accounting.
+func TestRunAttempt_postPublishHookFires_emptySupersedeOnNonSnapshot(t *testing.T) {
+	db, mock, err := sqlmock.New(
+		sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp),
+		sqlmock.MonitorPingsOption(false),
+	)
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	const (
+		publishID = "66666666-6666-6666-6666-666666666666"
+		pointID   = "11111111-1111-1111-1111-111111111111"
+		conceptID = "22222222-2222-2222-2222-222222222222"
+		versionID = "33333333-3333-3333-3333-333333333333"
+	)
+
+	var (
+		captured     embedding.PublishedEvent
+		captureCount int
+		captureMu    sync.Mutex
+	)
+	hook := func(ev embedding.PublishedEvent) {
+		captureMu.Lock()
+		defer captureMu.Unlock()
+		captureCount++
+		captured = ev
+	}
+
+	emb := newFakeEmbedder("test@v1", 4)
+	qd := newFakeQdrant()
+	deterministicUUID := func() (string, error) { return pointID, nil }
+	svc, err := New(db, emb, qd, Config{
+		ConfidenceThreshold: 0.7,
+		SupportThreshold:    5,
+		RunInterval:         time.Second,
+		TickTimeout:         5 * time.Second,
+		CandidateBatchSize:  10,
+		RetryBatchSize:      10,
+		AdvisoryLockKey:     testLockKey,
+	}, silentLogger(),
+		WithUUIDFactory(deterministicUUID),
+		WithPostPublishHook(hook),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	mock.ExpectExec(`INSERT INTO embedding_publish_event`).
+		WithArgs(publishID, "vector_written", 0, nil).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT coalesce\(details_json ->> 'supersedes_publish_id', ''\)`).
+		WithArgs(publishID).
+		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(""))
+	mock.ExpectExec(`INSERT INTO embedding_publish_event[\s\S]+'published'::embedding_publish_event_kind`).
+		WithArgs(publishID, 0).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// NO superseded insert expected — non-snapshot path.
+	mock.ExpectCommit()
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("db.Conn: %v", err)
+	}
+	defer conn.Close()
+
+	state := publishState{
+		publishID:     publishID,
+		pointID:       pointID,
+		modelVersion:  "test@v1",
+		attemptIndex:  0,
+		mode:          "candidate",
+		conceptID:     conceptID,
+		versionID:     versionID,
+		fingerprint:   []byte{0xca, 0xfe, 0xba, 0xbe},
+		prefetchedVec: []float32{0.5, 0.5, 0.5, 0.5},
+	}
+
+	last, err := svc.runAttempt(context.Background(), conn, state, "concept-content")
+	if err != nil {
+		t.Fatalf("runAttempt: %v", err)
+	}
+	if last != embedding.EventKindPublished {
+		t.Fatalf("runAttempt last event = %q, want %q", last, embedding.EventKindPublished)
+	}
+
+	captureMu.Lock()
+	defer captureMu.Unlock()
+	if captureCount != 1 {
+		t.Fatalf("post-publish hook fire count = %d, want 1 (hook fires on EVERY published transition, not just supersede)", captureCount)
+	}
+	if captured.SupersededPublishID != "" {
+		t.Errorf("hook SupersededPublishID = %q, want empty (non-snapshot publish MUST NOT carry a supersede id — the metrics consumer relies on '' to mean 'do not bump snapshot_published_total')", captured.SupersededPublishID)
+	}
+	if captured.PublishID != publishID {
+		t.Errorf("hook PublishID = %q, want %q", captured.PublishID, publishID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }

@@ -116,6 +116,34 @@
 //	                                             timeout (default 30s).
 //	AGENT_MEMORY_SHUTDOWN_TIMEOUT                graceful-shutdown
 //	                                             budget (default 30s).
+//	AGENT_MEMORY_EMBEDDING_MODEL_VERSION         current embedding-
+//	                                             model version stamp
+//	                                             (e.g. `openai-3-small@v1`).
+//	                                             Highest-priority source
+//	                                             for the snapshot verb's
+//	                                             model_version stamp.
+//	                                             When unset, mgmt-api
+//	                                             derives the stamp from
+//	                                             AGENT_MEMORY_ALLOW_STUB_EMBEDDER
+//	                                             (see below); when
+//	                                             neither is configured
+//	                                             the verb surface
+//	                                             returns 503.
+//	AGENT_MEMORY_ALLOW_STUB_EMBEDDER             when "true" AND
+//	                                             AGENT_MEMORY_EMBEDDING_MODEL_VERSION
+//	                                             is unset, mgmt-api
+//	                                             derives the snapshot
+//	                                             verb's model_version
+//	                                             stamp from the local-
+//	                                             dev stub embedder
+//	                                             (`stub-zero-vector@v0`).
+//	                                             Mirrors the
+//	                                             repoindexer's stub
+//	                                             selection so a dev
+//	                                             deployment gets a
+//	                                             working snapshot verb
+//	                                             without a redundant
+//	                                             env var.
 //
 // Exit codes
 // ----------
@@ -133,17 +161,20 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	_ "github.com/lib/pq"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/mgmtapi"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/snapshot"
 )
 
 func main() {
@@ -177,8 +208,10 @@ func main() {
 		logger.Error("mgmt-api.resolver", slog.String("error", err.Error()))
 		os.Exit(2)
 	}
+	snapshotter, snapMetrics := buildSnapshotter(db, cfg, logger)
 	handler := mgmtapi.NewHandler(db, verifier, resolver, mgmtapi.Options{
-		Logger: logger,
+		Logger:      logger,
+		Snapshotter: snapshotter,
 	})
 
 	mux := http.NewServeMux()
@@ -188,6 +221,23 @@ func main() {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+	// Iter-2 fix #4: expose snapshot_pending_total /
+	// snapshot_published_total in a Prometheus-text body.
+	// pending++ is wired from the snapshot service's enqueue
+	// loop; published++ is wired in the publisher binaries
+	// (repoindexer, concept-promoter) so this endpoint
+	// reports pending here and (always 0) published. The
+	// global snapshot_published_total is the SUM of every
+	// binary's contribution, federated in PromQL — standard
+	// multi-binary counter pattern. The /metrics endpoint
+	// stays registered even when buildSnapshotter returned
+	// a nil snapshotter (no AGENT_MEMORY_EMBEDDING_MODEL_VERSION
+	// configured) so an operator running with snapshot
+	// disabled still sees a scrape-friendly 200.
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		writeSnapshotMetrics(w, snapMetrics)
 	})
 
 	srv := &http.Server{
@@ -274,6 +324,23 @@ type config struct {
 	HeadResolverGitPath   string
 	HeadResolverTimeout   time.Duration
 	HeadResolverStaticSHA string
+
+	// Snapshot verb (Stage 7.4) — empty disables the verb;
+	// the handler then returns 503 on the surface. See
+	// docs/stories/code-intelligence-AGENT-MEMORY/
+	// implementation-plan.md for the model-bump runbook.
+	//
+	// Iter-3 operator answer "model-version-source: both-
+	// with-derive-as-default": when EmbeddingModelVersion
+	// is empty AND AllowStubEmbedder is true the
+	// snapshotter derives the model_version stamp from the
+	// stub embedder's `ModelVersion()` (mirrors the
+	// repoindexer's selectEmbedder default) so a local-dev
+	// deployment that already enabled the stub embedder
+	// gets a working snapshot verb without a redundant env
+	// var. Explicit EmbeddingModelVersion always wins.
+	EmbeddingModelVersion string
+	AllowStubEmbedder     bool
 }
 
 // loadConfig reads the binary's configuration from the
@@ -298,6 +365,8 @@ func loadConfig() (config, error) {
 		HeadResolverGitPath:   os.Getenv("AGENT_MEMORY_HEAD_RESOLVER_GIT_PATH"),
 		HeadResolverStaticSHA: os.Getenv("AGENT_MEMORY_HEAD_RESOLVER_STATIC_SHA"),
 		ResolverMode:          os.Getenv("AGENT_MEMORY_HEAD_RESOLVER"),
+		EmbeddingModelVersion: strings.TrimSpace(os.Getenv("AGENT_MEMORY_EMBEDDING_MODEL_VERSION")),
+		AllowStubEmbedder:     parseAllowStubEmbedder(os.Getenv("AGENT_MEMORY_ALLOW_STUB_EMBEDDER")),
 		ReadTimeout:           30 * time.Second,
 		WriteTimeout:          30 * time.Second,
 		ShutdownTimeout:       30 * time.Second,
@@ -486,6 +555,122 @@ func buildResolver(cfg config, logger *slog.Logger) (mgmtapi.HeadResolver, error
 	}
 }
 
+// buildSnapshotter wires the [mgmtapi.Snapshotter] used by
+// the Stage 7.4 `mgmt.snapshot` verb. Returns nil when no
+// model_version stamp is resolvable so the handler emits a
+// clean 503 + `snapshot_unavailable` envelope instead of
+// panicking at the snapshot service's boot-time guard. Also
+// returns the underlying [snapshot.Metrics] (or a fresh
+// empty one when snapshotting is disabled) so the binary's
+// /metrics endpoint can scrape pending counts even when the
+// verb is unwired.
+//
+// Iter-3 operator answer "model-version-source: both-with-
+// derive-as-default": the resolution order is
+//
+//  1. `AGENT_MEMORY_EMBEDDING_MODEL_VERSION` (explicit
+//     override — operator-supplied stamp, always wins).
+//  2. derived from the local-dev stub embedder when
+//     `AGENT_MEMORY_ALLOW_STUB_EMBEDDER=true` — mirrors
+//     the repoindexer's `selectEmbedder` default so a
+//     dev-mode mgmt-api gets a working snapshot verb
+//     without a redundant env var.
+//  3. neither — verb disabled, handler returns 503.
+//
+// We do not instantiate a real embedder client here because
+// mgmt-api otherwise has no embedder dependency — the
+// snapshot service only needs the model_version STRING, not
+// a working Embed/ModelVersion pair.
+func buildSnapshotter(db *sql.DB, cfg config, logger *slog.Logger) (mgmtapi.Snapshotter, *snapshot.Metrics) {
+	modelVersion, source := resolveSnapshotModelVersion(cfg)
+	if modelVersion == "" {
+		logger.Warn("mgmt-api.snapshotter.disabled",
+			slog.String("reason",
+				"AGENT_MEMORY_EMBEDDING_MODEL_VERSION not set "+
+					"and no stub-derive available; "+
+					"POST /v1/repos/{id}/snapshot will return 503"),
+		)
+		return nil, snapshot.NewMetrics()
+	}
+	svc := snapshot.New(db, modelVersion,
+		snapshot.WithLogger(logger),
+	)
+	logger.Info("mgmt-api.snapshotter.ready",
+		slog.String("model_version", svc.ModelVersion()),
+		slog.String("model_version_source", source),
+	)
+	return &snapshotAdapter{inner: svc}, svc.Metrics()
+}
+
+// resolveSnapshotModelVersion implements the iter-3 operator
+// answer "both-with-derive-as-default". Returns
+// `(modelVersion, sourceLabel)` for observability and an
+// empty string when the verb should be disabled.
+//
+// The `derive-from-stub` branch returns the same string the
+// repoindexer's stubEmbedder.ModelVersion() returns — kept
+// in sync by reference to the same constant rather than a
+// new package import to avoid pulling the repoindexer's
+// transitive deps (OpenAI client, etc.) into mgmt-api.
+func resolveSnapshotModelVersion(cfg config) (string, string) {
+	if cfg.EmbeddingModelVersion != "" {
+		return cfg.EmbeddingModelVersion, "explicit_env"
+	}
+	if cfg.AllowStubEmbedder {
+		// The repoindexer's stubEmbedder.ModelVersion()
+		// returns "stub-zero-vector@v0"; we mirror the
+		// exact string here (NOT a const import; see fn
+		// docstring for the cross-binary coupling note).
+		return "stub-zero-vector@v0", "derived_stub_embedder"
+	}
+	return "", ""
+}
+
+// parseAllowStubEmbedder is the tolerant boolean-env parser
+// for `AGENT_MEMORY_ALLOW_STUB_EMBEDDER`. Unset / unparseable
+// values are treated as `false` — production deployments
+// MUST explicitly opt into the stub.
+func parseAllowStubEmbedder(raw string) bool {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return false
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false
+	}
+	return b
+}
+
+// snapshotAdapter translates the snapshot package's native
+// [snapshot.Result] / [snapshot.ErrRepoNotFound] into the
+// [mgmtapi.Snapshotter] interface's [mgmtapi.SnapshotResult] /
+// [mgmtapi.ErrSnapshotRepoNotFound] sentinels.  The two
+// packages cannot share a struct without a circular dependency
+// (mgmtapi already imports nothing from snapshot, and snapshot
+// MUST NOT import mgmtapi), so the binary-side adapter is the
+// canonical place to bridge them.
+type snapshotAdapter struct{ inner *snapshot.Service }
+
+func (a *snapshotAdapter) Snapshot(ctx context.Context, repoID string) (mgmtapi.SnapshotResult, error) {
+	r, err := a.inner.Snapshot(ctx, repoID)
+	if err != nil {
+		if errors.Is(err, snapshot.ErrRepoNotFound) {
+			return mgmtapi.SnapshotResult{}, mgmtapi.ErrSnapshotRepoNotFound
+		}
+		return mgmtapi.SnapshotResult{}, err
+	}
+	return mgmtapi.SnapshotResult{
+		SnapshotID:          r.SnapshotID,
+		ModelVersion:        r.ModelVersion,
+		MethodsEnqueued:     r.MethodsEnqueued,
+		BlocksEnqueued:      r.BlocksEnqueued,
+		ConceptsEnqueued:    r.ConceptsEnqueued,
+		MethodBlocksSkipped: r.MethodBlocksSkipped,
+		ConceptsSkipped:     r.ConceptsSkipped,
+	}, nil
+}
+
 // openPG opens a *sql.DB against cfg.PGURL with conservative
 // pool limits, pings to verify connectivity, and returns the
 // ready pool. Caller is responsible for Close on shutdown.
@@ -506,4 +691,48 @@ func openPG(ctx context.Context, cfg config, logger *slog.Logger) (*sql.DB, erro
 	}
 	logger.Info("mgmt-api.pg.connected")
 	return pool, nil
+}
+
+// snapshotMetricsOrder pins the line order of the
+// `/metrics` exposition. Stable order keeps scrape diffs
+// human-readable and matches Prometheus's text-exposition
+// recommendation. Mirrors the deterministic-order pattern
+// used by `cmd/consolidator/main.go`'s writeMetrics.
+var snapshotMetricsOrder = []string{
+	snapshot.MetricSnapshotPendingTotal,
+	snapshot.MetricSnapshotPublishedTotal,
+}
+
+// snapshotMetricsHelp documents each counter for the
+// exposition body. Keeping help text in code rather than a
+// separate YAML keeps the binary self-contained for
+// air-gapped deploys.
+var snapshotMetricsHelp = map[string]string{
+	snapshot.MetricSnapshotPendingTotal: "Cumulative snapshot targets enqueued by the mgmt.snapshot verb (incremented once per Method/Block/Concept publish row written).",
+	snapshot.MetricSnapshotPublishedTotal: "Cumulative snapshot supersedes that completed publish (incremented by the publisher post-publish hook only when the queued event carried supersedes_publish_id).",
+}
+
+// writeSnapshotMetrics emits a Prometheus text-format body
+// (version 0.0.4) for the snapshot counters. Sorted by
+// `snapshotMetricsOrder` so successive scrapes diff cleanly.
+// Iter-2 fix #4: this is the per-binary exposition; the
+// snapshot_published_total counter from this binary is
+// always 0 because mgmt-api never calls the embedding
+// publisher — federated PromQL combines pending (from
+// mgmt-api) with published (from repoindexer + concept-
+// promoter) to compute backlog.
+func writeSnapshotMetrics(w io.Writer, m *snapshot.Metrics) {
+	if m == nil {
+		m = snapshot.NewMetrics()
+	}
+	snap := m.Snapshot()
+	for _, name := range snapshotMetricsOrder {
+		help := snapshotMetricsHelp[name]
+		if help == "" {
+			help = "(no description)"
+		}
+		fmt.Fprintf(w, "# HELP %s %s\n", name, help)
+		fmt.Fprintf(w, "# TYPE %s counter\n", name)
+		fmt.Fprintf(w, "%s %d\n", name, snap[name])
+	}
 }

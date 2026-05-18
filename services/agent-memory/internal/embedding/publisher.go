@@ -217,6 +217,43 @@ type Publisher struct {
 	// publish_id / point_id values.  Production passes nil →
 	// uses `NewUUIDv4`.
 	newUUID func() (string, error)
+
+	// postPublishHook fires after a publish transitions to
+	// `published` (i.e. after the published-event commit in
+	// `commitPublishedWithSupersede`).  Optional — when nil
+	// the publisher is a no-op for downstream observers.
+	// Wired by the snapshot/§9.6a observer surface to
+	// increment `snapshot_published_total`.  Panics inside a
+	// hook are caught and logged so a buggy observer cannot
+	// corrupt the §9.6a state machine.
+	postPublishHook func(PublishedEvent)
+}
+
+// PublishedEvent is the payload delivered to
+// `postPublishHook` after a publish transitions to
+// `published`.  Carries enough context for downstream
+// observers (snapshot bookkeeping, metrics, audit log) to
+// correlate without needing a fresh DB round-trip.
+type PublishedEvent struct {
+	// PublishID is the embedding_publish row that just
+	// transitioned to `published`.
+	PublishID string
+	// SupersededPublishID, when non-empty, is the prior
+	// publish_id that this publish replaced. Populated
+	// only when the queued event for this publish carried
+	// `supersedes_publish_id` (i.e. this publish was
+	// enqueued by the snapshot verb).
+	SupersededPublishID string
+	// NodeID is the Node owning this publish.  Useful for
+	// observers that index by node rather than publish row.
+	NodeID string
+	// Kind is the node kind (`method` / `block`).
+	Kind string
+	// RepoID is the repo owning this publish.
+	RepoID string
+	// ModelVersion is the embedding-model version stamp
+	// recorded on the publish row.
+	ModelVersion string
 }
 
 // Option is the functional-options shape used to construct a
@@ -254,6 +291,24 @@ func WithUUIDFactory(fn func() (string, error)) Option {
 	return func(p *Publisher) {
 		if fn != nil {
 			p.newUUID = fn
+		}
+	}
+}
+
+// WithPostPublishHook installs an observer that fires AFTER
+// every successful transition to `published` in the §9.6a
+// state machine.  The hook runs once per attempt, with the
+// `embedding_publish` row's tx already committed — so an
+// observer reading from PG sees a consistent state.  Panics
+// raised inside the hook are recovered and logged at
+// `mgmtapi.publish.post_hook_panic`; they NEVER bubble up
+// into the publisher's return value because §9.6a treats the
+// published-event commit as the irrevocable boundary.  Pass
+// nil (or omit this option) to disable observation.
+func WithPostPublishHook(fn func(PublishedEvent)) Option {
+	return func(p *Publisher) {
+		if fn != nil {
+			p.postPublishHook = fn
 		}
 	}
 }
@@ -583,13 +638,50 @@ func (p *Publisher) runAttempt(
 			ErrAttemptFailed, result.QdrantPointID, collection)
 	}
 
-	// Step 6: published event.
-	if err := p.insertEvent(ctx, result.PublishID, EventKindPublished,
-		result.AttemptIndex, nil); err != nil {
-		return result, fmt.Errorf("embedding: insert published: %w", err)
+	// Step 6: published event.  When the queued event
+	// carried a `supersedes_publish_id` (set by the snapshot
+	// verb under §9.6a), we MUST also emit a `superseded`
+	// event for the prior publish_id — in the SAME tx as the
+	// published event so the §9.6a state machine never
+	// observes a published-without-superseded prior, which
+	// would let the prior's qdrant point linger past its
+	// supersede.  The helper opens its own tx and probes the
+	// oldest queued event for this publish (attempt_index 0
+	// — Retry-appended queued events at attempt_index >= 1
+	// never carry supersede metadata).
+	supersededID, err := p.commitPublishedWithSupersede(ctx, result.PublishID, result.AttemptIndex)
+	if err != nil {
+		return result, fmt.Errorf("embedding: commit published: %w", err)
 	}
 	result.LastEventKind = EventKindPublished
 	p.logAttempt("published", req, result)
+
+	// Step 7: fire the post-publish hook.  Hook runs AFTER
+	// the published-event commit so observers never see
+	// inconsistent state.  Panic-recover keeps a buggy
+	// observer from corrupting the §9.6a contract — the
+	// published event is durable, the hook is best-effort.
+	if p.postPublishHook != nil {
+		ev := PublishedEvent{
+			PublishID:           result.PublishID,
+			SupersededPublishID: supersededID,
+			NodeID:              req.NodeID,
+			Kind:                req.Kind,
+			RepoID:              req.RepoID,
+			ModelVersion:        p.embedder.ModelVersion(),
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					p.logger.Error("mgmtapi.publish.post_hook_panic",
+						slog.String("publish_id", ev.PublishID),
+						slog.Any("recovered", r),
+					)
+				}
+			}()
+			p.postPublishHook(ev)
+		}()
+	}
 	return result, nil
 }
 
@@ -738,6 +830,106 @@ func marshalQueuedDetails(req PublishRequest, modelVersion string) (json.RawMess
 		return nil, fmt.Errorf("embedding: marshal queued details: %w", err)
 	}
 	return raw, nil
+}
+
+// commitPublishedWithSupersede atomically inserts the
+// `published` event for `publishID` AND, when the publish's
+// queued event (the snapshot-mint event at attempt_index 0)
+// carries a `supersedes_publish_id`, also inserts a
+// `superseded` event for that prior publish — all in ONE
+// transaction.  This atomicity is required by §9.6a: a reader
+// must NEVER observe the new publish in `published` while the
+// prior is still `published`; either both rows transition or
+// neither does.
+//
+// Returns the prior publish_id when a supersede was emitted
+// (empty otherwise) so the caller can wire the
+// `postPublishHook` payload without re-querying.
+//
+// Reads the OLDEST queued event for this publish
+// (`attempt_index = 0`, `ORDER BY created_at ASC, event_id
+// ASC LIMIT 1`).  Retry-appended queued events at
+// `attempt_index >= 1` are written WITHOUT supersede metadata
+// (Retry preserves the original snapshot intent but does not
+// re-stamp the prior — the prior was already marked
+// superseded at first transition-to-published), so probing
+// the freshest queued event would yield a false negative on
+// retried publishes.
+func (p *Publisher) commitPublishedWithSupersede(
+	ctx context.Context,
+	publishID string,
+	attempt int,
+) (supersededPublishID string, err error) {
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("begin published-tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Probe the snapshot-mint queued event for a
+	// supersedes_publish_id key.  When the publish was NOT
+	// enqueued by the snapshot verb the JSONB key is absent
+	// and the SELECT returns NULL → empty string here.
+	const probeQ = `
+		SELECT coalesce(details_json ->> 'supersedes_publish_id', '')
+		FROM embedding_publish_event
+		WHERE publish_id = $1
+		  AND event_kind = 'queued'
+		  AND attempt_index = 0
+		ORDER BY created_at ASC, event_id ASC
+		LIMIT 1
+	`
+	if err := tx.QueryRowContext(ctx, probeQ, publishID).Scan(&supersededPublishID); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("probe supersedes_publish_id: %w", err)
+		}
+		// No queued event at attempt_index 0 is itself a
+		// state-machine violation (every publish has its
+		// step-3 queued row) but Retry-only callers can
+		// theoretically race this read in a malformed
+		// schema.  Treat as no-supersede and continue —
+		// the published event still needs to land.
+		supersededPublishID = ""
+	}
+
+	// Step 6 proper: append the published event in the
+	// open tx so an observer reading the
+	// embedding_publish_event partition can never see a
+	// half-applied transition.
+	const insertPublishedQ = `
+		INSERT INTO embedding_publish_event
+		    (publish_id, event_kind, attempt_index, details_json)
+		VALUES ($1, 'published'::embedding_publish_event_kind, $2, NULL)
+	`
+	if _, err := tx.ExecContext(ctx, insertPublishedQ, publishID, attempt); err != nil {
+		return "", fmt.Errorf("insert published: %w", err)
+	}
+
+	if supersededPublishID != "" {
+		// The prior publish's own attempt_index sequence
+		// is unrelated to ours; we record the supersede
+		// at attempt_index 0 because there is exactly
+		// one supersede event per publish row (it
+		// terminates the row's lifecycle).
+		const insertSupersededQ = `
+			INSERT INTO embedding_publish_event
+			    (publish_id, event_kind, attempt_index, details_json)
+			VALUES ($1, 'superseded'::embedding_publish_event_kind, 0, $2::jsonb)
+		`
+		// JSONB body cross-links to the publish that
+		// supplanted it so an operator inspecting the
+		// event log can trace the snapshot graph.
+		body := fmt.Sprintf(`{"superseded_by_publish_id":%q}`, publishID)
+		if _, err := tx.ExecContext(ctx, insertSupersededQ, supersededPublishID, body); err != nil {
+			return "", fmt.Errorf("insert superseded for prior %s: %w",
+				supersededPublishID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("commit published-tx: %w", err)
+	}
+	return supersededPublishID, nil
 }
 
 // insertEvent appends a single event row.  Append-only by

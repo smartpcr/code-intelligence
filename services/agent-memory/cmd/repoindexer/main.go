@@ -52,6 +52,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -67,6 +68,7 @@ import (
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/repoindexer"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/repoindexer/ast"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/retirement"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/snapshot"
 )
 
 func main() {
@@ -121,8 +123,28 @@ func main() {
 		}
 	}
 
+	// Iter-2 fix #4: instantiate the snapshot.Metrics
+	// counter that this binary's /metrics endpoint exposes
+	// and that the publisher's post-publish hook increments
+	// when a publish supersedes a prior (i.e. the publish
+	// was enqueued by the mgmt.snapshot verb). Without this
+	// hook the snapshot_published_total counter the §6.2.1
+	// observability contract requires would never advance.
+	snapMetrics := snapshot.NewMetrics()
 	publisher := embedding.NewPublisher(db, embedder, qdrant,
-		embedding.WithLogger(logger))
+		embedding.WithLogger(logger),
+		embedding.WithPostPublishHook(func(ev embedding.PublishedEvent) {
+			// Attribute publishes to snapshot ONLY when
+			// the queued event carried a
+			// supersedes_publish_id (i.e. the publish was
+			// enqueued by the snapshot verb, not by a
+			// normal ingest path).
+			if ev.SupersededPublishID == "" {
+				return
+			}
+			snapMetrics.IncPublished(1)
+		}),
+	)
 
 	gw := graphwriter.New(db, logger)
 
@@ -177,6 +199,14 @@ func main() {
 			slog.Duration("every", cfg.FlushEvery))
 	}
 
+	// Iter-2 fix #4: start the /metrics + /healthz HTTP
+	// listener so Prometheus can scrape this binary's
+	// snapshot_published_total contribution. The listener
+	// runs in a background goroutine so a metrics-port
+	// bind failure does not block the publish/ingest
+	// worker — operators get a startup log line either way.
+	startMetricsServer(ctx, cfg.MetricsListenAddr, snapMetrics, logger)
+
 	logger.Info("repoindexer.start",
 		slog.String("worker_id", cfg.WorkerID),
 		slog.Duration("poll_every", cfg.PollEvery),
@@ -202,16 +232,24 @@ type config struct {
 	PollEvery         time.Duration
 	FlushEvery        time.Duration
 	AllowStubEmbedder bool
+	// MetricsListenAddr is the host:port the /metrics +
+	// /healthz HTTP listener binds to. Empty disables the
+	// listener (operators running a single-process dev
+	// deploy may not want a second open port). Default
+	// `:9101` chosen to not collide with the typical
+	// mgmt-api `:8080`.
+	MetricsListenAddr string
 }
 
 func loadConfig() (config, error) {
 	c := config{
-		PGURL:        os.Getenv("AGENT_MEMORY_PG_URL"),
-		QdrantURL:    os.Getenv("AGENT_MEMORY_QDRANT_URL"),
-		QdrantAPIKey: os.Getenv("AGENT_MEMORY_QDRANT_API_KEY"),
-		WorkerID:     os.Getenv("AGENT_MEMORY_WORKER_ID"),
-		PollEvery:    1 * time.Second,
-		FlushEvery:   30 * time.Second,
+		PGURL:             os.Getenv("AGENT_MEMORY_PG_URL"),
+		QdrantURL:         os.Getenv("AGENT_MEMORY_QDRANT_URL"),
+		QdrantAPIKey:      os.Getenv("AGENT_MEMORY_QDRANT_API_KEY"),
+		WorkerID:          os.Getenv("AGENT_MEMORY_WORKER_ID"),
+		PollEvery:         1 * time.Second,
+		FlushEvery:        30 * time.Second,
+		MetricsListenAddr: ":9101",
 	}
 	if c.PGURL == "" {
 		return c, errors.New("AGENT_MEMORY_PG_URL is required")
@@ -240,11 +278,89 @@ func loadConfig() (config, error) {
 		}
 		c.AllowStubEmbedder = b
 	}
+	if v, ok := os.LookupEnv("AGENT_MEMORY_METRICS_LISTEN_ADDR"); ok {
+		// Explicit empty string disables the listener.
+		c.MetricsListenAddr = v
+	}
 	if c.WorkerID == "" {
 		host, _ := os.Hostname()
 		c.WorkerID = fmt.Sprintf("repoindexer-%s-%d", host, os.Getpid())
 	}
 	return c, nil
+}
+
+// startMetricsServer spins up an HTTP listener on `addr`
+// exposing /metrics (Prometheus text format) and /healthz.
+// Iter-2 fix #4: this is the binary surface for the
+// `snapshot_published_total` counter — without it a Prometheus
+// scrape from the §6.2.1 observability contract has nothing
+// to read. The listener runs in a background goroutine; a
+// non-empty `addr` that fails to bind is logged but does not
+// abort the binary because the publish worker is the primary
+// duty.
+func startMetricsServer(ctx context.Context, addr string, m *snapshot.Metrics, logger *slog.Logger) {
+	if addr == "" {
+		logger.Info("repoindexer.metrics.disabled",
+			slog.String("reason", "AGENT_MEMORY_METRICS_LISTEN_ADDR=\"\" (explicit disable)"))
+		return
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		writeSnapshotMetrics(w, m)
+	})
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		logger.Info("repoindexer.metrics.listen",
+			slog.String("addr", addr))
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Warn("repoindexer.metrics.serve_failed",
+				slog.String("addr", addr),
+				slog.String("error", err.Error()))
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+}
+
+// snapshotMetricsOrder pins the line order of the /metrics
+// exposition; stable order keeps scrape diffs human-readable.
+var snapshotMetricsOrder = []string{
+	snapshot.MetricSnapshotPendingTotal,
+	snapshot.MetricSnapshotPublishedTotal,
+}
+
+var snapshotMetricsHelp = map[string]string{
+	snapshot.MetricSnapshotPendingTotal:   "Cumulative snapshot targets enqueued by the mgmt.snapshot verb. Always 0 in the repoindexer binary (the enqueue happens in mgmt-api); reported here for scrape-symmetry.",
+	snapshot.MetricSnapshotPublishedTotal: "Cumulative snapshot supersedes that completed publish in this binary. Incremented by the embedding-publisher post-publish hook only when the queued event carried supersedes_publish_id.",
+}
+
+func writeSnapshotMetrics(w io.Writer, m *snapshot.Metrics) {
+	if m == nil {
+		m = snapshot.NewMetrics()
+	}
+	snap := m.Snapshot()
+	for _, name := range snapshotMetricsOrder {
+		help := snapshotMetricsHelp[name]
+		if help == "" {
+			help = "(no description)"
+		}
+		fmt.Fprintf(w, "# HELP %s %s\n", name, help)
+		fmt.Fprintf(w, "# TYPE %s counter\n", name)
+		fmt.Fprintf(w, "%s %d\n", name, snap[name])
+	}
 }
 
 // selectEmbedder picks the embedding-model client based on

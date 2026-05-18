@@ -203,6 +203,13 @@ func expectRegisterIdempotent(mock sqlmock.Sqlmock, repoID, repoURL, branch, hea
 // expectIngestDeltaNew queues the four-statement enqueue path
 // for the FIRST identical ingest_delta call.
 func expectIngestDeltaNew(mock sqlmock.Sqlmock, repoID, fromSHA, toSHA, jobID, jobState string) {
+	// loadRepo is called BEFORE the enqueue tx so a missing
+	// repo returns 404 with no transaction leakage (see
+	// handler.go handleIngestDelta).
+	mock.ExpectQuery(`SELECT url, default_branch, current_head_sha\s+FROM repo`).
+		WithArgs(repoID).
+		WillReturnRows(sqlmock.NewRows([]string{"url", "default_branch", "current_head_sha"}).
+			AddRow(testRepoURL, testBranch, testHeadSHA))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO ingest_jobs \(repo_id, mode, from_sha, to_sha\)`).
 		WithArgs(repoID, fromSHA, toSHA).
@@ -218,6 +225,12 @@ func expectIngestDeltaNew(mock sqlmock.Sqlmock, repoID, fromSHA, toSHA, jobID, j
 // the handler SELECTs the existing job, and the tx commits
 // WITHOUT a new repo_event row.
 func expectIngestDeltaDeduped(mock sqlmock.Sqlmock, repoID, fromSHA, toSHA, jobID, jobState string) {
+	// loadRepo runs on every call -- same precondition as
+	// expectIngestDeltaNew above.
+	mock.ExpectQuery(`SELECT url, default_branch, current_head_sha\s+FROM repo`).
+		WithArgs(repoID).
+		WillReturnRows(sqlmock.NewRows([]string{"url", "default_branch", "current_head_sha"}).
+			AddRow(testRepoURL, testBranch, testHeadSHA))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO ingest_jobs \(repo_id, mode, from_sha, to_sha\)`).
 		WithArgs(repoID, fromSHA, toSHA).
@@ -711,6 +724,14 @@ func TestIngestDelta_foreignKeyViolation_returns404(t *testing.T) {
 	h, mock, cleanup := newTestHandler(t)
 	defer cleanup()
 
+	// loadRepo runs first; the repo *exists* (so the load
+	// succeeds), but the INSERT then races with a deletion
+	// and trips the FK. handler.go translates that race to
+	// 404 via the post-INSERT FK check.
+	mock.ExpectQuery(`SELECT url, default_branch, current_head_sha\s+FROM repo`).
+		WithArgs(testRepoID).
+		WillReturnRows(sqlmock.NewRows([]string{"url", "default_branch", "current_head_sha"}).
+			AddRow(testRepoURL, testBranch, testHeadSHA))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO ingest_jobs`).
 		WithArgs(testRepoID, testFromSHA, testToSHA).
@@ -731,6 +752,13 @@ func TestIngestDelta_dbOutage_returns500_noLeak(t *testing.T) {
 	h, mock, cleanup := newTestHandler(t)
 	defer cleanup()
 
+	// loadRepo runs first and succeeds; the OUTAGE shows up
+	// at the enqueue INSERT inside the tx. Body MUST NOT
+	// leak the driver-specific error string.
+	mock.ExpectQuery(`SELECT url, default_branch, current_head_sha\s+FROM repo`).
+		WithArgs(testRepoID).
+		WillReturnRows(sqlmock.NewRows([]string{"url", "default_branch", "current_head_sha"}).
+			AddRow(testRepoURL, testBranch, testHeadSHA))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO ingest_jobs`).
 		WithArgs(testRepoID, testFromSHA, testToSHA).
@@ -754,15 +782,20 @@ func TestRoute_wrongMethod_returns405(t *testing.T) {
 	h, _, cleanup := newTestHandler(t)
 	defer cleanup()
 
+	// Stage 7.5 added GET as a valid method (operator read
+	// endpoints), so the 405 contract is now "anything that
+	// isn't GET or POST". DELETE is a stable choice — there
+	// is no Stage on the roadmap that surfaces DELETE on the
+	// mgmt API.
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, RouteRepos, nil)
+	r := httptest.NewRequest(http.MethodDelete, RouteRepos, nil)
 	r.Header.Set(AuthorizationHeader, "Bearer "+testToken)
 	h.ServeHTTP(w, r)
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405. body=%q", w.Code, w.Body.String())
 	}
-	if got := w.Header().Get("Allow"); got != http.MethodPost {
-		t.Errorf("Allow = %q, want POST", got)
+	if got := w.Header().Get("Allow"); got != "GET, POST" {
+		t.Errorf("Allow = %q, want %q", got, "GET, POST")
 	}
 }
 

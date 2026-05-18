@@ -181,8 +181,14 @@ func main() {
 	})
 
 	mux := http.NewServeMux()
-	mux.Handle("/v1/repos", handler)
-	mux.Handle("/v1/repos/", handler)
+	// Single `/v1/` registration: the mgmtapi handler owns
+	// all method dispatch and per-verb routing under v1 (POST
+	// writes from Stage 7.1; GET reads from Stage 7.5). This
+	// keeps 404/405 envelopes uniform — any unknown path under
+	// /v1/ flows through the same JSON envelope as a known
+	// verb that received the wrong method, rather than falling
+	// back to net/http's default text/plain 404.
+	mux.Handle("/v1/", handler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))

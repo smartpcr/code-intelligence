@@ -180,17 +180,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // route dispatches an authenticated request to the right verb
 // handler. Method gating + path parsing live here so every
 // verb shares the same 404 / 405 envelopes.
+//
+// Method dispatch:
+//   - GET → Stage 7.5 read verbs (see read.go / routeRead).
+//   - POST → Stage 7.1 write verbs (register / ingest /
+//     ingest_delta).
+//   - Anything else → 405 with `Allow: GET, POST`.
 func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
+	switch r.Method {
+	case http.MethodGet:
+		h.routeRead(w, r)
+		return
+	case http.MethodPost:
+		h.routeWrite(w, r)
+		return
+	default:
+		w.Header().Set("Allow", "GET, POST")
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed",
-			fmt.Sprintf("method %s not allowed; use POST", r.Method))
+			fmt.Sprintf("method %s not allowed; use GET or POST", r.Method))
 		return
 	}
+}
 
-	// /v1/repos               -> register
-	// /v1/repos/{id}/ingest   -> ingest
-	// /v1/repos/{id}/ingest_delta -> ingest_delta
+// routeWrite dispatches an authenticated POST request to the
+// Stage 7.1 write verbs. The repos prefix splits into the
+// register surface (no trailing path) and the per-repo
+// ingest verbs (`/{id}/ingest` and `/{id}/ingest_delta`).
+func (h *Handler) routeWrite(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == RouteRepos, r.URL.Path == RouteRepos+"/":
 		h.handleRegister(w, r)

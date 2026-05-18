@@ -236,7 +236,7 @@ func main() {
 	})
 
 	// Stage 8.1 — Degraded-mode contract wiring (architecture
-	// §6.3 / §8.2 closed set / C22).  All five agent verbs
+	// §6.3 / §8.2 closed set / C22).  All four agent verbs
 	// (observe, recall, expand, summarize) share a single
 	// per-verb degraded counter — the operator dashboard
 	// aggregates by the `verb` + `reason` labels.  The fault

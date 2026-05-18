@@ -188,9 +188,10 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// /v1/repos               -> register
-	// /v1/repos/{id}/ingest   -> ingest
-	// /v1/repos/{id}/ingest_delta -> ingest_delta
+	// /v1/repos                            -> register
+	// /v1/repos/{id}/ingest                -> ingest
+	// /v1/repos/{id}/ingest_delta          -> ingest_delta
+	// /v1/episodes/{parent_id}/feedback    -> feedback (Stage 7.3)
 	switch {
 	case r.URL.Path == RouteRepos, r.URL.Path == RouteRepos+"/":
 		h.handleRegister(w, r)
@@ -207,6 +208,21 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
 			h.handleIngest(w, r, repoID)
 		case ingestDeltaSuffix:
 			h.handleIngestDelta(w, r, repoID)
+		default:
+			writeJSONError(w, http.StatusNotFound, "not_found",
+				"unknown management API route")
+		}
+		return
+	case strings.HasPrefix(r.URL.Path, RouteEpisodes+"/"):
+		parentID, suffix, ok := extractEpisodeFeedbackPath(r.URL.Path)
+		if !ok {
+			writeJSONError(w, http.StatusNotFound, "not_found",
+				"unknown management API route")
+			return
+		}
+		switch suffix {
+		case feedbackSuffix:
+			h.handleFeedback(w, r, parentID)
 		default:
 			writeJSONError(w, http.StatusNotFound, "not_found",
 				"unknown management API route")

@@ -1,10 +1,11 @@
 // Command mgmt-api is the long-running process that serves
-// the Stage 7.1 Onboarding write verbs of the Management
-// Surface (architecture.md §3.8 / §6.2.1; tech-spec.md §8.5):
+// the Management Surface write verbs (architecture.md §3.8 /
+// §6.2.1; tech-spec.md §8.5):
 //
-//	POST /v1/repos                       mgmt.register
-//	POST /v1/repos/{repo_id}/ingest      mgmt.ingest
-//	POST /v1/repos/{repo_id}/ingest_delta mgmt.ingest_delta
+//	POST /v1/repos                                mgmt.register
+//	POST /v1/repos/{repo_id}/ingest               mgmt.ingest
+//	POST /v1/repos/{repo_id}/ingest_delta         mgmt.ingest_delta
+//	POST /v1/episodes/{parent_episode_id}/feedback mgmt.feedback (Stage 7.3)
 //
 // The handler itself lives in internal/mgmtapi; this binary is
 // the composition root that wires up PostgreSQL, TLS, the OIDC
@@ -183,6 +184,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/v1/repos", handler)
 	mux.Handle("/v1/repos/", handler)
+	mux.Handle("/v1/episodes/", handler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))

@@ -70,8 +70,10 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"time"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphreader"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Direction constants close the {callees, callers} set for
@@ -518,6 +520,21 @@ func WithExpandEdgeKinds(kinds []string) Option {
 // (the "envelope-but-empty" cold-start case pinned by
 // `TestExpand_degradedEnvelopeWhenSnapshotMissing`).
 func (s *Service) Expand(ctx context.Context, req ExpandRequest) (resp ExpandResponse, err error) {
+	// Stage 8.3 — record `agent_expand_duration_seconds`
+	// for every call (happy path AND degraded). The defer
+	// fires AFTER the Stage 8.1 contract wrap below.
+	expandStart := time.Now()
+	defer func() { recordLatency(s.expandLatency, expandStart) }()
+
+	// Stage 8.3 step 2 — open the `agent.expand` operational
+	// span. Returned ctx propagates to the graph_store and
+	// snapshot calls below so their child spans (when those
+	// dependencies are themselves traced) hang under the
+	// verb span.
+	var span trace.Span
+	ctx, span = startVerbSpan(ctx, s.tracer, VerbExpand, req.RepoID)
+	defer func() { endVerbSpan(span, err, resp.DegradedReason) }()
+
 	// Stage 8.1 — named returns + deferred wrap funnel every
 	// successful exit through the closed-set contract helper.
 	// On error we skip the helper (no metric / no overlay on

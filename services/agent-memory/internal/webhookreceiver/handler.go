@@ -14,6 +14,11 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // DefaultMaxBodyBytes caps the inbound webhook body so a
@@ -141,6 +146,10 @@ type Options struct {
 	// (defaults to time.Now) and tests that need a frozen log
 	// timestamp inject one.
 	Clock Clock
+	// Tracer wraps each ServeHTTP call in a
+	// `webhookreceiver.receive` OTel span (Stage 8.3 step 2).
+	// Nil is tolerated and falls back to a noop tracer.
+	Tracer trace.Tracer
 }
 
 // Handler is the HTTP handler that authenticates and enqueues
@@ -156,6 +165,8 @@ type Handler struct {
 	signatureHeader string
 	maxBodyBytes    int64
 	clock           Clock
+	tracer          trace.Tracer
+	metrics         *metricsLedger
 }
 
 // NewHandler builds a Handler over `db`. Panics on a nil
@@ -173,6 +184,8 @@ func NewHandler(db *sql.DB, opts Options) *Handler {
 		signatureHeader: opts.SignatureHeader,
 		maxBodyBytes:    opts.MaxBodyBytes,
 		clock:           opts.Clock,
+		tracer:          opts.Tracer,
+		metrics:         newMetricsLedger(),
 	}
 	if h.logger == nil {
 		h.logger = slog.Default()
@@ -185,6 +198,9 @@ func NewHandler(db *sql.DB, opts Options) *Handler {
 	}
 	if h.clock == nil {
 		h.clock = time.Now
+	}
+	if h.tracer == nil {
+		h.tracer = noop.NewTracerProvider().Tracer("webhookreceiver.noop")
 	}
 	return h
 }
@@ -206,9 +222,51 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		h.metrics.observe(StatusRejectedMethod, "")
 		return
 	}
-	h.handle(w, r)
+	// Stage 8.3 step 2 -- wrap the request in a
+	// `webhookreceiver.receive` span. The span attaches the
+	// repo_id (low-cardinality) and the response status code
+	// so an operator can correlate webhook → ingest_jobs →
+	// repoindexer → mgmt-api in a single trace.
+	repoID, _ := extractRepoID(r.URL.Path)
+	ctx, span := h.tracer.Start(r.Context(), "webhookreceiver.receive",
+		trace.WithSpanKind(trace.SpanKindServer),
+		trace.WithAttributes(
+			attribute.String("repo_id", repoID),
+			attribute.String("http.method", r.Method),
+		),
+	)
+	defer span.End()
+	sw := &statusCaptureWriter{ResponseWriter: w}
+	h.handle(sw, r.WithContext(ctx))
+	span.SetAttributes(attribute.Int("http.status_code", sw.status))
+	if sw.status >= 500 {
+		span.SetStatus(codes.Error, fmt.Sprintf("HTTP %d", sw.status))
+	}
+}
+
+// statusCaptureWriter is a thin wrapper around
+// http.ResponseWriter that captures the status code passed to
+// WriteHeader so the receive-span can attach it. The default
+// status (200) is assumed when no explicit WriteHeader is
+// called, matching net/http's own behaviour.
+type statusCaptureWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusCaptureWriter) WriteHeader(status int) {
+	s.status = status
+	s.ResponseWriter.WriteHeader(status)
+}
+
+func (s *statusCaptureWriter) Write(b []byte) (int, error) {
+	if s.status == 0 {
+		s.status = http.StatusOK
+	}
+	return s.ResponseWriter.Write(b)
 }
 
 // handle is the unauthenticated request handler. It runs the
@@ -227,6 +285,7 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request) {
 		// repo" from "wrong signature". The 401 is a uniform
 		// "unauthorized" surface.
 		h.reject(w, "")
+		h.metrics.observe(StatusRejectedRepo, "")
 		return
 	}
 
@@ -252,6 +311,7 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request) {
 			)
 			http.Error(w, "request body too large",
 				http.StatusRequestEntityTooLarge)
+			h.metrics.observe(StatusRejectedBody, "")
 			return
 		}
 		h.logger.Warn("webhookreceiver.body_read_failed",
@@ -259,6 +319,7 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request) {
 			slog.String("error", err.Error()),
 		)
 		http.Error(w, "bad request", http.StatusBadRequest)
+		h.metrics.observe(StatusRejectedBody, "")
 		return
 	}
 
@@ -274,6 +335,7 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request) {
 			slog.String("repo_id", repoID),
 		)
 		h.reject(w, repoID)
+		h.metrics.observe(StatusRejectedSig, "")
 		return
 	}
 
@@ -285,6 +347,7 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request) {
 			slog.String("error", err.Error()),
 		)
 		http.Error(w, "bad request", http.StatusBadRequest)
+		h.metrics.observe(StatusRejectedPayload, "")
 		return
 	}
 	if err := p.validate(); err != nil {
@@ -294,6 +357,24 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request) {
 			slog.String("error", err.Error()),
 		)
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		// Distinguish "wrong kind" (likely client
+		// misconfiguration) from "malformed body" so the
+		// dashboard's per-status panel shows the right mix.
+		//
+		// Iter-5 evaluator finding #1 fix: the rejected_kind
+		// path used to pass `p.Kind` straight through, which
+		// is attacker-controlled at this point (the value
+		// failed validation, by definition). We now pass ""
+		// at the call site so the metric stays bounded even
+		// without the structural guard in metrics.go::observe.
+		// Belt-and-suspenders: the metric layer ALSO coerces
+		// out-of-band kind values, so future call sites that
+		// forget can not regress the cardinality cap.
+		if _, kindOK := allowedKinds[p.Kind]; !kindOK {
+			h.metrics.observe(StatusRejectedKind, "")
+		} else {
+			h.metrics.observe(StatusRejectedPayload, p.Kind)
+		}
 		return
 	}
 
@@ -313,6 +394,7 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request) {
 			slog.String("error", err.Error()),
 		)
 		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.metrics.observe(StatusErrorDB, p.Kind)
 		return
 	}
 
@@ -329,8 +411,10 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request) {
 			slog.String("repo_id", repoID),
 			slog.String("error", err.Error()),
 		)
+		h.metrics.observe(StatusErrorInternal, p.Kind)
 		return
 	}
+	h.metrics.observe(StatusAccepted, p.Kind)
 	h.logger.Info("webhookreceiver.enqueued",
 		slog.String("op", "webhook"),
 		slog.String("repo_id", repoID),

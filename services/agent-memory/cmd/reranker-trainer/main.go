@@ -137,6 +137,7 @@ import (
 
 	_ "github.com/lib/pq"
 
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/obs"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/rerankertrainer"
 )
 
@@ -153,6 +154,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Stage 8.3 step 2 — OTel trace export.
+	tracerSetup, err := obs.SetupTracer(ctx, obs.ServiceNameRerankerTrainer, logger)
+	if err != nil {
+		logger.Error("reranker-trainer.otel.setup_failed", slog.String("error", err.Error()))
+		os.Exit(2)
+	}
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tracerSetup.Shutdown(shutCtx)
+	}()
+	logger.Info("reranker-trainer.otel.ready",
+		slog.Bool("exporting", tracerSetup.Exporting),
+		slog.String("endpoint", tracerSetup.EndpointResolved))
 
 	db, err := openPG(ctx, cfg, logger)
 	if err != nil {
@@ -181,6 +197,10 @@ func main() {
 		logger.Error("reranker-trainer.service", slog.String("error", err.Error()))
 		os.Exit(2)
 	}
+	// Stage 8.3 step 2 -- wire the OTel tracer so each Tick
+	// produces a `rerankertrainer.tick` span (previously the
+	// SDK was set up but never started a span).
+	svc.ApplyOptions(rerankertrainer.WithTracer(tracerSetup.Tracer))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -624,4 +644,17 @@ func writeMetrics(w http.ResponseWriter, m *rerankertrainer.Metrics) {
 		lastUnix = last.Unix()
 	}
 	_, _ = fmt.Fprintf(w, "%s %d\n", rerankertrainer.MetricRerankerLastTrainedAtSeconds, lastUnix)
+
+	// Stage 8.3 step 1 alias: implementation-plan.md lists
+	// the freshness gauge as the suffix-less spelling
+	// `reranker_last_trained_at`. We emit it with the SAME
+	// sample value (and AS A GAUGE with its own HELP/TYPE) so
+	// dashboards / alert rules written against the Stage 8.3
+	// brief resolve, and the established `_seconds` name the
+	// §9.10 staleness alert references keeps working.
+	_, _ = fmt.Fprintf(w, "# HELP %s Stage 8.3 alias of %s; identical sample, suffix-less name.\n",
+		rerankertrainer.AltMetricRerankerLastTrainedAt,
+		rerankertrainer.MetricRerankerLastTrainedAtSeconds)
+	_, _ = fmt.Fprintf(w, "# TYPE %s gauge\n", rerankertrainer.AltMetricRerankerLastTrainedAt)
+	_, _ = fmt.Fprintf(w, "%s %d\n", rerankertrainer.AltMetricRerankerLastTrainedAt, lastUnix)
 }

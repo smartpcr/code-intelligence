@@ -149,6 +149,11 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // RouteSpans is the URL path the Stage 7.2 verb registers on.
@@ -687,8 +692,67 @@ func resolveIngestSpansRepoID(r *http.Request, req *SpanIngestRequest) (string, 
 func (h *Handler) handleIngestSpans(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
+	// Stage 8.3 — `mgmt_ingest_spans_batch_duration_seconds`
+	// histogram. Observed once per request regardless of
+	// branch (validation failure, forwarder outage, accepted
+	// batch) because the §8.3 SLO is over wall-clock latency
+	// of the verb, not just the happy path.
+	ingestStart := time.Now()
+	defer func() {
+		if h.ingestSpansLatency != nil {
+			h.ingestSpansLatency(time.Since(ingestStart).Seconds())
+		}
+	}()
+
+	// Stage 8.3 step 2 (iter-2 evaluator fix #1) — open the
+	// `mgmt.ingest_spans` operational span. The span name
+	// matches the §8.3 verb-naming convention so the
+	// dashboard's RPC panel can group recall/observe/expand/
+	// summarize/ingest_spans alongside each other. We
+	// stamp the span's repo_id attribute after the request
+	// body parses (the route doesn't know it upfront).
+	var ingestSpan trace.Span
+	ctx, ingestSpan = h.tracer.Start(ctx, "mgmt.ingest_spans", trace.WithAttributes(
+		attribute.String("agent_memory.verb", "mgmt.ingest_spans"),
+	))
+	r = r.WithContext(ctx)
+	var ingestStatus string
+	var ingestErr error
+	var ingestRepoID string
+	var ingestBatchSize int
+	defer func() {
+		if ingestStatus != "" {
+			ingestSpan.SetAttributes(attribute.String("agent_memory.ingest_status", ingestStatus))
+		}
+		if ingestRepoID != "" {
+			ingestSpan.SetAttributes(attribute.String("agent_memory.repo_id", ingestRepoID))
+		}
+		if ingestBatchSize > 0 {
+			ingestSpan.SetAttributes(attribute.Int("agent_memory.ingest_batch_size", ingestBatchSize))
+		}
+		if ingestErr != nil {
+			ingestSpan.RecordError(ingestErr)
+			ingestSpan.SetStatus(codes.Error, ingestStatus)
+		}
+		ingestSpan.End()
+	}()
+
+	// recordStatus tracks the per-request status for both
+	// the span attribute and the existing `spansMetrics`
+	// counter. Every error site that previously called
+	// `h.spansMetrics.Inc(status, repoID)` now routes through
+	// here so the span status mirrors the counter without
+	// duplicating the assignment.
+	recordStatus := func(status, repoID string) {
+		ingestStatus = status
+		if repoID != "" && repoID != metricUnknownRepo {
+			ingestRepoID = repoID
+		}
+		h.spansMetrics.Inc(status, repoID)
+	}
+
 	if h.spanForwarder == nil {
-		h.spansMetrics.Inc(IngestSpansStatusForwarderUnset, metricUnknownRepo)
+		recordStatus(IngestSpansStatusForwarderUnset, metricUnknownRepo)
 		h.logger.Error("mgmtapi.ingest_spans.forwarder_unset",
 			slog.String("op", "ingest_spans"),
 			slog.String("path", r.URL.Path),
@@ -706,19 +770,19 @@ func (h *Handler) handleIngestSpans(w http.ResponseWriter, r *http.Request) {
 	// decodeJSONBody so the cap stays route-local.
 	var req SpanIngestRequest
 	if !h.decodeJSONBodyWithCap(w, r, &req, IngestSpansMaxBodyBytes) {
-		h.spansMetrics.Inc(IngestSpansStatusValidationError, metricUnknownRepo)
+		recordStatus(IngestSpansStatusValidationError, metricUnknownRepo)
 		return
 	}
 
 	repoID, repoCode, repoMsg, ok := resolveIngestSpansRepoID(r, &req)
 	if !ok {
-		h.spansMetrics.Inc(IngestSpansStatusValidationError, metricUnknownRepo)
+		recordStatus(IngestSpansStatusValidationError, metricUnknownRepo)
 		writeJSONError(w, http.StatusBadRequest, repoCode, repoMsg)
 		return
 	}
 
 	if len(req.ResourceSpans) == 0 {
-		h.spansMetrics.Inc(IngestSpansStatusValidationError, repoID)
+		recordStatus(IngestSpansStatusValidationError, repoID)
 		writeJSONError(w, http.StatusBadRequest, "invalid_request",
 			"resourceSpans: at least one ResourceSpans entry required")
 		return
@@ -733,17 +797,18 @@ func (h *Handler) handleIngestSpans(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if total == 0 {
-		h.spansMetrics.Inc(IngestSpansStatusValidationError, repoID)
+		recordStatus(IngestSpansStatusValidationError, repoID)
 		writeJSONError(w, http.StatusBadRequest, "invalid_request",
 			"spans: at least one span required")
 		return
 	}
 	if total > IngestSpansMaxBatch {
-		h.spansMetrics.Inc(IngestSpansStatusValidationError, repoID)
+		recordStatus(IngestSpansStatusValidationError, repoID)
 		writeJSONError(w, http.StatusBadRequest, "batch_too_large",
 			fmt.Sprintf("spans: at most %d spans per batch (tech-spec §8.3)", IngestSpansMaxBatch))
 		return
 	}
+	ingestBatchSize = total
 
 	// Cheap validation pass first so malformed payloads do not
 	// pay the DB-existence-check round trip. Walk every span
@@ -761,7 +826,7 @@ func (h *Handler) handleIngestSpans(w http.ResponseWriter, r *http.Request) {
 					if code == "forbidden_field" {
 						status = IngestSpansStatusForbiddenField
 					}
-					h.spansMetrics.Inc(status, repoID)
+					recordStatus(status, repoID)
 					writeJSONError(w, http.StatusBadRequest, code, msg)
 					return
 				}
@@ -774,12 +839,13 @@ func (h *Handler) handleIngestSpans(w http.ResponseWriter, r *http.Request) {
 	// Repo existence check. Mirrors the handleIngest pattern.
 	if _, _, _, err := h.loadRepo(ctx, repoID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			h.spansMetrics.Inc(IngestSpansStatusRepoNotFound, repoID)
+			recordStatus(IngestSpansStatusRepoNotFound, repoID)
 			writeJSONError(w, http.StatusNotFound, "repo_not_found",
 				"no repo with the supplied repo_id")
 			return
 		}
-		h.spansMetrics.Inc(IngestSpansStatusForwarderError, repoID)
+		ingestErr = err
+		recordStatus(IngestSpansStatusForwarderError, repoID)
 		h.logger.Error("mgmtapi.ingest_spans.load_repo_failed",
 			slog.String("op", "ingest_spans"),
 			slog.String("repo_id", repoID),
@@ -793,7 +859,7 @@ func (h *Handler) handleIngestSpans(w http.ResponseWriter, r *http.Request) {
 	if err := h.spanForwarder.ForwardSpans(ctx, repoID, forwarded); err != nil {
 		switch {
 		case errors.Is(err, ErrSpanIngestorBackpressure):
-			h.spansMetrics.Inc(IngestSpansStatusBackpressure, repoID)
+			recordStatus(IngestSpansStatusBackpressure, repoID)
 			w.Header().Set("Retry-After", strconv.Itoa(ingestSpansRetryAfterSeconds))
 			writeJSONError(w, http.StatusServiceUnavailable,
 				SpanIngestorBackpressureReason,
@@ -805,7 +871,8 @@ func (h *Handler) handleIngestSpans(w http.ResponseWriter, r *http.Request) {
 			)
 			return
 		default:
-			h.spansMetrics.Inc(IngestSpansStatusForwarderError, repoID)
+			ingestErr = err
+			recordStatus(IngestSpansStatusForwarderError, repoID)
 			h.logger.Error("mgmtapi.ingest_spans.forwarder_failed",
 				slog.String("op", "ingest_spans"),
 				slog.String("repo_id", repoID),
@@ -818,7 +885,7 @@ func (h *Handler) handleIngestSpans(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	h.spansMetrics.Inc(IngestSpansStatusAccepted, repoID)
+	recordStatus(IngestSpansStatusAccepted, repoID)
 	subject, _ := SubjectFromContext(ctx)
 	h.logger.Info("mgmtapi.ingest_spans.ok",
 		slog.String("op", "ingest_spans"),

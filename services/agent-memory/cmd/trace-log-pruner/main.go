@@ -70,6 +70,7 @@ import (
 
 	_ "github.com/lib/pq"
 
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/obs"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/tracelogpruner"
 )
 
@@ -86,6 +87,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Stage 8.3 step 2 — OTel trace export.
+	tracerSetup, err := obs.SetupTracer(ctx, obs.ServiceNameTraceLogPruner, logger)
+	if err != nil {
+		logger.Error("trace-log-pruner.otel.setup_failed", slog.String("error", err.Error()))
+		os.Exit(2)
+	}
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tracerSetup.Shutdown(shutCtx)
+	}()
+	logger.Info("trace-log-pruner.otel.ready",
+		slog.Bool("exporting", tracerSetup.Exporting),
+		slog.String("endpoint", tracerSetup.EndpointResolved))
 
 	db, err := openPG(ctx, cfg, logger)
 	if err != nil {
@@ -105,6 +121,9 @@ func main() {
 		logger.Error("trace-log-pruner.service", slog.String("error", err.Error()))
 		os.Exit(2)
 	}
+	// Stage 8.3 step 2 -- wire the OTel tracer so each
+	// Prune run produces a `tracelogpruner.prune` span.
+	svc.ApplyOptions(tracelogpruner.WithTracer(tracerSetup.Tracer))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {

@@ -85,6 +85,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from observability import SidecarMetrics, install_observability, setup_tracer
+
 logger = logging.getLogger("reranker-sidecar")
 logging.basicConfig(level=os.environ.get("RERANKER_SIDECAR_LOG_LEVEL", "INFO"))
 
@@ -706,6 +708,24 @@ def make_app(config: SidecarConfig) -> FastAPI:
     app = FastAPI(title="reranker-sidecar", version="0.1.0")
     config.artifact_dir.mkdir(parents=True, exist_ok=True)
     store = ModelStore(config.model_name, config.artifact_dir)
+
+    # Stage 8.3 -- Prometheus /metrics + OTel trace export.
+    # setup_tracer falls back to a noop tracer when the
+    # OTel env vars are unset, matching the Go binaries'
+    # internal/obs/tracer.go behaviour. install_observability
+    # registers both the /metrics endpoint AND the FastAPI
+    # middleware that opens a span per inbound request and
+    # bumps the per-route counter + duration histogram.
+    metrics = SidecarMetrics()
+    tracer, _otel_shutdown = setup_tracer("reranker-sidecar")
+    install_observability(app, metrics, tracer)
+
+    @app.on_event("shutdown")
+    def _shutdown_obs() -> None:
+        try:
+            _otel_shutdown()
+        except Exception:  # pragma: no cover -- best-effort
+            logger.exception("obs.shutdown_failed")
 
     @app.on_event("startup")
     def _startup() -> None:

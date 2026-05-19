@@ -89,6 +89,8 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 // VerbSummarize is the §6.3 verb identifier the Stage 8.1
@@ -643,6 +645,20 @@ func WithSummariserTimeout(d time.Duration) Option {
 // freshness lookup — surfaces as a degraded envelope with
 // `degraded=true` so the agent loop stays alive.
 func (s *Service) Summarize(ctx context.Context, req SummarizeRequest) (resp SummarizeResponse, err error) {
+	// Stage 8.3 — record `agent_summarize_duration_seconds`
+	// for every call (happy path AND degraded). The defer
+	// fires AFTER the Stage 8.1 contract wrap below.
+	summarizeStart := time.Now()
+	defer func() { recordLatency(s.summarizeLatency, summarizeStart) }()
+
+	// Stage 8.3 step 2 — open the `agent.summarize` span and
+	// thread the returned context into every downstream call
+	// (graph_store snapshot, summariser POST, context-log
+	// append). Recorded with the final caller-visible status.
+	var span trace.Span
+	ctx, span = startVerbSpan(ctx, s.tracer, VerbSummarize, req.RepoID)
+	defer func() { endVerbSpan(span, err, resp.DegradedReason) }()
+
 	// Stage 8.1 — named returns + deferred wrap funnel every
 	// successful exit through the closed-set contract helper.
 	// On error we skip the helper (no metric / no overlay on

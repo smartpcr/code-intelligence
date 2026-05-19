@@ -78,6 +78,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/obs"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/spaningestor"
 )
 
@@ -94,6 +95,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Stage 8.3 step 2 — OTel trace export.
+	tracerSetup, err := obs.SetupTracer(ctx, obs.ServiceNameSpanIngestor, logger)
+	if err != nil {
+		logger.Error("span-ingestor.otel.setup_failed", slog.String("error", err.Error()))
+		os.Exit(2)
+	}
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tracerSetup.Shutdown(shutCtx)
+	}()
+	logger.Info("span-ingestor.otel.ready",
+		slog.Bool("exporting", tracerSetup.Exporting),
+		slog.String("endpoint", tracerSetup.EndpointResolved))
 
 	db, err := openPG(ctx, cfg, logger)
 	if err != nil {
@@ -125,6 +141,13 @@ func main() {
 	// PGLookup implements both the Lookup AND SHAReader
 	// interfaces over the same *sql.DB pool.
 	ingestor.SetSHAReader(lookup)
+	// Stage 8.3 step 2 (iter-2 evaluator fix #1) — wire the
+	// OTel tracer onto the ingestor so processBatch opens a
+	// `spaningestor.process_batch` span per dequeued batch.
+	// Threads under the W3C trace-context the OTLP receiver
+	// extracted from the producer's span, so the resulting
+	// trace shows producer → mgmt.ingest_spans → ingestor.
+	ingestor.ApplyOptions(spaningestor.WithTracer(tracerSetup.Tracer))
 
 	receiver := spaningestor.NewOTLPReceiver(
 		ingestor,

@@ -88,6 +88,15 @@ const (
 	// `RerankerFreshnessSource.LatestRerankerTrainedAt`
 	// returning `(_, false, nil)`.
 	MetricRerankerLastTrainedAtSeconds = "reranker_last_trained_at_seconds"
+
+	// AltMetricRerankerLastTrainedAt is the suffix-less
+	// spelling implementation-plan.md Stage 8.3 lists for the
+	// freshness gauge. The exposition emits BOTH names with
+	// identical samples so the Stage 8.3 dashboard / alert
+	// rule resolves against either spelling without forcing a
+	// rename of the established `_seconds` series the §9.10
+	// freshness alert already references.
+	AltMetricRerankerLastTrainedAt = "reranker_last_trained_at"
 )
 
 // Metrics is the package's atomic-counter surface. All counters

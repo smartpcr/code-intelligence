@@ -171,6 +171,7 @@ import (
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/degraded"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/mgmtapi"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/obs"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/spaningestor"
 )
 
@@ -187,6 +188,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Stage 8.3 step 2 — OTel trace export.
+	tracerSetup, err := obs.SetupTracer(ctx, obs.ServiceNameMgmtAPI, logger)
+	if err != nil {
+		logger.Error("mgmt-api.otel.setup_failed", slog.String("error", err.Error()))
+		os.Exit(2)
+	}
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tracerSetup.Shutdown(shutCtx)
+	}()
+	logger.Info("mgmt-api.otel.ready",
+		slog.Bool("exporting", tracerSetup.Exporting),
+		slog.String("endpoint", tracerSetup.EndpointResolved))
 
 	db, err := openPG(ctx, cfg, logger)
 	if err != nil {
@@ -211,6 +227,15 @@ func main() {
 		os.Exit(2)
 	}
 	ingestSpansMetrics := mgmtapi.NewIngestSpansMetrics()
+
+	// Stage 8.3 step 1 — ingest-spans batch latency
+	// histogram. Bucket boundaries align with the §8.3 SLO
+	// line at p95≤2s, p99≤5s so `histogram_quantile()`
+	// interpolation lands ON the SLO threshold rather than
+	// in the middle of a coarse bucket.
+	ingestSpansLatency := obs.NewHistogram(obs.MetricMgmtIngestSpansBatchDurationSeconds,
+		"mgmt.ingest_spans request wall-clock latency (seconds) -- §8.3 SLO p95≤2s, p99≤5s.",
+		obs.DefaultDurationBuckets)
 	// Stage 8.1 — Degraded-mode contract wiring for the mgmt
 	// read path. A single per-verb counter is shared across
 	// every `mgmt.read.*` verb (architecture §6.3 row "mgmt.*
@@ -253,6 +278,12 @@ func main() {
 		IngestSpansMetrics:   ingestSpansMetrics,
 		DegradedHealthSource: mgmtHealthSource,
 		DegradedMetric:       mgmtDegradedCounter,
+		IngestSpansLatency:   ingestSpansLatency.Observe,
+		// Stage 8.3 step 2 (iter-2 evaluator fix #1) — wire
+		// the OTel tracer so handleIngestSpans opens a real
+		// `mgmt.ingest_spans` span. Without this the OTel
+		// SDK is set up but no production code starts spans.
+		Tracer: tracerSetup.Tracer,
 	})
 
 	mux := http.NewServeMux()
@@ -261,12 +292,22 @@ func main() {
 	mux.Handle("/v1/episodes", handler)
 	mux.Handle("/v1/episodes/", handler)
 	mux.Handle("/v1/spans", handler)
+	// Stage 8.3 step 1 (iter-2 evaluator fix #4) -- real
+	// partition_provision_lag emitter. The gauge reads
+	// pg_partman lazily on scrape and reports per-parent lag
+	// seconds; the dashboard panel and the alert rule both
+	// reference the same metric name, so wiring it here
+	// closes the loop the iter-1 stub-driven absent() alert
+	// left open.
+	partitionLag := mgmtapi.NewPartitionLagGauge(db, logger)
 	// Stage 8.1 step 4 — compose ingest-spans + degraded
 	// metrics into a single `/metrics` response. The
 	// Prometheus parser tolerates two HELP/TYPE blocks for
 	// different metric names appearing in any order.
-	mux.Handle("/metrics", mgmtapi.NewCombinedMetricsHandler(
-		ingestSpansMetrics, mgmtDegradedCounter))
+	mux.Handle("/metrics", mgmtapi.NewCombinedMetricsHandlerWithExtras(
+		ingestSpansMetrics, mgmtDegradedCounter,
+		ingestSpansLatency.Write,
+		partitionLag.Write))
 	// Stage 7.5 -- mgmt.read.* GET endpoints. Each is a distinct
 	// top-level path so the Go ServeMux does NOT collapse them into
 	// /v1/. For the path-id endpoints (/v1/context/{id} etc.) we

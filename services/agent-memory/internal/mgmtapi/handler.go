@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/degraded"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // MgmtHealthSource is the cross-process degraded-state source
@@ -189,6 +191,24 @@ type Options struct {
 	// gRPC service so the admin `mgmt.metrics` endpoint can
 	// surface a unified per-verb gauge.
 	DegradedMetric degraded.Metric
+
+	// IngestSpansLatency — Stage 8.3 latency observer for
+	// the `mgmt_ingest_spans_batch_duration_seconds`
+	// histogram. The handler invokes it once per
+	// `POST /v1/spans` request (happy path AND error path)
+	// with the elapsed wall-clock seconds. A nil observer
+	// is a no-op; production binaries wire an
+	// `*obs.Histogram.Observe` so the binary's `/metrics`
+	// body exposes the §8.3 histogram.
+	IngestSpansLatency func(seconds float64)
+
+	// Tracer — Stage 8.3 step 2 OpenTelemetry tracer the
+	// handler uses to wrap each `POST /v1/spans` request in
+	// a `mgmt.ingest_spans` span. Nil means a package noop
+	// tracer is used. Production wires the result of
+	// `obs.SetupTracer(...).Tracer` so the OTLP exporter
+	// picks the spans up.
+	Tracer trace.Tracer
 }
 
 // Handler is the Management API HTTP handler. Construct one
@@ -224,6 +244,19 @@ type Handler struct {
 	// degradedMetric — Stage 8.1 per-verb counter;
 	// nil-safe. See [Options.DegradedMetric].
 	degradedMetric degraded.Metric
+
+	// ingestSpansLatency — Stage 8.3 latency observer for
+	// `mgmt_ingest_spans_batch_duration_seconds`. Nil-safe;
+	// the spans handler invokes it inside a deferred block
+	// so both happy + error paths feed the histogram.
+	ingestSpansLatency func(seconds float64)
+
+	// tracer — Stage 8.3 step 2 OpenTelemetry tracer wired
+	// by `Options.Tracer`. The spans handler opens a
+	// `mgmt.ingest_spans` span per request. Never nil after
+	// `NewHandler` (the constructor substitutes a package
+	// noop tracer).
+	tracer trace.Tracer
 
 	// mux is the http.Handler the public ServeHTTP delegates
 	// to after auth. Constructed in NewHandler so route
@@ -267,6 +300,10 @@ func NewHandler(db *sql.DB, verifier TokenVerifier, resolver HeadResolver, opts 
 	if spansMetrics == nil {
 		spansMetrics = NewIngestSpansMetrics()
 	}
+	tracer := opts.Tracer
+	if tracer == nil {
+		tracer = noop.NewTracerProvider().Tracer("mgmtapi.noop")
+	}
 	h := &Handler{
 		db:                    db,
 		verifier:              verifier,
@@ -280,6 +317,8 @@ func NewHandler(db *sql.DB, verifier TokenVerifier, resolver HeadResolver, opts 
 		degradedHealthSource:  opts.DegradedHealthSource,
 		degradedFaultInjector: opts.DegradedFaultInjector,
 		degradedMetric:        opts.DegradedMetric,
+		ingestSpansLatency:    opts.IngestSpansLatency,
+		tracer:                tracer,
 	}
 	// Build the inner mux. The outer ServeHTTP runs auth
 	// FIRST so we wrap this once. Method gating happens

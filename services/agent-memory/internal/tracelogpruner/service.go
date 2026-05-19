@@ -8,6 +8,10 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/obs"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // boolPtr returns a pointer to b. Helper because Go does not
@@ -110,6 +114,33 @@ type Service struct {
 	// goroutine-unsafe edge.
 	keepTable bool
 	metrics   *Metrics
+
+	// tracer wraps each Prune in a `tracelogpruner.prune`
+	// OTel span (Stage 8.3 step 2). Nil falls back to a
+	// noop tracer at call time.
+	tracer trace.Tracer
+}
+
+// Option is the functional-options shape used to install
+// post-construction hooks like the OTel tracer.
+type Option func(*Service)
+
+// WithTracer installs the OTel tracer used to wrap each
+// Prune in a `tracelogpruner.prune` span.
+func WithTracer(tracer trace.Tracer) Option {
+	return func(s *Service) {
+		if tracer != nil {
+			s.tracer = tracer
+		}
+	}
+}
+
+// ApplyOptions installs post-construction hooks (the OTel
+// tracer for Stage 8.3).
+func (s *Service) ApplyOptions(opts ...Option) {
+	for _, opt := range opts {
+		opt(s)
+	}
 }
 
 // New constructs a Service. Panics on a nil *sql.DB (a
@@ -243,6 +274,22 @@ type PruneResult struct {
 // uniformly `int` per the upstream source
 // (sql/functions/drop_partition_time.sql).
 func (s *Service) Prune(ctx context.Context) (PruneResult, error) {
+	// Stage 8.3 step 2 -- wrap Prune body in
+	// `tracelogpruner.prune` OTel span.
+	var res PruneResult
+	err := obs.TickSpan(ctx, s.tracer, "tracelogpruner.prune", []attribute.KeyValue{
+		attribute.String("parent_table", s.cfg.ParentTable),
+		attribute.Float64("retention_seconds", s.cfg.Retention.Seconds()),
+		attribute.Bool("keep_table", s.keepTable),
+	}, func(ctx context.Context) error {
+		var innerErr error
+		res, innerErr = s.pruneOnce(ctx)
+		return innerErr
+	})
+	return res, err
+}
+
+func (s *Service) pruneOnce(ctx context.Context) (PruneResult, error) {
 	s.metrics.IncRuns()
 
 	res := PruneResult{}

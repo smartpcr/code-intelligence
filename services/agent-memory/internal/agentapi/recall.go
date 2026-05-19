@@ -46,6 +46,7 @@ import (
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/degraded"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/embedding"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // VerbRecall / VerbExpand are the §6.3 verb identifiers the
@@ -247,6 +248,29 @@ type Service struct {
 	// always trips, even when no test seam is wired.
 	degradedMetric degraded.Metric
 	faultInjector  degraded.FaultInjector
+
+	// Stage 8.3 — per-verb latency observers wired by
+	// `WithRecallLatencyObserver` / `WithObserveLatencyObserver`
+	// / `WithExpandLatencyObserver` /
+	// `WithSummarizeLatencyObserver`. See `latency.go` for the
+	// callback contract. Each verb dispatches its elapsed
+	// wall-clock seconds via `recordLatency` in a deferred
+	// block; the binary at `cmd/agent-api/main.go` binds these
+	// to `obs.Histogram.Observe` for Prometheus exposition. A
+	// nil observer is a no-op (the verbs call `observerOrNoop`).
+	recallLatency    LatencyObserver
+	observeLatency   LatencyObserver
+	expandLatency    LatencyObserver
+	summarizeLatency LatencyObserver
+
+	// Stage 8.3 step 2 (iter-2 evaluator fix #1) — per-verb
+	// OpenTelemetry tracer. Each verb opens a single span at
+	// its entry point and threads the returned context into
+	// every downstream call so the span tree captures the
+	// real operation. A nil tracer is a no-op; the per-verb
+	// wrapper helpers in `tracing.go` substitute a package
+	// noop tracer at call time.
+	tracer trace.Tracer
 }
 
 // Option configures a `Service`.
@@ -680,6 +704,24 @@ const maxK = 256
 // operator can distinguish "no vectors matched the query"
 // from "all matching vectors are still queued/failed".
 func (s *Service) Recall(ctx context.Context, req RecallRequest) (resp RecallResponse, err error) {
+	// Stage 8.3 — record `agent_recall_duration_seconds`
+	// for every call (happy path AND degraded), so the
+	// dashboard's p95/p99 panels include the slow tail
+	// caused by degraded fallbacks. The defer fires
+	// AFTER the Stage 8.1 contract wrap below.
+	recallStart := time.Now()
+	defer func() { recordLatency(s.recallLatency, recallStart) }()
+
+	// Stage 8.3 step 2 — open the `agent.recall` operational
+	// span and thread the returned context into every
+	// downstream call. The defer below records the terminal
+	// status (error vs. degraded-but-served) AFTER the named-
+	// return wrap fires, so the span captures the final
+	// caller-visible outcome.
+	var span trace.Span
+	ctx, span = startVerbSpan(ctx, s.tracer, VerbRecall, req.RepoID)
+	defer func() { endVerbSpan(span, err, resp.DegradedReason) }()
+
 	// Stage 8.1 — every successful exit of Recall funnels
 	// through the closed-set contract helper. Named returns
 	// + deferred wrap keep every existing `return resp, nil`

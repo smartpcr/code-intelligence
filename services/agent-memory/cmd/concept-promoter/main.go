@@ -155,6 +155,7 @@ import (
 	_ "github.com/lib/pq"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/embedding"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/obs"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/promoter"
 )
 
@@ -171,6 +172,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Stage 8.3 step 2 — OTel trace export.
+	tracerSetup, err := obs.SetupTracer(ctx, obs.ServiceNameConceptPromoter, logger)
+	if err != nil {
+		logger.Error("promoter.otel.setup_failed", slog.String("error", err.Error()))
+		os.Exit(2)
+	}
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tracerSetup.Shutdown(shutCtx)
+	}()
+	logger.Info("promoter.otel.ready",
+		slog.Bool("exporting", tracerSetup.Exporting),
+		slog.String("endpoint", tracerSetup.EndpointResolved))
 
 	db, err := openPG(ctx, cfg, logger)
 	if err != nil {
@@ -196,7 +212,7 @@ func main() {
 		TickTimeout:         cfg.TickTimeout,
 		CandidateBatchSize:  cfg.CandidateBatchSize,
 		RetryBatchSize:      cfg.RetryBatchSize,
-	}, logger)
+	}, logger, promoter.WithTracer(tracerSetup.Tracer))
 	if err != nil {
 		logger.Error("promoter.service", slog.String("error", err.Error()))
 		os.Exit(2)

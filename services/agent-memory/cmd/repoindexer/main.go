@@ -64,6 +64,7 @@ import (
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/embedding"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/obs"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/repoindexer"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/repoindexer/ast"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/retirement"
@@ -82,6 +83,22 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Stage 8.3 step 2 — OTel trace export. Best-effort
+	// noop when no endpoint configured.
+	tracerSetup, err := obs.SetupTracer(ctx, obs.ServiceNameRepoIndexer, logger)
+	if err != nil {
+		logger.Error("repoindexer.otel.setup_failed", slog.String("error", err.Error()))
+		os.Exit(2)
+	}
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tracerSetup.Shutdown(shutCtx)
+	}()
+	logger.Info("repoindexer.otel.ready",
+		slog.Bool("exporting", tracerSetup.Exporting),
+		slog.String("endpoint", tracerSetup.EndpointResolved))
 
 	db, err := sql.Open("postgres", cfg.PGURL)
 	if err != nil {
@@ -124,6 +141,54 @@ func main() {
 	publisher := embedding.NewPublisher(db, embedder, qdrant,
 		embedding.WithLogger(logger))
 
+	// Stage 8.3 step 1+3 — /metrics + /healthz HTTP surface.
+	// repoindexer historically had no HTTP endpoints; the
+	// observability brief requires every binary to expose a
+	// scrape surface so the dashboard `up{}` panel can render
+	// process health and `snapshot_published_total` plots the
+	// publisher's success counter. Listen address defaults to
+	// `:9466` so a local-dev `repoindexer` doesn't fight
+	// `agent-api`'s `:8081` health bind.
+	if cfg.HealthAddr != "" {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		})
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				w.Header().Set("Allow", "GET, HEAD")
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			if r.Method == http.MethodHead {
+				return
+			}
+			fmt.Fprintf(w, "# HELP %s Cumulative count of successful EmbeddingPublishEvent->published transitions observed by this repoindexer process (Stage 8.3 step 1).\n",
+				obs.MetricSnapshotPublishedTotal)
+			fmt.Fprintf(w, "# TYPE %s counter\n", obs.MetricSnapshotPublishedTotal)
+			fmt.Fprintf(w, "%s %d\n", obs.MetricSnapshotPublishedTotal, publisher.SnapshotPublishedTotal())
+		})
+		srv := &http.Server{
+			Addr:              cfg.HealthAddr,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			logger.Info("repoindexer.health.listen", slog.String("addr", cfg.HealthAddr))
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("repoindexer.health.listen_failed", slog.String("error", err.Error()))
+			}
+		}()
+		defer func() {
+			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutCtx)
+		}()
+	}
+
 	gw := graphwriter.New(db, logger)
 
 	dispatcher := ast.NewDispatcher(gw,
@@ -152,6 +217,11 @@ func main() {
 		Differ:       differ,
 		Retirer:      retirer,
 		Logger:       logger,
+		// Stage 8.3 step 2 -- wire the OTel tracer so each
+		// claimed job produces a `repoindexer.process_job`
+		// span (low-cardinality attrs: repo_id, mode,
+		// worker_id).
+		Tracer: tracerSetup.Tracer,
 	})
 
 	// Optionally start the §9.6a background flusher.  The
@@ -202,6 +272,7 @@ type config struct {
 	PollEvery         time.Duration
 	FlushEvery        time.Duration
 	AllowStubEmbedder bool
+	HealthAddr        string
 }
 
 func loadConfig() (config, error) {
@@ -210,6 +281,7 @@ func loadConfig() (config, error) {
 		QdrantURL:    os.Getenv("AGENT_MEMORY_QDRANT_URL"),
 		QdrantAPIKey: os.Getenv("AGENT_MEMORY_QDRANT_API_KEY"),
 		WorkerID:     os.Getenv("AGENT_MEMORY_WORKER_ID"),
+		HealthAddr:   os.Getenv("AGENT_MEMORY_LISTEN_ADDR"),
 		PollEvery:    1 * time.Second,
 		FlushEvery:   30 * time.Second,
 	}
@@ -218,6 +290,13 @@ func loadConfig() (config, error) {
 	}
 	if c.QdrantURL == "" {
 		return c, errors.New("AGENT_MEMORY_QDRANT_URL is required")
+	}
+	if c.HealthAddr == "" {
+		// Stage 8.3 default: bind /metrics + /healthz so a
+		// dev-mode `repoindexer` is scrapable without
+		// additional env. `:0` would be impossible to
+		// scrape; an explicit port is friendlier.
+		c.HealthAddr = ":9466"
 	}
 	if v := os.Getenv("AGENT_MEMORY_POLL_EVERY"); v != "" {
 		d, err := time.ParseDuration(v)

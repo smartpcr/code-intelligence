@@ -35,6 +35,17 @@ import (
 	"go.opentelemetry.io/otel/trace/noop"
 )
 
+// tickSpanNoopTracer is the package-level fallback tracer used
+// when TickSpan is invoked with a nil tracer. Hoisted to a
+// package var so that the hot per-tick path of every
+// background worker (promoter, consolidator, span-ingestor,
+// trace-log-pruner, reranker-trainer, repo-indexer) avoids
+// allocating a fresh noop TracerProvider on each call. This
+// mirrors the singleton pattern used in agentapi/tracing.go,
+// consolidator/service.go, spaningestor/ingestor.go, and
+// qdrant-bootstrap/observability.go elsewhere in this PR.
+var tickSpanNoopTracer trace.Tracer = noop.NewTracerProvider().Tracer("obs.tickspan.noop")
+
 // TickSpan wraps body in an OTel span named verb. The
 // returned error is surfaced verbatim to the caller; the
 // span carries the error message + codes.Error if non-nil.
@@ -48,7 +59,7 @@ import (
 // supply an `attrFunc` to derive attributes from the result.
 func TickSpan(ctx context.Context, tracer trace.Tracer, verb string, attrs []attribute.KeyValue, body func(ctx context.Context) error) error {
 	if tracer == nil {
-		tracer = noop.NewTracerProvider().Tracer("obs.tickspan.noop")
+		tracer = tickSpanNoopTracer
 	}
 	startOpts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindInternal),

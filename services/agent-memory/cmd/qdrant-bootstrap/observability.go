@@ -34,7 +34,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -118,14 +117,7 @@ func (m *bootstrapMetrics) Write(w io.Writer) {
 // the current metric snapshot in Prometheus text format. The
 // content type matches the OpenMetrics v0.0.4 text exposition.
 func (m *bootstrapMetrics) Handler() http.Handler {
-	var headerOnce sync.Once
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		headerOnce.Do(func() {
-			// Avoid per-request allocs of the header map by
-			// caching the content-type set; harmless if the
-			// handler is replaced because the cached state
-			// only affects the WriteHeader path.
-		})
 		w.Header().Set("Content-Type",
 			"text/plain; version=0.0.4; charset=utf-8")
 		m.Write(w)

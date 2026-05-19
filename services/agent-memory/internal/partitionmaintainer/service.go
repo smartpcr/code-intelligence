@@ -280,6 +280,20 @@ type MaintenanceResult struct {
 // serialise behind the partman advisory lock, so a double-tick
 // is harmless but wasteful -- the caller (Run) ensures only one
 // in-flight call per parent at any time.
+//
+// Per-parent error handling
+// -------------------------
+// In the scoped path one parent's failure (e.g. transient
+// AccessExclusiveLock contention from a tenant DDL) MUST NOT
+// starve the remaining in-scope parents of provisioning for a
+// full MaintenanceInterval. We therefore iterate every parent,
+// increment MetricPartitionMaintenanceErrorsTotal per failure,
+// and surface a combined error via `errors.Join` so the caller
+// (Run) still observes the failure on its Warn log line. The
+// only early bail is when `runCtx` is itself cancelled or
+// deadline-exceeded: every remaining ExecContext would fail
+// with the same context error, so we stop to avoid log spam
+// and pointless metric inflation.
 func (s *Service) RunMaintenance(ctx context.Context) (MaintenanceResult, error) {
 	s.metrics.IncMaintenanceRuns()
 
@@ -316,6 +330,7 @@ func (s *Service) RunMaintenance(ctx context.Context) (MaintenanceResult, error)
 			slog.String("error", err.Error()))
 		return res, err
 	}
+	var errs []error
 	for _, parent := range parents {
 		if _, err := s.db.ExecContext(runCtx, `
 			SELECT partman.run_maintenance(
@@ -328,11 +343,31 @@ func (s *Service) RunMaintenance(ctx context.Context) (MaintenanceResult, error)
 				slog.String("scope", "scoped"),
 				slog.String("parent", parent),
 				slog.String("error", err.Error()))
-			return res, fmt.Errorf("partitionmaintainer: run_maintenance(%q): %w", parent, err)
+			errs = append(errs, fmt.Errorf("partitionmaintainer: run_maintenance(%q): %w", parent, err))
+			// Once the shared maintenance budget is exhausted
+			// (parent ctx cancelled OR MaintenanceTimeout
+			// reached), every remaining ExecContext would fail
+			// with the same context error. Bail to avoid log
+			// spam and to surface a single Canceled/Deadline
+			// error to the caller -- `errors.Join` below still
+			// preserves `errors.Is(err, context.Canceled)` so
+			// Run's shutdown-noise filter keeps working.
+			if runCtx.Err() != nil {
+				break
+			}
+			continue
 		}
 		res.ParentsMaintained++
 	}
 	res.Duration = time.Since(start)
+	if len(errs) > 0 {
+		s.logger.Warn("partitionmaintainer.maintenance.partial",
+			slog.String("scope", "scoped"),
+			slog.Int("parents_maintained", res.ParentsMaintained),
+			slog.Int("parents_failed", len(errs)),
+			slog.Duration("duration", res.Duration))
+		return res, errors.Join(errs...)
+	}
 	s.logger.Info("partitionmaintainer.maintenance.done",
 		slog.String("scope", "scoped"),
 		slog.Int("parents", res.ParentsMaintained),
@@ -414,13 +449,14 @@ func (s *Service) ScrapeLag(ctx context.Context) (LagResult, error) {
 			slog.String("error", err.Error()))
 		return res, err
 	}
-	s.metrics.SetParentsObserved(uint64(len(parents)))
 
 	if len(parents) == 0 {
-		// No in-scope parents → no observation. Reset the
-		// gauge to zero so a previous spike does not linger
+		// No in-scope parents → no observation. Reset both
+		// gauges to zero so a previous spike does not linger
 		// after the operator narrows the scope to an empty
-		// set.
+		// set, and so parents_observed honestly reflects "0
+		// parents were actually scraped this tick".
+		s.metrics.SetParentsObserved(0)
 		s.metrics.SetProvisionLagSeconds(0)
 		res.Duration = time.Since(start)
 		s.logger.Info("partitionmaintainer.scrape.empty_scope",
@@ -434,6 +470,14 @@ func (s *Service) ScrapeLag(ctx context.Context) (LagResult, error) {
 		lag, err := s.scrapeParentLag(runCtx, parent)
 		if err != nil {
 			s.metrics.IncLagScrapeErrors()
+			// Publish the count of parents that COMPLETED
+			// before the failure (not the full scope size).
+			// An operator pairing parents_observed with
+			// lag_scrape_errors_total can then read partial
+			// progress directly off the gauge instead of
+			// having to mentally subtract the error rate
+			// from the scope size.
+			s.metrics.SetParentsObserved(uint64(len(res.ParentLags)))
 			s.logger.Error("partitionmaintainer.scrape.parent",
 				slog.String("parent", parent),
 				slog.String("error", err.Error()))
@@ -449,6 +493,12 @@ func (s *Service) ScrapeLag(ctx context.Context) (LagResult, error) {
 	}
 	res.MaxLagSeconds = maxLag
 	res.Duration = time.Since(start)
+	// All in-scope parents scraped successfully; len(res.ParentLags)
+	// equals len(parents) here. We still source the count from
+	// res.ParentLags so the metric is consistent with the partial
+	// path above (single source of truth: "what we actually
+	// observed", not "what we set out to observe").
+	s.metrics.SetParentsObserved(uint64(len(res.ParentLags)))
 
 	// Clamp to >= 0 (defensive -- the SQL already does this).
 	// Store as uint64; lag is monotonically bounded by the

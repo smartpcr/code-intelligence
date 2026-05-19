@@ -155,6 +155,25 @@ const (
 // already carries a `traceparent` header continues that trace
 // rather than starting a fresh one. This is the contract the
 // downstream Span Ingestor's OTLP receiver assumes.
+//
+// Concurrency / test-safety contract. SetupTracer mutates two
+// process-global singletons via `otel.SetTracerProvider` and
+// `otel.SetTextMapPropagator`. This is intentional — every
+// caller (HTTP handler, background worker, sidecar) reaches
+// for the configured tracer through the same `otel.Tracer(...)`
+// global, so installing it once at process startup is the
+// whole point. It does mean that:
+//
+//   - Production binaries MUST call SetupTracer exactly once
+//     from `main` before serving traffic.
+//   - Unit tests that exercise SetupTracer MUST NOT call
+//     `t.Parallel()`. The existing tests use `t.Setenv`,
+//     which Go's `testing` package already refuses to combine
+//     with `t.Parallel`, so the current suite is safe by
+//     construction; the prohibition is restated here so
+//     future contributors who replace `t.Setenv` with manual
+//     `os.Setenv` do not accidentally introduce a data race
+//     on the global TracerProvider.
 func SetupTracer(ctx context.Context, svc ServiceName, logger *slog.Logger) (TracerSetupResult, error) {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -186,6 +205,11 @@ func SetupTracer(ctx context.Context, svc ServiceName, logger *slog.Logger) (Tra
 		// inbound trace-context header survives the hop
 		// even when this binary does not export its own
 		// spans.
+		//
+		// Not safe for parallel tests: the next two calls
+		// mutate process-global singletons. See the
+		// SetupTracer doc comment ("Concurrency /
+		// test-safety contract") for the full rationale.
 		otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 			propagation.TraceContext{},
 			propagation.Baggage{},
@@ -239,6 +263,10 @@ func SetupTracer(ctx context.Context, svc ServiceName, logger *slog.Logger) (Tra
 		sdktrace.WithSpanProcessor(bsp),
 		sdktrace.WithResource(res),
 	)
+	// Not safe for parallel tests: the next two calls mutate
+	// process-global singletons. See the SetupTracer doc
+	// comment ("Concurrency / test-safety contract") for the
+	// full rationale.
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{},

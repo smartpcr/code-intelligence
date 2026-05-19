@@ -1,0 +1,27 @@
+# Prometheus config for the local agent-memory dev/CI stack.
+# Loaded by the `prometheus` service in
+# `services/agent-memory/deploy/local/docker-compose.yml`.
+#
+# Single scrape target: the cmd/partition-maintainer binary
+# exposing /metrics on :8087. Stage 8.2's alert rule
+# (`./rules/partition_rotation.rules.yml`) keys off
+# `partition_provision_lag` from this scrape.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: agent-memory-local
+
+rule_files:
+  - /etc/prometheus/rules/*.rules.yml
+
+scrape_configs:
+  - job_name: partition-maintainer
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - partition-maintainer:8087
+        labels:
+          component: agent_memory
+          service: partition-maintainer

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -217,6 +218,16 @@ type Publisher struct {
 	// publish_id / point_id values.  Production passes nil →
 	// uses `NewUUIDv4`.
 	newUUID func() (string, error)
+
+	// snapshotPublishedTotal counts every successful
+	// publish-state transition (Stage 8.3 step 1 —
+	// `snapshot_published_total`). Incremented once per
+	// publish() call that records an `EventKindPublished`
+	// row, regardless of the embed/qdrant path that got us
+	// there. Exposed via SnapshotPublishedTotal(); production
+	// binaries (repoindexer, concept-promoter) render the
+	// counter on their `/metrics` body.
+	snapshotPublishedTotal atomic.Uint64
 }
 
 // Option is the functional-options shape used to construct a
@@ -304,6 +315,18 @@ func NewPublisher(db *sql.DB, embedder Embedder, qdrant Qdrant, opts ...Option) 
 // a non-recordable retry error rather than a supersede.
 func (p *Publisher) ModelVersion() string {
 	return p.embedder.ModelVersion()
+}
+
+// SnapshotPublishedTotal returns the monotonically-increasing
+// count of successful publish-state transitions observed by
+// this Publisher instance (Stage 8.3 step 1 —
+// `snapshot_published_total`). The counter resets on process
+// restart; production exposes it via the binary's `/metrics`
+// body so Prometheus can rate it for the §8.3 dashboard.
+//
+// Concurrency: safe for use from any goroutine.
+func (p *Publisher) SnapshotPublishedTotal() uint64 {
+	return p.snapshotPublishedTotal.Load()
 }
 
 // CollectionFor returns the Qdrant collection name the
@@ -589,6 +612,7 @@ func (p *Publisher) runAttempt(
 		return result, fmt.Errorf("embedding: insert published: %w", err)
 	}
 	result.LastEventKind = EventKindPublished
+	p.snapshotPublishedTotal.Add(1)
 	p.logAttempt("published", req, result)
 	return result, nil
 }

@@ -1,0 +1,406 @@
+# implementation-plan.md Stage 8.3 -- Prometheus alert rules
+# for the agent-memory service. The companion dashboard is at
+# `deploy/dashboards/agent-memory.json`; both files MUST stay
+# in lock-step with the canonical metric names pinned in
+# `services/agent-memory/internal/obs/metrics.go`.
+#
+# Why every latency rule has a `and ... > N` traffic gate:
+#   `histogram_quantile()` over zero samples returns NaN, but
+#   `histogram_quantile()` over a SINGLE slow sample returns
+#   that one sample's bucket midpoint as p95/p99 -- which would
+#   page on a 2am health-check probe. Adding
+#   `and sum(rate(<metric>_count[5m])) > <minRPS>` to every
+#   latency rule blocks the alert during quiet windows so a
+#   single slow trickle does not page the on-call.
+#
+# Why partition_provision_lag uses a threshold:
+#   As of iter-2 the metric IS emitted by mgmt-api (see
+#   internal/mgmtapi/partition_lag.go). The gauge reads
+#   pg_partman's tail forward-partition end on each scrape
+#   and reports lag in seconds. A `> 86400` rule fires when
+#   pg_partman has not provisioned forward partitions in the
+#   last 24h, which is the §8.2 SLO budget. We keep a
+#   `partition_provision_lag_missing` companion alert on
+#   `absent()` so an unreachable mgmt-api still surfaces.
+groups:
+  - name: agent-memory.slo
+    interval: 30s
+    rules:
+      # ---- Stage 8.3 SLO alerts -------------------------------------
+      - alert: recall_p95_breach
+        expr: |
+          histogram_quantile(0.95, sum(rate(agent_recall_duration_seconds_bucket[5m])) by (le)) > 1.5
+          and
+          sum(rate(agent_recall_duration_seconds_count[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: page
+          service: agent-memory
+          verb: recall
+        annotations:
+          summary: "agent.recall p95 latency over SLO threshold"
+          description: |
+            agent.recall p95 latency exceeded the §8.3 SLO of 1.5s for 5 minutes
+            (current value: {{ $value | humanizeDuration }}). See dashboard
+            `agent-memory-stage-8-3` panel "agent.recall latency" for the
+            histogram. Traffic gate: > 0.5 req/sec sustained over 5m so quiet
+            windows do not page on a single slow probe.
+          runbook_url: "https://wiki/agent-memory/recall-slo"
+
+      - alert: recall_p99_breach
+        expr: |
+          histogram_quantile(0.99, sum(rate(agent_recall_duration_seconds_bucket[5m])) by (le)) > 4
+          and
+          sum(rate(agent_recall_duration_seconds_count[5m])) > 0.5
+        for: 10m
+        labels:
+          severity: warn
+          service: agent-memory
+          verb: recall
+        annotations:
+          summary: "agent.recall p99 latency over SLO threshold"
+          description: "p99 over 4s (current: {{ $value | humanizeDuration }})."
+
+      - alert: observe_p95_breach
+        expr: |
+          histogram_quantile(0.95, sum(rate(agent_observe_duration_seconds_bucket[5m])) by (le)) > 0.4
+          and
+          sum(rate(agent_observe_duration_seconds_count[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: page
+          service: agent-memory
+          verb: observe
+        annotations:
+          summary: "agent.observe p95 latency over SLO threshold"
+          description: "p95 over 400ms (current: {{ $value | humanizeDuration }})."
+
+      - alert: observe_p99_breach
+        expr: |
+          histogram_quantile(0.99, sum(rate(agent_observe_duration_seconds_bucket[5m])) by (le)) > 1.5
+          and
+          sum(rate(agent_observe_duration_seconds_count[5m])) > 0.5
+        for: 10m
+        labels:
+          severity: warn
+          service: agent-memory
+          verb: observe
+        annotations:
+          summary: "agent.observe p99 latency over SLO threshold"
+          description: "p99 over 1.5s (current: {{ $value | humanizeDuration }})."
+
+      - alert: expand_p95_breach
+        expr: |
+          histogram_quantile(0.95, sum(rate(agent_expand_duration_seconds_bucket[5m])) by (le)) > 1.5
+          and
+          sum(rate(agent_expand_duration_seconds_count[5m])) > 0.2
+        for: 5m
+        labels:
+          severity: page
+          service: agent-memory
+          verb: expand
+        annotations:
+          summary: "agent.expand p95 latency over SLO threshold"
+          description: "p95 over 1.5s (current: {{ $value | humanizeDuration }})."
+
+      - alert: expand_p99_breach
+        expr: |
+          histogram_quantile(0.99, sum(rate(agent_expand_duration_seconds_bucket[5m])) by (le)) > 4
+          and
+          sum(rate(agent_expand_duration_seconds_count[5m])) > 0.2
+        for: 10m
+        labels:
+          severity: warn
+          service: agent-memory
+          verb: expand
+        annotations:
+          summary: "agent.expand p99 latency over SLO threshold"
+          description: "p99 over 4s (current: {{ $value | humanizeDuration }})."
+
+      - alert: summarize_p95_breach
+        expr: |
+          histogram_quantile(0.95, sum(rate(agent_summarize_duration_seconds_bucket[5m])) by (le)) > 4
+          and
+          sum(rate(agent_summarize_duration_seconds_count[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: warn
+          service: agent-memory
+          verb: summarize
+        annotations:
+          summary: "agent.summarize p95 latency over SLO threshold"
+          description: "p95 over 4s (current: {{ $value | humanizeDuration }})."
+
+      - alert: summarize_p99_breach
+        expr: |
+          histogram_quantile(0.99, sum(rate(agent_summarize_duration_seconds_bucket[5m])) by (le)) > 10
+          and
+          sum(rate(agent_summarize_duration_seconds_count[5m])) > 0.05
+        for: 15m
+        labels:
+          severity: warn
+          service: agent-memory
+          verb: summarize
+        annotations:
+          summary: "agent.summarize p99 latency over SLO threshold"
+          description: "p99 over 10s (current: {{ $value | humanizeDuration }})."
+
+      - alert: mgmt_ingest_spans_p95_breach
+        expr: |
+          histogram_quantile(0.95, sum(rate(mgmt_ingest_spans_batch_duration_seconds_bucket[5m])) by (le)) > 2
+          and
+          sum(rate(mgmt_ingest_spans_batch_duration_seconds_count[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: warn
+          service: agent-memory
+          verb: mgmt.ingest_spans
+        annotations:
+          summary: "mgmt.ingest_spans batch p95 latency over SLO threshold"
+          description: "p95 over 2s (current: {{ $value | humanizeDuration }})."
+
+  - name: agent-memory.degraded
+    interval: 30s
+    rules:
+      # ---- Stage 8.1 degraded-counter breakouts ---------------------
+      - alert: degraded_response_burst
+        expr: |
+          sum by (verb, reason) (rate(agent_memory_degraded_total[5m])) > 0.5
+        for: 10m
+        labels:
+          severity: warn
+          service: agent-memory
+        annotations:
+          summary: "Sustained degraded responses: verb={{ $labels.verb }} reason={{ $labels.reason }}"
+          description: |
+            Rate > 0.5 degraded responses/sec for verb {{ $labels.verb }} with
+            reason {{ $labels.reason }} sustained for 10m. See dashboard panel
+            "Degraded responses by (verb, reason)".
+
+      - alert: recall_unpublished_burst
+        expr: |
+          sum(rate(recall_filter_unpublished_total[5m])) > 1
+        for: 10m
+        labels:
+          severity: warn
+          service: agent-memory
+        annotations:
+          summary: "Sustained recall unpublished-hit drops"
+          description: |
+            recall_filter_unpublished_total rate > 1/sec for 10m. The recall
+            path is dropping vector hits whose §9.6a publish state has not
+            transitioned to `published` -- usually means the publisher /
+            Qdrant pipeline is stuck.
+
+      - alert: span_unresolved_burst
+        expr: |
+          sum(rate(span_unresolved_total[5m])) > 5
+        for: 10m
+        labels:
+          severity: warn
+          service: agent-memory
+        annotations:
+          summary: "Span ingestor: high unresolved-span rate"
+          description: |
+            More than 5 spans/sec rejected for missing fingerprints over 10m.
+            Either the upstream tracer is emitting unrecognised
+            method/block hashes, or the graph writer has lost a recent
+            symbol -- check the ingest_jobs queue.
+
+  - name: agent-memory.background-workers
+    interval: 30s
+    rules:
+      # ---- Background-worker freshness ------------------------------
+      - alert: consolidator_lag_high
+        expr: |
+          max(consolidator_episode_lag) > 60
+        for: 10m
+        labels:
+          severity: warn
+          service: agent-memory
+        annotations:
+          summary: "Consolidator episode lag over 60s"
+          description: |
+            consolidator_episode_lag > 60s for 10m: the consolidator's
+            high-water mark is more than a minute behind the newest
+            Episode. Usually means the consolidator worker is stuck or
+            the partition rotation cron has fallen behind.
+
+      - alert: observe_wal_depth_high
+        expr: |
+          max(observe_wal_buffer_depth) > 1000
+        for: 10m
+        labels:
+          severity: warn
+          service: agent-memory
+        annotations:
+          summary: "agent.observe WAL buffer depth over 1000"
+          description: |
+            The observe WAL has more than 1000 buffered episodes pending
+            replay for 10m. The writer pool is likely degraded -- check
+            `repo_health` for `consolidator_backpressure` and the
+            episodes table for INSERT latency.
+
+      - alert: reranker_freshness_stale
+        expr: |
+          (time() - max(reranker_last_trained_at)) > 604800
+          and
+          max(reranker_last_trained_at) > 0
+        for: 15m
+        labels:
+          severity: warn
+          service: agent-memory
+        annotations:
+          summary: "Reranker model freshness over 7d"
+          description: |
+            time() - reranker_last_trained_at > 7d (604800s) for 15m:
+            the reranker has not produced a fresh model in over a week.
+            See tech-spec.md §9.10 staleness alert.
+
+      - alert: snapshot_publish_stalled
+        expr: |
+          rate(snapshot_published_total[10m]) == 0
+          and
+          rate(snapshot_published_total[60m]) == 0
+        for: 30m
+        labels:
+          severity: warn
+          service: agent-memory
+        annotations:
+          summary: "snapshot_published_total has not advanced in 60m"
+          description: |
+            No new EmbeddingPublishEvent->published transitions observed
+            in 60m. The repoindexer's publish pipeline is likely stuck:
+            check Qdrant reachability and the §9.6a flusher logs.
+
+      - alert: partition_provision_lag_high
+        expr: |
+          max(partition_provision_lag) > 86400
+        for: 15m
+        labels:
+          severity: warn
+          service: agent-memory
+        annotations:
+          summary: "pg_partman provisioning behind by > 24h"
+          description: |
+            partition_provision_lag exceeds 86400s (24h) for at least
+            one parent table for 15m. Iter-2 wires this gauge through
+            mgmt-api's /metrics handler; values > 0 mean pg_partman's
+            background worker has fallen behind the rolling forward
+            buffer and the next INSERT into an out-of-range parent
+            will land in `<table>_default`. See dashboard panel
+            "Partition provision lag" for the per-parent breakdown.
+          runbook_url: "https://wiki/agent-memory/partman-lag"
+
+      - alert: partition_provision_lag_missing
+        expr: |
+          absent(partition_provision_lag)
+        for: 15m
+        labels:
+          severity: warn
+          service: agent-memory
+        annotations:
+          summary: "partition_provision_lag metric is missing"
+          description: |
+            mgmt-api emits partition_provision_lag on every scrape
+            since Stage 8.3 iter-2 (see
+            internal/mgmtapi/partition_lag.go). A missing series
+            means either the mgmt-api binary is unreachable or the
+            scrape target is misconfigured. The companion
+            `partition_provision_lag_high` alert covers the > 24h
+            case once the metric is back.
+
+  - name: agent-memory.sidecars
+    interval: 60s
+    rules:
+      # ---- Stage 8.3 iter-3 evaluator fix #4: alerts for the
+      # qdrant-bootstrap and reranker-sidecar metrics so the
+      # operator artifacts reference every name pinned in
+      # internal/obs/metrics.go. ---------------------------------
+      - alert: qdrant_bootstrap_failure_burst
+        expr: |
+          sum(rate(qdrant_bootstrap_runs_total{status="failed"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warn
+          service: agent-memory
+          binary: qdrant-bootstrap
+        annotations:
+          summary: "qdrant-bootstrap snapshot scheduler is flapping"
+          description: |
+            qdrant_bootstrap_runs_total{status="failed"} rate > 0/sec
+            sustained for 15m: the snapshot scheduler tried to take a
+            snapshot and failed. Check Qdrant reachability and the
+            sidecar logs (cmd/qdrant-bootstrap).
+
+      - alert: qdrant_bootstrap_scheduler_stalled
+        expr: |
+          (time() - max(qdrant_bootstrap_last_completed_at)) > 259200
+          and
+          max(qdrant_bootstrap_last_completed_at) > 0
+        for: 30m
+        labels:
+          severity: warn
+          service: agent-memory
+          binary: qdrant-bootstrap
+        annotations:
+          summary: "qdrant-bootstrap last completed > 3d ago"
+          description: |
+            time() - qdrant_bootstrap_last_completed_at > 3d (259200s)
+            for 30m: the snapshot scheduler has not produced a
+            successful run in over three days. With the default
+            24h --snapshot-interval, this means at least two
+            consecutive ticks have failed; the snapshot scheduler
+            is stuck.
+
+      - alert: reranker_sidecar_error_burst
+        expr: |
+          sum(rate(reranker_sidecar_inference_total{status="error"}[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warn
+          service: agent-memory
+          binary: reranker-sidecar
+        annotations:
+          summary: "reranker-sidecar /rank error rate over 0.1/sec"
+          description: |
+            reranker_sidecar_inference_total{status="error"} rate exceeds
+            0.1/sec for 10m: the Python cross-encoder is failing on
+            real recall traffic. The recall verb is degrading per
+            internal/degraded -- check the sidecar process logs and
+            verify the model artifact is reachable.
+
+      - alert: reranker_sidecar_latency_p95_breach
+        expr: |
+          histogram_quantile(0.95, sum(rate(reranker_sidecar_inference_duration_seconds_bucket[5m])) by (le)) > 2
+          and
+          sum(rate(reranker_sidecar_inference_duration_seconds_count[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warn
+          service: agent-memory
+          binary: reranker-sidecar
+        annotations:
+          summary: "reranker-sidecar inference p95 > 2s"
+          description: |
+            Python cross-encoder p95 latency exceeds 2s for 10m. The
+            recall verb's SLO budget is 1.5s end-to-end; a slow
+            reranker drags the whole verb over the line.
+
+      - alert: webhook_receiver_rejection_burst
+        expr: |
+          sum by (status) (rate(webhook_receiver_requests_total{status=~"rejected_.*|error_.*"}[5m])) > 0.5
+        for: 10m
+        labels:
+          severity: warn
+          service: agent-memory
+          binary: webhook-receiver
+        annotations:
+          summary: "webhook-receiver rejection rate > 0.5/sec for status={{ $labels.status }}"
+          description: |
+            webhook_receiver_requests_total rejection rate (status =~
+            rejected_.* OR error_.*) > 0.5/sec for 10m. The most likely
+            cause is either a misconfigured webhook secret (lots of
+            rejected_sig) or a git host pushing oversized payloads
+            (rejected_body). Check the cmd/webhook-receiver logs for
+            the same window.

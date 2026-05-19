@@ -91,6 +91,7 @@ import (
 	"time"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/degraded"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // VerbObserve is the canonical verb name passed to
@@ -470,6 +471,22 @@ type ObserveService struct {
 	// production wires either a PG-row health source or the
 	// in-process consolidator gauge.
 	consolidatorBackpressure ConsolidatorBackpressureSource
+
+	// Stage 8.3 — `agent_observe_duration_seconds` observer
+	// wired by `WithObserveLatencyObserver`. A nil observer
+	// is a no-op; production wiring at `cmd/agent-api/main.go`
+	// binds it to an `*obs.Histogram` so the binary's
+	// `/metrics` body exposes the histogram.
+	latency LatencyObserver
+
+	// Stage 8.3 step 2 (iter-2 evaluator fix #1) — per-verb
+	// OpenTelemetry tracer wired by `WithObserveTracer`. The
+	// Observe verb opens an `agent.observe` span and threads
+	// the returned context into every downstream call (DB
+	// writer, WAL, context resolver). A nil tracer is a
+	// no-op (the helpers in `tracing.go` substitute a
+	// package noop tracer at call time).
+	tracer trace.Tracer
 }
 
 // ObserveOption configures an ObserveService.
@@ -561,6 +578,19 @@ func WithObserveConsolidatorBackpressure(b ConsolidatorBackpressureSource) Obser
 	}
 }
 
+// WithObserveLatency plumbs the §8.3
+// `agent_observe_duration_seconds` histogram observer. Mirrors
+// `WithObserveLatencyObserver` (which is the `Service`-level
+// helper exported from `latency.go`); both names exist because
+// the recall/expand/summarize verbs hang off `Service` while
+// `Observe` hangs off `ObserveService`, and a single option
+// type cannot configure both. A nil observer is a no-op.
+func WithObserveLatency(o LatencyObserver) ObserveOption {
+	return func(s *ObserveService) {
+		s.latency = o
+	}
+}
+
 // NewObserveService constructs an Observe handler. The two
 // required dependencies panic on nil — a wiring bug surfacing
 // at process start is cheaper than the same bug surfacing on
@@ -609,7 +639,23 @@ func NewObserveService(writer EpisodeAppender, resolver ContextResolver, opts ..
 //     refuse to return success when the row is not durable.
 //  6. Any other writer error propagates verbatim — schema /
 //     constraint failures must surface loudly.
-func (s *ObserveService) Observe(ctx context.Context, req ObserveRequest) (ObserveResponse, error) {
+func (s *ObserveService) Observe(ctx context.Context, req ObserveRequest) (resp ObserveResponse, err error) {
+	// Stage 8.3 — record `agent_observe_duration_seconds`
+	// for every call (happy path AND degraded). The defer
+	// fires AFTER the function returns regardless of which
+	// branch handled the request.
+	observeStart := time.Now()
+	defer func() { recordLatency(s.latency, observeStart) }()
+
+	// Stage 8.3 step 2 — open the `agent.observe` operational
+	// span and thread the returned context into every
+	// downstream call. The deferred `endVerbSpan` runs AFTER
+	// the function returns so the span records the final
+	// caller-visible status (error or degraded reason).
+	var span trace.Span
+	ctx, span = startVerbSpan(ctx, s.tracer, VerbObserve, req.RepoID)
+	defer func() { endVerbSpan(span, err, resp.DegradedReason) }()
+
 	if err := validateObserveRequest(req); err != nil {
 		return ObserveResponse{}, err
 	}

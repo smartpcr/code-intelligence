@@ -55,6 +55,27 @@ go.work.sum
 .pre-commit-cache/
 
 # ---------------------------------------------------------------
+# Python toolchain output (services/agent-memory/cmd/reranker-sidecar/)
+# ---------------------------------------------------------------
+# Bytecode caches emitted by `python` / `pytest` runs against
+# the reranker-sidecar service. These appear next to every
+# .py file but must never be tracked.
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+# Virtualenv directories devs sometimes create alongside the
+# reranker-sidecar to install requirements.txt locally.
+.venv/
+venv/
+.python-version
+# Pytest / coverage caches.
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ---------------------------------------------------------------
 # Editor / OS junk
 # ---------------------------------------------------------------
 .idea/

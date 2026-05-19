@@ -58,6 +58,22 @@ type PrometheusMetricsHandler struct {
 	// in any order as long as a given name is contiguous).
 	// MAY be nil.
 	Degraded *degraded.Counter
+
+	// Extra is the §8.3 extension point that lets the cmd
+	// binary chain additional metric families into the same
+	// /metrics body without each call site needing to know
+	// about every histogram / counter the binary exposes.
+	// Each function is called with the response writer in
+	// registration order; the convention is that the function
+	// emits a self-contained metric family (HELP + TYPE +
+	// series rows). Examples in production wiring:
+	//
+	//   - `mgmt_ingest_spans_batch_duration_seconds` histogram
+	//     (`obs.Histogram.Write`).
+	//   - `partition_provision_lag` gauge (Stage 8.2).
+	//
+	// MAY be nil or empty.
+	Extra []func(io.Writer)
 }
 
 // NewPrometheusMetricsHandler builds a handler bound to the
@@ -73,8 +89,23 @@ func NewPrometheusMetricsHandler(spans *IngestSpansMetrics) *PrometheusMetricsHa
 // fix for evaluator finding #3: the degraded counter MUST be
 // graphable by operators, so it has to appear on the same
 // scrape surface the existing ingest-spans counter sits on.
+//
+// Stage 8.3 step 1 extends the composition: pass additional
+// metric writers via [PrometheusMetricsHandler.Extra] (or
+// [NewCombinedMetricsHandlerWithExtras]) to chain in the
+// `mgmt_ingest_spans_batch_duration_seconds` histogram or any
+// other family the binary owns.
 func NewCombinedMetricsHandler(spans *IngestSpansMetrics, deg *degraded.Counter) *PrometheusMetricsHandler {
 	return &PrometheusMetricsHandler{Spans: spans, Degraded: deg}
+}
+
+// NewCombinedMetricsHandlerWithExtras is [NewCombinedMetricsHandler]
+// plus the Stage 8.3 extension point. Each `extras` function
+// emits one metric family (HELP + TYPE + samples) into the
+// /metrics response body in registration order. A nil or empty
+// `extras` is identical to [NewCombinedMetricsHandler].
+func NewCombinedMetricsHandlerWithExtras(spans *IngestSpansMetrics, deg *degraded.Counter, extras ...func(io.Writer)) *PrometheusMetricsHandler {
+	return &PrometheusMetricsHandler{Spans: spans, Degraded: deg, Extra: extras}
 }
 
 // ServeHTTP implements http.Handler.
@@ -130,6 +161,15 @@ func (h *PrometheusMetricsHandler) write(w io.Writer) {
 	// dashboard requirement). Composed onto the same response
 	// so a single /metrics scrape returns both counters.
 	degraded.NewPrometheusHandler(h.Degraded).Write(w)
+
+	// Stage 8.3 extras (histograms, gauges from downstream
+	// stages). Emitted in registration order; each function
+	// owns its full HELP/TYPE/series envelope.
+	for _, fn := range h.Extra {
+		if fn != nil {
+			fn(w)
+		}
+	}
 }
 
 // escapePromLabelValue escapes the three characters Prometheus

@@ -170,6 +170,7 @@ import (
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/degraded"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/embedding"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphreader"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/obs"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/recallcontext"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/rerankertrainer"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/spaningestor"
@@ -245,6 +246,52 @@ func main() {
 	// it nil here is what guarantees the production binary
 	// cannot be coerced into emitting an injected reason.
 	degradedCounter := degraded.NewCounter()
+
+	// Stage 8.3 step 2 — OTel trace export. Best-effort:
+	// SetupTracer is a noop when neither
+	// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` nor
+	// `OTEL_EXPORTER_OTLP_ENDPOINT` is set, so the binary
+	// boots cleanly on developer laptops without a Collector.
+	// When an endpoint IS configured and unreachable
+	// (DNS/parse error) we crash early — operators must know
+	// trace export is broken before traffic arrives.
+	tracerSetup, err := obs.SetupTracer(ctx, obs.ServiceNameAgentAPI, logger)
+	if err != nil {
+		logger.Error("agent-api.otel.setup_failed", slog.String("error", err.Error()))
+		os.Exit(2)
+	}
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tracerSetup.Shutdown(shutCtx); err != nil {
+			logger.Warn("agent-api.otel.shutdown_failed", slog.String("error", err.Error()))
+		}
+	}()
+	logger.Info("agent-api.otel.ready",
+		slog.Bool("exporting", tracerSetup.Exporting),
+		slog.String("endpoint", tracerSetup.EndpointResolved))
+
+	// Stage 8.3 step 1 — verb-latency histograms. One per
+	// agent verb so the dashboard can compute p95/p99 via
+	// `histogram_quantile()` independently. Bucket
+	// boundaries align with §8.3 SLO lines (0.4, 1.5, 2, 4,
+	// 5, 10) so `histogram_quantile()`'s linear
+	// interpolation lands exactly on the SLO threshold —
+	// avoids the off-by-bucket oscillation that plagues
+	// default Prometheus bucket sets.
+	recallLatency := obs.NewHistogram(obs.MetricAgentRecallDurationSeconds,
+		"agent.recall verb wall-clock latency (seconds) -- §8.3 SLO p95≤1.5s, p99≤4s.",
+		obs.DefaultDurationBuckets)
+	observeLatency := obs.NewHistogram(obs.MetricAgentObserveDurationSeconds,
+		"agent.observe verb wall-clock latency (seconds) -- §8.3 SLO p95≤0.4s, p99≤1.5s.",
+		obs.DefaultDurationBuckets)
+	expandLatency := obs.NewHistogram(obs.MetricAgentExpandDurationSeconds,
+		"agent.expand verb wall-clock latency (seconds) -- §8.3 SLO p95≤1.5s, p99≤4s.",
+		obs.DefaultDurationBuckets)
+	summarizeLatency := obs.NewHistogram(obs.MetricAgentSummarizeDurationSeconds,
+		"agent.summarize verb wall-clock latency (seconds) -- §8.3 SLO p95≤4s, p99≤10s.",
+		obs.DefaultDurationBuckets)
+
 	// Stage 8.1 — `consolidator_backpressure` source.  The
 	// `repo_health` table is the same per-repo health blob
 	// the recall path already consults via `NewPGHealthSource`
@@ -402,6 +449,20 @@ func main() {
 		// recall / expand / summarize.  Observe wires the
 		// same counter via WithObserveDegradedMetric below.
 		agentapi.WithDegradedMetric(degradedCounter),
+		// Stage 8.3 step 1 — verb-latency observers. Each
+		// histogram's `Observe` method is plumbed as a
+		// `LatencyObserver` callback so the verb code stays
+		// decoupled from the obs package (avoids an import
+		// cycle).
+		agentapi.WithRecallLatencyObserver(recallLatency.Observe),
+		agentapi.WithExpandLatencyObserver(expandLatency.Observe),
+		agentapi.WithSummarizeLatencyObserver(summarizeLatency.Observe),
+		// Stage 8.3 step 2 (iter-2 evaluator fix #1) — wire
+		// the OTel tracer so the recall/expand/summarize verbs
+		// each open a real operational span. The tracer name
+		// is "agent-api" via the resource attribute the
+		// SetupTracer call attached above.
+		agentapi.WithTracer(tracerSetup.Tracer),
 		agentapi.WithReranker(reranker),
 		agentapi.WithSeedExpander(expander),
 		agentapi.WithExpansionDepth(1),
@@ -489,6 +550,15 @@ func main() {
 			// metric series.  See architecture §7.5 C24.
 			agentapi.WithObserveDegradedMetric(degradedCounter),
 			agentapi.WithObserveConsolidatorBackpressure(consolidatorSource),
+			// Stage 8.3 step 1 — observe verb latency
+			// histogram. ObserveService carries its own
+			// latency observer (its handler is separate
+			// from Service's Recall/Expand/Summarize).
+			agentapi.WithObserveLatency(observeLatency.Observe),
+			// Stage 8.3 step 2 (iter-2 evaluator fix #1) —
+			// wire the OTel tracer onto the observe verb
+			// so it opens an `agent.observe` span per call.
+			agentapi.WithObserveTracer(tracerSetup.Tracer),
 		}
 		var observeMetrics *agentapi.Metrics
 		if cfg.WALDir != "" {
@@ -583,6 +653,14 @@ func main() {
 			fmt.Fprintf(w, "# TYPE observe_wal_buffer_depth gauge\n")
 			fmt.Fprintf(w, "observe_wal_buffer_depth %d\n", depth)
 			degradedHandler.Write(w)
+			// Stage 8.3 step 1 — verb-latency histograms.
+			// Each Write emits a self-contained
+			// HELP/TYPE/series envelope so the body parses
+			// even when no samples have been observed yet.
+			recallLatency.Write(w)
+			observeLatency.Write(w)
+			expandLatency.Write(w)
+			summarizeLatency.Write(w)
 		})
 		srv := &http.Server{
 			Addr:              cfg.HealthAddr,
@@ -788,6 +866,20 @@ func loadConfig() (config, error) {
 			return c, fmt.Errorf("AGENT_MEMORY_RERANKER_INFERENCE_TIMEOUT must be > 0 (got %s)", v)
 		}
 		c.RerankerInferenceTimeout = d
+	}
+	// Stage 8.3 (iter-2 evaluator fix #3): the /metrics
+	// + /healthz HTTP surface MUST be on by default so
+	// Prometheus can scrape every binary without operator
+	// opt-in. Empty AGENT_MEMORY_HEALTH_ADDR defaults to
+	// :9464 (the OpenMetrics-conventional "second app"
+	// port; agent-api's gRPC owns :9460). Operators can
+	// still disable by setting AGENT_MEMORY_HEALTH_ADDR=off
+	// (compared case-insensitive after trim).
+	if c.HealthAddr == "" {
+		c.HealthAddr = ":9464"
+	} else if strings.EqualFold(strings.TrimSpace(c.HealthAddr), "off") ||
+		strings.EqualFold(strings.TrimSpace(c.HealthAddr), "disabled") {
+		c.HealthAddr = ""
 	}
 	return c, nil
 }

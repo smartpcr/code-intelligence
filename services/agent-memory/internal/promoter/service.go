@@ -14,6 +14,9 @@ import (
 	"github.com/lib/pq"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/embedding"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/obs"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Default parameter values surfaced both as package constants
@@ -232,6 +235,11 @@ type Service struct {
 	// publish_id / point_id values. Production passes nil →
 	// uses embedding.NewUUIDv4.
 	newUUID func() (string, error)
+
+	// tracer wraps each Tick in a promoter.tick OTel span
+	// (Stage 8.3 step 2). Nil falls back to a noop tracer
+	// at call time so unit tests don't need a tracer.
+	tracer trace.Tracer
 }
 
 // Option is the functional-options shape used to construct a
@@ -246,6 +254,18 @@ func WithUUIDFactory(fn func() (string, error)) Option {
 	return func(s *Service) {
 		if fn != nil {
 			s.newUUID = fn
+		}
+	}
+}
+
+// WithTracer installs the OTel tracer used to wrap each Tick
+// in a `promoter.tick` span (Stage 8.3 step 2 — OTel-trace
+// export from every binary on its own operational verbs).
+// Nil is tolerated and falls back to the noop tracer.
+func WithTracer(tracer trace.Tracer) Option {
+	return func(s *Service) {
+		if tracer != nil {
+			s.tracer = tracer
 		}
 	}
 }
@@ -455,6 +475,27 @@ type TickResult struct {
 // NOT through the pinned conn from step 2. The pinned conn is
 // CLOSED before step 6 executes.
 func (s *Service) Tick(ctx context.Context) (TickResult, error) {
+	// Stage 8.3 step 2 -- wrap the tick body in a
+	// `promoter.tick` OTel span so an operator can correlate
+	// the concept-promoter binary's work with the upstream
+	// trigger trace. A noop tracer is substituted when none
+	// was configured via WithTracer.
+	var result TickResult
+	err := obs.TickSpan(ctx, s.tracer, "promoter.tick", []attribute.KeyValue{
+		attribute.Int64("advisory_lock_key", s.cfg.AdvisoryLockKey),
+	}, func(ctx context.Context) error {
+		var innerErr error
+		result, innerErr = s.tickOnce(ctx)
+		return innerErr
+	})
+	return result, err
+}
+
+// tickOnce is the un-instrumented body of one promoter tick.
+// Tick wraps it in an OTel span (Stage 8.3 step 2); existing
+// unit tests that exercised Tick directly keep working because
+// the noop tracer fallback is transparent.
+func (s *Service) tickOnce(ctx context.Context) (TickResult, error) {
 	s.metrics.IncRuns()
 
 	tickCtx, cancel := context.WithTimeout(ctx, s.cfg.TickTimeout)

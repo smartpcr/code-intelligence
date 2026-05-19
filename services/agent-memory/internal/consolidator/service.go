@@ -12,7 +12,16 @@ import (
 	"time"
 
 	"github.com/lib/pq"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
+
+// noopConsolidatorTracer is the fallback used when the
+// Service has no tracer wired. Allocating once avoids per-tick
+// alloc churn.
+var noopConsolidatorTracer trace.Tracer = noop.NewTracerProvider().Tracer("consolidator.noop")
 
 // Default parameter values surfaced both as package constants
 // (so the binary's loadConfig can reference them in env-var
@@ -189,6 +198,38 @@ type Service struct {
 	cfg     Config
 	logger  *slog.Logger
 	metrics *Metrics
+	// tracer — Stage 8.3 step 2 OTel tracer used by Tick to
+	// open a `consolidator.tick` span per scheduler activation.
+	// nil-safe: callers may leave it unset and a noop tracer
+	// substitutes at call time. Wired by `WithTracer`.
+	tracer trace.Tracer
+}
+
+// Option configures a Service after construction. Used by
+// `cmd/consolidator/main.go` to plumb the OTel tracer set up
+// at process start without changing the existing
+// `New(db, cfg, logger)` signature.
+type Option func(*Service)
+
+// WithTracer plumbs an OpenTelemetry tracer onto the Service.
+// Stage 8.3 step 2: each Tick opens a `consolidator.tick` span
+// with attributes for episodes_scanned and concepts_created so
+// the trace UI can chart per-tick throughput alongside the
+// `consolidator_episode_lag` metric.
+func WithTracer(t trace.Tracer) Option {
+	return func(s *Service) {
+		s.tracer = t
+	}
+}
+
+// ApplyOptions applies the supplied options in order. Kept as
+// a named method so callers can construct a Service via
+// `consolidator.New(...)` and then call `svc.ApplyOptions(...)`
+// without exposing the Service struct internals.
+func (s *Service) ApplyOptions(opts ...Option) {
+	for _, opt := range opts {
+		opt(s)
+	}
 }
 
 // New constructs a Service. Panics on a nil *sql.DB (a nil-DB
@@ -426,13 +467,39 @@ type tickSnapshot struct {
 // MaxOpenConns=1) pool would deadlock waiting for a connection
 // to free up. This is the iter-2 fix for the evaluator's
 // integration-test deadlock.
-func (s *Service) Tick(ctx context.Context) (TickResult, error) {
+func (s *Service) Tick(ctx context.Context) (result TickResult, err error) {
 	s.metrics.IncRuns()
+
+	// Stage 8.3 step 2 (iter-2 evaluator fix #1) — open the
+	// per-tick `consolidator.tick` span. Wraps the entire
+	// tick lifecycle (open_run → delta scan → emit → finalise)
+	// so the trace UI can show how each phase contributes to
+	// the §8.3 consolidator latency budget.
+	tracer := s.tracer
+	if tracer == nil {
+		tracer = noopConsolidatorTracer
+	}
+	var span trace.Span
+	ctx, span = tracer.Start(ctx, "consolidator.tick", trace.WithAttributes(
+		attribute.Int("consolidator.threshold", s.cfg.Threshold),
+	))
+	defer func() {
+		span.SetAttributes(
+			attribute.String("consolidator.run_id", result.RunID),
+			attribute.Int64("consolidator.episodes_scanned", int64(result.EpisodesScanned)),
+			attribute.Int64("consolidator.concepts_created", int64(result.ConceptsCreated)),
+			attribute.Int64("consolidator.versions_appended", int64(result.VersionsAppended)),
+		)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "consolidator_tick_failed")
+		}
+		span.End()
+	}()
 
 	tickCtx, cancel := context.WithTimeout(ctx, s.cfg.TickTimeout)
 	defer cancel()
 
-	result := TickResult{}
 	snap := tickSnapshot{}
 
 	// Step 1: open the run row in its own transaction.

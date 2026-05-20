@@ -316,9 +316,16 @@ document and re-stated at the relevant body section.
 
 Surfaces in plain English:
 
-- **Management** is the lifecycle / control-plane surface: register a
-  repo, mark a commit as scanned, retract a sample, read the public
-  metric and finding views.
+- **Management** is the lifecycle / control-plane surface: register
+  a repo, change a repo's mode, retract a sample, rescan at a SHA,
+  mute / override a rule, and read the public metric and finding
+  views (all read verbs are `mgmt.read.*` per Section 6.3).
+  Management is the **formal G1 writer** of the Catalog / Lifecycle
+  sub-store (`Repo`, `RepoEvent`, `Commit`) but it **delegates**
+  actual `Commit` row creation to the **Repo Indexer** (Section
+  3.3, Management's formal G1 delegate) and it **never** writes
+  `Commit.scan_status` -- the Metric Ingestor is the only writer
+  of `Commit.scan_status` per Section 1.5.1 row 1.
 - **Metric Ingestor** turns "a SHA appeared" or "an external payload
   arrived" into rows in the Measurement sub-store.
 - **Compute Engine** consumes ASTs and writes foundation-tier rows.
@@ -1498,9 +1505,10 @@ wins.
 
 | Writer | Trigger | Reads | Writes |
 | --- | --- | --- | --- |
-| Management | `mgmt.register_repo`, `mgmt.set_mode` | -- | Repo, RepoEvent (Catalog / Lifecycle) |
+| Management | `mgmt.register_repo`, `mgmt.set_mode` | -- | Repo, RepoEvent (Catalog / Lifecycle). **Management is the formal G1 writer of `Commit`** (Section 1.5 G1 Catalog / Lifecycle row) but **delegates** actual `Commit` row creation to the Repo Indexer (next row, Section 3.3); Management itself never writes any `Commit` column directly, and never writes `Commit.scan_status` (Metric Ingestor row below, per Section 1.5.1 row 1). |
 | Management | `mgmt.retract_sample` | MetricSample (Measurement; validates sample exists) | RepoEvent (Catalog / Lifecycle; records intent + delegates to the Metric Ingestor, which appends `MetricRetraction` in Measurement -- Management is NOT a Measurement writer per G1) |
-| Worker -- Metric Ingestor (Section 3.1) | full / delta / external scan | MetricKind (Catalog / Lifecycle; schema lookup) | MetricSample, ScopeBinding, MetricRetraction (Measurement); Commit, ScanRun (Catalog / Lifecycle) |
+| Worker -- Repo Indexer (Section 3.3) [Management's formal G1 delegate for `Commit` creation] | git remote watch / git host webhook (new SHA appears on a tracked branch) | -- | `Commit` rows in Catalog / Lifecycle -- **every column except `scan_status`**: writes `(repo_id, sha, parent_sha, committed_at)` and stamps `scan_status='pending'` at insert time. The Indexer never updates a `Commit` row after insert; it never writes any sub-store other than Catalog / Lifecycle. Per Section 3.3 lines 446-449 and Section 1.5 G1, the Indexer holds Management's `Commit` writer slot by delegation; per Section 1.5.1 row 1, the Metric Ingestor is the only writer of `Commit.scan_status` thereafter. |
+| Worker -- Metric Ingestor (Section 3.1) | full / delta / external scan | MetricKind (Catalog / Lifecycle; schema lookup) | MetricSample, ScopeBinding, MetricRetraction (Measurement); ScanRun (Catalog / Lifecycle); `Commit.scan_status` (Catalog / Lifecycle, **only this column** -- transitions `pending -> scanning -> scanned | failed` per Section 1.5.1 row 1; the Repo Indexer row above writes every other `Commit` column at row creation time, and no component updates `Commit` columns other than `scan_status` after that). |
 | Worker -- SOLID Rule Engine batch (Section 3.6) | post-ingest refresh (Section 4.7) | MetricSample (Measurement); Rule, PolicyVersion, Override (Policy / rules) | **EvaluationRun, EvaluationVerdict, Finding** (Audit / verdict) -- per the expanded G1 ACL the batch worker writes all three tables; rows carry `EvaluationRun.caller='batch_refresh'`. |
 | Worker -- Refactor Planner (Section 3.9) | post-ingest refresh | MetricSample, Finding | HotSpot, RefactorPlan, RefactorTask (Refactor) |
 | Worker -- Cross-Repo Aggregator (Section 3.10) | cadence tick | MetricSample (Measurement; reads foundation-tier rows) | **MetricSample** (Measurement; **system-tier** rows only, stamped `pack='system'`, `source='derived'` per Section 3.10 step 4 -- the Aggregator is the **only** writer that produces `pack='system'` rows; foundation-tier writes remain with the Metric Ingestor per row above and per the Section 1.5.1 reconciliation table); RepoMetricSnapshot, CrossRepoPercentile, PortfolioSnapshot (Measurement; derived per G6) |

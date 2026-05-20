@@ -156,8 +156,9 @@ following decisions as "pinned in tech-spec":
 
 - `scan_timeout` and periodic-sweep cadence for orphan `ScanRun`
   cleanup (architecture Sec 3.1).
-- The exact partial-unique-index DDL for the `MetricSample`
-  active-row uniqueness invariant (architecture Sec 5.2.1).
+- The exact active-row uniqueness DDL for `MetricSample` --
+  pinned in Sec 8.7 as a separate `metric_sample_active`
+  pointer table (architecture G2/G3, Sec 5.2.1, Sec 5.2.2).
 - `window_days` default for the `modification_count_in_window`
   SOLID input materialisation (NOT for ML effort-model training
   -- architecture Sec 1.4 row 12 and Sec 5.3.3 are explicit
@@ -193,7 +194,8 @@ We build a **tree-sitter-backed AST adapter** that emits a
 canonical AST representation per file, a **Compute Engine** that
 applies per-language recipes to produce metric samples, a
 **PostgreSQL-backed append-only `MetricSample` store** with active-
-row uniqueness enforced by a partial unique index, a **signed
+row uniqueness enforced by a separate `metric_sample_active`
+pointer table (Sec 8.7), a **signed
 `PolicyVersion`** that maps metric thresholds + SOLID rule packs
 to verdicts, an **`eval.gate` gRPC surface** the evaluator agent
 calls per PR, a **Cross-Repo Aggregator** that produces derived
@@ -317,9 +319,10 @@ but opt-in. v1 language coverage is pinned in Sec 8.6.
 PostgreSQL `MetricSample` table with `MetricRetraction`
 satellite table for soft-deletes. Active-row uniqueness on
 `(repo_id, sha, scope_id, metric_kind, metric_version)` is
-enforced by a partial unique index whose DDL is pinned in
-Sec 8.7. G2 + G3 invariants from architecture Sec 1.5 are the
-acceptance criteria.
+enforced by a separate `metric_sample_active` pointer table
+whose DDL is pinned in Sec 8.7 (preserving G3 immutability of
+`MetricSample` rows). G2 + G3 invariants from architecture Sec
+1.5 are the acceptance criteria.
 
 ### 4.7 Signed `PolicyVersion` lifecycle
 
@@ -357,13 +360,24 @@ metric_kind into `CrossRepoPercentile`. G6 invariant
 (percentiles are derived, never authoritative) is the
 acceptance criterion.
 
-### 4.11 External metric ingest webhook (Cobertura XML only in v1)
+### 4.11 External metric ingest webhook (four verbs)
 
-A webhook endpoint that accepts Cobertura XML coverage reports
-and normalises them into `MetricSample` rows tagged with a
-provenance marker. Operator pin: `external-metric-coverage
--format=Cobertura XML` (architecture Sec 1.6 row 2). Other
-coverage formats are explicitly out of scope (Sec 5).
+A webhook endpoint surfaced by the Metric Ingestor that accepts
+external-mode payloads in **four ingest shapes**, mirroring the
+four `ScanRun` modes (architecture Sec 1.5.1 row 3, Sec 3.12,
+Sec 6.4):
+
+| Verb | SHA binding | Payload | Notes |
+|------|-------------|---------|-------|
+| `ingest.coverage` | `single` (one `sha` per call) | Cobertura XML (operator pin `external-metric-coverage-format=Cobertura XML`, arch Sec 1.6 row 2) | Writes coverage-related `MetricSample` rows. Other coverage formats (JaCoCo, lcov, Clover, Cobertura JSON) are out of scope **for this verb's payload** in v1 (Sec 5.6) |
+| `ingest.test_balance` | `single` | JSON `{scope_id, attempt_count, pass_count}` rows | Writes foundation-tier `pass_first_try_ratio`; the Cross-Repo Aggregator promotes it to system-tier `xservice_test_reliability` (architecture Sec 3.10 step 4) |
+| `ingest.churn` | `per_row` (each payload row carries its own `sha`) | JSON `{repo_id, file_path, sha, modified_at}` rows | Drives `modification_count_in_window` materialisation; parent `ScanRun.to_sha=NULL`. `window_days` (Sec 8.2) is the commit-window applied at materialisation |
+| `ingest.defects` | `per_row` | JSON `{repo_id, file_path, sha, defect_id, severity}` rows | Drives `defect_density` and downstream system-tier hotspot signals; parent `ScanRun.to_sha=NULL` |
+
+All four verbs produce `MetricSample` rows with `source='ingested'`
+(architecture Sec 5.2.1 field `source`) and route through the
+Metric Ingestor's single-writer role grant (C8). Webhook
+transport is REST + signed-HMAC body per Sec 8.5.
 
 ### 4.12 Management surface
 
@@ -421,8 +435,9 @@ planners do not re-litigate.
   planner emits `HotSpot` / `RefactorPlan` / `RefactorTask` rows;
   pushing them into an external tracker is a follow-on
   integration story.
-- **5.6 Non-Cobertura coverage formats** (JaCoCo, lcov, Clover,
-  Cobertura JSON). v1 ingests **only** Cobertura XML per
+- **5.6 Non-Cobertura coverage payloads for `ingest.coverage`**
+  (JaCoCo, lcov, Clover, Cobertura JSON). The `ingest.coverage`
+  verb (Sec 4.11) accepts **only** Cobertura XML in v1 per
   operator pin (architecture Sec 1.6 row 2). v2 can add adapters
   behind the same `External Metric Ingest Webhook` (architecture
   Sec 3).
@@ -505,18 +520,28 @@ these is a release-blocker.
 - **C1.** The `MetricSample` table MUST enforce active-row
   identity on the tuple `(repo_id, sha, scope_id, metric_kind,
   metric_version)`. "Active" means not present in the
-  `MetricRetraction` satellite table. Enforcement is by a
-  partial unique index whose DDL is pinned in Sec 8.7.
-- **C2.** `MetricSample` rows are **immutable**. Corrections
-  are issued by appending a new row + recording a retraction
-  for the prior row in the same transaction. Direct `UPDATE`
-  on `MetricSample` is forbidden at the role-grant level
-  (Sec 8.7).
+  `MetricRetraction` satellite table (architecture G2 lines
+  148-157). Enforcement is by a separate active-pointer table
+  (`metric_sample_active`) whose DDL is pinned in Sec 8.7 --
+  this preserves C2 immutability while giving the DB a true
+  unique constraint on the identity quintuple.
+- **C2.** `MetricSample` rows are **immutable** per
+  architecture G3 (architecture Sec 5.2.1 lines 908-920). No
+  column on `MetricSample` is ever updated after insert,
+  including `degraded` / `degraded_reason`. Corrections are
+  issued by appending a new `MetricSample` row at a **later
+  HEAD SHA** plus an append-only `MetricRetraction` row that
+  tombstones the prior `sample_id`; the active-pointer row is
+  updated to reference the new sample. Direct `UPDATE` or
+  `DELETE` on `MetricSample` is forbidden at the role-grant
+  level (Sec 8.7).
 - **C3.** Identity invariants persist across the
   embedded<->linked AST mode flip (operator pin row 1). The
-  `scope_id` derivation MUST be deterministic from
-  `(repo_id, file_path_normalised, ast_node_path)` and MUST
-  NOT depend on which mode the adapter ran in. (Risk 9.13.)
+  `scope_id` derivation MUST mirror architecture G2 /
+  ScopeBinding (architecture Sec 5.2.3 line 1043): a
+  deterministic UUID from `(repo_id, scope_kind,
+  canonical_signature, first_seen_sha)`. None of those four
+  inputs depend on which mode the adapter ran in. (Risk 9.13.)
 - **C4.** `metric_version` MUST be incremented when a compute
   recipe changes in a way that alters the numeric output for
   the same input AST. Recipes are versioned independently per
@@ -576,12 +601,17 @@ these is a release-blocker.
 ### 7.4 Findings cite their inputs (architecture G4)
 
 - **C14.** Every `Finding` row MUST cite the `MetricSample`
-  rows that drove the verdict via a `Finding.sample_refs`
-  array of `sample_id` values. A finding with empty
-  `sample_refs` is invalid and MUST NOT be written.
+  rows that drove the verdict via the
+  `Finding.metric_sample_ids` JSON array of `sample_id`
+  values (architecture Sec 5.4.1 lines 1174-1188; field name
+  is **`metric_sample_ids`**, not `sample_refs`). A finding
+  with an empty `metric_sample_ids` is invalid and MUST NOT
+  be written.
 - **C15.** Cited `MetricSample` rows MUST be active at the
   time the finding is emitted. The Evaluator Surface joins
-  against the active-row partial index (Sec 8.7) before writing.
+  against `clean_code.metric_sample_active` (Sec 8.7) before
+  writing -- the active-pointer table is the authoritative
+  active-set source.
 - **C16.** When a cited `MetricSample` is later retracted,
   the finding is NOT automatically retracted -- the historic
   audit trail is preserved. New gates evaluating the same
@@ -668,19 +698,31 @@ these is a release-blocker.
 ### 8.1 Storage engine and topology
 
 - **8.1.1 Engine.** PostgreSQL 16+. We pin 16 specifically
-  because the active-row partial unique index (C1, Sec 8.7)
-  relies on the planner improvements to partial indexes that
-  shipped in 16. Earlier versions parse the DDL but the
-  planner ignores the index for inequality predicates in some
-  query shapes.
+  because the active-row enforcement (C1, Sec 8.7) relies on
+  the planner's ability to do efficient FK joins from
+  `metric_sample_active` to `metric_sample` and on the
+  `ON CONFLICT ... DO UPDATE` upsert semantics that are stable
+  in 14+ and well-tuned by 16. Earlier versions work but
+  have known regressions around partition-pruned FK lookups.
 - **8.1.2 Instance topology.** Single primary + read replica.
   The Insights Surface and Cross-Repo Aggregator read from
   the replica; all writers go to the primary.
-- **8.1.3 Schema isolation.** CLEAN-CODE lives in a dedicated
-  `clean_code` schema, separate from `agent_memory`. Whether
-  they share a physical PostgreSQL instance is an
-  ops/deployment choice and not pinned here. Open question
-  `metrics-store-engine` captures the operator's call.
+- **8.1.3 Schema isolation and instance sharing.** CLEAN-CODE
+  lives in a dedicated `clean_code` schema, separate from
+  `agent_memory`. **Pinned default for v1:** the schema is
+  hosted on the **shared PostgreSQL instance** that already
+  carries `agent_memory`, with per-schema role grants
+  isolating the two services' writers (C5, Sec 8.7). Rationale:
+  AGENT-MEMORY precedent uses the same instance-per-org +
+  schema-per-service shape; a second physical cluster doubles
+  ops cost without removing the schema isolation that the
+  per-role grant scheme already provides. Operators who need a
+  dedicated cluster (e.g. for noisy-neighbour isolation or
+  per-tenant DB-level data-residency rules in a v2 multi-tenant
+  deployment, Sec 5.4) MAY override by re-targeting the
+  `clean_code` schema at a separate connection string -- no
+  schema, code, or role-grant changes are required. Locked
+  decision row 22 reflects this pin.
 - **8.1.4 Partitioning.** `MetricSample` is partitioned by
   `(metric_kind, sample_date_bucket)` where `sample_date_bucket`
   is monthly. `EvaluationRun`, `EvaluationVerdict`, and
@@ -762,12 +804,18 @@ these is a release-blocker.
   `version() int`. Recipes are loaded into the Compute Engine
   at boot from a static registry; runtime hot-swap is out of
   scope.
-- **v1 language coverage.** UNDECIDED -- captured as open
-  question `v1-language-coverage`. Default proposal pending
-  operator confirmation: Go + Python + TypeScript + Java
-  (covering the org's top-4 languages by repo count). All four
-  have mature tree-sitter grammars. Adding a language post-v1
-  is a recipe-pack addition, not a schema change.
+- **v1 language coverage.** **Pinned:** Go + Python +
+  TypeScript + Java -- the org's top-4 languages by repo
+  count. All four have mature, version-stable tree-sitter
+  grammars (`tree-sitter-go`, `tree-sitter-python`,
+  `tree-sitter-typescript`, `tree-sitter-java`) and have
+  recipe-shape precedent in Halleck45/ast-metrics. Adding a
+  language post-v1 is a recipe-pack addition (a row in
+  `recipe_manifest` plus the per-language `Recipe`
+  implementations) and not a schema change. The pin is
+  recorded as locked decision row 21; operators who need an
+  additional v1 language MAY add it by shipping the recipe
+  pack and the grammar pin in the same release.
 - **Recipe versioning.** Bumping a recipe's `version()` MUST
   bump the corresponding `metric_version` on emitted samples
   (C4). The Compute Engine publishes a `recipe_manifest` table
@@ -781,46 +829,148 @@ schema lives in `services/clean-code/migrations/` after
 implementation; the fragments here pin the architecture-
 deferred choices.
 
-**Active-row partial unique index on `MetricSample`** (C1):
+**Active-row uniqueness via a separate active-pointer table**
+(C1, C2):
+
+The architecture (G2 lines 148-157) requires "at most one active
+row per quintuple `(repo_id, sha, scope_id, metric_kind,
+metric_version)`" while G3 (lines 908-920, 1035-1037) requires
+`MetricSample` rows to be **immutable** -- no column on
+`MetricSample` is ever updated, including any retraction flag.
+A literal partial unique index of the form
+`CREATE UNIQUE INDEX ... WHERE sample_id NOT IN (SELECT
+sample_id FROM clean_code.metric_retraction)` is **not
+production-valid** because PostgreSQL rejects subqueries in
+index predicates. A trigger that flips an `is_retracted` boolean
+on `MetricSample` is **likewise not acceptable** because it
+violates G3 immutability (C2). We therefore pin a separate
+active-pointer table whose row IS the active-set membership
+fact and which CAN be mutated without touching `MetricSample`:
 
 ```sql
--- Append-only constraint: no direct UPDATE / DELETE grant
-CREATE INDEX metric_sample_active_uniq
-  ON clean_code.metric_sample (
-    repo_id,
-    sha,
-    scope_id,
-    metric_kind,
-    metric_version
-  )
-  WHERE sample_id NOT IN (
-    SELECT sample_id FROM clean_code.metric_retraction
-  );
--- Note: enforced as a unique index; PostgreSQL 16+ planner
--- correctly uses this for active-row joins. We rely on the
--- retraction insert + new-sample insert being in the same
--- transaction (C2) so the active set is consistent.
+-- Append-only row store. Plain, no triggers, no flag columns.
+CREATE TABLE clean_code.metric_sample (
+    sample_id      uuid PRIMARY KEY,
+    repo_id        uuid NOT NULL,
+    sha            text NOT NULL,
+    scope_id       uuid NOT NULL,
+    metric_kind    text NOT NULL,
+    metric_version int  NOT NULL,
+    value          double precision NOT NULL,
+    pack           text NOT NULL,
+    source         text NOT NULL,
+    degraded       boolean NOT NULL DEFAULT false,
+    degraded_reason text,
+    producer_run_id uuid NOT NULL,
+    attrs_json     jsonb,
+    recorded_at    timestamptz NOT NULL DEFAULT now(),
+    sample_date_bucket date GENERATED ALWAYS AS
+        (date_trunc('month', recorded_at)::date) STORED
+) PARTITION BY LIST (metric_kind);
+-- per-metric_kind sub-partition by sample_date_bucket monthly
+
+-- Tombstone log. Append-only; one row per retraction event.
+CREATE TABLE clean_code.metric_retraction (
+    retraction_id uuid PRIMARY KEY,
+    sample_id     uuid NOT NULL UNIQUE
+                  REFERENCES clean_code.metric_sample(sample_id),
+    reason        text NOT NULL,
+    appended_by   text NOT NULL,
+    created_at    timestamptz NOT NULL DEFAULT now()
+);
+-- UNIQUE on sample_id prevents double-retraction.
+
+-- Active-pointer table. One row per active quintuple.
+-- Mutable by DESIGN -- the Metric Ingestor updates this row
+-- when retraction + new sample land together. MetricSample
+-- itself remains untouched (G3 / C2).
+CREATE TABLE clean_code.metric_sample_active (
+    repo_id        uuid NOT NULL,
+    sha            text NOT NULL,
+    scope_id       uuid NOT NULL,
+    metric_kind    text NOT NULL,
+    metric_version int  NOT NULL,
+    sample_id      uuid NOT NULL
+                   REFERENCES clean_code.metric_sample(sample_id),
+    PRIMARY KEY (repo_id, sha, scope_id, metric_kind, metric_version)
+);
+
+CREATE UNIQUE INDEX metric_sample_active_sample_id_uniq
+    ON clean_code.metric_sample_active (sample_id);
 ```
 
-> Implementation note: the literal partial-unique-index form
-> above uses a subquery, which PostgreSQL rejects in index
-> predicates. The production form materialises an
-> `is_retracted boolean` column on `MetricSample` and uses
-> `WHERE is_retracted = false` in the index predicate, with
-> a trigger on `MetricRetraction` that flips the flag inside
-> the same transaction. The semantic guarantee (active-row
-> uniqueness) is the constraint that matters; the DDL shape
-> is an implementation detail captured here so the implementor
-> does not reinvent it.
+**Transactional pattern (Metric Ingestor, single writer per
+C5):**
+
+```sql
+BEGIN;
+-- 1. Append the new MetricSample row.
+INSERT INTO clean_code.metric_sample (...) VALUES ($new_sample);
+
+-- 2. If a prior active row existed for the same quintuple
+--    (G2 allows retract-then-reinsert), tombstone it.
+INSERT INTO clean_code.metric_retraction (sample_id, reason,
+       appended_by)
+SELECT a.sample_id, 'superseded', 'ingestor'
+  FROM clean_code.metric_sample_active a
+ WHERE (a.repo_id, a.sha, a.scope_id, a.metric_kind,
+        a.metric_version)
+     = ($repo, $sha, $scope, $kind, $version);
+
+-- 3. Upsert the active-pointer row. PostgreSQL's standard
+--    ON CONFLICT does the swap atomically.
+INSERT INTO clean_code.metric_sample_active (repo_id, sha,
+       scope_id, metric_kind, metric_version, sample_id)
+VALUES ($repo, $sha, $scope, $kind, $version, $new_sample.id)
+ON CONFLICT (repo_id, sha, scope_id, metric_kind, metric_version)
+DO UPDATE SET sample_id = EXCLUDED.sample_id;
+COMMIT;
+```
+
+**Reader pattern (Evaluator, Insights, Refactor Planner):**
+
+```sql
+-- Active-set query for a SHA-pinned read (Sec 7.7 / arch G3
+-- Read-time semantics): join through the pointer, not the
+-- raw sample table.
+SELECT s.*
+  FROM clean_code.metric_sample_active a
+  JOIN clean_code.metric_sample s ON s.sample_id = a.sample_id
+ WHERE a.repo_id = $repo AND a.sha = $sha;
+```
+
+Why this shape:
+
+- **MetricSample is immutable (C2 / G3).** No trigger, no
+  flag, no `UPDATE` ever touches `MetricSample`. The DDL grant
+  in this section's next block explicitly revokes `UPDATE` and
+  `DELETE` on `clean_code.metric_sample` from every role.
+- **Active-row uniqueness is DB-enforced (C1 / G2).** The
+  `PRIMARY KEY` on `metric_sample_active` is a real unique
+  constraint on the identity quintuple. There is no subquery,
+  no partial predicate, no clever index. The
+  `metric_sample_active_sample_id_uniq` index ensures a single
+  pointer never references two samples.
+- **Retract-then-reinsert at the same quintuple is supported**
+  (architecture G2 line 154-156) by the `ON CONFLICT ... DO
+  UPDATE` clause on `metric_sample_active` in the transactional
+  pattern. The retracted `MetricSample` row stays in the table
+  forever as the audit trail.
+- **Readers never see retracted samples** because they join
+  through `metric_sample_active` rather than scanning
+  `metric_sample` directly. The reader pattern is normative.
 
 **Append-only role grants** (C2, C25):
 
 ```sql
--- Metric Ingestor role
+-- Metric Ingestor role: append to samples + retractions + active-pointer swaps.
 GRANT INSERT, SELECT ON clean_code.metric_sample TO clean_code_metric_ingestor;
 GRANT INSERT, SELECT ON clean_code.metric_retraction TO clean_code_metric_ingestor;
--- Explicitly NO UPDATE or DELETE grant
+GRANT INSERT, SELECT, UPDATE ON clean_code.metric_sample_active TO clean_code_metric_ingestor;
+-- MetricSample remains strictly immutable.
 REVOKE UPDATE, DELETE ON clean_code.metric_sample FROM PUBLIC, clean_code_metric_ingestor;
+REVOKE DELETE         ON clean_code.metric_retraction FROM PUBLIC, clean_code_metric_ingestor;
+REVOKE DELETE         ON clean_code.metric_sample_active FROM PUBLIC, clean_code_metric_ingestor;
 -- Audit/verdict sub-store: append-only across the board for all three callers
 -- (Evaluator Surface, SOLID Rule Engine batch worker, WAL Reconciler replay-only)
 GRANT INSERT, SELECT ON clean_code.evaluation_run TO clean_code_evaluator, clean_code_solid_batch, clean_code_wal_reconciler;
@@ -831,21 +981,17 @@ REVOKE UPDATE, DELETE ON clean_code.evaluation_run, clean_code.evaluation_verdic
 
 **Partitioning conventions** (Sec 8.1.4):
 
-```sql
-CREATE TABLE clean_code.metric_sample (
-    sample_id     uuid PRIMARY KEY,
-    repo_id       uuid NOT NULL,
-    sha           text NOT NULL,
-    scope_id      text NOT NULL,
-    metric_kind   text NOT NULL,
-    metric_version int  NOT NULL,
-    value         double precision NOT NULL,
-    is_retracted  boolean NOT NULL DEFAULT false,
-    recorded_at   timestamptz NOT NULL DEFAULT now(),
-    sample_date_bucket date GENERATED ALWAYS AS (date_trunc('month', recorded_at)::date) STORED
-) PARTITION BY LIST (metric_kind);
--- per-metric_kind sub-partition by sample_date_bucket monthly
-```
+The `metric_sample` partitioning shape is pinned alongside the
+table CREATE in the active-row block above: `PARTITION BY LIST
+(metric_kind)` with monthly sub-partitions keyed on
+`sample_date_bucket`. The active-pointer table
+(`metric_sample_active`) is **not** partitioned -- it is the
+hot read path for SHA-pinned reads and benefits from the single
+B-tree on its primary key. Retention on `metric_sample` is
+partition-drop only (Sec 8.1.4); when a `metric_sample`
+partition is dropped, the corresponding `metric_sample_active`
+rows are dropped via FK cascade enforced at the application
+layer (the Metric Ingestor sweep, Sec 8.2 `periodic_sweep_cadence`).
 
 **Enum types.** `degraded_reason` (C21; populates both
 `MetricSample.degraded_reason` and `EvaluationVerdict
@@ -945,11 +1091,22 @@ discovered.
   trunk-based dev, churn pattern flips).
 - **Impact.** Refactor planner mis-ranks
   recommendations; teams lose trust in the backlog.
-- **Mitigation.** (a) Re-train quarterly on the rolling
-  `window_days=90` window (Sec 8.2). (b) Publish model
-  evaluation metrics (MAE on hold-out PRs) alongside the
-  model version in `recipe_manifest`. (c) Operator can
-  manually re-rank or override per-recommendation.
+- **Mitigation.** (a) Re-train **on a quarterly cadence** with
+  a separate `model_training_lookback_days` parameter (default
+  `90`) that is **distinct from** `PolicyVersion.refactor_weights.window_days`
+  (Sec 8.2). The two parameters happen to share the same default
+  value but mean different things: `window_days` is the
+  commit-window the Metric Ingestor uses to materialise
+  `modification_count_in_window` SOLID input rows on
+  `ingest.churn` arrival (architecture Sec 5.3.3, Sec 3.1 case
+  3); `model_training_lookback_days` is the rolling historical
+  window the offline trainer consumes from
+  `EvaluationRun`/`EvaluationVerdict` to fit the effort model.
+  Conflating the two would couple a policy-publish parameter to
+  the ML training cadence, which we explicitly forbid. (b)
+  Publish model evaluation metrics (MAE on hold-out PRs)
+  alongside the model version in `recipe_manifest`. (c)
+  Operator can manually re-rank or override per-recommendation.
 - **Residual.** Online learning is out of scope (Sec 5.11);
   drift between quarterly trains is accepted.
 
@@ -960,16 +1117,25 @@ discovered.
   violations are by design or out of the team's control.
 - **Impact.** Gate fails on code the team cannot/should
   not fix; team distrusts the gate.
-- **Mitigation.** (a) `PolicyVersion` carries a
-  `path_exclusions` glob list; the Compute Engine respects
-  exclusions and the Evaluator Surface short-circuits
-  findings on excluded scopes. (b) Per-finding mute / unmute
-  flows through the `mgmt.override` verb (architecture Sec
-  1.5.1 row 5 -- `policy.override` does NOT exist on the
-  Policy Steward surface) and lands in the `Override` row in
-  the Policy / rules sub-store; future evaluations honour
-  active overrides. See Risk 9.10 for the mute-storm
-  counter-risk.
+- **Mitigation.** (a) Path-level exclusions live on `Override`
+  rows, **not** on `PolicyVersion`. Per architecture Sec 5.3.6
+  (lines 1160-1170), `Override` carries a `scope_filter` JSON
+  field of shape `{repo_id, scope_kind, scope_signature_glob}`
+  plus a `mute` boolean; the Compute Engine respects the
+  scope_filter and the Evaluator Surface short-circuits findings
+  on matched scopes (writing `severity='info'` to preserve the
+  audit trail when `mute=true`, per architecture Sec 5.3.6 line
+  1167). Operators emit exclusions through `mgmt.override`
+  (architecture Sec 6.3 / Sec 1.5.1 row 5 -- `policy.override`
+  does NOT exist on the Policy Steward surface); the Policy
+  Steward appends the `Override` row in the Policy/rules
+  sub-store; future evaluations honour the active overrides.
+  `PolicyVersion` itself carries only `rule_refs`,
+  `threshold_refs`, `refactor_weights`, and `signature`
+  (architecture Sec 5.3.3 lines 1125-1131) -- it does NOT
+  carry path exclusions. (b) Per-finding mute / unmute also
+  flows through `mgmt.override` and lands in `Override`. See
+  Risk 9.10 for the mute-storm counter-risk.
 - **Residual.** Tuning exclusions / mutes is per-team
   operational work; CLEAN-CODE provides the surfaces.
 
@@ -996,18 +1162,26 @@ discovered.
   windows extend; `eval.gate` returns `DEGRADED`.
 - **Mitigation.** (a) Cycle detection runs as a separate
   pass scheduled outside the per-PR critical path. (b) The
-  metric_kind `package_cycle_count` is computed per
-  module / package and aggregated -- not as a single
-  whole-repo cycle search. (c) Operator can disable the
-  metric on opt-out repos via `PolicyVersion`.
+  catalog metric is `cycle_member` (architecture Sec 1.4.1
+  row 10; foundation-tier boolean rows -- 1 iff the scope
+  participates in a strongly-connected component, with the
+  cycle id carried in `MetricSample.attrs_json.cycle_id`,
+  architecture Sec 5.2.1 field `attrs_json`). Computation is
+  per-package/per-file rather than a single whole-repo cycle
+  search, and per-cycle aggregation rolls up to the
+  Cross-Repo Aggregator's system-tier `arch_debt_ratio`
+  (architecture Sec 1.4.2). (c) Operator can disable
+  `cycle_member` evaluation on opt-out repos via an
+  `Override` row with the `cycle_member` rule muted and a
+  `scope_filter` scoped to `repo_id` (architecture Sec 5.3.6).
 - **Residual.** Cycle metric latency on the largest repos
   is acknowledged; the gate degrades gracefully.
 
-### 9.9 Active-row partial unique index lock contention
+### 9.9 Active-pointer table lock contention
 
 - **Trigger.** Two concurrent scan runs against the same
-  `(repo, sha)` both attempt to write samples; the partial
-  unique index serialises them.
+  `(repo, sha)` both attempt to write samples; the
+  `metric_sample_active` upsert serialises them.
 - **Impact.** Tail-latency spike on Metric Ingestor writes.
 - **Mitigation.** (a) Repo Indexer's scan-state machine
   guarantees one running `ScanRun` per `(repo, sha)` at a
@@ -1069,10 +1243,11 @@ discovered.
 - **Impact.** Active-row uniqueness invariant violated;
   retractions misalign; findings cite wrong samples.
 - **Mitigation.** (a) `scope_id` is derived from
-  `(repo_id, normalised_file_path, ast_node_path)` --
-  none of which depend on the AST mode. (b) Integration
-  test in CI flips the mode between two scans of the same
-  input and asserts identical `scope_id` set.
+  `(repo_id, scope_kind, canonical_signature, first_seen_sha)`
+  per architecture G2 / ScopeBinding (architecture Sec 5.2.3
+  line 1043) -- none of which depend on the AST mode. (b)
+  Integration test in CI flips the mode between two scans of
+  the same input and asserts identical `scope_id` set.
 - **Residual.** A bug in `scope_id` derivation breaks
   this; the reconciler will detect the drift but cannot
   retroactively fix the misaligned rows.
@@ -1120,32 +1295,32 @@ you only read one section of this doc, read this one.
 | 1 | Storage engine | PostgreSQL 16+ | Sec 8.1.1 |
 | 2 | Schema isolation | dedicated `clean_code` schema | Sec 8.1.3 |
 | 3 | `MetricSample` partitioning | `(metric_kind, month)` | Sec 8.1.4 |
-| 4 | Active-row uniqueness | partial unique index via `is_retracted` flag | C1, Sec 8.7 |
-| 5 | Metric / audit append-only | no `UPDATE` / `DELETE` grants | C2, C25, Sec 8.7 |
+| 4 | Active-row uniqueness | separate `metric_sample_active` pointer table with PK on the identity quintuple; `MetricSample` immutable | C1, C2, Sec 8.7 |
+| 5 | Metric / audit append-only | no `UPDATE` / `DELETE` grants on `MetricSample`; `UPDATE` only on `metric_sample_active` pointer | C2, C25, Sec 8.7 |
 | 6 | `scan_timeout` | 30 min | Sec 8.2 |
 | 7 | Sweep cadence | 5 min | Sec 8.2 |
 | 8 | Full-scan cadence | nightly 00:00 UTC | Sec 8.2 |
-| 9 | Refactor effort `window_days` | 90 | Sec 8.2 |
+| 9 | Refactor effort `window_days` (churn-materialisation only) | 90 days; **distinct from** `model_training_lookback_days` | Sec 8.2, Risk 9.5 |
 | 10 | Percentile `freshness_window_seconds` | 3600 | Sec 8.2 |
 | 11 | Key-rotation overlap floor | 86400 s | Sec 8.2 |
 | 12 | Policy signing algorithm | Ed25519 | Sec 8.4 |
 | 13 | Policy signing required | v1 required (operator pin) | C9, arch Sec 1.6 |
 | 14 | AST mode default | embedded (operator pin) | Sec 4.5, arch Sec 1.6 |
-| 15 | External coverage format | Cobertura XML only (operator pin) | Sec 4.11, arch Sec 1.6 |
+| 15 | External coverage payload (verb `ingest.coverage`) | Cobertura XML only (operator pin) | Sec 4.11, arch Sec 1.6 |
 | 16 | Gate degraded policy | warn (operator pin) | Sec 4.8, arch Sec 1.6 |
 | 17 | Refactor effort source | ML model on historical commits (operator pin) | Sec 4.9, arch Sec 1.6 |
 | 18 | Agent transport | gRPC + protobuf, mTLS | Sec 8.5 |
 | 19 | Management transport | REST + JSON, OIDC | Sec 8.5 |
-| 20 | External webhook transport | REST + XML, HMAC | Sec 8.5 |
-| 21 | v1 language coverage | UNDECIDED -- open question `v1-language-coverage` | Sec 8.6 |
-| 22 | Cross-store deployment | UNDECIDED -- open question `metrics-store-engine` | Sec 8.1.3 |
+| 20 | External webhook transport | REST + signed-HMAC body (per verb in Sec 4.11) | Sec 8.5 |
+| 21 | v1 language coverage | Go + Python + TypeScript + Java | Sec 8.6 |
+| 22 | Cross-store deployment | shared PostgreSQL instance with `agent_memory`, separate `clean_code` schema, per-role grants | Sec 8.1.3 |
 | 23 | Closed `degraded_reason` set | 4 values, table at C21 | Sec 7.7 |
-| 24 | Writer count per sub-store | exactly 1, table at C5 | Sec 7.2 |
+| 24 | Sub-store writer model | 5 logical sub-stores with split-writer carve-outs per architecture Sec 1.5 G1 + Sec 1.5.1 reconciliation (Catalog/Lifecycle = Management + Metric Ingestor; Measurement system-tier carve-out = Cross-Repo Aggregator; Audit/verdict shared by Evaluator + SOLID batch + WAL Reconciler); see C5 table for the per-row writers | Sec 7.2 |
 | 25 | Refactor Planner write scope | `HotSpot` / `RefactorPlan` / `RefactorTask` only | C7, C23 |
-| 26 | Findings cite samples | mandatory; rejected if empty | C14 |
+| 26 | Findings cite samples | mandatory via `Finding.metric_sample_ids`; rejected if empty | C14 |
 | 27 | Percentiles derived, not authoritative | gate joins raw samples | C17 |
 | 28 | AST is canonical front end | external webhook is the only exception | C19 |
-| 29 | Mode-flip identity preservation | `scope_id` mode-agnostic | C3, C24, Risk 9.13 |
+| 29 | Mode-flip identity preservation | `scope_id` from `(repo_id, scope_kind, canonical_signature, first_seen_sha)` -- mode-agnostic | C3, Risk 9.13 |
 | 30 | Multi-tenant | out of scope v1; `tenant_id` reserved | Sec 4.14, Sec 5.4 |
 
 ---
@@ -1191,8 +1366,9 @@ you only read one section of this doc, read this one.
 ## 12. Glossary
 
 - **Active row.** A `MetricSample` row whose `sample_id` is
-  not present in `MetricRetraction` (equivalently:
-  `is_retracted = false`).
+  referenced by a row in `clean_code.metric_sample_active`
+  for its identity quintuple (equivalently: not present in
+  `MetricRetraction`).
 - **Scope.** A unit of source code -- file, package, module,
   or repo -- that a metric attaches to. Identified by
   `scope_id`, which is mode-agnostic (C3).

@@ -689,8 +689,8 @@ these is a release-blocker.
   | Sub-store | Tables | Writer(s) | Notes |
   |-----------|--------|-----------|-------|
   | Catalog / Lifecycle | `Repo`, `Commit`, `RepoEvent`, `MetricKind`, `ScanRun` | Management (writes `Repo`, `RepoEvent`, and every `Commit` column **except** `scan_status`) + Metric Ingestor (writes `ScanRun` and the `Commit.scan_status` column **only**) | The `Commit.scan_status` `'pending'` initial value is supplied by a schema-level column DEFAULT -- no component writes it explicitly. See architecture Sec 1.5.1 row 1 for the normative split. Repo Indexer (architecture Sec 3.3) is Management's delegated writer for the `Commit` columns Management owns |
-  | Measurement | `MetricSample` rows where `pack IN ('base', 'solid', 'ingested')`, `ScopeBinding`, `MetricRetraction` | Metric Ingestor | Foundation-tier rows + retractions |
-  | Measurement (system-tier carve-out) | `MetricSample` rows where `pack='system'` AND `source='derived'`, `RepoMetricSnapshot`, `CrossRepoPercentile`, `PortfolioSnapshot` | Cross-Repo Aggregator | The **only** writer of `pack='system'` rows; see architecture Sec 3.10 step 4 and Sec 1.5.1 row 2 |
+  | Measurement | `MetricSample` rows where `pack IN ('base', 'solid', 'ingested')`, `ScopeBinding`, `MetricRetraction`, `metric_sample_active` rows where `metric_kind` is foundation-tier | Metric Ingestor | Foundation-tier rows + retractions + foundation pointer entries |
+  | Measurement (system-tier carve-out) | `MetricSample` rows where `pack='system'` AND `source='derived'`, `RepoMetricSnapshot`, `CrossRepoPercentile`, `PortfolioSnapshot`, `metric_sample_active` rows where `metric_kind` is system-tier, plus `MetricRetraction` entries for system-tier rows | Cross-Repo Aggregator | The **only** writer of `pack='system'` rows; both Measurement writers share the single `metric_sample_active` pointer table with disjoint-by-`metric_kind` carve-outs (Sec 8.7) so the normative active-pointer reader pattern applies uniformly to all `pack` values; see architecture Sec 3.10 step 4 and Sec 1.5.1 row 2 |
   | Policy / rules | `Rule`, `RulePack`, `PolicyVersion`, `PolicyActivation`, `Threshold`, `Override` | Policy Steward | The **only** writer of `RulePack`; Management has no `mgmt.publish_rulepack` delegate (architecture Sec 1.5.1 row 4) |
   | Audit / verdict | `EvaluationRun`, `EvaluationVerdict`, `Finding` | Evaluator Surface (`eval.gate` caller) + SOLID Rule Engine batch worker (`EvaluationRun.caller='batch_refresh'`, architecture Sec 3.6) + Audit WAL Reconciler (replay-only, architecture Sec 7.10) | Three callers share one write path; `EvaluationRun.caller` tags each row's origin. WAL Reconciler never originates new rows |
   | Refactor | `HotSpot`, `RefactorPlan`, `RefactorTask` | Refactor Planner (architecture Sec 3.9) | Read-only against Measurement + Policy + Audit + Catalog |
@@ -1200,40 +1200,59 @@ Why this shape:
 
 The Measurement sub-store has TWO writer roles per the C5 ACL
 table (Sec 7.2): the **Metric Ingestor** for `pack IN ('base',
-'solid', 'ingested')` rows + the active-pointer table + the
-retraction log, and the **Cross-Repo Aggregator** for
-`pack='system'` AND `source='derived'` rows (architecture Sec
-3.10 step 4, Sec 1.5.1 row 2). Both roles get `INSERT, SELECT`
-on `metric_sample`; the Aggregator additionally gets the
-sibling aggregator-owned tables (`RepoMetricSnapshot`,
-`CrossRepoPercentile`, `PortfolioSnapshot`). Neither role
-gets `UPDATE` or `DELETE` on `metric_sample` (G3 row
-immutability). Only the Metric Ingestor writes the
-`metric_sample_active` pointer table -- the Aggregator's
-system-tier rows are pointed to by the Ingestor in the same
-transactional pattern when an Aggregator emit completes
-(Sec 8.2 sweep), or are read directly via a system-tier
-projection that does not use the pointer table when the
-Aggregator owns its own latest-row resolution (the choice is
-implementation-local to `services/clean-code`):
+'solid', 'ingested')` rows + the retraction log, and the
+**Cross-Repo Aggregator** for `pack='system'` AND
+`source='derived'` rows (architecture Sec 3.10 step 4, Sec
+1.5.1 row 2) + the aggregator-owned snapshot tables
+(`RepoMetricSnapshot`, `CrossRepoPercentile`,
+`PortfolioSnapshot`). Both roles get `INSERT, SELECT` on
+`metric_sample`; neither gets `UPDATE` or `DELETE` on it (G3
+row immutability).
+
+**Active-pointer table writers (single-table, two-writer
+carve-out).** `metric_sample_active` is the **only** active-set
+relation -- there is no parallel system-tier projection that
+bypasses it. Both Measurement writers maintain their own
+pointer rows in the same transactional pattern (the pattern
+shown above for the Ingestor applies identically to the
+Aggregator); the writer roles never collide on a quintuple
+because `metric_kind` partitions the table by writer (the
+Ingestor only ever writes pointers for `base` / `solid` /
+`ingested` kinds, the Aggregator only ever writes pointers
+for `system` kinds), so the two-writer grant on the pointer
+table cannot violate single-writer-per-row -- it is a
+single-writer-per-metric_kind carve-out, structurally
+identical to the C5 split on `metric_sample` itself.
+Retractions on system-tier rows follow the same pointer-swap
+flow via the `MetricRetraction` log (G2 lines 154-156); the
+reader pattern at lines 1150-1196 above is normative for ALL
+`pack` values, including `pack='system'`, and C15's
+active-pointer citation rule applies uniformly.
 
 ```sql
--- Metric Ingestor role: append to foundation samples + retractions + active-pointer swaps.
+-- Metric Ingestor role: append foundation/solid/ingested samples + retractions + active-pointer swaps for those kinds.
 GRANT INSERT, SELECT         ON clean_code.metric_sample          TO clean_code_metric_ingestor;
 GRANT INSERT, SELECT         ON clean_code.metric_retraction      TO clean_code_metric_ingestor;
 GRANT INSERT, SELECT, UPDATE ON clean_code.metric_sample_active   TO clean_code_metric_ingestor;
--- Cross-Repo Aggregator role: append system-tier rows + own snapshot tables (C5 carve-out row).
+-- Cross-Repo Aggregator role: append system-tier samples + own snapshot tables (C5 carve-out row)
+-- AND maintain the active-pointer rows for system-tier metric_kinds via the same transactional pattern.
 GRANT INSERT, SELECT         ON clean_code.metric_sample          TO clean_code_xrepo_aggregator;
+GRANT INSERT, SELECT         ON clean_code.metric_retraction      TO clean_code_xrepo_aggregator;
+GRANT INSERT, SELECT, UPDATE ON clean_code.metric_sample_active   TO clean_code_xrepo_aggregator;
 GRANT INSERT, SELECT         ON clean_code.repo_metric_snapshot   TO clean_code_xrepo_aggregator;
 GRANT INSERT, SELECT         ON clean_code.cross_repo_percentile  TO clean_code_xrepo_aggregator;
 GRANT INSERT, SELECT         ON clean_code.portfolio_snapshot     TO clean_code_xrepo_aggregator;
 -- MetricSample remains strictly immutable for both writer roles.
 REVOKE UPDATE, DELETE ON clean_code.metric_sample          FROM PUBLIC, clean_code_metric_ingestor, clean_code_xrepo_aggregator;
-REVOKE DELETE         ON clean_code.metric_retraction      FROM PUBLIC, clean_code_metric_ingestor;
-REVOKE DELETE         ON clean_code.metric_sample_active   FROM PUBLIC, clean_code_metric_ingestor;
+REVOKE DELETE         ON clean_code.metric_retraction      FROM PUBLIC, clean_code_metric_ingestor, clean_code_xrepo_aggregator;
+REVOKE DELETE         ON clean_code.metric_sample_active   FROM PUBLIC, clean_code_metric_ingestor, clean_code_xrepo_aggregator;
 REVOKE UPDATE, DELETE ON clean_code.repo_metric_snapshot,
                          clean_code.cross_repo_percentile,
                          clean_code.portfolio_snapshot     FROM PUBLIC, clean_code_xrepo_aggregator;
+-- Per-metric_kind partitioning of the pointer-table grant is enforced at the
+-- application layer (each writer service only ever passes its own metric_kind
+-- values into the INSERT/UPDATE statements); the row-immutability + active-set
+-- semantics on metric_sample remain DB-enforced for both writers.
 -- Audit/verdict sub-store: append-only across the board for all three callers
 -- (Evaluator Surface, SOLID Rule Engine batch worker, WAL Reconciler replay-only)
 GRANT INSERT, SELECT ON clean_code.evaluation_run TO clean_code_evaluator, clean_code_solid_batch, clean_code_wal_reconciler;

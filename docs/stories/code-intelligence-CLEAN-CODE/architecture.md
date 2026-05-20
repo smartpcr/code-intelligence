@@ -233,7 +233,7 @@ these.
 
 ### 1.5.1 Writer-ownership reconciliation (normative single-claim per disputed seam)
 
-Three writer-ownership seams have surfaced in prior reviews as
+Five normative seams have surfaced in prior reviews as
 "contradicted across sections". For each, this table is the
 **single normative claim** the rest of the document is required to
 match. If a later section appears to say otherwise, this table wins
@@ -891,39 +891,60 @@ against. Every table belongs to exactly one G1 sub-store
 >
 > **Read-time semantics (normative -- the only correct way to
 > consume around degraded rows).** Two read modes are defined
-> on the Read API (Section 3.4) and the Evaluator Surface
-> (Section 3.7); every reader MUST declare which mode it is in:
+> on the **Management surface read verbs** (Section 3.13 /
+> Section 6.3 `mgmt.read.*`) and the Evaluator Surface (Section
+> 3.7 / Section 6.2 `eval.gate`); every reader MUST declare
+> which mode it is in. **The mode is mechanically determined by
+> whether the caller supplies a `sha` argument to the verb** --
+> there is no separate "read API" component, only the per-verb
+> SHA shape defined in Section 6.3:
 >
-> - **SHA-pinned reads** (`eval.gate`, `refactor.*`, and any
->   `read.*` call that supplies a `sha` parameter) MUST return
->   the row at the exact requested SHA. If the row at that SHA
->   is degraded, the reply carries `Degraded { reason }`
->   (Section 6.1) and the `gate-degraded-policy=warn` rule
->   (Section 1.6) governs the resulting verdict. **A SHA-pinned
->   reader NEVER silently substitutes a later-SHA value for an
->   earlier-SHA query.** This preserves G2 (the
->   `(repo_id, sha, scope_id, metric_kind, metric_version)`
->   identity), keeps every historical verdict reproducible, and
->   means a `Finding` or `RefactorTask` persisted against a SHA
->   always cites a row that actually existed at that SHA.
-> - **Latest-dashboard reads** (`read.snapshot` with no `sha`
->   parameter, the Insights Surface dashboards in Section 3.4,
->   the cross-repo portfolio surface in Section 3.13) MAY
->   substitute the latest non-degraded row per
+> - **SHA-pinned reads** (`eval.gate`; any `mgmt.read.*` verb
+>   whose Section 6.3 signature has `sha` as a **required**
+>   argument -- `mgmt.read.metric_samples(repo_id, sha, ...)`,
+>   `mgmt.read.regressions(repo_id, sha, ...)`,
+>   `mgmt.read.refactor_plan(repo_id, sha)` -- and any
+>   `mgmt.read.*` verb with optional `sha?` called WITH a `sha`
+>   argument -- e.g. `mgmt.read.findings(repo_id, sha=...)`,
+>   `mgmt.read.cross_repo(..., sha=...)`; plus the Refactor
+>   Planner's internal reads at Section 3.9) MUST return the
+>   row at the exact requested SHA. If the row at that SHA is
+>   degraded, the reply carries `Degraded { reason }` (Section
+>   6.1) and the `gate-degraded-policy=warn` rule (Section 1.6)
+>   governs the resulting verdict. **A SHA-pinned reader NEVER
+>   silently substitutes a later-SHA value for an earlier-SHA
+>   query.** This preserves G2 (the `(repo_id, sha, scope_id,
+>   metric_kind, metric_version)` identity), keeps every
+>   historical verdict reproducible, and means a `Finding` or
+>   `RefactorTask` persisted against a SHA always cites a row
+>   that actually existed at that SHA.
+> - **Latest-dashboard reads** (`mgmt.read.*` verbs whose
+>   Section 6.3 signature has **no** `sha` argument --
+>   `mgmt.read.repo(repo_id)`, `mgmt.read.portfolio(metric_kind,
+>   scope_kind)` -- and any `mgmt.read.*` verb with optional
+>   `sha?` called WITHOUT a `sha` argument -- e.g.
+>   `mgmt.read.findings(repo_id)`, `mgmt.read.cross_repo(...)`;
+>   plus the Insights Surface (Section 3.8) dashboards, which
+>   call these no-`sha` / optional-`sha` verbs under the hood)
+>   MAY substitute the latest non-degraded row per
 >   `(repo_id, scope_id, metric_kind, metric_version)` via
 >   `MAX(Commit.committed_at)` to give a "current best estimate"
 >   view. These substitutions are NEVER persisted into a
->   `Finding`, a `RefactorTask`, or an `EvaluationVerdict`; they
->   are read-only UI projections and the reply explicitly stamps
->   `substituted_from_sha` on the response envelope so the UI
->   can render "as of SHA X" rather than the query SHA.
+>   `Finding`, a `RefactorTask`, or an `EvaluationVerdict`;
+>   they are read-only UI projections and the reply explicitly
+>   stamps `substituted_from_sha` on the response envelope so
+>   the UI can render "as of SHA X" rather than the query SHA.
 >
-> The two modes are disjoint by design: a single call is either
-> SHA-pinned or latest-dashboard, never both. The Evaluator
-> Surface is always SHA-pinned; the Refactor Planner is always
-> SHA-pinned; the Insights dashboards are always
-> latest-dashboard (Insights queries that need SHA-pinned
-> reproducibility go through the Read API instead).
+> The two modes are disjoint by design: a single call is
+> either SHA-pinned or latest-dashboard, never both. The
+> Evaluator Surface (Section 3.7) is always SHA-pinned; the
+> Refactor Planner (Section 3.9) is always SHA-pinned; the
+> Insights Surface (Section 3.8) dashboards are always
+> latest-dashboard. Insights queries that need SHA-pinned
+> reproducibility go through `mgmt.read.metric_samples(repo_id,
+> sha, ...)` or `mgmt.read.findings(repo_id, sha=...)` on the
+> Management surface (Section 3.13 / Section 6.3) instead of
+> through the dashboard verbs.
 >
 > If an operator explicitly needs the degraded row removed from
 > SHA-pinned gate inputs before a new HEAD SHA arrives, they

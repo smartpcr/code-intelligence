@@ -269,16 +269,33 @@ SRP / OCP / DIP / LSP / ISP rule packs (Sec 4.3).
 
 ### 4.1.1 Ingested-pack foundation metric_kinds (pinned in tech-spec)
 
-The four `ingest.*` verbs (architecture Sec 6.4) write foundation-
-tier rows with `pack='ingested'` and `source='ingested'` per the
-architecture's enum at Sec 5.2.1 (the `pack` enum is `base | solid
-| ingested | system`; the `source` enum is `computed | ingested |
-derived`). Architecture Sec 1.4.1 lists the 12 `computed` /
-foundation kinds but **delegates the ingested-pack `metric_kind`
-names to this tech-spec** (architecture Sec 1.4.2 row 6 names
-`pass_first_try_ratio` in prose for `xservice_test_reliability`
-input; the rest are pinned here). The v1 ingested-pack catalogue
-is:
+The four `ingest.*` verbs (architecture Sec 6.4) drive the
+ingested-pack foundation tier in two distinct shapes -- not
+all four write a `MetricSample` row directly:
+
+- `ingest.coverage` and `ingest.test_balance` write
+  `MetricSample` rows with `pack='ingested'` and
+  `source='ingested'` per architecture Sec 5.2.1 (the `pack`
+  enum is `base | solid | ingested | system`; the `source`
+  enum is `computed | ingested | derived`). The
+  `metric_kind`s those two verbs land are pinned in this
+  tech-spec (architecture Sec 1.4.1 lists the 12 `computed`
+  / foundation kinds and Sec 1.4.2 row 6 names
+  `pass_first_try_ratio` in prose for
+  `xservice_test_reliability` input; the rest of the
+  ingested-pack names are pinned here).
+- `ingest.churn` does NOT write a `MetricSample` row from
+  the webhook -- it feeds the `modification_count_in_window`
+  materialiser (Sec 8.2, catalogue row 12) which is the
+  writer; the materialiser's row is `pack='base'`,
+  `source='computed'` (Sec 4.11, Sec 7.6 table).
+- `ingest.defects` writes no `MetricSample` row in v1
+  (Sec 4.11, Sec 10A pin).
+
+The v1 ingested-pack catalogue below therefore covers only
+the rows that the Metric Ingestor lands as `pack='ingested'`
+/ `source='ingested'` -- i.e. only `ingest.coverage` and
+`ingest.test_balance`:
 
 | `metric_kind` | Scope | Written by | Consumed by | Source verb |
 | --- | --- | --- | --- | --- |
@@ -414,7 +431,7 @@ Sec 6.4):
 | `ingest.coverage` | `single` (one `sha` per call) | Cobertura XML (operator pin `external-metric-coverage-format=Cobertura XML`, arch Sec 1.6 row 2) | Metric Ingestor parses the XML and writes `coverage_line_ratio` and `coverage_branch_ratio` `MetricSample` rows (Sec 4.1.1 ingested-pack catalogue; the `coverage_line_ratio` name is anchored at arch Sec 4.3 lines 772-774, `coverage_branch_ratio` follows the same convention under arch's "(and similar)" clause), `pack='ingested'`, `source='ingested'`. Other coverage formats (JaCoCo, lcov, Clover, Cobertura JSON) are out of scope **for this verb's payload** in v1 (Sec 5.6) |
 | `ingest.test_balance` | `single` | JSON `{scope_id, attempt_count, pass_count}` rows | Writes ingested-pack foundation row `pass_first_try_ratio` (Sec 4.1.1); the Cross-Repo Aggregator promotes it to system-tier `xservice_test_reliability` (architecture Sec 3.10 step 4, Sec 1.4.2 row 6) |
 | `ingest.churn` | `per_row` (each payload row carries its own `sha`) | JSON `{repo_id, file_path, sha, modified_at}` rows | Drives `modification_count_in_window` materialisation (catalogue row 12; the materialiser writes `pack='base'` rows -- the webhook itself does not write a per-row `MetricSample`). Parent `ScanRun.to_sha=NULL`; `window_days` (Sec 8.2) is the commit-window applied at materialisation |
-| `ingest.defects` | `per_row` | JSON `{repo_id, file_path, sha, defect_id, severity}` rows | **v1 pin: store-only at the `ScanRun` boundary.** The Metric Ingestor accepts the payload, persists a `ScanRun` row with `kind='external_per_row'`, `sha_binding='per_row'`, `to_sha=NULL`, and records `payload_hash` (architecture Sec 5.7 `ScanRun.payload_hash`) for idempotency. **The defect payload body itself is NOT persisted** -- upstream `ScanRun` (architecture Sec 5.7 lines 1269-1280) carries `payload_hash` only and no payload-body/backlog field, so the Ingestor acks the webhook, records the hash, and discards the body. **No `MetricSample` row is written by this verb in v1** (the architecture metric catalogue at Sec 1.4.1 + Sec 1.4.2 names no defect-derived foundation `metric_kind`, the augmentcode-referenced incident-derived metrics are reserved per Sec 5.8, and `MetricSample.metric_kind` is `NOT NULL` per arch Sec 5.2.1 + Sec 8.7 DDL -- so writing a row would require either an invented metric_kind or a NULL violation, both forbidden). A v2 follow-on (a) extends the `ScanRun`-or-sibling schema upstream to hold the payload body, (b) adds a defect-driven foundation `metric_kind` (likely candidates: per-file `defect_count`, per-scope `severity_weighted_defect_density`), and (c) materialises rows from re-ingested payloads at that point; the v1 pin owner is tech-spec Sec 4.11. |
+| `ingest.defects` | `per_row` | JSON `{repo_id, file_path, sha, defect_id, severity}` rows | **v1 pin: store-only at the `ScanRun` boundary.** The Metric Ingestor accepts the payload, persists a `ScanRun` row with `kind='external_per_row'`, `sha_binding='per_row'`, `to_sha=NULL`, and records `payload_hash` (architecture Sec 5.7 `ScanRun.payload_hash`) for idempotency. **The defect payload body itself is NOT persisted** -- upstream `ScanRun` (architecture Sec 5.7 lines 1269-1280) carries `payload_hash` only and no payload-body/backlog field, so the Ingestor acks the webhook, records the hash, and discards the body. **No `MetricSample` row is written by this verb in v1** (the architecture metric catalogue at Sec 1.4.1 + Sec 1.4.2 names no defect-derived foundation `metric_kind` -- and no incident-derived `metric_kind` either; the augmentcode-referenced change-failure-rate / MTTR / lead-time kinds are v2 candidates per Sec 5.8, not reserved slots in the upstream catalogue -- and `MetricSample.metric_kind` is `NOT NULL` per arch Sec 5.2.1 + Sec 8.7 DDL, so writing a row would require either an invented metric_kind or a NULL violation, both forbidden). A v2 follow-on (a) extends the `ScanRun`-or-sibling schema upstream to hold the payload body, (b) adds a defect-driven foundation `metric_kind` (likely candidates: per-file `defect_count`, per-scope `severity_weighted_defect_density`), and (c) materialises rows from re-ingested payloads at that point; the v1 pin owner is tech-spec Sec 4.11. |
 
 All four verbs route through the Metric Ingestor's single-writer
 role grant (C8). The `source` field on resulting `MetricSample`
@@ -522,8 +539,15 @@ planners do not re-litigate.
 - **5.8 Incident-derived metrics.** Change failure rate, MTTR,
   lead time for changes. These were named in the augmentcode
   reference but require incident-management integration (which
-  the org lacks today). They are reserved metric_kind slots in
-  `architecture.md` Sec 1.4 but no compute recipe is shipped.
+  the org lacks today). They are **not** reserved `metric_kind`
+  slots in the upstream architecture (architecture Sec 1.4
+  lines 92-125 enumerates the canonical metric catalogue and
+  does not list change-failure-rate / MTTR / lead-time kinds);
+  this tech-spec records them only as v2 candidates and does
+  not assert any upstream reservation. v2 would require an
+  architecture amendment to introduce the corresponding
+  `MetricKind` Catalog/Lifecycle rows (architecture Sec 5.1)
+  before any compute recipe can land.
 - **5.9 Cross-language deduplication.** A v1 "duplication" signal
   is per-language only. Detecting the same algorithm copy-pasted
   between Go and TypeScript is out of scope.
@@ -753,15 +777,22 @@ these is a release-blocker.
   | `ingest.churn` | JSON churn rows | Commit history is VCS data, not source-tree data | Feeds the `modification_count_in_window` materialiser (Sec 8.2); the materialiser writes `pack='base'`, `source='computed'`, `metric_kind='modification_count_in_window'` -- the webhook itself does NOT write a MetricSample row |
   | `ingest.defects` | JSON defect rows | Defect tracker payload is external system data | v1: ScanRun row only, **no** MetricSample row (no v1 `metric_kind` is defined; see Sec 4.11 and Sec 10A pin "ingest.defects v1") |
 
-  For the rows that DO produce a `MetricSample`, the
-  `source` field (architecture Sec 5.2.1) is `ingested` and
-  `pack` is `ingested` per architecture Sec 1.4.1 + Sec 1.5
-  G1 Measurement row, matching the Sec 4.1.1 catalogue. No
-  metric value MAY be derived from raw regex / line-counting /
-  text-grep heuristics on source files outside these
-  enumerated exceptions; `provenance` on the resulting
-  `MetricSample.attrs_json` records which external verb
-  produced each row so downstream consumers can distinguish.
+  For the rows that DO produce a `MetricSample` with
+  `pack='ingested'` / `source='ingested'` (the `ingest.coverage`
+  and `ingest.test_balance` rows in the table above, matching
+  the Sec 4.1.1 catalogue), `pack` and `source` align with
+  architecture Sec 1.4.1 + Sec 1.5 G1 Measurement row. The
+  `ingest.churn` materialiser row is `pack='base'`,
+  `source='computed'` (the materialiser is the writer, not the
+  webhook); `ingest.defects` writes no `MetricSample` row in
+  v1. No metric value MAY be derived from raw regex /
+  line-counting / text-grep heuristics on source files outside
+  these enumerated exceptions; the `provenance` annotation on
+  the resulting `MetricSample.attrs_json` records which
+  external verb produced each row so downstream consumers can
+  distinguish (and, for the `ingest.churn` materialiser path,
+  records that the underlying commit rows came from
+  `ingest.churn` even though `source='computed'`).
 - **C20.** Tree-sitter parse errors are NOT silently dropped
   -- they produce a `ScanRun` row in `status='failed'` (the
   closed `ScanRun.status` enum at architecture Sec 5.7 line
@@ -1167,15 +1198,42 @@ Why this shape:
 
 **Append-only role grants** (C2, C25):
 
+The Measurement sub-store has TWO writer roles per the C5 ACL
+table (Sec 7.2): the **Metric Ingestor** for `pack IN ('base',
+'solid', 'ingested')` rows + the active-pointer table + the
+retraction log, and the **Cross-Repo Aggregator** for
+`pack='system'` AND `source='derived'` rows (architecture Sec
+3.10 step 4, Sec 1.5.1 row 2). Both roles get `INSERT, SELECT`
+on `metric_sample`; the Aggregator additionally gets the
+sibling aggregator-owned tables (`RepoMetricSnapshot`,
+`CrossRepoPercentile`, `PortfolioSnapshot`). Neither role
+gets `UPDATE` or `DELETE` on `metric_sample` (G3 row
+immutability). Only the Metric Ingestor writes the
+`metric_sample_active` pointer table -- the Aggregator's
+system-tier rows are pointed to by the Ingestor in the same
+transactional pattern when an Aggregator emit completes
+(Sec 8.2 sweep), or are read directly via a system-tier
+projection that does not use the pointer table when the
+Aggregator owns its own latest-row resolution (the choice is
+implementation-local to `services/clean-code`):
+
 ```sql
--- Metric Ingestor role: append to samples + retractions + active-pointer swaps.
-GRANT INSERT, SELECT ON clean_code.metric_sample TO clean_code_metric_ingestor;
-GRANT INSERT, SELECT ON clean_code.metric_retraction TO clean_code_metric_ingestor;
-GRANT INSERT, SELECT, UPDATE ON clean_code.metric_sample_active TO clean_code_metric_ingestor;
--- MetricSample remains strictly immutable.
-REVOKE UPDATE, DELETE ON clean_code.metric_sample FROM PUBLIC, clean_code_metric_ingestor;
-REVOKE DELETE         ON clean_code.metric_retraction FROM PUBLIC, clean_code_metric_ingestor;
-REVOKE DELETE         ON clean_code.metric_sample_active FROM PUBLIC, clean_code_metric_ingestor;
+-- Metric Ingestor role: append to foundation samples + retractions + active-pointer swaps.
+GRANT INSERT, SELECT         ON clean_code.metric_sample          TO clean_code_metric_ingestor;
+GRANT INSERT, SELECT         ON clean_code.metric_retraction      TO clean_code_metric_ingestor;
+GRANT INSERT, SELECT, UPDATE ON clean_code.metric_sample_active   TO clean_code_metric_ingestor;
+-- Cross-Repo Aggregator role: append system-tier rows + own snapshot tables (C5 carve-out row).
+GRANT INSERT, SELECT         ON clean_code.metric_sample          TO clean_code_xrepo_aggregator;
+GRANT INSERT, SELECT         ON clean_code.repo_metric_snapshot   TO clean_code_xrepo_aggregator;
+GRANT INSERT, SELECT         ON clean_code.cross_repo_percentile  TO clean_code_xrepo_aggregator;
+GRANT INSERT, SELECT         ON clean_code.portfolio_snapshot     TO clean_code_xrepo_aggregator;
+-- MetricSample remains strictly immutable for both writer roles.
+REVOKE UPDATE, DELETE ON clean_code.metric_sample          FROM PUBLIC, clean_code_metric_ingestor, clean_code_xrepo_aggregator;
+REVOKE DELETE         ON clean_code.metric_retraction      FROM PUBLIC, clean_code_metric_ingestor;
+REVOKE DELETE         ON clean_code.metric_sample_active   FROM PUBLIC, clean_code_metric_ingestor;
+REVOKE UPDATE, DELETE ON clean_code.repo_metric_snapshot,
+                         clean_code.cross_repo_percentile,
+                         clean_code.portfolio_snapshot     FROM PUBLIC, clean_code_xrepo_aggregator;
 -- Audit/verdict sub-store: append-only across the board for all three callers
 -- (Evaluator Surface, SOLID Rule Engine batch worker, WAL Reconciler replay-only)
 GRANT INSERT, SELECT ON clean_code.evaluation_run TO clean_code_evaluator, clean_code_solid_batch, clean_code_wal_reconciler;

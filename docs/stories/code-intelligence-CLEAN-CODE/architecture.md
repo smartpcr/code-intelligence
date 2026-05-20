@@ -244,7 +244,7 @@ ends.
 
 | # | Disputed seam | Normative claim | Restated at |
 | --- | --- | --- | --- |
-| 1 | **`ScanRun` and `Commit` writer split** | The **Metric Ingestor** (Section 3.1) is the only writer of `ScanRun` rows. The `Commit` row has a two-writer column split: **Management** writes every `Commit` column (`repo_id`, `sha`, `parent_sha`, `committed_at`) **except** `scan_status`; the **Metric Ingestor** is the only writer of `Commit.scan_status` and transitions it `pending -> scanning -> scanned | failed`. Management NEVER writes `Commit.scan_status` and NEVER writes `ScanRun`. | Section 1.5 G1 (Catalog / Lifecycle ACL row), Section 3.1 (Ingestor responsibilities / Failure modes), Section 5.1.2 (`Commit.scan_status` field note), Section 5.7 (`ScanRun` writer column), Section 6.3 (Management write verbs note), Section 9 (public-contract summary rows) |
+| 1 | **`ScanRun` and `Commit` writer split** | The **Metric Ingestor** (Section 3.1) is the only writer of `ScanRun` rows. The `Commit` row has a two-writer column split with a **DB-default carve-out for the initial `pending` state**: **Management** (whose `Commit` writer slot is delegated to the **Repo Indexer** per Section 3.3) writes every `Commit` column (`repo_id`, `sha`, `parent_sha`, `committed_at`) on INSERT **except** `scan_status`; the `scan_status` column has a **schema-level column DEFAULT of `'pending'`** which the database engine supplies at INSERT time, so **no component** (not Management, not the Repo Indexer, not the Metric Ingestor) writes the `'pending'` value explicitly. After the row exists the **Metric Ingestor** is the only writer of `Commit.scan_status` and is the only component that may transition it `pending -> scanning -> scanned | failed`. Management NEVER writes `Commit.scan_status` and NEVER writes `ScanRun`. | Section 1.5 G1 (Catalog / Lifecycle ACL row), Section 3.1 (Ingestor responsibilities / Failure modes), Section 3.3 (Repo Indexer omits `scan_status` from INSERT), Section 4.1 step 1 (DB default supplies `'pending'`), Section 5.1.2 (`Commit.scan_status` field note), Section 5.7 (`ScanRun` writer column), Section 6.3 (Management write verbs note), Section 9 (public-contract summary rows) |
 | 2 | **`xservice_test_reliability` source** | The **Cross-Repo Aggregator** (Section 3.10 step 4) is the writer; `source='derived'` and `pack='system'`. The External Metric Ingest Webhook writes only the foundation-tier `pass_first_try_ratio` input row (`pack='ingested'`); it **never** writes the system-tier `xservice_test_reliability` row directly. | Section 1.4.2 row 6, Section 3.10 step 4, Section 3.12 (webhook), Section 5.2.2 (sample `pack` enum) |
 | 3 | **External ingest SHA shape** | The Metric Ingestor accepts external-mode payloads in **four** ingest shapes (Section 3.1): `external_cov(repo_id, sha, payload)`, `external_test(repo_id, sha, payload)`, `external_churn(repo_id, payload)`, `external_defects(repo_id, payload)`. For coverage and test-balance the payload is bound to a single SHA; for churn and defects each row carries its own SHA and the parent `ScanRun.sha_binding='per_row'` with `to_sha=NULL` (Section 5.7). The webhook surface in Section 6.4 mirrors these four shapes. | Section 3.1 preamble ("four modes"), Section 5.7 (`ScanRun.sha_binding` enum), Section 6.4 (verb signatures) |
 | 4 | **`RulePack` writer and sub-store** | The **Policy Steward** (Section 3.11) is the only writer of `RulePack` rows, and the row lives in the **Policy / rules** sub-store alongside `Rule` and `PolicyVersion` (which it bundles). Management does NOT delegate `RulePack` writes via any `mgmt.*` verb; operators publish packs through `policy.publish_rulepack` (Section 6.5). `RulePack` is NOT in the Catalog / Lifecycle sub-store. | Section 1.5 G1 (Policy / rules ACL row), Section 5.3.2 (`RulePack` field table placement callout), Section 5.8 (sub-store summary table), Section 9 (Policy Steward Writes column) |
@@ -450,10 +450,25 @@ not write to the Metrics Store directly.
 ### 3.3 Repo Indexer
 
 **Purpose.** Watches the git remote (or accepts webhooks from a
-git host) and writes `Commit` rows with `scan_status='pending'`
-when a new SHA appears. Owns the `Commit` writer slot in the
-Catalog / Lifecycle sub-store (delegated by Management, which is
-the formal G1 writer).
+git host) and writes `Commit` rows when a new SHA appears. Owns
+the `Commit` writer slot in the Catalog / Lifecycle sub-store
+(delegated by Management, which is the formal G1 writer).
+
+**Initial `scan_status` is a DB default, not an Indexer write.**
+The Indexer INSERTs `Commit` rows naming **only** the columns
+`(repo_id, sha, parent_sha, committed_at)`. The `scan_status`
+column is **omitted from the INSERT column list**; the database
+schema declares `scan_status enum NOT NULL DEFAULT 'pending'`, so
+the engine supplies `'pending'` on the new row without any
+application component writing the column. This keeps the
+normative claim in Section 1.5.1 row 1 -- "the Metric Ingestor is
+the only writer of `Commit.scan_status`" -- literally true at the
+application layer: the Indexer never names the column on INSERT
+and never updates the column afterward, and the `'pending'`
+initial value is contributed by the DB schema, not by any
+component. The Metric Ingestor is the only component that ever
+writes `Commit.scan_status` explicitly (transitioning
+`pending -> scanning -> scanned | failed`).
 
 The Indexer is intentionally thin -- a few lines of glue between a
 git event source and the Catalog table. The Metric Ingestor takes
@@ -701,9 +716,17 @@ preserves the single-writer-per-sub-store rule.
 ### 4.1 New commit -> foundation-tier scan
 
 1. **Repo Indexer** observes a new SHA on the watched remote and
-   writes a `Commit` row with `scan_status='pending'`. (Per G1 the
-   Indexer is delegated by Management, which owns the Commit
-   writer slot in the Catalog sub-store.)
+   INSERTs a `Commit` row naming **only** `(repo_id, sha,
+   parent_sha, committed_at)`; the `scan_status` column is
+   **omitted from the INSERT** and the DB-level column DEFAULT
+   (`scan_status enum NOT NULL DEFAULT 'pending'`, Section 3.3
+   and Section 5.1.2) supplies the initial `'pending'` value. No
+   application component (neither the Indexer nor any other)
+   writes `Commit.scan_status` at this step, which preserves the
+   Section 1.5.1 row 1 invariant that the Metric Ingestor is the
+   only writer of that column. (Per G1 the Indexer is delegated
+   by Management, which owns the Commit writer slot in the
+   Catalog sub-store.)
 2. **Metric Ingestor** picks up the pending Commit, opens a
    `ScanRun(kind='full', sha_binding='single', to_sha=sha)` row,
    and flips `Commit.scan_status='scanning'`.
@@ -838,7 +861,7 @@ against. Every table belongs to exactly one G1 sub-store
 | `sha` | text | Part of composite primary key. |
 | `parent_sha` | text | Nullable for the first commit. |
 | `committed_at` | timestamp | Author / committer timestamp from git. |
-| `scan_status` | enum | `pending`, `scanning`, `scanned`, `failed`. **The only column the Metric Ingestor may write** (per Section 1.5.1 row 1); Management writes the rest of the row. |
+| `scan_status` | enum, `NOT NULL DEFAULT 'pending'` | Allowed values `pending`, `scanning`, `scanned`, `failed`. The **initial `'pending'` value is supplied by the schema-level column DEFAULT on INSERT** -- the Repo Indexer (Section 3.3) omits this column from its INSERT column list, so no application component writes `'pending'` explicitly. **The Metric Ingestor is the only application writer of this column** and is the only component that may transition it (`pending -> scanning -> scanned | failed`) per Section 1.5.1 row 1. Management writes the rest of the `Commit` row via its Repo Indexer delegate (Section 3.3); no component writes any other `Commit` column after row creation. |
 
 #### 5.1.3 MetricKind
 
@@ -1507,7 +1530,7 @@ wins.
 | --- | --- | --- | --- |
 | Management | `mgmt.register_repo`, `mgmt.set_mode` | -- | Repo, RepoEvent (Catalog / Lifecycle). **Management is the formal G1 writer of `Commit`** (Section 1.5 G1 Catalog / Lifecycle row) but **delegates** actual `Commit` row creation to the Repo Indexer (next row, Section 3.3); Management itself never writes any `Commit` column directly, and never writes `Commit.scan_status` (Metric Ingestor row below, per Section 1.5.1 row 1). |
 | Management | `mgmt.retract_sample` | MetricSample (Measurement; validates sample exists) | RepoEvent (Catalog / Lifecycle; records intent + delegates to the Metric Ingestor, which appends `MetricRetraction` in Measurement -- Management is NOT a Measurement writer per G1) |
-| Worker -- Repo Indexer (Section 3.3) [Management's formal G1 delegate for `Commit` creation] | git remote watch / git host webhook (new SHA appears on a tracked branch) | -- | `Commit` rows in Catalog / Lifecycle -- **every column except `scan_status`**: writes `(repo_id, sha, parent_sha, committed_at)` and stamps `scan_status='pending'` at insert time. The Indexer never updates a `Commit` row after insert; it never writes any sub-store other than Catalog / Lifecycle. Per Section 3.3 lines 446-449 and Section 1.5 G1, the Indexer holds Management's `Commit` writer slot by delegation; per Section 1.5.1 row 1, the Metric Ingestor is the only writer of `Commit.scan_status` thereafter. |
+| Worker -- Repo Indexer (Section 3.3) [Management's formal G1 delegate for `Commit` creation] | git remote watch / git host webhook (new SHA appears on a tracked branch) | -- | `Commit` rows in Catalog / Lifecycle -- writes **only** the columns `(repo_id, sha, parent_sha, committed_at)` on INSERT. The Indexer **omits `scan_status` from the INSERT column list**; the schema declares `scan_status enum NOT NULL DEFAULT 'pending'` (Section 5.1.2) so the database engine supplies the initial `'pending'` value with no application writer. The Indexer never names `scan_status` on INSERT, never updates the column afterward, never updates any other `Commit` column after row creation, and never writes any sub-store other than Catalog / Lifecycle. Per Section 1.5.1 row 1 the Metric Ingestor is the only application writer of `Commit.scan_status` (and the row below in this table records that writer). |
 | Worker -- Metric Ingestor (Section 3.1) | full / delta / external scan | MetricKind (Catalog / Lifecycle; schema lookup) | MetricSample, ScopeBinding, MetricRetraction (Measurement); ScanRun (Catalog / Lifecycle); `Commit.scan_status` (Catalog / Lifecycle, **only this column** -- transitions `pending -> scanning -> scanned | failed` per Section 1.5.1 row 1; the Repo Indexer row above writes every other `Commit` column at row creation time, and no component updates `Commit` columns other than `scan_status` after that). |
 | Worker -- SOLID Rule Engine batch (Section 3.6) | post-ingest refresh (Section 4.7) | MetricSample (Measurement); Rule, PolicyVersion, Override (Policy / rules) | **EvaluationRun, EvaluationVerdict, Finding** (Audit / verdict) -- per the expanded G1 ACL the batch worker writes all three tables; rows carry `EvaluationRun.caller='batch_refresh'`. |
 | Worker -- Refactor Planner (Section 3.9) | post-ingest refresh | MetricSample, Finding | HotSpot, RefactorPlan, RefactorTask (Refactor) |

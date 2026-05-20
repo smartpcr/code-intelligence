@@ -138,7 +138,7 @@ these.
 
   | Sub-store | Tables | Writer(s) | Readers |
   | --- | --- | --- | --- |
-  | Catalog / Lifecycle | `Repo`, `Commit`, `MetricKind`, `ScanRun` | Management (Repo, Commit, RepoEvent rows) + Metric Ingestor (ScanRun, Commit `scan_status` transitions only) | All other components (read-only) |
+  | Catalog / Lifecycle | `Repo`, `Commit`, `RepoEvent`, `MetricKind`, `ScanRun` | Management (writes `Repo`, `RepoEvent`, and every `Commit` column **except** `scan_status`) + Metric Ingestor (writes `ScanRun` and the `Commit.scan_status` column **only** -- never any other `Commit` column; see Section 1.5.1 row 1 for the normative split) | All other components (read-only) |
   | Measurement | `MetricSample` (foundation-tier rows where `pack IN ('base', 'solid', 'ingested')`), `ScopeBinding`, `MetricRetraction` | Metric Ingestor | Compute Engine, SOLID Rule Engine, Refactor Planner, Cross-Repo Aggregator, Insights, Evaluator |
   | Measurement (system-tier carve-out) | `MetricSample` rows where `pack='system'` AND `source='derived'`, `RepoMetricSnapshot`, `CrossRepoPercentile`, `PortfolioSnapshot` | Cross-Repo Aggregator (the **only** writer of `pack='system'` rows; see Section 3.10 step 4) | Insights, Evaluator, Refactor Planner |
   | Policy / rules | `Rule`, `RulePack`, `PolicyVersion`, `PolicyActivation`, `Threshold`, `Override` | Policy Steward (Section 3.11) -- the **only** writer of `RulePack` (see Section 1.5.1 row 4) | Evaluator (read-only), Insights (read-only) |
@@ -146,9 +146,16 @@ these.
   | Refactor | `HotSpot`, `RefactorPlan`, `RefactorTask` | Refactor Planner (Section 3.9) | Insights, Management |
 
 - **G2 -- Identity by `(repo_id, sha, scope_id, metric_kind,
-  metric_version)`.** Every `MetricSample` row is uniquely keyed by
-  this quintuple, uniformly across all three `source` values
-  (`computed`, `ingested`, `derived`). `metric_version` participates
+  metric_version)`, over the active row set.** Every **active**
+  `MetricSample` row is uniquely keyed by this quintuple,
+  uniformly across all three `source` values (`computed`,
+  `ingested`, `derived`). A row is **active** iff no
+  `MetricRetraction` row (Section 5.2.2) references its
+  `sample_id`; retracted rows are tombstones and do NOT block a
+  fresh insert at the same quintuple, but SHA-pinned readers
+  always filter retracted rows out of consideration (Section
+  5.2.1 Read-time semantics callout). At any instant at most one
+  active row exists per quintuple. `metric_version` participates
   in the identity so a definitional change (a new formula for
   `cyclo`, say) lands as a **new row** alongside the old one (per
   G3); historical verdicts pinned to the prior version remain
@@ -237,7 +244,7 @@ ends.
 
 | # | Disputed seam | Normative claim | Restated at |
 | --- | --- | --- | --- |
-| 1 | **ScanRun writer** | The **Metric Ingestor** (Section 3.1) is the only writer of `ScanRun` rows. Management opens and closes `Commit.scan_status` transitions only -- it never writes `ScanRun` directly. | Section 3.1 (Ingestor responsibilities), Section 5.7 (`ScanRun` writer column), Section 9 (public-contract summary row) |
+| 1 | **`ScanRun` and `Commit` writer split** | The **Metric Ingestor** (Section 3.1) is the only writer of `ScanRun` rows. The `Commit` row has a two-writer column split: **Management** writes every `Commit` column (`repo_id`, `sha`, `parent_sha`, `committed_at`) **except** `scan_status`; the **Metric Ingestor** is the only writer of `Commit.scan_status` and transitions it `pending -> scanning -> scanned | failed`. Management NEVER writes `Commit.scan_status` and NEVER writes `ScanRun`. | Section 1.5 G1 (Catalog / Lifecycle ACL row), Section 3.1 (Ingestor responsibilities / Failure modes), Section 5.1.2 (`Commit.scan_status` field note), Section 5.7 (`ScanRun` writer column), Section 6.3 (Management write verbs note), Section 9 (public-contract summary rows) |
 | 2 | **`xservice_test_reliability` source** | The **Cross-Repo Aggregator** (Section 3.10 step 4) is the writer; `source='derived'` and `pack='system'`. The External Metric Ingest Webhook writes only the foundation-tier `pass_first_try_ratio` input row (`pack='ingested'`); it **never** writes the system-tier `xservice_test_reliability` row directly. | Section 1.4.2 row 6, Section 3.10 step 4, Section 3.12 (webhook), Section 5.2.2 (sample `pack` enum) |
 | 3 | **External ingest SHA shape** | The Metric Ingestor accepts external-mode payloads in **four** ingest shapes (Section 3.1): `external_cov(repo_id, sha, payload)`, `external_test(repo_id, sha, payload)`, `external_churn(repo_id, payload)`, `external_defects(repo_id, payload)`. For coverage and test-balance the payload is bound to a single SHA; for churn and defects each row carries its own SHA and the parent `ScanRun.sha_binding='per_row'` with `to_sha=NULL` (Section 5.7). The webhook surface in Section 6.4 mirrors these four shapes. | Section 3.1 preamble ("four modes"), Section 5.7 (`ScanRun.sha_binding` enum), Section 6.4 (verb signatures) |
 | 4 | **`RulePack` writer and sub-store** | The **Policy Steward** (Section 3.11) is the only writer of `RulePack` rows, and the row lives in the **Policy / rules** sub-store alongside `Rule` and `PolicyVersion` (which it bundles). Management does NOT delegate `RulePack` writes via any `mgmt.*` verb; operators publish packs through `policy.publish_rulepack` (Section 6.5). `RulePack` is NOT in the Catalog / Lifecycle sub-store. | Section 1.5 G1 (Policy / rules ACL row), Section 5.3.2 (`RulePack` field table placement callout), Section 5.8 (sub-store summary table), Section 9 (Policy Steward Writes column) |
@@ -389,12 +396,23 @@ public-facing verb shape in Section 6.4.
   scanned | failed`); this is the **only** column the Ingestor
   may flip on `Commit` (Management owns the rest of the row).
 
-**Failure modes.** Crash mid-scan leaves `Commit.scan_status =
-'scanning'`; the Audit WAL Reconciler (Section 7.10) replays from
-the WAL and either re-enters the scan or moves it to `failed`.
-Idempotency: the Ingestor checks `(repo_id, sha, scope_id,
-metric_kind, metric_version)` before insert per G2 -- a re-run for
-the same SHA is a no-op (the row is already there).
+**Failure modes.** Crash mid-scan leaves `ScanRun.status='running'`
+and the linked `Commit.scan_status='scanning'`. **Recovery is owned
+by the Metric Ingestor, not by the Audit WAL Reconciler** (the WAL
+is scoped to Audit-sub-store rows only per Section 7.1 / Section
+7.10, and Measurement / Catalog state is re-derivable from a
+re-scan per G6). On startup -- and on a periodic sweep cadence
+operator-pinned in the tech-spec -- the Ingestor scans for
+`ScanRun` rows where `status='running' AND (now - started_at) >
+scan_timeout` and either re-enters the scan (if the input is still
+ingestible) or transitions both `ScanRun.status` and the linked
+`Commit.scan_status` to `failed`. Idempotency: the Ingestor checks
+`(repo_id, sha, scope_id, metric_kind, metric_version)` against
+the **active row set** (Section 5.2.1) before insert per G2 -- a
+re-run for the same SHA whose prior rows are still active is a
+no-op (the row is already there); a re-run after a retraction of
+the prior rows lands a fresh active row at the same quintuple,
+because retracted rows are tombstoned out of the uniqueness check.
 
 ### 3.2 AST Adapter
 
@@ -913,25 +931,45 @@ against. Every table belongs to exactly one G1 sub-store
 > `MetricRetraction` row referencing the degraded sample id;
 > SHA-pinned readers filter retracted rows out of consideration.
 > A subsequent `mgmt.rescan(repo_id, sha)` (Section 6.3) re-runs
-> the scan at the same SHA to land a fresh row -- the new row
-> has its own `MetricSample.sample_id` and the uniqueness check
-> in Section 5.2.2 treats retracted rows as not contributing to
-> the uniqueness key, so the fresh row is admitted.
+> the scan at the same SHA to land a fresh **active** row -- the
+> new row has its own `MetricSample.sample_id` and the uniqueness
+> check defined in the Uniqueness paragraph below is over the
+> active row set only, so the prior retracted row (now a
+> tombstone) does not block the insert.
 >
-> **Uniqueness.** For `source IN ('computed', 'ingested')` the
-> tuple `(repo_id, sha, scope_id, metric_kind, metric_version)`
-> is unique. Re-running the Ingestor for the same SHA is a no-op
-> (the row is already there); a definitional bump
-> (`metric_version`) is a *new row*, never a rewrite. For
-> `source='derived'` rows (the system-tier rows the Cross-Repo
-> Aggregator materialises per Section 3.10 step 4) the same
-> quintuple is unique by construction: the Aggregator writes at
-> most one row per `(repo_id, sha, scope_id, metric_kind,
-> metric_version)` per HEAD SHA per tick -- if its tick lands on
-> a SHA where a derived row already exists (degraded or not), it
-> **skips the insert** for that SHA and waits for the next HEAD
-> SHA. This keeps the quintuple globally unique across all three
-> `source` values and makes G2's identity contract hold uniformly.
+> **Uniqueness (active-row-only -- this is the single normative
+> definition referenced by G2 and by Section 3.1 idempotency).**
+> Across all three `source` values (`computed`, `ingested`,
+> `derived`), at any instant **at most one active row** exists
+> per `(repo_id, sha, scope_id, metric_kind, metric_version)`,
+> where a row is **active** iff no `MetricRetraction` row
+> (Section 5.2.2) references its `sample_id`. Retracted rows are
+> tombstones: they remain queryable as audit trail (G3) but they
+> do NOT contribute to the uniqueness check and they do NOT
+> appear in SHA-pinned reads. The active-row constraint is
+> enforced by a partial unique index on the quintuple
+> `WHERE sample_id NOT IN (SELECT sample_id FROM
+> MetricRetraction)` (the exact DDL is in `tech-spec.md`).
+> Practical implications:
+>
+> - Re-running the Metric Ingestor for the same SHA whose prior
+>   rows are still active is a no-op (the active row is already
+>   there). Re-running after a retraction lands a fresh active
+>   row at the same quintuple (the retracted row is a tombstone).
+> - A definitional bump (`metric_version`) is a *new active row*,
+>   never a rewrite; the prior row stays active at its prior
+>   `metric_version`.
+> - For `source='derived'` rows the Cross-Repo Aggregator (Section
+>   3.10 step 4) writes at most one row per quintuple per HEAD
+>   SHA per tick; if its tick lands on a SHA where an **active**
+>   derived row already exists (degraded or not), it **skips the
+>   insert** for that SHA and waits for the next HEAD SHA. If the
+>   prior derived row has been retracted (e.g. by `mgmt.retract_sample`
+>   targeting a degraded derived sample), the next tick at the
+>   same SHA may write a fresh active derived row at that
+>   quintuple. This keeps active-row uniqueness uniform across
+>   all three `source` values and makes G2's identity contract
+>   hold without exception.
 
 #### 5.2.2 MetricRetraction
 

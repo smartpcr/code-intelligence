@@ -57,9 +57,13 @@ owns:
   `PolicyActivation`, `Threshold`, `Override`,
   `EvaluationRun`, `EvaluationVerdict`, `Finding`, `HotSpot`,
   `RefactorPlan`, `RefactorTask`).
-- **Wire-format payloads** -- owned by `architecture.md` Sec 6 (gRPC
-  proto definitions for `MetricIngest`, `EvaluatorGate`, `Insights`,
-  `RefactorPlanner`, `Management`).
+- **Wire-format payloads** -- owned by `architecture.md` Sec 6 (the
+  four gRPC verb namespaces are `eval.*` for the Evaluator Surface,
+  `mgmt.*` for the Management surface including all `mgmt.read.*`
+  Insights-backing dashboard reads, `ingest.*` for the External
+  Metric Ingest Webhook, and `policy.*` for the Policy Steward;
+  there is no separate `Insights` surface verb namespace in
+  architecture Sec 6 -- Insights dashboards consume `mgmt.read.*`).
 - **Phased build order, ticket breakdown, owners, dates** -- owned
   by `implementation-plan.md`.
 - **End-to-end walkthroughs** -- owned by `e2e-scenarios.md`.
@@ -263,6 +267,44 @@ Sec 5.2). `solid`-pack rows (`lcom4`, `fan_in`, `fan_out`,
 `coupling_between_objects`) are the direct inputs to the
 SRP / OCP / DIP / LSP / ISP rule packs (Sec 4.3).
 
+### 4.1.1 Ingested-pack foundation metric_kinds (pinned in tech-spec)
+
+The four `ingest.*` verbs (architecture Sec 6.4) write foundation-
+tier rows with `pack='ingested'` and `source='ingested'` per the
+architecture's enum at Sec 5.2.1 (the `pack` enum is `base | solid
+| ingested | system`; the `source` enum is `computed | ingested |
+derived`). Architecture Sec 1.4.1 lists the 12 `computed` /
+foundation kinds but **delegates the ingested-pack `metric_kind`
+names to this tech-spec** (architecture Sec 1.4.2 row 6 names
+`pass_first_try_ratio` in prose for `xservice_test_reliability`
+input; the rest are pinned here). The v1 ingested-pack catalogue
+is:
+
+| `metric_kind` | Scope | Written by | Consumed by | Source verb |
+| --- | --- | --- | --- | --- |
+| `line_coverage_ratio` | file, package, repo | Metric Ingestor (writes the `MetricSample` row; the External Metric Ingest Webhook enqueues the `ScanRun` per arch Sec 3.12) | Insights; threshold rules on `PolicyVersion.threshold_refs` | `ingest.coverage` |
+| `branch_coverage_ratio` | file, package, repo | Metric Ingestor | Insights; threshold rules | `ingest.coverage` |
+| `pass_first_try_ratio` | repo | Metric Ingestor | Cross-Repo Aggregator (composes into system-tier `xservice_test_reliability` per arch Sec 1.4.2 row 6) | `ingest.test_balance` |
+
+Notes:
+
+- All three rows are foundation-tier (`pack='ingested'`) and
+  carry `source='ingested'`; they participate in the active-row
+  uniqueness check (C1) over the same quintuple as the
+  `computed` rows.
+- The catalogue intentionally omits any `metric_kind` for
+  `ingest.churn` and `ingest.defects` payloads: `ingest.churn`
+  payloads feed the `modification_count_in_window` materialiser
+  (Sec 8.2 `window_days`, Sec 4.1 catalogue row 12) so the
+  resulting `MetricSample` rows are written with
+  `metric_kind='modification_count_in_window'` and
+  `pack='base'` (the materialiser is the writer, not the
+  webhook), and `ingest.defects` is v1-deferred per Sec 4.11.
+- Adding an ingested-pack `metric_kind` requires (a) a new row
+  in this catalogue table, (b) a `MetricKind` Catalog/Lifecycle
+  row (architecture Sec 5.1), and (c) a `MetricVersion`
+  assignment per C4.
+
 ### 4.2 System-tier metric catalogue (7 metrics)
 
 The 7 system-tier metric_kinds from architecture Sec 1.4.2
@@ -369,15 +411,20 @@ Sec 6.4):
 
 | Verb | SHA binding | Payload | Notes |
 |------|-------------|---------|-------|
-| `ingest.coverage` | `single` (one `sha` per call) | Cobertura XML (operator pin `external-metric-coverage-format=Cobertura XML`, arch Sec 1.6 row 2) | Writes coverage-related `MetricSample` rows. Other coverage formats (JaCoCo, lcov, Clover, Cobertura JSON) are out of scope **for this verb's payload** in v1 (Sec 5.6) |
-| `ingest.test_balance` | `single` | JSON `{scope_id, attempt_count, pass_count}` rows | Writes foundation-tier `pass_first_try_ratio`; the Cross-Repo Aggregator promotes it to system-tier `xservice_test_reliability` (architecture Sec 3.10 step 4) |
-| `ingest.churn` | `per_row` (each payload row carries its own `sha`) | JSON `{repo_id, file_path, sha, modified_at}` rows | Drives `modification_count_in_window` materialisation; parent `ScanRun.to_sha=NULL`. `window_days` (Sec 8.2) is the commit-window applied at materialisation |
-| `ingest.defects` | `per_row` | JSON `{repo_id, file_path, sha, defect_id, severity}` rows | Raw defect rows are accepted and stored as `MetricSample` with `source='ingested'` for future use; v1 does **not** pin a `metric_kind` emission for this verb (the architecture metric catalogue at Sec 1.4.1 + Sec 1.4.2 names no `defect_density` row, and the augmentcode-referenced incident-derived metrics are reserved per Sec 5.8). Compute-recipe scope for defect-driven metric_kinds is **Open Question OQ-defects-metric-kind** below. Parent `ScanRun.to_sha=NULL` |
+| `ingest.coverage` | `single` (one `sha` per call) | Cobertura XML (operator pin `external-metric-coverage-format=Cobertura XML`, arch Sec 1.6 row 2) | Metric Ingestor parses the XML and writes `line_coverage_ratio` and `branch_coverage_ratio` `MetricSample` rows (Sec 4.1.1 ingested-pack catalogue), `pack='ingested'`, `source='ingested'`. Other coverage formats (JaCoCo, lcov, Clover, Cobertura JSON) are out of scope **for this verb's payload** in v1 (Sec 5.6) |
+| `ingest.test_balance` | `single` | JSON `{scope_id, attempt_count, pass_count}` rows | Writes ingested-pack foundation row `pass_first_try_ratio` (Sec 4.1.1); the Cross-Repo Aggregator promotes it to system-tier `xservice_test_reliability` (architecture Sec 3.10 step 4, Sec 1.4.2 row 6) |
+| `ingest.churn` | `per_row` (each payload row carries its own `sha`) | JSON `{repo_id, file_path, sha, modified_at}` rows | Drives `modification_count_in_window` materialisation (catalogue row 12; the materialiser writes `pack='base'` rows -- the webhook itself does not write a per-row `MetricSample`). Parent `ScanRun.to_sha=NULL`; `window_days` (Sec 8.2) is the commit-window applied at materialisation |
+| `ingest.defects` | `per_row` | JSON `{repo_id, file_path, sha, defect_id, severity}` rows | **v1 pin: store-only at the `ScanRun` boundary.** The Metric Ingestor accepts the payload, persists a `ScanRun` row with `kind='external_per_row'`, `sha_binding='per_row'`, `to_sha=NULL`, and `payload_hash` (architecture Sec 5.7); the raw payload rows are retained on the `ScanRun` envelope for replay only. **No `MetricSample` row is written by this verb in v1** (the architecture metric catalogue at Sec 1.4.1 + Sec 1.4.2 names no defect-derived foundation `metric_kind`, the augmentcode-referenced incident-derived metrics are reserved per Sec 5.8, and `MetricSample.metric_kind` is `NOT NULL` per arch Sec 5.2.1 + Sec 8.7 DDL -- so writing a row would require either an invented metric_kind or a NULL violation, both forbidden). A v2 follow-on adds a defect-driven foundation `metric_kind` (likely candidates: per-file `defect_count`, per-scope `severity_weighted_defect_density`) and re-routes the existing `ScanRun` payload backlog through the new materialiser. v1 pin owner: tech-spec Sec 4.11. |
 
-All four verbs produce `MetricSample` rows with `source='ingested'`
-(architecture Sec 5.2.1 field `source`) and route through the
-Metric Ingestor's single-writer role grant (C8). Webhook
-transport is REST + signed-HMAC body per Sec 8.5.
+All four verbs route through the Metric Ingestor's single-writer
+role grant (C8). Where they produce `MetricSample` rows (the
+ingested-pack kinds in Sec 4.1.1 for `ingest.coverage` and
+`ingest.test_balance`; `pack='base'` rows via the
+`modification_count_in_window` materialiser for `ingest.churn`),
+those rows carry `source='ingested'` (architecture Sec 5.2.1 field
+`source`); `ingest.defects` writes a `ScanRun` row only in v1 per
+the row above. Webhook transport is REST + signed-HMAC body per
+Sec 8.5.
 
 ### 4.12 Management surface
 
@@ -409,10 +456,11 @@ carries **no** `tenant_id` column on any table in v1; the
 single-tenant assumption is preserved at the
 schema-isolation boundary (one `clean_code` schema per
 deployment, Sec 8.1.3) rather than at the row level. A v2
-multi-tenant migration will introduce per-tenant schemas
-or per-tenant row keys at that time; the specific shape is
-**Open Question OQ-multi-tenant-shape** for v2 planners and
-is intentionally not pre-reserved as a column here.
+multi-tenant migration will adopt per-schema isolation
+(one `clean_code_<tenant>` schema per tenant, extending the
+Sec 8.1.3 single-tenant shape); the v2 shape is pinned at
+Sec 10A ("multi-tenant v2 shape") and no `tenant_id`
+column is pre-reserved here.
 
 ---
 
@@ -441,7 +489,8 @@ planners do not re-litigate.
   single-tenant. No `tenant_id` column is reserved in the
   v1 data model (architecture Sec 5 carries none); the
   isolation boundary in v1 is the schema (Sec 8.1.3). v2
-  shape is Open Question OQ-multi-tenant-shape.
+  shape is pinned at Sec 10A ("multi-tenant v2 shape"):
+  per-schema isolation extends the v1 shape.
 - **5.5 Jira / Linear / GitHub Issues integration.** The refactor
   planner emits `HotSpot` / `RefactorPlan` / `RefactorTask` rows;
   pushing them into an external tracker is a follow-on
@@ -530,35 +579,53 @@ these is a release-blocker.
 
 - **C1.** The `MetricSample` table MUST enforce active-row
   identity on the tuple `(repo_id, sha, scope_id, metric_kind,
-  metric_version)`. "Active" means not present in the
-  `MetricRetraction` satellite table (architecture G2 lines
-  148-157, Section 5.2.1 lines 991-1003). The architecture's
-  uniqueness paragraph at lines 991-1003 states the **logical
-  invariant** ("at most one active row per quintuple") and
-  explicitly delegates the **DDL realisation** to this doc
-  ("the exact DDL is in `tech-spec.md`"). Sec 8.7 below pins
-  the realisation as a separate active-pointer table
-  (`metric_sample_active`) keyed on the identity quintuple,
-  because the architecture's example wording -- a partial
-  unique index `WHERE sample_id NOT IN (SELECT sample_id FROM
-  MetricRetraction)` -- is **not a production-valid PostgreSQL
-  artefact** (PostgreSQL rejects subqueries in index
-  predicates, see Sec 8.7 rationale). The pointer-table shape
-  preserves the same logical invariant while honouring C2
-  immutability. **Open Question OQ-active-row-ddl** below asks
-  the operator to align architecture Sec 5.2.1 lines 991-1003
-  with this realisation so the two docs cite the same
-  enforcement mechanism.
+  metric_version)` -- the partial unique index over the active
+  row set that architecture G2 + Sec 5.2.1 lines 991-1003
+  mandate ("at most one active row per quintuple ... enforced
+  by a partial unique index on the quintuple"). "Active" means
+  not present in the `MetricRetraction` satellite table
+  (architecture G2 lines 148-157). Architecture lines 1001-1003
+  delegate the **exact DDL** to this doc ("the exact DDL is in
+  `tech-spec.md`"); Sec 8.7 below pins that DDL. The
+  partial-unique-index requirement is satisfied by a `PRIMARY
+  KEY (repo_id, sha, scope_id, metric_kind, metric_version)`
+  constraint on a side relation `metric_sample_active` that by
+  construction contains **exactly** the active row set (Sec
+  8.7) -- a PRIMARY KEY in PostgreSQL is implemented as a
+  unique B-tree index, so this IS the partial unique index
+  over the active row set, materialised as a separate relation
+  because (a) PostgreSQL rejects subqueries in index
+  predicates (so the index cannot live on `metric_sample`
+  itself with a `WHERE sample_id NOT IN (SELECT ... FROM
+  MetricRetraction)` predicate) and (b) `metric_sample` rows
+  are immutable per C2 / G3 (so no mutable flag column on
+  `metric_sample` may be used as the index predicate). The
+  side-relation realisation is the unique PostgreSQL-valid
+  shape that honours both G2 (active-row uniqueness over the
+  quintuple) and G3 (`MetricSample` immutability) at the same
+  time; the architecture's literal example wording is
+  preserved as the **logical** invariant the side-relation
+  realises.
 - **C2.** `MetricSample` rows are **immutable** per
   architecture G3 (architecture Sec 5.2.1 lines 908-920). No
   column on `MetricSample` is ever updated after insert,
   including `degraded` / `degraded_reason`. Corrections are
-  issued by appending a new `MetricSample` row at a **later
-  HEAD SHA** plus an append-only `MetricRetraction` row that
-  tombstones the prior `sample_id`; the active-pointer row is
-  updated to reference the new sample. Direct `UPDATE` or
-  `DELETE` on `MetricSample` is forbidden at the role-grant
-  level (Sec 8.7).
+  issued by appending an `MetricRetraction` row that
+  tombstones the prior `sample_id` plus appending a new
+  `MetricSample` row with a fresh `sample_id`; the
+  `metric_sample_active` pointer row is then atomically
+  swapped to reference the new sample (Sec 8.7
+  transactional pattern). Per architecture Sec 5.2.1 lines
+  981-989 (`mgmt.retract_sample` followed by `mgmt.rescan(repo_id,
+  sha)`), the correction MAY be issued **at the same SHA** --
+  the retracted row remains in `metric_sample` as the audit
+  trail (G3) and does not block a fresh active row at the
+  same quintuple because the uniqueness key in C1 is
+  enforced over the **active** row set only (a retracted
+  row is a tombstone, not an active row). The corrected row
+  MAY also land at a later HEAD SHA; both flows are
+  architecture-supported. Direct `UPDATE` or `DELETE` on
+  `MetricSample` is forbidden at the role-grant level (Sec 8.7).
 - **C3.** Identity invariants persist across the
   embedded<->linked AST mode flip (operator pin row 1). The
   `scope_id` derivation MUST mirror architecture G2 /
@@ -665,16 +732,17 @@ these is a release-blocker.
   verbs whose payloads are inherently non-AST. The full set
   of non-AST exceptions in v1 is:
 
-  | Verb (arch Sec 6.4 lines 1360-1377) | Payload | Non-AST rationale |
-  |------|---------|--------------------|
-  | `ingest.coverage` | Cobertura XML | Coverage is a test-runtime measurement, not a source-tree property |
-  | `ingest.test_balance` | JSON test-balance rows | Test pass/fail counts are CI-runtime data |
-  | `ingest.churn` | JSON churn rows | Commit history is VCS data, not source-tree data |
-  | `ingest.defects` | JSON defect rows | Defect tracker payload is external system data |
+  | Verb (arch Sec 6.4 lines 1360-1377) | Payload | Non-AST rationale | v1 MetricSample shape |
+  |------|---------|--------------------|------|
+  | `ingest.coverage` | Cobertura XML | Coverage is a test-runtime measurement, not a source-tree property | `pack='ingested'`, `source='ingested'`, `metric_kind IN (line_coverage_ratio, branch_coverage_ratio)` per Sec 4.1.1 |
+  | `ingest.test_balance` | JSON test-balance rows | Test pass/fail counts are CI-runtime data | `pack='ingested'`, `source='ingested'`, `metric_kind='pass_first_try_ratio'` per Sec 4.1.1 |
+  | `ingest.churn` | JSON churn rows | Commit history is VCS data, not source-tree data | Feeds the `modification_count_in_window` materialiser (Sec 8.2); the materialiser writes `pack='base'`, `source='computed'`, `metric_kind='modification_count_in_window'` -- the webhook itself does NOT write a MetricSample row |
+  | `ingest.defects` | JSON defect rows | Defect tracker payload is external system data | v1: ScanRun row only, **no** MetricSample row (no v1 `metric_kind` is defined; see Sec 4.11 and Sec 10A pin "ingest.defects v1") |
 
-  All four produce `MetricSample` rows with `source='ingested'`
-  (architecture Sec 5.2.1 field `source`) and `pack='ingested'`
-  per architecture Sec 1.4.1 + Sec 1.5 G1 Measurement row. No
+  For the rows that DO produce a `MetricSample`, the
+  `source` field (architecture Sec 5.2.1) is `ingested` and
+  `pack` is `ingested` per architecture Sec 1.4.1 + Sec 1.5
+  G1 Measurement row, matching the Sec 4.1.1 catalogue. No
   metric value MAY be derived from raw regex / line-counting /
   text-grep heuristics on source files outside these
   enumerated exceptions; `provenance` on the resulting
@@ -828,14 +896,41 @@ these is a release-blocker.
 
 ### 8.5 Transport and authN
 
-- **Agent-facing gRPC.** `eval.gate`, `MetricIngest`,
-  `RefactorPlanner.Read`, `Insights.Read`. gRPC + protobuf.
-  mTLS for service-to-service.
-- **Management surface (REST/JSON).** Repo onboarding, policy
-  publication, kill-switch toggle, audit-log retrieval. REST
-  + JSON, gated by OIDC bearer tokens. This pins the
-  architecture Sec 6 "HTTP/JSON gateway" deferred decision to
-  REST/JSON specifically.
+- **Agent-facing gRPC verb namespaces (per architecture Sec 6).**
+  The four verb namespaces are pinned to gRPC + protobuf with
+  mTLS for service-to-service auth:
+  - `eval.*` -- Evaluator Surface (architecture Sec 6.2);
+    the v1 verb is `eval.gate`.
+  - `mgmt.*` -- Management surface (architecture Sec 6.3);
+    write verbs `mgmt.register_repo`, `mgmt.set_mode`,
+    `mgmt.retract_sample`, `mgmt.rescan`, `mgmt.override`,
+    plus the `mgmt.read.*` family that backs the Insights
+    Surface dashboards (`mgmt.read.repo`,
+    `mgmt.read.metric_sample(s)`, `mgmt.read.findings`,
+    `mgmt.read.regressions`, `mgmt.read.cross_repo`,
+    `mgmt.read.portfolio`, `mgmt.read.refactor_plan`).
+    Architecture Sec 6 does NOT define a separate `Insights`
+    verb namespace; Insights dashboards are HTTP/JSON
+    projections over `mgmt.read.*`.
+  - `ingest.*` -- External Metric Ingest Webhook
+    (architecture Sec 6.4); `ingest.coverage`,
+    `ingest.test_balance`, `ingest.churn`, `ingest.defects`.
+  - `policy.*` -- Policy Steward (architecture Sec 6.5);
+    `policy.publish`, `policy.activate`,
+    `policy.publish_rulepack`. There is no `policy.override`
+    verb (architecture Sec 6.5 note); operator mute / unmute
+    flows through `mgmt.override`.
+- **HTTP/JSON gateway (operator-facing).** Repo onboarding,
+  policy publication, kill-switch toggle, audit-log retrieval,
+  Insights dashboard reads. The gateway terminates HTTP/JSON
+  at the edge and translates to the underlying `mgmt.*` /
+  `policy.*` gRPC calls; gated by OIDC bearer tokens. This
+  pins the architecture Sec 6 "HTTP/JSON gateway" deferred
+  decision to REST/JSON specifically and removes the prior
+  draft's invented surface names `MetricIngest`,
+  `EvaluatorGate`, `RefactorPlanner.Read`, and `Insights.Read`
+  -- those names are NOT part of architecture Sec 6 and were
+  retired in this iteration.
 - **External webhook (per-verb transport, four verbs from
   Sec 4.11 / arch Sec 6.4).** All four verbs run over REST
   with a signed-HMAC header for source verification; the
@@ -884,23 +979,33 @@ schema lives in `services/clean-code/migrations/` after
 implementation; the fragments here pin the architecture-
 deferred choices.
 
-**Active-row uniqueness via a separate active-pointer table**
-(C1, C2):
+**Active-row uniqueness: the partial unique index over the
+active row set** (C1, C2):
 
-The architecture (G2 lines 148-157) requires "at most one active
-row per quintuple `(repo_id, sha, scope_id, metric_kind,
-metric_version)`" while G3 (lines 908-920, 1035-1037) requires
-`MetricSample` rows to be **immutable** -- no column on
-`MetricSample` is ever updated, including any retraction flag.
-A literal partial unique index of the form
-`CREATE UNIQUE INDEX ... WHERE sample_id NOT IN (SELECT
-sample_id FROM clean_code.metric_retraction)` is **not
-production-valid** because PostgreSQL rejects subqueries in
-index predicates. A trigger that flips an `is_retracted` boolean
-on `MetricSample` is **likewise not acceptable** because it
-violates G3 immutability (C2). We therefore pin a separate
-active-pointer table whose row IS the active-set membership
-fact and which CAN be mutated without touching `MetricSample`:
+The architecture (G2 lines 148-157, Sec 5.2.1 lines 991-1003)
+requires "at most one active row per quintuple `(repo_id, sha,
+scope_id, metric_kind, metric_version)` ... enforced by a
+partial unique index on the quintuple" while G3 (lines 908-920,
+1035-1037) requires `MetricSample` rows to be **immutable** --
+no column on `MetricSample` is ever updated, including any
+retraction flag. The architecture explicitly delegates the DDL
+to this section ("the exact DDL is in `tech-spec.md`", line
+1003). In PostgreSQL the partial unique index cannot live on
+`metric_sample` itself because the natural predicate
+`WHERE sample_id NOT IN (SELECT sample_id FROM
+clean_code.metric_retraction)` is a subquery, and PostgreSQL
+rejects subqueries in index predicates; and a trigger-
+maintained `is_retracted` boolean on `MetricSample` is rejected
+because mutating that column violates G3 immutability (C2).
+The PostgreSQL-valid realisation that honours both G2 and G3
+is to **materialise the active row set as a side relation**
+whose `PRIMARY KEY` IS the partial unique index over the
+quintuple (a PRIMARY KEY in PostgreSQL is implemented as a
+unique B-tree index). The side relation contains, by
+construction, exactly the active row set -- so its unique
+index over the quintuple IS architecture's "partial unique
+index on the quintuple", just keyed on a different physical
+relation than the immutable sample-row store:
 
 ```sql
 -- Append-only row store. Plain, no triggers, no flag columns.
@@ -1000,17 +1105,28 @@ Why this shape:
   flag, no `UPDATE` ever touches `MetricSample`. The DDL grant
   in this section's next block explicitly revokes `UPDATE` and
   `DELETE` on `clean_code.metric_sample` from every role.
-- **Active-row uniqueness is DB-enforced (C1 / G2).** The
-  `PRIMARY KEY` on `metric_sample_active` is a real unique
-  constraint on the identity quintuple. There is no subquery,
-  no partial predicate, no clever index. The
-  `metric_sample_active_sample_id_uniq` index ensures a single
-  pointer never references two samples.
+- **Active-row uniqueness is the architecture-mandated partial
+  unique index, DB-enforced (C1 / G2).** The `PRIMARY KEY` on
+  `metric_sample_active` IS the partial unique index over the
+  quintuple that architecture Sec 5.2.1 lines 991-1003
+  mandates -- a PRIMARY KEY in PostgreSQL is realised as a
+  unique B-tree index, and the side relation by construction
+  contains exactly the active row set, so the unique constraint
+  on the quintuple over that relation IS architecture's
+  "partial unique index on the quintuple over the active row
+  set". The `metric_sample_active_sample_id_uniq` index
+  additionally ensures a single pointer never references two
+  samples.
 - **Retract-then-reinsert at the same quintuple is supported**
-  (architecture G2 line 154-156) by the `ON CONFLICT ... DO
+  (architecture G2 lines 154-156, Sec 5.2.1 lines 981-989 for
+  the `mgmt.retract_sample` + `mgmt.rescan(repo_id, sha)`
+  same-SHA correction flow) by the `ON CONFLICT ... DO
   UPDATE` clause on `metric_sample_active` in the transactional
   pattern. The retracted `MetricSample` row stays in the table
-  forever as the audit trail.
+  forever as the audit trail; a fresh `MetricSample` at the
+  same quintuple (same `(repo_id, sha, scope_id, metric_kind,
+  metric_version)`) lands as a new active row because the
+  uniqueness check is over the active row set only.
 - **Readers never see retracted samples** because they join
   through `metric_sample_active` rather than scanning
   `metric_sample` directly. The reader pattern is normative.
@@ -1281,7 +1397,8 @@ discovered.
   `policy.publish` to mute lifecycle (architecture Sec 6.5
   `policy.publish` at lines 1381-1387 has no mute-reset
   semantics). A built-in TTL field and a publish-time
-  mute-reset are **Open Question OQ-mute-ttl** below.
+  mute-reset are explicitly out of scope for v1; see Sec
+  10A pin "mute lifecycle".
 - **Residual.** Operational governance; CLEAN-CODE
   provides the visibility, the latest-row-wins unmute
   path, and the aged-mute report.
@@ -1402,93 +1519,54 @@ you only read one section of this doc, read this one.
 | 27 | Percentiles derived, not authoritative | gate joins raw samples | C17 |
 | 28 | AST is canonical front end | external webhook is the only exception | C19 |
 | 29 | Mode-flip identity preservation | `scope_id` from `(repo_id, scope_kind, canonical_signature, first_seen_sha)` -- mode-agnostic | C3, Risk 9.13 |
-| 30 | Multi-tenant | out of scope v1; **no** `tenant_id` column reserved in v1 data model (architecture Sec 5 carries none); isolation boundary is the `clean_code` schema (Sec 8.1.3) | Sec 4.14, Sec 5.4, OQ-multi-tenant-shape |
+| 30 | Multi-tenant | out of scope v1; **no** `tenant_id` column reserved in v1 data model (architecture Sec 5 carries none); isolation boundary is the `clean_code` schema (Sec 8.1.3); v2 shape pinned at Sec 10A as per-schema isolation | Sec 4.14, Sec 5.4, Sec 10A |
 
 ---
 
-## 10A. Open Questions raised by this tech-spec
+## 10A. Tech-spec pins for cross-doc reconciliation
 
-The following questions arose during cross-checking against
-`architecture.md`. They are not implementation blockers for
-v1 (each has a documented default behaviour) but the operator
-should sign off so the architecture doc and tech-spec doc
-converge on identical wording.
+The following decisions were raised in prior iterations as
+candidates for operator escalation; they are **pinned in this
+tech-spec** for v1. No operator answer is required to proceed;
+the architecture doc continues to delegate the DDL realisation
+to this section per its explicit "(the exact DDL is in
+`tech-spec.md`)" delegation. If a future architect chooses to
+restate any of these decisions in `architecture.md`, the pins
+here are the source of truth that should be mirrored.
 
-- **OQ-active-row-ddl.** Architecture Sec 5.2.1 lines 991-1003
-  describes active-row uniqueness as "a partial unique index on
-  the quintuple `WHERE sample_id NOT IN (SELECT sample_id FROM
-  MetricRetraction)` (the exact DDL is in `tech-spec.md`)".
-  PostgreSQL does not support subqueries in index predicates,
-  so Sec 8.7 below realises the same invariant via a separate
-  `metric_sample_active` pointer table. Action requested: align
-  architecture Sec 5.2.1 lines 991-1003 to cite the
-  pointer-table mechanism (either by referencing this tech-spec
-  Sec 8.7 normatively, or by rewriting the example to a
-  pointer-table sketch). Default if undecided: tech-spec Sec
-  8.7 stands and architecture continues to delegate via "the
-  exact DDL is in `tech-spec.md`".
-- **OQ-defects-metric-kind.** Architecture Sec 6.4 line 1375
-  defines `ingest.defects` but the metric catalogue at Sec
-  1.4.1 + Sec 1.4.2 names no defect-derived metric_kind. v1
-  accepts and stores defect payloads as `MetricSample` rows
-  with `source='ingested'` but emits no v1 metric_kind from
-  them. Action requested: confirm v1 stores-only behaviour, or
-  authorise a `MetricKind` addition (and a compute-recipe
-  scope decision) before v1 ships. Default if undecided:
-  stores-only; downstream metric_kinds are deferred to v2.
-- **OQ-multi-tenant-shape.** v1 is single-tenant (Sec 4.14 /
-  Sec 5.4). The v2 multi-tenant migration could take per-tenant
-  schemas, per-tenant row keys, or per-tenant connection
-  routing. Action requested: not for v1; recorded so v2
-  planners do not re-discover. Default if undecided: per-schema
-  isolation (extends Sec 8.1.3 shape).
-- **OQ-mute-ttl.** Architecture Sec 5.3.6 `Override` (lines
-  1160-1170) carries no `expires_at` field, and Sec 6.5
-  `policy.publish` (lines 1381-1387) has no mute-reset
-  semantics. Risk 9.10 documents the latest-row-wins unmute
-  flow + Insights aged-mute report as the v1 mitigation.
-  Action requested: confirm v1 ships without a built-in TTL
-  column on `Override`, or authorise an architecture change
-  to add one. Default if undecided: v1 ships without a TTL
-  column; aged-mute is operator governance via Insights.
-
-```json open-questions
-{ "openQuestions": [
-    { "id": "OQ-active-row-ddl",
-      "text": "Architecture Sec 5.2.1 lines 991-1003 describes active-row uniqueness as a partial unique index with a NOT IN subquery; PostgreSQL rejects subqueries in index predicates, so tech-spec Sec 8.7 realises the same invariant via a separate metric_sample_active pointer table. Should architecture be updated to cite the pointer-table mechanism, or should tech-spec attempt a different realisation?",
-      "type": "choice",
-      "choices": [
-        "A: Update architecture Sec 5.2.1 lines 991-1003 to cite the metric_sample_active pointer-table mechanism (tech-spec Sec 8.7 stands)",
-        "B: Keep architecture wording; tech-spec must use an alternative mechanism that maps to a single partial unique index (e.g. a denormalised retraction flag on a separate side-table, NOT on MetricSample itself)",
-        "C: Leave both as-is; readers interpret architecture lines 991-1003 as a logical statement and tech-spec Sec 8.7 as the binding DDL"
-      ] },
-    { "id": "OQ-defects-metric-kind",
-      "text": "Architecture defines `ingest.defects` as a verb but names no defect-derived metric_kind in the catalogue. Should v1 emit any metric_kind from ingest.defects, or just store the payload?",
-      "type": "choice",
-      "choices": [
-        "A: v1 stores ingest.defects payloads as MetricSample rows with source='ingested' but emits no v1 metric_kind",
-        "B: v1 ships a new defect_density metric_kind (requires architecture metric-catalogue addition)",
-        "C: v1 ships a different defect-driven metric_kind (operator names it)"
-      ] },
-    { "id": "OQ-multi-tenant-shape",
-      "text": "What v2 shape should multi-tenant isolation take? (Records intent for v2 planners; no v1 change.)",
-      "type": "choice",
-      "choices": [
-        "A: Per-schema isolation (extends Sec 8.1.3 single-tenant pattern)",
-        "B: Per-tenant row keys (adds tenant_id columns to every table in a v2 migration)",
-        "C: Per-tenant connection routing (deployment-level)",
-        "D: Decide later"
-      ] },
-    { "id": "OQ-mute-ttl",
-      "text": "Architecture Override (Sec 5.3.6) has no expires_at field and policy.publish has no mute-reset semantics. Should v1 ship without a built-in TTL on Override, with mute lifecycle governed by Insights aged-mute reports + operator-driven latest-row-wins unmute?",
-      "type": "choice",
-      "choices": [
-        "A: v1 ships without a TTL column; mute lifecycle is operator governance via Insights aged-mute reports + latest-row-wins unmute",
-        "B: Add an expires_at field to Override (requires architecture change) for v1",
-        "C: Add policy.publish mute-reset semantics (requires architecture change) for v1"
-      ] }
-] }
-```
+- **Pin: active-row DDL.** The architecture's "partial unique
+  index on the quintuple" requirement (architecture Sec 5.2.1
+  lines 991-1003) is realised by the `PRIMARY KEY` on
+  `clean_code.metric_sample_active(repo_id, sha, scope_id,
+  metric_kind, metric_version)`. The side relation contains
+  exactly the active row set, so its `PRIMARY KEY` IS the
+  partial unique index over the quintuple (Sec 7.1 C1,
+  Sec 8.7).
+- **Pin: `ingest.defects` v1 behaviour.** v1 accepts the
+  webhook verb and persists a `ScanRun` row with `kind=
+  'external_per_row'`, `sha_binding='per_row'`, `to_sha=NULL`,
+  `payload_hash` set; **no `MetricSample` row is written by
+  this verb in v1** because no defect-derived `metric_kind`
+  exists in the architecture catalogue and
+  `MetricSample.metric_kind NOT NULL` (Sec 4.11, Sec 8.7
+  DDL). A v2 follow-on adds the defect-derived `metric_kind`
+  and re-routes the payload backlog (Sec 4.11 v1-pin row).
+- **Pin: multi-tenant v2 shape.** v1 is single-tenant per
+  Sec 4.14 / Sec 5.4. v2 multi-tenant migration adopts
+  **per-schema isolation** (one `clean_code_<tenant>` schema
+  per tenant, extending the Sec 8.1.3 single-tenant shape).
+  No `tenant_id` column is reserved in v1 tables; a
+  per-schema migration does not require row-level columns
+  (Sec 5.4).
+- **Pin: mute lifecycle.** v1 ships without a TTL column on
+  `Override` (architecture Sec 5.3.6 has no `expires_at`)
+  and without mute-reset semantics on `policy.publish`
+  (architecture Sec 6.5). Mute / unmute lifecycle is
+  operator governance via (a) the Insights aged-mute report
+  and (b) the latest-row-wins `Override` semantics from
+  architecture Sec 5.3.6 line 1170 -- operator appends a
+  new `Override` row with `mute=false` via `mgmt.override`
+  to unmute (Risk 9.10).
 
 ---
 
@@ -1553,8 +1631,11 @@ converge on identical wording.
   Engine batch worker, Audit WAL Reconciler -- the last
   replay-only). The C5 table is the authoritative listing.
 - **Foundation-tier metric.** A per-scope numeric value
-  derived from a single language's AST -- the 12 metrics
-  listed in Sec 4.1.
+  carried on a `MetricSample` row with `pack IN ('base',
+  'solid', 'ingested')` (architecture Sec 5.2.1 `pack` enum).
+  The v1 set is the 12 AST-derived (`pack='base'` /
+  `pack='solid'`) rows in Sec 4.1 plus the 3 externally-
+  ingested (`pack='ingested'`) rows pinned in Sec 4.1.1.
 - **System-tier metric.** A per-scope numeric value derived
   from cross-scope or cross-module relationships -- the 7
   metrics listed in Sec 4.2.

@@ -138,11 +138,11 @@ these.
 
   | Sub-store | Tables | Writer(s) | Readers |
   | --- | --- | --- | --- |
-  | Catalog / Lifecycle | `Repo`, `Commit`, `MetricKind`, `RulePack`, `ScanRun` | Management (Repo, Commit, RepoEvent rows) + Metric Ingestor (ScanRun, Commit `scan_status` transitions only) | All other components (read-only) |
+  | Catalog / Lifecycle | `Repo`, `Commit`, `MetricKind`, `ScanRun` | Management (Repo, Commit, RepoEvent rows) + Metric Ingestor (ScanRun, Commit `scan_status` transitions only) | All other components (read-only) |
   | Measurement | `MetricSample` (foundation-tier rows where `pack IN ('base', 'solid', 'ingested')`), `ScopeBinding`, `MetricRetraction` | Metric Ingestor | Compute Engine, SOLID Rule Engine, Refactor Planner, Cross-Repo Aggregator, Insights, Evaluator |
   | Measurement (system-tier carve-out) | `MetricSample` rows where `pack='system'` AND `source='derived'`, `RepoMetricSnapshot`, `CrossRepoPercentile`, `PortfolioSnapshot` | Cross-Repo Aggregator (the **only** writer of `pack='system'` rows; see Section 3.10 step 4) | Insights, Evaluator, Refactor Planner |
-  | Policy / rules | `Rule`, `PolicyVersion`, `PolicyActivation`, `Threshold`, `Override` | Policy Steward (Section 3.11) | Evaluator (read-only), Insights (read-only) |
-  | Audit / verdict | `EvaluationRun`, `EvaluationVerdict`, `Finding` | Evaluator Surface (`eval.gate` caller) **and** SOLID Rule Engine batch worker (`Section 3.6`, post-ingest refresh -- writes all three tables with `EvaluationRun.caller='batch_refresh'`) | Insights, Management |
+  | Policy / rules | `Rule`, `RulePack`, `PolicyVersion`, `PolicyActivation`, `Threshold`, `Override` | Policy Steward (Section 3.11) -- the **only** writer of `RulePack` (see Section 1.5.1 row 4) | Evaluator (read-only), Insights (read-only) |
+  | Audit / verdict | `EvaluationRun`, `EvaluationVerdict`, `Finding` | Evaluator Surface (`eval.gate` caller); SOLID Rule Engine batch worker (`Section 3.6`, post-ingest refresh -- writes all three tables with `EvaluationRun.caller='batch_refresh'`); **and** Audit WAL Reconciler (Section 7.10, **replay-only** of WAL-buffered rows -- never originates a new `EvaluationRun`, only re-commits rows already written to the local WAL when PostgreSQL was unreachable, preserving the original `EvaluationRun.caller` value from the WAL frame) | Insights, Management |
   | Refactor | `HotSpot`, `RefactorPlan`, `RefactorTask` | Refactor Planner (Section 3.9) | Insights, Management |
 
 - **G2 -- Identity by `(repo_id, sha, scope_id, metric_kind,
@@ -240,6 +240,8 @@ ends.
 | 1 | **ScanRun writer** | The **Metric Ingestor** (Section 3.1) is the only writer of `ScanRun` rows. Management opens and closes `Commit.scan_status` transitions only -- it never writes `ScanRun` directly. | Section 3.1 (Ingestor responsibilities), Section 5.7 (`ScanRun` writer column), Section 9 (public-contract summary row) |
 | 2 | **`xservice_test_reliability` source** | The **Cross-Repo Aggregator** (Section 3.10 step 4) is the writer; `source='derived'` and `pack='system'`. The External Metric Ingest Webhook writes only the foundation-tier `pass_first_try_ratio` input row (`pack='ingested'`); it **never** writes the system-tier `xservice_test_reliability` row directly. | Section 1.4.2 row 6, Section 3.10 step 4, Section 3.12 (webhook), Section 5.2.2 (sample `pack` enum) |
 | 3 | **External ingest SHA shape** | The Metric Ingestor accepts external-mode payloads in **four** ingest shapes (Section 3.1): `external_cov(repo_id, sha, payload)`, `external_test(repo_id, sha, payload)`, `external_churn(repo_id, payload)`, `external_defects(repo_id, payload)`. For coverage and test-balance the payload is bound to a single SHA; for churn and defects each row carries its own SHA and the parent `ScanRun.sha_binding='per_row'` with `to_sha=NULL` (Section 5.7). The webhook surface in Section 6.4 mirrors these four shapes. | Section 3.1 preamble ("four modes"), Section 5.7 (`ScanRun.sha_binding` enum), Section 6.4 (verb signatures) |
+| 4 | **`RulePack` writer and sub-store** | The **Policy Steward** (Section 3.11) is the only writer of `RulePack` rows, and the row lives in the **Policy / rules** sub-store alongside `Rule` and `PolicyVersion` (which it bundles). Management does NOT delegate `RulePack` writes via any `mgmt.*` verb; operators publish packs through `policy.publish_rulepack` (Section 6.5). `RulePack` is NOT in the Catalog / Lifecycle sub-store. | Section 1.5 G1 (Policy / rules ACL row), Section 5.3.2 (`RulePack` field table placement callout), Section 5.8 (sub-store summary table), Section 9 (Policy Steward Writes column) |
+| 5 | **Override verb naming** | Operator mute / unmute uses the **`mgmt.override`** verb on the Management surface (Section 6.3); Management delegates to the Policy Steward, which appends the `Override` row. There is intentionally **no** `policy.override` verb on the Policy Steward surface (Section 6.5) -- all override traffic is routed via Management so audit logs are uniform across operator mutations. Sections that listed `policy.override` as a trigger in prior drafts are bugs. | Section 6.3 (`mgmt.override` definition), Section 6.5 (no-`policy.override` note), Section 4.6 (operator-mute flow uses `mgmt.override`), Section 9 (Policy Steward Trigger column lists `mgmt.override`) |
 
 ### 1.6 Operator pins (answered, normative)
 
@@ -860,21 +862,61 @@ against. Every table belongs to exactly one G1 sub-store
 > `MetricRetraction` (Section 5.2.2). The `degraded` /
 > `degraded_reason` fields are likewise insert-only -- a sample
 > that was written `degraded=true` because an input was missing
-> at the Aggregator tick stays `degraded=true` forever as the
-> audit trail. The non-degraded replacement is **not** written
-> at the same SHA (that would collide with the uniqueness key
-> below and break G3); instead, when the missing input later
-> arrives, the **next** Aggregator tick that runs at a **later
-> HEAD SHA** writes the corrected non-degraded `MetricSample`
-> at that new SHA, and consumers join the latest non-degraded
-> row per `(repo_id, scope_id, metric_kind, metric_version)`
-> via `MAX(Commit.committed_at)`. The old degraded row remains
-> queryable at the older SHA (G3 + G6). If an operator
-> explicitly needs the degraded row removed from gate inputs
-> before a new SHA arrives, they call `mgmt.retract_sample`
-> (Section 6.3), which appends a `MetricRetraction` row
-> referencing the degraded sample id; readers filter retracted
-> rows out of consideration.
+> at the Aggregator tick stays `degraded=true` forever at that
+> SHA as the audit trail. **The corrected non-degraded row is
+> not written at the same SHA** (that would collide with the
+> uniqueness key below and break G2/G3); when the missing input
+> later arrives, the **next** Aggregator tick that runs at a
+> **later HEAD SHA** writes the corrected non-degraded
+> `MetricSample` at that new SHA. The old degraded row remains
+> queryable at its original SHA forever (G3 + G6).
+>
+> **Read-time semantics (normative -- the only correct way to
+> consume around degraded rows).** Two read modes are defined
+> on the Read API (Section 3.4) and the Evaluator Surface
+> (Section 3.7); every reader MUST declare which mode it is in:
+>
+> - **SHA-pinned reads** (`eval.gate`, `refactor.*`, and any
+>   `read.*` call that supplies a `sha` parameter) MUST return
+>   the row at the exact requested SHA. If the row at that SHA
+>   is degraded, the reply carries `Degraded { reason }`
+>   (Section 6.1) and the `gate-degraded-policy=warn` rule
+>   (Section 1.6) governs the resulting verdict. **A SHA-pinned
+>   reader NEVER silently substitutes a later-SHA value for an
+>   earlier-SHA query.** This preserves G2 (the
+>   `(repo_id, sha, scope_id, metric_kind, metric_version)`
+>   identity), keeps every historical verdict reproducible, and
+>   means a `Finding` or `RefactorTask` persisted against a SHA
+>   always cites a row that actually existed at that SHA.
+> - **Latest-dashboard reads** (`read.snapshot` with no `sha`
+>   parameter, the Insights Surface dashboards in Section 3.4,
+>   the cross-repo portfolio surface in Section 3.13) MAY
+>   substitute the latest non-degraded row per
+>   `(repo_id, scope_id, metric_kind, metric_version)` via
+>   `MAX(Commit.committed_at)` to give a "current best estimate"
+>   view. These substitutions are NEVER persisted into a
+>   `Finding`, a `RefactorTask`, or an `EvaluationVerdict`; they
+>   are read-only UI projections and the reply explicitly stamps
+>   `substituted_from_sha` on the response envelope so the UI
+>   can render "as of SHA X" rather than the query SHA.
+>
+> The two modes are disjoint by design: a single call is either
+> SHA-pinned or latest-dashboard, never both. The Evaluator
+> Surface is always SHA-pinned; the Refactor Planner is always
+> SHA-pinned; the Insights dashboards are always
+> latest-dashboard (Insights queries that need SHA-pinned
+> reproducibility go through the Read API instead).
+>
+> If an operator explicitly needs the degraded row removed from
+> SHA-pinned gate inputs before a new HEAD SHA arrives, they
+> call `mgmt.retract_sample` (Section 6.3), which appends a
+> `MetricRetraction` row referencing the degraded sample id;
+> SHA-pinned readers filter retracted rows out of consideration.
+> A subsequent `mgmt.rescan(repo_id, sha)` (Section 6.3) re-runs
+> the scan at the same SHA to land a fresh row -- the new row
+> has its own `MetricSample.sample_id` and the uniqueness check
+> in Section 5.2.2 treats retracted rows as not contributing to
+> the uniqueness key, so the fresh row is admitted.
 >
 > **Uniqueness.** For `source IN ('computed', 'ingested')` the
 > tuple `(repo_id, sha, scope_id, metric_kind, metric_version)`
@@ -973,9 +1015,11 @@ against. Every table belongs to exactly one G1 sub-store
 
 #### 5.3.2 RulePack
 
-> **Sub-store placement (G1).** `RulePack` is a Catalog /
-> Lifecycle row, listed here for proximity to `Rule` /
-> `PolicyVersion` (which it bundles). Writer: Policy Steward.
+> **Sub-store placement (G1).** `RulePack` is a **Policy / rules**
+> sub-store row (Section 1.5 G1 ACL row 4, Section 1.5.1 row 4),
+> sitting alongside `Rule` and `PolicyVersion` (which it bundles).
+> Writer: Policy Steward (Section 3.11). No other component writes
+> `RulePack`. `RulePack` is NOT a Catalog / Lifecycle row.
 
 | Field | Type | Notes |
 | --- | --- | --- |
@@ -1150,9 +1194,9 @@ are derived and can be rebuilt deterministically.
 
 | Sub-store | Tables in this section |
 | --- | --- |
-| Catalog / Lifecycle | `Repo`, `Commit`, `MetricKind`, `RepoEvent`, `RulePack`, `ScanRun` |
+| Catalog / Lifecycle | `Repo`, `Commit`, `MetricKind`, `RepoEvent`, `ScanRun` |
 | Measurement | `MetricSample`, `MetricRetraction`, `ScopeBinding`, `RepoMetricSnapshot`, `CrossRepoPercentile`, `PortfolioSnapshot` |
-| Policy / rules | `Rule`, `PolicyVersion`, `PolicyActivation`, `Threshold`, `Override` |
+| Policy / rules | `Rule`, `RulePack`, `PolicyVersion`, `PolicyActivation`, `Threshold`, `Override` |
 | Audit / verdict | `EvaluationRun`, `EvaluationVerdict`, `Finding` |
 | Refactor | `HotSpot`, `RefactorPlan`, `RefactorTask` |
 
@@ -1253,16 +1297,40 @@ Per Section 1.5.1 row 3, four shapes mirror the four `ScanRun` modes:
 - `policy.publish_rulepack(pack_id, display_name, ...) ->
   RulePack`
 
+> **Note (no `policy.override` verb).** Operator mute / unmute
+> goes through `mgmt.override` (Section 6.3), which delegates to
+> the Policy Steward for the actual `Override` row append
+> (Section 3.11, Section 4.6). There is intentionally **no**
+> public `policy.override` verb on this surface -- all override
+> traffic is routed via the Management surface so audit logs
+> are uniform across all operator mutations (Section 1.5.1 row
+> 5). Any earlier draft that listed `policy.override` as a
+> trigger is a bug; the Section 9 Policy Steward trigger column lists
+> `mgmt.override`.
+
 ---
 
 ## 7. Cross-cutting components
 
 ### 7.1 Audit WAL
 
-Every Measurement / Audit-sub-store write goes through a local
+Every **Audit-sub-store** write (`EvaluationRun`,
+`EvaluationVerdict`, `Finding`) goes through a local
 write-ahead log first; the row is committed to PostgreSQL only
-after the WAL fsync succeeds. This is what makes the system
-crash-safe even when the database is temporarily unreachable.
+after the WAL fsync succeeds. The Audit WAL Reconciler
+(Section 7.10) replays WAL-buffered rows after a crash,
+preserving the original `EvaluationRun.caller` recorded in the
+WAL frame. **The WAL contract is scoped to the Audit sub-store
+only**: Measurement writes do NOT use this WAL, because
+Measurement rows are re-derivable from a re-scan (G6) -- on
+PostgreSQL unreachability the Metric Ingestor fails the
+in-flight `ScanRun` and a subsequent scan re-attempts to land
+a fresh row. Catalog / Lifecycle writes (`Repo`, `Commit`,
+`RepoEvent`, `ScanRun`) are single-row commits and rely on
+PostgreSQL synchronous replication for durability rather than
+on this local WAL. Policy / rules and Refactor sub-store writes
+are likewise not WAL-buffered (they are infrequent
+operator-triggered commits).
 
 ### 7.10 Audit WAL Reconciler
 
@@ -1378,7 +1446,7 @@ wins.
 | Worker -- Refactor Planner (Section 3.9) | post-ingest refresh | MetricSample, Finding | HotSpot, RefactorPlan, RefactorTask (Refactor) |
 | Worker -- Cross-Repo Aggregator (Section 3.10) | cadence tick | MetricSample (Measurement; reads foundation-tier rows) | **MetricSample** (Measurement; **system-tier** rows only, stamped `pack='system'`, `source='derived'` per Section 3.10 step 4 -- the Aggregator is the **only** writer that produces `pack='system'` rows; foundation-tier writes remain with the Metric Ingestor per row above and per the Section 1.5.1 reconciliation table); RepoMetricSnapshot, CrossRepoPercentile, PortfolioSnapshot (Measurement; derived per G6) |
 | Worker -- Audit WAL Reconciler (Section 7.10) | Metrics Store recovery | local audit WAL (process-local; not a Metrics Store sub-store) | EvaluationRun, EvaluationVerdict, Finding (Audit / verdict; replay-only of WAL-buffered rows) |
-| Policy Steward (Section 3.11) | `policy.publish`, `policy.activate`, `policy.override` | -- | Rule, RulePack, PolicyVersion, PolicyActivation, Threshold, Override (Policy / rules) |
+| Policy Steward (Section 3.11) | `policy.publish`, `policy.activate`, `policy.publish_rulepack`, and `mgmt.override` (delegated from the Management surface per Section 6.3 -- there is no `policy.override` verb, see Section 6.5 note and Section 1.5.1 row 5) | -- | Rule, RulePack, PolicyVersion, PolicyActivation, Threshold, Override (Policy / rules) |
 | Evaluator Surface (Section 3.7) | `eval.gate` | MetricSample, PolicyVersion, Override | EvaluationRun, EvaluationVerdict, Finding (Audit / verdict; `EvaluationRun.caller='eval_gate'`) |
 | External Metric Ingest Webhook (Section 3.12) | `ingest.coverage / churn / defects / test_balance` | -- (auth only) | enqueues `ScanRun` for the Metric Ingestor -- the Ingestor is the actual writer (per G1) |
 

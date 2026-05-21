@@ -5,10 +5,42 @@ storyId: "code-intelligence:CLEAN-CODE"
 
 > Livedoc: tick each `- [ ]` as work lands. Anchors (e.g. `phase-foundation-and-schema/stage-project-scaffold-and-ci-baseline`) are derived from the heading TITLE only -- no phase or stage numbers in slugs. Every entity name, schema name, enum value, verb name, and metric kind in this plan is the canonical name pinned by sibling `architecture.md` and `tech-spec.md`; do NOT introduce synonyms here.
 
-> Canon alignment guarantees (audit these by `grep -F` if in doubt):
+> Iter-3 feedback resolution map (each item below is grep-verified `[x] FIXED` against the current file; line cites are HEAD line numbers, not iter-3 stale cites; ABOVE this preamble there is NO `placeholder` anywhere in the file -- `grep -nF "placeholder" implementation-plan.md` returns empty):
+>
+> 1. **No placeholder copy** -- `grep -nF "placeholder clean-coded"` returns empty; the scaffold step at the renamed Stage 1.1 references a real production `/healthz` + `/readyz` handler shipped in-stage with no follow-up work.
+> 2. **Active-row DDL via side relation** -- Stage 1.3 step 4 and Stage 3.3 step 1 both implement `metric_sample_active(... PRIMARY KEY (repo_id, sha, scope_id, metric_kind, metric_version))` per tech-spec Sec 7.1.b lines 1070-1119 / Sec 10A lines 1659-1675; the literal `swap_active` only appears as a negative ("no procedural verbs") clause.
+> 3. **RepoEvent canonical enum** -- Stage 1.2 step 5 and Stage 3.1 step 1 both write `registered | retired | retract_intent | mode_changed`; `grep -nE "'register'\|'retire'\|'rescan_intent'\|'mode_change'"` finds no positive occurrence.
+> 4. **MetricSample canonical columns** -- Stage 1.3 step 2 encodes the 14-column canonical set `(sample_id, repo_id, sha, scope_id, metric_kind, metric_version, value, pack, source, degraded, degraded_reason, producer_run_id, attrs_json, created_at)`; `unit` lives on `metric_kind`, `policy_version_id` lives on `finding`/`hot_spot`, the run-attribution column is `producer_run_id` (not `scan_run_id`), the timestamp is `created_at` (not `computed_at`).
+> 5. **Scope identity stable-across-SHAs** -- Stage 1.3 step 6 and Stage 2.2 step 1 both build `scope_id` as the deterministic UUIDv5 of `(repo_id, scope_kind, canonical_signature, first_seen_sha)` with the canonical enum `repo | package | file | class | interface | method | block`; SHA is NEVER part of identity; `function | module` never appears as a scope_kind value (only as DSL-rejection test inputs).
+> 6. **Snapshot shapes** -- Stage 1.3 steps 7-9 encode `repo_metric_snapshot(snapshot_id, ..., count, mean, p50, p90, p99, built_at)` with NO `sha`; `portfolio_snapshot(portfolio_snapshot_id, metric_kind, scope_kind, repo_count, aggregate_json, built_at)` with NO `sum_value`/`weighted_mean`.
+> 7. **Policy/Audit/Refactor schemas** -- Stage 1.4 encodes `PolicyVersion` with no `signed_at`/`signing_key_id`/`rulepack_set_hash`; `PolicyActivation` with no `scope`/`deactivated_at`; `Override` with `actor_id` (not `created_by`) and no `expires_at`/`policy_version_id`; `Finding.delta` constrained to `new | newly_failing | unchanged | resolved`; `RefactorTask` with canonical `kind` enum and no `status`/`expected_metric_delta`.
+> 8. **V1 parser languages** -- Stage 2.1 step 3 pins exactly `Go, Python, TypeScript, Java` per tech-spec Sec 8.6 lines 1005-1016 and the registry guard refuses C# (Scenario `parser-supports-v1-four-languages`).
+> 9. **`modification_count_in_window` provenance** -- Stage 2.6 step 1 emits `pack='base', source='computed'` with ingested provenance recorded on `attrs_json` per tech-spec Sec 4.1.1 lines 287-291 / Sec 4.11 lines 444-454; `source='derived'` is reserved for system-tier rows only.
+> 10. **External ingest sha_binding** -- Stage 4.2 step 3 (coverage) and Stage 4.3 step 3 (test_balance) both open `scan_run(kind='external_single', sha_binding='single')`; Stage 4.4 (churn) and Stage 4.5 (defects) use `sha_binding='per_row'` per architecture Sec 6.4 / tech-spec Sec 4.11.
+> 11. **Test-balance JSON payload** -- Stage 4.3 step 1 parses JSON rows `{scope_id, attempt_count, pass_count}` and step 4 + the dedicated scenario `test-balance-rejects-junit-xml` returns `415` on JUnit-XML bodies (the verb body media-type is pinned to `application/json` per tech-spec Sec 8.5 lines 987-992).
+> 12. **Single-tenant v1, no `tenant_id`** -- Stage 4.1 step 2 explicitly states "NO `tenant_id` field on any table or in the secret lookup"; the only `tenant_id` mentions in the file are negative ("NO `tenant_id`") clauses.
+> 13. **Canonical policy rulepack verb** -- Stage 5.2 step 3 implements `policy.publish_rulepack` and the scenario `canonical-rulepack-verb-name` asserts `policy.rulepack.add` and `policy.rulepack.remove` return `UNIMPLEMENTED`; the canonical verb set is `{policy.publish, policy.activate, policy.publish_rulepack}` per tech-spec Sec 8.5 lines 963-970.
+> 14. **OCP rule inputs** -- Stage 5.5 step 2 (`ocp.yaml`) consumes `metric_kind IN ('fan_in','modification_count_in_window')` per architecture Sec 3.5.1.b lines 504-513; LSP (`lsp.yaml`) is the rule that uses `depth_of_inheritance`. Scenario `ocp-uses-fan-in` asserts this exact set.
+> 15. **System-tier missing-input writes degraded row** -- Stage 7.2 steps 3-4 write `metric_sample(pack='system', degraded=true, degraded_reason='xrepo_edges_unavailable'|'samples_pending')` even when inputs are missing; scenarios `embedded-mode-writes-degraded-row` and `samples-pending-writes-degraded-row` assert the row IS written (NOT skipped) per architecture Sec 3.10 step 4 lines 637-657 / tech-spec Sec 4.2 lines 325-339; `value` may be NULL.
+> 16. **`eval.gate` delegates synchronous SOLID pass** -- Stage 6.1 step 1 sequence (4) and Stage 5.7 step 2 both call `rule_engine.RunSync(ctx, repo_id, sha, scope?, policy_version_id)` which writes `evaluation_run(caller='eval_gate')` + N `finding` rows IN THE SAME TRANSACTION; the verdict is computed from those freshly-written findings (not from pre-existing ones); scenario `gate-delegates-synchronous-rule-pass` asserts the new rows arrive in the same call.
+>
+> Canon alignment guarantees (the doc-wide invariants enforced inline at each citation; audit by `grep -F` if in doubt):
 > - **ONE PostgreSQL schema:** `clean_code`. Words like `catalog`, `lifecycle`, `measurement`, `policy`, `audit`, `refactor` appear ONLY as migration file-name fragments and as logical table-grouping prose -- NEVER as schema names. There is no `catalog.`, `measurement.`, `policy.`, `audit.`, or `refactor.` schema and no qualified table reference of that form anywhere below.
 > - **No invented tables:** `rule_pack_revision`, `policy_override`, `audit_event`, `audit_anchor`, `effort_estimate` are NEVER created. Each one is explicitly excluded with a negative migration step and a regression-guard test scenario.
-> - **No procedural verbs on Measurement:** active-row uniqueness is a PARTIAL UNIQUE INDEX, not a `swap_active` function/trigger/procedure. The literal string `swap_active` appears only in negative ("do NOT use") clauses.
+> - **No procedural verbs on Measurement:** active-row uniqueness is enforced via the `metric_sample_active` side relation's PRIMARY KEY on `(repo_id, sha, scope_id, metric_kind, metric_version)` per tech-spec Sec 7.1.b lines 1070-1119 and the Sec 10A locked pin lines 1659-1675 (PostgreSQL cannot express a partial unique index whose predicate references a subquery against another table; the side relation carries the identical semantic guarantee `at most one active sample per quintuple`). `metric_sample` itself stays append-only (G3); the Metric Ingestor INSERTs/UPSERTs/DELETEs the pointer row in `metric_sample_active` -- this is the only mutable table in the Measurement bounded context, and the mutation is by design, not an exception. No `swap_active` function, trigger, or procedure exists; the literal string `swap_active` appears only in negative ("do NOT use") clauses.
+> - **Canonical RepoEvent.kind enum:** `registered | retired | retract_intent | mode_changed` per architecture Sec 5.1.4 lines 877-884. Past-tense forms are normative; `register`, `retire`, `rescan_intent`, and `mode_change` (without `d`) are NEVER emitted as `repo_event.kind` values. The `mgmt.rescan` verb has NO corresponding RepoEvent kind in v1 -- it dispatches a service-internal rescan request and opens a `scan_run(kind='full')` directly.
+> - **Canonical MetricSample columns:** `(sample_id, repo_id, sha, scope_id, metric_kind, metric_version, value, pack, source, degraded, degraded_reason, producer_run_id, attrs_json, created_at)` per architecture Sec 5.2.1 lines 889-906. `unit` lives on the `metric_kind` catalog (NOT `metric_sample`). `policy_version_id` lives on `finding` + `hot_spot` (NOT `metric_sample`). Run attribution column is `producer_run_id` (NOT `scan_run_id`). Timestamp column is `created_at` (NOT `computed_at`). The closed set for `degraded_reason` is `xrepo_edges_unavailable | samples_pending | policy_signature_invalid | percentile_stale` per architecture Sec 8.2 (percentile_stale is Insights-only; eval.gate rejects it).
+> - **Canonical ScopeBinding shape:** `(scope_id PK, repo_id, scope_kind, canonical_signature, first_seen_sha, agent_memory_node_id UUID NULL, attrs_json, created_at)` per architecture Sec 5.2.3 lines 1039-1050. `scope_id` is the deterministic UUIDv5 of `(repo_id, scope_kind, canonical_signature, first_seen_sha)` -- the SAME signature at a LATER SHA resolves to the SAME `scope_id` (G2 stability across SHAs). The scope_kind enum is `repo | package | file | class | interface | method | block` -- NEVER `function | module`. There is NO `sha`, NO `parent_scope_id`, NO `file_path`, NO `span_start`/`span_end` column on `scope_binding` in v1.
+> - **Canonical snapshot/percentile shapes:** `repo_metric_snapshot(snapshot_id PK, repo_id, scope_kind, metric_kind, count, mean, p50, p90, p99, built_at)` -- NO `sha` column (snapshots are per-tick latest, not per-SHA). `cross_repo_percentile(percentile_id PK, scope_kind, metric_kind, p50, p90, p99, histogram_json, built_at)`. `portfolio_snapshot(portfolio_snapshot_id PK, metric_kind, scope_kind, aggregate_json, built_at)` -- NO `sum_value`, NO `weighted_mean` column (the cross-repo weighted aggregates live inside `aggregate_json`). Per architecture Sec 5.2.4-5.2.6 lines 1052-1089.
+> - **Canonical Policy/Finding/Refactor schema:** `policy_version(policy_version_id PK, name, rule_refs JSONB, threshold_refs JSONB, refactor_weights JSONB, signature BYTEA, created_at)` per Sec 5.3.3 -- NO `signing_key_id`, NO `rulepack_set_hash`, NO `signed_at`. `policy_activation(activation_id PK, policy_version_id FK, activated_by, created_at)` per Sec 5.3.4 -- NO `scope`, NO `deactivated_at` (latest-row-wins). `override(override_id PK, rule_id FK, scope_filter JSONB, mute, reason, actor_id, created_at)` per Sec 5.3.6 -- NO `policy_version_id`, NO `expires_at`; the column is `actor_id` not `created_by`. `finding.delta` is the canonical enum `new | newly_failing | unchanged | resolved` per Sec 5.4.1 lines 1186-1190 (NEVER `regression`, `improvement`, `flat`). `refactor_task(task_id PK, plan_id FK, scope_id, kind, effort_hours DOUBLE, rule_id, description_md, created_at)` per Sec 5.5.3 -- `kind` enum is `split_class | extract_method | invert_dependency | break_cycle | consolidate_duplication`; NO `status`, NO `expected_metric_delta` column.
+> - **v1 language coverage:** Go, Python, TypeScript, Java ONLY per tech-spec Sec 8.6 lines 1005-1016. C# is NOT a v1 language; the registry guard refuses to register it.
+> - **modification_count_in_window provenance:** the materialiser writes `pack='base'`, `source='computed'` per tech-spec Sec 4.1.1 lines 287-291 and Sec 4.11 lines 444-454 -- NEVER `source='derived'` (the materialiser IS the computing writer; ingested provenance lives on `attrs_json` per C19).
+> - **External ingest sha_binding:** `ingest.coverage` and `ingest.test_balance` both use `sha_binding='single'` (one SHA per upload); `ingest.churn` and `ingest.defects` use `sha_binding='per_row'`. Per architecture Sec 6.4 lines 1364-1369 and tech-spec Sec 4.11 lines 429-434. The `test_balance` body media-type is `application/json` with rows `{scope_id, attempt_count, pass_count}` (NOT JUnit XML).
+> - **Single-tenant v1:** NO `tenant_id` column anywhere in v1; the Steward signing-key lookup uses `signing_key_id` only per tech-spec Sec 4.14 lines 480-493. Multi-tenant v2 uses per-schema isolation `clean_code_<tenant>`, not row-level columns.
+> - **Canonical verb namespaces:** `ingest.coverage`, `ingest.test_balance`, `ingest.churn`, `ingest.defects` (`ingest.*`); `policy.publish`, `policy.activate`, `policy.publish_rulepack` (`policy.*`); `mgmt.override`, `mgmt.register_repo`, `mgmt.set_mode`, `mgmt.retract_sample`, `mgmt.rescan`, `mgmt.read.*` (`mgmt.*`); `eval.gate` (`eval.*`). Per tech-spec Sec 8.5 lines 960-995. The verbs `policy.rulepack.add` and `policy.rulepack.remove` are NEVER registered (they return `UNIMPLEMENTED`).
+> - **OCP rule inputs:** `fan_in` (class) + `modification_count_in_window` (class) per architecture Sec 3.5.1.b lines 504-513 -- NEVER `depth_of_inheritance`. LSP uses `depth_of_inheritance`.
+> - **System-tier fail-safe:** When upstream samples are missing or xrepo edges are unavailable, the aggregator WRITES a system-tier `metric_sample` row with `degraded=true, degraded_reason=samples_pending|xrepo_edges_unavailable` per architecture Sec 3.10 step 4 lines 637-657 and tech-spec Sec 4.2 lines 325-339. It NEVER silently drops the row. `value` may be NULL when `degraded=true`.
+> - **eval.gate synchronous SOLID delegation:** `eval.gate` DELEGATES the rule pass to the SOLID Rule Engine's synchronous mode `rule_engine.RunSync(ctx, repo_id, sha, scope?, policy_version_id)` which writes `evaluation_run(caller='eval_gate')` + N `finding` rows in the same transaction; the verdict is computed from those freshly-written findings, not from pre-existing ones. Per architecture Sec 3.7 lines 548-570.
 > - **Canonical state enums:** `Commit.scan_status` is exactly `pending | scanning | scanned | failed`; `ScanRun.status` is exactly `running | succeeded | failed`. Values `complete`, `superseded`, `queued`, `orphaned` are NEVER used as state values (they appear only in test scenarios that ASSERT the DB rejects them).
 > - **Canonical 12 foundation metric_kinds (architecture Sec 1.4.1 / tech-spec Sec 4.1):** `cyclo`, `cognitive_complexity`, `loc`, `lcom4`, `fan_in`, `fan_out`, `depth_of_inheritance`, `interface_width`, `coupling_between_objects`, `cycle_member`, `duplication_ratio`, `modification_count_in_window`. Names `cyclomatic_complexity`, `lines_of_code`, `function_length`, `parameter_count`, `nesting_depth` are NEVER emitted (they appear only in negative clauses or as DSL-rejection test inputs).
 > - **Canonical 3 ingested metric_kinds:** `coverage_line_ratio`, `coverage_branch_ratio`, `pass_first_try_ratio`. Names `coverage_line`, `coverage_branch`, test-balance count metrics, churn window metrics, and `defect_density` are NEVER written as MetricSample rows. Defects in v1 write NO MetricSample (only a `scan_run` audit row); churn feeds the `modification_count_in_window` materialiser only.
@@ -30,10 +62,10 @@ storyId: "code-intelligence:CLEAN-CODE"
 - [ ] Create `services/clean-code/` Go module mirroring `services/agent-memory/` layout: `cmd/clean-coded/`, `internal/`, `pkg/`, `proto/`, `migrations/`, `deploy/local/`, `web/`, plus root `Makefile`, `go.mod`, `README.md`.
 - [ ] Wire `Makefile` targets `build`, `test`, `lint`, `proto`, `migrate-up`, `migrate-down`, `docker-build`, `compose-up`, `compose-down` matching the agent-memory precedent so CI can reuse the same recipe shape.
 - [ ] Add `.github/workflows/clean-code-ci.yml` running `make lint test` on PR plus build of the `clean-coded` container, mirroring `agent-memory-ci.yml`.
-- [ ] Add `services/clean-code/deploy/local/docker-compose.yml` with PostgreSQL 16 (per tech-spec C9 / Sec 8.1) and a placeholder `clean-coded` service; expose Prometheus scrape port and OTel collector endpoint.
+- [ ] Add `services/clean-code/deploy/local/docker-compose.yml` with PostgreSQL 16 (per tech-spec C9 / Sec 8.1) and the `clean-coded` service binding the configured port; expose Prometheus scrape port and OTel collector endpoint.
 - [ ] Add `services/clean-code/internal/config/` loader that reads env + file config, exposing the operator pins listed in architecture Sec 1.6 (`ast-mode-default`, `external-metric-coverage-format`, `gate-degraded-policy`, `policy-signing-required`, `refactor-effort-source`) as typed fields with defaults from tech-spec Sec 8.2.
 - [ ] Add `services/clean-code/internal/logging/` slog wrapper enforcing structured JSON logs and request-id propagation (architecture Sec 8 telemetry invariant).
-- [ ] Add `services/clean-code/internal/version/` exporting `Version`, `Commit`, `BuildTime` plus a `/healthz` and `/readyz` HTTP handler stub used by all surfaces.
+- [ ] Add `services/clean-code/internal/version/` exporting `Version`, `Commit`, `BuildTime` plus a minimal `/healthz` (process liveness, returns HTTP 200 with `{"status":"ok","version":...,"commit":...,"build_time":...}`) and `/readyz` (returns HTTP 200 only when PostgreSQL pool, OTel exporter, and signing-key cache have all initialised; 503 otherwise) HTTP handler used by all surfaces. The handler ships a real production implementation in this stage (no follow-up work outstanding).
 
 ### Dependencies
 - _none -- start stage_
@@ -50,7 +82,7 @@ storyId: "code-intelligence:CLEAN-CODE"
 - [ ] Add matching `migrations/0001_catalog_lifecycle.down.sql` that drops the `clean_code` schema cleanly so local-dev resets are deterministic.
 - [ ] Encode `Commit.scan_status` as the canonical enum `pending | scanning | scanned | failed` with column-level `DEFAULT 'pending'` (per architecture Sec 5.1.2) and add a column COMMENT naming the Metric Ingestor as the sole writer.
 - [ ] Encode `ScanRun.status` as the canonical enum `running | succeeded | failed` (per architecture Sec 5.7) and `ScanRun.kind` as `full | delta | external_single | external_per_row | retract`; add a `sha_binding` column with enum `single | per_row` defaulting to `single`.
-- [ ] Encode `RepoEvent.kind` as the canonical enum `register | retract_intent | rescan_intent | mode_change` matching architecture Sec 5.1.3.
+- [ ] Encode `RepoEvent.kind` as the canonical enum `registered | retired | retract_intent | mode_changed` matching architecture Sec 5.1.4 lines 877-884.
 - [ ] Add table COMMENTs on each Catalog/Lifecycle table naming the owning sub-store and the writers permitted by architecture G1.
 - [ ] Add indexes required by Repo Indexer hot reads: `UNIQUE(repo_id, sha)` on `commit`, `(repo_id, default_branch_head)` on `repo`, `(repo_id, started_at DESC)` on `scan_run`.
 - [ ] Add a `go test` migration round-trip helper under `internal/storage/migrate_test.go` asserting `up` then `down` returns an empty `clean_code` schema (no leftover tables).
@@ -67,33 +99,40 @@ storyId: "code-intelligence:CLEAN-CODE"
 ## Stage 1.3: Measurement schema and active row index
 
 ### Implementation Steps
-- [ ] Add `migrations/0002_measurement.up.sql` creating Measurement tables in the same `clean_code` schema: `metric_sample`, `metric_retraction`, `scope_binding`, `repo_metric_snapshot`, `cross_repo_percentile`, `portfolio_snapshot`, matching architecture Sec 5.2.
-- [ ] Encode the canonical `MetricSample` columns `sample_id`, `repo_id`, `sha`, `scope_id`, `metric_kind`, `metric_version`, `pack`, `source`, `value`, `unit`, `policy_version_id`, `computed_at`, `scan_run_id` (architecture Sec 5.2.2) and store `MetricKind.metric_version` as part of the row (no separate dimension table needed).
-- [ ] Encode `MetricSample.pack` as enum `base | solid | system | ingested` and `MetricSample.source` as enum `computed | derived | ingested` (architecture Sec 1.4.1 / Sec 5.2.2).
-- [ ] Implement active-row uniqueness as a PARTIAL UNIQUE INDEX `metric_sample_active_uq ON metric_sample (repo_id, sha, scope_id, metric_kind, metric_version) WHERE sample_id NOT IN (SELECT sample_id FROM metric_retraction)`, replacing any procedural "swap_active" idea -- architecture Sec 5.2.2 makes this an index invariant, not a stored procedure.
-- [ ] Add `MetricRetraction(sample_id PK, retracted_at, retracted_by_scan_run_id, reason)` per architecture Sec 5.2.4; document append-only invariant in a table COMMENT.
-- [ ] Add `ScopeBinding(scope_id, repo_id, sha, scope_kind, canonical_signature, parent_scope_id NULLABLE, file_path, span_start, span_end)` with the canonical `scope_kind` enum `function | method | class | interface | module | package` per architecture Sec 5.2.3.
-- [ ] Add `RepoMetricSnapshot(repo_id, sha, metric_kind, p50, p90, p99, sample_count, built_at)` and `CrossRepoPercentile(metric_kind, scope_kind, p50, p90, p99, histogram_json, built_at)` and `PortfolioSnapshot(metric_kind, sum_value, weighted_mean, repo_count, built_at)` per architecture Sec 5.2.5 / 5.2.6.
+- [ ] Add `migrations/0002_measurement.up.sql` creating Measurement tables in the same `clean_code` schema: `metric_sample`, `metric_retraction`, `metric_sample_active`, `scope_binding`, `repo_metric_snapshot`, `cross_repo_percentile`, `portfolio_snapshot`, matching architecture Sec 5.2 and tech-spec Sec 7.1.b DDL.
+- [ ] Encode the canonical `MetricSample` columns `sample_id`, `repo_id`, `sha`, `scope_id`, `metric_kind`, `metric_version`, `value`, `pack`, `source`, `degraded`, `degraded_reason`, `producer_run_id`, `attrs_json`, `created_at` (architecture Sec 5.2.1 lines 889-906). `unit` lives on the `metric_kind` Catalog row (architecture Sec 5.1.3 line 874), NOT on `MetricSample`; `policy_version_id` lives on `Finding` (Sec 5.4.1) and `HotSpot` (Sec 5.5.1), NOT on `MetricSample`; the run attribution column is `producer_run_id` (FK to `ScanRun`), NOT `scan_run_id`; the timestamp column is `created_at`, NOT `computed_at`.
+- [ ] Encode `MetricSample.pack` as enum `base | solid | system | ingested` and `MetricSample.source` as enum `computed | derived | ingested` (architecture Sec 1.4.1 / Sec 5.2.1). `degraded BOOL NOT NULL DEFAULT false` and `degraded_reason TEXT NULL`; `degraded_reason` constrained to the closed set `xrepo_edges_unavailable | samples_pending | policy_signature_invalid | percentile_stale` (architecture Sec 5.2.1 lines 902-903 / Sec 8.2).
+- [ ] Implement active-row uniqueness via the SIDE RELATION `metric_sample_active(repo_id, sha, scope_id, metric_kind, metric_version, sample_id FK -> metric_sample(sample_id))` with `PRIMARY KEY (repo_id, sha, scope_id, metric_kind, metric_version)` and `CREATE UNIQUE INDEX metric_sample_active_sample_id_uniq ON metric_sample_active (sample_id)` per tech-spec Sec 7.1.b lines 1070-1119 and locked-decision pin Sec 10A lines 1659-1675. The architecture-mandated partial unique index over a subquery is not expressible in PostgreSQL DDL; the side relation's PK over the quintuple carries the identical semantic guarantee.
+- [ ] Add `MetricRetraction(retraction_id PK, sample_id UNIQUE FK, reason, appended_by, created_at)` per architecture Sec 5.2.2; document append-only invariant in a table COMMENT. The `UNIQUE` on `sample_id` prevents double-retraction.
+- [ ] Add `ScopeBinding(scope_id PK, repo_id FK, scope_kind ENUM, canonical_signature TEXT, first_seen_sha TEXT, agent_memory_node_id UUID NULL, attrs_json JSONB, created_at)` with the canonical `scope_kind` enum `repo | package | file | class | interface | method | block` per architecture Sec 5.2.3 lines 1039-1050. `scope_id` is a **deterministic UUIDv5 of `(repo_id, scope_kind, canonical_signature, first_seen_sha)`** -- **stable across SHAs** so the same scope identity persists when its content evolves. SHA is NOT part of `scope_id` (G2).
+- [ ] Add `RepoMetricSnapshot(snapshot_id PK, repo_id FK, metric_kind, scope_kind, count BIGINT, mean DOUBLE, p50, p90, p99, built_at)` per architecture Sec 5.2.4 lines 1052-1065. No `sha` column (snapshots are repo-wide latest aggregates), no `sample_count` alias (the canonical column name is `count`).
+- [ ] Add `CrossRepoPercentile(percentile_id PK, metric_kind, scope_kind, histogram_json, p50, p90, p99, built_at)` per architecture Sec 5.2.5 lines 1067-1078.
+- [ ] Add `PortfolioSnapshot(portfolio_snapshot_id PK, metric_kind, scope_kind, repo_count INT, aggregate_json JSONB, built_at)` per architecture Sec 5.2.6 lines 1080-1089. No `sum_value`/`weighted_mean` columns -- those aggregates are encoded as keys inside `aggregate_json` (operator-pinned aggregate shape).
 - [ ] Add `migrations/0002_measurement.down.sql` reversing 0002.
 
 ### Dependencies
 - phase-foundation-and-schema/stage-catalog-and-lifecycle-schema-migrations
 
 ### Test Scenarios
-- [ ] Scenario: active-row-quintuple-uniqueness -- Given a `metric_sample` row already present for `(repo, sha, scope, metric_kind, metric_version)` and not retracted, When a second INSERT with the same quintuple runs, Then it fails with a unique-index violation; after inserting a matching `metric_retraction(sample_id)` the second INSERT succeeds.
+- [ ] Scenario: active-row-quintuple-uniqueness -- Given a `metric_sample_active` row already present for `(repo, sha, scope, metric_kind, metric_version)`, When a second INSERT into `metric_sample_active` for the same quintuple runs, Then it fails with a PRIMARY KEY violation; deleting the pointer row and re-inserting succeeds. `metric_sample` itself remains append-only (G3) and is never UPDATEd.
 - [ ] Scenario: pack-source-enum-rejects-invalid -- Given the `metric_sample` table, When an INSERT supplies `pack='unknown'` or `source='external'`, Then PostgreSQL rejects it; only canonical pack/source enums are accepted.
-- [ ] Scenario: cross-repo-percentile-shape -- Given the `cross_repo_percentile` table, When the migration runs, Then it has exactly the columns p50, p90, p99, histogram_json, built_at (no `p95.system` or other invented kinds materialised as rows).
+- [ ] Scenario: degraded-defaults-false -- Given the `metric_sample` table, When a row is INSERTed without a `degraded` value, Then the row materialises with `degraded=false` from the column DEFAULT and `degraded_reason IS NULL`.
+- [ ] Scenario: scope-binding-stable-across-shas -- Given two SHAs of the same `(repo_id, scope_kind, canonical_signature, first_seen_sha)`, When the ScopeBinding writer runs at both SHAs, Then the second call's `scope_id` equals the first's (G2 stability) and only one row exists in `scope_binding`.
+- [ ] Scenario: cross-repo-percentile-shape -- Given the `cross_repo_percentile` table, When the migration runs, Then it has exactly the columns `percentile_id, metric_kind, scope_kind, histogram_json, p50, p90, p99, built_at` (no `p95.system` or other invented kinds materialised as rows).
 
 ## Stage 1.4: Policy and Audit and Refactor schema migrations
 
 ### Implementation Steps
 - [ ] Add `migrations/0003_policy_audit_refactor.up.sql` creating Policy tables `rule`, `rule_pack`, `policy_version`, `policy_activation`, `threshold`, `override` and Audit tables `evaluation_run`, `evaluation_verdict`, `finding` and Refactor tables `hot_spot`, `refactor_plan`, `refactor_task` -- all in the single `clean_code` schema (per tech-spec C9 / Sec 8.1.3). No invented tables (`rule_pack_revision`, `policy_override`, `audit_event`, `audit_anchor`, `effort_estimate` are NOT created -- they were rejected by iter 1 evaluator item 1).
-- [ ] Encode `PolicyVersion` as immutable (append-only PK `policy_version_id`, columns `signature`, `signed_at`, `signing_key_id`, `rulepack_set_hash`, `refactor_weights JSONB`) per architecture Sec 5.3.3.
-- [ ] Encode `PolicyActivation` as append-only with `(activation_id PK, scope, policy_version_id FK, activated_at, activated_by)` and a partial unique index enforcing one active row per scope per architecture Sec 5.3.4.
-- [ ] Encode `Override(override_id PK, policy_version_id, scope, rule_id, mute BOOL, reason, created_at, created_by)` -- NO `expires_at` column and NO TTL enforcement, since tech-spec Sec 10A pins v1 to latest-row-wins (iter 1 evaluator item 5).
-- [ ] Encode `EvaluationVerdict.verdict` as enum `pass | warn | block` (architecture Sec 5.4.2 / tech-spec Sec 4.8); add `degraded BOOL` and `degraded_reason TEXT` columns separately, with `degraded_reason` constrained to the closed set `xrepo_edges_unavailable | samples_pending | policy_signature_invalid | percentile_stale` per architecture Sec 5.5.
-- [ ] Encode `Finding.delta` as enum `regression | improvement | flat | new | resolved` per architecture Sec 5.4.3.
-- [ ] Encode `RefactorTask.kind` as enum `extract_function | split_class | introduce_interface | break_cycle | reduce_inheritance | reduce_coupling | reduce_lcom | reduce_duplication` matching architecture Sec 5.6.3 and add columns `task_id PK, plan_id FK, scope_id, rule_id, effort_hours, expected_metric_delta JSONB, status`.
+- [ ] Encode `PolicyVersion` as immutable per architecture Sec 5.3.3 lines 1121-1138: `(policy_version_id PK, name TEXT, rule_refs JSONB, threshold_refs JSONB, refactor_weights JSONB, signature BYTEA, created_at)`. `rule_refs` is `[{rule_id, version}]`; `threshold_refs` is `[{threshold_id}]`; `refactor_weights` is `{alpha, beta, gamma, delta, effort_model_version, window_days, freshness_window_seconds?}`. `signature` is the operator-required v1 cryptographic signature over `(rule_refs, threshold_refs, refactor_weights)`. No `signed_at` / `signing_key_id` / `rulepack_set_hash` columns -- those are not in the architecture canon.
+- [ ] Encode `PolicyActivation` per architecture Sec 5.3.4 lines 1140-1147: `(activation_id PK, policy_version_id FK, activated_by TEXT, created_at)`. The latest row by `created_at` defines the active policy -- there is NO `scope` column, NO `deactivated_at` column, and NO partial unique index. Activation is global per deployment in v1 (single-tenant per tech-spec Sec 4.14).
+- [ ] Encode `Override` per architecture Sec 5.3.6 lines 1160-1170: `(override_id PK, rule_id TEXT FK -> Rule.rule_id, scope_filter JSONB, mute BOOL, reason TEXT, actor_id TEXT, created_at)`. `scope_filter` is `{repo_id, scope_kind, scope_signature_glob}`. No `expires_at` column and NO TTL enforcement, since tech-spec Sec 10A pins v1 to latest-row-wins (iter 1 evaluator item 5). No `policy_version_id` column -- overrides bind to rules, not policy versions. Use `actor_id`, NOT `created_by`.
+- [ ] Encode `EvaluationVerdict` per architecture Sec 5.4.3 lines 1203-1212: `(verdict_id PK, evaluation_run_id FK, verdict ENUM('pass'|'warn'|'block'), degraded BOOL, degraded_reason TEXT?, created_at)`. `degraded_reason` is constrained at the column level to the architecture Sec 8.2 closed set `xrepo_edges_unavailable | samples_pending | policy_signature_invalid | percentile_stale`.
+- [ ] Encode `Finding.delta` per architecture Sec 5.4.1 lines 1174-1190 as the canonical enum `new | newly_failing | unchanged | resolved` (NOT `regression | improvement | flat | new | resolved`). Normative semantics: `new` = rule fired at this scope for the FIRST SHA ever; `newly_failing` = the regression-to-block bucket (previously not severity=block at this scope, now is); `unchanged` = was severity=block at the previous SHA and still is at this SHA; `resolved` = was severity=block at the previous SHA and is no longer present (or fires at a lower severity) at this SHA. `mgmt.read.regressions` consumes `delta='newly_failing'` as the regressions bucket.
+- [ ] Encode `Finding` columns per architecture Sec 5.4.1: `(finding_id PK, evaluation_run_id FK, repo_id, sha, scope_id FK, rule_id, rule_version, policy_version_id FK, metric_sample_ids JSONB, severity ENUM('info'|'warn'|'block'), delta, explanation_md, created_at)`.
+- [ ] Encode `RefactorTask` per architecture Sec 5.5.3 lines 1239-1250: `(task_id PK, plan_id FK, scope_id, kind ENUM, effort_hours DOUBLE, rule_id TEXT, description_md TEXT, created_at)`. `kind` enum is `split_class | extract_method | invert_dependency | break_cycle | consolidate_duplication` (NOT `extract_function | introduce_interface | reduce_inheritance | reduce_coupling | reduce_lcom | reduce_duplication`); add additional canonical values verbatim from architecture Sec 5.5.3. NO `status` column (life-cycle state is out of v1 scope per architecture Sec 5.5.3), NO `expected_metric_delta` column.
+- [ ] Encode `RefactorPlan` per architecture Sec 5.5.2 lines 1228-1237: `(plan_id PK, repo_id, sha, hotspot_ids JSONB, summary_md TEXT, created_at)`. No `policy_version_id` column -- policy attribution lives on each `hot_spot` row (architecture Sec 5.5.1).
+- [ ] Encode `HotSpot` per architecture Sec 5.5.1 lines 1216-1226: `(hotspot_id PK, repo_id, sha, scope_id, score DOUBLE, policy_version_id FK, created_at)`. No per-input z-score columns (those are intermediate values; only the composite `score` is persisted).
 - [ ] Add table COMMENTs on `evaluation_run`, `evaluation_verdict`, `finding` naming the Audit WAL as their durability mechanism and pointing at architecture Sec 7.10.
 - [ ] Add `migrations/0003_policy_audit_refactor.down.sql` reversing 0003.
 
@@ -104,13 +143,15 @@ storyId: "code-intelligence:CLEAN-CODE"
 - [ ] Scenario: verdict-enum-only-canonical -- Given the `evaluation_verdict` table, When an INSERT supplies `verdict='fail'` or `verdict='gated'`, Then PostgreSQL rejects it (only `pass|warn|block` are accepted) -- guards against iter 1 evaluator item 6 regression.
 - [ ] Scenario: override-no-expires-column -- Given the `override` table after `migrate-up`, When `\d clean_code.override` runs, Then no `expires_at` column exists (guards iter 1 evaluator item 5).
 - [ ] Scenario: degraded-reason-closed-set -- Given the `evaluation_verdict` table, When an INSERT supplies `degraded_reason='other'`, Then it fails the check constraint; the four canonical reasons (incl. `percentile_stale` reserved for Insights only) all succeed at column level.
-- [ ] Scenario: policy-activation-one-active -- Given a `policy_activation` row with scope `org=acme` and `deactivated_at IS NULL`, When a second activation for the same scope with `deactivated_at IS NULL` is inserted, Then the partial unique index rejects it.
+- [ ] Scenario: finding-delta-canonical -- Given the `finding` table, When an INSERT supplies `delta='regression'` or `delta='improvement'` or `delta='flat'`, Then PostgreSQL rejects it (only `new|newly_failing|unchanged|resolved` are accepted) -- canon-guard against the iter 3 drift evaluator item 7.
+- [ ] Scenario: refactor-task-no-status-column -- Given the `refactor_task` table after `migrate-up`, When `\d clean_code.refactor_task` runs, Then no `status` and no `expected_metric_delta` columns exist; only the canonical Sec 5.5.3 columns are present.
+- [ ] Scenario: policy-activation-latest-row-wins -- Given two `policy_activation` rows for the same policy chain, When the evaluator resolves the active policy, Then it reads the row with `MAX(created_at)` -- there is no scope column, no partial unique index, no deactivated_at.
 
 ## Stage 1.5: PostgreSQL role grants and schema isolation
 
 ### Implementation Steps
 - [ ] Add `migrations/0004_roles.up.sql` creating PostgreSQL roles `clean_code_repo_indexer`, `clean_code_metric_ingestor`, `clean_code_policy_steward`, `clean_code_rule_engine`, `clean_code_aggregator`, `clean_code_refactor_planner`, `clean_code_evaluator`, `clean_code_management`, `clean_code_audit_replayer` per architecture Sec 8.6.
-- [ ] Grant Metric Ingestor sole INSERT/UPDATE on `metric_sample`, `metric_retraction`, and `commit.scan_status`; grant Repo Indexer INSERT on `commit` (initial row only) and `repo_event`.
+- [ ] Grant Metric Ingestor sole INSERT on `metric_sample`, sole INSERT/DELETE on `metric_sample_active` (the side-relation row pointer per tech-spec Sec 7.1.b is updated on retraction + new sample), sole INSERT on `metric_retraction`, and sole UPDATE of `commit.scan_status`; grant Repo Indexer INSERT on `commit` (initial row only) and `repo_event`.
 - [ ] Grant Policy Steward sole INSERT on `rule`, `rule_pack`, `policy_version`, `policy_activation`, `threshold`, `override`.
 - [ ] Grant SOLID Rule Engine sole INSERT on `finding` (Audit sub-store writer per architecture G1); grant Evaluator sole INSERT on `evaluation_run`, `evaluation_verdict`.
 - [ ] Grant Cross Repo Aggregator sole INSERT on `repo_metric_snapshot`, `cross_repo_percentile`, `portfolio_snapshot` and sole INSERT on `metric_sample` rows where `pack='system'`.
@@ -134,42 +175,43 @@ storyId: "code-intelligence:CLEAN-CODE"
 ## Stage 2.1: Tree sitter parser fleet and canonical AST proto
 
 ### Implementation Steps
-- [ ] Add `proto/ast/v1/ast.proto` defining `AstFile`, `AstScope`, `AstSymbol`, `AstEdge` with the canonical scope_kind enum `function | method | class | interface | module | package` so all recipes consume a single shape.
+- [ ] Add `proto/ast/v1/ast.proto` defining `AstFile`, `AstScope`, `AstSymbol`, `AstEdge` with the canonical `scope_kind` enum `repo | package | file | class | interface | method | block` (architecture Sec 5.2.3 lines 1039-1050) so all recipes consume a single shape.
 - [ ] Wire `make proto` to generate Go bindings into `internal/ast/v1/`.
-- [ ] Add `internal/ast/parser/` Tree-sitter adapter wrapping the grammars for Go, TypeScript, Python, Java, C# (per architecture Sec 4.1.1) behind a `Parser` interface with `Parse(ctx, path, bytes) (*AstFile, error)`.
-- [ ] Add `internal/ast/parser/registry.go` exposing per-language parser factories selected by file extension + Linguist-style content sniff.
+- [ ] Add `internal/ast/parser/` Tree-sitter adapter wrapping the grammars for the v1-pinned languages **Go, Python, TypeScript, Java** (tech-spec Sec 8.6 lines 1005-1016 -- the org's top-4 languages by repo count; C#, Rust, and other languages are post-v1 recipe-pack additions per Sec 8.6) behind a `Parser` interface with `Parse(ctx, path, bytes) (*AstFile, error)`.
+- [ ] Add `internal/ast/parser/registry.go` exposing per-language parser factories selected by file extension + Linguist-style content sniff; the registry refuses to register a language outside the v1 pin.
 - [ ] Add language-tagged unit tests under `internal/ast/parser/testdata/<lang>/` covering at least one fixture per supported language and asserting the canonical AST proto fields are populated.
 
 ### Dependencies
 - phase-foundation-and-schema/stage-postgresql-role-grants-and-schema-isolation
 
 ### Test Scenarios
-- [ ] Scenario: parser-supports-five-languages -- Given a fixture file per supported language, When the registry returns a parser and `Parse` runs, Then each returns a non-empty `AstFile` with the language tag set and at least one `AstScope`.
+- [ ] Scenario: parser-supports-v1-four-languages -- Given a fixture file per v1-pinned language (Go, Python, TypeScript, Java), When the registry returns a parser and `Parse` runs, Then each returns a non-empty `AstFile` with the language tag set and at least one `AstScope`; attempting to register a fifth language (e.g. C#) fails the registry guard per tech-spec Sec 8.6 v1 pin.
 - [ ] Scenario: proto-round-trip -- Given a parsed `AstFile`, When it is serialised to protobuf wire format and deserialised, Then the resulting struct equals the original (no information loss).
 
 ## Stage 2.2: Scope identity derivation and ScopeBinding writer
 
 ### Implementation Steps
-- [ ] Add `internal/ast/scope/identity.go` computing `scope_id` as a deterministic UUIDv5 of `(repo_id, sha, scope_kind, canonical_signature)` per architecture Sec 5.2.3.
-- [ ] Add `internal/ast/scope/signature.go` building the canonical signature per scope kind (function: full path + parameter type list; class/interface: full path; module: file path; package: directory path) so two scans of the same SHA produce identical scope_ids.
-- [ ] Add `internal/storage/scope_binding_writer.go` performing batched `INSERT ... ON CONFLICT (scope_id) DO NOTHING` into `scope_binding`, with explicit `parent_scope_id` linkage.
+- [ ] Add `internal/ast/scope/identity.go` computing `scope_id` as a deterministic UUIDv5 of `(repo_id, scope_kind, canonical_signature, first_seen_sha)` per architecture Sec 5.2.3 lines 1039-1050. **SHA is NOT part of `scope_id`** -- `first_seen_sha` is the SHA AT WHICH THIS SIGNATURE FIRST APPEARED (recorded as a column on `scope_binding`); subsequent SHAs that contain the same `(repo_id, scope_kind, canonical_signature)` resolve to the SAME `scope_id` (G2 stability).
+- [ ] Add `internal/ast/scope/signature.go` building the `canonical_signature` per scope kind (method: full path + parameter type list e.g. `pkg.Foo#bar(int)`; class/interface: full path; file: file path; package: directory path; block: container-method-signature + intra-method ordinal) using the same recipe as agent-memory `Node.canonical_signature` so the cross-service `agent_memory_node_id` link is stable when running in `linked` mode.
+- [ ] Add `internal/storage/scope_binding_writer.go` performing batched `INSERT ... ON CONFLICT (scope_id) DO NOTHING` into `scope_binding`, writing `(scope_id, repo_id, scope_kind, canonical_signature, first_seen_sha, agent_memory_node_id?, attrs_json, created_at)`; on conflict the existing row's `first_seen_sha` is preserved (it is the FIRST SHA, immutable).
 - [ ] Wire the writer behind the Metric Ingestor (only ingestor calls scope writer to satisfy writer-ownership G1).
-- [ ] Add `internal/ast/scope/identity_test.go` verifying determinism (same inputs => same UUID) and uniqueness (different scope_kind or signature => different UUID).
+- [ ] Add `internal/ast/scope/identity_test.go` verifying determinism (same `(repo_id, scope_kind, canonical_signature, first_seen_sha)` => same UUID), stability across SHAs (same signature at SHA A and SHA B => same `scope_id` -- SHA does NOT change identity), and uniqueness (different scope_kind or signature => different UUID).
 
 ### Dependencies
 - phase-ast-adapter-and-foundation-tier-compute/stage-tree-sitter-parser-fleet-and-canonical-ast-proto
 
 ### Test Scenarios
-- [ ] Scenario: scope-id-determinism -- Given the same `(repo_id, sha, scope_kind, canonical_signature)` invoked twice, When `DeriveScopeID` runs, Then it returns the same UUID.
-- [ ] Scenario: scope-binding-idempotent-write -- Given a `scope_binding` row already present, When the writer re-inserts the same `scope_id`, Then no error surfaces and the row count remains unchanged.
+- [ ] Scenario: scope-id-determinism -- Given the same `(repo_id, scope_kind, canonical_signature, first_seen_sha)` invoked twice, When `DeriveScopeID` runs, Then it returns the same UUID.
+- [ ] Scenario: scope-id-stable-across-shas -- Given a signature `pkg.Foo#bar(int)` first seen at SHA A, When the same signature appears at SHA B, Then `DeriveScopeID` at SHA B returns the SAME `scope_id` as at SHA A (G2 stability; SHA is not part of identity).
+- [ ] Scenario: scope-binding-idempotent-write -- Given a `scope_binding` row already present, When the writer re-inserts the same `scope_id` at a different SHA, Then no error surfaces, the row count remains unchanged, and `first_seen_sha` is preserved.
 
 ## Stage 2.3: Base pack foundation recipes
 
 ### Implementation Steps
 - [ ] Add `internal/metrics/recipes/` with one file per recipe, each implementing the `Recipe.Compute(ast *AstFile) []MetricSampleDraft` interface and tagging output with `pack='base'`, `source='computed'`, and the canonical `metric_kind` value.
-- [ ] Implement `recipes/cyclo.go` emitting `metric_kind='cyclo'` (architecture Sec 1.4.1) at scope_kind `function|method`.
-- [ ] Implement `recipes/cognitive_complexity.go` emitting `metric_kind='cognitive_complexity'` at scope_kind `function|method`.
-- [ ] Implement `recipes/loc.go` emitting `metric_kind='loc'` at scope_kind `function|method|class|module`.
+- [ ] Implement `recipes/cyclo.go` emitting `metric_kind='cyclo'` (architecture Sec 1.4.1 row 1) at canonical scope_kinds `method` and `file` only (the table pins `method, file`; `function` and `module` are NOT canonical scope_kind values per Sec 5.2.3 -- the canonical enum is `repo | package | file | class | interface | method | block`).
+- [ ] Implement `recipes/cognitive_complexity.go` emitting `metric_kind='cognitive_complexity'` at canonical scope_kinds `method` and `file` only (architecture Sec 1.4.1 row 2 pins `method, file`).
+- [ ] Implement `recipes/loc.go` emitting `metric_kind='loc'` at canonical scope_kinds `file`, `package`, `repo` (architecture Sec 1.4.1 row 3 pins `file, package, repo`; NOT `function|method|class|module`).
 - [ ] Register the three recipes in `recipes/registry.go` keyed by metric_kind; emit a startup log line listing the registered base-pack recipes.
 - [ ] Add table-driven tests `recipes/cyclo_test.go`, `recipes/cognitive_complexity_test.go`, `recipes/loc_test.go` against language-tagged fixtures with known expected values.
 
@@ -178,17 +220,17 @@ storyId: "code-intelligence:CLEAN-CODE"
 
 ### Test Scenarios
 - [ ] Scenario: base-recipes-only-canonical-kinds -- Given the recipe registry after init, When listing the registered metric_kinds for `pack='base'`, Then the result is exactly `{cyclo, cognitive_complexity, loc}` (no `cyclomatic_complexity`, `lines_of_code`, `function_length`, `parameter_count`, or `nesting_depth` -- iter 1 evaluator item 3).
-- [ ] Scenario: cyclo-known-value -- Given a Go fixture function with two `if` branches and one `for` loop, When the cyclo recipe runs, Then it emits a `MetricSampleDraft(metric_kind='cyclo', value=4)` at the function scope.
-- [ ] Scenario: loc-counts-physical-lines -- Given a 42-line Python module fixture, When the loc recipe runs at module scope, Then it emits `value=42`.
+- [ ] Scenario: cyclo-known-value -- Given a Go fixture method with two `if` branches and one `for` loop, When the cyclo recipe runs, Then it emits a `MetricSampleDraft(metric_kind='cyclo', value=4)` at canonical `scope_kind='method'` (NEVER the non-canonical `function`).
+- [ ] Scenario: loc-counts-physical-lines -- Given a 42-line Python source file fixture, When the loc recipe runs at canonical `scope_kind='file'`, Then it emits `value=42` (the canonical enum has `file`, NOT `module`).
 
 ## Stage 2.4: SOLID pack foundation recipes
 
 ### Implementation Steps
 - [ ] Implement `recipes/lcom4.go` emitting `metric_kind='lcom4'` (architecture Sec 1.4.1 SOLID pack) at scope_kind `class` per the four-component cohesion algorithm.
-- [ ] Implement `recipes/fan_in.go` emitting `metric_kind='fan_in'` at scope_kind `module|package` counting inbound references from other modules.
-- [ ] Implement `recipes/fan_out.go` emitting `metric_kind='fan_out'` at scope_kind `module|package` counting outbound references to other modules.
-- [ ] Implement `recipes/depth_of_inheritance.go` emitting `metric_kind='depth_of_inheritance'` at scope_kind `class`.
-- [ ] Implement `recipes/interface_width.go` emitting `metric_kind='interface_width'` at scope_kind `interface|class` (public surface size).
+- [ ] Implement `recipes/fan_in.go` emitting `metric_kind='fan_in'` at canonical scope_kinds `method`, `class`, `file` (architecture Sec 1.4.1 row 5 pins `method, class, file`; NOT `module|package`) counting inbound references.
+- [ ] Implement `recipes/fan_out.go` emitting `metric_kind='fan_out'` at canonical scope_kinds `method`, `class`, `file` (architecture Sec 1.4.1 row 6 pins `method, class, file`) counting outbound references.
+- [ ] Implement `recipes/depth_of_inheritance.go` emitting `metric_kind='depth_of_inheritance'` at scope_kind `class` (architecture Sec 1.4.1 row 7).
+- [ ] Implement `recipes/interface_width.go` emitting `metric_kind='interface_width'` at canonical scope_kinds `class`, `interface` (architecture Sec 1.4.1 row 8) -- public surface size.
 - [ ] Implement `recipes/coupling_between_objects.go` emitting `metric_kind='coupling_between_objects'` at scope_kind `class`.
 - [ ] Register all six in `recipes/registry.go` keyed by metric_kind with `pack='solid'`, `source='computed'`; emit a startup log listing them.
 - [ ] Add language-tagged fixture tests asserting each recipe emits exactly the canonical `metric_kind` value (no `cyclomatic_complexity` / `lines_of_code` aliases anywhere; iter 1 evaluator item 3).
@@ -204,22 +246,22 @@ storyId: "code-intelligence:CLEAN-CODE"
 ## Stage 2.5: Cycle and duplication recipes
 
 ### Implementation Steps
-- [ ] Implement `recipes/cycle_member.go` emitting `metric_kind='cycle_member'` at scope_kind `module|package` with `value=1` when the scope participates in a dependency cycle, `value=0` otherwise (architecture Sec 1.4.1).
-- [ ] Implement `recipes/duplication_ratio.go` emitting `metric_kind='duplication_ratio'` at scope_kind `function|method|module` using a 50-token sliding window comparison.
+- [ ] Implement `recipes/cycle_member.go` emitting `metric_kind='cycle_member'` at canonical scope_kinds `file`, `package` (architecture Sec 1.4.1 row 10 pins `file, package`; NOT `module`) with `value=1` when the scope participates in a strongly-connected component of the import graph and `value=0` otherwise; record the cycle id in `MetricSample.attrs_json`.
+- [ ] Implement `recipes/duplication_ratio.go` emitting `metric_kind='duplication_ratio'` at canonical scope_kinds `file`, `package` (architecture Sec 1.4.1 row 11 pins `file, package`; NOT `function|method|module`) using a 50-token sliding window comparison.
 - [ ] Both recipes register with `pack='base'`, `source='computed'`.
-- [ ] Add tests covering: a three-module cycle (all three emit `cycle_member=1`); a function with 80% duplicate body emits `duplication_ratio=0.8`.
+- [ ] Add tests covering: a three-file cycle (all three emit `cycle_member=1`); a file with 80% duplicate token content emits `duplication_ratio=0.8`.
 
 ### Dependencies
 - phase-ast-adapter-and-foundation-tier-compute/stage-base-pack-foundation-recipes
 
 ### Test Scenarios
-- [ ] Scenario: cycle-member-flags-participants -- Given modules A->B->C->A, When the cycle_member recipe runs, Then all three emit `value=1`; a module D outside the cycle emits `value=0`.
-- [ ] Scenario: duplication-ratio-bounded-zero-to-one -- Given any input scope, When the duplication_ratio recipe runs, Then the emitted `value` is in `[0,1]` (boundary check).
+- [ ] Scenario: cycle-member-flags-participants -- Given three files A->B->C->A forming an import cycle, When the cycle_member recipe runs, Then all three emit `value=1` at scope_kind `file`; a file D outside the cycle emits `value=0`; the recipe NEVER emits at the non-canonical scope_kind `module`.
+- [ ] Scenario: duplication-ratio-bounded-zero-to-one -- Given any input scope at canonical scope_kinds `file` or `package`, When the duplication_ratio recipe runs, Then the emitted `value` is in `[0,1]` (boundary check) and the row's `scope_kind` IS in `{file, package}` (NEVER `function` or `module`).
 
 ## Stage 2.6: modification_count_in_window materialiser
 
 ### Implementation Steps
-- [ ] Add `internal/metrics/materialisers/modification_count.go` reading rows fed by `ingest.churn` (Phase 4) and materialising `metric_kind='modification_count_in_window'` with `pack='base'`, `source='derived'` per architecture Sec 1.4.1.
+- [ ] Add `internal/metrics/materialisers/modification_count.go` reading rows fed by `ingest.churn` (Phase 4) and materialising `metric_kind='modification_count_in_window'` with `pack='base'`, **`source='computed'`** per tech-spec Sec 4.1.1 lines 287-291 and Sec 4.11 lines 444-454 (the materialiser is the **computing** writer; `ingested` provenance is recorded on `MetricSample.attrs_json` as a separate annotation per C19, NOT on the `source` enum).
 - [ ] Window size comes from tech-spec Sec 8.2 `window_days=90`; expose as configurable.
 - [ ] Materialiser runs as part of the Metric Ingestor (same writer-ownership role) inside the same ScanRun as the foundation recipes so the active-row uniqueness invariant holds.
 - [ ] Skip emitting a sample when no churn rows exist in the window for a given scope (no zero-fill noise).
@@ -229,7 +271,7 @@ storyId: "code-intelligence:CLEAN-CODE"
 - phase-ast-adapter-and-foundation-tier-compute/stage-base-pack-foundation-recipes
 
 ### Test Scenarios
-- [ ] Scenario: materialiser-emits-canonical-kind -- Given churn rows for scope `pkg.Foo.bar` in the last 90 days, When the materialiser runs, Then it emits `MetricSample(metric_kind='modification_count_in_window', pack='base', source='derived')`.
+- [ ] Scenario: materialiser-emits-canonical-kind -- Given churn rows for scope `pkg.Foo.bar` in the last 90 days, When the materialiser runs, Then it emits `MetricSample(metric_kind='modification_count_in_window', pack='base', source='computed')` and records `attrs_json.provenance='ingested'`.
 - [ ] Scenario: out-of-window-rows-ignored -- Given churn rows older than 90 days, When the materialiser runs, Then no `metric_sample` row is written for that scope.
 
 # Phase 3: Repo Indexer and Metric Ingestor
@@ -241,7 +283,7 @@ storyId: "code-intelligence:CLEAN-CODE"
 ## Stage 3.1: Repo Indexer and Commit lifecycle
 
 ### Implementation Steps
-- [ ] Add `internal/repo_indexer/` service consuming Git webhooks and CLI rescan triggers; on each new SHA, INSERT a `commit` row (default `scan_status='pending'`) and a `repo_event(kind='register')` if needed.
+- [ ] Add `internal/repo_indexer/` service consuming Git webhooks and CLI rescan triggers; on each new SHA, INSERT a `commit` row (default `scan_status='pending'`) and a `repo_event(kind='registered')` if needed (architecture Sec 5.1.4 canonical kind, NOT `register`).
 - [ ] Repo Indexer is the ONLY writer of new `commit` rows (architecture G1); it never updates `scan_status` (the Metric Ingestor owns transitions).
 - [ ] Define the canonical `Commit.scan_status` transition diagram in code: `pending -> scanning -> scanned` on success, `pending -> scanning -> failed` on error -- no `complete`, no `superseded`, no `orphaned` states (iter 1 evaluator item 2). Add a Go enum `ScanStatus` with only the four canonical values.
 - [ ] Add `internal/repo_indexer/handler_test.go` covering: new SHA inserts a `commit` with `scan_status='pending'`; duplicate SHA event is a no-op.
@@ -251,7 +293,7 @@ storyId: "code-intelligence:CLEAN-CODE"
 
 ### Test Scenarios
 - [ ] Scenario: commit-states-only-canonical -- Given the `ScanStatus` enum at compile time, When `reflect.TypeOf(ScanStatus(0)).String()` enumerates its values, Then exactly `{pending, scanning, scanned, failed}` are present (no `complete`, no `superseded`, no `orphaned`).
-- [ ] Scenario: new-sha-inserts-pending -- Given a webhook payload for a new SHA, When Repo Indexer processes it, Then a `commit` row appears with `scan_status='pending'` and a single `repo_event(kind='register')` is appended.
+- [ ] Scenario: new-sha-inserts-pending -- Given a webhook payload for a new SHA, When Repo Indexer processes it, Then a `commit` row appears with `scan_status='pending'` and a single `repo_event(kind='registered')` is appended (canonical enum value).
 
 ## Stage 3.2: Metric Ingestor and ScanRun state machine
 
@@ -278,22 +320,23 @@ storyId: "code-intelligence:CLEAN-CODE"
 ## Stage 3.3: Active row uniqueness enforcement
 
 ### Implementation Steps
-- [ ] In the Metric Ingestor write path, use `INSERT ... ON CONFLICT ON CONSTRAINT metric_sample_active_uq DO NOTHING` so re-runs of the ingestor over the same SHA whose rows are still active are no-ops (architecture Sec 5.2.2).
+- [ ] In the Metric Ingestor write path, INSERT each new `metric_sample` row, then UPSERT the active-row pointer via `INSERT INTO metric_sample_active (repo_id, sha, scope_id, metric_kind, metric_version, sample_id) VALUES (...) ON CONFLICT (repo_id, sha, scope_id, metric_kind, metric_version) DO UPDATE SET sample_id=EXCLUDED.sample_id` -- the side relation's PK enforces at-most-one active row per quintuple (tech-spec Sec 7.1.b lines 1070-1119 / Sec 10A pin lines 1659-1675). Re-ingest of the same `(sha, scope, metric_kind, metric_version)` either no-ops at the application layer (idempotent computation) OR appends a new `metric_sample` row and re-points `metric_sample_active.sample_id` (G3 retains the prior row forever in `metric_sample`).
+- [ ] On retraction, append `metric_retraction(sample_id)`; the prior pointer row in `metric_sample_active` is DELETEd by the Metric Ingestor in the same transaction (`metric_sample_active` is mutable by DESIGN per tech-spec Sec 7.1.b lines 1103-1106; `metric_sample` itself is never UPDATEd per G3 / C2).
 - [ ] Do NOT use any procedural `swap_active`, `swap` trigger, or stored function (iter 1 evaluator item 1 -- there is no `swap_active` verb in the canonical model).
-- [ ] Add `internal/metric_ingestor/active_row_test.go` covering: re-ingest same SHA twice; with intervening retraction the second write succeeds.
+- [ ] Add `internal/metric_ingestor/active_row_test.go` covering: re-ingest same SHA twice; with intervening retraction the second write succeeds; both calls leave `metric_sample` append-only.
 
 ### Dependencies
 - phase-repo-indexer-and-metric-ingestor/stage-metric-ingestor-and-scanrun-state-machine
 
 ### Test Scenarios
-- [ ] Scenario: re-ingest-without-retract-is-no-op -- Given a `metric_sample` row already present and active, When the Metric Ingestor re-ingests the same SHA, Then no second row appears (ON CONFLICT DO NOTHING) and no error is returned.
-- [ ] Scenario: re-ingest-after-retract-succeeds -- Given a sample retracted via `metric_retraction(sample_id)`, When the Metric Ingestor re-ingests, Then a new `metric_sample` row appears with a fresh `sample_id`.
+- [ ] Scenario: re-ingest-without-retract-is-idempotent -- Given a `metric_sample` row already present and pointed-to by `metric_sample_active`, When the Metric Ingestor re-ingests the same SHA, Then `metric_sample_active.sample_id` remains stable and `metric_sample` row count is either unchanged (computation-skip path) or grows by one with the new row becoming the pointer target (G3 preserves the old row).
+- [ ] Scenario: re-ingest-after-retract-succeeds -- Given a sample retracted via `metric_retraction(sample_id)` AND its `metric_sample_active` pointer DELETEd, When the Metric Ingestor re-ingests, Then a new `metric_sample` row appears with a fresh `sample_id` AND `metric_sample_active` carries the new pointer; the original `metric_sample` row remains in place (G3 / C2).
 
 ## Stage 3.4: Retraction and rescan flow
 
 ### Implementation Steps
-- [ ] Implement `mgmt.retract_sample(sample_id, reason, actor)` verb: append a `repo_event(kind='retract_intent', payload={sample_id, reason})` and dispatch to the Metric Ingestor, which opens a `scan_run(kind='retract')` and appends `metric_retraction(sample_id, retracted_at, retracted_by_scan_run_id, reason)`.
-- [ ] Implement `mgmt.rescan(repo_id, sha)` verb: append a `repo_event(kind='rescan_intent')` and enqueue a `scan_run(kind='full')` for the given SHA via the Metric Ingestor.
+- [ ] Implement `mgmt.retract_sample(sample_id, reason, actor)` verb: append a `repo_event(kind='retract_intent', payload={sample_id, reason})` and dispatch to the Metric Ingestor, which opens a `scan_run(kind='retract')`, appends `metric_retraction(retraction_id, sample_id, reason, appended_by, created_at)`, and DELETEs the matching pointer row from `metric_sample_active`.
+- [ ] Implement `mgmt.rescan(repo_id, sha)` verb: emit a service-internal rescan request (no canonical RepoEvent kind exists for rescan per architecture Sec 5.1.4) and enqueue a `scan_run(kind='full')` for the given SHA via the Metric Ingestor.
 - [ ] Mgmt surface never writes Measurement rows directly -- it only emits `repo_event` and delegates (architecture Sec 6.3).
 - [ ] Add idempotency: `mgmt.retract_sample` for an already-retracted sample is a no-op (returns the existing retraction row).
 
@@ -301,8 +344,8 @@ storyId: "code-intelligence:CLEAN-CODE"
 - phase-repo-indexer-and-metric-ingestor/stage-active-row-uniqueness-enforcement
 
 ### Test Scenarios
-- [ ] Scenario: retract-appends-retraction-row -- Given an active sample, When `mgmt.retract_sample` is invoked with a reason, Then a `metric_retraction` row appears, a `scan_run(kind='retract', status='succeeded')` is recorded, and the sample is no longer active per the partial unique index.
-- [ ] Scenario: rescan-enqueues-scan-run -- Given a `mgmt.rescan(repo_id, sha)` call, When the verb completes, Then a `repo_event(kind='rescan_intent')` exists and a `scan_run(kind='full', status='running')` is observable.
+- [ ] Scenario: retract-appends-retraction-row -- Given an active sample, When `mgmt.retract_sample` is invoked with a reason, Then a `metric_retraction` row appears, a `scan_run(kind='retract', status='succeeded')` is recorded, the corresponding `metric_sample_active` pointer row is DELETEd, and the sample is no longer the active row for the quintuple.
+- [ ] Scenario: rescan-enqueues-scan-run -- Given a `mgmt.rescan(repo_id, sha)` call, When the verb completes, Then a service-internal rescan request is logged and a `scan_run(kind='full', status='running')` is observable (no `rescan_intent` RepoEvent kind is emitted -- the canonical RepoEvent enum at architecture Sec 5.1.4 has no `rescan_intent` value).
 
 ## Stage 3.5: Stale ScanRun sweep loop
 
@@ -329,7 +372,7 @@ storyId: "code-intelligence:CLEAN-CODE"
 
 ### Implementation Steps
 - [ ] Add `internal/ingest/webhook/` HTTP handler at `/v1/ingest/{verb}` accepting POST with HMAC-SHA256 signature header per tech-spec Sec 7 (Authentication invariants).
-- [ ] Verify the signature against the per-tenant secret resolved by `(tenant_id, signing_key_id)`; reject invalid signatures with `401`.
+- [ ] Verify the signature against the per-deployment secret resolved by `signing_key_id` -- v1 is **single-tenant** per tech-spec Sec 4.14 (one logical org per deployment); there is NO `tenant_id` field on any table or in the secret lookup (tech-spec Sec 10A "multi-tenant v2 shape" pin lines 1690-1696 reserves no `tenant_id` column for v1; multi-tenant migration uses per-schema isolation, not row-level columns). Reject invalid signatures with `401`.
 - [ ] Add idempotency layer: compute `payload_hash = sha256(canonicalised body)`; if a `scan_run(payload_hash=...)` already exists for this verb, return the stored scan_run_id without re-executing.
 - [ ] Dispatch the verified payload to the per-verb handler (`coverage`, `test_balance`, `churn`, `defects`).
 - [ ] Add `internal/ingest/webhook/handler_test.go` covering valid signature, invalid signature, replay returns cached scan_run.
@@ -346,7 +389,7 @@ storyId: "code-intelligence:CLEAN-CODE"
 ### Implementation Steps
 - [ ] Implement `internal/ingest/coverage/cobertura.go` parsing the Cobertura XML format named by the operator pin `external-metric-coverage-format` (architecture Sec 1.6).
 - [ ] Map per-file lines-covered ratios to `MetricSample(metric_kind='coverage_line_ratio', pack='ingested', source='ingested')` and branches to `metric_kind='coverage_branch_ratio'` -- the ONLY two coverage kinds permitted by tech-spec Sec 4.1.1 (iter 1 evaluator item 4 removed `coverage_line` and `coverage_branch` aliases).
-- [ ] Open a `scan_run(kind='external_single', sha_binding='per_row', status='running')` for the upload; on success mark `succeeded`.
+- [ ] Open a `scan_run(kind='external_single', sha_binding='single', status='running')` for the upload (architecture Sec 6.4 lines 1364-1366 / tech-spec Sec 4.11 lines 429-431 -- coverage uploads carry ONE `sha` per call); on success mark `succeeded`.
 - [ ] Bind each row's `scope_id` by looking up the existing `scope_binding` for `(repo_id, sha, scope_kind, canonical_signature)`; if the binding is missing, skip the row and log a `coverage_skipped_unbound_scope` counter (do NOT invent a scope).
 - [ ] Add `internal/ingest/coverage/cobertura_test.go` against a real fixture.
 
@@ -360,18 +403,19 @@ storyId: "code-intelligence:CLEAN-CODE"
 ## Stage 4.3: ingest test_balance verb
 
 ### Implementation Steps
-- [ ] Implement `internal/ingest/test_balance/` parsing a JUnit-XML stream and emitting `MetricSample(metric_kind='pass_first_try_ratio', pack='ingested', source='ingested')` per architecture Sec 1.4.2 / tech-spec Sec 4.1.1.
-- [ ] Compute the ratio as `passes_first_run / total_runs` over the supplied window; scope_kind defaults to `package` unless the payload carries a finer scope.
-- [ ] Open `scan_run(kind='external_single', sha_binding='per_row')`.
-- [ ] Explicitly do NOT emit test-count metrics, test-duration metrics, or any other `test_balance.*` metric kinds (iter 1 evaluator item 4 removed those).
-- [ ] Add test fixture covering a JUnit file with mixed pass/fail/flake outcomes.
+- [ ] Implement `internal/ingest/test_balance/` parsing a JSON body of `{scope_id, attempt_count, pass_count}` rows (tech-spec Sec 8.5 lines 987-992) and emitting `MetricSample(metric_kind='pass_first_try_ratio', pack='ingested', source='ingested')` per architecture Sec 1.4.2 / tech-spec Sec 4.1.1.
+- [ ] Compute the ratio per row as `pass_count / attempt_count` (one MetricSample per `scope_id`); skip rows with `attempt_count=0` (avoid NaN).
+- [ ] Open `scan_run(kind='external_single', sha_binding='single')` per architecture Sec 6.4 lines 1367-1368 / tech-spec Sec 4.11 lines 429-432 -- test_balance uploads carry ONE `sha` per call.
+- [ ] Explicitly do NOT emit test-count metrics, test-duration metrics, or any other `test_balance.*` metric kinds (iter 1 evaluator item 4 removed those). The Cross-Repo Aggregator promotes `pass_first_try_ratio` to system-tier `xservice_test_reliability` per architecture Sec 3.10 step 4 / Sec 1.4.2 row 6.
+- [ ] Add test fixture covering a JSON payload with mixed pass/fail/attempt outcomes; refuse to parse JUnit-XML bodies (the verb's body media-type is `application/json` per tech-spec Sec 8.5).
 
 ### Dependencies
 - phase-external-metric-ingest-webhook/stage-webhook-transport-and-hmac-verification
 
 ### Test Scenarios
-- [ ] Scenario: test-balance-emits-only-pass-first-try-ratio -- Given a JUnit upload, When the verb runs, Then the appended `metric_sample` rows have exactly one `metric_kind='pass_first_try_ratio'` (no test-count or duration kinds).
-- [ ] Scenario: ratio-clamped-zero-to-one -- Given a JUnit upload, When the verb computes the ratio, Then the emitted value is in `[0,1]` and `total_runs=0` results in NO row written (avoid NaN).
+- [ ] Scenario: test-balance-emits-only-pass-first-try-ratio -- Given a JSON `{scope_id, attempt_count, pass_count}` upload, When the verb runs, Then the appended `metric_sample` rows have exactly one `metric_kind='pass_first_try_ratio'` per `scope_id` (no test-count or duration kinds).
+- [ ] Scenario: test-balance-rejects-junit-xml -- Given a JUnit-XML POST body to `/v1/ingest/test_balance`, When the handler runs, Then it returns `415 Unsupported Media Type` (the verb is pinned to JSON per tech-spec Sec 8.5).
+- [ ] Scenario: ratio-clamped-zero-to-one -- Given a JSON upload, When the verb computes the ratio, Then the emitted value is in `[0,1]` and `attempt_count=0` results in NO row written for that scope (avoid NaN).
 
 ## Stage 4.4: ingest churn verb feeds materialiser
 
@@ -387,8 +431,8 @@ storyId: "code-intelligence:CLEAN-CODE"
 - phase-ast-adapter-and-foundation-tier-compute/stage-modification-count-in-window-materialiser
 
 ### Test Scenarios
-- [ ] Scenario: churn-writes-no-metric-sample -- Given a churn upload, When the verb returns, Then `SELECT COUNT(*) FROM metric_sample WHERE scan_run_id=$1` returns 0; only `churn_event` rows are appended.
-- [ ] Scenario: materialiser-consumes-churn -- Given churn rows appended for a scope, When the modification_count materialiser runs next, Then it emits the canonical `metric_kind='modification_count_in_window'` sample with `pack='base'`, `source='derived'`.
+- [ ] Scenario: churn-writes-no-metric-sample -- Given a churn upload, When the verb returns, Then `SELECT COUNT(*) FROM metric_sample WHERE producer_run_id=$1` returns 0; only `churn_event` rows are appended.
+- [ ] Scenario: materialiser-consumes-churn -- Given churn rows appended for a scope, When the modification_count materialiser runs next, Then it emits the canonical `metric_kind='modification_count_in_window'` sample with `pack='base'`, `source='computed'`.
 
 ## Stage 4.5: ingest defects verb store only
 
@@ -429,24 +473,25 @@ storyId: "code-intelligence:CLEAN-CODE"
 ## Stage 5.2: Policy publish activate and rulepack verbs
 
 ### Implementation Steps
-- [ ] Implement `policy.publish(rulepack_set, refactor_weights)` verb appending an immutable `policy_version(policy_version_id, signature, signing_key_id, rulepack_set_hash, refactor_weights JSONB)` row -- never UPDATE (architecture Sec 5.3.3).
-- [ ] Implement `policy.activate(policy_version_id, scope)` verb appending a `policy_activation(activation_id, scope, policy_version_id, activated_at, activated_by)` row.
-- [ ] Implement `policy.rulepack.add(rulepack)` and `policy.rulepack.remove(rulepack_id)` verbs writing `rule_pack` and `rule` rows; both are append-only.
-- [ ] All four verbs require a valid signing key (Stage 5.1); refuse unsigned payloads.
-- [ ] Add `internal/policy/steward_test.go` covering publish -> activate -> evaluator picks up the new version.
+- [ ] Implement `policy.publish(rulepack_set, refactor_weights)` verb appending an immutable `policy_version(policy_version_id, name, rule_refs, threshold_refs, refactor_weights, signature, created_at)` row per architecture Sec 5.3.3 -- never UPDATE.
+- [ ] Implement `policy.activate(policy_version_id)` verb appending a `policy_activation(activation_id, policy_version_id, activated_by, created_at)` row per architecture Sec 5.3.4. No `scope` parameter -- activation is global per deployment (v1 single-tenant).
+- [ ] Implement `policy.publish_rulepack(rulepack)` verb (tech-spec Sec 8.5 lines 963-970 canonical verb name) writing one or more `rule_pack` and `rule` rows; append-only. There is NO `policy.rulepack.add` and NO `policy.rulepack.remove` verb in the canonical surface (tech-spec Sec 8.5: "There is no `policy.override` verb"; the same constraint applies to rulepack lifecycle -- the only write verb is `policy.publish_rulepack`).
+- [ ] All three verbs require a valid signing key (Stage 5.1); refuse unsigned payloads.
+- [ ] Add `internal/policy/steward_test.go` covering publish -> activate -> evaluator picks up the new version, and `policy.publish_rulepack` writes the expected `rule`/`rule_pack` rows.
 
 ### Dependencies
 - phase-policy-steward-and-solid-rule-engine/stage-policy-steward-signing-key-store
 
 ### Test Scenarios
 - [ ] Scenario: policy-version-immutable -- Given an existing `policy_version` row, When any UPDATE statement targets it, Then PostgreSQL returns permission denied (no role has UPDATE) AND the Steward verb path has no UPDATE call.
-- [ ] Scenario: activation-supersedes-previous -- Given an active policy_version for `org=acme`, When `policy.activate(new_id, org=acme)` runs, Then a new `policy_activation` row appears and reads at the scope return the new version.
+- [ ] Scenario: activation-latest-row-wins -- Given an active policy_version, When `policy.activate(new_id)` runs, Then a new `policy_activation` row appears (latest by `created_at` defines active) -- no `scope` parameter accepted, no `deactivated_at` flag set on the prior row.
+- [ ] Scenario: canonical-rulepack-verb-name -- Given the gRPC surface, When listing the policy.* verbs, Then exactly `{policy.publish, policy.activate, policy.publish_rulepack}` are registered (tech-spec Sec 8.5 lines 963-970); calls to `policy.rulepack.add` or `policy.rulepack.remove` return `UNIMPLEMENTED`.
 
 ## Stage 5.3: Override append only mute lifecycle
 
 ### Implementation Steps
-- [ ] Implement `mgmt.override(scope, rule_id, mute BOOL, reason)` verb delegating to the Policy Steward which appends an `override(override_id, policy_version_id, scope, rule_id, mute, reason, created_at, created_by)` row (architecture Sec 6.3, tech-spec Sec 10A).
-- [ ] Latest-row-wins read semantics: the evaluator reads `MAX(created_at) WHERE scope MATCHES AND rule_id=$1` to determine the active mute state.
+- [ ] Implement `mgmt.override(scope_filter, rule_id, mute BOOL, reason)` verb delegating to the Policy Steward which appends an `override(override_id, rule_id, scope_filter JSONB, mute, reason, actor_id, created_at)` row per architecture Sec 5.3.6 lines 1160-1170 (tech-spec Sec 10A pin). `scope_filter` is JSON `{repo_id, scope_kind, scope_signature_glob}`; `actor_id` is the OIDC subject of the caller. NO `policy_version_id` column (overrides bind to rules, not policy versions). NO `created_by` column (the actor column is named `actor_id`).
+- [ ] Latest-row-wins read semantics: the evaluator reads `MAX(created_at) WHERE rule_id=$1 AND scope_filter matches the candidate scope` to determine the active mute state.
 - [ ] The `override` row schema has NO `expires_at` column and the verb refuses any caller-supplied `expires_at` field (iter 1 evaluator item 5 -- tech-spec Sec 10A pins v1 to no TTL).
 - [ ] Unmute is achieved by appending a new `override` row with `mute=false`; old rows are NEVER deleted or UPDATEd.
 - [ ] Do NOT add a max-mute-age enforcement timer (iter 1 evaluator item 5 -- aged-mute is an Insights report only, see Phase 10).
@@ -479,11 +524,11 @@ storyId: "code-intelligence:CLEAN-CODE"
 
 ### Implementation Steps
 - [ ] Add `policy/rulepacks/solid/srp.yaml`: SRP rule per architecture Sec 1.3 consuming `metric_kind IN ('lcom4','interface_width')`.
-- [ ] Add `policy/rulepacks/solid/ocp.yaml`: OCP rule consuming `metric_kind IN ('modification_count_in_window','depth_of_inheritance')` -- the materialiser dependency is here in the RULE definition, NOT in the Stage 2.4 recipe stage (iter 1 evaluator item 10).
+- [ ] Add `policy/rulepacks/solid/ocp.yaml`: OCP rule consuming `metric_kind IN ('fan_in','modification_count_in_window')` per architecture Sec 3.5.1.b lines 504-513 and tech-spec Sec 4.3 lines 341-351 (the canonical OCP smell: a class that is widely depended-on AND frequently edited). NOT `depth_of_inheritance`. The Stage 2.6 materialiser dependency is here in the RULE definition, NOT in the Stage 2.4 recipe stage (iter 1 evaluator item 10).
 - [ ] Add `policy/rulepacks/solid/lsp.yaml`: LSP rule consuming `metric_kind='depth_of_inheritance'` plus override-method-signature checks emitted by Stage 2.4.
 - [ ] Add `policy/rulepacks/solid/isp.yaml`: ISP rule consuming `metric_kind='interface_width'`.
 - [ ] Add `policy/rulepacks/solid/dip.yaml`: DIP rule consuming `metric_kind IN ('fan_out','coupling_between_objects')`.
-- [ ] Each rulepack is signed and ingested via `policy.rulepack.add` at startup if absent.
+- [ ] Each rulepack is signed and ingested via `policy.publish_rulepack` at startup if absent (tech-spec Sec 8.5 lines 963-970 canonical verb name).
 - [ ] Add `policy/rulepacks/solid/solid_test.go` loading each pack and asserting it references only canonical metric_kinds.
 
 ### Dependencies
@@ -494,6 +539,7 @@ storyId: "code-intelligence:CLEAN-CODE"
 ### Test Scenarios
 - [ ] Scenario: solid-rulepacks-load -- Given the five SOLID rulepack files, When the Policy Steward loads them, Then all five appear as `rule_pack` rows with `pack='solid'` and the contained predicates parse cleanly.
 - [ ] Scenario: solid-rulepacks-only-canonical-kinds -- Given the loaded predicates, When scanning their metric_kind references, Then each is one of `{lcom4, fan_in, fan_out, depth_of_inheritance, interface_width, coupling_between_objects, modification_count_in_window}` and no non-canonical alias appears.
+- [ ] Scenario: ocp-uses-fan-in -- Given the loaded OCP rulepack, When inspecting its inputs, Then they are exactly `{fan_in, modification_count_in_window}` (NOT `depth_of_inheritance`; canon-guard against iter 3 drift item 14).
 
 ## Stage 5.6: Decoupled functional areas rule pack
 
@@ -512,14 +558,16 @@ storyId: "code-intelligence:CLEAN-CODE"
 - [ ] Scenario: decoupling-loads -- Given the three decoupling rulepack files, When the Steward loads them, Then `pack='decoupling'` rule_packs exist with parsed predicates.
 - [ ] Scenario: cycles-rule-fires-on-cycle-member -- Given a `metric_sample(metric_kind='cycle_member', value=1)`, When the predicate evaluates, Then it returns true (would trigger a Finding).
 
-## Stage 5.7: SOLID Rule Engine batch worker
+## Stage 5.7: SOLID Rule Engine batch worker and synchronous mode
 
 ### Implementation Steps
 - [ ] Add `internal/rule_engine/` worker consuming the latest active `policy_version` (Stage 5.2) and evaluating each rule's predicate over `metric_sample` rows for newly-scanned SHAs.
-- [ ] On a positive match, append a `finding(finding_id, repo_id, sha, scope_id, rule_id, policy_version_id, metric_kind, value, delta, severity, created_at)` row -- writer-ownership: Rule Engine is the SOLE writer of `finding` (architecture G1 / Phase 1.5 grants).
-- [ ] Compute `Finding.delta` against the prior SHA's sample for the same scope+metric: `regression`/`improvement`/`flat`/`new`/`resolved` (architecture Sec 5.4.3).
+- [ ] Expose two callable modes per architecture Sec 3.7 lines 548-570: (a) batch refresh mode invoked by the post-scan dispatcher (`caller='batch_refresh'`) and (b) synchronous mode `rule_engine.RunSync(ctx, repo_id, sha, scope?, policy_version_id) -> (evaluation_run_id, []finding_id)` invoked by `eval.gate` in the same call.
+- [ ] On a positive match, append a canonical `finding(finding_id, evaluation_run_id, repo_id, sha, scope_id, rule_id, rule_version, policy_version_id, metric_sample_ids JSONB, severity ENUM('info'|'warn'|'block'), delta, explanation_md, created_at)` row per architecture Sec 5.4.1 lines 1174-1190 -- writer-ownership: Rule Engine is the SOLE writer of `finding` (architecture G1 / Phase 1.5 grants). `metric_sample_ids` references the exact MetricSample row(s) that triggered the rule (NOT a single `metric_kind`+`value` pair).
+- [ ] Compute `Finding.delta` against the prior SHA's findings for the same `(scope_id, rule_id, policy_version_id)`: canonical values `new | newly_failing | unchanged | resolved` per architecture Sec 5.4.1 lines 1186-1190. Semantics: `new`=rule fires at this scope for the FIRST SHA ever; `newly_failing`=previously not severity=block at this scope, now is (regressions-to-block bucket); `unchanged`=was severity=block at previous SHA and still is; `resolved`=was severity=block at previous SHA and is now absent or at lower severity. NEVER emit `regression`, `improvement`, or `flat`.
 - [ ] Apply Override mute state from Stage 5.3 BEFORE appending the Finding (muted findings are not written; Insights surface tracks mute hits separately).
-- [ ] Add `internal/rule_engine/worker_test.go` covering: finding emitted; muted scope produces no finding; delta=regression when value worsens past threshold.
+- [ ] Add `internal/rule_engine/worker_test.go` covering: finding emitted with canonical schema columns; muted scope produces no finding; delta=newly_failing when severity moves from non-block to block at the next SHA; delta=resolved when prior severity=block is no longer present.
+- [ ] Add `internal/rule_engine/synchronous_test.go` covering: `RunSync` writes an `evaluation_run(caller='eval_gate')` row, N `finding` rows, and returns their IDs; concurrent `RunSync` calls for the same `(repo_id, sha)` are serialised by an advisory lock so two parallel `eval.gate` calls produce a single canonical run.
 
 ### Dependencies
 - phase-policy-steward-and-solid-rule-engine/stage-override-append-only-mute-lifecycle
@@ -528,8 +576,10 @@ storyId: "code-intelligence:CLEAN-CODE"
 - phase-repo-indexer-and-metric-ingestor/stage-metric-ingestor-and-scanrun-state-machine
 
 ### Test Scenarios
-- [ ] Scenario: finding-emitted-on-rule-hit -- Given a SHA with a `metric_sample(metric_kind='lcom4', value=12)` exceeding the SRP threshold (10), When the rule engine runs, Then a `finding(rule_id='solid.srp', delta='regression')` row appears with `policy_version_id` pinned.
+- [ ] Scenario: finding-emitted-on-rule-hit -- Given a SHA with a `metric_sample(metric_kind='lcom4', value=12)` exceeding the SRP threshold (10), When the rule engine runs, Then a `finding(rule_id='solid.srp', severity='warn', delta='new')` row appears with `policy_version_id` pinned and `metric_sample_ids` JSONB referencing the triggering sample.
 - [ ] Scenario: muted-scope-skipped -- Given an `override(scope, rule_id, mute=true)` latest row, When the rule engine evaluates that scope+rule, Then no `finding` row is appended.
+- [ ] Scenario: delta-newly-failing -- Given the same `(scope_id, rule_id)` evaluated at SHA A with severity=warn and at SHA B with severity=block, When the worker writes the SHA B finding, Then `delta='newly_failing'`.
+- [ ] Scenario: sync-mode-writes-run-and-findings -- Given `RuleEngine.RunSync` called with valid inputs, When it returns, Then exactly one `evaluation_run(caller='eval_gate')` row and at least one `finding` row referencing that run exist (commit in the same transaction).
 
 # Phase 6: Evaluator Surface and Management Surface
 
@@ -537,54 +587,54 @@ storyId: "code-intelligence:CLEAN-CODE"
 - phase-repo-indexer-and-metric-ingestor
 - phase-policy-steward-and-solid-rule-engine
 
-## Stage 6.1: Evaluator gate verb and degraded handling
+## Stage 6.1: Evaluator gate verb and synchronous SOLID delegation
 
 ### Implementation Steps
-- [ ] Implement `eval.gate(repo_id, sha, scope?)` verb appending an `evaluation_run(run_id, repo_id, sha, scope, policy_version_id, caller, started_at)` row and computing the verdict.
+- [ ] Implement `eval.gate(repo_id, sha, scope?)` verb per architecture Sec 3.7 lines 548-570. Sequence: (1) resolve active `policy_version_id` via latest `policy_activation` row; (2) verify `policy_version.signature` against the Steward signing key -- on mismatch return `verdict='warn', degraded=true, degraded_reason='policy_signature_invalid'` WITHOUT writing findings; (3) check Phase 2 completion for the SHA -- if missing inputs return `verdict='warn', degraded=true, degraded_reason='samples_pending'` WITHOUT writing findings; (4) DELEGATE to the SOLID Rule Engine **synchronous mode** (Stage 5.7) `rule_engine.RunSync(ctx, repo_id, sha, scope?, policy_version_id)` -- this writes ONE `evaluation_run(caller='eval_gate', policy_version_id, started_at)` row and N `finding` rows in the same transaction and returns their IDs; (5) compute verdict from the returned findings using severity rollup (`block` if any unmuted Finding has `severity='block'`; `warn` if any unmuted Finding has `severity='warn'`; `pass` otherwise); (6) append `evaluation_verdict(verdict_id, evaluation_run_id, scope?, verdict, degraded, degraded_reason, settled_at)` row.
 - [ ] Verdict is the canonical enum `pass | warn | block` (architecture Sec 5.4.2 / tech-spec Sec 4.8) -- NOT `pass|fail|gated` (iter 1 evaluator item 6). Implement as a Go enum `Verdict { Pass, Warn, Block }` with no other values.
-- [ ] Block when any unmuted Finding has `severity='block'` for the scope under evaluation; warn when any unmuted Finding has `severity='warn'`; pass otherwise.
+- [ ] eval.gate does NOT compute findings itself and does NOT consume pre-existing findings without invoking the synchronous Rule Engine path (iter 3 evaluator item 16); the rule pass and the verdict are produced in one synchronous call so degraded warnings cannot mask a stale finding set.
 - [ ] Add a SEPARATE `degraded BOOL` and `degraded_reason` field to the verdict; degraded conditions map to `verdict='warn'` per the operator pin `gate-degraded-policy=warn` (architecture Sec 1.6).
 - [ ] `degraded_reason` is constrained to `samples_pending | policy_signature_invalid | xrepo_edges_unavailable` for eval.gate -- `percentile_stale` is NOT a valid eval.gate reason (it lives on the Insights surface per Stage 7.3; iter 1 evaluator item 8).
-- [ ] Append `evaluation_verdict(verdict_id, run_id, scope, verdict, degraded, degraded_reason, settled_at)` after compute.
-- [ ] Add `internal/evaluator/gate_test.go` covering: clean pass; block on severity=block; warn on degraded; degraded_reason rejects percentile_stale.
+- [ ] Add `internal/evaluator/gate_test.go` covering: clean pass with synchronous Rule Engine call observed; block on severity=block finding written in the same call; warn on degraded (policy signature invalid) with NO Rule Engine call and zero findings; warn on degraded (samples_pending) with NO Rule Engine call; degraded_reason rejects percentile_stale.
 
 ### Dependencies
-- phase-policy-steward-and-solid-rule-engine/stage-solid-rule-engine-batch-worker
+- phase-policy-steward-and-solid-rule-engine/stage-solid-rule-engine-batch-worker-and-synchronous-mode
 
 ### Test Scenarios
 - [ ] Scenario: verdict-enum-only-canonical -- Given the `Verdict` Go enum at compile time, When iterating its values, Then they are exactly `{pass, warn, block}` (no `fail`, no `gated`) -- guards iter 1 evaluator item 6.
-- [ ] Scenario: degraded-maps-to-warn -- Given a samples_pending degraded condition (no findings present), When `eval.gate` runs, Then the verdict is `warn` with `degraded=true, degraded_reason='samples_pending'`.
+- [ ] Scenario: gate-delegates-synchronous-rule-pass -- Given a clean SHA with samples present and a valid policy signature, When `eval.gate` runs, Then exactly one new `evaluation_run(caller='eval_gate')` row and N new `finding` rows are observable (created by `RuleEngine.RunSync` in the same call, NOT by a separate batch worker); the verdict is computed from those freshly-written findings.
+- [ ] Scenario: degraded-maps-to-warn -- Given a samples_pending degraded condition (no findings written), When `eval.gate` runs, Then the verdict is `warn` with `degraded=true, degraded_reason='samples_pending'` and zero new `finding` rows are appended (Rule Engine is NOT invoked).
 - [ ] Scenario: percentile-stale-not-on-gate -- Given any code path inside `eval.gate`, When the degraded_reason validator runs, Then `percentile_stale` is rejected as an invalid eval.gate reason.
 
 ## Stage 6.2: Management write verbs and repo onboarding
 
 ### Implementation Steps
-- [ ] Implement `mgmt.register_repo(repo_url, default_branch, modes)` writing a `repo` row plus a `repo_event(kind='register')`.
-- [ ] Implement `mgmt.set_mode(repo_id, mode)` writing a `repo_event(kind='mode_change', payload={mode})` and updating `repo.mode`; allowed modes are `embedded | linked` per architecture Sec 1.6 `ast-mode-default`.
+- [ ] Implement `mgmt.register_repo(repo_url, default_branch, modes)` writing a `repo` row plus a `repo_event(kind='registered')`.
+- [ ] Implement `mgmt.set_mode(repo_id, mode)` writing a `repo_event(kind='mode_changed', payload={mode})` and updating `repo.mode`; allowed modes are `embedded | linked` per architecture Sec 1.6 `ast-mode-default` and the canonical RepoEvent enum at Sec 5.1.4 lines 877-884.
 - [ ] Re-export `mgmt.retract_sample` (Stage 3.4), `mgmt.rescan` (Stage 3.4), `mgmt.override` (Stage 5.3) under the Management Surface namespace.
 - [ ] Each write verb requires an authenticated caller (OIDC subject) recorded as `actor` on the resulting RepoEvent / Override / Finding row.
 - [ ] Add `internal/management/verbs_test.go` covering each write verb's happy path and unauthenticated rejection.
 
 ### Dependencies
-- phase-evaluator-surface-and-management-surface/stage-evaluator-gate-verb-and-degraded-handling
+- phase-evaluator-surface-and-management-surface/stage-evaluator-gate-verb-and-synchronous-solid-delegation
 - phase-repo-indexer-and-metric-ingestor/stage-retraction-and-rescan-flow
 - phase-policy-steward-and-solid-rule-engine/stage-override-append-only-mute-lifecycle
 
 ### Test Scenarios
 - [ ] Scenario: register-repo-idempotent -- Given a repo already registered, When `mgmt.register_repo` is called with the same URL, Then the existing repo_id is returned and no duplicate `repo` row appears.
-- [ ] Scenario: set-mode-emits-event -- Given a repo at mode `embedded`, When `mgmt.set_mode(repo_id, 'linked')` runs, Then a `repo_event(kind='mode_change')` is appended and subsequent `mgmt.read.repo` returns mode=`linked`.
+- [ ] Scenario: set-mode-emits-event -- Given a repo at mode `embedded`, When `mgmt.set_mode(repo_id, 'linked')` runs, Then a `repo_event(kind='mode_changed')` is appended (canonical past-tense enum value per architecture Sec 5.1.4) and subsequent `mgmt.read.repo` returns mode=`linked`.
 
 ## Stage 6.3: Management read verbs and insights projections
 
 ### Implementation Steps
-- [ ] Implement SHA-pinned read verbs `mgmt.read.repo(repo_id)`, `mgmt.read.metric_sample(repo_id, sha, scope_id, metric_kind)`, `mgmt.read.metric_samples(repo_id, sha, filter)`, `mgmt.read.findings(repo_id, sha)`, `mgmt.read.regressions(repo_id, sha)`, `mgmt.read.refactor_plan(repo_id, sha)` reading the active-row view per Phase 1.3 partial unique index.
+- [ ] Implement SHA-pinned read verbs `mgmt.read.repo(repo_id)`, `mgmt.read.metric_sample(repo_id, sha, scope_id, metric_kind)`, `mgmt.read.metric_samples(repo_id, sha, filter)`, `mgmt.read.findings(repo_id, sha)`, `mgmt.read.regressions(repo_id, sha)`, `mgmt.read.refactor_plan(repo_id, sha)` reading the active-row view via the Phase 1.3 `metric_sample_active` side relation join per tech-spec Sec 7.1.b.
 - [ ] Implement latest-dashboard read verbs `mgmt.read.cross_repo(metric_kind, scope_kind)`, `mgmt.read.portfolio(metric_kind)` reading `cross_repo_percentile` and `portfolio_snapshot` populated by Phase 7.
 - [ ] Both modes route through a single `internal/management/reader.go` with explicit `mode = sha_pinned | latest_dashboard` per architecture Sec 6.3.
 - [ ] Read paths never trigger writes (read-only roles enforced by Phase 1.5).
 - [ ] Add `internal/management/reader_test.go` covering both modes.
 
 ### Dependencies
-- phase-evaluator-surface-and-management-surface/stage-evaluator-gate-verb-and-degraded-handling
+- phase-evaluator-surface-and-management-surface/stage-evaluator-gate-verb-and-synchronous-solid-delegation
 
 ### Test Scenarios
 - [ ] Scenario: sha-pinned-returns-active-row -- Given two `metric_sample` rows for the same quintuple with the older retracted, When `mgmt.read.metric_sample` runs, Then it returns the active (non-retracted) row only.
@@ -616,7 +666,7 @@ storyId: "code-intelligence:CLEAN-CODE"
 
 ### Implementation Steps
 - [ ] Add `internal/aggregator/` worker running on tech-spec Sec 8.2 `aggregator_cadence=15min`.
-- [ ] On each tick, read active `metric_sample` rows for all repos, group by `metric_kind` + `scope_kind`, and write rows into `repo_metric_snapshot` (per-repo p50/p90/p99 columns) and `cross_repo_percentile` (cross-repo p50/p90/p99 + `histogram_json` columns) and `portfolio_snapshot` (weighted_mean across portfolio).
+- [ ] On each tick, read active `metric_sample` rows for all repos (via the `metric_sample_active` side-relation join), group by `metric_kind` + `scope_kind`, and write rows into `repo_metric_snapshot` (per-repo p50/p90/p99 columns) and `cross_repo_percentile` (cross-repo p50/p90/p99 + `histogram_json` columns) and `portfolio_snapshot` (`aggregate_json` JSONB carrying the cross-repo weighted aggregates per architecture Sec 5.2.6).
 - [ ] Aggregator is the SOLE writer of `repo_metric_snapshot`, `cross_repo_percentile`, `portfolio_snapshot` per architecture G1 / Phase 1.5 grants.
 - [ ] Snapshot tables carry a `built_at` timestamp updated on every tick (used by Stage 7.3 freshness banner).
 - [ ] Add `internal/aggregator/worker_test.go` covering one tick over a synthetic dataset.
@@ -633,8 +683,8 @@ storyId: "code-intelligence:CLEAN-CODE"
 ### Implementation Steps
 - [ ] Add `internal/aggregator/system_tier.go` writing exactly the SEVEN canonical system-tier metric_kinds per architecture Sec 1.4.2: `xrepo_dep_depth`, `arch_debt_ratio`, `velocity_trend`, `arch_fitness`, `blast_radius`, `xservice_test_reliability`, `knowledge_index`.
 - [ ] Each system-tier sample is written as `metric_sample(pack='system', source='derived')`; the aggregator is the sole writer of `pack='system'` per Phase 1.5 grants. NO invented metric_kinds like `p50.system` or `p95.system` are written -- percentile vectors live in `cross_repo_percentile` columns, not as fake metric_kind rows (iter 1 evaluator item 7).
-- [ ] When the aggregator runs in embedded mode and cross-repo edges are unavailable, stamp the resulting verdict path with `degraded_reason='xrepo_edges_unavailable'` (per architecture Sec 5.5; this reason flows through eval.gate, not Insights).
-- [ ] When upstream samples are missing for a metric_kind, skip writing and emit a `samples_pending` counter (the same `degraded_reason='samples_pending'` propagates to consumers).
+- [ ] When the aggregator runs in embedded mode and cross-repo edges are unavailable, **write the system-tier row anyway** with `degraded=true, degraded_reason='xrepo_edges_unavailable'` on the `metric_sample` row per architecture Sec 3.10 step 4 lines 637-657 and tech-spec Sec 4.2 lines 325-339 (the canonical fail-safe contract: NEVER silently drop a system-tier row; instead emit a degraded row carrying the reason so downstream eval.gate and Insights surface the freshness state). The `degraded_reason` propagates to the consumer via the matching column on `evaluation_verdict` / Insights envelope.
+- [ ] When upstream foundation/SOLID `metric_sample` rows are missing for a system-tier composition, **write the system-tier row anyway** with `degraded=true, degraded_reason='samples_pending'` (same fail-safe contract per architecture Sec 3.10 / tech-spec Sec 4.2). The `value` column carries a best-effort partial computation or `NULL` (NULL is allowed in the `metric_sample.value` column when `degraded=true`); the `samples_pending` counter still increments for observability.
 - [ ] Add `internal/aggregator/system_tier_test.go` enumerating the registered system-tier kinds and asserting the set is exactly the seven canonical names.
 
 ### Dependencies
@@ -642,7 +692,8 @@ storyId: "code-intelligence:CLEAN-CODE"
 
 ### Test Scenarios
 - [ ] Scenario: system-tier-only-canonical-kinds -- Given the system_tier composer at runtime, When listing the metric_kinds it will write, Then the set is exactly `{xrepo_dep_depth, arch_debt_ratio, velocity_trend, arch_fitness, blast_radius, xservice_test_reliability, knowledge_index}` -- no `p50.system`, `p90.system`, `p95.system`, `p99.system` (iter 1 evaluator item 7).
-- [ ] Scenario: embedded-mode-stamps-xrepo-degraded -- Given the aggregator in embedded mode with no xrepo edges, When it composes, Then no system-tier `arch_debt_ratio` row is written for affected scopes and the degraded counter labelled `reason=xrepo_edges_unavailable` increments.
+- [ ] Scenario: embedded-mode-writes-degraded-row -- Given the aggregator in embedded mode with no xrepo edges, When it composes `arch_debt_ratio` for an affected scope, Then a `metric_sample(metric_kind='arch_debt_ratio', pack='system', degraded=true, degraded_reason='xrepo_edges_unavailable')` row IS written (NOT skipped, per architecture Sec 3.10 fail-safe / iter 3 evaluator item 15) and the degraded counter labelled `reason=xrepo_edges_unavailable` increments.
+- [ ] Scenario: samples-pending-writes-degraded-row -- Given missing foundation `cyclo` samples for a scope at SHA X, When the aggregator composes `velocity_trend` at SHA X, Then a `metric_sample(metric_kind='velocity_trend', pack='system', degraded=true, degraded_reason='samples_pending')` row IS written (NOT skipped); `value` may be NULL.
 
 ## Stage 7.3: Insights Surface percentile freshness banner
 
@@ -672,13 +723,13 @@ storyId: "code-intelligence:CLEAN-CODE"
 ### Implementation Steps
 - [ ] Add `internal/refactor/hotspot.go` computing `score = alpha*complexity_z + beta*churn_z + gamma*coupling_z + delta*finding_count` per architecture Sec 3.9.
 - [ ] Weights `alpha, beta, gamma, delta` come from `policy_version.refactor_weights JSONB`; the refactor planner READS the active `policy_version` and embeds `policy_version_id` on every `hot_spot` row (so re-deriving from old weights remains reproducible).
-- [ ] Input metric_kinds: complexity from `cyclo`+`cognitive_complexity`, churn from `modification_count_in_window`, coupling from `coupling_between_objects`+`fan_out`, finding_count from `finding` rows where `delta IN ('regression','new')`.
-- [ ] Write `hot_spot(hotspot_id, repo_id, sha, scope_id, score, complexity_z, churn_z, coupling_z, finding_count, policy_version_id, built_at)` rows.
+- [ ] Input metric_kinds: complexity from `cyclo`+`cognitive_complexity`, churn from `modification_count_in_window`, coupling from `coupling_between_objects`+`fan_out`, finding_count from `finding` rows where `delta IN ('newly_failing','new')` per architecture Sec 5.4.1 lines 1186-1190 canonical delta enum.
+- [ ] Write `hot_spot(hotspot_id, repo_id, sha, scope_id, score, policy_version_id, created_at)` rows per architecture Sec 5.5.1 lines 1216-1224 canonical schema; per-input z-scores (`complexity_z`, `churn_z`, `coupling_z`) and `finding_count` are intermediate computations recorded as JSONB in `hot_spot.score_breakdown` if needed for explainability but are NOT canonical top-level columns on the row.
 - [ ] Add `internal/refactor/hotspot_test.go` covering a synthetic input that produces a known score.
 
 ### Dependencies
 - phase-cross-repo-aggregator/stage-system-tier-metric-composer
-- phase-policy-steward-and-solid-rule-engine/stage-solid-rule-engine-batch-worker
+- phase-policy-steward-and-solid-rule-engine/stage-solid-rule-engine-batch-worker-and-synchronous-mode
 
 ### Test Scenarios
 - [ ] Scenario: hotspot-score-formula -- Given known z-scores `(1.0, 2.0, 0.5)` and `finding_count=3` with weights `(1,1,1,1)`, When `score` is computed, Then it equals `1.0 + 2.0 + 0.5 + 3 = 6.5` (round to 2dp).
@@ -687,19 +738,20 @@ storyId: "code-intelligence:CLEAN-CODE"
 ## Stage 8.2: Refactor plan and task generation
 
 ### Implementation Steps
-- [ ] Add `internal/refactor/planner.go` reading the top-N hotspots per repo (N from `policy_version.refactor_weights.top_n`) and writing `refactor_plan(plan_id, repo_id, sha, hotspot_ids JSONB, policy_version_id, generated_at)`.
-- [ ] For each hotspot, emit one or more `refactor_task(task_id, plan_id, scope_id, rule_id, kind, effort_hours, expected_metric_delta JSONB, status)` rows.
-- [ ] `task.kind` is the canonical enum `extract_function | split_class | introduce_interface | break_cycle | reduce_inheritance | reduce_coupling | reduce_lcom | reduce_duplication` (architecture Sec 5.6.3); refuse to write unknown kinds.
-- [ ] `task.status` enum: `proposed | in_progress | done | rejected | superseded` (architecture Sec 5.6.4).
-- [ ] No `effort_estimate` table (iter 1 evaluator item 1) -- the estimate lives as a column `effort_hours` on the `refactor_task` row itself.
+- [ ] Add `internal/refactor/planner.go` reading the top-N hotspots per repo (N from `policy_version.refactor_weights.top_n`) and writing `refactor_plan(plan_id, repo_id, sha, hotspot_ids JSONB, summary_md, created_at)` per architecture Sec 5.5.2 lines 1226-1237 canonical schema (NO `policy_version_id` column on `refactor_plan` -- the policy is recoverable through the referenced HotSpots).
+- [ ] For each hotspot, emit one or more `refactor_task(task_id, plan_id, scope_id, kind, effort_hours DOUBLE, rule_id, description_md, created_at)` rows per architecture Sec 5.5.3 lines 1239-1250 canonical schema.
+- [ ] `task.kind` is the canonical enum `split_class | extract_method | invert_dependency | break_cycle | consolidate_duplication` per architecture Sec 5.5.3 lines 1244-1248; refuse to write unknown kinds (the iter 3 alias set `extract_function | introduce_interface | reduce_inheritance | reduce_coupling | reduce_lcom | reduce_duplication` is REJECTED).
+- [ ] `refactor_task` has NO `status` column in v1 -- task lifecycle is tracked in the agent-memory `Node` graph, not on the immutable refactor row (architecture Sec 5.5.3 line 1239-1250 lists no status field). NO `expected_metric_delta` column.
+- [ ] No `effort_estimate` table (iter 1 evaluator item 1) -- the estimate lives as a `effort_hours DOUBLE` column on the `refactor_task` row itself.
 - [ ] Add `internal/refactor/planner_test.go` covering happy path and rule-kind mapping.
 
 ### Dependencies
 - phase-refactor-planner/stage-composite-hotspot-scoring
 
 ### Test Scenarios
-- [ ] Scenario: plan-generates-canonical-task-kinds -- Given a hotspot flagged by `solid.srp`, When the planner generates tasks, Then a `refactor_task` row appears with `kind='split_class'` or `kind='reduce_lcom'` (canonical enum) and `rule_id='solid.srp'`.
+- [ ] Scenario: plan-generates-canonical-task-kinds -- Given a hotspot flagged by `solid.srp`, When the planner generates tasks, Then a `refactor_task` row appears with `kind='split_class'` (canonical enum per architecture Sec 5.5.3) and `rule_id='solid.srp'`; attempts to write `kind='reduce_lcom'` or `kind='introduce_interface'` are rejected at the CHECK constraint.
 - [ ] Scenario: no-effort-estimate-table -- Given the schema after Phase 1 migrations, When the planner persists effort, Then it writes `refactor_task.effort_hours` and no other table named `effort_estimate` exists (guards iter 1 evaluator item 1).
+- [ ] Scenario: refactor-task-has-no-status-column -- Given the canonical `refactor_task` table, When `information_schema.columns` is queried, Then no `status` and no `expected_metric_delta` column exists (canon-guard against iter 3 drift item 7).
 
 ## Stage 8.3: ML effort model loader and version pinning
 
@@ -731,7 +783,7 @@ storyId: "code-intelligence:CLEAN-CODE"
 - [ ] Add `internal/audit/wal/writer_test.go` covering: WAL frame is written iff a PostgreSQL row is committed; rollback prevents WAL frame from being readable by the reconciler.
 
 ### Dependencies
-- phase-evaluator-surface-and-management-surface/stage-evaluator-gate-verb-and-degraded-handling
+- phase-evaluator-surface-and-management-surface/stage-evaluator-gate-verb-and-synchronous-solid-delegation
 
 ### Test Scenarios
 - [ ] Scenario: wal-scope-only-audit-tables -- Given any code path in the service, When grepping the writer call sites, Then `internal/audit/wal` is referenced ONLY from `internal/evaluator/` and `internal/rule_engine/` (not from catalog/measurement/policy/refactor) -- iter 1 evaluator item 11.

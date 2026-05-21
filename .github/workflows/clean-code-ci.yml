@@ -1,0 +1,153 @@
+name: clean-code CI
+
+# Runs on every PR that touches the clean-code service tree or any
+# of the workstream branches that converge into `feature/clean-code`.
+# Implementation-plan.md Stage 1.1 requires `make lint && make test`
+# to pass and a `clean-coded` container image to build cleanly.
+
+on:
+  pull_request:
+    branches:
+      - feature/clean-code
+      - "ws/code-intelligence-CLEAN-CODE/**"
+    paths:
+      - "services/clean-code/**"
+      - ".github/workflows/clean-code-ci.yml"
+      - ".editorconfig"
+      - ".pre-commit-config.yaml"
+      - ".yamllint.yaml"
+  push:
+    branches:
+      - feature/clean-code
+      - "ws/code-intelligence-CLEAN-CODE/**"
+    paths:
+      - "services/clean-code/**"
+      - ".github/workflows/clean-code-ci.yml"
+      - ".editorconfig"
+      - ".pre-commit-config.yaml"
+      - ".yamllint.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clean-code-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-build-test:
+    name: lint + build + test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/clean-code
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/clean-code/go.mod
+          # No third-party deps yet; setup-go's default cache key
+          # is enough to keep the toolchain primed.
+          cache: true
+
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.61.0
+          working-directory: services/clean-code
+          # `install-only: true` makes the action install the binary
+          # and prime its cache without invoking `golangci-lint run`.
+          # The actual lint pass is driven by `make lint` below so
+          # local dev and CI exercise the exact same Makefile path.
+          install-only: true
+          install-mode: binary
+          skip-cache: false
+
+      - name: make lint
+        run: make lint
+
+      - name: make build
+        run: make build
+
+      - name: make test
+        run: make test
+
+      - name: make test-race
+        # `make test` is portable (no `-race`); `make test-race`
+        # adds the race detector and is what we run on Linux
+        # runners where CGO is available.
+        run: make test-race
+
+      - name: upload clean-coded binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: clean-coded-${{ github.sha }}
+          path: services/clean-code/bin/clean-coded
+          if-no-files-found: error
+          retention-days: 7
+
+  docker-build:
+    name: build clean-coded container
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set build time
+        id: build-time
+        # `github.event.repository.updated_at` reflects repo metadata
+        # changes, not this CI run, so capture an RFC3339 UTC stamp
+        # here. `internal/version.BuildTime` (exposed via `/healthz`)
+        # is what operators correlate against a deploy, so the value
+        # must match when this image was actually built.
+        run: echo "value=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Build clean-coded image
+        uses: docker/build-push-action@v6
+        with:
+          context: services/clean-code
+          file: services/clean-code/Dockerfile
+          push: false
+          load: true
+          tags: clean-code/clean-coded:ci-${{ github.sha }}
+          build-args: |
+            VERSION=ci-${{ github.run_number }}
+            COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ steps.build-time.outputs.value }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test image
+        run: |
+          set -euo pipefail
+          # The distroless final stage carries no shell, so we
+          # smoke-test by running the binary with -version.
+          docker run --rm "clean-code/clean-coded:ci-${{ github.sha }}" -version
+
+  pre-commit:
+    name: pre-commit hooks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/clean-code/go.mod
+          cache: true
+
+      - name: Run pre-commit
+        uses: pre-commit/action@v3.0.1

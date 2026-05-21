@@ -1,0 +1,109 @@
+# Local-dev / CI dependency stack for the clean-code service.
+#
+# Stage 1.1 (implementation-plan.md) requires:
+#   * PostgreSQL 16 (tech-spec Sec 8.1.1, C9) -- the `clean_code`
+#     schema lives here. The container does NOT yet create any
+#     tables; Stage 1.2's migrations populate the schema.
+#   * The `clean-coded` service itself, built from the source tree
+#     via the sibling Dockerfile.
+#   * A Prometheus scrape target so dashboards / alerts can be
+#     wired against `clean-coded` metrics in later stages.
+#   * An OpenTelemetry Collector so the slog wrapper's traces /
+#     metrics export has somewhere to land.
+#
+# Image versions are pinned. Bump them in their own PR with a clean
+# `docker compose up -d` + integration-test pass.
+
+name: clean-code-local
+
+networks:
+  clean_code:
+    driver: bridge
+
+volumes:
+  clean_code_pgdata:
+
+services:
+  postgres:
+    container_name: clean_code_postgres
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+    image: clean-code/postgres:16-pgcrypto
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: clean_code
+      POSTGRES_PASSWORD: clean_code
+      POSTGRES_DB: clean_code
+    networks:
+      - clean_code
+    ports:
+      - "5432:5432"
+    volumes:
+      - clean_code_pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clean_code -d clean_code"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  otel:
+    container_name: clean_code_otel
+    # Bumped image must match a build-tested commit; the
+    # `make compose-up` integration test in CI re-asserts the
+    # health_check extension responds 200 on /.
+    image: otel/opentelemetry-collector-contrib:0.112.0
+    restart: unless-stopped
+    command: ["--config=/etc/otel/config.yaml"]
+    networks:
+      - clean_code
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "13133:13133" # health_check extension
+    volumes:
+      - ./otel/config.yaml:/etc/otel/config.yaml:ro
+
+  prometheus:
+    container_name: clean_code_prometheus
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=24h"
+      - "--web.enable-lifecycle"
+    networks:
+      - clean_code
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  clean-coded:
+    container_name: clean_code_clean_coded
+    build:
+      # The clean-coded image is built from the service root so the
+      # Dockerfile can COPY go.mod / sources without leaking
+      # parent-repo files into the build context.
+      context: ../..
+      dockerfile: Dockerfile
+    image: clean-code/clean-coded:dev
+    restart: unless-stopped
+    environment:
+      CLEAN_CODE_HTTP_ADDR: ":8080"
+      CLEAN_CODE_PROMETHEUS_ADDR: ":9090"
+      CLEAN_CODE_OTEL_ENDPOINT: "otel:4317"
+      CLEAN_CODE_PG_URL: "postgres://clean_code:clean_code@postgres:5432/clean_code?sslmode=disable"
+      CLEAN_CODE_LOG_LEVEL: "info"
+    networks:
+      - clean_code
+    ports:
+      - "8080:8080"   # /healthz, /readyz, future REST surfaces
+      - "9090:9090"   # Prometheus scrape
+    depends_on:
+      postgres:
+        condition: service_healthy
+      otel:
+        condition: service_started

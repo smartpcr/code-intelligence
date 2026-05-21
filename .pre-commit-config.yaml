@@ -40,7 +40,11 @@ repos:
         args: ["--allow-multiple-documents"]
         # docker-compose files use !reset / similar tags; let the
         # dedicated yamllint hook handle compose-style files.
-        exclude: ^services/agent-memory/deploy/local/docker-compose\.yml$
+        exclude: |
+          (?x)^(
+            services/agent-memory/deploy/local/docker-compose\.yml|
+            services/clean-code/deploy/local/docker-compose\.yml
+          )$
       - id: check-json
       - id: check-added-large-files
         args: ["--maxkb=512"]
@@ -61,6 +65,7 @@ repos:
         exclude: |
           (?x)^(
             services/agent-memory/vendor/.*|
+            services/clean-code/vendor/.*|
             docs/stories/.*|
             .*\.bak$|
             .*\.iter-snapshot\.bak$
@@ -85,6 +90,18 @@ repos:
         language: system
         pass_filenames: false
         files: ^services/agent-memory/.*\.go$
+      - id: clean-code-gofmt
+        name: gofmt clean-code
+        entry: bash -c 'cd services/clean-code && gofmt -l -d $(git ls-files "*.go") | tee /dev/stderr | (! read)'
+        language: system
+        pass_filenames: false
+        files: ^services/clean-code/.*\.go$
+      - id: clean-code-govet
+        name: go vet clean-code
+        entry: bash -c 'cd services/clean-code && go vet ./...'
+        language: system
+        pass_filenames: false
+        files: ^services/clean-code/.*\.go$
 
   - repo: https://github.com/adrienverge/yamllint
     rev: v1.35.1

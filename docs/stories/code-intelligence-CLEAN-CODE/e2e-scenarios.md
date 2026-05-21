@@ -67,7 +67,7 @@ processes run yet -- this phase is the schema contract.
 - **Pre-test bootstrap**: `make migrate-up` (applies every numbered SQL migration), then `make migrate-down && make migrate-up` (forward/reverse parity check).
 
 Compose services at `tests/e2e/phase-01-foundation/docker-compose.yml`:
-- `postgres` (Postgres 15, healthcheck `pg_isready`, exposes 5432 internally only; DSN exported as `CLEAN_CODE_PG_URL`).
+- `postgres` (Postgres 16, healthcheck `pg_isready`, exposes 5432 internally only; DSN exported as `CLEAN_CODE_PG_URL`).
 - `migrator` (one-shot container that runs `make migrate-up`; exit 0 gates the test job).
 
 ### Scenarios
@@ -342,17 +342,19 @@ Background:
 
 ```gherkin
 @happy @invariant
-Feature: Foundation tier produces exactly 12 metric_kinds per scope [arch Sec 1.4.1]
-  Scenario: A class scope from the Java fixture yields the 12 foundation kinds
-    Given the fixture `tests/fixtures/ast/java/billing/InvoiceProcessor.java`
-    When the AST adapter parses the file and emits foundation metrics for the class scope
-    Then exactly 12 `metric_sample` rows are produced
-     And the `metric_kind` set is exactly
+Feature: Foundation tier emits 12 canonical metric_kinds split across `base` and `solid` packs [arch Sec 1.4.1, Sec 5.2.1]
+  Scenario: A Java fixture file produces samples covering all 12 foundation metric_kinds, partitioned by pack
+    Given the fixture `tests/fixtures/ast/java/billing/InvoiceProcessor.java` defines one class with three methods
+    When the AST adapter parses the file and emits foundation metrics for every applicable scope
+    Then the union of emitted `metric_sample.metric_kind` values across the file's scopes is exactly the 12 names:
         `cyclo`, `cognitive_complexity`, `loc`, `lcom4`, `fan_in`, `fan_out`,
         `depth_of_inheritance`, `interface_width`, `coupling_between_objects`,
         `cycle_member`, `duplication_ratio`, `modification_count_in_window`
-     And every row's `pack` field equals `base`
-     And every row's `source` field equals `ast`
+     And the 6 rows with `pack='base'` are exactly `cyclo`, `cognitive_complexity`, `loc`, `cycle_member`, `duplication_ratio`, `modification_count_in_window`
+     And the 6 rows with `pack='solid'` are exactly `lcom4`, `fan_in`, `fan_out`, `depth_of_inheritance`, `interface_width`, `coupling_between_objects`
+     And every emitted row has `source='computed'` (the MetricSample source enum is `computed | ingested | derived` per arch Sec 5.2.1 -- never `ast` or `external`)
+     And the class scope `com.example.billing.InvoiceProcessor` emits exactly the 6 class-applicable kinds:
+        `lcom4`, `fan_in`, `fan_out`, `depth_of_inheritance`, `interface_width`, `coupling_between_objects`
 ```
 
 ```gherkin
@@ -441,7 +443,7 @@ permitted roles.
 - **Pre-test bootstrap**: `make migrate-up` against `CLEAN_CODE_PG_URL`; `make seed-fixtures-phase-03` loads a 3-repo, 12-SHA fixture corpus.
 
 Compose services at `tests/e2e/phase-03-indexer-ingestor/docker-compose.yml`:
-- `postgres` (Postgres 15; DSN -> `CLEAN_CODE_PG_URL`).
+- `postgres` (Postgres 16; DSN -> `CLEAN_CODE_PG_URL`).
 - `otel-collector` (gRPC 4317 internal; endpoint -> `CLEAN_CODE_OTEL_ENDPOINT`).
 - `indexer` (the `clean-code-indexer` service binary).
 - `ingestor` (the `clean-code-metric-ingestor` service binary, role `clean_code_metric_ingestor`).
@@ -463,7 +465,7 @@ Feature: Indexer enqueues a full ScanRun on a new SHA [arch Sec 3.5]
     Given `repo-a` is on SHA `0000aaaa` with `Commit.scan_status='scanned'`
     When the indexer observes a new SHA `1111bbbb`
     Then a `Commit` row is upserted with `scan_status='pending'`
-     And a `ScanRun` row is created with `mode='ast_foundation'`, `status='running'`, `to_sha='1111bbbb'`
+     And a `ScanRun` row is created with `kind='delta'`, `sha_binding='single'`, `status='running'`, `to_sha='1111bbbb'` (canonical `ScanRun.kind` enum is `full | delta | external_single | external_per_row | retract` per implementation-plan Stage 1.2)
      And after the AST adapter completes, the `ScanRun` transitions `running -> succeeded`
      And the `Commit.scan_status` transitions `pending -> scanning -> scanned`
 ```
@@ -546,7 +548,7 @@ single vs per_row ScanRun shapes, and the "store-only" behaviour for
 - **Pre-test bootstrap**: `make migrate-up`; `make seed-repo-d` (creates `repo-d` in `external` mode with a known SHA `dddd0001`).
 
 Compose services at `tests/e2e/phase-04-webhook/docker-compose.yml`:
-- `postgres` (Postgres 15; DSN -> `CLEAN_CODE_PG_URL`).
+- `postgres` (Postgres 16; DSN -> `CLEAN_CODE_PG_URL`).
 - `webhook` (the `clean-code-webhook` service, mounting `CLEAN_CODE_WEBHOOK_HMAC_SECRET`).
 - `ingestor` (same as Phase 3).
 - `otel-collector` (gRPC; endpoint -> `CLEAN_CODE_OTEL_ENDPOINT`).
@@ -586,10 +588,10 @@ Feature: ingest.coverage accepts Cobertura XML [arch Sec 1.6 operator pin]
     Given the request `Content-Type` is `application/xml`
       And the body is a valid Cobertura XML covering `repo-d` SHA `dddd0001`
     When the webhook accepts the payload and the ingestor processes it
-    Then the resulting `ScanRun` row has `mode='single'` and `to_sha='dddd0001'`
+    Then the resulting `ScanRun` row has `kind='external_single'`, `sha_binding='single'`, and `to_sha='dddd0001'`
      And `metric_sample` contains exactly N rows with `metric_kind='coverage_line_ratio'` (one per scope in the XML)
      And `metric_sample` contains exactly N rows with `metric_kind='coverage_branch_ratio'`
-     And every row has `pack='ingested'` and `source='external'`
+     And every row has `pack='ingested'` and `source='ingested'` (NOT `source='external'`; the source enum is `computed | ingested | derived` per arch Sec 5.2.1 / tech-spec Sec 4.1.1)
 
   Scenario: Coverage payload with a non-XML Content-Type is rejected
     When the client posts a JSON payload to `/ingest/coverage`
@@ -605,42 +607,52 @@ Feature: ingest.test_balance accepts JSON [arch Sec 1.4.1]
     When the webhook accepts the payload and the ingestor processes it
     Then `metric_sample` contains a row for `S1` with `pass_first_try_ratio=1.0`
      And `metric_sample` contains a row for `S2` with `pass_first_try_ratio=0.5`
-     And the resulting `ScanRun.mode='single'` and `to_sha='dddd0001'`
+     And every emitted row has `pack='ingested'` and `source='ingested'`
+     And the resulting `ScanRun.kind='external_single'`, `ScanRun.sha_binding='single'`, and `to_sha='dddd0001'`
 ```
 
 ```gherkin
 @happy
-Feature: ingest.churn writes ZERO metric_sample rows directly [tech-spec C7]
+Feature: ingest.churn writes ZERO metric_sample rows directly [tech-spec C7, arch Sec 4.11]
   Scenario: Churn payload feeds the materialiser only
     When the webhook accepts a valid `ingest.churn` payload for repo-d
-    Then a `ScanRun` row is persisted with `mode='per_row'` and `to_sha IS NULL`
+    Then a `ScanRun` row is persisted with `kind='external_per_row'`, `sha_binding='per_row'`, and `to_sha IS NULL`
      And zero new rows appear in `metric_sample` directly attributable to this scan_run_id
-     And the churn materialiser feeds `modification_count_in_window` recomputation on the next ingestor pass
+     And the churn materialiser feeds the `modification_count_in_window` recomputation, which lands a row with `pack='base'` and `source='computed'` on the next ingestor pass
 ```
 
 ```gherkin
 @happy @invariant
-Feature: ingest.defects is store-only in v1 [tech-spec C7]
+Feature: ingest.defects is store-only in v1 [tech-spec C7, implementation-plan Stage 4.4]
   Scenario: Defects payload is stored but emits no metric_sample
     When the webhook accepts a valid `ingest.defects` payload
-    Then a `ScanRun` row is persisted with `mode='per_row'`, `to_sha IS NULL`, and a non-null `payload_hash`
-     And zero rows appear in `metric_sample` referencing this scan_run_id
+    Then a `ScanRun` row is persisted with `kind='external_per_row'`, `sha_binding='per_row'`, `to_sha IS NULL`, and a non-null `payload_hash`
+     And zero rows appear in `metric_sample` referencing this scan_run_id (no `metric_kind='defect_density'` row exists in v1)
      And the original payload is retrievable via `mgmt.read.scan_run(scan_run_id)`
 ```
 
 ```gherkin
-@edge
-Feature: ScanRun shape is correct per verb [arch Sec 5.2.3]
-  Scenario Outline: <verb> produces ScanRun with <shape>
+@edge @invariant
+Feature: ScanRun kind and sha_binding are correct per verb [arch Sec 5.2.3, implementation-plan Stage 1.2]
+  Scenario Outline: <verb> produces ScanRun with <kind> / <sha_binding>
     When the webhook accepts a valid payload for `<verb>`
-    Then the resulting `ScanRun.mode='<shape>'`
+    Then the resulting `ScanRun.kind='<kind>'` and `ScanRun.sha_binding='<sha_binding>'`
      And `to_sha` is `<to_sha_state>`
     Examples:
-      | verb               | shape    | to_sha_state         |
-      | ingest.coverage    | single   | equal to commit SHA  |
-      | ingest.test_balance| single   | equal to commit SHA  |
-      | ingest.churn       | per_row  | NULL                 |
-      | ingest.defects     | per_row  | NULL                 |
+      | verb                | kind              | sha_binding | to_sha_state         |
+      | ingest.coverage     | external_single   | single      | equal to commit SHA  |
+      | ingest.test_balance | external_single   | single      | equal to commit SHA  |
+      | ingest.churn        | external_per_row  | per_row     | NULL                 |
+      | ingest.defects      | external_per_row  | per_row     | NULL                 |
+
+  Scenario: ScanRun.kind enum is exactly the five canonical values
+    When the suite queries the `scan_run_kind` enum labels
+    Then the labels are exactly `full`, `delta`, `external_single`, `external_per_row`, `retract`
+     And no label named `single`, `per_row`, `ast_foundation`, or `incremental` exists
+
+  Scenario: ScanRun.sha_binding enum is exactly two values
+    When the suite queries the `scan_run_sha_binding` enum labels
+    Then the labels are exactly `single`, `per_row`
 ```
 
 ```gherkin
@@ -660,9 +672,13 @@ Feature: Idempotent replay defends against retries [tech-spec C9]
 
 Implements `implementation-plan.md` Phase 5 (lines 439-568). Brings up
 the `policy.publish` / `policy.activate` / `policy.publish_rulepack`
-verbs with Ed25519 signing, the 24h `policy_publish_overlap_min_seconds`
-overlap rule, and the rule engine that evaluates SOLID rules against a
-metric snapshot.
+verbs with Ed25519 signing, the 24h signing-key rotation overlap
+(`policy_publish_overlap_min_seconds=86400`, implementation-plan Stage
+5.1 -- two signing keys may co-exist during the overlap), the
+append-only `PolicyActivation` mechanism (arch Sec 5.3.4 -- there is
+NO `status` column on `PolicyVersion`; the active version is the
+latest row in `policy_activation` by `created_at`), and the rule
+engine that evaluates SOLID rules against a metric snapshot.
 
 ### Setup
 - **Type**: compose
@@ -672,7 +688,7 @@ metric snapshot.
 - **Pre-test bootstrap**: `make migrate-up`; `make seed-phase-05` registers `repo-a`/`repo-b` with a baseline metric_sample snapshot.
 
 Compose services at `tests/e2e/phase-05-policy-engine/docker-compose.yml`:
-- `postgres` (Postgres 15; DSN -> `CLEAN_CODE_PG_URL`).
+- `postgres` (Postgres 16; DSN -> `CLEAN_CODE_PG_URL`).
 - `kms-mock` (Ed25519 sign/verify HTTP shim; URL -> `CLEAN_CODE_KMS_URL`).
 - `policy-steward` (the `clean-code-policy-steward` service).
 - `rule-engine` (the `clean-code-rule-engine` service, role `clean_code_solid_batch`).
@@ -683,35 +699,65 @@ Compose services at `tests/e2e/phase-05-policy-engine/docker-compose.yml`:
 ```gherkin
 Background:
   Given the compose stack is healthy
-    And the `kms-mock` exposes an Ed25519 keypair `kid=policy-v1`
+    And the `kms-mock` exposes an Ed25519 keypair with key-id label `K1` (the kms-mock's own opaque identifier; `kid` is NOT a column on `policy_version`)
     And a baseline metric snapshot exists for `repo-a` at SHA `aaaa1111`
 ```
 
 ```gherkin
 @happy @security
-Feature: policy.publish signs a PolicyVersion with Ed25519 [tech-spec Sec 8.4]
+Feature: policy.publish signs a PolicyVersion with Ed25519 [tech-spec Sec 8.4, arch Sec 5.3.3]
   Scenario: A valid policy document is signed and persisted
-    Given a draft PolicyVersion document `D1` is valid against the schema
+    Given a candidate `PolicyVersion` payload `D1` is valid against the schema
     When the operator calls `policy.publish(D1)`
-    Then a `policy_version` row is INSERTed with `signature_alg='ed25519'`, `kid='policy-v1'`, `signature` non-null
-     And the signature verifies against the public key returned by `kms-mock`
-     And the row's `status='draft'` (not yet active)
+    Then a `policy_version` row is INSERTed with non-null `signature` covering `rule_refs`, `threshold_refs`, `refactor_weights`
+     And the Ed25519 signature verifies against the active signing key returned by `kms-mock`
+     And no row is written to `policy_activation` (publish does NOT activate; activation is a separate verb -- arch Sec 5.3.3 callout "PolicyVersion is immutable")
+
+  Scenario: policy_version columns are EXACTLY the seven canonical names
+    When the suite queries `information_schema.columns` for `policy_version`
+    Then the column set is exactly `policy_version_id`, `name`, `rule_refs`, `threshold_refs`, `refactor_weights`, `signature`, `created_at`
+     And no column named `signature_alg`, `kid`, `status`, `activated_at`, `superseded_at`, or `expires_at` exists
+     And no UPDATE is ever issued against `policy_version` (the row is immutable per G5 -- arch Sec 5.3.3)
 ```
 
 ```gherkin
 @happy @invariant
-Feature: policy.activate enforces 24h publish overlap [tech-spec Sec 8.2, Sec 8.4]
-  Scenario: Activation succeeds only after 86400s overlap
-    Given `D1` was published at T0
-    When the operator calls `policy.activate(policy_version_id=D1, target_time=T0 + 86401s)`
-    Then the call succeeds and `D1.status='active'`
-     And any prior `active` PolicyVersion is moved to `superseded`
+Feature: policy.activate is an append to PolicyActivation [arch Sec 5.3.4]
+  Scenario: Activation appends a row; latest row by created_at wins
+    Given `policy.publish(D1)` was previously called, producing `policy_version_id=D1`
+      And the current active PolicyVersion (latest `policy_activation` row) is `D0`
+    When the operator calls `policy.activate(policy_version_id=D1)`
+    Then a NEW `policy_activation` row is INSERTed with `policy_version_id=D1`, `activated_by` non-null, `created_at=NOW()`
+     And no existing `policy_activation` row was UPDATEd or DELETEd
+     And `policy_version` rows for `D0` and `D1` are byte-identical to their pre-activation state (no `status` column to flip; activation does NOT mutate PolicyVersion)
+     And the current active PolicyVersion (latest row in `policy_activation` by `created_at`) is now `D1`
 
-  Scenario: Activation inside the overlap window is rejected
-    Given `D1` was published at T0
-    When the operator calls `policy.activate(policy_version_id=D1, target_time=T0 + 3600s)`
-    Then the call fails with error `POLICY_OVERLAP_NOT_SATISFIED`
-     And `D1.status` remains `draft`
+  Scenario: Re-activating an older PolicyVersion is also an append
+    When the operator calls `policy.activate(policy_version_id=D0)` (reverting to the previously-active version)
+    Then a new `policy_activation` row is INSERTed with `policy_version_id=D0`
+     And the latest row by `created_at` is now `D0` again
+     And no prior `policy_activation` row was UPDATEd
+
+  Scenario: policy_activation columns are EXACTLY the four canonical names
+    When the suite queries `information_schema.columns` for `policy_activation`
+    Then the column set is exactly `activation_id`, `policy_version_id`, `activated_by`, `created_at`
+     And no column named `target_time`, `valid_from`, `valid_until`, `superseded_at`, or `status` exists
+```
+
+```gherkin
+@happy @security
+Feature: Policy signing-key rotation overlap is 86400s (24h) [tech-spec Sec 8.2 `policy_publish_overlap_min_seconds=86400`, implementation-plan Stage 5.1]
+  Scenario: Old key remains valid for 24h after rotation
+    Given a signing-key rotation occurred at T0 producing a new key `K2` while `K1` is still cached as active
+    When a `policy.publish` payload signed by `K1` arrives at T0 + 23h 59min
+    Then the evaluator (and steward) verifies the signature successfully
+     And the published `policy_version.signature` is accepted
+
+  Scenario: Old key fails verification 24h+epsilon after rotation
+    When a payload signed by `K1` arrives at T0 + 24h + 1s
+    Then the steward rejects the publish call with an unverified-signature error
+     And no `policy_version` row is INSERTed
+     And an `eval.gate` invocation observing a policy still signed with `K1` at this point surfaces `verdict='warn'`, `degraded=true`, `degraded_reason='policy_signature_invalid'`
 ```
 
 ```gherkin
@@ -725,25 +771,33 @@ Feature: There is no `policy.override` verb [tech-spec C13]
 
 ```gherkin
 @happy
-Feature: policy.publish_rulepack registers a SOLID rule pack
-  Scenario: A valid rule pack is signed and stored
+Feature: policy.publish_rulepack registers a SOLID rule pack [arch Sec 5.3.1, 5.3.2, implementation-plan Stage 5.2]
+  Scenario: A valid rule pack is signed and stored, append-only
     Given a rule pack `R1` containing rules `srp.lcom4_threshold`, `dip.fan_in_high`, `isp.interface_width_max`
+      And the request payload is signed with the active Ed25519 key
     When the operator calls `policy.publish_rulepack(R1)`
-    Then a `rule_pack` row is INSERTed with `signature_alg='ed25519'` and `kid='policy-v1'`
-     And the rule pack participates in PolicyVersion bundles via FK
+    Then `rule_pack` and `rule` rows are INSERTed (append-only per arch Sec 5.3.1 / 5.3.2)
+     And the steward refuses unsigned payloads (implementation-plan Stage 5.2: "All three verbs require a valid signing key; refuse unsigned payloads")
+     And no row in `rule_pack` or `rule` is UPDATEd
+     And the rule pack participates in PolicyVersion bundles by being referenced from `policy_version.rule_refs`
 ```
 
 ```gherkin
 @happy
-Feature: Rule engine emits one verdict + N findings per evaluation [arch Sec 3.7]
-  Scenario: An evaluation transaction writes exactly the expected rows
-    Given an active PolicyVersion `P1` references rule pack `R1`
+Feature: Rule engine emits one verdict + N findings per evaluation [arch Sec 3.7, Sec 5.4.2]
+  Scenario: A batch-refresh evaluation transaction writes exactly the expected rows
+    Given an active PolicyVersion `P1` (latest `policy_activation` row) references rule pack `R1`
       And a metric snapshot for `repo-a` SHA `aaaa1111` violates `srp.lcom4_threshold` on scope `S1` and `S2`
-    When the rule engine evaluates the snapshot against `P1`
-    Then exactly one `evaluation_run` row is INSERTed with `caller='rule_engine'`
+    When the rule engine evaluates the snapshot against `P1` under the batch-refresh job
+    Then exactly one `evaluation_run` row is INSERTed with `caller='batch_refresh'` (the EvaluationRun.caller enum is `eval_gate | batch_refresh` per arch Sec 5.4.2 -- never `rule_engine`)
      And exactly one `evaluation_verdict` row is INSERTed with a non-null FK to the run
      And exactly two `finding` rows are INSERTed (one per violating scope)
      And all writes complete in a single transaction (suite verifies via Postgres txn id)
+
+  Scenario: EvaluationRun.caller enum is exactly two values
+    When the suite queries the `evaluation_run_caller` enum labels
+    Then the labels are exactly `eval_gate`, `batch_refresh`
+     And no label named `rule_engine`, `wal_reconciler`, `policy_steward`, or `mgmt_surface` exists
 ```
 
 ```gherkin
@@ -790,7 +844,7 @@ isolation.
 - **Pre-test bootstrap**: `make migrate-up`; `make seed-phase-06` (creates `repo-a` baseline + active PolicyVersion + active rule pack); `make tokens` mints OIDC bearer tokens for roles `dev`, `lead`, `auditor`.
 
 Compose services at `tests/e2e/phase-06-evaluator-mgmt/docker-compose.yml`:
-- `postgres` (Postgres 15; DSN -> `CLEAN_CODE_PG_URL`).
+- `postgres` (Postgres 16; DSN -> `CLEAN_CODE_PG_URL`).
 - `dex` (OIDC issuer; URL -> `CLEAN_CODE_OIDC_ISSUER`).
 - `kms-mock` (Ed25519 signer; URL -> `CLEAN_CODE_KMS_URL`).
 - `evaluator` (the `clean-code-evaluator` service, role `clean_code_evaluator`).
@@ -814,7 +868,7 @@ Feature: eval.gate clean path delegates to the rule engine [arch Sec 3.7]
     Given every required metric_sample for `repo-a` SHA `aaaa2222` is present and fresh
     When the caller invokes `eval.gate(repo=repo-a, sha=aaaa2222)`
     Then the response carries `verdict in {pass|warn|block}` per rule engine output
-     And exactly one `evaluation_run` row exists for this call with `caller='rule_engine'`
+     And exactly one `evaluation_run` row exists for this call with `caller='eval_gate'` (the eval.gate verb is the caller; the synchronous rule-engine delegation does NOT mint its own run row -- arch Sec 3.7, Sec 5.4.2)
      And exactly one `evaluation_verdict` row exists with `degraded=false`
      And findings rows (N >= 0) reference the verdict via FK
 
@@ -916,8 +970,8 @@ Feature: mgmt.retract_sample triggers append-and-repoint flow [arch Sec 1.5.1]
 Feature: mgmt.rescan enqueues a ScanRun [arch Sec 3.5]
   Scenario: Force a rescan of an already-scanned SHA
     Given `repo-a` SHA `aaaa2222` has `Commit.scan_status='scanned'`
-    When a `lead` caller invokes `mgmt.rescan(repo=repo-a, sha=aaaa2222, mode='ast_foundation')`
-    Then a new `ScanRun` is created with `mode='ast_foundation'`, `status='running'`, `to_sha='aaaa2222'`
+    When a `lead` caller invokes `mgmt.rescan(repo=repo-a, sha=aaaa2222, kind='full')`
+    Then a new `ScanRun` is created with `kind='full'`, `sha_binding='single'`, `status='running'`, `to_sha='aaaa2222'`
      And on completion the prior `metric_sample` rows are NOT updated (G3)
      And `metric_sample_active` is re-pointed at the latest samples
 ```
@@ -951,7 +1005,7 @@ degraded path, and the `percentile_stale` Insights-only signal.
 - **Pre-test bootstrap**: `make migrate-up`; `make seed-phase-07` loads 10 repos with cross-repo dependency edges.
 
 Compose services at `tests/e2e/phase-07-aggregator/docker-compose.yml`:
-- `postgres` (Postgres 15; DSN -> `CLEAN_CODE_PG_URL`).
+- `postgres` (Postgres 16; DSN -> `CLEAN_CODE_PG_URL`).
 - `xrepo-aggregator` (role `clean_code_xrepo_aggregator`).
 - `mgmt-surface` (for `mgmt.read.insights`).
 - `evaluator` (for cross-checking degraded behaviour against Phase 6).
@@ -1036,7 +1090,7 @@ the absence of disallowed columns (`refactor_task.status`,
 - **Pre-test bootstrap**: `make migrate-up`; `make seed-phase-08` seeds findings + system aggregates for `repo-a`.
 
 Compose services at `tests/e2e/phase-08-refactor-planner/docker-compose.yml`:
-- `postgres` (Postgres 15; DSN -> `CLEAN_CODE_PG_URL`).
+- `postgres` (Postgres 16; DSN -> `CLEAN_CODE_PG_URL`).
 - `refactor-planner` (the `clean-code-refactor-planner` service).
 - `mgmt-surface` (for read APIs).
 - `otel-collector` (endpoint -> `CLEAN_CODE_OTEL_ENDPOINT`).
@@ -1117,7 +1171,7 @@ Catalog/Measurement/Policy/Refactor do NOT route through the WAL.
 - **Pre-test bootstrap**: `make migrate-up`; `make seed-phase-09` (a baseline metric snapshot + active PolicyVersion).
 
 Compose services at `tests/e2e/phase-09-audit-wal/docker-compose.yml`:
-- `postgres` (Postgres 15; DSN -> `CLEAN_CODE_PG_URL`).
+- `postgres` (Postgres 16; DSN -> `CLEAN_CODE_PG_URL`).
 - `evaluator` (role `clean_code_evaluator`, also writes to the WAL stream).
 - `rule-engine` (role `clean_code_solid_batch`).
 - `wal-reconciler` (role `clean_code_wal_reconciler`, REPLAY-ONLY).
@@ -1214,7 +1268,7 @@ deployment topology.
 - **Pre-test bootstrap**: `make migrate-up` (both `clean_code` and `agent_memory` schemas); `make seed-phase-10`.
 
 Compose services at `tests/e2e/phase-10-linked-mode/docker-compose.yml`:
-- `postgres` (Postgres 15; DSN -> `CLEAN_CODE_PG_URL`; same instance hosts `agent_memory` schema for the linked-mode test).
+- `postgres` (Postgres 16; DSN -> `CLEAN_CODE_PG_URL`; same instance hosts `agent_memory` schema for the linked-mode test).
 - `agent-memory` (the sister story's binary; gRPC endpoint -> `AGENT_MEMORY_GRPC_ENDPOINT`).
 - `evaluator`, `indexer`, `ingestor`, `mgmt-surface` (the same clean-code services from previous phases).
 - `kms-mock` (URL -> `CLEAN_CODE_KMS_URL`).
@@ -1387,7 +1441,7 @@ Feature: Signing throughput does not bottleneck publishes
   Scenario: 100 sequential policy.publish calls satisfy p99 <= 1s
     When the load generator drives 100 sequential `policy.publish` calls signed via `kms-mock`
     Then p50 <= 250 ms and p99 <= 1000 ms
-     And every persisted `policy_version.signature` verifies with the matching `kid`
+     And every persisted `policy_version.signature` verifies with the active signing key (the kms-mock's key-id label is matched against the steward's signing-key cache; there is no `kid` column on `policy_version`)
 ```
 
 ---
@@ -1401,7 +1455,10 @@ when triaging an evaluator failure.
 
 - Single `clean_code` schema (no `catalog.`/`measurement.`/`policy.`/`audit.`/`refactor.`).
 - The 22 metric_kinds are the only ones in the enum (12 foundation + 3 ingested + 7 system).
+- Foundation tier is split: 6 rows are `pack='base'` (`cyclo`, `cognitive_complexity`, `loc`, `cycle_member`, `duplication_ratio`, `modification_count_in_window`) and 6 rows are `pack='solid'` (`lcom4`, `fan_in`, `fan_out`, `depth_of_inheritance`, `interface_width`, `coupling_between_objects`).
+- MetricSample.source enum is exactly `computed | ingested | derived` -- never `ast` or `external`. AST-emitted rows are `source='computed'`; webhook-emitted rows are `source='ingested'`; aggregator-emitted rows are `source='derived'`.
 - `scope_kind` is exactly 7 values; `verdict` is exactly 3; `delta` is exactly 4.
+- `ScanRun.kind` is exactly `full | delta | external_single | external_per_row | retract`; `ScanRun.sha_binding` is exactly `single | per_row`. There is NO `ScanRun.mode` column.
 - `RepoEvent.kind` is past-tense (`registered | retired | retract_intent | mode_changed`).
 - `MetricSample` is append-only (G3); `metric_sample_active` is a side relation with PK on the quintuple plus `sample_id`; DELETE is REVOKEd from BOTH writer roles.
 - Two-writer carve-out on Measurement (`ingestor` writes `base|solid|ingested`, `xrepo_aggregator` writes `system AND source=derived`).
@@ -1409,10 +1466,12 @@ when triaging an evaluator failure.
 - `Override` has NO `expires_at`; unmute is an APPEND.
 - `refactor_task` has NO `status` and NO `expected_metric_delta`; `hot_spot.policy_version_id` exists but `refactor_plan.policy_version_id` does NOT.
 - `eval.gate` short-circuits ONLY for `samples_pending` and `policy_signature_invalid`. `xrepo_edges_unavailable` flows through the engine. `percentile_stale` is INSIGHTS-ONLY -- `eval.gate` rejects it.
+- `EvaluationRun.caller` enum is exactly `eval_gate | batch_refresh` -- never `rule_engine`, `wal_reconciler`, `policy_steward`, or `mgmt_surface`.
 - WAL covers ONLY `evaluation_run | evaluation_verdict | finding`. Reconciler is REPLAY-ONLY, preserves original `caller`.
 - No invented tables (`audit_event`, `audit_anchor`, `effort_estimate`, `rule_pack_revision`, `policy_override`, `swap_active`).
 - v1 single-tenant: NO `tenant_id` columns. v1 languages: Go, Python, TypeScript, Java only -- Registry refuses C#/Rust.
-- All `policy.publish` payloads carry Ed25519 signatures; activation requires 24h overlap (`policy_publish_overlap_min_seconds=86400`).
+- `PolicyVersion` is immutable (G5) with columns EXACTLY `policy_version_id`, `name`, `rule_refs`, `threshold_refs`, `refactor_weights`, `signature`, `created_at` -- no `signature_alg`, `kid`, `status`, `activated_at`, or `superseded_at`. Activation is recorded by appending a `PolicyActivation(activation_id, policy_version_id, activated_by, created_at)` row; the latest row by `created_at` is the active version.
+- Signing-key rotation overlap is 86400s (24h) per `policy_publish_overlap_min_seconds`. Two signing keys may co-exist during overlap; both verify successfully.
 - Cobertura XML is the only `ingest.coverage` payload (operator pin `external-metric-coverage-format=Cobertura XML`).
 - `ingest.churn` writes ZERO `metric_sample` rows directly; `ingest.defects` is store-only in v1.
 
@@ -1427,13 +1486,14 @@ when triaging an evaluator failure.
 ## Iteration Summary
 
 - **Path written**: `docs/stories/code-intelligence-CLEAN-CODE/e2e-scenarios.md`
+- **Iteration**: 2 (file existed pre-edit at 71,532 bytes; iter-2 edits brought it to 79,083 bytes).
 - **Coverage matrix**: 11 phases, each with `### Setup` (Type/Local/CI runner/Secrets/Pre-test bootstrap) followed by `### Scenarios` (Background + Gherkin features).
   - Phase 1 (compose) -- schema, enums, role grants, append-only, no-invented-tables.
-  - Phase 2 (inline) -- AST foundation 12 metric_kinds, scope_id UUIDv5, language registry refusals, throughput SLO.
-  - Phase 3 (compose) -- indexer scan flow, ingestor append-and-repoint, sustained 5k/s SLO.
-  - Phase 4 (compose) -- webhook HMAC, Cobertura XML coverage pin, ingest.churn/defects shapes, idempotent replay.
-  - Phase 5 (compose) -- Ed25519 publish, 24h overlap, rule-engine one-run/one-verdict/N-findings, no `policy.override` verb.
-  - Phase 6 (compose) -- eval.gate clean path + two degraded short-circuits, percentile_stale REJECTed, OIDC roles, mgmt verbs.
+  - Phase 2 (inline) -- AST foundation 12 metric_kinds split 6+6 across `pack='base'`/`pack='solid'` with `source='computed'`, scope_id UUIDv5, language registry refusals, throughput SLO.
+  - Phase 3 (compose) -- indexer scan flow with `ScanRun.kind='delta', sha_binding='single'`, ingestor append-and-repoint, sustained 5k/s SLO.
+  - Phase 4 (compose) -- webhook HMAC; Cobertura XML coverage with `pack='ingested', source='ingested', kind='external_single'`; ingest.churn/defects with `kind='external_per_row', sha_binding='per_row'`; idempotent replay; new enum-assertion scenarios for `scan_run_kind` and `scan_run_sha_binding`.
+  - Phase 5 (compose) -- Ed25519 publish, PolicyVersion-with-7-canonical-columns enforcement, append-only PolicyActivation (no `status` column), 86400s signing-key rotation overlap (NOT publish-to-activate), rule-engine one-run/one-verdict/N-findings with `caller='batch_refresh'`, EvaluationRun.caller enum guard.
+  - Phase 6 (compose) -- eval.gate clean path with `caller='eval_gate'`, two degraded short-circuits, percentile_stale REJECTed, OIDC roles, mgmt verbs with `kind='full'` for force rescan.
   - Phase 7 (compose) -- aggregator cadence, 7 system metric_kinds, xrepo_edges_unavailable degraded, percentile_stale Insights-only.
   - Phase 8 (compose) -- refactor planner, 5 task kinds, hot_spot.policy_version_id traceback, no status/expected_metric_delta.
   - Phase 9 (compose) -- WAL scope = 3 tables, reconciler REPLAY-ONLY caller-preserve, Catalog/Policy NOT routed through WAL.
@@ -1441,14 +1501,71 @@ when triaging an evaluator failure.
   - Phase 11 (lab-bare-metal) -- SLO conformance at 100 repos x 50 scans/min x 30 min on `forge-lab-hw` with both KeyVault `kv-forge-shared/clean-code-perf-*` AND GH environment `forge-lab-clean-code-perf` named.
 - **Anchors**: every scenario references the spec (`[arch Sec X]`, `[tech-spec Sec X]`, `[tech-spec C##]`) so the evaluator can prove the assertion back to a sibling doc.
 - **Connection strings**: ALL referenced as env-var names (`CLEAN_CODE_PG_URL`, `CLEAN_CODE_KMS_URL`, `CLEAN_CODE_OIDC_ISSUER`, `CLEAN_CODE_WEBHOOK_HMAC_SECRET`, `CLEAN_CODE_OTEL_ENDPOINT`, `AGENT_MEMORY_GRPC_ENDPOINT`).
-- **Canonical names**: only the locked names from the sibling docs appear (22 metric_kinds, 7 scope_kinds, verdict 3, delta 4, refactor_task.kind 5, degraded_reason 4, past-tense RepoEvent.kind 4, etc.).
+- **Canonical names (iter-2 corrected)**: 22 metric_kinds; foundation tier 6 `base` + 6 `solid`; MetricSample.source enum `computed | ingested | derived`; ScanRun.kind enum `full | delta | external_single | external_per_row | retract` with separate `sha_binding in {single, per_row}`; PolicyVersion columns exactly `policy_version_id, name, rule_refs, threshold_refs, refactor_weights, signature, created_at`; PolicyActivation append-only with `activation_id, policy_version_id, activated_by, created_at`; EvaluationRun.caller enum exactly `eval_gate | batch_refresh`.
 
 ### Prior feedback resolution
-No prior evaluator feedback applies (iteration 1, file did not exist on disk before this run). No checkboxes to replay.
+
+Iter-1 evaluator scored 82 with 6 numbered issues. All 6 are addressed in iter 2:
+
+- [x] 1. FIXED -- All Postgres pins -- PowerShell global replace `Postgres 15` -> `Postgres 16` across all 9 compose-service descriptors (Phases 1/3/4/5/6/7/8/9/10). Aligns with tech-spec Sec 8.1.1 and implementation-plan Stage 1.1. Verification:
+
+```
+$ grep -nF "Postgres 15" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+(empty)
+```
+
+- [x] 2. FIXED -- Phase 2 foundation feature (lines ~343-356) -- rewrote the foundation-metrics feature to assert the 6+6 `pack='base'`/`pack='solid'` split (arch Sec 1.4.1 lines 92-105) with `source='computed'` (arch Sec 5.2.1 line 901). Also corrected the "12 rows per class scope" error -- only 6 metric_kinds apply to a `class` scope per the upstream applicability table. Verification:
+
+```
+$ grep -nF "source='ast'" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+(empty)
+```
+
+- [x] 3. FIXED -- Phase 4 coverage feature (lines ~582-598) AND test_balance feature (lines ~600-609) -- both now assert `pack='ingested', source='ingested'` per tech-spec Sec 4.1.1 lines 276-280. The only remaining `source='external'` is in an Appendix-A negation clause that explicitly says "NOT `source='external'`" as a canon-guard. Verification:
+
+```
+$ grep -nF "source='external'" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+594:     And every row has `pack='ingested'` and `source='ingested'` (NOT `source='external'`; the source enum is `computed | ingested | derived` per arch Sec 5.2.1 / tech-spec Sec 4.1.1)
+```
+
+(The surviving hit is a negation clause kept by design.)
+
+- [x] 4. FIXED -- Phase 3 indexer (line ~466), Phase 4 coverage/test_balance/churn/defects (lines ~589, 608, 616, 626), Phase 4 ScanRun-shape outline (lines ~636-644), Phase 6 mgmt.rescan (lines ~919-920) -- ALL replaced `ScanRun.mode='ast_foundation|single|per_row'` with the canonical `ScanRun.kind in {full, delta, external_single, external_per_row, retract}` + separate `sha_binding in {single, per_row}` per implementation-plan Stage 1.2 line 69. Also added two new enum-assertion scenarios in Phase 4 for `scan_run_kind` and `scan_run_sha_binding`. The only surviving `ScanRun.mode` reference is in an Appendix-A negation that says "There is NO `ScanRun.mode` column." Verification:
+
+```
+$ grep -nF "mode='ast_foundation'" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+(empty)
+$ grep -nF "ScanRun.mode" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+1461:- `ScanRun.kind` is exactly `full | delta | external_single | external_per_row | retract`; `ScanRun.sha_binding` is exactly `single | per_row`. There is NO `ScanRun.mode` column.
+```
+
+(The surviving hit is a negation canon-guard kept by design.)
+
+- [x] 5. FIXED -- Phase 5 PolicyVersion publish (lines ~706-715) -- removed `signature_alg`, `kid`, `status='draft|active|superseded'`. The publish feature now INSERTs a `policy_version` row with EXACTLY the 7 canonical columns (`policy_version_id, name, rule_refs, threshold_refs, refactor_weights, signature, created_at`) per arch Sec 5.3.3 lines 1121-1138, and the assertion explicitly says "no column named `signature_alg`, `kid`, `status`, `activated_at`, `superseded_at`, or `expires_at` exists". Replaced the bogus "policy.activate enforces 24h overlap since publish" with two new features: (a) `policy.activate` writes an append-only `PolicyActivation(activation_id, policy_version_id, activated_by, created_at)` row per arch Sec 5.3.4 and the active version is the latest by `created_at`; (b) signing-key rotation enforces an 86400s overlap during which BOTH keys verify (the actual semantic of `policy_publish_overlap_min_seconds` per implementation-plan Stage 5.1). Updated the Phase 5 prose intro AND the Phase 5 Background to reflect that the kms-mock's `kid` is an opaque keypair label, NOT a `policy_version` column. Verification:
+
+```
+$ grep -nF "signature_alg='ed25519'" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+(empty)
+$ grep -nF "status='draft'" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+(empty)
+$ grep -nF "status='active'" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+(empty)
+$ grep -nF "POLICY_OVERLAP_NOT_SATISFIED" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+(empty)
+```
+
+The two surviving `signature_alg` / `superseded_at` hits in the doc (lines 715, 740) are inside `no column named ...` negation assertions that explicitly enforce the canon -- kept by design.
+
+- [x] 6. FIXED -- Phase 5 rule-engine evaluation scenario (line ~743) is now `caller='batch_refresh'`; added a new enum-assertion scenario in Phase 5 that proves `EvaluationRun.caller` is constrained to exactly `eval_gate | batch_refresh` per arch Sec 5.4.2 line 1200. Phase 6 eval.gate clean-path scenario (line ~817) is now `caller='eval_gate'`. Verification:
+
+```
+$ grep -nF "caller='rule_engine'" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+(empty)
+```
 
 ### Story-description coverage
 - "decoupled functional areas" -- Phase 1 enforces a single schema while the role grants in Phases 1/3/5/7/9 enforce per-service writer carve-outs; Phase 9 enforces audit-WAL scoping to exactly the evaluation triplet so other sub-stores stay decoupled.
 - "SOLID coding principal" -- Phase 5 covers `srp.lcom4_threshold`, `dip.fan_in_high`, `isp.interface_width_max` as concrete rule examples bound to a signed `rule_pack`.
-- "system level metrics ... measurable code qualities for big repo, and cross-repo measurements" -- Phase 2 (12 foundation metrics) + Phase 7 (7 system-tier metrics) + Phase 11 (100-repo scale).
+- "system level metrics ... measurable code qualities for big repo, and cross-repo measurements" -- Phase 2 (12 foundation metrics, 6+6 base/solid split) + Phase 7 (7 system-tier metrics) + Phase 11 (100-repo scale).
 - "used by evaluator agent to guard bad practices" -- Phase 6 covers `eval.gate` clean path + the two degraded short-circuits; Phase 7 keeps `percentile_stale` out of the gate.
 - "metrics will be used for refactoring effort of big repo" -- Phase 8 covers the planner with the operator-pinned effort source (`ML model from historical commits`).

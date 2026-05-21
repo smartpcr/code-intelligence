@@ -157,10 +157,12 @@ public class ProjectScaffoldAndCiBaselineSteps
     public void GivenAConfigFileThatOmitsTheFiveOperatorPins()
     {
         // Write a minimal / empty config to a temp file and set it for the loader.
+        // The Go config loader reads CLEAN_CODE_CONFIG_FILE
+        // (see services/clean-code/internal/config/config.go: EnvConfigFile).
         var tempConfig = Path.Combine(Path.GetTempPath(), $"clean-code-test-config-{Guid.NewGuid()}.yaml");
         File.WriteAllText(tempConfig, "# empty config — all operator pins omitted\n");
 
-        Environment.SetEnvironmentVariable("CLEAN_CODE_CONFIG_PATH", tempConfig);
+        Environment.SetEnvironmentVariable("CLEAN_CODE_CONFIG_FILE", tempConfig);
     }
 
     [When("the loader initialises")]

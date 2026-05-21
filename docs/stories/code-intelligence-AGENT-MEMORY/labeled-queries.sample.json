@@ -1,0 +1,41 @@
+[
+  {
+    "query": "where does the agent service handle a recall request",
+    "expected_node_id": "func:agent-memory/internal/agentapi.Service.Recall",
+    "expected_concept_ids": [
+      "concept:agent-memory/agent/recall-pipeline"
+    ]
+  },
+  {
+    "query": "how does the harness compute open-loop scheduling drift",
+    "expected_node_id": "func:agent-memory/internal/loadtest/harness.driveScenario",
+    "expected_concept_ids": [
+      "concept:agent-memory/reliability/open-loop-scheduling",
+      "concept:agent-memory/reliability/dropped-tick-accounting"
+    ]
+  },
+  {
+    "query": "what fields are persisted on the calibration report artifact",
+    "expected_node_id": "type:agent-memory/internal/loadtest/calibration.Report",
+    "expected_concept_ids": [
+      "concept:agent-memory/observability/calibration-artifact"
+    ]
+  },
+  {
+    "query": "where is the mgmt-api repo id contract enforced",
+    "expected_node_id": "func:agent-memory/internal/mgmtapi.resolveIngestSpansRepoID",
+    "expected_concept_ids": [
+      "concept:agent-memory/mgmt/repo-id-resolution"
+    ]
+  },
+  {
+    "query": "which scenario sources observe context ids for the load harness",
+    "expected_node_id": "func:agent-memory/internal/loadtest/scenarios.ObserveScenario.Execute",
+    "expected_concept_ids": [
+      "concept:agent-memory/reliability/observe-prefill"
+    ]
+  },
+  {
+    "query": "pure load driver: walk the recall hot path with no learning-quality expectations"
+  }
+]

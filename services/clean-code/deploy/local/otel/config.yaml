@@ -1,0 +1,41 @@
+# OpenTelemetry Collector config for the clean-code local stack.
+#
+# Stage 1.1 (implementation-plan.md) requires only that the
+# collector accept OTLP traffic over both gRPC (:4317) and HTTP
+# (:4318) and expose a /health_check (:13133) listener that the
+# compose healthcheck and `make compose-up` smoke tests can poll.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: basic
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

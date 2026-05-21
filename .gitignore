@@ -1,8 +1,8 @@
 # Root .gitignore for the code-intelligence repo.
 #
-# The repo currently hosts a single Go service under
-# `services/agent-memory/`; if/when other services land they
-# should add their own toolchain-specific globs here.
+# The repo currently hosts two Go services under `services/`
+# (`agent-memory/` and `clean-code/`); if/when other services land
+# they should add their own toolchain-specific globs here.
 
 # ---------------------------------------------------------------
 # Go toolchain output
@@ -43,6 +43,25 @@ services/agent-memory/repoindexer
 services/agent-memory/trace-log-pruner
 services/agent-memory/span-ingestor
 
+# clean-code service binaries (mirror of the agent-memory globs
+# above). `make build` deposits the binary under bin/, which is
+# the canonical build output. We deliberately do NOT ignore the
+# extensionless name `clean-coded` under cmd/ because the gitignore
+# pattern matcher cannot distinguish between a binary file named
+# `clean-coded` (which we want to ignore) and the source directory
+# `cmd/clean-coded/` (which we MUST track). The .exe / -linux /
+# -darwin / -windows.exe suffixes below are extension-specific so
+# they only match files, never the source directory. A developer
+# who builds the binary in-place inside cmd/clean-coded/ should
+# rely on `make clean` rather than gitignore.
+services/clean-code/bin/
+services/clean-code/dist/
+services/clean-code/cmd/**/clean-coded.exe
+services/clean-code/cmd/**/*-linux
+services/clean-code/cmd/**/*-darwin
+services/clean-code/cmd/**/*-windows.exe
+services/clean-code/*.exe
+
 # Go workspace files -- the monorepo uses a single module per
 # service rather than a `go.work` file.
 go.work
@@ -80,3 +99,5 @@ Thumbs.db
 # ---------------------------------------------------------------
 services/agent-memory/deploy/local/data/
 services/agent-memory/deploy/local/**/_data/
+services/clean-code/deploy/local/data/
+services/clean-code/deploy/local/**/_data/

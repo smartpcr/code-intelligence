@@ -34,10 +34,17 @@
 -- `internal/storage/migrate_test.go` exercise the up/down
 -- round-trip end-to-end.
 --
--- Required PostgreSQL extension: `pgcrypto` (for `gen_random_uuid`).
--- The local-dev stack enables it in `deploy/local/postgres/init/
--- 00-extensions.sql`; production deployments must ensure the
--- extension is loaded before running this migration.
+-- PostgreSQL extension requirements: NONE for this migration.
+-- `gen_random_uuid()` (used by `repo.repo_id`, `repo_event.event_id`,
+-- and `scan_run.scan_run_id`) ships in core PostgreSQL 13+; it no
+-- longer requires the `pgcrypto` extension that hosted it on
+-- PG <=12. The `migration-integration` CI job proves this -- it
+-- runs against stock `postgres:16` with no extensions pre-loaded
+-- and the migration succeeds. The local-dev stack still installs
+-- `pgcrypto` in `deploy/local/postgres/init/00-extensions.sql` as
+-- a convenience for FUTURE `digest()` use in `payload_hash`
+-- workflows; that install is NOT a prerequisite for running this
+-- migration.
 
 BEGIN;
 

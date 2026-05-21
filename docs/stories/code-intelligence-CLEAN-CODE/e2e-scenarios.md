@@ -322,16 +322,26 @@ Feature: Forward / reverse migration parity
 
 Implements `implementation-plan.md` Phase 2 (lines 156-261). The AST
 adapter ingests source code for the four v1 languages (Go, Python,
-TypeScript, Java) and emits the 12 foundation `metric_sample` rows per
-scope. No database is required for the unit-level parser tests, but a
-local fixture corpus is exercised. Phase 2 is in-process pure-Go.
+TypeScript, Java) and emits **11 of the 12** foundation `metric_sample`
+rows per scope. The 12th foundation kind, `modification_count_in_window`,
+is **NOT** produced by the AST adapter -- it is produced by the
+**Metric Ingestor's modification_count materialiser** (implementation-plan
+Stage 2.6 lines 247-261) consuming rows fed by `ingest.churn` (arch
+Sec 1.4.1 row 12 line 105, tech-spec Sec 4.1.1 lines 287-291, Sec 4.11,
+Sec 8.2 `window_days=90`). The materialiser lives in the same writer
+role as the AST adapter (the Metric Ingestor) and emits its row with
+`pack='base'`, `source='computed'` while recording `attrs_json.provenance='ingested'`
+as the provenance annotation. Phase 2 is in-process pure-Go; the
+materialiser is exercised with a synthetic churn stream (no DB
+required). End-to-end churn-webhook -> materialiser plumbing is
+re-asserted in Phase 4.
 
 ### Setup
 - **Type**: inline
-- **Local**: `make test-phase-02` (runs `go test ./internal/ast/...` against the fixture corpus under `tests/fixtures/ast/{go,python,typescript,java}`).
+- **Local**: `make test-phase-02` (runs `go test ./internal/ast/...` against the fixture corpus under `tests/fixtures/ast/{go,python,typescript,java}` and `go test ./internal/metrics/materialisers/...` against a synthetic churn stream).
 - **CI runner**: GitHub-hosted `ubuntu-latest`.
 - **Secrets**: none.
-- **Pre-test bootstrap**: `make fixtures-ast` extracts `tests/fixtures/ast.tar.zst` if missing.
+- **Pre-test bootstrap**: `make fixtures-ast` extracts `tests/fixtures/ast.tar.zst` if missing; `make fixtures-churn-synth` generates the in-memory churn fixtures used by the materialiser scenarios.
 
 ### Scenarios
 
@@ -344,19 +354,46 @@ Background:
 
 ```gherkin
 @happy @invariant
-Feature: Foundation tier emits 12 canonical metric_kinds split across `base` and `solid` packs [arch Sec 1.4.1, Sec 5.2.1]
-  Scenario: A Java fixture file produces samples covering all 12 foundation metric_kinds, partitioned by pack
+Feature: AST adapter emits EXACTLY the 11 AST-derived foundation kinds (NOT `modification_count_in_window`) [arch Sec 1.4.1, Sec 5.2.1; implementation-plan Stage 2.4-2.5]
+  Scenario: A Java fixture file produces samples covering 11 of 12 foundation metric_kinds, partitioned by pack
     Given the fixture `tests/fixtures/ast/java/billing/InvoiceProcessor.java` defines one class with three methods
     When the AST adapter parses the file and emits foundation metrics for every applicable scope
-    Then the union of emitted `metric_sample.metric_kind` values across the file's scopes is exactly the 12 names:
+    Then the union of emitted `metric_sample.metric_kind` values across the file's scopes is exactly these 11 names:
         `cyclo`, `cognitive_complexity`, `loc`, `lcom4`, `fan_in`, `fan_out`,
         `depth_of_inheritance`, `interface_width`, `coupling_between_objects`,
-        `cycle_member`, `duplication_ratio`, `modification_count_in_window`
-     And the 6 rows with `pack='base'` are exactly `cyclo`, `cognitive_complexity`, `loc`, `cycle_member`, `duplication_ratio`, `modification_count_in_window`
-     And the 6 rows with `pack='solid'` are exactly `lcom4`, `fan_in`, `fan_out`, `depth_of_inheritance`, `interface_width`, `coupling_between_objects`
+        `cycle_member`, `duplication_ratio`
+     And NO row has `metric_kind='modification_count_in_window'` (this kind is materialised by the Metric Ingestor's `modification_count` materialiser from `ingest.churn` data per arch Sec 1.4.1 row 12 line 105, tech-spec Sec 4.1.1 lines 287-291; the AST adapter is NOT a producer of this kind)
+     And the 5 rows emitted with `pack='base'` from AST are exactly `cyclo`, `cognitive_complexity`, `loc`, `cycle_member`, `duplication_ratio` (the 6th `pack='base'` kind `modification_count_in_window` is not emitted by AST)
+     And the 6 rows emitted with `pack='solid'` are exactly `lcom4`, `fan_in`, `fan_out`, `depth_of_inheritance`, `interface_width`, `coupling_between_objects`
      And every emitted row has `source='computed'` (the MetricSample source enum is `computed | ingested | derived` per arch Sec 5.2.1 -- never `ast` or `external`)
      And the class scope `com.example.billing.InvoiceProcessor` emits exactly the 6 class-applicable kinds:
         `lcom4`, `fan_in`, `fan_out`, `depth_of_inheritance`, `interface_width`, `coupling_between_objects`
+```
+
+```gherkin
+@happy @invariant
+Feature: Metric Ingestor materialiser emits `modification_count_in_window` from churn (NOT the AST adapter) [arch Sec 1.4.1 row 12 line 105, tech-spec Sec 4.1.1 lines 287-291, implementation-plan Stage 2.6 lines 247-261]
+  Scenario: Synthetic churn stream feeds the materialiser; it emits a single canonical row per scope
+    Given a synthetic churn stream `C90` carries 7 commits touching scope `pkg.Foo.bar` within the last 90 days
+      And the AST adapter has previously emitted the 11 AST-derived foundation rows for `pkg.Foo.bar` in the same `ScanRun`
+    When the `modification_count` materialiser (`internal/metrics/materialisers/modification_count.go`) runs over `C90`
+    Then exactly one `metric_sample` row is emitted with `metric_kind='modification_count_in_window'`
+     And the emitted row has `pack='base'` and `source='computed'` (per tech-spec Sec 4.1.1 line 290 -- the materialiser is the **computing** writer; ingested provenance is recorded on `attrs_json`, NOT on the `source` enum)
+     And the emitted row's `attrs_json.provenance` equals the literal string `ingested` (implementation-plan Stage 2.6 line 260)
+     And the emitted row's `attrs_json.window_days` equals `90` (the operator pin from tech-spec Sec 8.2)
+     And the materialiser's writer identity is the Metric Ingestor (same role that owns the AST adapter samples); the AST adapter has emitted zero rows for this metric_kind in this scan_run_id
+
+  Scenario: Out-of-window churn rows are ignored (no zero-fill noise)
+    Given a synthetic churn stream `C_OLD` whose commits are all older than 90 days for scope `pkg.Bar.baz`
+    When the materialiser runs over `C_OLD`
+    Then zero `metric_sample` rows are emitted with `metric_kind='modification_count_in_window'` for `pkg.Bar.baz` (per implementation-plan Stage 2.6 line 253: skip when no churn rows exist in the window)
+
+  Scenario: AST adapter is NOT a producer of `modification_count_in_window` (canon-guard, no churn fed)
+    Given the fixture `tests/fixtures/ast/java/billing/InvoiceProcessor.java`
+      And NO churn stream is fed (the materialiser has no input)
+    When the AST adapter alone runs over the fixture and the producer-attribution registry is queried
+    Then no `metric_sample` row exists with `metric_kind='modification_count_in_window'` (the AST adapter is not registered as a producer of this kind)
+     And the registry maps `modification_count_in_window` to the writer identity `modification_count_materialiser`, NOT to any AST language analyzer
 ```
 
 ```gherkin
@@ -395,11 +432,13 @@ Feature: Duplication detection is content-canonicalised [arch Sec 1.4.1]
 
 ```gherkin
 @edge
-Feature: modification_count_in_window is bounded by the operator pin [tech-spec Sec 8.2]
-  Scenario: Window default is 90 days
-    When the adapter computes `modification_count_in_window` with no override
+Feature: Window default for `modification_count_in_window` materialiser is 90 days [tech-spec Sec 8.2]
+  Scenario: Window default is 90 days and is read from the materialiser config (NOT from the AST adapter)
+    Given the materialiser config has no `window_days` override
+    When the `modification_count` materialiser runs over a synthetic churn stream
     Then the count covers commits whose `committer_date` is within the last 90 days
-     And the emitted sample's `attributes.window_days` field equals `90`
+     And the emitted row's `attrs_json.window_days` field equals `90`
+     And the AST adapter does NOT read or honour the `window_days` config (it is not a producer of this kind)
 ```
 
 ```gherkin
@@ -1496,70 +1535,58 @@ when triaging an evaluator failure.
 ## Iteration Summary
 
 - **Path written**: `docs/stories/code-intelligence-CLEAN-CODE/e2e-scenarios.md`
-- **Iteration**: 3 (file existed pre-edit at 85,046 bytes; iter-3 edits brought it to ~87,200 bytes -- 4 schema-canon corrections plus the iter-3 resolution block below).
+- **Iteration**: 4 (file existed pre-edit at 85,019 bytes; iter-4 edits brought it to 89,096 bytes -- one structural fix to Phase 2 producer attribution).
 - **Coverage matrix**: 11 phases, each with `### Setup` (Type/Local/CI runner/Secrets/Pre-test bootstrap) followed by `### Scenarios` (Background + Gherkin features). Phase 11 is `lab-bare-metal` with BOTH Key Vault path AND GH environment named.
-- **Anchors (iter-3 corrected)**: refactor scenarios now cite `arch Sec 5.5.1` (HotSpot), `Sec 5.5.2` (RefactorPlan), `Sec 5.5.3` (RefactorTask) instead of the non-existent `Sec 5.6`; Sec 5.6 is a reserved system-tier carve-out and contains no refactor tables.
 - **Connection strings**: ALL referenced as env-var names (`CLEAN_CODE_PG_URL`, `CLEAN_CODE_KMS_URL`, `CLEAN_CODE_OIDC_ISSUER`, `CLEAN_CODE_WEBHOOK_HMAC_SECRET`, `CLEAN_CODE_OTEL_ENDPOINT`, `AGENT_MEMORY_GRPC_ENDPOINT`).
 
 ### Prior feedback resolution
 
-Iter-2 evaluator scored 86/iterate with 4 numbered issues. All 4 are addressed in iter 3:
+Iter-3 evaluator scored 88/iterate with 1 numbered issue. It is addressed in iter 4:
 
-- [x] 1. FIXED -- Phase 1 Scenario at lines 205-208 AND Appendix A bullet at line ~1463 -- rewrote the `metric_sample_active` PK assertion. The PK is now declared as EXACTLY the quintuple `(repo_id, sha, scope_id, metric_kind, metric_version)` (no `sample_id` inside the PK) with a SEPARATE `metric_sample_active_sample_id_uniq` UNIQUE INDEX on `sample_id`. The Phase 1 scenario also explicitly asserts the two indexes are distinct physical indexes. Aligns with tech-spec Sec 7.1.b lines 1108-1119 and implementation-plan Stage 1.3 line 90. Verification:
+- [x] 1. FIXED -- Phase 2 producer attribution for `modification_count_in_window` -- STRUCTURAL split (not a word-tweak). Three coordinated changes:
+  - (a) Phase 2 intro (lines 321-336): rewrote to say AST adapter emits **11 of the 12** foundation kinds, with `modification_count_in_window` produced separately by the Metric Ingestor's `modification_count` materialiser (`internal/metrics/materialisers/modification_count.go`) consuming `ingest.churn` rows. Updated the `Local` and `Pre-test bootstrap` lines to add `./internal/metrics/materialisers/...` and `make fixtures-churn-synth`.
+  - (b) Foundation-kinds feature (lines 345-360): split into two Features. The first now asserts the AST adapter emits **exactly 11** AST-derived kinds and explicitly excludes `modification_count_in_window` (with arch/tech-spec citations); the `pack='base'` row count drops from 6 to 5 because the 6th `pack='base'` kind is materialiser-owned. The second is a brand-new Feature "Metric Ingestor materialiser emits `modification_count_in_window` from churn (NOT the AST adapter)" with three scenarios: (i) synthetic-churn-stream emits exactly one row with `pack='base', source='computed'` and `attrs_json.provenance='ingested'`; (ii) out-of-window rows are ignored; (iii) AST-only run (no churn fed) produces zero rows for this kind and the producer-attribution registry maps the kind to `modification_count_materialiser`, NOT to any AST language analyzer.
+  - (c) Window-default feature (formerly lines 396-403): rewrote so the `window_days=90` assertion fires on the materialiser config, not on "the adapter computes", and adds an explicit canon-guard "AST adapter does NOT read or honour the `window_days` config".
 
-```
-$ grep -nF "(repo_id, sha, scope_id, metric_kind, metric_version, sample_id)" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
-(empty)
-$ grep -nF "with PK on the quintuple plus" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
-(empty)
-```
-
-- [x] 2. FIXED -- Phase 5 rule-engine scenario at line ~793 AND Phase 6 eval.gate scenarios at lines ~872-873 / ~889 -- all `finding`-row assertions now reference `EvaluationRun` directly via `evaluation_run_id` (NOT via the verdict). Every Finding assertion explicitly says the row "FK references the SAME `evaluation_run` row" and adds a canon-guard "no `finding` row has any column named `verdict_id`". `EvaluationVerdict` continues to FK the run via its own `evaluation_run_id`. Aligns with arch Sec 5.4.1 line 1179 (Finding.evaluation_run_id) and Sec 5.4.3 line 1208 (EvaluationVerdict.evaluation_run_id). Verification:
+  Aligns with arch Sec 1.4.1 row 12 line 105, tech-spec Sec 4.1.1 lines 287-291, implementation-plan Stage 2.6 lines 247-261. Verification:
 
 ```
-$ grep -nF "reference the verdict via FK" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+$ grep -nF "emits the 12 foundation `metric_sample` rows per scope" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
 (empty)
-$ grep -nF "FK to the verdict" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+$ grep -nF "all 12 foundation metric_kinds" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
 (empty)
+$ grep -nF "exactly the 12 names" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+(empty)
+$ grep -nF "When the adapter computes `modification_count_in_window`" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+(empty)
+$ grep -nF "AST adapter is NOT a producer" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+365:     And NO row has `metric_kind='modification_count_in_window'` (...; the AST adapter is NOT a producer of this kind)
+391:  Scenario: AST adapter is NOT a producer of `modification_count_in_window` (canon-guard, no churn fed)
+$ grep -nF "modification_count_materialiser" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+396:     And the registry maps `modification_count_in_window` to the writer identity `modification_count_materialiser`, NOT to any AST language analyzer
 ```
 
-- [x] 3. FIXED -- Phase 8 effort-estimation feature at line ~1126 -- rewrote the multi-hop trace assertion to follow the canonical path: `task.plan_id -> RefactorPlan.hotspot_ids` (JSON array; the suite picks one id) `-> HotSpot.policy_version_id -> PolicyVersion.refactor_weights.effort_model_version` (JSON field, NOT a scalar column). Added an explicit canon-guard: "`policy_version` has NO column named `effort_model_version_id`". Aligns with arch Sec 5.5.2 line 1235 (`hotspot_ids` JSON column) and Sec 5.5.3 line 1247 (`effort_hours` produced by ML model pinned in `PolicyVersion.refactor_weights.effort_model_version`). Verification:
+Phase 4 was already canon-correct on `ingest.churn` (line ~618 says it writes zero `metric_sample` directly and feeds the materialiser); no Phase 4 edits required.
 
-```
-$ grep -nF "plan.hot_spot_id -> hot_spot.policy_version_id -> policy_version.effort_model_version_id" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
-(empty)
-$ grep -nF "plan.hot_spot_id" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
-1133:      And `P1.hotspot_ids` is a JSON array (arch Sec 5.5.2 line 1235 -- the column is `hotspot_ids` JSON, NOT a scalar `plan.hot_spot_id`)
-$ grep -nF "effort_model_version_id" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
-1138:     And the effort-model identifier lives inside the JSON path `PV1.refactor_weights.effort_model_version` (arch Sec 5.5.3 line 1247 -- the model version is a JSON field on `policy_version.refactor_weights`, NOT a top-level `policy_version.effort_model_version_id` column)
-1139:     And `policy_version` has NO column named `effort_model_version_id` (the model version is JSON-embedded, not a scalar column)
-```
+### Earlier iterations (re-confirmed clean in iter 4)
 
-(All surviving hits are inside negation canon-guards that explicitly forbid the wrong shape.)
-
-- [x] 4. FIXED -- Refactor scenarios at lines 188, 271, 280, 1108, 1117, 1126 -- ALL `arch Sec 5.6`, `5.6.1`, `5.6.2` references replaced with the canonical `arch Sec 5.5.1` (HotSpot), `Sec 5.5.2` (RefactorPlan), `Sec 5.5.3` (RefactorTask). Sec 5.6 in arch is "Reserved -- system-tier carve-out documented in 5.2.1" and contains zero refactor-sub-store tables. Verification:
-
-```
-$ grep -nF "arch Sec 5.6" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
-(empty)
-$ grep -nF "Sec 5.6.1" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
-(empty)
-$ grep -nF "Sec 5.6.2" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
-(empty)
-```
-
-### Iter-1 issues (resolved in iter 2, re-confirmed clean in iter 3)
-
-- [x] 1. (iter 1) `Postgres 15` -> `Postgres 16` -- iter-3 re-grep confirms (empty).
-- [x] 2. (iter 1) Phase 2 foundation 6+6 base/solid split with `source='computed'` -- iter-3 re-grep confirms only canon-guard negation hits remain.
-- [x] 3. (iter 1) Phase 4 ingested `pack='ingested', source='ingested'` -- iter-3 re-grep confirms only Appendix-A negation hit remains by design.
-- [x] 4. (iter 1) ScanRun.kind + sha_binding -- iter-3 re-grep confirms only Appendix-A negation hit ("There is NO `ScanRun.mode` column") remains by design.
-- [x] 5. (iter 1) PolicyVersion 7-column / PolicyActivation append-only / 86400s key-rotation overlap -- iter-3 re-grep confirms clean.
-- [x] 6. (iter 1) EvaluationRun.caller enum `eval_gate | batch_refresh` -- iter-3 re-grep confirms clean.
+- [x] iter-1 item 1: Postgres 16 -- still empty on `grep -nF "Postgres 15"`.
+- [x] iter-1 item 2: Foundation 6+6 base/solid split with `source='computed'` -- iter-4 narrowed the AST-emitted set to 11 and added a separate materialiser feature for the 12th, preserving the 6+6 pack totals at the system level.
+- [x] iter-1 item 3: Ingested `pack='ingested', source='ingested'` -- only Appendix-A negation hit remains.
+- [x] iter-1 item 4: ScanRun.kind + sha_binding -- only Appendix-A negation hit remains.
+- [x] iter-1 item 5: PolicyVersion 7-column / PolicyActivation append-only / 86400s key-rotation overlap -- clean.
+- [x] iter-1 item 6: EvaluationRun.caller enum -- clean.
+- [x] iter-2 item 1: `metric_sample_active` PK on quintuple with separate `metric_sample_active_sample_id_uniq` -- clean.
+- [x] iter-2 item 2: Finding FKs EvaluationRun via `evaluation_run_id` (NOT verdict) -- clean.
+- [x] iter-2 item 3: Refactor effort multi-hop trace through `hotspot_ids` JSON array and `refactor_weights.effort_model_version` JSON field -- clean.
+- [x] iter-2 item 4: Refactor anchors cite `arch Sec 5.5.1-5.5.3` -- clean.
 
 ### Story-description coverage
-- "decoupled functional areas" -- Phase 1 enforces a single schema while the role grants in Phases 1/3/5/7/9 enforce per-service writer carve-outs; Phase 9 enforces audit-WAL scoping to exactly the evaluation triplet so other sub-stores stay decoupled.
-- "SOLID coding principal" -- Phase 5 covers `srp.lcom4_threshold`, `dip.fan_in_high`, `isp.interface_width_max` as concrete rule examples bound to a signed `rule_pack`.
-- "system level metrics ... measurable code qualities for big repo, and cross-repo measurements" -- Phase 2 (12 foundation metrics, 6+6 base/solid split) + Phase 7 (7 system-tier metrics) + Phase 11 (100-repo scale).
-- "used by evaluator agent to guard bad practices" -- Phase 6 covers `eval.gate` clean path + the two degraded short-circuits; Phase 7 keeps `percentile_stale` out of the gate.
-- "metrics will be used for refactoring effort of big repo" -- Phase 8 covers the planner with the operator-pinned effort source (`ML model from historical commits`) AND the canonical multi-hop effort-version trace through `RefactorPlan.hotspot_ids` JSON array and `PolicyVersion.refactor_weights.effort_model_version` JSON field.
+- "decoupled functional areas" -- Phases 1/3/5/7/9 (writer carve-outs, audit-WAL scoping).
+- "SOLID coding principal" -- Phase 5 (srp.lcom4_threshold, dip.fan_in_high, isp.interface_width_max).
+- "system level metrics for big repo, and cross-repo measurements" -- Phase 2 (11 AST-derived foundation kinds + the materialiser-emitted `modification_count_in_window`, totalling 12 foundation rows) + Phase 7 (7 system-tier metrics) + Phase 11 (100-repo scale).
+- "used by evaluator agent to guard bad practices" -- Phase 6 (eval.gate clean + degraded short-circuits) + Phase 7 (percentile_stale Insights-only).
+- "metrics for refactoring effort" -- Phase 8 (planner with multi-hop `RefactorPlan.hotspot_ids` JSON array -> `HotSpot.policy_version_id` -> `PolicyVersion.refactor_weights.effort_model_version` JSON field).
+
+### Open questions for next iteration
+None. All operator pins from prior iterations remain locked in the sibling docs.

@@ -132,6 +132,14 @@ const (
 	// Go-side wrapper that proxies sidecar requests can use
 	// the same canonical service name.
 	ServiceNameRerankerSidecar ServiceName = "reranker-sidecar"
+	// ServiceNamePartitionMaintainer is for `cmd/partition-maintainer`,
+	// the Stage 8.2 partition rotation daemon.
+	ServiceNamePartitionMaintainer ServiceName = "partition-maintainer"
+	// ServiceNameLoadtestHarness is for `cmd/loadtest-harness`,
+	// the Stage 8.4 calibration-harness CLI. Declared here
+	// so the binary participates in the cmd-inventory
+	// observability gate (`deploy/cmd_inventory_test.go`).
+	ServiceNameLoadtestHarness ServiceName = "loadtest-harness"
 )
 
 // SetupTracer wires the package-global `otel.Tracer(...)` to

@@ -23,7 +23,6 @@
 package config
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -405,6 +404,13 @@ func applyOverrides(cfg *Config, overrides map[string]string) error {
 // `#` comments allowed). Quoted values are NOT unwrapped -- the
 // expected use case is operator-managed env-style files, not
 // shell scripts.
+//
+// A file containing only comments / blank lines is treated as
+// "no overrides" and returns an empty map. Operators commonly
+// keep a fully-commented template checked in, and forcing a
+// startup crash on that input is hostile to that workflow --
+// the loader already tolerates the env var being unset, so a
+// file with zero effective entries is the natural equivalent.
 func parseConfigFile(path string) (map[string]string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -426,9 +432,6 @@ func parseConfigFile(path string) (map[string]string, error) {
 			return nil, fmt.Errorf("line %d: empty key", lineNo+1)
 		}
 		out[key] = val
-	}
-	if len(out) == 0 {
-		return nil, errors.New("config file is empty")
 	}
 	return out, nil
 }

@@ -8,7 +8,7 @@ import (
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/reliability"
 )
 
-// SummarizeScenario drives `agent.summarize` at the §8.3
+// SummarizeScenario drives `agent.summarize` at the ┬º8.3
 // sustained rate (5 RPS in the nominal envelope). Alternates
 // between node-target and concept-target summaries so both
 // surfaces of the verb are exercised.
@@ -20,7 +20,9 @@ type SummarizeScenario struct {
 	MaxTokens      int32
 	RequestTimeout time.Duration
 
-	next atomic.Uint64
+	next          atomic.Uint64 // alternation tick (node vs concept)
+	nodeCursor    atomic.Uint64 // rotation cursor — advances by 1 per NodeIDs pick
+	conceptCursor atomic.Uint64 // rotation cursor — advances by 1 per ConceptIDs pick
 }
 
 // Verb returns the canonical verb identifier.
@@ -39,16 +41,20 @@ func (s *SummarizeScenario) Execute(ctx context.Context, _ RNG) Sample {
 		RepoID:    s.RepoID,
 		MaxTokens: s.MaxTokens,
 	}
-	// Alternate node ↔ concept target. When one pool is
+	// Alternate node Γåö concept target. When one pool is
 	// empty fall back to the other so the harness still
 	// drives the envelope.
-	if tick%2 == 0 && len(s.NodeIDs) > 0 {
-		req.NodeID = s.NodeIDs[tick%uint64(len(s.NodeIDs))]
-	} else if len(s.ConceptIDs) > 0 {
-		req.ConceptID = s.ConceptIDs[tick%uint64(len(s.ConceptIDs))]
-	} else if len(s.NodeIDs) > 0 {
-		req.NodeID = s.NodeIDs[tick%uint64(len(s.NodeIDs))]
-	} else {
+	switch {
+	case tick%2 == 0 && len(s.NodeIDs) > 0:
+		idx := s.nodeCursor.Add(1) - 1
+		req.NodeID = s.NodeIDs[idx%uint64(len(s.NodeIDs))]
+	case len(s.ConceptIDs) > 0:
+		idx := s.conceptCursor.Add(1) - 1
+		req.ConceptID = s.ConceptIDs[idx%uint64(len(s.ConceptIDs))]
+	case len(s.NodeIDs) > 0:
+		idx := s.nodeCursor.Add(1) - 1
+		req.NodeID = s.NodeIDs[idx%uint64(len(s.NodeIDs))]
+	default:
 		// Neither pool supplied: synthetic node id so the
 		// wire shape is well-formed.
 		req.NodeID = "calibration-synthetic-node"

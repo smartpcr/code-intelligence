@@ -1,0 +1,23 @@
+# Prometheus scrape config for the clean-code local stack.
+#
+# Stage 1.1 (implementation-plan.md) requires a scrape target on
+# the `clean-coded` service so dashboards / alerts can be wired
+# against the future metric endpoint. The :9090 port carries the
+# Prometheus-formatted metrics; the :8080 port serves /healthz
+# and /readyz.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "clean-coded"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets:
+          - "clean-coded:9090"
+
+  - job_name: "prometheus"
+    static_configs:
+      - targets:
+          - "localhost:9090"

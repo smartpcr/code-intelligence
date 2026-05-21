@@ -346,7 +346,9 @@ CREATE TABLE clean_code.scan_run (
     -- Set for `kind='delta'` (Sec 5.7 line 1275).
     from_sha      text,
     -- Set when `sha_binding='single'`; NULL when
-    -- `sha_binding='per_row'` (Sec 5.7 line 1276).
+    -- `sha_binding='per_row'` (Sec 5.7 line 1276). The
+    -- `scan_run_sha_binding_consistent` CHECK below enforces
+    -- the two-way invariant at the database level.
     to_sha        text,
     -- sha256 of the input payload (external modes only); used for
     -- idempotency (Sec 5.7 line 1277).
@@ -358,7 +360,26 @@ CREATE TABLE clean_code.scan_run (
     -- Defaults to `running` because the Metric Ingestor INSERTs
     -- the row at scan start and transitions it on completion.
     status        clean_code.scan_run_status        NOT NULL
-                   DEFAULT 'running'
+                   DEFAULT 'running',
+    -- Enforce the documented sha_binding <-> to_sha invariant
+    -- from Sec 5.7 line 1274 at the database level. Without this
+    -- CHECK a bare `INSERT (repo_id, kind)` would silently accept
+    -- the (`sha_binding='single'`, `to_sha IS NULL`) shape and
+    -- break the contract the Insights surface relies on (every
+    -- `single`-bound run resolves to exactly one SHA via
+    -- `to_sha`). Both Metric-Ingestor scan modes know `to_sha`
+    -- at scan start: foundation-tier `full`/`delta` scans target
+    -- a specific HEAD/parent SHA, and `external_single` carries
+    -- the SHA in the submitted payload -- so this is a
+    -- non-deferred CHECK that fires at INSERT time. The
+    -- `external_per_row` shape sets `sha_binding='per_row'` and
+    -- leaves `to_sha` NULL because the SHA lives on each emitted
+    -- MetricSample row instead.
+    CONSTRAINT scan_run_sha_binding_consistent CHECK (
+        (sha_binding = 'single'  AND to_sha IS NOT NULL)
+        OR
+        (sha_binding = 'per_row' AND to_sha IS NULL)
+    )
 );
 
 COMMENT ON TABLE clean_code.scan_run IS
@@ -373,7 +394,11 @@ COMMENT ON COLUMN clean_code.scan_run.sha_binding IS
     'SHA-attribution mode (architecture Sec 5.7 line 1274). '
     'single = one SHA for the whole run (to_sha non-null). '
     'per_row = each emitted MetricSample carries its own SHA '
-    'from the payload (to_sha NULL; e.g. churn / defect ingest).';
+    'from the payload (to_sha NULL; e.g. churn / defect ingest). '
+    'The `scan_run_sha_binding_consistent` CHECK enforces this '
+    'two-way invariant: callers must supply `to_sha` whenever '
+    'they accept the `single` default, and must omit `to_sha` '
+    'whenever they pass `per_row`.';
 
 COMMENT ON COLUMN clean_code.scan_run.status IS
     'Per-scan-execution outcome (architecture Sec 5.7 line 1280). '

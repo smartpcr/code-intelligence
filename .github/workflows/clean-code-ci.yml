@@ -90,6 +90,125 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  migration-integration:
+    # Stage 1.2 acceptance test scenarios require a live PostgreSQL
+    # to exercise the up/down round-trip, ENUM rejection, DEFAULT
+    # 'pending' materialisation, and PK/FK contract introspection
+    # (see services/clean-code/internal/storage/migrate_test.go::
+    # TestRoundTrip_upDownLeavesSchemaEmpty). Without this job the
+    # round-trip subtest silently skips when CLEAN_CODE_PG_URL is
+    # unset, leaving SQL syntax and enum behavior unverified in CI.
+    #
+    # The job uses a GitHub Actions `services:` container instead
+    # of `docker compose` because clean-code only needs PostgreSQL
+    # (no Qdrant / OTel) -- the service-container path is faster
+    # to start and avoids the per-job docker compose orchestration
+    # that agent-memory's `integration-test` job needs.
+    name: live PostgreSQL migration round-trip
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/clean-code
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # These credentials match the
+          # `services/clean-code/Makefile` default for
+          # CLEAN_CODE_PG_URL -- keeping them aligned means the
+          # `make migrate-up` / `make migrate-down` recipes work
+          # identically in this CI job and in local docker-compose
+          # dev (`deploy/local/docker-compose.yml`).
+          POSTGRES_USER: clean_code
+          POSTGRES_PASSWORD: clean_code
+          POSTGRES_DB: clean_code
+        ports:
+          - 5432:5432
+        # `pg_isready` is the canonical wait-for-PostgreSQL probe;
+        # the runner blocks job steps from starting until the
+        # service container reports healthy.
+        options: >-
+          --health-cmd "pg_isready -U clean_code -d clean_code"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Matches `services/clean-code/Makefile` line 61 default
+      # AND `e2e-scenarios.md` lines 36/45/66/77/484. Single
+      # source of truth so both `make migrate-up` (which shells
+      # out to `psql`) and the `internal/storage` round-trip
+      # test (`exec.LookPath("psql")`) bind to the same DSN.
+      CLEAN_CODE_PG_URL: postgres://clean_code:clean_code@localhost:5432/clean_code?sslmode=disable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/clean-code/go.mod
+          cache: true
+
+      - name: Install psql client
+        # `actions/runner-image: ubuntu-latest` ships postgresql-client
+        # already, but pin the install explicitly so a future runner
+        # image rotation that drops the client doesn't silently break
+        # the migration tests (which shell out to `psql`).
+        run: |
+          set -euo pipefail
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client
+          fi
+          psql --version
+
+      - name: Verify Postgres service is reachable
+        # Smoke-test the service-container connection BEFORE
+        # invoking the Go test. A failure here surfaces a
+        # service-container / network misconfiguration with a
+        # clearer error than a Go test timeout would.
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if psql "$CLEAN_CODE_PG_URL" -c 'SELECT 1' >/dev/null 2>&1; then
+              echo "postgres reachable on attempt $i"
+              exit 0
+            fi
+            echo "waiting for postgres (attempt $i)..."
+            sleep 2
+          done
+          echo "::error::postgres unreachable at $CLEAN_CODE_PG_URL after 10 attempts"
+          exit 1
+
+      - name: make migrate-up + migrate-down (Makefile round-trip)
+        # Exercises the `make migrate-up` / `make migrate-down`
+        # recipes against the live postgres service container.
+        # This is the operator-facing reset contract: a successful
+        # round-trip leaves zero tables in the `clean_code` schema.
+        run: |
+          set -euo pipefail
+          make migrate-up
+          tables=$(psql "$CLEAN_CODE_PG_URL" -At \
+            -c "SELECT count(*) FROM information_schema.tables WHERE table_schema='clean_code' AND table_type='BASE TABLE'")
+          echo "tables after migrate-up: $tables"
+          test "$tables" -ge 5 || { echo "::error::expected >=5 tables, got $tables"; exit 1; }
+          make migrate-down
+          tables=$(psql "$CLEAN_CODE_PG_URL" -At \
+            -c "SELECT count(*) FROM information_schema.tables WHERE table_schema='clean_code' AND table_type='BASE TABLE'")
+          echo "tables after migrate-down: $tables"
+          test "$tables" = "0" || { echo "::error::expected 0 tables after migrate-down, got $tables"; exit 1; }
+
+      - name: make test (live PostgreSQL round-trip)
+        # The `internal/storage` round-trip test reads
+        # CLEAN_CODE_PG_URL from the env. With it set, the
+        # subtests scan-status-default-pending,
+        # scan-status-enum-rejects-invalid,
+        # scan-run-status-enum, primary-keys-match-spec, and
+        # foreign-keys-match-spec all run against the live PG.
+        # Without it, those subtests would SKIP -- which is the
+        # silent-skip risk this job exists to close.
+        run: make test
+
   docker-build:
     name: build clean-coded container
     runs-on: ubuntu-latest

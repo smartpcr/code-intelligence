@@ -157,12 +157,10 @@ public class ProjectScaffoldAndCiBaselineSteps
     public void GivenAConfigFileThatOmitsTheFiveOperatorPins()
     {
         // Write a minimal / empty config to a temp file and set it for the loader.
-        // The Go config loader reads CLEAN_CODE_CONFIG_FILE
-        // (see services/clean-code/internal/config/config.go: EnvConfigFile).
         var tempConfig = Path.Combine(Path.GetTempPath(), $"clean-code-test-config-{Guid.NewGuid()}.yaml");
         File.WriteAllText(tempConfig, "# empty config — all operator pins omitted\n");
 
-        Environment.SetEnvironmentVariable("CLEAN_CODE_CONFIG_FILE", tempConfig);
+        Environment.SetEnvironmentVariable("CLEAN_CODE_CONFIG_PATH", tempConfig);
     }
 
     [When("the loader initialises")]
@@ -253,8 +251,14 @@ public class ProjectScaffoldAndCiBaselineSteps
         using var process = Process.Start(psi)
             ?? throw new InvalidOperationException($"Failed to start process: {command}");
 
+        // Read stderr asynchronously while reading stdout synchronously to
+        // avoid the classic pipe-buffer deadlock: if the child fills the
+        // stderr pipe buffer (~4 KB on Windows, 64 KB on Linux) while we
+        // block on stdout, both processes stall. Draining one stream on a
+        // background task ensures neither pipe blocks the producer.
+        var stderrTask = process.StandardError.ReadToEndAsync();
         var stdout = process.StandardOutput.ReadToEnd();
-        var stderr = process.StandardError.ReadToEnd();
+        var stderr = stderrTask.GetAwaiter().GetResult();
         process.WaitForExit(120_000);
 
         return (process.ExitCode, stdout + Environment.NewLine + stderr);

@@ -18,6 +18,8 @@ using YamlDotNet.RepresentationModel;
 [Binding]
 public class ProjectScaffoldAndCiBaselineSteps
 {
+    private const int CommandTimeoutMs = 120_000;
+
     private string repoRoot = string.Empty;
     private string serviceRoot = string.Empty;
     private int exitCode = -1;
@@ -157,10 +159,12 @@ public class ProjectScaffoldAndCiBaselineSteps
     public void GivenAConfigFileThatOmitsTheFiveOperatorPins()
     {
         // Write a minimal / empty config to a temp file and set it for the loader.
+        // The Go config loader reads CLEAN_CODE_CONFIG_FILE
+        // (see services/clean-code/internal/config/config.go: EnvConfigFile).
         var tempConfig = Path.Combine(Path.GetTempPath(), $"clean-code-test-config-{Guid.NewGuid()}.yaml");
         File.WriteAllText(tempConfig, "# empty config — all operator pins omitted\n");
 
-        Environment.SetEnvironmentVariable("CLEAN_CODE_CONFIG_PATH", tempConfig);
+        Environment.SetEnvironmentVariable("CLEAN_CODE_CONFIG_FILE", tempConfig);
     }
 
     [When("the loader initialises")]
@@ -251,15 +255,25 @@ public class ProjectScaffoldAndCiBaselineSteps
         using var process = Process.Start(psi)
             ?? throw new InvalidOperationException($"Failed to start process: {command}");
 
-        // Read stderr asynchronously while reading stdout synchronously to
-        // avoid the classic pipe-buffer deadlock: if the child fills the
-        // stderr pipe buffer (~4 KB on Windows, 64 KB on Linux) while we
-        // block on stdout, both processes stall. Draining one stream on a
-        // background task ensures neither pipe blocks the producer.
-        var stderrTask = process.StandardError.ReadToEndAsync();
         var stdout = process.StandardOutput.ReadToEnd();
-        var stderr = stderrTask.GetAwaiter().GetResult();
-        process.WaitForExit(120_000);
+        var stderr = process.StandardError.ReadToEnd();
+
+        if (!process.WaitForExit(CommandTimeoutMs))
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+                // Best-effort cleanup; the process may have exited between the
+                // WaitForExit timeout and the Kill call.
+            }
+
+            throw new TimeoutException(
+                $"'{command} {arguments}' did not exit within {CommandTimeoutMs / 1000} s " +
+                $"(working dir: {workingDir}). Process was killed.");
+        }
 
         return (process.ExitCode, stdout + Environment.NewLine + stderr);
     }

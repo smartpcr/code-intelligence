@@ -185,7 +185,7 @@ Feature: ScanRun and Commit status enums are tight [arch Sec 5.2.2, Sec 5.2.3]
 
 ```gherkin
 @invariant
-Feature: RefactorTask.kind enum [arch Sec 5.6.2]
+Feature: RefactorTask.kind enum [arch Sec 5.5.3]
   Scenario: refactor_task_kind labels are exactly five values
     When the suite queries the `refactor_task_kind` enum labels
     Then the labels are exactly `split_class`, `extract_method`, `invert_dependency`, `break_cycle`, `consolidate_duplication`
@@ -202,9 +202,11 @@ Feature: MetricSample append-only and active-pointer uniqueness [arch Sec 1.5.1,
     When the suite, connected as `clean_code_xrepo_aggregator`, attempts `DELETE FROM metric_sample_active`
     Then Postgres returns `permission denied for table metric_sample_active`
 
-  Scenario: PRIMARY KEY on metric_sample_active is the quintuple plus sample_id
-    When the suite reads `pg_indexes` for `metric_sample_active`
-    Then a UNIQUE index exists whose columns are exactly `(repo_id, sha, scope_id, metric_kind, metric_version, sample_id)`
+  Scenario: PRIMARY KEY on metric_sample_active is exactly the quintuple (sample_id is NOT part of the PK)
+    When the suite reads `pg_indexes` and `pg_constraint` for `metric_sample_active`
+    Then the PRIMARY KEY constraint covers exactly the columns `(repo_id, sha, scope_id, metric_kind, metric_version)` (no `sample_id` column inside the PK -- per tech-spec Sec 7.1.b lines 1108-1115 and implementation-plan Stage 1.3 line 90)
+     And `sample_id` is a NOT NULL FK column with a SEPARATE UNIQUE INDEX named `metric_sample_active_sample_id_uniq` (per tech-spec lines 1118-1119)
+     And the suite asserts the two indexes are distinct (the PK index and the sample_id unique index are NOT the same physical index)
 
   Scenario: MetricRetraction.sample_id FK is UNIQUE
     When the suite reads constraints on `metric_retraction`
@@ -268,7 +270,7 @@ Feature: Override has no expires_at column [arch Sec 5.5.3, tech-spec C16]
 
 ```gherkin
 @invariant
-Feature: refactor_task has no status and no expected_metric_delta [arch Sec 5.6.2, tech-spec C19]
+Feature: refactor_task has no status and no expected_metric_delta [arch Sec 5.5.3, tech-spec C19]
   Scenario: information_schema.columns excludes both columns
     When the suite queries `information_schema.columns` for `refactor_task`
     Then no column named `status` exists
@@ -277,7 +279,7 @@ Feature: refactor_task has no status and no expected_metric_delta [arch Sec 5.6.
 
 ```gherkin
 @invariant
-Feature: Refactor traceback goes task -> plan -> hotspot -> policy_version [arch Sec 5.6, tech-spec C20]
+Feature: Refactor traceback goes task -> plan -> hotspot -> policy_version [arch Sec 5.5.1-5.5.3, tech-spec C20]
   Scenario: hot_spot carries policy_version_id, refactor_plan does NOT
     When the suite queries `information_schema.columns`
     Then `hot_spot` has a column `policy_version_id` (NOT NULL FK to `policy_version`)
@@ -790,8 +792,9 @@ Feature: Rule engine emits one verdict + N findings per evaluation [arch Sec 3.7
       And a metric snapshot for `repo-a` SHA `aaaa1111` violates `srp.lcom4_threshold` on scope `S1` and `S2`
     When the rule engine evaluates the snapshot against `P1` under the batch-refresh job
     Then exactly one `evaluation_run` row is INSERTed with `caller='batch_refresh'` (the EvaluationRun.caller enum is `eval_gate | batch_refresh` per arch Sec 5.4.2 -- never `rule_engine`)
-     And exactly one `evaluation_verdict` row is INSERTed with a non-null FK to the run
-     And exactly two `finding` rows are INSERTed (one per violating scope)
+     And exactly one `evaluation_verdict` row is INSERTed whose `evaluation_run_id` FK references the run (arch Sec 5.4.3 line 1208)
+     And exactly two `finding` rows are INSERTed (one per violating scope), each whose `evaluation_run_id` FK references the SAME `evaluation_run` row (arch Sec 5.4.1 line 1179 -- Finding FKs the EvaluationRun, NOT the EvaluationVerdict)
+     And NO `finding` row has any column named `verdict_id` (Finding does not FK the verdict; the run is the join key)
      And all writes complete in a single transaction (suite verifies via Postgres txn id)
 
   Scenario: EvaluationRun.caller enum is exactly two values
@@ -869,8 +872,9 @@ Feature: eval.gate clean path delegates to the rule engine [arch Sec 3.7]
     When the caller invokes `eval.gate(repo=repo-a, sha=aaaa2222)`
     Then the response carries `verdict in {pass|warn|block}` per rule engine output
      And exactly one `evaluation_run` row exists for this call with `caller='eval_gate'` (the eval.gate verb is the caller; the synchronous rule-engine delegation does NOT mint its own run row -- arch Sec 3.7, Sec 5.4.2)
-     And exactly one `evaluation_verdict` row exists with `degraded=false`
-     And findings rows (N >= 0) reference the verdict via FK
+     And exactly one `evaluation_verdict` row exists whose `evaluation_run_id` FK equals the run's id, with `degraded=false` (arch Sec 5.4.3 line 1208)
+     And every `finding` row (N >= 0) carries the SAME `evaluation_run_id` FK to that run -- Finding references the EvaluationRun directly, not the EvaluationVerdict (arch Sec 5.4.1 line 1179)
+     And no `finding` row has a column named `verdict_id`
 
   Scenario: Clean path latency SLO
     Given the above clean-path conditions
@@ -886,7 +890,7 @@ Feature: eval.gate short-circuit for samples_pending [arch Sec 3.7, Sec 8.2]
     When `eval.gate(repo=repo-a, sha=aaaa2222)` is invoked
     Then exactly one `evaluation_run` row is INSERTed with `caller='eval_gate'`
      And exactly one `evaluation_verdict` row is INSERTed with `verdict='warn'`, `degraded=true`, `degraded_reason='samples_pending'`
-     And the verdict's FK to the run is non-null
+     And the verdict's `evaluation_run_id` FK to the run is non-null (arch Sec 5.4.3 line 1208)
      And ZERO `finding` rows are written
      And the rule engine was NOT invoked (suite verifies via OTel: no `rule_engine.evaluate` span)
 ```
@@ -1105,7 +1109,7 @@ Background:
 
 ```gherkin
 @happy @invariant
-Feature: refactor_task.kind is one of five canonical values [arch Sec 5.6.2]
+Feature: refactor_task.kind is one of five canonical values [arch Sec 5.5.3]
   Scenario: A generated plan emits tasks within the closed set
     When the planner runs against the seeded data
     Then every `refactor_task.kind` is in `split_class`, `extract_method`, `invert_dependency`, `break_cycle`, `consolidate_duplication`
@@ -1114,7 +1118,7 @@ Feature: refactor_task.kind is one of five canonical values [arch Sec 5.6.2]
 
 ```gherkin
 @happy
-Feature: hot_spot carries the policy_version_id [arch Sec 5.6.1]
+Feature: hot_spot carries the policy_version_id [arch Sec 5.5.1]
   Scenario: Each hot_spot row references its policy_version
     When the planner runs
     Then every `hot_spot` row has a non-null `policy_version_id` referencing `P1`
@@ -1123,10 +1127,16 @@ Feature: hot_spot carries the policy_version_id [arch Sec 5.6.1]
 
 ```gherkin
 @invariant
-Feature: Effort estimation traces task -> plan -> hotspot -> policy_version -> effort_model_version [arch Sec 5.6.2]
-  Scenario: A task carries an effort estimate joined back through hotspot
+Feature: Effort estimation traces task -> plan -> hotspot -> policy_version -> effort_model_version [arch Sec 5.5.2, Sec 5.5.3]
+  Scenario: A task carries an effort estimate joined back through hotspot via the canonical multi-hop path
+    Given a `refactor_task` row `T1` exists with non-null `plan_id` referencing `RefactorPlan` row `P1`
+      And `P1.hotspot_ids` is a JSON array (arch Sec 5.5.2 line 1235 -- the column is `hotspot_ids` JSON, NOT a scalar `plan.hot_spot_id`)
     When a `refactor_task` is emitted
-    Then the suite can follow `task.plan_id -> plan.hot_spot_id -> hot_spot.policy_version_id -> policy_version.effort_model_version_id`
+    Then the suite dereferences `T1.plan_id -> P1`
+     And the suite picks any single id `H_id` from the JSON array `P1.hotspot_ids` and resolves it to a `HotSpot` row `H1`
+     And `H1.policy_version_id` resolves to PolicyVersion row `PV1`
+     And the effort-model identifier lives inside the JSON path `PV1.refactor_weights.effort_model_version` (arch Sec 5.5.3 line 1247 -- the model version is a JSON field on `policy_version.refactor_weights`, NOT a top-level `policy_version.effort_model_version_id` column)
+     And `policy_version` has NO column named `effort_model_version_id` (the model version is JSON-embedded, not a scalar column)
      And the effort source pin is satisfied (operator pin: `ML model from historical commits`)
 ```
 
@@ -1460,7 +1470,7 @@ when triaging an evaluator failure.
 - `scope_kind` is exactly 7 values; `verdict` is exactly 3; `delta` is exactly 4.
 - `ScanRun.kind` is exactly `full | delta | external_single | external_per_row | retract`; `ScanRun.sha_binding` is exactly `single | per_row`. There is NO `ScanRun.mode` column.
 - `RepoEvent.kind` is past-tense (`registered | retired | retract_intent | mode_changed`).
-- `MetricSample` is append-only (G3); `metric_sample_active` is a side relation with PK on the quintuple plus `sample_id`; DELETE is REVOKEd from BOTH writer roles.
+- `MetricSample` is append-only (G3); `metric_sample_active` is a side relation whose PRIMARY KEY is EXACTLY the quintuple `(repo_id, sha, scope_id, metric_kind, metric_version)` with `sample_id` carried as a NOT NULL FK column under a SEPARATE `metric_sample_active_sample_id_uniq` UNIQUE INDEX (tech-spec Sec 7.1.b lines 1108-1119, implementation-plan Stage 1.3 line 90); DELETE is REVOKEd from BOTH writer roles.
 - Two-writer carve-out on Measurement (`ingestor` writes `base|solid|ingested`, `xrepo_aggregator` writes `system AND source=derived`).
 - Three-writer ACL on Audit (`evaluator`, `solid_batch`, `wal_reconciler` get INSERT+SELECT; UPDATE/DELETE revoked).
 - `Override` has NO `expires_at`; unmute is an APPEND.
@@ -1486,86 +1496,70 @@ when triaging an evaluator failure.
 ## Iteration Summary
 
 - **Path written**: `docs/stories/code-intelligence-CLEAN-CODE/e2e-scenarios.md`
-- **Iteration**: 2 (file existed pre-edit at 71,532 bytes; iter-2 edits brought it to 79,083 bytes).
-- **Coverage matrix**: 11 phases, each with `### Setup` (Type/Local/CI runner/Secrets/Pre-test bootstrap) followed by `### Scenarios` (Background + Gherkin features).
-  - Phase 1 (compose) -- schema, enums, role grants, append-only, no-invented-tables.
-  - Phase 2 (inline) -- AST foundation 12 metric_kinds split 6+6 across `pack='base'`/`pack='solid'` with `source='computed'`, scope_id UUIDv5, language registry refusals, throughput SLO.
-  - Phase 3 (compose) -- indexer scan flow with `ScanRun.kind='delta', sha_binding='single'`, ingestor append-and-repoint, sustained 5k/s SLO.
-  - Phase 4 (compose) -- webhook HMAC; Cobertura XML coverage with `pack='ingested', source='ingested', kind='external_single'`; ingest.churn/defects with `kind='external_per_row', sha_binding='per_row'`; idempotent replay; new enum-assertion scenarios for `scan_run_kind` and `scan_run_sha_binding`.
-  - Phase 5 (compose) -- Ed25519 publish, PolicyVersion-with-7-canonical-columns enforcement, append-only PolicyActivation (no `status` column), 86400s signing-key rotation overlap (NOT publish-to-activate), rule-engine one-run/one-verdict/N-findings with `caller='batch_refresh'`, EvaluationRun.caller enum guard.
-  - Phase 6 (compose) -- eval.gate clean path with `caller='eval_gate'`, two degraded short-circuits, percentile_stale REJECTed, OIDC roles, mgmt verbs with `kind='full'` for force rescan.
-  - Phase 7 (compose) -- aggregator cadence, 7 system metric_kinds, xrepo_edges_unavailable degraded, percentile_stale Insights-only.
-  - Phase 8 (compose) -- refactor planner, 5 task kinds, hot_spot.policy_version_id traceback, no status/expected_metric_delta.
-  - Phase 9 (compose) -- WAL scope = 3 tables, reconciler REPLAY-ONLY caller-preserve, Catalog/Policy NOT routed through WAL.
-  - Phase 10 (compose) -- linked-mode integration with sister `agent-memory` service via `AGENT_MEMORY_GRPC_ENDPOINT`.
-  - Phase 11 (lab-bare-metal) -- SLO conformance at 100 repos x 50 scans/min x 30 min on `forge-lab-hw` with both KeyVault `kv-forge-shared/clean-code-perf-*` AND GH environment `forge-lab-clean-code-perf` named.
-- **Anchors**: every scenario references the spec (`[arch Sec X]`, `[tech-spec Sec X]`, `[tech-spec C##]`) so the evaluator can prove the assertion back to a sibling doc.
+- **Iteration**: 3 (file existed pre-edit at 85,046 bytes; iter-3 edits brought it to ~87,200 bytes -- 4 schema-canon corrections plus the iter-3 resolution block below).
+- **Coverage matrix**: 11 phases, each with `### Setup` (Type/Local/CI runner/Secrets/Pre-test bootstrap) followed by `### Scenarios` (Background + Gherkin features). Phase 11 is `lab-bare-metal` with BOTH Key Vault path AND GH environment named.
+- **Anchors (iter-3 corrected)**: refactor scenarios now cite `arch Sec 5.5.1` (HotSpot), `Sec 5.5.2` (RefactorPlan), `Sec 5.5.3` (RefactorTask) instead of the non-existent `Sec 5.6`; Sec 5.6 is a reserved system-tier carve-out and contains no refactor tables.
 - **Connection strings**: ALL referenced as env-var names (`CLEAN_CODE_PG_URL`, `CLEAN_CODE_KMS_URL`, `CLEAN_CODE_OIDC_ISSUER`, `CLEAN_CODE_WEBHOOK_HMAC_SECRET`, `CLEAN_CODE_OTEL_ENDPOINT`, `AGENT_MEMORY_GRPC_ENDPOINT`).
-- **Canonical names (iter-2 corrected)**: 22 metric_kinds; foundation tier 6 `base` + 6 `solid`; MetricSample.source enum `computed | ingested | derived`; ScanRun.kind enum `full | delta | external_single | external_per_row | retract` with separate `sha_binding in {single, per_row}`; PolicyVersion columns exactly `policy_version_id, name, rule_refs, threshold_refs, refactor_weights, signature, created_at`; PolicyActivation append-only with `activation_id, policy_version_id, activated_by, created_at`; EvaluationRun.caller enum exactly `eval_gate | batch_refresh`.
 
 ### Prior feedback resolution
 
-Iter-1 evaluator scored 82 with 6 numbered issues. All 6 are addressed in iter 2:
+Iter-2 evaluator scored 86/iterate with 4 numbered issues. All 4 are addressed in iter 3:
 
-- [x] 1. FIXED -- All Postgres pins -- PowerShell global replace `Postgres 15` -> `Postgres 16` across all 9 compose-service descriptors (Phases 1/3/4/5/6/7/8/9/10). Aligns with tech-spec Sec 8.1.1 and implementation-plan Stage 1.1. Verification:
+- [x] 1. FIXED -- Phase 1 Scenario at lines 205-208 AND Appendix A bullet at line ~1463 -- rewrote the `metric_sample_active` PK assertion. The PK is now declared as EXACTLY the quintuple `(repo_id, sha, scope_id, metric_kind, metric_version)` (no `sample_id` inside the PK) with a SEPARATE `metric_sample_active_sample_id_uniq` UNIQUE INDEX on `sample_id`. The Phase 1 scenario also explicitly asserts the two indexes are distinct physical indexes. Aligns with tech-spec Sec 7.1.b lines 1108-1119 and implementation-plan Stage 1.3 line 90. Verification:
 
 ```
-$ grep -nF "Postgres 15" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+$ grep -nF "(repo_id, sha, scope_id, metric_kind, metric_version, sample_id)" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+(empty)
+$ grep -nF "with PK on the quintuple plus" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
 (empty)
 ```
 
-- [x] 2. FIXED -- Phase 2 foundation feature (lines ~343-356) -- rewrote the foundation-metrics feature to assert the 6+6 `pack='base'`/`pack='solid'` split (arch Sec 1.4.1 lines 92-105) with `source='computed'` (arch Sec 5.2.1 line 901). Also corrected the "12 rows per class scope" error -- only 6 metric_kinds apply to a `class` scope per the upstream applicability table. Verification:
+- [x] 2. FIXED -- Phase 5 rule-engine scenario at line ~793 AND Phase 6 eval.gate scenarios at lines ~872-873 / ~889 -- all `finding`-row assertions now reference `EvaluationRun` directly via `evaluation_run_id` (NOT via the verdict). Every Finding assertion explicitly says the row "FK references the SAME `evaluation_run` row" and adds a canon-guard "no `finding` row has any column named `verdict_id`". `EvaluationVerdict` continues to FK the run via its own `evaluation_run_id`. Aligns with arch Sec 5.4.1 line 1179 (Finding.evaluation_run_id) and Sec 5.4.3 line 1208 (EvaluationVerdict.evaluation_run_id). Verification:
 
 ```
-$ grep -nF "source='ast'" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+$ grep -nF "reference the verdict via FK" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+(empty)
+$ grep -nF "FK to the verdict" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
 (empty)
 ```
 
-- [x] 3. FIXED -- Phase 4 coverage feature (lines ~582-598) AND test_balance feature (lines ~600-609) -- both now assert `pack='ingested', source='ingested'` per tech-spec Sec 4.1.1 lines 276-280. The only remaining `source='external'` is in an Appendix-A negation clause that explicitly says "NOT `source='external'`" as a canon-guard. Verification:
+- [x] 3. FIXED -- Phase 8 effort-estimation feature at line ~1126 -- rewrote the multi-hop trace assertion to follow the canonical path: `task.plan_id -> RefactorPlan.hotspot_ids` (JSON array; the suite picks one id) `-> HotSpot.policy_version_id -> PolicyVersion.refactor_weights.effort_model_version` (JSON field, NOT a scalar column). Added an explicit canon-guard: "`policy_version` has NO column named `effort_model_version_id`". Aligns with arch Sec 5.5.2 line 1235 (`hotspot_ids` JSON column) and Sec 5.5.3 line 1247 (`effort_hours` produced by ML model pinned in `PolicyVersion.refactor_weights.effort_model_version`). Verification:
 
 ```
-$ grep -nF "source='external'" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
-594:     And every row has `pack='ingested'` and `source='ingested'` (NOT `source='external'`; the source enum is `computed | ingested | derived` per arch Sec 5.2.1 / tech-spec Sec 4.1.1)
-```
-
-(The surviving hit is a negation clause kept by design.)
-
-- [x] 4. FIXED -- Phase 3 indexer (line ~466), Phase 4 coverage/test_balance/churn/defects (lines ~589, 608, 616, 626), Phase 4 ScanRun-shape outline (lines ~636-644), Phase 6 mgmt.rescan (lines ~919-920) -- ALL replaced `ScanRun.mode='ast_foundation|single|per_row'` with the canonical `ScanRun.kind in {full, delta, external_single, external_per_row, retract}` + separate `sha_binding in {single, per_row}` per implementation-plan Stage 1.2 line 69. Also added two new enum-assertion scenarios in Phase 4 for `scan_run_kind` and `scan_run_sha_binding`. The only surviving `ScanRun.mode` reference is in an Appendix-A negation that says "There is NO `ScanRun.mode` column." Verification:
-
-```
-$ grep -nF "mode='ast_foundation'" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+$ grep -nF "plan.hot_spot_id -> hot_spot.policy_version_id -> policy_version.effort_model_version_id" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
 (empty)
-$ grep -nF "ScanRun.mode" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
-1461:- `ScanRun.kind` is exactly `full | delta | external_single | external_per_row | retract`; `ScanRun.sha_binding` is exactly `single | per_row`. There is NO `ScanRun.mode` column.
+$ grep -nF "plan.hot_spot_id" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+1133:      And `P1.hotspot_ids` is a JSON array (arch Sec 5.5.2 line 1235 -- the column is `hotspot_ids` JSON, NOT a scalar `plan.hot_spot_id`)
+$ grep -nF "effort_model_version_id" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+1138:     And the effort-model identifier lives inside the JSON path `PV1.refactor_weights.effort_model_version` (arch Sec 5.5.3 line 1247 -- the model version is a JSON field on `policy_version.refactor_weights`, NOT a top-level `policy_version.effort_model_version_id` column)
+1139:     And `policy_version` has NO column named `effort_model_version_id` (the model version is JSON-embedded, not a scalar column)
 ```
 
-(The surviving hit is a negation canon-guard kept by design.)
+(All surviving hits are inside negation canon-guards that explicitly forbid the wrong shape.)
 
-- [x] 5. FIXED -- Phase 5 PolicyVersion publish (lines ~706-715) -- removed `signature_alg`, `kid`, `status='draft|active|superseded'`. The publish feature now INSERTs a `policy_version` row with EXACTLY the 7 canonical columns (`policy_version_id, name, rule_refs, threshold_refs, refactor_weights, signature, created_at`) per arch Sec 5.3.3 lines 1121-1138, and the assertion explicitly says "no column named `signature_alg`, `kid`, `status`, `activated_at`, `superseded_at`, or `expires_at` exists". Replaced the bogus "policy.activate enforces 24h overlap since publish" with two new features: (a) `policy.activate` writes an append-only `PolicyActivation(activation_id, policy_version_id, activated_by, created_at)` row per arch Sec 5.3.4 and the active version is the latest by `created_at`; (b) signing-key rotation enforces an 86400s overlap during which BOTH keys verify (the actual semantic of `policy_publish_overlap_min_seconds` per implementation-plan Stage 5.1). Updated the Phase 5 prose intro AND the Phase 5 Background to reflect that the kms-mock's `kid` is an opaque keypair label, NOT a `policy_version` column. Verification:
+- [x] 4. FIXED -- Refactor scenarios at lines 188, 271, 280, 1108, 1117, 1126 -- ALL `arch Sec 5.6`, `5.6.1`, `5.6.2` references replaced with the canonical `arch Sec 5.5.1` (HotSpot), `Sec 5.5.2` (RefactorPlan), `Sec 5.5.3` (RefactorTask). Sec 5.6 in arch is "Reserved -- system-tier carve-out documented in 5.2.1" and contains zero refactor-sub-store tables. Verification:
 
 ```
-$ grep -nF "signature_alg='ed25519'" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+$ grep -nF "arch Sec 5.6" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
 (empty)
-$ grep -nF "status='draft'" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+$ grep -nF "Sec 5.6.1" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
 (empty)
-$ grep -nF "status='active'" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
-(empty)
-$ grep -nF "POLICY_OVERLAP_NOT_SATISFIED" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
+$ grep -nF "Sec 5.6.2" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
 (empty)
 ```
 
-The two surviving `signature_alg` / `superseded_at` hits in the doc (lines 715, 740) are inside `no column named ...` negation assertions that explicitly enforce the canon -- kept by design.
+### Iter-1 issues (resolved in iter 2, re-confirmed clean in iter 3)
 
-- [x] 6. FIXED -- Phase 5 rule-engine evaluation scenario (line ~743) is now `caller='batch_refresh'`; added a new enum-assertion scenario in Phase 5 that proves `EvaluationRun.caller` is constrained to exactly `eval_gate | batch_refresh` per arch Sec 5.4.2 line 1200. Phase 6 eval.gate clean-path scenario (line ~817) is now `caller='eval_gate'`. Verification:
-
-```
-$ grep -nF "caller='rule_engine'" docs\stories\code-intelligence-CLEAN-CODE\e2e-scenarios.md
-(empty)
-```
+- [x] 1. (iter 1) `Postgres 15` -> `Postgres 16` -- iter-3 re-grep confirms (empty).
+- [x] 2. (iter 1) Phase 2 foundation 6+6 base/solid split with `source='computed'` -- iter-3 re-grep confirms only canon-guard negation hits remain.
+- [x] 3. (iter 1) Phase 4 ingested `pack='ingested', source='ingested'` -- iter-3 re-grep confirms only Appendix-A negation hit remains by design.
+- [x] 4. (iter 1) ScanRun.kind + sha_binding -- iter-3 re-grep confirms only Appendix-A negation hit ("There is NO `ScanRun.mode` column") remains by design.
+- [x] 5. (iter 1) PolicyVersion 7-column / PolicyActivation append-only / 86400s key-rotation overlap -- iter-3 re-grep confirms clean.
+- [x] 6. (iter 1) EvaluationRun.caller enum `eval_gate | batch_refresh` -- iter-3 re-grep confirms clean.
 
 ### Story-description coverage
 - "decoupled functional areas" -- Phase 1 enforces a single schema while the role grants in Phases 1/3/5/7/9 enforce per-service writer carve-outs; Phase 9 enforces audit-WAL scoping to exactly the evaluation triplet so other sub-stores stay decoupled.
 - "SOLID coding principal" -- Phase 5 covers `srp.lcom4_threshold`, `dip.fan_in_high`, `isp.interface_width_max` as concrete rule examples bound to a signed `rule_pack`.
 - "system level metrics ... measurable code qualities for big repo, and cross-repo measurements" -- Phase 2 (12 foundation metrics, 6+6 base/solid split) + Phase 7 (7 system-tier metrics) + Phase 11 (100-repo scale).
 - "used by evaluator agent to guard bad practices" -- Phase 6 covers `eval.gate` clean path + the two degraded short-circuits; Phase 7 keeps `percentile_stale` out of the gate.
-- "metrics will be used for refactoring effort of big repo" -- Phase 8 covers the planner with the operator-pinned effort source (`ML model from historical commits`).
+- "metrics will be used for refactoring effort of big repo" -- Phase 8 covers the planner with the operator-pinned effort source (`ML model from historical commits`) AND the canonical multi-hop effort-version trace through `RefactorPlan.hotspot_ids` JSON array and `PolicyVersion.refactor_weights.effort_model_version` JSON field.

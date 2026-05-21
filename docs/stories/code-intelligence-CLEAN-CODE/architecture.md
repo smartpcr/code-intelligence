@@ -851,6 +851,7 @@ against. Every table belongs to exactly one G1 sub-store
 | `display_name` | text | Free-form. |
 | `mode` | enum | `embedded` (default; operator pin `ast-mode-default`, Section 1.6) or `linked`. Determines AST Adapter mode (Section 3.2). |
 | `default_branch` | text | E.g. `main`. |
+| `default_branch_head` | text? | Head SHA of `default_branch`, cached by the Repo Indexer on push/merge webhooks so the Insights surface can answer "what's current?" with a single-row read instead of scanning `Commit`. Nullable until the first scan lands. The composite index `(repo_id, default_branch_head)` (implementation-plan Stage 1.2) backs the index-only-scan shape. The Repo Indexer (Section 3.3) is the only writer. |
 | `created_at` | timestamp | Append-only. |
 
 #### 5.1.2 Commit

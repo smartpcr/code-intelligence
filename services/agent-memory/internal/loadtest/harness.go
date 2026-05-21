@@ -2,7 +2,7 @@
 // orchestrator.
 //
 // The harness composes a [calibration.Config] (which carries
-// the §8.3-derived [reliability.LoadProfile]) and a set of
+// the ┬º8.3-derived [reliability.LoadProfile]) and a set of
 // per-verb [scenarios.Scenario] drivers, runs them concurrently
 // against an [scenarios.AgentClient] / [scenarios.ManagementClient]
 // for the configured duration, and emits a single
@@ -14,7 +14,7 @@
 // to acquire a slot from a per-verb semaphore (sized by
 // `Config.MaxInflightPerVerb`) and launches a worker goroutine.
 // When the semaphore is full the tick is recorded as a "dropped
-// tick" instead of stalling — this preserves the open-loop
+// tick" instead of stalling ΓÇö this preserves the open-loop
 // invariant: planned arrival rate is honoured regardless of
 // downstream latency, and the artifact surfaces drift between
 // requested and achieved RPS rather than the closed-loop
@@ -62,9 +62,9 @@ type Harness struct {
 	// after every Scenario.Execute completes. Used by the
 	// cmd binary to feed an obs.Histogram so the harness's
 	// /metrics surface produces an approximate per-verb
-	// latency signal bucketed at the §8.3 SLO thresholds.
+	// latency signal bucketed at the ┬º8.3 SLO thresholds.
 	// The /metrics histogram does NOT reproduce the
-	// artifact's exact nearest-rank percentiles — see the
+	// artifact's exact nearest-rank percentiles ΓÇö see the
 	// docstring on `cmd/loadtest-harness/main.go::loadtestHarnessRunDurationSeconds`
 	// and on `WithSampleObserver` below for the
 	// bucket-quantization caveat. Nil = no-op (the in-process
@@ -107,9 +107,9 @@ func WithRNG(factory func() scenarios.RNG) Option {
 // Used by the cmd binary to drive the
 // `loadtest_harness_request_duration_seconds` histogram so the
 // /metrics surface offers an approximate per-verb percentile
-// signal whose bucket boundaries align with the §8.3 SLO
+// signal whose bucket boundaries align with the ┬º8.3 SLO
 // thresholds. The /metrics histogram does NOT reproduce the
-// on-disk artifact's exact percentiles — see the docstring on
+// on-disk artifact's exact percentiles ΓÇö see the docstring on
 // `cmd/loadtest-harness/main.go::loadtestHarnessRunDurationSeconds`
 // for the bucket-quantization caveat.
 func WithSampleObserver(observe func(sample scenarios.Sample)) Option {
@@ -164,7 +164,7 @@ func NewHarness(cfg calibration.Config, scen []scenarios.Scenario, opts ...Optio
 	// a per-worker `*rand.Rand` so the runtime does not
 	// serialise on a shared source. rand.NewSource is
 	// goroutine-unsafe but each *rand.Rand we hand out is
-	// local to a scenario worker — no shared state.
+	// local to a scenario worker ΓÇö no shared state.
 	src := rand.NewSource(seed)
 	mu := &sync.Mutex{}
 	h.newRNG = func() scenarios.RNG {
@@ -235,8 +235,8 @@ func (a *aggregator) addSample(s scenarios.Sample) {
 			}
 		}
 	}
-	// Always include measured ranks — including misses
-	// (RecallRank=0) — so the median doesn't silently
+	// Always include measured ranks ΓÇö including misses
+	// (RecallRank=0) ΓÇö so the median doesn't silently
 	// improve when a labelled query fails to find the
 	// expected node. AggregateLearningQuality buckets 0 into
 	// the worst-rank slot (K+1).
@@ -256,18 +256,18 @@ func (a *aggregator) addDrop() { a.dropped.Add(1) }
 // so an operator can replay the run.
 //
 // Context discipline: there are TWO contexts in play.
-//   - `ctx` (the caller's) is the request context — it cancels
+//   - `ctx` (the caller's) is the request context ΓÇö it cancels
 //     when the operator interrupts (SIGINT/SIGTERM) or when the
 //     caller explicitly cancels. In-flight requests use this
 //     context, so a cancel propagates immediately. The harness
 //     does NOT cancel ctx itself.
 //   - `schedulerCtx` (an internal derivative) is the SCHEDULER
-//     context — it cancels when the planned duration elapses,
+//     context ΓÇö it cancels when the planned duration elapses,
 //     stopping new ticks. In-flight requests are NOT cancelled
 //     by the scheduler deadline; they complete (or fail) on
 //     their own (subject to per-scenario RequestTimeout). This
 //     is why the harness measures the FULL latency distribution
-//     including the requests that overflow the planned window —
+//     including the requests that overflow the planned window ΓÇö
 //     truncating those would understate the tail.
 func (h *Harness) Run(ctx context.Context) (calibration.Report, error) {
 	duration := h.cfg.EffectiveDuration()
@@ -321,10 +321,10 @@ func (h *Harness) Run(ctx context.Context) (calibration.Report, error) {
 		report.Aborted = true
 		report.CompletionReason = "aborted-context-cancelled"
 		report.Notes = append(report.Notes,
-			"run aborted by caller (SIGINT/SIGTERM/cancel); per-verb percentiles cover a partial window and must NOT be promoted to a §8.3 baseline")
+			"run aborted by caller (SIGINT/SIGTERM/cancel); per-verb percentiles cover a partial window and must NOT be promoted to a ┬º8.3 baseline")
 	case errors.Is(err, context.DeadlineExceeded):
 		// Caller-supplied deadline fired before our planned
-		// duration elapsed — still an abort from the harness's
+		// duration elapsed ΓÇö still an abort from the harness's
 		// perspective.
 		if report.ActualDuration < report.PlannedDuration {
 			report.Aborted = true
@@ -388,12 +388,20 @@ func (h *Harness) Run(ctx context.Context) (calibration.Report, error) {
 	}
 
 	// Operator-supplied stable notes (e.g. workflow-doc
-	// cross-references) — appended after the dynamic notes so
+	// cross-references) ΓÇö appended after the dynamic notes so
 	// the footer position is deterministic across runs.
+	//
+	// We deliberately do NOT sort report.Notes here. The
+	// append order is already deterministic for a given run
+	// (abort note first, then per-verb degraded/dropped notes
+	// in `cfg.Profile.Verbs` order, then the recall-not-driven
+	// note, then operator artifactNotes in registration
+	// order), and an alphabetical sort would shuffle the
+	// operator-supplied notes into the middle of the dynamic
+	// notes ΓÇö contradicting WithArtifactNote's documented
+	// "predictable footer position" contract.
 	report.Notes = append(report.Notes, h.artifactNotes...)
 
-	// Stable note order — sort for deterministic diffs.
-	sort.Strings(report.Notes)
 	return report, nil
 }
 
@@ -458,7 +466,7 @@ func formatDegradedReasons(reasons map[string]int) string {
 //   - schedulerCtx: governs the TICKER loop. Cancels at the
 //     planned-duration deadline; new ticks stop firing.
 //   - reqCtx: governs IN-FLIGHT requests. Outlives
-//     schedulerCtx by design — requests started before the
+//     schedulerCtx by design ΓÇö requests started before the
 //     deadline complete (or fail on their own RequestTimeout)
 //     rather than being unilaterally cancelled by the harness.
 //     This matches the open-loop invariant: an in-flight request
@@ -474,7 +482,7 @@ func formatDegradedReasons(reasons map[string]int) string {
 func (h *Harness) driveScenario(reqCtx, schedulerCtx context.Context, scen scenarios.Scenario, verb reliability.VerbProfile, agg *aggregator) {
 	interval := verb.Interval()
 	if interval <= 0 {
-		// Defensive — the profile validator already rejects
+		// Defensive ΓÇö the profile validator already rejects
 		// SustainedRPS <= 0; this would mean the operator
 		// constructed a profile bypassing Validate.
 		return
@@ -504,7 +512,7 @@ func (h *Harness) driveScenario(reqCtx, schedulerCtx context.Context, scen scena
 					// obs.Histogram.Observe). Fired
 					// before the aggregator add so a
 					// crashing observer doesn't lose
-					// the sample from the artifact —
+					// the sample from the artifact ΓÇö
 					// the aggregator add is the source
 					// of truth.
 					func() {
@@ -527,7 +535,7 @@ func (h *Harness) driveScenario(reqCtx, schedulerCtx context.Context, scen scena
 		select {
 		case <-schedulerCtx.Done():
 			// Stop firing new ticks. Wait for in-flight
-			// workers to drain — they use reqCtx, not
+			// workers to drain ΓÇö they use reqCtx, not
 			// schedulerCtx, so they complete normally
 			// (subject to their own timeout) instead of
 			// returning ctx.Err() noise that would inflate

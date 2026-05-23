@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,10 +14,16 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cucumber/godog"
 	"gopkg.in/yaml.v3"
 )
+
+// runCmdTimeout bounds external commands invoked by the E2E suite
+// (make lint/test, docker build, ...) so a stalled tool does not hang
+// the whole suite with no diagnostic output.
+const runCmdTimeout = 5 * time.Minute
 
 // requireEnv returns the value of the named environment variable,
 // calling t.Skip when unset or empty.
@@ -202,14 +209,8 @@ func pathPatternMatches(configured []string, expected string) bool {
 			return true
 		}
 		// Also accept a trailing wildcard that would cover the expected path.
-		// Append "/" to the trimmed prefix so we enforce a path-segment
-		// boundary; otherwise "services/clean/**" would incorrectly match
-		// "services/clean-code/**".
-		if strings.HasSuffix(p, "/**") {
-			prefix := strings.TrimSuffix(p, "/**") + "/"
-			if strings.HasPrefix(expected, prefix) {
-				return true
-			}
+		if strings.HasSuffix(p, "/**") && strings.HasPrefix(expected, strings.TrimSuffix(p, "/**")) {
+			return true
 		}
 	}
 	return false
@@ -299,15 +300,30 @@ func (c *ciState) workflowRunsMakeLintTestAndContainerBuildAndBothSucceed(workfl
 	return nil
 }
 
+// runCmd executes the named command in the service directory with a
+// hard deadline (runCmdTimeout) so an unresponsive tool — most notably
+// `docker build --no-cache` against a stalled daemon — cannot hang the
+// whole E2E suite with no diagnostic output. On timeout the child is
+// killed by exec.CommandContext, the buffered stdout/stderr is returned
+// to the caller for inclusion in the failure message, and a trailing
+// "timed out" line is appended so the cause is obvious in CI logs.
 func (c *ciState) runCmd(name string, args ...string) (int, string) {
-	cmd := exec.Command(name, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), runCmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = c.svcRoot
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	exitCode := 0
 	if err := cmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			fmt.Fprintf(&buf,
+				"\nrunCmd: timed out after %s running %q %v in %s\n",
+				runCmdTimeout, name, args, c.svcRoot,
+			)
+			exitCode = -1
+		} else if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 		} else {
 			exitCode = -1

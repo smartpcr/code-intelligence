@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,16 +13,10 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cucumber/godog"
 	"gopkg.in/yaml.v3"
 )
-
-// runCmdTimeout bounds external commands invoked by the E2E suite
-// (make lint/test, docker build, ...) so a stalled tool does not hang
-// the whole suite with no diagnostic output.
-const runCmdTimeout = 5 * time.Minute
 
 // requireEnv returns the value of the named environment variable,
 // calling t.Skip when unset or empty.
@@ -167,11 +160,12 @@ type ghWorkflowStep struct {
 }
 
 type ciState struct {
-	svcRoot     string
-	repoDir     string
-	pathPattern string
-	workflow    *ghWorkflow
-	rawYAML     []byte
+	svcRoot           string
+	repoDir           string
+	pathPattern       string
+	workflow          *ghWorkflow
+	rawYAML           []byte
+	dockerImageTagged bool
 }
 
 func (c *ciState) aPRTouching(pathPattern string) error {
@@ -293,6 +287,9 @@ func (c *ciState) workflowRunsMakeLintTestAndContainerBuildAndBothSucceed(workfl
 	if _, err := os.Stat(dockerfile); err != nil {
 		return fmt.Errorf("Dockerfile not found in %s: %w", c.svcRoot, err)
 	}
+	// Mark before invoking docker build so the scenario's After hook
+	// removes the image even if the build itself fails partway through.
+	c.dockerImageTagged = true
 	if code, out := c.runCmd("docker", "build", "--no-cache", "-t", "clean-code-e2e-verify:latest", "."); code != 0 {
 		return fmt.Errorf("docker build failed (exit %d):\n%s", code, out)
 	}
@@ -300,30 +297,15 @@ func (c *ciState) workflowRunsMakeLintTestAndContainerBuildAndBothSucceed(workfl
 	return nil
 }
 
-// runCmd executes the named command in the service directory with a
-// hard deadline (runCmdTimeout) so an unresponsive tool — most notably
-// `docker build --no-cache` against a stalled daemon — cannot hang the
-// whole E2E suite with no diagnostic output. On timeout the child is
-// killed by exec.CommandContext, the buffered stdout/stderr is returned
-// to the caller for inclusion in the failure message, and a trailing
-// "timed out" line is appended so the cause is obvious in CI logs.
 func (c *ciState) runCmd(name string, args ...string) (int, string) {
-	ctx, cancel := context.WithTimeout(context.Background(), runCmdTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := exec.Command(name, args...)
 	cmd.Dir = c.svcRoot
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	exitCode := 0
 	if err := cmd.Run(); err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			fmt.Fprintf(&buf,
-				"\nrunCmd: timed out after %s running %q %v in %s\n",
-				runCmdTimeout, name, args, c.svcRoot,
-			)
-			exitCode = -1
-		} else if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 		} else {
 			exitCode = -1
@@ -473,6 +455,16 @@ ctx.Step(`^the "([^"]*)" binary is produced$`, s.theBinaryIsProduced)
 
 // ci-workflow-triggers
 ci := &ciState{}
+ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
+if ci.dockerImageTagged {
+// Best-effort cleanup so repeated CI/dev runs do not accumulate
+// dangling clean-code-e2e-verify images. -f tolerates a missing
+// image when the docker build never produced one.
+cleanup := exec.Command("docker", "rmi", "-f", "clean-code-e2e-verify:latest")
+_ = cleanup.Run()
+}
+return ctx, nil
+})
 ctx.Step(`^a PR touching "([^"]*)"$`, ci.aPRTouching)
 ctx.Step(`^GitHub Actions evaluates the workflow file$`, ci.gitHubActionsEvaluatesTheWorkflowFile)
 ctx.Step(`^"([^"]*)" runs make lint test and the container build job and both succeed on the empty scaffold$`, ci.workflowRunsMakeLintTestAndContainerBuildAndBothSucceed)

@@ -202,8 +202,14 @@ func pathPatternMatches(configured []string, expected string) bool {
 			return true
 		}
 		// Also accept a trailing wildcard that would cover the expected path.
-		if strings.HasSuffix(p, "/**") && strings.HasPrefix(expected, strings.TrimSuffix(p, "/**")) {
-			return true
+		// Append "/" to the trimmed prefix so we enforce a path-segment
+		// boundary; otherwise "services/clean/**" would incorrectly match
+		// "services/clean-code/**".
+		if strings.HasSuffix(p, "/**") {
+			prefix := strings.TrimSuffix(p, "/**") + "/"
+			if strings.HasPrefix(expected, prefix) {
+				return true
+			}
 		}
 	}
 	return false

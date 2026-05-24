@@ -285,3 +285,112 @@ are lost on process restart. The development warning log line
 `policy steward backed by in-memory store` signals which mode
 is active.
 
+
+## Predicate DSL evaluator (Stage 5.4)
+
+### What
+
+Every Rule row in the clean_code.rule table carries a
+predicate_dsl text column (architecture Sec 5.3.1 line
+1101). The Rule Engine compiles that text into a boolean
+function over MetricSample rows and evaluates it for every
+SHA being gated. The DSL is implemented in
+`internal/policy/dsl/` -- it is pure (no IO, no side
+effects) and per-policy-version cached.
+
+### Grammar
+
+```
+predicate      ::= or_expr
+or_expr        ::= and_expr ( "OR" and_expr )*
+and_expr       ::= not_expr ( "AND" not_expr )*
+not_expr       ::= "NOT" not_expr | atom
+atom           ::= "(" predicate ")" | threshold_call | comparison | bool_literal
+threshold_call ::= "threshold" "(" string_literal ")"
+comparison     ::= operand cmp_op operand
+cmp_op         ::= "==" | "!=" | ">" | ">=" | "<" | "<="
+operand        ::= field | string_literal | number_literal | bool_literal
+field          ::= "metric_kind" | "scope_kind" | "value" | "pack" | "source" | "degraded"
+```
+
+Precedence: `atom < NOT < AND < OR` (parens override).
+Keywords `AND` / `OR` / `NOT` are case-insensitive;
+field names and string literals are case-sensitive (they
+match DB ENUM labels verbatim).
+
+Closed-set canon-guards run at parse time. A predicate
+`metric_kind == 'lines_of_code'` is rejected as
+`ErrSemantic` because `lines_of_code` is not in the
+canonical set (the canonical name is `loc`); the error
+carries a `Position` pointing at the offending literal.
+The canonical metric_kind set is the union of (a) the 12
+foundation metric_kinds (implementation-plan line 30 / arch
+Sec 1.4.1), (b) the 3 ingested metric_kinds
+`coverage_line_ratio`, `coverage_branch_ratio`,
+`pass_first_try_ratio` (implementation-plan line 31 /
+tech-spec Sec 4.1 lines 302-304), and (c) the 7 system-tier
+metric_kinds (implementation-plan line 32 / arch Sec 1.4.2)
+-- 22 entries total. Editing the set in
+`internal/policy/dsl/sample.go` requires a matching update
+in the planning artifacts.
+
+### Threshold references
+
+`threshold('<uuid>')` references a row in
+`clean_code.threshold` by its `threshold_id`. `Bind`
+resolves the row once at compile time; the bound atom is
+true iff the sample matches the threshold's
+`(metric_kind, scope_kind)` AND the sample value
+satisfies `value <threshold.op> threshold.value`. The UUID
+MUST be present in the `PolicyVersion.ThresholdRefs` set
+of the policy that owns the rule -- this is the
+application-layer FK contract from migration 0003 line 462.
+
+### Caching
+
+`dsl.Cache` memoises compiled predicates per
+`(policy_version_id, source string)`. The hot path is an
+`RWMutex` `RLock` + two map lookups + a closed-channel
+receive (single-digit nanoseconds). Misses install a
+placeholder `cacheEntry{ready chan struct{}}` under the
+cache mutex and then RELEASE the mutex before calling
+`Compile`, so:
+
+- multiple `(policy, source)` keys compile in parallel --
+  a slow `ThresholdResolver.Lookup` on one key does NOT
+  stall hits or compiles for unrelated keys; and
+- concurrent callers racing for the SAME `(policy, source)`
+  de-duplicate via the placeholder's `ready` channel, so
+  `Compile` runs at most once per key (singleflight).
+
+Cache entries are immutable (`PolicyVersion` rows are
+themselves immutable per architecture G5); call
+`Cache.Invalidate` only when a policy version is permanently
+retired and its memory should be reclaimed. `Invalidate` is
+a memory-reclamation hint, NOT a hard correctness boundary
+-- if a `GetOrCompile` races with `Invalidate`, the cache
+may re-install a freshly-compiled entry for the retired
+policy. Because policy versions are immutable, this is
+semantically equivalent; callers needing post-`Invalidate`
+guarantees must externally quiesce concurrent compiles.
+
+The resolver is consulted **only** on the miss path; cache
+hits never reach back into the policy store, so
+`Predicate.Eval` preserves the Stage 5.4 purity contract.
+
+### Failure modes
+
+| Failure                                                          | Sentinel kind         | Where               |
+| ---------------------------------------------------------------- | --------------------- | ------------------- |
+| Bad operator / unterminated string / illegal byte                | `ErrLex`            | `Parse`           |
+| Missing operand / unbalanced paren / trailing junk               | `ErrParse`          | `Parse`           |
+| Unknown field / unknown `metric_kind` / `scope_kind` literal | `ErrSemantic`       | `Parse`           |
+| Type mismatch (e.g. `value == 'foo'`, `metric_kind > 'x'`)   | `ErrType`           | `Parse`           |
+| Unknown threshold UUID / malformed UUID / nil resolver           | `ErrBind`           | `Bind`            |
+| Resolver returned mismatched `threshold_id`                      | `ErrBind`           | `Bind`            |
+| Resolver returned `ErrUnknownThreshold`                        | `ErrBind` + wrapped | `Bind`            |
+
+All errors are `*dsl.Error` carrying a `Position` (line +
+column, 1-indexed). Multi-target `Unwrap` exposes the
+sentinel `Kind` AND any underlying `Cause` so
+`errors.Is` works for both.

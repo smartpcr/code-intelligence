@@ -213,3 +213,31 @@ migration 0003). To back out:
 There is no DOWN-migration step required for backout because
 the existing append-only rows do not block the prior build.
 
+
+## Stage 5.4: Predicate DSL evaluator
+
+### What changed
+
+A new in-process package `internal/policy/dsl/` parses + evaluates
+the `Rule.predicate_dsl` strings stored under
+`clean_code.rule`. There is no new HTTP / gRPC surface, no new
+DB table, and no new env var -- the package is library-only and
+will be wired in by the Stage 5.7 SOLID Rule Engine.
+
+### Pre-roll checks
+
+1. `go test ./services/clean-code/internal/policy/dsl/...` exits 0.
+2. `golangci-lint run ./services/clean-code/internal/policy/dsl/...`
+   exits 0.
+3. No migration is required. Stage 5.4 ships zero schema changes.
+
+### Roll-forward
+
+This is a library-only change. Deploy the new container; nothing
+else.
+
+### Roll-back
+
+Roll back to the prior container. The DSL package is unreferenced
+from any production code path until Stage 5.7 wires it into the
+Rule Engine, so a rollback at this stage is a no-op for state.

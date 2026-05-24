@@ -1,0 +1,156 @@
+package dsl
+
+import "github.com/gofrs/uuid"
+
+// Sample is the denormalised [MetricSample] view the DSL
+// evaluator consumes. The DSL grammar references both
+// `metric_kind` (which lives on the `metric_sample` row
+// directly) and `scope_kind` (which lives on the
+// `scope_binding` row referenced by `metric_sample.scope_id`,
+// architecture Sec 5.2.3 line 1046). To keep [Predicate.Eval]
+// a pure function with no IO, callers MUST denormalise the
+// scope kind into [Sample.ScopeKind] before evaluation.
+//
+// The Rule Engine (Stage 5.7) does this join at batch-load
+// time using a single SQL JOIN of `metric_sample` against
+// `scope_binding`; the evaluator never reaches back into the
+// store.
+//
+// Field shape mirrors architecture Sec 5.2.1 line 894-907.
+// Nullable fields are represented as Has<Field> companions
+// so callers can distinguish "missing" from "zero" without
+// pointer indirection on the hot path:
+//
+//   - `Value` is paired with `HasValue` because the
+//     `metric_sample.value` column is nullable when
+//     `Degraded=true` (migration 0002 line 367 `CHECK (value
+//     IS NOT NULL OR degraded = true)`).
+//
+//   - `DegradedReason` is the empty string when `Degraded`
+//     is false.
+type Sample struct {
+	SampleID       uuid.UUID
+	RepoID         uuid.UUID
+	SHA            string
+	ScopeID        uuid.UUID
+	ScopeKind      string
+	MetricKind     string
+	MetricVersion  int
+	Value          float64
+	HasValue       bool
+	Pack           string
+	Source         string
+	Degraded       bool
+	DegradedReason string
+}
+
+// CanonicalMetricKinds is the closed set of `metric_kind`
+// values architecture Sec 1.4 (lines 81-125) pins as the
+// v1 catalogue. The DSL parser refuses any string literal
+// in a `metric_kind == '...'` comparison that is not in this
+// set -- this is the `dsl-rejects-unknown-metric-kind` test
+// scenario in the Stage 5.4 implementation plan (canon-guard
+// against non-canonical aliases like `lines_of_code` instead
+// of the canonical `loc`).
+//
+// Adding a new metric_kind requires (1) an entry here, (2) a
+// Catalog row in `clean_code.metric_kind` (migration 0001),
+// and (3) a Compute Engine recipe or Cross-Repo Aggregator
+// composer. The set is curated by architecture Sec 1.4 and
+// any extension here MUST be cross-referenced to that section.
+var CanonicalMetricKinds = map[string]struct{}{
+	// Foundation tier / pack=base (architecture Sec 1.4.1).
+	"cyclo":                        {},
+	"cognitive_complexity":         {},
+	"loc":                          {},
+	"cycle_member":                 {},
+	"duplication_ratio":            {},
+	"modification_count_in_window": {},
+	// Foundation tier / pack=solid (architecture Sec 1.4.1).
+	"lcom4":                    {},
+	"fan_in":                   {},
+	"fan_out":                  {},
+	"depth_of_inheritance":     {},
+	"interface_width":          {},
+	"coupling_between_objects": {},
+	// System tier / pack=system (architecture Sec 1.4.2).
+	"xrepo_dep_depth":           {},
+	"arch_debt_ratio":           {},
+	"velocity_trend":            {},
+	"arch_fitness":              {},
+	"blast_radius":              {},
+	"xservice_test_reliability": {},
+	"knowledge_index":           {},
+	// Ingested tier / pack=ingested (implementation-plan line 31
+	// "Canonical 3 ingested metric_kinds", tech-spec Sec 4.1.X
+	// table at lines 302-304). The v1 set is exactly three:
+	// `coverage_line_ratio`, `coverage_branch_ratio` (both
+	// written by Metric Ingestor on `ingest.coverage`), and
+	// `pass_first_try_ratio` (written on `ingest.test_balance`).
+	// The legacy aliases `coverage_line` and `coverage_branch`
+	// are NEVER written (negative clause in implementation-plan
+	// line 31).
+	"coverage_line_ratio":   {},
+	"coverage_branch_ratio": {},
+	"pass_first_try_ratio":  {},
+}
+
+// IsCanonicalMetricKind reports whether s is a member of the
+// closed [CanonicalMetricKinds] set.
+func IsCanonicalMetricKind(s string) bool {
+	_, ok := CanonicalMetricKinds[s]
+	return ok
+}
+
+// CanonicalScopeKinds mirrors the `clean_code.scope_kind`
+// ENUM declared in migration 0002 line 142. Architecture Sec
+// 5.2.3 line 1046 lists the same closed set.
+var CanonicalScopeKinds = map[string]struct{}{
+	"repo":      {},
+	"package":   {},
+	"file":      {},
+	"class":     {},
+	"interface": {},
+	"method":    {},
+	"block":     {},
+}
+
+// IsCanonicalScopeKind reports whether s is a member of the
+// closed [CanonicalScopeKinds] set.
+func IsCanonicalScopeKind(s string) bool {
+	_, ok := CanonicalScopeKinds[s]
+	return ok
+}
+
+// CanonicalPacks mirrors the `clean_code.metric_sample_pack`
+// ENUM declared in migration 0002 line 103. Architecture Sec
+// 5.2.1 line 901 names the same closed set.
+var CanonicalPacks = map[string]struct{}{
+	"base":     {},
+	"solid":    {},
+	"system":   {},
+	"ingested": {},
+}
+
+// IsCanonicalPack reports whether s is a member of the closed
+// [CanonicalPacks] set.
+func IsCanonicalPack(s string) bool {
+	_, ok := CanonicalPacks[s]
+	return ok
+}
+
+// CanonicalSources mirrors the `clean_code.metric_sample_source`
+// ENUM declared in migration 0002 line 115. Architecture Sec
+// 5.2.1 line 902 names the same closed set.
+var CanonicalSources = map[string]struct{}{
+	"computed": {},
+	"derived":  {},
+	"ingested": {},
+}
+
+// IsCanonicalSource reports whether s is a member of the
+// closed [CanonicalSources] set.
+func IsCanonicalSource(s string) bool {
+	_, ok := CanonicalSources[s]
+	return ok
+}

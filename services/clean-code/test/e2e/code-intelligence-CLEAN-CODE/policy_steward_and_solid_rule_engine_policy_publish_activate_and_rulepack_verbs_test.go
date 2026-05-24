@@ -7,8 +7,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -435,11 +437,33 @@ func (s *publishActivateState) noScopeParameterWasAccepted() error {
 		"version_id": s.newVersionID,
 		"scope":      "repo-a",
 	})
-	if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	// FIX (review iter): a transport-level failure (timeout, DNS, conn
+	// refused, TLS) is NOT proof the server rejected the parameter — it
+	// means we never got a real response. Surface it as a test failure
+	// so transient network issues cannot silently mask a regression that
+	// would otherwise accept 'scope'.
+	if err != nil {
+		var netErr net.Error
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			return fmt.Errorf("policy.activate scope-rejection check is inconclusive: "+
+				"request deadline exceeded (network/timeout); cannot prove 'scope' was rejected: %w", err)
+		case errors.As(err, &netErr) && netErr.Timeout():
+			return fmt.Errorf("policy.activate scope-rejection check is inconclusive: "+
+				"network timeout; cannot prove 'scope' was rejected: %w", err)
+		case errors.As(err, &netErr):
+			return fmt.Errorf("policy.activate scope-rejection check is inconclusive: "+
+				"network error (likely connection refused/DNS/TLS); cannot prove 'scope' was rejected: %w", err)
+		default:
+			return fmt.Errorf("policy.activate scope-rejection check is inconclusive: "+
+				"transport-level error; cannot prove 'scope' was rejected: %w", err)
+		}
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return fmt.Errorf("steward accepted 'scope' parameter with 2xx (%d) — should reject; body: %s",
 			resp.StatusCode, string(body))
 	}
-	// Non-2xx or network error = scope was not accepted — good.
+	// Non-2xx HTTP response from the server = scope was actively rejected — good.
 
 	// Also verify schema: no scope column in policy_activation.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

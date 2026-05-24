@@ -857,6 +857,323 @@ func TestMeasurementDownSQLDropsMeasurementObjects(t *testing.T) {
 	}
 }
 
+// TestDiscoverMigrations_findsStage15Pair is the load-bearing
+// assertion for the Stage 1.5 implementation step "Add
+// migrations/0004_roles.up.sql ... and matching
+// 0004_roles.down.sql". A test failure here means the directory
+// layout regressed below the structural minimum the Stage 1.5
+// brief locks in (the role grants migration disappeared, was
+// renamed, or lost its down half).
+func TestDiscoverMigrations_findsStage15Pair(t *testing.T) {
+	t.Parallel()
+	dir, err := MigrationDir(callerDir(t))
+	if err != nil {
+		t.Fatalf("MigrationDir: %v", err)
+	}
+	migs, err := DiscoverMigrations(dir)
+	if err != nil {
+		t.Fatalf("DiscoverMigrations(%q): %v", dir, err)
+	}
+	var got *Migration
+	for i := range migs {
+		if migs[i].Version == "0004" {
+			got = &migs[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("DiscoverMigrations(%q) missing the Stage 1.5 "+
+			"0004_roles pair", dir)
+	}
+	if got.Name != "roles" {
+		t.Errorf("Stage 1.5 migration name = %q, want %q",
+			got.Name, "roles")
+	}
+	if _, err := os.Stat(got.UpPath); err != nil {
+		t.Errorf("up path %q: %v", got.UpPath, err)
+	}
+	if _, err := os.Stat(got.DownPath); err != nil {
+		t.Errorf("down path %q: %v", got.DownPath, err)
+	}
+}
+
+// TestRolesUpSQLBodyMentionsExpectedObjects pins the structural
+// shape of the Stage 1.5 `0004_roles.up.sql` migration against
+// tech-spec Sec 7.2 lines 1232-1261 (canonical role names) and
+// the C5 ACL table at lines 690-696. The contract this test
+// pins:
+//
+//   - All nine canonical roles are created
+//     (`clean_code_repo_indexer`, `clean_code_metric_ingestor`,
+//     `clean_code_xrepo_aggregator`, `clean_code_policy_steward`,
+//     `clean_code_solid_batch`, `clean_code_evaluator`,
+//     `clean_code_wal_reconciler`, `clean_code_refactor_planner`,
+//     `clean_code_management`).
+//   - No alias names (`clean_code_aggregator`,
+//     `clean_code_rule_engine`, `clean_code_audit_replayer`)
+//     appear in the DDL -- they are NEVER created in v1.
+//   - CREATE ROLE statements use the race-safe DO-block pattern
+//     catching `duplicate_object` (no plain `CREATE ROLE` lines
+//     that would fail under concurrent test schemas).
+//   - The two-writer carve-out grants (tech-spec Sec 7.2 lines
+//     1212-1248) are issued to BOTH `clean_code_metric_ingestor`
+//     and `clean_code_xrepo_aggregator` on `metric_sample`,
+//     `metric_retraction`, and `metric_sample_active`.
+//   - Metric Ingestor receives column-level UPDATE on
+//     `commit.scan_status` (sole writer per arch Sec 1.5.1 row 1).
+//   - Repo Indexer receives INSERT on `commit` (initial row only)
+//     and INSERT on `repo_event`.
+//   - Policy Steward receives INSERT on each of the six Policy
+//     tables (`rule`, `rule_pack`, `policy_version`,
+//     `policy_activation`, `threshold`, `override`).
+//   - The three Audit tables (`evaluation_run`,
+//     `evaluation_verdict`, `finding`) carry INSERT grants for
+//     all three writer roles in parallel.
+//   - G3 / C2 / C25 immutability REVOKEs are present
+//     (`metric_sample` no UPDATE/DELETE, retraction +
+//     active no DELETE, snapshot tables no UPDATE/DELETE,
+//     Audit tables no UPDATE/DELETE).
+//   - Refactor Planner receives INSERT on the three Refactor
+//     tables (`hot_spot`, `refactor_plan`, `refactor_task`).
+func TestRolesUpSQLBodyMentionsExpectedObjects(t *testing.T) {
+	t.Parallel()
+	dir, err := MigrationDir(callerDir(t))
+	if err != nil {
+		t.Fatalf("MigrationDir: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "0004_roles.up.sql"))
+	if err != nil {
+		t.Fatalf("read up.sql: %v", err)
+	}
+	sql := strings.ReplaceAll(string(body), "\r\n", "\n")
+	// `code` is the SQL with `--` line comments + single-quoted
+	// string-literal payloads stripped. Forbidden-alias absence
+	// checks run against `code` so a documentary mention of a
+	// rejected alias inside a `--` rationale comment does not
+	// trigger a false positive.
+	code := sqlCodeOnly(sql)
+
+	wantSubstrs := []string{
+		// All nine canonical roles created with the race-safe
+		// DO-block pattern (tech-spec Sec 7.2 lines 1232-1261).
+		"CREATE ROLE clean_code_repo_indexer NOLOGIN",
+		"CREATE ROLE clean_code_metric_ingestor NOLOGIN",
+		"CREATE ROLE clean_code_xrepo_aggregator NOLOGIN",
+		"CREATE ROLE clean_code_policy_steward NOLOGIN",
+		"CREATE ROLE clean_code_solid_batch NOLOGIN",
+		"CREATE ROLE clean_code_evaluator NOLOGIN",
+		"CREATE ROLE clean_code_wal_reconciler NOLOGIN",
+		"CREATE ROLE clean_code_refactor_planner NOLOGIN",
+		"CREATE ROLE clean_code_management NOLOGIN",
+		// Race-safe shape: every CREATE ROLE catches
+		// `duplicate_object` so concurrent test schemas don't
+		// abort the migration on the loser-of-the-race.
+		"EXCEPTION WHEN duplicate_object THEN NULL",
+		// Schema USAGE for every writer role.
+		"GRANT USAGE ON SCHEMA clean_code TO clean_code_repo_indexer",
+		"GRANT USAGE ON SCHEMA clean_code TO clean_code_management",
+		// ----- Catalog / Lifecycle (C5 row 1) -----
+		// Management: BOTH INSERT and UPDATE are column-level on
+		// the Management-owned columns ONLY. INSERT names
+		// (repo_id, display_name, mode, default_branch); UPDATE
+		// names (display_name, mode, default_branch).
+		// `default_branch_head` is excluded from BOTH grants per
+		// architecture Sec 5.1.1 line 854 / Sec 1.5.1 row 1 pin
+		// (Repo Indexer is the sole writer of that column);
+		// `created_at` is excluded so Management cannot backdate.
+		"GRANT INSERT (repo_id, display_name, mode, default_branch) ON clean_code.repo       TO clean_code_management",
+		"GRANT UPDATE (display_name, mode, default_branch)          ON clean_code.repo       TO clean_code_management",
+		"GRANT INSERT                                               ON clean_code.repo_event TO clean_code_management",
+		// Repo Indexer: column-level INSERT on `commit` excludes
+		// `scan_status` per architecture Sec 5.1.2 line 864 / Sec
+		// 1.5.1 row 1 -- the schema-level DEFAULT supplies
+		// 'pending'. Indexer also UPDATEs `repo.default_branch_head`
+		// only (Management-owned columns are off-limits).
+		"GRANT INSERT (repo_id, sha, parent_sha, committed_at) ON clean_code.commit      TO clean_code_repo_indexer",
+		"GRANT INSERT                                          ON clean_code.repo_event  TO clean_code_repo_indexer",
+		"GRANT UPDATE (default_branch_head)                    ON clean_code.repo        TO clean_code_repo_indexer",
+		// Metric Ingestor sole UPDATE of commit.scan_status (column-level).
+		"GRANT UPDATE (scan_status) ON clean_code.commit   TO clean_code_metric_ingestor",
+		"GRANT INSERT, UPDATE       ON clean_code.scan_run TO clean_code_metric_ingestor",
+		// Policy Steward owns the MetricKind catalogue rows.
+		"GRANT INSERT ON clean_code.metric_kind TO clean_code_policy_steward",
+		// ----- Measurement -- foundation tier (C5 row 2) -----
+		"GRANT INSERT, SELECT         ON clean_code.scope_binding        TO clean_code_metric_ingestor",
+		"GRANT INSERT, SELECT         ON clean_code.metric_sample        TO clean_code_metric_ingestor",
+		"GRANT INSERT, SELECT         ON clean_code.metric_retraction    TO clean_code_metric_ingestor",
+		"GRANT INSERT, SELECT, UPDATE ON clean_code.metric_sample_active TO clean_code_metric_ingestor",
+		// ----- Measurement -- system-tier carve-out (C5 row 3) -----
+		"GRANT INSERT, SELECT         ON clean_code.metric_sample          TO clean_code_xrepo_aggregator",
+		"GRANT INSERT, SELECT         ON clean_code.metric_retraction      TO clean_code_xrepo_aggregator",
+		"GRANT INSERT, SELECT, UPDATE ON clean_code.metric_sample_active   TO clean_code_xrepo_aggregator",
+		"GRANT INSERT, SELECT         ON clean_code.repo_metric_snapshot   TO clean_code_xrepo_aggregator",
+		"GRANT INSERT, SELECT         ON clean_code.cross_repo_percentile  TO clean_code_xrepo_aggregator",
+		"GRANT INSERT, SELECT         ON clean_code.portfolio_snapshot     TO clean_code_xrepo_aggregator",
+		// G3 / C2 row immutability REVOKEs (tech-spec Sec 7.2
+		// lines 1362-1367 verbatim).
+		"REVOKE UPDATE, DELETE ON clean_code.metric_sample          FROM PUBLIC, clean_code_metric_ingestor, clean_code_xrepo_aggregator",
+		"REVOKE DELETE         ON clean_code.metric_retraction      FROM PUBLIC, clean_code_metric_ingestor, clean_code_xrepo_aggregator",
+		"REVOKE DELETE         ON clean_code.metric_sample_active   FROM PUBLIC, clean_code_metric_ingestor, clean_code_xrepo_aggregator",
+		"REVOKE UPDATE, DELETE ON clean_code.repo_metric_snapshot   FROM PUBLIC, clean_code_xrepo_aggregator",
+		"REVOKE UPDATE, DELETE ON clean_code.cross_repo_percentile  FROM PUBLIC, clean_code_xrepo_aggregator",
+		"REVOKE UPDATE, DELETE ON clean_code.portfolio_snapshot     FROM PUBLIC, clean_code_xrepo_aggregator",
+		// ----- Policy (C5 row 4) -----
+		"GRANT INSERT ON clean_code.rule              TO clean_code_policy_steward",
+		"GRANT INSERT ON clean_code.rule_pack         TO clean_code_policy_steward",
+		"GRANT INSERT ON clean_code.policy_version    TO clean_code_policy_steward",
+		"GRANT INSERT ON clean_code.policy_activation TO clean_code_policy_steward",
+		"GRANT INSERT ON clean_code.threshold         TO clean_code_policy_steward",
+		"GRANT INSERT ON clean_code.override          TO clean_code_policy_steward",
+		// ----- Audit / verdict (C5 row 5; tech-spec Sec 7.2
+		// lines 1374-1377 -- three writers in parallel) -----
+		"GRANT INSERT, SELECT ON clean_code.evaluation_run     TO clean_code_evaluator",
+		"GRANT INSERT, SELECT ON clean_code.evaluation_run     TO clean_code_solid_batch",
+		"GRANT INSERT, SELECT ON clean_code.evaluation_run     TO clean_code_wal_reconciler",
+		"GRANT INSERT, SELECT ON clean_code.evaluation_verdict TO clean_code_evaluator",
+		"GRANT INSERT, SELECT ON clean_code.evaluation_verdict TO clean_code_solid_batch",
+		"GRANT INSERT, SELECT ON clean_code.evaluation_verdict TO clean_code_wal_reconciler",
+		"GRANT INSERT, SELECT ON clean_code.finding            TO clean_code_evaluator",
+		"GRANT INSERT, SELECT ON clean_code.finding            TO clean_code_solid_batch",
+		"GRANT INSERT, SELECT ON clean_code.finding            TO clean_code_wal_reconciler",
+		"REVOKE UPDATE, DELETE ON clean_code.evaluation_run     FROM PUBLIC, clean_code_evaluator, clean_code_solid_batch, clean_code_wal_reconciler",
+		"REVOKE UPDATE, DELETE ON clean_code.evaluation_verdict FROM PUBLIC, clean_code_evaluator, clean_code_solid_batch, clean_code_wal_reconciler",
+		"REVOKE UPDATE, DELETE ON clean_code.finding            FROM PUBLIC, clean_code_evaluator, clean_code_solid_batch, clean_code_wal_reconciler",
+		// ----- Refactor (C5 row 6) -----
+		"GRANT INSERT ON clean_code.hot_spot       TO clean_code_refactor_planner",
+		"GRANT INSERT ON clean_code.refactor_plan  TO clean_code_refactor_planner",
+		"GRANT INSERT ON clean_code.refactor_task  TO clean_code_refactor_planner",
+	}
+	for _, want := range wantSubstrs {
+		if !strings.Contains(sql, want) {
+			t.Errorf("0004 up.sql missing required substring %q", want)
+		}
+	}
+
+	// Forbidden alias absence: tech-spec Sec 7.2 lines 1232-1261
+	// pins the canonical role names ONLY. The three names below
+	// are NEVER created in v1; checking against `code` (with
+	// comments + string literals stripped) keeps explanatory
+	// prose in COMMENTs / rationale lines from triggering a false
+	// positive while still catching an accidental
+	// `CREATE ROLE clean_code_aggregator` in the DDL itself.
+	notWantSubstrs := []string{
+		"clean_code_aggregator",
+		"clean_code_rule_engine",
+		"clean_code_audit_replayer",
+	}
+	for _, notWant := range notWantSubstrs {
+		if strings.Contains(code, notWant) {
+			t.Errorf("0004 up.sql DDL contains forbidden alias %q -- "+
+				"only the nine canonical role names per tech-spec "+
+				"Sec 7.2 lines 1232-1261 are permitted", notWant)
+		}
+	}
+
+	// The down half MUST NOT use a plain CREATE ROLE (race
+	// hazard under concurrent test schemas -- see the file
+	// header rationale). Every CREATE ROLE in the DDL must be
+	// wrapped in a DO block. We check by counting -- the only
+	// way to safely have N CREATE ROLE lines in the file is via
+	// N DO blocks each catching duplicate_object.
+	//
+	// `sqlNoComments` strips `--` line comments only (NOT string
+	// literals); we deliberately avoid the full `sqlCodeOnly`
+	// view here because that view's literal-stripper enters
+	// "in-string" state on the first single quote and exits on
+	// the next single quote, which an apostrophe-in-comment
+	// (e.g. "Management's delegated") would unbalance, silently
+	// swallowing DDL lines between two apostrophes. Comment
+	// stripping alone is sufficient because the count targets
+	// (`CREATE ROLE`, `EXCEPTION WHEN duplicate_object`) never
+	// appear inside SQL string literals in this migration.
+	sqlNoComments := stripSQLComments(sql)
+	createRoleCount := strings.Count(sqlNoComments, "CREATE ROLE")
+	doBlockCount := strings.Count(sqlNoComments, "EXCEPTION WHEN duplicate_object THEN NULL")
+	if createRoleCount != doBlockCount {
+		t.Errorf("0004 up.sql: CREATE ROLE count = %d, DO-block "+
+			"duplicate_object handler count = %d (every CREATE "+
+			"ROLE must be wrapped in a race-safe DO block per "+
+			"the file header)",
+			createRoleCount, doBlockCount)
+	}
+	if createRoleCount != 9 {
+		t.Errorf("0004 up.sql: CREATE ROLE count = %d, want 9 "+
+			"(the nine canonical roles per tech-spec Sec 7.2 "+
+			"lines 1232-1261)", createRoleCount)
+	}
+}
+
+// TestRolesDownSQLRevokesGrants verifies the Stage 1.5 down half
+// REVOKEs every grant the up half issued and does NOT DROP the
+// nine writer roles. Roles are cluster-wide; a DROP ROLE in this
+// migration would (a) fail under SQLSTATE 2BP01 when sibling
+// tenants hold grants and (b) take the roles away from concurrent
+// test schemas that are still using them.
+func TestRolesDownSQLRevokesGrants(t *testing.T) {
+	t.Parallel()
+	dir, err := MigrationDir(callerDir(t))
+	if err != nil {
+		t.Fatalf("MigrationDir: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "0004_roles.down.sql"))
+	if err != nil {
+		t.Fatalf("read down.sql: %v", err)
+	}
+	sql := strings.ReplaceAll(string(body), "\r\n", "\n")
+	code := sqlCodeOnly(sql)
+
+	wantRevokes := []string{
+		// Symmetric REVOKE for each up-half GRANT (we only
+		// pin the load-bearing ones -- the full set lives in
+		// the up.sql test).
+		"REVOKE INSERT ON clean_code.hot_spot       FROM clean_code_refactor_planner",
+		"REVOKE INSERT ON clean_code.evaluation_run     FROM clean_code_evaluator",
+		"REVOKE INSERT ON clean_code.evaluation_run     FROM clean_code_solid_batch",
+		"REVOKE INSERT ON clean_code.evaluation_run     FROM clean_code_wal_reconciler",
+		"REVOKE INSERT ON clean_code.finding            FROM clean_code_wal_reconciler",
+		"REVOKE INSERT ON clean_code.rule_pack         FROM clean_code_policy_steward",
+		"REVOKE INSERT ON clean_code.policy_version    FROM clean_code_policy_steward",
+		"REVOKE INSERT ON clean_code.metric_kind FROM clean_code_policy_steward",
+		"REVOKE INSERT         ON clean_code.metric_sample        FROM clean_code_metric_ingestor",
+		"REVOKE INSERT         ON clean_code.metric_sample          FROM clean_code_xrepo_aggregator",
+		"REVOKE INSERT, UPDATE ON clean_code.metric_sample_active   FROM clean_code_xrepo_aggregator",
+		"REVOKE INSERT, UPDATE ON clean_code.metric_sample_active FROM clean_code_metric_ingestor",
+		"REVOKE UPDATE (scan_status) ON clean_code.commit   FROM clean_code_metric_ingestor",
+		"REVOKE INSERT (repo_id, sha, parent_sha, committed_at) ON clean_code.commit      FROM clean_code_repo_indexer",
+		"REVOKE INSERT                                          ON clean_code.repo_event  FROM clean_code_repo_indexer",
+		"REVOKE UPDATE (default_branch_head)                    ON clean_code.repo        FROM clean_code_repo_indexer",
+		"REVOKE INSERT (repo_id, display_name, mode, default_branch) ON clean_code.repo       FROM clean_code_management",
+		"REVOKE UPDATE (display_name, mode, default_branch)          ON clean_code.repo       FROM clean_code_management",
+		"REVOKE INSERT                                               ON clean_code.repo_event FROM clean_code_management",
+		// Symmetric schema-USAGE REVOKE for every role.
+		"REVOKE USAGE ON SCHEMA clean_code FROM clean_code_repo_indexer",
+		"REVOKE USAGE ON SCHEMA clean_code FROM clean_code_management",
+	}
+	for _, want := range wantRevokes {
+		if !strings.Contains(sql, want) {
+			t.Errorf("0004 down.sql missing required REVOKE %q", want)
+		}
+	}
+
+	// Down half MUST NOT drop roles (cluster-wide -- see the
+	// file header rationale). A regression here would break
+	// concurrent test schemas that share the cluster.
+	if strings.Contains(code, "DROP ROLE") {
+		t.Errorf("0004 down.sql contains `DROP ROLE` -- roles are " +
+			"cluster-wide and a drop would fail (SQLSTATE 2BP01) " +
+			"when sibling tenants hold grants. The down half MUST " +
+			"REVOKE only.")
+	}
+	// Down half MUST NOT drop the schema CASCADE (that's
+	// 0001_catalog_lifecycle.down.sql's job; 0004 unwinds only
+	// its own grants).
+	if strings.Contains(code, "DROP SCHEMA") {
+		t.Errorf("0004 down.sql contains `DROP SCHEMA` -- only the " +
+			"0001 down half should DROP SCHEMA CASCADE; 0004 unwinds " +
+			"only the role grants it added.")
+	}
+}
+
 // TestRoundTrip_upDownLeavesSchemaEmpty is the integration test
 // for implementation-plan Stage 1.2 scenario "catalog-up-down":
 //

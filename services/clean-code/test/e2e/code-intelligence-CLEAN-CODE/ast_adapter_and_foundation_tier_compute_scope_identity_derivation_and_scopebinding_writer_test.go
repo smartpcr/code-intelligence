@@ -16,17 +16,6 @@ import (
 	"github.com/cucumber/godog"
 )
 
-// requireEnv returns the value of the named environment variable,
-// calling t.Skip when unset or empty.
-func requireEnv(t *testing.T, name string) string {
-	t.Helper()
-	v := os.Getenv(name)
-	if v == "" {
-		t.Skipf("environment variable %s is not set; skipping", name)
-	}
-	return v
-}
-
 // serviceRoot returns the absolute path to the services/clean-code
 // directory by walking up from this source file's location.
 func serviceRoot() string {
@@ -53,34 +42,30 @@ func readModulePath(dir string) (string, error) {
 }
 
 // runProbe compiles and executes a small Go program within the service
-// module, returning its stdout (for JSON parsing), stderr (for error
-// diagnostics only), and exit code. Stdout and stderr are captured into
-// separate buffers so that build-time noise from `go run` (module
-// downloads, vet diagnostics, etc.) does not get prepended to the JSON
-// payload on stdout and break json.Unmarshal in the callers.
-func runProbe(svcRoot, source string) (string, string, int, error) {
+// module, returning its combined stdout/stderr and exit code.
+func runProbe(svcRoot, source string) (string, int, error) {
 	tmpDir, err := os.MkdirTemp(svcRoot, "e2e-scope-probe-")
 	if err != nil {
-		return "", "", -1, fmt.Errorf("creating probe dir: %w", err)
+		return "", -1, fmt.Errorf("creating probe dir: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
 	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(source), 0644); err != nil {
-		return "", "", -1, fmt.Errorf("writing probe: %w", err)
+		return "", -1, fmt.Errorf("writing probe: %w", err)
 	}
 
 	relDir, err := filepath.Rel(svcRoot, tmpDir)
 	if err != nil {
-		return "", "", -1, fmt.Errorf("relative path: %w", err)
+		return "", -1, fmt.Errorf("relative path: %w", err)
 	}
 
 	cmd := exec.Command("go", "run", "./"+filepath.ToSlash(relDir))
 	cmd.Dir = svcRoot
 	cmd.Env = os.Environ()
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
 
 	exitCode := 0
 	if err := cmd.Run(); err != nil {
@@ -90,7 +75,7 @@ func runProbe(svcRoot, source string) (string, string, int, error) {
 			exitCode = -1
 		}
 	}
-	return stdout.String(), stderr.String(), exitCode, nil
+	return buf.String(), exitCode, nil
 }
 
 // ---------- Scenario: scope-id-determinism ----------
@@ -143,20 +128,20 @@ func main() {
 }
 `, modPath)
 
-	stdoutOut, stderrOut, exitCode, err := runProbe(s.svcRoot, probe)
+	output, exitCode, err := runProbe(s.svcRoot, probe)
 	if err != nil {
 		return fmt.Errorf("running determinism probe: %w", err)
 	}
 	if exitCode != 0 {
-		return fmt.Errorf("determinism probe exited %d:\nstderr: %s\nstdout: %s", exitCode, stderrOut, stdoutOut)
+		return fmt.Errorf("determinism probe exited %d:\n%s", exitCode, output)
 	}
 
 	var res struct {
 		ID1 string `json:"id1"`
 		ID2 string `json:"id2"`
 	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(stdoutOut)), &res); err != nil {
-		return fmt.Errorf("parsing probe output: %w\nstdout: %s\nstderr: %s", err, stdoutOut, stderrOut)
+	if err := json.Unmarshal([]byte(strings.TrimSpace(output)), &res); err != nil {
+		return fmt.Errorf("parsing probe output: %w\nraw: %s", err, output)
 	}
 
 	s.id1 = res.ID1
@@ -225,20 +210,20 @@ func main() {
 }
 `, modPath)
 
-	stdoutOut, stderrOut, exitCode, err := runProbe(s.svcRoot, probe)
+	output, exitCode, err := runProbe(s.svcRoot, probe)
 	if err != nil {
 		return fmt.Errorf("running SHA-stability probe: %w", err)
 	}
 	if exitCode != 0 {
-		return fmt.Errorf("SHA-stability probe exited %d:\nstderr: %s\nstdout: %s", exitCode, stderrOut, stdoutOut)
+		return fmt.Errorf("SHA-stability probe exited %d:\n%s", exitCode, output)
 	}
 
 	var res struct {
 		IDShaA string `json:"id_sha_a"`
 		IDShaB string `json:"id_sha_b"`
 	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(stdoutOut)), &res); err != nil {
-		return fmt.Errorf("parsing probe output: %w\nstdout: %s\nstderr: %s", err, stdoutOut, stderrOut)
+	if err := json.Unmarshal([]byte(strings.TrimSpace(output)), &res); err != nil {
+		return fmt.Errorf("parsing probe output: %w\nraw: %s", err, output)
 	}
 
 	s.idShaA = res.IDShaA
@@ -345,12 +330,12 @@ func main() {
 }
 `, modPath)
 
-	stdoutOut, stderrOut, exitCode, err := runProbe(s.svcRoot, probe)
+	output, exitCode, err := runProbe(s.svcRoot, probe)
 	if err != nil {
 		return fmt.Errorf("running idempotent-write probe: %w", err)
 	}
 	if exitCode != 0 {
-		return fmt.Errorf("idempotent-write probe exited %d:\nstderr: %s\nstdout: %s", exitCode, stderrOut, stdoutOut)
+		return fmt.Errorf("idempotent-write probe exited %d:\n%s", exitCode, output)
 	}
 
 	var res struct {
@@ -360,8 +345,8 @@ func main() {
 		FirstSeenSHA string `json:"first_seen_sha"`
 		FinalSHA     string `json:"final_sha"`
 	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(stdoutOut)), &res); err != nil {
-		return fmt.Errorf("parsing probe output: %w\nstdout: %s\nstderr: %s", err, stdoutOut, stderrOut)
+	if err := json.Unmarshal([]byte(strings.TrimSpace(output)), &res); err != nil {
+		return fmt.Errorf("parsing probe output: %w\nraw: %s", err, output)
 	}
 
 	s.writeErr = res.WriteErr

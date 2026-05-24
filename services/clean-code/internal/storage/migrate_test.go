@@ -1174,6 +1174,193 @@ func TestRolesDownSQLRevokesGrants(t *testing.T) {
 	}
 }
 
+// TestDiscoverMigrations_findsStage51Pair pins the Stage 5.1
+// implementation step "Add migrations/0005_policy_signing_keys.up.sql
+// ... and matching 0005_policy_signing_keys.down.sql".
+func TestDiscoverMigrations_findsStage51Pair(t *testing.T) {
+	t.Parallel()
+	dir, err := MigrationDir(callerDir(t))
+	if err != nil {
+		t.Fatalf("MigrationDir: %v", err)
+	}
+	migs, err := DiscoverMigrations(dir)
+	if err != nil {
+		t.Fatalf("DiscoverMigrations(%q): %v", dir, err)
+	}
+	var got *Migration
+	for i := range migs {
+		if migs[i].Version == "0005" {
+			got = &migs[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("DiscoverMigrations(%q) missing the Stage 5.1 "+
+			"0005_policy_signing_keys pair", dir)
+	}
+	if got.Name != "policy_signing_keys" {
+		t.Errorf("Stage 5.1 migration name = %q, want %q",
+			got.Name, "policy_signing_keys")
+	}
+	if _, err := os.Stat(got.UpPath); err != nil {
+		t.Errorf("up path %q: %v", got.UpPath, err)
+	}
+	if _, err := os.Stat(got.DownPath); err != nil {
+		t.Errorf("down path %q: %v", got.DownPath, err)
+	}
+}
+
+// TestPolicySigningKeysUpSQLBodyMentionsExpectedObjects pins the
+// structural shape of the Stage 5.1 `0005_policy_signing_keys.up.sql`
+// migration against tech-spec Sec 8.4 (key storage canon) +
+// Sec 7.2 / C5 (writer isolation). The contract this test
+// pins:
+//
+//   - Exactly one table created: `clean_code.policy_signing_keys`.
+//   - Columns: `key_id`, `fingerprint`, `public_key`,
+//     `key_handle`, `valid_from`, `algorithm`.
+//   - PRIVATE-KEY ABSENCE: the migration MUST NOT include
+//     `private_key`, `secret_key`, `sealed_key`, `signing_secret`,
+//     `wrapped_key`, or any other column that could hold the
+//     Ed25519 private bytes -- tech-spec Sec 8.4 line 944
+//     explicitly forbids storing the private key here.
+//   - VALID_UNTIL ABSENCE: the upper-bound of a key's validity
+//     is DERIVED at read time per the in-package Manager (see
+//     `computeValidUntil` in `internal/policy/keys/manager.go`).
+//     A `valid_until` column would invite an UPDATE on rotation,
+//     violating G3.
+//   - CHECK constraints enforce: fingerprint = 64 lowercase hex
+//     chars, public_key length = 32 bytes (Ed25519), algorithm
+//     in {ed25519}.
+//   - PolicyVersion / PolicyActivation column shape from 0003
+//     remains UNCHANGED (this migration does not add a
+//     `signing_key_id` FK to policy_version per implementation-
+//     plan canon line 112).
+//   - Privilege grants: clean_code_policy_steward gets
+//     INSERT+SELECT; every other writer role gets SELECT only;
+//     UPDATE / DELETE is REVOKEd from PUBLIC and every writer
+//     role per G3.
+//   - The canonical `(valid_from DESC, key_id DESC)` index is
+//     declared so the Evaluator's per-`eval.gate` lookup is a
+//     single index range scan.
+func TestPolicySigningKeysUpSQLBodyMentionsExpectedObjects(t *testing.T) {
+	t.Parallel()
+	dir, err := MigrationDir(callerDir(t))
+	if err != nil {
+		t.Fatalf("MigrationDir: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "0005_policy_signing_keys.up.sql"))
+	if err != nil {
+		t.Fatalf("read up.sql: %v", err)
+	}
+	sql := strings.ReplaceAll(string(body), "\r\n", "\n")
+	code := sqlCodeOnly(sql)
+
+	wantSubstrs := []string{
+		// Table + columns.
+		"CREATE TABLE clean_code.policy_signing_keys",
+		"key_id        uuid           PRIMARY KEY DEFAULT gen_random_uuid()",
+		"fingerprint   text           NOT NULL UNIQUE",
+		"public_key    bytea          NOT NULL",
+		"key_handle    text           NOT NULL",
+		"valid_from    timestamptz    NOT NULL DEFAULT now()",
+		"algorithm     text           NOT NULL DEFAULT 'ed25519'",
+		// CHECK constraints.
+		"CONSTRAINT policy_signing_keys_fingerprint_shape CHECK",
+		"^[0-9a-f]{64}$",
+		"CONSTRAINT policy_signing_keys_public_key_ed25519_len CHECK",
+		"octet_length(public_key) = 32",
+		"CONSTRAINT policy_signing_keys_algorithm_canonical CHECK",
+		"algorithm IN ('ed25519')",
+		// Canonical lookup index.
+		"CREATE INDEX policy_signing_keys_valid_from_idx",
+		"(valid_from DESC, key_id DESC)",
+		// Grants -- writer isolation per C5.
+		"GRANT INSERT, SELECT ON clean_code.policy_signing_keys TO clean_code_policy_steward",
+		"GRANT SELECT ON clean_code.policy_signing_keys TO clean_code_evaluator",
+		"GRANT SELECT ON clean_code.policy_signing_keys TO clean_code_wal_reconciler",
+		"GRANT SELECT ON clean_code.policy_signing_keys TO clean_code_management",
+		// G3: append-only.
+		"REVOKE UPDATE, DELETE ON clean_code.policy_signing_keys FROM PUBLIC",
+	}
+	for _, want := range wantSubstrs {
+		if !strings.Contains(sql, want) {
+			t.Errorf("0005 up.sql missing required substring %q", want)
+		}
+	}
+
+	// Forbidden-column absence checks run against the
+	// code-only view so documentary mentions inside `--`
+	// comments (e.g. "The PRIVATE key NEVER lives in this
+	// table") do not trip false positives.
+	forbiddenColumns := []string{
+		"private_key",
+		"secret_key",
+		"sealed_key",
+		"signing_secret",
+		"wrapped_key",
+		// `valid_until` is derived in code, NOT stored
+		// (storing it would require an UPDATE on rotation,
+		// violating G3).
+		"valid_until",
+		// No `retired_at` either -- retirement is implicit
+		// from the next key's `valid_from + overlap`.
+		"retired_at",
+	}
+	for _, want := range forbiddenColumns {
+		if strings.Contains(code, want) {
+			t.Errorf("0005 up.sql contains forbidden column reference %q "+
+				"(tech-spec Sec 8.4: private keys live in the operator's "+
+				"secret manager; valid_until/retired_at are derived at read time)",
+				want)
+		}
+	}
+
+	// PolicyVersion / PolicyActivation MUST NOT gain a
+	// signing_key_id FK in this stage (implementation-plan
+	// canon line 112).
+	if strings.Contains(code, "policy_version") && strings.Contains(code, "signing_key_id") {
+		t.Errorf("0005 up.sql ties policy_version to signing_key_id; " +
+			"the implementation-plan canon line 112 forbids that column.")
+	}
+}
+
+// TestPolicySigningKeysDownSQLDropsOwnObjects pins the down
+// half: drop the Stage-5.1 index + table only, leave 0004's
+// roles and the schema intact.
+func TestPolicySigningKeysDownSQLDropsOwnObjects(t *testing.T) {
+	t.Parallel()
+	dir, err := MigrationDir(callerDir(t))
+	if err != nil {
+		t.Fatalf("MigrationDir: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "0005_policy_signing_keys.down.sql"))
+	if err != nil {
+		t.Fatalf("read down.sql: %v", err)
+	}
+	sql := strings.ReplaceAll(string(body), "\r\n", "\n")
+	wantDrops := []string{
+		"DROP INDEX IF EXISTS clean_code.policy_signing_keys_valid_from_idx",
+		"DROP TABLE IF EXISTS clean_code.policy_signing_keys",
+	}
+	for _, want := range wantDrops {
+		if !strings.Contains(sql, want) {
+			t.Errorf("0005 down.sql missing required DROP %q", want)
+		}
+	}
+	// Must NOT drop roles or the schema.
+	code := sqlCodeOnly(sql)
+	if strings.Contains(code, "DROP ROLE") {
+		t.Errorf("0005 down.sql contains DROP ROLE -- roles are " +
+			"created by 0004 and are cluster-wide; 0005 down must " +
+			"only unwind its own objects.")
+	}
+	if strings.Contains(code, "DROP SCHEMA") {
+		t.Errorf("0005 down.sql contains DROP SCHEMA -- only " +
+			"0001_catalog_lifecycle.down.sql should DROP SCHEMA.")
+	}
+}
+
 // TestRoundTrip_upDownLeavesSchemaEmpty is the integration test
 // for implementation-plan Stage 1.2 scenario "catalog-up-down":
 //
@@ -1335,6 +1522,15 @@ func TestRoundTrip_upDownLeavesSchemaEmpty(t *testing.T) {
 	})
 	t.Run("portfolio-snapshot-shape", func(t *testing.T) {
 		assertPortfolioSnapshotShape(t, psql, url)
+	})
+	t.Run("policy-signing-keys-roundtrip", func(t *testing.T) {
+		assertPolicySigningKeysRoundTrip(t, psql, url)
+	})
+	t.Run("policy-signing-keys-constraints", func(t *testing.T) {
+		assertPolicySigningKeysConstraints(t, psql, url)
+	})
+	t.Run("policy-signing-keys-grants", func(t *testing.T) {
+		assertPolicySigningKeysGrants(t, psql, url)
 	})
 
 	// Revert in reverse lexical order. Per the Makefile
@@ -3020,5 +3216,250 @@ VALUES ('%s'::uuid, '%s-c', '%s'::uuid, '%s', %d,
 			"under degraded=true per implementation-plan.md "+
 			"line 674 (\"best-effort partial computation or "+
 			"NULL\").", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Stage 5.1 policy_signing_keys live-PG canon-guards
+// ---------------------------------------------------------------------------
+
+// assertPolicySigningKeysRoundTrip exercises the basic
+// INSERT/SELECT contract against
+// `clean_code.policy_signing_keys`. Seeds a valid row, reads it
+// back via `policy.keys.list_active` projection columns,
+// asserts the round-trip matches.
+func assertPolicySigningKeysRoundTrip(t *testing.T, psql, url string) {
+	t.Helper()
+	// Cleanup any prior row from a re-run before seeding.
+	if err := runPSQLInline(t, psql, url,
+		"DELETE FROM clean_code.policy_signing_keys WHERE fingerprint LIKE 'aa%';"); err != nil {
+		t.Fatalf("pre-test cleanup: %v", err)
+	}
+
+	const seed = `
+INSERT INTO clean_code.policy_signing_keys
+    (key_id, fingerprint, public_key, key_handle)
+VALUES (
+    'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa',
+    'aa11220000000000000000000000000000000000000000000000000000000000',
+    decode('0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20', 'hex'),
+    'local-v1:test-handle-roundtrip'
+);`
+	if err := runPSQLInline(t, psql, url, seed); err != nil {
+		t.Fatalf("seed valid policy_signing_keys row: %v", err)
+	}
+
+	// The four columns the `policy.keys.list_active` verb
+	// projects: key_id, fingerprint, valid_from, valid_until.
+	// `valid_until` is DERIVED so the query proves the column
+	// is intentionally absent (we cast valid_from to text via
+	// to_char so any timestamptz mis-format surfaces here).
+	out, err := runPSQLQuery(t, psql, url,
+		"SELECT key_id::text || '|' || fingerprint || '|' || (valid_from IS NOT NULL)::text "+
+			"FROM clean_code.policy_signing_keys "+
+			"WHERE fingerprint = 'aa11220000000000000000000000000000000000000000000000000000000000';")
+	if err != nil {
+		t.Fatalf("read-back round-trip row: %v", err)
+	}
+	out = strings.TrimSpace(out)
+	expectedKeyID := "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa"
+	expectedFingerprint := "aa11220000000000000000000000000000000000000000000000000000000000"
+	if !strings.Contains(out, expectedKeyID) {
+		t.Errorf("round-trip key_id missing; got %q", out)
+	}
+	if !strings.Contains(out, expectedFingerprint) {
+		t.Errorf("round-trip fingerprint missing; got %q", out)
+	}
+	if !strings.Contains(out, "t") {
+		t.Errorf("round-trip valid_from is NULL; got %q", out)
+	}
+
+	// The index on (valid_from DESC, key_id DESC) must be
+	// present -- the active-set lookup query relies on it.
+	// `policy.keys.list_active` runs this exact ordering on
+	// every read.
+	idxOut, err := runPSQLQuery(t, psql, url,
+		"SELECT indexname FROM pg_indexes "+
+			"WHERE schemaname='clean_code' AND tablename='policy_signing_keys' "+
+			"AND indexname='policy_signing_keys_valid_from_idx';")
+	if err != nil {
+		t.Fatalf("query indexes: %v", err)
+	}
+	if !strings.Contains(strings.TrimSpace(idxOut), "policy_signing_keys_valid_from_idx") {
+		t.Errorf("missing index `policy_signing_keys_valid_from_idx`; got %q", idxOut)
+	}
+
+	// `valid_until` MUST NOT be a column on the table -- the
+	// tech-spec Sec 8.4 + Stage 5.1 design DERIVES it at read
+	// time from the successor row. If a future migration adds
+	// the column, the in-process derivation path
+	// (Manager.computeValidUntil) becomes ambiguous.
+	colOut, err := runPSQLQuery(t, psql, url,
+		"SELECT column_name FROM information_schema.columns "+
+			"WHERE table_schema='clean_code' AND table_name='policy_signing_keys' "+
+			"AND column_name IN ('valid_until','retired_at','private_key','secret_key','sealed_key','signing_secret','wrapped_key');")
+	if err != nil {
+		t.Fatalf("query forbidden columns: %v", err)
+	}
+	if strings.TrimSpace(colOut) != "" {
+		t.Errorf("forbidden column(s) present on policy_signing_keys: %q -- the Stage 5.1 contract requires valid_until DERIVED + no private-key column", colOut)
+	}
+
+	// Cleanup so re-runs stay idempotent.
+	if err := runPSQLInline(t, psql, url,
+		"DELETE FROM clean_code.policy_signing_keys WHERE fingerprint = 'aa11220000000000000000000000000000000000000000000000000000000000';"); err != nil {
+		t.Fatalf("post-test cleanup: %v", err)
+	}
+}
+
+// assertPolicySigningKeysConstraints walks every CHECK
+// constraint declared on the table. Each negative case names
+// the constraint expected to fire so a constraint-name drift
+// surfaces here rather than at the Manager layer (where the
+// SQLSTATE -> sentinel mapping in `internal/policy/keys/sql_store.go`
+// keys off the same names).
+func assertPolicySigningKeysConstraints(t *testing.T, psql, url string) {
+	t.Helper()
+	// Cleanup before each negative case.
+	pre := func() {
+		_ = runPSQLInline(t, psql, url,
+			"DELETE FROM clean_code.policy_signing_keys WHERE fingerprint LIKE 'bb%' OR fingerprint LIKE 'cc%' OR fingerprint LIKE 'dd%';")
+	}
+
+	// 1. fingerprint shape violation: too short, non-hex,
+	//    uppercase -- all rejected by
+	//    `policy_signing_keys_fingerprint_shape`.
+	for _, bad := range []string{
+		"AA11220000000000000000000000000000000000000000000000000000000000", // uppercase
+		"bb",      // too short
+		"bbxxzz1100000000000000000000000000000000000000000000000000000000", // non-hex
+	} {
+		pre()
+		insert := fmt.Sprintf(`INSERT INTO clean_code.policy_signing_keys (fingerprint, public_key, key_handle) VALUES ('%s', decode('0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20','hex'), 'h');`, bad)
+		err := runPSQLInline(t, psql, url, insert)
+		if err == nil {
+			t.Errorf("bad fingerprint %q: INSERT succeeded; want CHECK violation", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "policy_signing_keys_fingerprint_shape") {
+			t.Errorf("bad fingerprint %q: error did not name constraint; got %v", bad, err)
+		}
+	}
+
+	// 2. public_key length violation: 31 bytes / 33 bytes ->
+	//    `policy_signing_keys_public_key_ed25519_len`.
+	for _, bad := range []string{
+		"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",     // 31 bytes
+		"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021", // 33 bytes
+	} {
+		pre()
+		insert := fmt.Sprintf(`INSERT INTO clean_code.policy_signing_keys (fingerprint, public_key, key_handle) VALUES ('cc11220000000000000000000000000000000000000000000000000000000000', decode('%s','hex'), 'h');`, bad)
+		err := runPSQLInline(t, psql, url, insert)
+		if err == nil {
+			t.Errorf("bad public_key (hex=%s): INSERT succeeded; want CHECK violation", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "policy_signing_keys_public_key_ed25519_len") {
+			t.Errorf("bad public_key length: error did not name constraint; got %v", err)
+		}
+	}
+
+	// 3. algorithm closed-set violation:
+	//    `policy_signing_keys_algorithm_canonical`.
+	pre()
+	insert := `INSERT INTO clean_code.policy_signing_keys (fingerprint, public_key, key_handle, algorithm) VALUES ('dd11220000000000000000000000000000000000000000000000000000000000', decode('0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20','hex'), 'h', 'dilithium3');`
+	err := runPSQLInline(t, psql, url, insert)
+	if err == nil {
+		t.Error("algorithm='dilithium3': INSERT succeeded; want CHECK violation")
+	} else if !strings.Contains(err.Error(), "policy_signing_keys_algorithm_canonical") {
+		t.Errorf("bad algorithm: error did not name constraint; got %v", err)
+	}
+
+	// 4. fingerprint UNIQUE violation -- two rows with the
+	//    same fingerprint must collide on the UNIQUE
+	//    constraint (which `internal/policy/keys/sql_store.go`
+	//    maps to ErrDuplicateKey via SQLSTATE 23505).
+	pre()
+	if err := runPSQLInline(t, psql, url,
+		`INSERT INTO clean_code.policy_signing_keys (fingerprint, public_key, key_handle) VALUES ('bbcafe0000000000000000000000000000000000000000000000000000000000', decode('0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20','hex'), 'h');`); err != nil {
+		t.Fatalf("seed for UNIQUE test: %v", err)
+	}
+	dupErr := runPSQLInline(t, psql, url,
+		`INSERT INTO clean_code.policy_signing_keys (fingerprint, public_key, key_handle) VALUES ('bbcafe0000000000000000000000000000000000000000000000000000000000', decode('2120191817161514131211100f0e0d0c0b0a09080706050403020100ffeeddcc','hex'), 'h');`)
+	if dupErr == nil {
+		t.Error("duplicate fingerprint: INSERT succeeded; want UNIQUE violation")
+	} else if !strings.Contains(strings.ToLower(dupErr.Error()), "policy_signing_keys_fingerprint_key") &&
+		!strings.Contains(strings.ToLower(dupErr.Error()), "duplicate key") {
+		t.Errorf("duplicate fingerprint: error did not look like UNIQUE violation; got %v", dupErr)
+	}
+	pre()
+}
+
+// assertPolicySigningKeysGrants checks the privilege contract
+// the migration declares against
+// `information_schema.role_table_grants`. The Policy Steward
+// MUST hold INSERT + SELECT; every other writer role MUST
+// hold SELECT and NOT INSERT (writer isolation per tech-spec
+// Sec 7.2 / C5). UPDATE and DELETE MUST be absent from every
+// grantee (append-only G3).
+func assertPolicySigningKeysGrants(t *testing.T, psql, url string) {
+	t.Helper()
+	// Aggregate grants into a single concatenated string so a
+	// single round-trip captures the full ACL.
+	out, err := runPSQLQuery(t, psql, url,
+		"SELECT grantee || '|' || privilege_type FROM information_schema.role_table_grants "+
+			"WHERE table_schema='clean_code' AND table_name='policy_signing_keys' "+
+			"ORDER BY grantee, privilege_type;")
+	if err != nil {
+		t.Fatalf("query role_table_grants: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	has := make(map[string]bool, len(lines))
+	for _, line := range lines {
+		has[strings.TrimSpace(line)] = true
+	}
+
+	mustHave := []string{
+		"clean_code_policy_steward|INSERT",
+		"clean_code_policy_steward|SELECT",
+		"clean_code_repo_indexer|SELECT",
+		"clean_code_metric_ingestor|SELECT",
+		"clean_code_xrepo_aggregator|SELECT",
+		"clean_code_solid_batch|SELECT",
+		"clean_code_evaluator|SELECT",
+		"clean_code_wal_reconciler|SELECT",
+		"clean_code_refactor_planner|SELECT",
+		"clean_code_management|SELECT",
+	}
+	for _, g := range mustHave {
+		if !has[g] {
+			t.Errorf("missing required grant %q; actual grants:\n%s", g, out)
+		}
+	}
+
+	mustNotHave := []string{
+		// Append-only G3: UPDATE and DELETE banned for every
+		// grantee.
+		"clean_code_policy_steward|UPDATE",
+		"clean_code_policy_steward|DELETE",
+		"clean_code_repo_indexer|INSERT",
+		"clean_code_repo_indexer|UPDATE",
+		"clean_code_repo_indexer|DELETE",
+		"clean_code_metric_ingestor|INSERT",
+		"clean_code_xrepo_aggregator|INSERT",
+		"clean_code_solid_batch|INSERT",
+		"clean_code_evaluator|INSERT",
+		"clean_code_evaluator|UPDATE",
+		"clean_code_evaluator|DELETE",
+		"clean_code_wal_reconciler|INSERT",
+		"clean_code_refactor_planner|INSERT",
+		"clean_code_management|INSERT",
+		"clean_code_management|UPDATE",
+		"clean_code_management|DELETE",
+	}
+	for _, g := range mustNotHave {
+		if has[g] {
+			t.Errorf("forbidden grant present %q; tech-spec Sec 7.2 writer isolation breached. Full grants:\n%s", g, out)
+		}
 	}
 }

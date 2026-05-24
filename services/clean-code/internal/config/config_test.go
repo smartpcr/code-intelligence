@@ -30,6 +30,8 @@ func clearCleanCodeEnv(t *testing.T) {
 		EnvWindowDays,
 		EnvFreshnessWindowSeconds,
 		EnvPolicyPublishOverlapSeconds,
+		EnvKMSProvider,
+		EnvKMSMasterKeyHex,
 	} {
 		t.Setenv(k, "")
 	}
@@ -218,6 +220,95 @@ func TestLoad_ConfigFileAndEnvCompose(t *testing.T) {
 	if cfg.PolicySigningRequired != "v1 required" {
 		t.Errorf("PolicySigningRequired (default): %q; want %q", cfg.PolicySigningRequired, "v1 required")
 	}
+}
+
+// TestKMSProvider_DefaultsAndClosedSet pins Stage 5.1
+// composition-root behaviour: KMSProvider defaults to "" so
+// scaffold-mode startup stays signing-disabled; the closed set
+// is `{"", "local", "in-memory"}`; "local" requires a master
+// key of exactly 64 hex chars; and a master key set with a
+// non-local provider is rejected (fail-closed -- never silently
+// drop the master).
+func TestKMSProvider_DefaultsAndClosedSet(t *testing.T) {
+	clearCleanCodeEnv(t)
+
+	t.Run("default empty", func(t *testing.T) {
+		clearCleanCodeEnv(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.KMSProvider != "" {
+			t.Errorf("KMSProvider default = %q; want \"\"", cfg.KMSProvider)
+		}
+		if cfg.KMSMasterKeyHex != "" {
+			t.Errorf("KMSMasterKeyHex default = %q; want \"\"", cfg.KMSMasterKeyHex)
+		}
+	})
+
+	t.Run("unknown provider rejected", func(t *testing.T) {
+		clearCleanCodeEnv(t)
+		t.Setenv(EnvKMSProvider, "magic-vault")
+		if _, err := Load(); err == nil {
+			t.Error("Load with KMSProvider=magic-vault: err=nil; want closed-set rejection")
+		}
+	})
+
+	t.Run("local requires master key", func(t *testing.T) {
+		clearCleanCodeEnv(t)
+		t.Setenv(EnvKMSProvider, "local")
+		if _, err := Load(); err == nil {
+			t.Error("Load with KMSProvider=local but empty master key: err=nil; want length check")
+		}
+	})
+
+	t.Run("local master key wrong length", func(t *testing.T) {
+		clearCleanCodeEnv(t)
+		t.Setenv(EnvKMSProvider, "local")
+		t.Setenv(EnvKMSMasterKeyHex, "deadbeef")
+		if _, err := Load(); err == nil {
+			t.Error("Load with short master key: err=nil; want length check")
+		}
+	})
+
+	t.Run("master key without local provider rejected", func(t *testing.T) {
+		clearCleanCodeEnv(t)
+		t.Setenv(EnvKMSProvider, "in-memory")
+		// 64 hex chars but provider is in-memory -- the
+		// master key has nowhere to go. Fail-closed.
+		t.Setenv(EnvKMSMasterKeyHex, strings.Repeat("a", 64))
+		if _, err := Load(); err == nil {
+			t.Error("Load with master key + in-memory provider: err=nil; want fail-closed rejection")
+		}
+	})
+
+	t.Run("local valid round-trip", func(t *testing.T) {
+		clearCleanCodeEnv(t)
+		t.Setenv(EnvKMSProvider, "local")
+		t.Setenv(EnvKMSMasterKeyHex, strings.Repeat("a", 64))
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load (local + 64-hex master): %v", err)
+		}
+		if cfg.KMSProvider != "local" {
+			t.Errorf("KMSProvider = %q; want local", cfg.KMSProvider)
+		}
+		if len(cfg.KMSMasterKeyHex) != 64 {
+			t.Errorf("KMSMasterKeyHex len = %d; want 64", len(cfg.KMSMasterKeyHex))
+		}
+	})
+
+	t.Run("in-memory provider accepted with no master key", func(t *testing.T) {
+		clearCleanCodeEnv(t)
+		t.Setenv(EnvKMSProvider, "in-memory")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load (in-memory, no master): %v", err)
+		}
+		if cfg.KMSProvider != "in-memory" {
+			t.Errorf("KMSProvider = %q; want in-memory", cfg.KMSProvider)
+		}
+	})
 }
 
 func TestLoad_ConfigFileEnvOverridesFile(t *testing.T) {

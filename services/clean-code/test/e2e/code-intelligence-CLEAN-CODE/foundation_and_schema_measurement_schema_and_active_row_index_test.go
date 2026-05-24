@@ -376,18 +376,45 @@ func (s *measurementState) theScopeBindingWriterInsertsARow(repo, scopeKind, sig
 }
 
 func (s *measurementState) theScopeBindingWriterRunsAgainForSameNaturalKeyAtSHA(sha string) error {
-	// The natural key is (repo_id, scope_kind, canonical_signature, first_seen_sha).
-	// Running again with the same natural key should return the same scope_id.
-	var scopeID string
+	// Simulate the ScopeBinding writer being invoked at a new SHA. Per
+	// architecture G2 ("stable across SHAs", Sec 5.2.3 line 1044), the
+	// writer first resolves the natural key (repo_id, scope_kind,
+	// canonical_signature). If a row already exists, the writer reuses
+	// that row's first_seen_sha so the deterministic-UUID derivation
+	// (which uses first_seen_sha) yields the same scope_id even though
+	// the current sha differs. Only when the scope has never been
+	// observed does the current sha become first_seen_sha.
+	//
+	// This step is the second invocation in the scenario, so a row at
+	// first_seen_sha='sha-A' already exists; the lookup below finds it
+	// and the conflict-on-upsert returns the existing scope_id. The
+	// `sha` parameter ("sha-B") drives both the diagnostic context and
+	// the fallback path (used only if the writer fires on an unseen
+	// scope).
+	var firstSeenSha string
 	err := s.db.QueryRowContext(context.Background(), `
+		SELECT first_seen_sha FROM clean_code.scope_binding
+		WHERE repo_id = $1 AND scope_kind = $2 AND canonical_signature = $3
+		LIMIT 1
+	`, "r1", "function", "pkg.Foo").Scan(&firstSeenSha)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("looking up existing first_seen_sha at sha %q: %w", sha, err)
+		}
+		// No existing row — writer would record the current sha as first_seen.
+		firstSeenSha = sha
+	}
+
+	var scopeID string
+	err = s.db.QueryRowContext(context.Background(), `
 		INSERT INTO clean_code.scope_binding (scope_id, repo_id, scope_kind, canonical_signature, first_seen_sha)
-		VALUES (gen_random_uuid()::text, 'r1', 'function', 'pkg.Foo', 'sha-A')
+		VALUES (gen_random_uuid()::text, 'r1', 'function', 'pkg.Foo', $1)
 		ON CONFLICT (repo_id, scope_kind, canonical_signature, first_seen_sha)
 		DO UPDATE SET scope_id = clean_code.scope_binding.scope_id
 		RETURNING scope_id
-	`).Scan(&scopeID)
+	`, firstSeenSha).Scan(&scopeID)
 	if err != nil {
-		return fmt.Errorf("second scope_binding insert: %w", err)
+		return fmt.Errorf("second scope_binding insert at sha %q (resolved first_seen_sha=%q): %w", sha, firstSeenSha, err)
 	}
 	s.secondScopeID = scopeID
 	return nil
@@ -401,17 +428,22 @@ func (s *measurementState) theSecondCallScopeIDEqualsTheFirst() error {
 }
 
 func (s *measurementState) onlyOneRowExistsInScopeBindingForThatNaturalKey() error {
+	// G2 "stable across SHAs" treats (repo_id, scope_kind, canonical_signature)
+	// as the cross-SHA natural key, with first_seen_sha being a property of
+	// the row (not a discriminator). Count without filtering on first_seen_sha
+	// so a writer bug that creates a separate row at sha-B would be detected
+	// here instead of being masked.
 	var count int
 	err := s.db.QueryRowContext(context.Background(), `
 		SELECT COUNT(*) FROM clean_code.scope_binding
 		WHERE repo_id='r1' AND scope_kind='function'
-		  AND canonical_signature='pkg.Foo' AND first_seen_sha='sha-A'
+		  AND canonical_signature='pkg.Foo'
 	`).Scan(&count)
 	if err != nil {
 		return fmt.Errorf("counting scope_binding rows: %w", err)
 	}
 	if count != 1 {
-		return fmt.Errorf("expected 1 scope_binding row, got %d", count)
+		return fmt.Errorf("expected 1 scope_binding row for natural key (r1,function,pkg.Foo) across all SHAs, got %d", count)
 	}
 	return nil
 }

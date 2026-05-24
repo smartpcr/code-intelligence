@@ -72,6 +72,11 @@ func isEnumOrCheckViolation(err error) bool {
 	return isConstraintViolation(err, "22P02", "23514")
 }
 
+// testRepoID is the canonical hard-coded parent repo row used by the insert
+// scenarios. Kept as a constant so it can be bound as a parameter rather than
+// interpolated into SQL literals.
+const testRepoID = "00000000-0000-0000-0000-000000000001"
+
 // ---------------------------------------------------------------------------
 // shared state for a single scenario run
 // ---------------------------------------------------------------------------
@@ -120,6 +125,16 @@ func (s *policyMigrationState) ensureMigrateUp() error {
 	return nil
 }
 
+// ensureTestRepo inserts the canonical parent repo row used by FK-bearing
+// insert scenarios. Uses parameter binding to avoid SQL literal interpolation.
+func (s *policyMigrationState) ensureTestRepo(ctx context.Context) {
+	_, _ = s.db.ExecContext(ctx, `
+		INSERT INTO clean_code.repo (repo_id, display_name, default_branch)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (repo_id) DO NOTHING
+	`, testRepoID, "test-repo", "main")
+}
+
 // ---------------------------------------------------------------------------
 // step implementations — evaluation_verdict
 // ---------------------------------------------------------------------------
@@ -134,17 +149,13 @@ var verdictSeq int
 func (s *policyMigrationState) anINSERTSuppliesVerdict(verdict string) error {
 	verdictSeq++
 
-	// Ensure parent rows exist for FK references.
-	_, _ = s.db.ExecContext(context.Background(), `
-		INSERT INTO clean_code.repo (repo_id, display_name, default_branch)
-		VALUES ('00000000-0000-0000-0000-000000000001', 'test-repo', 'main')
-		ON CONFLICT (repo_id) DO NOTHING
-	`)
+	ctx := context.Background()
+	s.ensureTestRepo(ctx)
 
-	_, s.lastInsertErr = s.db.ExecContext(context.Background(), fmt.Sprintf(`
+	_, s.lastInsertErr = s.db.ExecContext(ctx, `
 		INSERT INTO clean_code.evaluation_verdict (repo_id, verdict)
-		VALUES ('00000000-0000-0000-0000-000000000001', '%s')
-	`, verdict))
+		VALUES ($1, $2)
+	`, testRepoID, verdict)
 	return nil
 }
 
@@ -174,16 +185,13 @@ var degradedReasonSeq int
 func (s *policyMigrationState) anINSERTSuppliesDegradedReason(reason string) error {
 	degradedReasonSeq++
 
-	_, _ = s.db.ExecContext(context.Background(), `
-		INSERT INTO clean_code.repo (repo_id, display_name, default_branch)
-		VALUES ('00000000-0000-0000-0000-000000000001', 'test-repo', 'main')
-		ON CONFLICT (repo_id) DO NOTHING
-	`)
+	ctx := context.Background()
+	s.ensureTestRepo(ctx)
 
-	_, s.lastInsertErr = s.db.ExecContext(context.Background(), fmt.Sprintf(`
+	_, s.lastInsertErr = s.db.ExecContext(ctx, `
 		INSERT INTO clean_code.evaluation_verdict (repo_id, verdict, degraded_reason)
-		VALUES ('00000000-0000-0000-0000-000000000001', 'pass', '%s')
-	`, reason))
+		VALUES ($1, $2, $3)
+	`, testRepoID, "pass", reason)
 	return nil
 }
 
@@ -217,16 +225,13 @@ func (s *policyMigrationState) theFindingTableExistsAfterMigrateUp() error {
 func (s *policyMigrationState) anINSERTSuppliesDelta(delta string) error {
 	findingDeltaSeq++
 
-	_, _ = s.db.ExecContext(context.Background(), `
-		INSERT INTO clean_code.repo (repo_id, display_name, default_branch)
-		VALUES ('00000000-0000-0000-0000-000000000001', 'test-repo', 'main')
-		ON CONFLICT (repo_id) DO NOTHING
-	`)
+	ctx := context.Background()
+	s.ensureTestRepo(ctx)
 
-	_, s.lastInsertErr = s.db.ExecContext(context.Background(), fmt.Sprintf(`
+	_, s.lastInsertErr = s.db.ExecContext(ctx, `
 		INSERT INTO clean_code.finding (repo_id, delta)
-		VALUES ('00000000-0000-0000-0000-000000000001', '%s')
-	`, delta))
+		VALUES ($1, $2)
+	`, testRepoID, delta)
 	return nil
 }
 
@@ -326,37 +331,36 @@ func (s *policyMigrationState) thePolicyActivationTableExistsAfterMigrateUp() er
 }
 
 func (s *policyMigrationState) twoPolicyActivationRowsInsertedForSamePolicyChain() error {
-	_, _ = s.db.ExecContext(context.Background(), `
-		INSERT INTO clean_code.repo (repo_id, display_name, default_branch)
-		VALUES ('00000000-0000-0000-0000-000000000001', 'test-repo', 'main')
-		ON CONFLICT (repo_id) DO NOTHING
-	`)
+	ctx := context.Background()
+	s.ensureTestRepo(ctx)
+
+	const chainID = "chain-A"
 
 	// Insert first activation (older).
-	_, err := s.db.ExecContext(context.Background(), `
+	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO clean_code.policy_activation (policy_chain_id, repo_id, created_at)
-		VALUES ('chain-A', '00000000-0000-0000-0000-000000000001', now() - interval '1 hour')
-	`)
+		VALUES ($1, $2, now() - interval '1 hour')
+	`, chainID, testRepoID)
 	if err != nil {
 		return fmt.Errorf("inserting first policy_activation: %w", err)
 	}
 
 	// Insert second activation (newer) — this should be the winner.
-	_, err = s.db.ExecContext(context.Background(), `
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO clean_code.policy_activation (policy_chain_id, repo_id, created_at)
-		VALUES ('chain-A', '00000000-0000-0000-0000-000000000001', now())
-	`)
+		VALUES ($1, $2, now())
+	`, chainID, testRepoID)
 	if err != nil {
 		return fmt.Errorf("inserting second policy_activation: %w", err)
 	}
 
 	// Record the latest created_at row's id.
-	err = s.db.QueryRowContext(context.Background(), `
+	err = s.db.QueryRowContext(ctx, `
 		SELECT policy_activation_id::text FROM clean_code.policy_activation
-		WHERE policy_chain_id = 'chain-A'
+		WHERE policy_chain_id = $1
 		ORDER BY created_at DESC
 		LIMIT 1
-	`).Scan(&s.latestPolicyID)
+	`, chainID).Scan(&s.latestPolicyID)
 	if err != nil {
 		return fmt.Errorf("querying latest policy_activation: %w", err)
 	}
@@ -365,15 +369,17 @@ func (s *policyMigrationState) twoPolicyActivationRowsInsertedForSamePolicyChain
 }
 
 func (s *policyMigrationState) theRowWithMAXCreatedAtIsTheActivePolicy() error {
+	const chainID = "chain-A"
+
 	// Simulate the evaluator's resolution query: MAX(created_at) wins.
 	err := s.db.QueryRowContext(context.Background(), `
 		SELECT policy_activation_id::text FROM clean_code.policy_activation
-		WHERE policy_chain_id = 'chain-A'
+		WHERE policy_chain_id = $1
 		  AND created_at = (
 			SELECT MAX(created_at) FROM clean_code.policy_activation
-			WHERE policy_chain_id = 'chain-A'
+			WHERE policy_chain_id = $1
 		  )
-	`).Scan(&s.activePolicyID)
+	`, chainID).Scan(&s.activePolicyID)
 	if err != nil {
 		return fmt.Errorf("resolving active policy: %w", err)
 	}

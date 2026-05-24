@@ -3,7 +3,7 @@ package management
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -76,7 +76,12 @@ func NewHandler(reader *Reader) *Handler {
 //   - 405: method other than GET / HEAD.
 //   - 503: signing-key cache not wired or the underlying
 //     Manager returned [keys.ErrNoActiveKey].
-//   - 500: other reader errors.
+//   - 500: other reader errors. The response body is the
+//     fixed opaque string `internal error`; the underlying
+//     error is logged server-side under
+//     `management.list_active failed` so operators can
+//     diagnose without the wire surface leaking driver / stack
+//     details to unauthenticated clients.
 //
 // Empty arrays at 200 are allowed and expected during the
 // brief startup window before [Bootstrap] mints the first key.
@@ -98,7 +103,17 @@ func (h *Handler) ListActiveSigningKeys(w http.ResponseWriter, r *http.Request) 
 		case errors.Is(err, keys.ErrNoActiveKey):
 			http.Error(w, "no active signing key", http.StatusServiceUnavailable)
 		default:
-			http.Error(w, fmt.Sprintf("management: list_active: %v", err), http.StatusInternalServerError)
+			// Log the raw error server-side (request-id is
+			// picked up from r.Context() by the logging
+			// handler) but emit an opaque body to the wire.
+			// Echoing `err.Error()` back to an unauthenticated
+			// HTTP client leaks driver messages, package
+			// paths, and stack context.
+			slog.ErrorContext(r.Context(), "management.list_active failed",
+				"verb", "policy.keys.list_active",
+				"error", err.Error(),
+			)
+			http.Error(w, "internal error", http.StatusInternalServerError)
 		}
 		return
 	}

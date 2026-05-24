@@ -58,6 +58,20 @@ type Sample struct {
 // and (3) a Compute Engine recipe or Cross-Repo Aggregator
 // composer. The set is curated by architecture Sec 1.4 and
 // any extension here MUST be cross-referenced to that section.
+//
+// DO NOT MUTATE: this map is treated as an immutable closed
+// set by the parser's canon-guard (parser.go validateStringLit
+// and the `dsl-rejects-unknown-metric-kind` test scenario).
+// Inserting or deleting entries at runtime silently bypasses
+// that guard and lets non-canonical metric_kinds slip into
+// compiled predicates. Callers MUST treat this as read-only:
+// only the literal at-rest declaration below may add entries.
+// The variable is exported for in-package iteration (e.g.
+// [TestThreshold_Validate_AcceptsAllCanonicalMetricKinds] and
+// parser.go's error-message helper) and for godoc visibility;
+// a follow-up refactor will unexport it to `canonicalMetricKinds`
+// once those call sites migrate to the [ListCanonicalMetricKinds]
+// helper added below.
 var CanonicalMetricKinds = map[string]struct{}{
 	// Foundation tier / pack=base (architecture Sec 1.4.1).
 	"cyclo":                        {},
@@ -102,9 +116,25 @@ func IsCanonicalMetricKind(s string) bool {
 	return ok
 }
 
+// ListCanonicalMetricKinds returns the canonical metric_kind
+// set as a sorted slice of fresh strings. The returned slice
+// is a new allocation each call, so mutation by the caller
+// cannot leak back into the underlying [CanonicalMetricKinds]
+// canon-guard set. Prefer this helper over ranging over the
+// exported map when constructing error messages or surfacing
+// the catalogue to callers outside this file.
+func ListCanonicalMetricKinds() []string {
+	return sortedKeys(CanonicalMetricKinds)
+}
+
 // CanonicalScopeKinds mirrors the `clean_code.scope_kind`
 // ENUM declared in migration 0002 line 142. Architecture Sec
 // 5.2.3 line 1046 lists the same closed set.
+//
+// DO NOT MUTATE: read-only canon-guard set; see the
+// [CanonicalMetricKinds] doc for the rationale. Prefer
+// [IsCanonicalScopeKind] / [ListCanonicalScopeKinds] over
+// direct map access.
 var CanonicalScopeKinds = map[string]struct{}{
 	"repo":      {},
 	"package":   {},
@@ -122,9 +152,21 @@ func IsCanonicalScopeKind(s string) bool {
 	return ok
 }
 
+// ListCanonicalScopeKinds returns the canonical scope_kind
+// set as a sorted slice of fresh strings; see
+// [ListCanonicalMetricKinds] for the no-leak guarantee.
+func ListCanonicalScopeKinds() []string {
+	return sortedKeys(CanonicalScopeKinds)
+}
+
 // CanonicalPacks mirrors the `clean_code.metric_sample_pack`
 // ENUM declared in migration 0002 line 103. Architecture Sec
 // 5.2.1 line 901 names the same closed set.
+//
+// DO NOT MUTATE: read-only canon-guard set; see the
+// [CanonicalMetricKinds] doc for the rationale. Prefer
+// [IsCanonicalPack] / [ListCanonicalPacks] over direct map
+// access.
 var CanonicalPacks = map[string]struct{}{
 	"base":     {},
 	"solid":    {},
@@ -139,9 +181,21 @@ func IsCanonicalPack(s string) bool {
 	return ok
 }
 
+// ListCanonicalPacks returns the canonical pack set as a
+// sorted slice of fresh strings; see [ListCanonicalMetricKinds]
+// for the no-leak guarantee.
+func ListCanonicalPacks() []string {
+	return sortedKeys(CanonicalPacks)
+}
+
 // CanonicalSources mirrors the `clean_code.metric_sample_source`
 // ENUM declared in migration 0002 line 115. Architecture Sec
 // 5.2.1 line 902 names the same closed set.
+//
+// DO NOT MUTATE: read-only canon-guard set; see the
+// [CanonicalMetricKinds] doc for the rationale. Prefer
+// [IsCanonicalSource] / [ListCanonicalSources] over direct
+// map access.
 var CanonicalSources = map[string]struct{}{
 	"computed": {},
 	"derived":  {},
@@ -153,4 +207,34 @@ var CanonicalSources = map[string]struct{}{
 func IsCanonicalSource(s string) bool {
 	_, ok := CanonicalSources[s]
 	return ok
+}
+
+// ListCanonicalSources returns the canonical source set as a
+// sorted slice of fresh strings; see [ListCanonicalMetricKinds]
+// for the no-leak guarantee.
+func ListCanonicalSources() []string {
+	return sortedKeys(CanonicalSources)
+}
+
+// sortedKeys returns the keys of set as a sorted slice. The
+// returned slice is a fresh allocation; mutation by the caller
+// does not affect set. Closed canon-guard sets here are tiny
+// (<= 30 entries) so the tiny in-place selection sort matches
+// parser.go's listCanonical -- algorithmic choice is irrelevant
+// next to the determinism we need for stable error messages.
+func sortedKeys(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	for i := 0; i < len(out); i++ {
+		mn := i
+		for j := i + 1; j < len(out); j++ {
+			if out[j] < out[mn] {
+				mn = j
+			}
+		}
+		out[i], out[mn] = out[mn], out[i]
+	}
+	return out
 }

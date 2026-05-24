@@ -283,7 +283,7 @@ func javaWalkClassBody(w *javaWalker, body *sitter.Node, parentID, parentQualifi
 		switch c.Type() {
 		case "method_declaration", "constructor_declaration":
 			javaEmitMethod(w, c, parentID, parentQualified, parentKind)
-		case "class_declaration", "record_declaration":
+		case "class_declaration", "record_declaration", "enum_declaration":
 			w.handleClass(c, parentID, parentQualified)
 		case "interface_declaration":
 			w.handleInterface(c, parentID, parentQualified)

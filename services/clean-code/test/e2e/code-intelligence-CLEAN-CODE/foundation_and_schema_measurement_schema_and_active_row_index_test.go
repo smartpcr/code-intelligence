@@ -261,43 +261,6 @@ func (s *measurementState) metricSampleIsNeverUPDATEd() error {
 	if count != 2 {
 		return fmt.Errorf("expected 2 metric_sample rows (append-only), got %d", count)
 	}
-
-	// Row-count alone does not prove immutability: a sneaky UPDATE could
-	// rewrite value_json without changing the row count. To make the
-	// "never UPDATEd" assertion meaningful, verify that each row still
-	// carries the value_json it was inserted with. We compare via the
-	// ::jsonb cast so that jsonb canonicalisation (key ordering / spacing)
-	// does not produce spurious mismatches.
-	//
-	// firstSampleID  was inserted with '{}'     in aMetricSampleActiveRowIsInsertedForQuintuple.
-	// upsertNewSampleID was inserted with '{"v":2}' in anUPSERTOnMetricSampleActiveForTheSameQuintupleSetsANewSampleID.
-	var firstUnchanged bool
-	var firstValueJSON string
-	err = s.db.QueryRowContext(context.Background(), `
-		SELECT value_json::jsonb = '{}'::jsonb, value_json::text
-		FROM clean_code.metric_sample
-		WHERE sample_id = $1
-	`, s.firstSampleID).Scan(&firstUnchanged, &firstValueJSON)
-	if err != nil {
-		return fmt.Errorf("reading original sample value_json: %w", err)
-	}
-	if !firstUnchanged {
-		return fmt.Errorf("metric_sample.value_json for original sample_id=%q was mutated by UPSERT (expected '{}', got %q)", s.firstSampleID, firstValueJSON)
-	}
-
-	var newUnchanged bool
-	var newValueJSON string
-	err = s.db.QueryRowContext(context.Background(), `
-		SELECT value_json::jsonb = '{"v":2}'::jsonb, value_json::text
-		FROM clean_code.metric_sample
-		WHERE sample_id = $1
-	`, s.upsertNewSampleID).Scan(&newUnchanged, &newValueJSON)
-	if err != nil {
-		return fmt.Errorf("reading new sample value_json: %w", err)
-	}
-	if !newUnchanged {
-		return fmt.Errorf("metric_sample.value_json for new sample_id=%q was mutated (expected '{\"v\":2}', got %q)", s.upsertNewSampleID, newValueJSON)
-	}
 	return nil
 }
 

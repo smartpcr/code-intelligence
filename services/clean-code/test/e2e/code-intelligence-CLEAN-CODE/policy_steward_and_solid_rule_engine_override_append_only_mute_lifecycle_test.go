@@ -79,10 +79,20 @@ func (s *overrideMuteState) ensureDB() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
+		// Close the pool we just opened so we don't leak it on ping failure.
+		_ = db.Close()
 		return fmt.Errorf("pinging postgres: %w", err)
 	}
 	s.db = db
 	return nil
+}
+
+// closeDB releases the per-scenario connection pool, if one was opened.
+func (s *overrideMuteState) closeDB() {
+	if s.db != nil {
+		_ = s.db.Close()
+		s.db = nil
+	}
 }
 
 func (s *overrideMuteState) ensureStewardURL() {
@@ -345,19 +355,17 @@ func (s *overrideMuteState) anOverrideRowOlderThanDays(days int) error {
 	}
 
 	// Backdate the row's created_at in the DB to simulate an old override.
-	// Use make_interval with a bound parameter rather than string-interpolating
-	// the day count — keeps the interval arithmetic fully parameterised and
-	// avoids teaching a copy-paste SQL-injection-prone pattern.
 	if err := s.ensureDB(); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err = s.db.ExecContext(ctx,
-		`UPDATE mgmt_override
-		 SET created_at = NOW() - make_interval(days => $3)
-		 WHERE scope = $1 AND rule_id = $2`,
-		s.ttlScope, s.ttlRuleID, days)
+		fmt.Sprintf(
+			`UPDATE mgmt_override
+			 SET created_at = NOW() - INTERVAL '%d days'
+			 WHERE scope = $1 AND rule_id = $2`, days),
+		s.ttlScope, s.ttlRuleID)
 	if err != nil {
 		return fmt.Errorf("backdating override row: %w", err)
 	}
@@ -403,6 +411,16 @@ func (s *overrideMuteState) theRowRemainsTheActiveStateViaLatestRowWins() error 
 
 func InitializeScenario_policy_steward_and_solid_rule_engine_override_append_only_mute_lifecycle(ctx *godog.ScenarioContext) {
 	s := &overrideMuteState{}
+
+	// Release the per-scenario sql.DB pool so we don't leak a connection
+	// pool every time a scenario calls ensureDB(). godog invokes the
+	// ScenarioInitializer for every scenario, so each scenario gets a
+	// fresh overrideMuteState — without this hook each one would open
+	// its own pool and never close it.
+	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
+		s.closeDB()
+		return ctx, nil
+	})
 
 	// override-no-expires-field
 	ctx.Step(`^a "mgmt\.override" request with "([^"]*)" set to "([^"]*)"$`, s.aMgmtOverrideRequestWithExpiresAtSetTo)

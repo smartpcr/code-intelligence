@@ -143,12 +143,7 @@ func (s *policyMigrationState) theEvaluationVerdictTableExistsAfterMigrateUp() e
 	return s.ensureMigrateUp()
 }
 
-// verdictSeq is a monotonic counter to generate unique rows per scenario.
-var verdictSeq int
-
 func (s *policyMigrationState) anINSERTSuppliesVerdict(verdict string) error {
-	verdictSeq++
-
 	ctx := context.Background()
 	s.ensureTestRepo(ctx)
 
@@ -180,11 +175,7 @@ func (s *policyMigrationState) postgreSQLAcceptsTheVerdictInsert() error {
 // step implementations — degraded_reason
 // ---------------------------------------------------------------------------
 
-var degradedReasonSeq int
-
 func (s *policyMigrationState) anINSERTSuppliesDegradedReason(reason string) error {
-	degradedReasonSeq++
-
 	ctx := context.Background()
 	s.ensureTestRepo(ctx)
 
@@ -216,15 +207,11 @@ func (s *policyMigrationState) postgreSQLAcceptsTheDegradedReasonInsert() error 
 // step implementations — finding delta
 // ---------------------------------------------------------------------------
 
-var findingDeltaSeq int
-
 func (s *policyMigrationState) theFindingTableExistsAfterMigrateUp() error {
 	return s.ensureMigrateUp()
 }
 
 func (s *policyMigrationState) anINSERTSuppliesDelta(delta string) error {
-	findingDeltaSeq++
-
 	ctx := context.Background()
 	s.ensureTestRepo(ctx)
 

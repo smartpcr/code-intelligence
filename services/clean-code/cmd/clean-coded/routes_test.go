@@ -20,7 +20,7 @@ import (
 // `services/clean-code/docs/runbook.md` Stage 5.1 runbook.
 func TestRootMux_ScaffoldModeListActive503(t *testing.T) {
 	t.Parallel()
-	mux := rootMux(health.New("v0", "c0", "t0"), nil)
+	mux := rootMux(health.New("v0", "c0", "t0"), nil, nil)
 
 	for _, path := range []string{"/healthz", "/readyz"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -55,7 +55,7 @@ func TestRootMux_ScaffoldModeListActive503(t *testing.T) {
 func TestRootMux_ListActiveMounted(t *testing.T) {
 	t.Parallel()
 	mgmt := management.NewHandler(management.NewReader(nil))
-	mux := rootMux(health.New("v0", "c0", "t0"), mgmt)
+	mux := rootMux(health.New("v0", "c0", "t0"), mgmt, nil)
 
 	req := httptest.NewRequest(http.MethodGet, management.VerbListActivePath, nil)
 	rr := httptest.NewRecorder()

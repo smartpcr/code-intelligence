@@ -83,3 +83,133 @@ already minted production keys** -- doing so destroys the
 public-key record and every signed bundle becomes
 unverifiable. The DOWN is reserved for clean-room dev-loop
 re-bootstraps.
+
+## Stage 5.2: Policy publish/activate/rulepack verbs
+
+### Pre-requisites
+
+This stage builds on the Stage 5.1 signing-key cache. Before
+rolling out 5.2, confirm Stage 5.1's bootstrap (master key,
+migration 0005, env vars, `signing_key_cache` readiness)
+already lands green per the section above. The publish verbs
+refuse to write when no active signing key is loaded
+(`ErrNoActiveSigningKey` -> 503).
+
+### One-time bootstrap (per environment)
+
+1. **Apply migration `0003_policy_audit_refactor`** against
+   the shared Postgres instance. It creates the canonical
+   `clean_code.{policy_version, policy_activation, rule_pack,
+   rule}` tables plus the `clean_code.rule_severity` ENUM and
+   the supporting append-only column constraints.
+
+2. **Confirm the role grants** from `0004_roles.up.sql` are in
+   place: the steward role must have `INSERT, SELECT` on all
+   four tables and MUST NOT have `UPDATE` or `DELETE`. The
+   policy/rules sub-store is append-only per architecture G3.
+
+3. **No additional env vars** are required beyond Stage 5.1.
+   The composition root constructs the steward against the
+   same `*sql.DB` handle the keys subsystem uses; when
+   `CLEAN_CODE_PG_URL` is set the steward writes to PostgreSQL,
+   otherwise it falls back to the in-memory store
+   (development only).
+
+### Per-rollout verification
+
+After deploying a new build, confirm:
+
+1. `/readyz` returns 200 within 30s (Stage 5.1 cache loaded).
+
+2. **Bootstrap a rulepack BEFORE the first `policy.publish`.**
+   `Steward.Publish` enforces the JSON-FK contract on
+   `rule_refs` -- a publish naming a `(rule_id, version)` that
+   has not yet been registered returns **400** with
+   `error:"unknown_rule_ref"`. On a fresh environment you MUST
+   publish the rulepack(s) you intend to reference first:
+
+   ```bash
+   curl -fsS -X POST http://$POD:8080/v1/policy/publish_rulepack \
+     -H 'Content-Type: application/json' \
+     -d '{
+       "pack_id": "solid.srp",
+       "version": 1,
+       "display_name": "Single Responsibility",
+       "description_md": "SOLID SRP rulepack.",
+       "rules": [
+         {
+           "rule_id": "solid.srp.lcom4_high",
+           "version": 1,
+           "predicate_dsl": "lcom4 > 0.7",
+           "severity_default": "block",
+           "description_md": "High LCOM4 -- methods share little state."
+         }
+       ]
+     }' | jq .
+   ```
+
+   Expect 200 with the inserted `rule_pack` + `rules` echoed.
+   A 409 means the pack was already published in a prior
+   rollout -- safe to skip and move on. A 503 means the
+   signing-key cache isn't loaded; triage via the Stage 5.1
+   runbook before re-running.
+
+3. A canary `policy.publish` succeeds (this references the
+   rule registered in step 2):
+
+   ```bash
+   curl -fsS -X POST http://$POD:8080/v1/policy/publish \
+     -H 'Content-Type: application/json' \
+     -d '{
+       "name": "canary",
+       "rule_refs": [{"rule_id": "solid.srp.lcom4_high", "version": 1}],
+       "threshold_refs": [],
+       "refactor_weights": {
+         "alpha": 0.4, "beta": 0.3, "gamma": 0.2, "delta": 0.1,
+         "effort_model_version": "v1.0",
+         "window_days": 90
+       }
+     }' | jq .
+   ```
+
+   Expect 200 + a `policy_version_id`, `signature`, and
+   `created_at`. A 400 with `error:"unknown_rule_ref"` here
+   means step 2 was skipped (or the `rule_id`/`version` in
+   this body does not match what step 2 registered). A 503
+   indicates the signing-key cache isn't loaded -- triage via
+   the Stage 5.1 runbook.
+
+4. A `policy.activate` against the returned id succeeds:
+
+   ```bash
+   curl -fsS -X POST http://$POD:8080/v1/policy/activate \
+     -H 'Content-Type: application/json' \
+     -d '{"policy_version_id":"<uuid from step 3>","activated_by":"rollout"}' | jq .
+   ```
+
+5. The banned-verb paths return 501 (NOT 404 -- the route is
+   intentionally mounted as a "verb is rejected" signal):
+
+   ```bash
+   curl -i -X POST http://$POD:8080/v1/policy/rulepack/add -d '{}'
+   # HTTP/1.1 501 Not Implemented
+   ```
+
+6. The audit log shows `policy_version`, `policy_activation`,
+   `rule_pack`, and `rule` writes by the
+   `clean_code_policy_steward` role only -- no other role
+   should appear in INSERT statements against these tables.
+
+### Backout
+
+Stage 5.2 is purely additive (new routes + new tables in
+migration 0003). To back out:
+
+1. Stop calling the new verbs from the operator dashboard
+   client.
+2. Restart the pod with the previous build; the new tables
+   stay populated (append-only) but are no longer written.
+
+There is no DOWN-migration step required for backout because
+the existing append-only rows do not block the prior build.
+

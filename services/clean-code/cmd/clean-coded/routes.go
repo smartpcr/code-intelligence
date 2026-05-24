@@ -29,7 +29,15 @@ import (
 // case with a 503 + descriptive body inside
 // `ListActiveSigningKeys`, so the scaffold path reuses that
 // branch instead of duplicating an inline 503.
-func rootMux(healthHandler *health.Handler, mgmt *management.Handler) *http.ServeMux {
+//
+// `policy` MAY also be nil; same scaffold semantics apply --
+// every write verb routes through to the steward-not-wired
+// 503 branch in [management.PolicyWriter]. The banned-verb
+// 501 paths (`policy.rulepack.add`, `policy.rulepack.remove`,
+// `policy.override`) are ALWAYS mounted -- a 501 is the
+// canonical "this verb is not part of the v1 surface"
+// signal regardless of whether the steward is wired.
+func rootMux(healthHandler *health.Handler, mgmt *management.Handler, policy *management.PolicyWriter) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthHandler.Healthz)
 	mux.HandleFunc("/readyz", healthHandler.Readyz)
@@ -37,5 +45,15 @@ func rootMux(healthHandler *health.Handler, mgmt *management.Handler) *http.Serv
 		mgmt = management.NewHandler(nil)
 	}
 	mux.HandleFunc(management.VerbListActivePath, mgmt.ListActiveSigningKeys)
+
+	if policy == nil {
+		policy = management.NewPolicyWriter(nil)
+	}
+	mux.HandleFunc(management.VerbPublishPath, policy.Publish)
+	mux.HandleFunc(management.VerbActivatePath, policy.Activate)
+	mux.HandleFunc(management.VerbPublishRulepackPath, policy.PublishRulepack)
+	mux.HandleFunc(management.VerbRulepackAddPath, management.UnimplementedVerb("policy.rulepack.add"))
+	mux.HandleFunc(management.VerbRulepackRemovePath, management.UnimplementedVerb("policy.rulepack.remove"))
+	mux.HandleFunc(management.VerbOverridePath, management.UnimplementedVerb("policy.override"))
 	return mux
 }

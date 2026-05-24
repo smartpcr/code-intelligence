@@ -49,6 +49,7 @@ import (
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/logging"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/management"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/keys"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/steward"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/version"
 )
 
@@ -114,6 +115,7 @@ func run(args []string) error {
 		keysResult  *keys.BuildResult
 		stopRefresh func()
 		mgmt        *management.Handler
+		policy      *management.PolicyWriter
 	)
 
 	// --- Policy Steward signing-key wiring (Stage 5.1) ---
@@ -162,6 +164,44 @@ func run(args []string) error {
 			)
 		})
 		mgmt = management.NewHandler(management.NewReader(built.Manager))
+
+		// --- Policy Steward write verbs (Stage 5.2) ---
+		// The steward signs the policy-version row at
+		// publish time using the same `keys.Manager` the
+		// read-side verb (`policy.keys.list_active`)
+		// exposes. We pick the persistence backend the
+		// same way as the keys subsystem: when a PostgreSQL
+		// handle is wired, use the SQL store; otherwise
+		// fall back to the in-memory store so a developer
+		// can exercise the verbs end-to-end without
+		// spinning up a database.
+		var stewStore steward.Store
+		if db != nil {
+			sqlStore, ssErr := steward.NewSQLStore(db)
+			if ssErr != nil {
+				_ = db.Close()
+				return fmt.Errorf("policy/steward: NewSQLStore: %w", ssErr)
+			}
+			stewStore = sqlStore
+			log.Info("policy steward backed by postgres")
+		} else {
+			stewStore = steward.NewInMemoryStore()
+			log.Warn("policy steward backed by in-memory store (rows are lost on process restart; set CLEAN_CODE_PG_URL to persist)")
+		}
+		stew, stewErr := steward.New(steward.Config{
+			Store:  stewStore,
+			Signer: built.Manager,
+		})
+		if stewErr != nil {
+			if db != nil {
+				_ = db.Close()
+			}
+			return fmt.Errorf("policy/steward: New: %w", stewErr)
+		}
+		policy = management.NewPolicyWriter(stew)
+		log.Info("policy steward wired",
+			"backend", map[bool]string{true: "postgres", false: "memory"}[db != nil],
+		)
 		log.Info("policy signing-key cache wired",
 			"kms_provider", cfg.KMSProvider,
 			"postgres_configured", db != nil,
@@ -174,7 +214,7 @@ func run(args []string) error {
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           rootMux(healthHandler, mgmt),
+		Handler:           rootMux(healthHandler, mgmt, policy),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

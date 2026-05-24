@@ -345,17 +345,19 @@ func (s *overrideMuteState) anOverrideRowOlderThanDays(days int) error {
 	}
 
 	// Backdate the row's created_at in the DB to simulate an old override.
+	// Use make_interval with a bound parameter rather than string-interpolating
+	// the day count — keeps the interval arithmetic fully parameterised and
+	// avoids teaching a copy-paste SQL-injection-prone pattern.
 	if err := s.ensureDB(); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err = s.db.ExecContext(ctx,
-		fmt.Sprintf(
-			`UPDATE mgmt_override
-			 SET created_at = NOW() - INTERVAL '%d days'
-			 WHERE scope = $1 AND rule_id = $2`, days),
-		s.ttlScope, s.ttlRuleID)
+		`UPDATE mgmt_override
+		 SET created_at = NOW() - make_interval(days => $3)
+		 WHERE scope = $1 AND rule_id = $2`,
+		s.ttlScope, s.ttlRuleID, days)
 	if err != nil {
 		return fmt.Errorf("backdating override row: %w", err)
 	}

@@ -28,18 +28,35 @@ func requireEnv(t *testing.T, name string) string {
 }
 
 // serviceRoot returns the absolute path to the services/clean-code
-// directory by walking up from this source file's location.
-func serviceRoot() string {
-	_, thisFile, _, _ := runtime.Caller(0)
+// directory by walking up from this source file's location. It returns
+// an error if runtime.Caller cannot determine the source file path or if
+// the path cannot be resolved to an absolute path; callers must propagate
+// this error rather than silently working with an empty or wrong root.
+func serviceRoot() (string, error) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		return "", fmt.Errorf("runtime.Caller(0) failed; cannot determine source file path for serviceRoot")
+	}
+	if thisFile == "" {
+		return "", fmt.Errorf("runtime.Caller(0) returned an empty source file path; cannot derive serviceRoot")
+	}
 	dir := filepath.Dir(thisFile)
 	root := filepath.Join(dir, "..", "..", "..")
-	abs, _ := filepath.Abs(root)
-	return abs
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolving absolute path of %s: %w", root, err)
+	}
+	return abs, nil
 }
 
 // fixturesRoot returns the absolute path to the tests/fixtures/ast directory.
-func fixturesRoot() string {
-	return filepath.Join(serviceRoot(), "tests", "fixtures", "ast")
+// It returns an error if the service root cannot be determined.
+func fixturesRoot() (string, error) {
+	root, err := serviceRoot()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "tests", "fixtures", "ast"), nil
 }
 
 // readModulePath extracts the module path from go.mod in dir.
@@ -58,10 +75,8 @@ func readModulePath(dir string) (string, error) {
 }
 
 // runProbe compiles and executes a small Go program within the service
-// module, returning its combined stdout/stderr and exit code. Any
-// trailing args are forwarded to the probe as command-line arguments,
-// so probes can read them via os.Args[1:].
-func runProbe(svcRoot, source string, args ...string) (string, int, error) {
+// module, returning its combined stdout/stderr and exit code.
+func runProbe(svcRoot, source string) (string, int, error) {
 	tmpDir, err := os.MkdirTemp(svcRoot, "e2e-ast-probe-")
 	if err != nil {
 		return "", -1, fmt.Errorf("creating probe dir: %w", err)
@@ -77,8 +92,7 @@ func runProbe(svcRoot, source string, args ...string) (string, int, error) {
 		return "", -1, fmt.Errorf("relative path: %w", err)
 	}
 
-	cmdArgs := append([]string{"run", "./" + filepath.ToSlash(relDir)}, args...)
-	cmd := exec.Command("go", cmdArgs...)
+	cmd := exec.Command("go", "run", "./"+filepath.ToSlash(relDir))
 	cmd.Dir = svcRoot
 	cmd.Env = os.Environ()
 
@@ -115,8 +129,17 @@ type parseResultEntry struct {
 }
 
 func (p *parserFleetState) aFixtureFilePerV1PinnedLanguage() error {
-	p.svcRoot = serviceRoot()
-	p.fixturesDir = fixturesRoot()
+	svc, err := serviceRoot()
+	if err != nil {
+		return fmt.Errorf("resolving service root: %w", err)
+	}
+	p.svcRoot = svc
+
+	fixDir, err := fixturesRoot()
+	if err != nil {
+		return fmt.Errorf("resolving fixtures root: %w", err)
+	}
+	p.fixturesDir = fixDir
 
 	// Verify at least the fixture directories exist (or will be created by
 	// make fixtures-ast). If they don't exist yet, run the bootstrap target.
@@ -168,10 +191,6 @@ type result struct {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: probe <fixturesDir>")
-		os.Exit(2)
-	}
 	fixturesDir := os.Args[1]
 	languages := []string{"go", "python", "typescript", "java"}
 	results := make(map[string]result)
@@ -235,7 +254,7 @@ func main() {
 }
 `, modPath)
 
-	output, exitCode, err := runProbe(p.svcRoot, probe, p.fixturesDir)
+	output, exitCode, err := runProbe(p.svcRoot, probe)
 	if err != nil {
 		return fmt.Errorf("running parse probe: %w", err)
 	}
@@ -324,8 +343,17 @@ type protoRoundTripState struct {
 }
 
 func (r *protoRoundTripState) aParsedAstFile() error {
-	r.svcRoot = serviceRoot()
-	r.fixturesDir = fixturesRoot()
+	svc, err := serviceRoot()
+	if err != nil {
+		return fmt.Errorf("resolving service root: %w", err)
+	}
+	r.svcRoot = svc
+
+	fixDir, err := fixturesRoot()
+	if err != nil {
+		return fmt.Errorf("resolving fixtures root: %w", err)
+	}
+	r.fixturesDir = fixDir
 
 	// Ensure fixtures exist.
 	if _, err := os.Stat(r.fixturesDir); os.IsNotExist(err) {
@@ -380,10 +408,6 @@ type result struct {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: probe <fixturesDir>")
-		os.Exit(2)
-	}
 	fixturesDir := os.Args[1]
 	goDir := filepath.Join(fixturesDir, "go")
 	entries, err := os.ReadDir(goDir)
@@ -455,7 +479,7 @@ func main() {
 }
 `, modPath)
 
-	output, exitCode, err := runProbe(r.svcRoot, probe, r.fixturesDir)
+	output, exitCode, err := runProbe(r.svcRoot, probe)
 	if err != nil {
 		return fmt.Errorf("running round-trip probe: %w", err)
 	}

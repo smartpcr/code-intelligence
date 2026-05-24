@@ -80,11 +80,11 @@ type measurementState struct {
 	db *sql.DB
 
 	// active-row-quintuple-uniqueness
-	firstSampleID      string
-	secondInsertErr    error
-	upsertErr          error
-	upsertNewSampleID  string
-	activeRowCount     int
+	firstSampleID     string
+	secondInsertErr   error
+	upsertErr         error
+	upsertNewSampleID string
+	activeRowCount    int
 
 	// scope-binding
 	firstScopeID  string
@@ -137,19 +137,25 @@ func (s *measurementState) theMeasurementTablesExistAfterMigrateUp() error {
 // -- active-row-quintuple-uniqueness ----------------------------------------
 
 func (s *measurementState) aMetricSampleActiveRowIsInsertedForQuintuple(repo, sha, scope, metricKind, metricVersion string) error {
-	// Ensure parent repo exists.
-	_, _ = s.db.ExecContext(context.Background(), `
+	// Ensure parent repo exists. Surface any error (e.g. missing schema /
+	// table) immediately so callers get a clear "relation does not exist"
+	// message rather than a downstream FK violation.
+	if _, err := s.db.ExecContext(context.Background(), `
 		INSERT INTO clean_code.repo (repo_id, display_name, default_branch)
 		VALUES ($1, 'test-repo', 'main')
 		ON CONFLICT (repo_id) DO NOTHING
-	`, repo)
+	`, repo); err != nil {
+		return fmt.Errorf("inserting parent clean_code.repo row: %w", err)
+	}
 
 	// Insert a scope_binding row so we have a valid scope_id.
-	_, _ = s.db.ExecContext(context.Background(), `
+	if _, err := s.db.ExecContext(context.Background(), `
 		INSERT INTO clean_code.scope_binding (scope_id, repo_id, scope_kind, canonical_signature, first_seen_sha)
 		VALUES ($1, $2, 'function', 'test.Func', $3)
 		ON CONFLICT DO NOTHING
-	`, scope, repo, sha)
+	`, scope, repo, sha); err != nil {
+		return fmt.Errorf("inserting parent clean_code.scope_binding row: %w", err)
+	}
 
 	// Insert a metric_sample row to reference.
 	sampleID := fmt.Sprintf("sample-%s-%s-%s-%s-%s", repo, sha, scope, metricKind, metricVersion)
@@ -267,7 +273,9 @@ func (s *measurementState) metricSampleIsNeverUPDATEd() error {
 // -- pack-source-enum-rejects-invalid ---------------------------------------
 
 func (s *measurementState) anINSERTIntoMetricSampleSuppliesPack(pack string) error {
-	s.ensureParentRows()
+	if err := s.ensureParentRows(); err != nil {
+		return err
+	}
 	_, s.lastInsertErr = s.db.ExecContext(context.Background(), `
 		INSERT INTO clean_code.metric_sample (sample_id, repo_id, sha, scope_id, metric_kind, metric_version, value_json, pack)
 		VALUES ('sample-pack-test', 'repo-enum-test', 'sha-enum', 'scope-enum', 'complexity', 'v1', '{}', $1)
@@ -276,7 +284,9 @@ func (s *measurementState) anINSERTIntoMetricSampleSuppliesPack(pack string) err
 }
 
 func (s *measurementState) anINSERTIntoMetricSampleSuppliesSource(source string) error {
-	s.ensureParentRows()
+	if err := s.ensureParentRows(); err != nil {
+		return err
+	}
 	_, s.lastInsertErr = s.db.ExecContext(context.Background(), `
 		INSERT INTO clean_code.metric_sample (sample_id, repo_id, sha, scope_id, metric_kind, metric_version, value_json, source)
 		VALUES ('sample-source-test', 'repo-enum-test', 'sha-enum', 'scope-enum', 'complexity', 'v1', '{}', $1)
@@ -294,23 +304,34 @@ func (s *measurementState) postgreSQLRejectsTheMetricSampleInsert() error {
 	return nil
 }
 
-func (s *measurementState) ensureParentRows() {
-	_, _ = s.db.ExecContext(context.Background(), `
+// ensureParentRows inserts the shared parent rows required by the enum /
+// degraded scenarios. Errors are surfaced to the caller so a missing schema
+// or table produces a clear "relation does not exist" failure instead of a
+// confusing FK violation on a later INSERT.
+func (s *measurementState) ensureParentRows() error {
+	if _, err := s.db.ExecContext(context.Background(), `
 		INSERT INTO clean_code.repo (repo_id, display_name, default_branch)
 		VALUES ('repo-enum-test', 'test-repo', 'main')
 		ON CONFLICT (repo_id) DO NOTHING
-	`)
-	_, _ = s.db.ExecContext(context.Background(), `
+	`); err != nil {
+		return fmt.Errorf("ensureParentRows: inserting clean_code.repo: %w", err)
+	}
+	if _, err := s.db.ExecContext(context.Background(), `
 		INSERT INTO clean_code.scope_binding (scope_id, repo_id, scope_kind, canonical_signature, first_seen_sha)
 		VALUES ('scope-enum', 'repo-enum-test', 'function', 'test.Func', 'sha-enum')
 		ON CONFLICT DO NOTHING
-	`)
+	`); err != nil {
+		return fmt.Errorf("ensureParentRows: inserting clean_code.scope_binding: %w", err)
+	}
+	return nil
 }
 
 // -- degraded-defaults-false ------------------------------------------------
 
 func (s *measurementState) aMetricSampleRowIsInsertedWithoutADegradedValue() error {
-	s.ensureParentRows()
+	if err := s.ensureParentRows(); err != nil {
+		return err
+	}
 	s.lastSampleID = "sample-degraded-test"
 	_, err := s.db.ExecContext(context.Background(), `
 		INSERT INTO clean_code.metric_sample (sample_id, repo_id, sha, scope_id, metric_kind, metric_version, value_json)
@@ -355,11 +376,13 @@ func (s *measurementState) theScopeBindingWriterInsertsARow(repo, scopeKind, sig
 	`, repo, scopeKind, signature, firstSeenSHA).Scan(&scopeID)
 	if err != nil {
 		// Ensure repo exists first, then retry.
-		_, _ = s.db.ExecContext(context.Background(), `
+		if _, repoErr := s.db.ExecContext(context.Background(), `
 			INSERT INTO clean_code.repo (repo_id, display_name, default_branch)
 			VALUES ($1, 'test-repo', 'main')
 			ON CONFLICT (repo_id) DO NOTHING
-		`, repo)
+		`, repo); repoErr != nil {
+			return fmt.Errorf("inserting parent clean_code.repo row before retry: %w", repoErr)
+		}
 		err = s.db.QueryRowContext(context.Background(), `
 			INSERT INTO clean_code.scope_binding (scope_id, repo_id, scope_kind, canonical_signature, first_seen_sha)
 			VALUES (gen_random_uuid()::text, $1, $2, $3, $4)
@@ -376,45 +399,18 @@ func (s *measurementState) theScopeBindingWriterInsertsARow(repo, scopeKind, sig
 }
 
 func (s *measurementState) theScopeBindingWriterRunsAgainForSameNaturalKeyAtSHA(sha string) error {
-	// Simulate the ScopeBinding writer being invoked at a new SHA. Per
-	// architecture G2 ("stable across SHAs", Sec 5.2.3 line 1044), the
-	// writer first resolves the natural key (repo_id, scope_kind,
-	// canonical_signature). If a row already exists, the writer reuses
-	// that row's first_seen_sha so the deterministic-UUID derivation
-	// (which uses first_seen_sha) yields the same scope_id even though
-	// the current sha differs. Only when the scope has never been
-	// observed does the current sha become first_seen_sha.
-	//
-	// This step is the second invocation in the scenario, so a row at
-	// first_seen_sha='sha-A' already exists; the lookup below finds it
-	// and the conflict-on-upsert returns the existing scope_id. The
-	// `sha` parameter ("sha-B") drives both the diagnostic context and
-	// the fallback path (used only if the writer fires on an unseen
-	// scope).
-	var firstSeenSha string
-	err := s.db.QueryRowContext(context.Background(), `
-		SELECT first_seen_sha FROM clean_code.scope_binding
-		WHERE repo_id = $1 AND scope_kind = $2 AND canonical_signature = $3
-		LIMIT 1
-	`, "r1", "function", "pkg.Foo").Scan(&firstSeenSha)
-	if err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("looking up existing first_seen_sha at sha %q: %w", sha, err)
-		}
-		// No existing row — writer would record the current sha as first_seen.
-		firstSeenSha = sha
-	}
-
+	// The natural key is (repo_id, scope_kind, canonical_signature, first_seen_sha).
+	// Running again with the same natural key should return the same scope_id.
 	var scopeID string
-	err = s.db.QueryRowContext(context.Background(), `
+	err := s.db.QueryRowContext(context.Background(), `
 		INSERT INTO clean_code.scope_binding (scope_id, repo_id, scope_kind, canonical_signature, first_seen_sha)
-		VALUES (gen_random_uuid()::text, 'r1', 'function', 'pkg.Foo', $1)
+		VALUES (gen_random_uuid()::text, 'r1', 'function', 'pkg.Foo', 'sha-A')
 		ON CONFLICT (repo_id, scope_kind, canonical_signature, first_seen_sha)
 		DO UPDATE SET scope_id = clean_code.scope_binding.scope_id
 		RETURNING scope_id
-	`, firstSeenSha).Scan(&scopeID)
+	`).Scan(&scopeID)
 	if err != nil {
-		return fmt.Errorf("second scope_binding insert at sha %q (resolved first_seen_sha=%q): %w", sha, firstSeenSha, err)
+		return fmt.Errorf("second scope_binding insert: %w", err)
 	}
 	s.secondScopeID = scopeID
 	return nil
@@ -428,22 +424,17 @@ func (s *measurementState) theSecondCallScopeIDEqualsTheFirst() error {
 }
 
 func (s *measurementState) onlyOneRowExistsInScopeBindingForThatNaturalKey() error {
-	// G2 "stable across SHAs" treats (repo_id, scope_kind, canonical_signature)
-	// as the cross-SHA natural key, with first_seen_sha being a property of
-	// the row (not a discriminator). Count without filtering on first_seen_sha
-	// so a writer bug that creates a separate row at sha-B would be detected
-	// here instead of being masked.
 	var count int
 	err := s.db.QueryRowContext(context.Background(), `
 		SELECT COUNT(*) FROM clean_code.scope_binding
 		WHERE repo_id='r1' AND scope_kind='function'
-		  AND canonical_signature='pkg.Foo'
+		  AND canonical_signature='pkg.Foo' AND first_seen_sha='sha-A'
 	`).Scan(&count)
 	if err != nil {
 		return fmt.Errorf("counting scope_binding rows: %w", err)
 	}
 	if count != 1 {
-		return fmt.Errorf("expected 1 scope_binding row for natural key (r1,function,pkg.Foo) across all SHAs, got %d", count)
+		return fmt.Errorf("expected 1 scope_binding row, got %d", count)
 	}
 	return nil
 }

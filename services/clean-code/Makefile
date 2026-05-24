@@ -8,8 +8,18 @@ MIGRATIONS_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))migrations
 
 migrate-up:
 	@test -n "$(CLEAN_CODE_PG_URL)" || (echo "ERROR: CLEAN_CODE_PG_URL is not set" && exit 1)
-	psql "$(CLEAN_CODE_PG_URL)" -f "$(MIGRATIONS_DIR)/001_up.sql"
+	@files="$(sort $(wildcard $(MIGRATIONS_DIR)/*_up.sql))"; \
+	if [ -z "$$files" ]; then echo "No *_up.sql migrations found in $(MIGRATIONS_DIR)"; exit 1; fi; \
+	for f in $$files; do \
+		echo "Applying $$f"; \
+		psql "$(CLEAN_CODE_PG_URL)" -f "$$f" || exit 1; \
+	done
 
 migrate-down:
 	@test -n "$(CLEAN_CODE_PG_URL)" || (echo "ERROR: CLEAN_CODE_PG_URL is not set" && exit 1)
-	psql "$(CLEAN_CODE_PG_URL)" -f "$(MIGRATIONS_DIR)/001_down.sql"
+	@files="$(sort $(wildcard $(MIGRATIONS_DIR)/*_down.sql))"; \
+	if [ -z "$$files" ]; then echo "No *_down.sql migrations found in $(MIGRATIONS_DIR)"; exit 1; fi; \
+	for f in $$(printf '%s\n' $$files | sort -r); do \
+		echo "Reverting $$f"; \
+		psql "$(CLEAN_CODE_PG_URL)" -f "$$f" || exit 1; \
+	done

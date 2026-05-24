@@ -65,7 +65,7 @@ func isPermissionDenied(err error) bool {
 
 // writerRoles lists every application-level writer role.
 var writerRoles = []string{
-	"clean_code_ingestor",
+	"clean_code_metric_ingestor",
 	"clean_code_aggregator",
 	"clean_code_evaluator",
 	"clean_code_solid_batch",
@@ -74,7 +74,7 @@ var writerRoles = []string{
 
 // nonAuditWriterRoles are roles that must NOT write audit tables.
 var nonAuditWriterRoles = []string{
-	"clean_code_ingestor",
+	"clean_code_metric_ingestor",
 	"clean_code_aggregator",
 	"clean_code_policy_steward",
 	"clean_code_refactor_planner",
@@ -105,7 +105,7 @@ var measurementTables = []string{
 
 // roleOwnership maps each writer role to the tables it may INSERT into.
 var roleOwnership = map[string][]string{
-	"clean_code_ingestor":       {"metric_sample", "metric_retraction", "metric_sample_active"},
+	"clean_code_metric_ingestor": {"metric_sample", "metric_retraction", "metric_sample_active"},
 	"clean_code_aggregator":     {"metric_sample", "metric_retraction", "metric_sample_active"},
 	"clean_code_evaluator":      {"evaluation_run", "evaluation_verdict", "finding"},
 	"clean_code_solid_batch":    {"evaluation_run", "evaluation_verdict", "finding"},
@@ -313,7 +313,7 @@ func (s *roleIsolationState) eachWriterRoleSucceedsOnOwnedTables() error {
 
 func (s *roleIsolationState) ingestorCanInsertMeasurementTables() error {
 	for _, table := range measurementTables {
-		err := s.execAsRole("clean_code_ingestor", buildInsertSQL(table))
+		err := s.execAsRole("clean_code_metric_ingestor", buildInsertSQL(table))
 		if err != nil {
 			return fmt.Errorf("ingestor INSERT into %s failed: %v", table, err)
 		}

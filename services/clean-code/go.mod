@@ -5,6 +5,9 @@ go 1.25.1
 require (
 	github.com/cucumber/godog v0.15.1
 	github.com/lib/pq v1.12.3
+	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
+	google.golang.org/protobuf v1.36.11
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

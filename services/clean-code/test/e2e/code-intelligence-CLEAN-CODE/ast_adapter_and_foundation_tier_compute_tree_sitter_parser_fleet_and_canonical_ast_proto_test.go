@@ -28,35 +28,18 @@ func requireEnv(t *testing.T, name string) string {
 }
 
 // serviceRoot returns the absolute path to the services/clean-code
-// directory by walking up from this source file's location. It returns
-// an error if runtime.Caller cannot determine the source file path or if
-// the path cannot be resolved to an absolute path; callers must propagate
-// this error rather than silently working with an empty or wrong root.
-func serviceRoot() (string, error) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		return "", fmt.Errorf("runtime.Caller(0) failed; cannot determine source file path for serviceRoot")
-	}
-	if thisFile == "" {
-		return "", fmt.Errorf("runtime.Caller(0) returned an empty source file path; cannot derive serviceRoot")
-	}
+// directory by walking up from this source file's location.
+func serviceRoot() string {
+	_, thisFile, _, _ := runtime.Caller(0)
 	dir := filepath.Dir(thisFile)
 	root := filepath.Join(dir, "..", "..", "..")
-	abs, err := filepath.Abs(root)
-	if err != nil {
-		return "", fmt.Errorf("resolving absolute path of %s: %w", root, err)
-	}
-	return abs, nil
+	abs, _ := filepath.Abs(root)
+	return abs
 }
 
 // fixturesRoot returns the absolute path to the tests/fixtures/ast directory.
-// It returns an error if the service root cannot be determined.
-func fixturesRoot() (string, error) {
-	root, err := serviceRoot()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(root, "tests", "fixtures", "ast"), nil
+func fixturesRoot() string {
+	return filepath.Join(serviceRoot(), "tests", "fixtures", "ast")
 }
 
 // readModulePath extracts the module path from go.mod in dir.
@@ -76,23 +59,43 @@ func readModulePath(dir string) (string, error) {
 
 // runProbe compiles and executes a small Go program within the service
 // module, returning its combined stdout/stderr and exit code.
+//
+// Design note: the generated probe imports `${modPath}/internal/ast`,
+// and Go's internal-package rule is filesystem-scoped — a probe living
+// in `os.TempDir()` / `t.TempDir()` cannot import the module's
+// internal packages, and neither `go.mod replace` nor `go run -modfile`
+// lift that restriction (both affect module-path resolution, not the
+// internal/ filesystem rule). The probe must therefore live inside
+// svcRoot's tree.
+//
+// To avoid scattering transient probe directories at the module root,
+// all scratch dirs are confined to a single dedicated subdirectory,
+// svcRoot/.e2e-probes/, which:
+//   - is skipped by `go list ./...` / `go build ./...` (dot-prefixed),
+//   - is easy to gitignore and exclude from editor/linter scans, and
+//   - keeps any directories leaked by abnormal exits in one predictable
+//     place.
+//
+// The probe is invoked with `go run -mod=readonly <file>` so accidental
+// dependency resolution cannot mutate go.mod or go.sum.
 func runProbe(svcRoot, source string) (string, int, error) {
-	tmpDir, err := os.MkdirTemp(svcRoot, "e2e-ast-probe-")
+	probesRoot := filepath.Join(svcRoot, ".e2e-probes")
+	if err := os.MkdirAll(probesRoot, 0o755); err != nil {
+		return "", -1, fmt.Errorf("creating probes root: %w", err)
+	}
+
+	tmpDir, err := os.MkdirTemp(probesRoot, "probe-")
 	if err != nil {
 		return "", -1, fmt.Errorf("creating probe dir: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
-	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(source), 0644); err != nil {
+	mainPath := filepath.Join(tmpDir, "main.go")
+	if err := os.WriteFile(mainPath, []byte(source), 0o644); err != nil {
 		return "", -1, fmt.Errorf("writing probe: %w", err)
 	}
 
-	relDir, err := filepath.Rel(svcRoot, tmpDir)
-	if err != nil {
-		return "", -1, fmt.Errorf("relative path: %w", err)
-	}
-
-	cmd := exec.Command("go", "run", "./"+filepath.ToSlash(relDir))
+	cmd := exec.Command("go", "run", "-mod=readonly", mainPath)
 	cmd.Dir = svcRoot
 	cmd.Env = os.Environ()
 
@@ -123,23 +126,14 @@ type parserFleetState struct {
 
 // parseResultEntry captures the outcome of parsing a single fixture file.
 type parseResultEntry struct {
-	Language   string `json:"language"`
-	ScopeCount int    `json:"scope_count"`
-	FileOK     bool   `json:"file_ok"`
+	Language  string `json:"language"`
+	ScopeCount int  `json:"scope_count"`
+	FileOK    bool   `json:"file_ok"`
 }
 
 func (p *parserFleetState) aFixtureFilePerV1PinnedLanguage() error {
-	svc, err := serviceRoot()
-	if err != nil {
-		return fmt.Errorf("resolving service root: %w", err)
-	}
-	p.svcRoot = svc
-
-	fixDir, err := fixturesRoot()
-	if err != nil {
-		return fmt.Errorf("resolving fixtures root: %w", err)
-	}
-	p.fixturesDir = fixDir
+	p.svcRoot = serviceRoot()
+	p.fixturesDir = fixturesRoot()
 
 	// Verify at least the fixture directories exist (or will be created by
 	// make fixtures-ast). If they don't exist yet, run the bootstrap target.
@@ -343,17 +337,8 @@ type protoRoundTripState struct {
 }
 
 func (r *protoRoundTripState) aParsedAstFile() error {
-	svc, err := serviceRoot()
-	if err != nil {
-		return fmt.Errorf("resolving service root: %w", err)
-	}
-	r.svcRoot = svc
-
-	fixDir, err := fixturesRoot()
-	if err != nil {
-		return fmt.Errorf("resolving fixtures root: %w", err)
-	}
-	r.fixturesDir = fixDir
+	r.svcRoot = serviceRoot()
+	r.fixturesDir = fixturesRoot()
 
 	// Ensure fixtures exist.
 	if _, err := os.Stat(r.fixturesDir); os.IsNotExist(err) {

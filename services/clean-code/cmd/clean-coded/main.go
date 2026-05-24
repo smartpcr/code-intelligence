@@ -36,6 +36,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -115,16 +116,29 @@ func run(args []string) error {
 		keysResult  *keys.BuildResult
 		stopRefresh func()
 		mgmt        *management.Handler
-		policy      *management.PolicyWriter
+		signer      steward.Signer
 	)
 
 	// --- Policy Steward signing-key wiring (Stage 5.1) ---
 	// Scaffold-mode (`KMSProvider == ""`) leaves the signing-
-	// key cache unwired and /readyz keeps its 503 by design;
-	// production deploys set `CLEAN_CODE_KMS_PROVIDER=local`
-	// and pair it with `CLEAN_CODE_KMS_MASTER_KEY_HEX` +
-	// `CLEAN_CODE_PG_URL` so a real `keys.Manager` is
-	// constructed.
+	// key cache unwired and the signing-key-dependent read
+	// verb (`/v1/policy/keys/list_active`) keeps its 503 by
+	// design; production deploys set
+	// `CLEAN_CODE_KMS_PROVIDER=local` and pair it with
+	// `CLEAN_CODE_KMS_MASTER_KEY_HEX` + `CLEAN_CODE_PG_URL` so
+	// a real `keys.Manager` is constructed.
+	//
+	// Stage 5.3 contract: the override write verb
+	// (`POST /v1/mgmt/override`) is the operator's emergency
+	// kill switch and MUST keep serving 200 even when the
+	// signing-key cache is unwired. The Policy Steward + write
+	// verbs are therefore built UNCONDITIONALLY below, after
+	// this signing-key branch. The Stage 5.2 verbs
+	// (publish / activate / publish_rulepack) still refuse with
+	// 503 in scaffold mode because the steward's null-object
+	// signer reports an empty active-key set, which is exactly
+	// the [ErrNoActiveSigningKey] precondition those verbs
+	// already enforce.
 	if cfg.KMSProvider != "" {
 		bc := keys.BuildConfig{
 			KMSProvider:         cfg.KMSProvider,
@@ -164,44 +178,7 @@ func run(args []string) error {
 			)
 		})
 		mgmt = management.NewHandler(management.NewReader(built.Manager))
-
-		// --- Policy Steward write verbs (Stage 5.2) ---
-		// The steward signs the policy-version row at
-		// publish time using the same `keys.Manager` the
-		// read-side verb (`policy.keys.list_active`)
-		// exposes. We pick the persistence backend the
-		// same way as the keys subsystem: when a PostgreSQL
-		// handle is wired, use the SQL store; otherwise
-		// fall back to the in-memory store so a developer
-		// can exercise the verbs end-to-end without
-		// spinning up a database.
-		var stewStore steward.Store
-		if db != nil {
-			sqlStore, ssErr := steward.NewSQLStore(db)
-			if ssErr != nil {
-				_ = db.Close()
-				return fmt.Errorf("policy/steward: NewSQLStore: %w", ssErr)
-			}
-			stewStore = sqlStore
-			log.Info("policy steward backed by postgres")
-		} else {
-			stewStore = steward.NewInMemoryStore()
-			log.Warn("policy steward backed by in-memory store (rows are lost on process restart; set CLEAN_CODE_PG_URL to persist)")
-		}
-		stew, stewErr := steward.New(steward.Config{
-			Store:  stewStore,
-			Signer: built.Manager,
-		})
-		if stewErr != nil {
-			if db != nil {
-				_ = db.Close()
-			}
-			return fmt.Errorf("policy/steward: New: %w", stewErr)
-		}
-		policy = management.NewPolicyWriter(stew)
-		log.Info("policy steward wired",
-			"backend", map[bool]string{true: "postgres", false: "memory"}[db != nil],
-		)
+		signer = built.Manager
 		log.Info("policy signing-key cache wired",
 			"kms_provider", cfg.KMSProvider,
 			"postgres_configured", db != nil,
@@ -210,6 +187,20 @@ func run(args []string) error {
 		)
 	} else {
 		log.Warn("policy signing-key cache NOT wired (scaffold mode: CLEAN_CODE_KMS_PROVIDER is empty)")
+	}
+
+	// --- Policy Steward write verbs (Stage 5.2 + 5.3) ---
+	// Built UNCONDITIONALLY so the Stage 5.3 kill-switch verb
+	// (`mgmt.override`) is always reachable. In scaffold mode
+	// `signer` is the zero interface; `steward.New` installs a
+	// null-object signer in that case. The persistence backend
+	// follows the same `db != nil` rule as the keys subsystem.
+	policy, policyCloseDB, policyErr := buildPolicyWriter(db, signer, log)
+	if policyErr != nil {
+		if policyCloseDB && db != nil {
+			_ = db.Close()
+		}
+		return fmt.Errorf("policy/steward: %w", policyErr)
 	}
 
 	srv := &http.Server{
@@ -263,4 +254,71 @@ func run(args []string) error {
 		}
 		return nil
 	}
+}
+
+// buildPolicyWriter constructs the Policy Steward (Stage 5.2 +
+// 5.3 write verbs) and wraps it in a [management.PolicyWriter].
+// It is the testable composition seam that pins the Stage 5.3
+// kill-switch contract at the wiring layer:
+//
+//   - When `db != nil`, the Steward is backed by an
+//     `[steward.SQLStore]` so override rows persist across
+//     process restarts.
+//   - When `db == nil` (scaffold mode), the Steward is backed
+//     by an `[steward.InMemoryStore]`; the operator gets a
+//     warning that rows are ephemeral.
+//   - `signer` MAY be nil. `[steward.New]` installs a null
+//     object in that case, so `Steward.Override` (which does
+//     not require a signing key) keeps serving 200 while the
+//     Stage 5.2 verbs return `[steward.ErrNoActiveSigningKey]`
+//     via the existing `len(ListActive)==0` branch.
+//
+// Returns the `*management.PolicyWriter`, a `closeDBOnError`
+// boolean the caller uses to decide whether to close `db` on a
+// failure (true when this helper opened internal state that
+// makes the db handle unsafe to reuse), and an error.
+//
+// Pinned by:
+//   - `TestBuildPolicyWriter_ScaffoldModeProducesWriter` (the
+//     wiring invariant: nil signer + nil db -> non-nil writer)
+//   - `TestRootMux_ScaffoldModeOverrideMounted_200` (the
+//     composition-root + kill-switch invariant: rootMux wired
+//     with a steward built via this helper serves 200 at
+//     `POST /v1/mgmt/override` AND still serves 503 at
+//     `POST /v1/policy/publish` under the SAME scaffold-mode
+//     mux)
+func buildPolicyWriter(db *sql.DB, signer steward.Signer, log *slog.Logger) (*management.PolicyWriter, bool, error) {
+	var (
+		stewStore    steward.Store
+		closeDBOnErr bool
+	)
+	if db != nil {
+		sqlStore, err := steward.NewSQLStore(db)
+		if err != nil {
+			return nil, true, fmt.Errorf("NewSQLStore: %w", err)
+		}
+		stewStore = sqlStore
+		if log != nil {
+			log.Info("policy steward backed by postgres")
+		}
+	} else {
+		stewStore = steward.NewInMemoryStore()
+		if log != nil {
+			log.Warn("policy steward backed by in-memory store (rows are lost on process restart; set CLEAN_CODE_PG_URL to persist)")
+		}
+	}
+	stew, err := steward.New(steward.Config{
+		Store:  stewStore,
+		Signer: signer, // MAY be nil in scaffold mode -- steward.New installs a null-object signer
+	})
+	if err != nil {
+		return nil, closeDBOnErr, fmt.Errorf("New: %w", err)
+	}
+	if log != nil {
+		log.Info("policy steward wired",
+			"backend", map[bool]string{true: "postgres", false: "memory"}[db != nil],
+			"signing_key_cache", signer != nil,
+		)
+	}
+	return management.NewPolicyWriter(stew), closeDBOnErr, nil
 }

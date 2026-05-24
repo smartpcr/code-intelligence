@@ -30,13 +30,35 @@ import (
 // `ListActiveSigningKeys`, so the scaffold path reuses that
 // branch instead of duplicating an inline 503.
 //
-// `policy` MAY also be nil; same scaffold semantics apply --
-// every write verb routes through to the steward-not-wired
-// 503 branch in [management.PolicyWriter]. The banned-verb
-// 501 paths (`policy.rulepack.add`, `policy.rulepack.remove`,
-// `policy.override`) are ALWAYS mounted -- a 501 is the
-// canonical "this verb is not part of the v1 surface"
-// signal regardless of whether the steward is wired.
+// `policy` SHOULD be non-nil in scaffold mode too -- the
+// Stage 5.3 kill-switch contract (`mgmt.override` serves 200
+// during a signing-key outage) requires the steward + write
+// verbs to be wired UNCONDITIONALLY. The composition root in
+// `main.go` therefore calls `buildPolicyWriter` regardless of
+// `cfg.KMSProvider`, passing a null-object signer when KMS is
+// unset. The `policy == nil` fallback below remains for the
+// degenerate test case (e.g. the legacy
+// `TestRootMux_ScaffoldModeListActive503` test that doesn't
+// care about the policy surface); in production wiring it is
+// unreachable.
+//
+// The banned-verb 501 paths (`policy.rulepack.add`,
+// `policy.rulepack.remove`, `policy.override`) are ALWAYS
+// mounted -- a 501 is the canonical "this verb is not part of
+// the v1 surface" signal regardless of whether the steward is
+// wired.
+//
+// Stage 5.3 adds `mgmt.override` at [management.VerbMgmtOverridePath]
+// (the canonical operator mute/unmute kill switch per
+// architecture Sec 6.3 line 1357). It does NOT require a
+// signing key (overrides carry no signature column and the
+// kill switch must remain operable during a signing-key
+// outage). In scaffold mode it serves **200** for valid
+// requests against a registered rule, while the Stage 5.2
+// write verbs serve **503** via the null-object signer's
+// empty active-key set. The signing-key-dependent read verb
+// `policy.keys.list_active` likewise serves 503 in scaffold
+// mode.
 func rootMux(healthHandler *health.Handler, mgmt *management.Handler, policy *management.PolicyWriter) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthHandler.Healthz)
@@ -52,6 +74,7 @@ func rootMux(healthHandler *health.Handler, mgmt *management.Handler, policy *ma
 	mux.HandleFunc(management.VerbPublishPath, policy.Publish)
 	mux.HandleFunc(management.VerbActivatePath, policy.Activate)
 	mux.HandleFunc(management.VerbPublishRulepackPath, policy.PublishRulepack)
+	mux.HandleFunc(management.VerbMgmtOverridePath, policy.Override)
 	mux.HandleFunc(management.VerbRulepackAddPath, management.UnimplementedVerb("policy.rulepack.add"))
 	mux.HandleFunc(management.VerbRulepackRemovePath, management.UnimplementedVerb("policy.rulepack.remove"))
 	mux.HandleFunc(management.VerbOverridePath, management.UnimplementedVerb("policy.override"))

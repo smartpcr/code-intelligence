@@ -29,6 +29,15 @@ const (
 	// VerbPublishRulepackPath mounts `policy.publish_rulepack`.
 	VerbPublishRulepackPath = "/v1/policy/publish_rulepack"
 
+	// VerbMgmtOverridePath mounts `mgmt.override` (Stage
+	// 5.3) -- the canonical operator-mute / unmute verb per
+	// architecture Sec 6.3 line 1357 and Sec 1.5.1 row 5.
+	// Sits on the `/v1/mgmt/...` namespace to match the
+	// `mgmt.*` verb family (architecture Sec 6.3); MUST NOT
+	// collide with the historical-draft 501 path
+	// [VerbOverridePath] which lives on `/v1/policy/...`.
+	VerbMgmtOverridePath = "/v1/mgmt/override"
+
 	// VerbRulepackAddPath is the historical-draft verb name
 	// the canonical surface explicitly REJECTS. The handler
 	// returns 501 Not Implemented at this path so a stray
@@ -42,8 +51,27 @@ const (
 	// VerbOverridePath is the historical-draft
 	// `policy.override` verb. Architecture Sec 6.5 pins the
 	// canonical name as `mgmt.override`; this 501 surfaces
-	// the rename without a 404.
+	// the rename without a 404. The canonical write path
+	// lives at [VerbMgmtOverridePath].
 	VerbOverridePath = "/v1/policy/override"
+
+	// OIDCSubjectHeader is the HTTP header the authenticating
+	// gateway (architecture Sec 8.4 + tech-spec Sec 8.5
+	// "OIDC bearer tokens") fills with the caller's OIDC
+	// subject. Stage 5.3 reads it to populate
+	// `Override.actor_id`. The trust boundary is the gateway
+	// -- in any deployment where clean-coded is directly
+	// reachable from untrusted clients this header MUST be
+	// stripped at the edge and re-injected by the auth proxy,
+	// or attackers can spoof the actor.
+	//
+	// We choose `X-OIDC-Subject` rather than reading the
+	// `sub` JWT claim ourselves because the gateway already
+	// validates the token signature; re-validating here
+	// would duplicate the verification path and require us
+	// to plumb JWKS into the composition root. The runbook
+	// pins this contract for operators.
+	OIDCSubjectHeader = "X-OIDC-Subject"
 )
 
 // stewardWriter is the narrow subset of [steward.Steward] the
@@ -54,6 +82,7 @@ type stewardWriter interface {
 	Publish(ctx context.Context, req steward.PublishRequest) (steward.PolicyVersion, error)
 	Activate(ctx context.Context, req steward.ActivateRequest) (steward.PolicyActivation, error)
 	PublishRulepack(ctx context.Context, req steward.PublishRulepackRequest) (steward.RulePack, []steward.Rule, error)
+	Override(ctx context.Context, req steward.OverrideRequest) (steward.Override, error)
 }
 
 // PolicyWriter is the HTTP write-side surface of the
@@ -96,10 +125,10 @@ func newPolicyWriterFromInterface(s stewardWriter) *PolicyWriter {
 // to-one; defined here so the HTTP surface owns the wire
 // vocabulary independently of the steward's in-memory shape.
 type publishWireRequest struct {
-	Name            string                    `json:"name"`
-	RuleRefs        []steward.RuleRef         `json:"rule_refs"`
-	ThresholdRefs   []steward.ThresholdRef    `json:"threshold_refs"`
-	RefactorWeights steward.RefactorWeights   `json:"refactor_weights"`
+	Name            string                  `json:"name"`
+	RuleRefs        []steward.RuleRef       `json:"rule_refs"`
+	ThresholdRefs   []steward.ThresholdRef  `json:"threshold_refs"`
+	RefactorWeights steward.RefactorWeights `json:"refactor_weights"`
 }
 
 // activateWireRequest is the inbound wire shape for the
@@ -331,6 +360,8 @@ func writeJSON(w http.ResponseWriter, r *http.Request, verb string, status int, 
 //
 //   - [steward.ErrNoActiveSigningKey] -> 503
 //   - [steward.ErrInvalidRequest]     -> 400
+//   - [steward.ErrInvalidOverride]    -> 400
+//   - [steward.ErrUnknownRule]        -> 400
 //   - [steward.ErrUnknownPolicyVersion] -> 400 (the caller
 //     supplied an id we don't know -- a client error)
 //   - [steward.ErrDuplicateRulePack]  -> 409
@@ -345,6 +376,10 @@ func writeStewardError(w http.ResponseWriter, r *http.Request, verb string, err 
 	case errors.Is(err, steward.ErrNoActiveSigningKey):
 		http.Error(w, "no active signing key", http.StatusServiceUnavailable)
 	case errors.Is(err, steward.ErrInvalidRequest):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	case errors.Is(err, steward.ErrInvalidOverride):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	case errors.Is(err, steward.ErrUnknownRule):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, steward.ErrUnknownPolicyVersion):
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -368,7 +403,8 @@ func writeStewardError(w http.ResponseWriter, r *http.Request, verb string, err 
 // Routes returns an `http.ServeMux` ready to mount onto the
 // service's HTTP listener. Mounts the three canonical Stage 5.2
 // write verb paths plus the three banned-historical-draft
-// paths (each backed by [UnimplementedVerb] -> 501).
+// paths (each backed by [UnimplementedVerb] -> 501) plus the
+// canonical Stage 5.3 `mgmt.override` path.
 //
 // The composition root can register this mux as a child of a
 // parent mux or mount each path manually via the constants
@@ -378,6 +414,7 @@ func (pw *PolicyWriter) Routes() *http.ServeMux {
 	mux.HandleFunc(VerbPublishPath, pw.Publish)
 	mux.HandleFunc(VerbActivatePath, pw.Activate)
 	mux.HandleFunc(VerbPublishRulepackPath, pw.PublishRulepack)
+	mux.HandleFunc(VerbMgmtOverridePath, pw.Override)
 	mux.HandleFunc(VerbRulepackAddPath, UnimplementedVerb("policy.rulepack.add"))
 	mux.HandleFunc(VerbRulepackRemovePath, UnimplementedVerb("policy.rulepack.remove"))
 	mux.HandleFunc(VerbOverridePath, UnimplementedVerb("policy.override"))

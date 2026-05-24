@@ -97,6 +97,64 @@ type Store interface {
 	// migration can populate them. Returns a wrapped error
 	// on duplicate `threshold_id`.
 	InsertThreshold(ctx context.Context, t Threshold) error
+
+	// RuleExistsByID reports whether ANY row with the given
+	// `rule_id` exists in `clean_code.rule` (across every
+	// version). Used by [Steward.Override] to enforce the
+	// logical FK `Override.rule_id -> Rule.rule_id`
+	// documented in architecture Sec 5.3.6 line 1166. The
+	// migration 0003 COMMENT clarifies the FK is logical
+	// (not a SQL FK) because `rule` has the composite PK
+	// `(rule_id, version)` and the Override row binds to
+	// the rule LINEAGE, not to a specific version -- so the
+	// writer enforces "some version of this rule_id has
+	// been registered". Distinct from [RuleExists], which
+	// takes a `(rule_id, version)` pair for the
+	// `policy.publish` `rule_refs[]` FK check.
+	RuleExistsByID(ctx context.Context, ruleID string) (bool, error)
+
+	// InsertOverride appends `o` to `clean_code.override`.
+	// Append-only -- the Store interface intentionally has
+	// no UpdateOverride / DeleteOverride method so unmute
+	// MUST land as a fresh row with `mute=false` (tech-spec
+	// Sec 10A "mute lifecycle" pin). Returns a wrapped error
+	// on duplicate `override_id` (PK violation).
+	InsertOverride(ctx context.Context, o Override) error
+
+	// LatestMatchingOverride returns the most recent
+	// [Override] row whose `scope_filter` matches the
+	// supplied `candidate` per the architecture-pinned read
+	// semantic (Sec 5.3.6 line 1171):
+	//
+	//     MAX(created_at) WHERE rule_id=$1 AND
+	//       scope_filter matches the candidate scope.
+	//
+	// "Matches" is the AND of three conditions:
+	//
+	//   - `scope_filter.repo_id == candidate.RepoID`,
+	//   - `scope_filter.scope_kind == candidate.ScopeKind`,
+	//   - `scopeGlobMatches(scope_filter.scope_signature_glob,
+	//     candidate.Signature) == true`.
+	//
+	// The glob vocabulary is `*` (zero or more chars) and
+	// `?` (one char); see [scopeGlobMatches] in
+	// scope_glob.go for the full translation rules.
+	//
+	// Returns `ok=false` when no override row matches the
+	// candidate. The Steward's read helper
+	// [Steward.LatestMatchingOverride] additionally
+	// validates the candidate up front -- the Store-level
+	// method assumes the candidate is well-formed.
+	//
+	// Tie-break: when two matching rows share `created_at`,
+	// the row with the largest `override_id` (lexicographic
+	// uuid order) wins -- mirrors the SQL ORDER BY contract
+	// used by [LatestActivation]. The SQL implementation
+	// streams rows in `(created_at DESC, override_id DESC)`
+	// order and stops at the first glob match; there is NO
+	// row-count limit, so an older matching glob is never
+	// hidden behind a newer non-matching row.
+	LatestMatchingOverride(ctx context.Context, ruleID string, candidate CandidateScope) (Override, bool, error)
 }
 
 // InMemoryStore is a process-local [Store] backed by
@@ -110,6 +168,7 @@ type InMemoryStore struct {
 	rulePacks      map[rulePackKey]RulePack
 	rules          map[ruleKey]Rule
 	thresholds     map[uuid.UUID]Threshold
+	overrides      []Override
 }
 
 type rulePackKey struct {
@@ -319,6 +378,93 @@ func (s *InMemoryStore) InsertThreshold(ctx context.Context, t Threshold) error 
 	}
 	s.thresholds[t.ThresholdID] = t
 	return nil
+}
+
+// RuleExistsByID reports whether ANY rule row with the given
+// `ruleID` (across every version) has been persisted via a
+// prior [InMemoryStore.InsertRulePackAndRules] call.
+func (s *InMemoryStore) RuleExistsByID(ctx context.Context, ruleID string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k := range s.rules {
+		if k.RuleID == ruleID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// InsertOverride appends `o` to the in-memory override log.
+// Returns a wrapped error on duplicate `override_id`.
+func (s *InMemoryStore) InsertOverride(ctx context.Context, o Override) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if o.OverrideID == uuid.Nil {
+		return fmt.Errorf("steward: InMemoryStore.InsertOverride: override_id is the zero uuid")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.overrides {
+		if existing.OverrideID == o.OverrideID {
+			return fmt.Errorf("steward: InMemoryStore.InsertOverride: override_id=%s already exists", o.OverrideID)
+		}
+	}
+	s.overrides = append(s.overrides, o)
+	return nil
+}
+
+// LatestMatchingOverride scans the in-memory override log for
+// rows whose `(rule_id, scope_filter)` matches `(ruleID,
+// candidate)` under the Stage 5.3 glob semantic and returns
+// the one with the largest `(created_at, override_id)` tuple.
+// Mirrors the SQL streaming contract: no LIMIT -- every
+// in-partition row is considered.
+func (s *InMemoryStore) LatestMatchingOverride(ctx context.Context, ruleID string, candidate CandidateScope) (Override, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return Override{}, false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var best Override
+	var found bool
+	for _, o := range s.overrides {
+		if o.RuleID != ruleID {
+			continue
+		}
+		if o.ScopeFilter.RepoID != candidate.RepoID {
+			continue
+		}
+		if o.ScopeFilter.ScopeKind != candidate.ScopeKind {
+			continue
+		}
+		match, err := scopeGlobMatches(o.ScopeFilter.ScopeSignatureGlob, candidate.Signature)
+		if err != nil {
+			// Defensive: a malformed glob is a
+			// configuration bug. Propagate so the
+			// evaluator surfaces it rather than fail-
+			// open the gate.
+			return Override{}, false, err
+		}
+		if !match {
+			continue
+		}
+		if !found {
+			best = o
+			found = true
+			continue
+		}
+		switch {
+		case o.CreatedAt.After(best.CreatedAt):
+			best = o
+		case o.CreatedAt.Equal(best.CreatedAt) && uuidCompare(o.OverrideID, best.OverrideID) > 0:
+			best = o
+		}
+	}
+	return best, found, nil
 }
 
 // Compile-time check that InMemoryStore satisfies Store.

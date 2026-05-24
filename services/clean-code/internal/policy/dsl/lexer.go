@@ -228,6 +228,31 @@ func (l *lexer) nextToken() (token, error) {
 		return token{kind: tokLT, text: "<", pos: pos}, nil
 	case r == '\'':
 		return l.readString(pos)
+	case r == '-':
+		// The grammar has no binary subtraction operator
+		// (cmp_op covers all infix operators), so a '-'
+		// is valid only as the sign of a number literal.
+		// We require the digit to follow IMMEDIATELY so
+		// the lexer never needs contextual lookback
+		// against the previous token to disambiguate.
+		// Negative literals are supported because
+		// [Threshold] rows can carry negative float64
+		// values (e.g. `velocity_trend` reading negative
+		// when the trend is downward), and inline
+		// comparisons -- `value < -0.5`, `value == -1.5`,
+		// `value > -5` -- must be able to express the
+		// same range as the Threshold rows the rule
+		// could otherwise reference via a threshold()
+		// atom.
+		if l.pos+1 < len(l.src) {
+			next := l.src[l.pos+1]
+			if next >= '0' && next <= '9' {
+				return l.readNumber(pos)
+			}
+		}
+		l.next()
+		return token{}, newError(ErrLex, pos,
+			"unexpected character '-' (a leading '-' is only valid as the sign of a number literal and must be immediately followed by a digit)")
 	case r >= '0' && r <= '9':
 		return l.readNumber(pos)
 	case isIdentStart(r):
@@ -284,12 +309,26 @@ func (l *lexer) readString(start Position) (token, error) {
 }
 
 // readNumber consumes a decimal number literal. Grammar:
-// `[0-9]+ ( '.' [0-9]+ )?`. Scientific notation is NOT
-// supported in v1; thresholds live in [Threshold] rows so
-// the DSL only sees integer/decimal constants used as
-// inline comparators.
+// `'-'? [0-9]+ ( '.' [0-9]+ )?`. Scientific notation is
+// NOT supported in v1; thresholds live in [Threshold] rows
+// so the DSL only sees integer/decimal constants used as
+// inline comparators. A leading '-' is consumed when
+// present so inline literals stay symmetric with the
+// float64 range Threshold rows carry -- a metric like
+// `velocity_trend` reads negative when trending downward
+// and rule authors must be able to write `value < -0.5`
+// inline without being forced through a threshold() atom.
+//
+// Precondition: nextToken's dispatch only enters this
+// path when (a) the leading rune is a digit, OR (b) the
+// leading rune is '-' and the immediately following byte
+// is a digit. The leading digit-consumption loop is
+// therefore guaranteed to advance at least once.
 func (l *lexer) readNumber(start Position) (token, error) {
 	startOff := l.pos
+	if l.peek() == '-' {
+		l.next()
+	}
 	for l.pos < len(l.src) && unicode.IsDigit(l.peek()) {
 		l.next()
 	}

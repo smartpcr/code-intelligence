@@ -85,6 +85,17 @@ const (
 	// `policy_publish_overlap_min_seconds` row: minimum
 	// key-rotation overlap (C13 mitigation).
 	DefaultPolicyPublishOverlapSeconds = 86400
+	// DefaultKMSProvider is the canonical default for the
+	// Stage 5.1 `kms-provider` knob. The empty default
+	// preserves scaffold-mode startup -- the composition root
+	// branches on this value to decide whether to wire the
+	// SQL-backed `internal/policy/keys` package against a
+	// LocalSealedKMS or stay in-memory. Setting it to
+	// `"in-memory"` would force every operator who omits the
+	// env var into scaffold mode silently; leaving it empty
+	// makes the operator's intent explicit at config-load
+	// time.
+	DefaultKMSProvider = ""
 )
 
 // Default network bind addresses for the empty scaffold. Operators
@@ -131,6 +142,20 @@ const (
 	EnvWindowDays                  = "CLEAN_CODE_WINDOW_DAYS"
 	EnvFreshnessWindowSeconds      = "CLEAN_CODE_FRESHNESS_WINDOW_SECONDS"
 	EnvPolicyPublishOverlapSeconds = "CLEAN_CODE_POLICY_PUBLISH_OVERLAP_SECONDS"
+	// EnvKMSProvider names the operator-facing knob that picks
+	// the policy-signing KMS adapter. Closed set: `local` |
+	// `in-memory`. Unset leaves the service in scaffold mode
+	// (no production key persistence). Per Stage 5.1
+	// tech-spec Sec 8.4.
+	EnvKMSProvider = "CLEAN_CODE_KMS_PROVIDER"
+	// EnvKMSMasterKeyHex is the 64-char lowercase hex
+	// encoding of the AES-256 master key the LocalSealedKMS
+	// uses to wrap Ed25519 seeds. The composition root
+	// reads this once at startup and the value MUST NOT be
+	// echoed into any log line. Operators are expected to
+	// inject this via their secret manager (env var, k8s
+	// Secret, etc.) and never check it into source.
+	EnvKMSMasterKeyHex = "CLEAN_CODE_KMS_MASTER_KEY_HEX"
 )
 
 // Config is the in-memory shape of the service's runtime
@@ -204,6 +229,20 @@ type Config struct {
 	// PolicyPublishOverlapSeconds is the tech-spec Sec 8.2
 	// `policy_publish_overlap_min_seconds` value.
 	PolicyPublishOverlapSeconds int
+
+	// --- Policy signing (Stage 5.1) ---
+
+	// KMSProvider selects the policy-signing KMS adapter.
+	// Closed set: `""` (scaffold; signing disabled), `"local"`
+	// (envelope-encrypted Ed25519 seeds under a master key),
+	// `"in-memory"` (test-only; private keys live in heap).
+	// Defaults to `""`. See tech-spec Sec 8.4.
+	KMSProvider string
+
+	// KMSMasterKeyHex is the 64-char lowercase hex encoding
+	// of the AES-256 master key the LocalSealedKMS uses.
+	// Required when `KMSProvider == "local"`. NEVER logged.
+	KMSMasterKeyHex string
 }
 
 // Defaults returns a Config populated with the canonical
@@ -226,6 +265,8 @@ func Defaults() Config {
 		WindowDays:                   DefaultWindowDays,
 		FreshnessWindowSeconds:       DefaultFreshnessWindowSeconds,
 		PolicyPublishOverlapSeconds:  DefaultPolicyPublishOverlapSeconds,
+		KMSProvider:                  DefaultKMSProvider,
+		KMSMasterKeyHex:              "",
 	}
 }
 
@@ -304,6 +345,27 @@ func (c Config) Validate() error {
 	if c.PeriodicSweepCadence <= 0 {
 		return fmt.Errorf("config: periodic-sweep-cadence=%s must be > 0", c.PeriodicSweepCadence)
 	}
+	// KMS provider closed-set + interlocks.
+	switch c.KMSProvider {
+	case "", "local", "in-memory":
+	default:
+		return fmt.Errorf("config: kms-provider=%q is not one of {\"\", local, in-memory}", c.KMSProvider)
+	}
+	if c.KMSProvider == "local" {
+		// Length check matches `keys.LocalKMSMasterKeyLen=32`
+		// (= 64 hex chars). The deeper hex-decode + AES key
+		// schedule construction happens at start-up inside
+		// `keys.NewLocalSealedKMS`; the config layer just
+		// pins the shape so an operator gets a clean error
+		// before reaching the policy/keys package.
+		hex := c.KMSMasterKeyHex
+		if len(hex) != 64 {
+			return fmt.Errorf("config: kms-provider=local requires kms-master-key-hex of exactly 64 hex chars; got %d chars", len(hex))
+		}
+	}
+	if c.KMSProvider != "local" && c.KMSMasterKeyHex != "" {
+		return fmt.Errorf("config: kms-master-key-hex is set but kms-provider=%q is not \"local\"", c.KMSProvider)
+	}
 	return nil
 }
 
@@ -327,6 +389,8 @@ func readEnvOverrides() map[string]string {
 		EnvWindowDays,
 		EnvFreshnessWindowSeconds,
 		EnvPolicyPublishOverlapSeconds,
+		EnvKMSProvider,
+		EnvKMSMasterKeyHex,
 	}
 	out := make(map[string]string, len(keys))
 	for _, k := range keys {
@@ -393,6 +457,10 @@ func applyOverrides(cfg *Config, overrides map[string]string) error {
 				return fmt.Errorf("%s=%q: %w", k, v, err)
 			}
 			cfg.PolicyPublishOverlapSeconds = n
+		case EnvKMSProvider:
+			cfg.KMSProvider = v
+		case EnvKMSMasterKeyHex:
+			cfg.KMSMasterKeyHex = v
 		default:
 			return fmt.Errorf("unknown config key %q", k)
 		}

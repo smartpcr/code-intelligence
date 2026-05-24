@@ -1,6 +1,6 @@
 // Command clean-coded is the long-running process for the
-// clean-code service. Stage 1.1 (implementation-plan.md) ships
-// this binary with three responsibilities:
+// clean-code service. The Stage 5.1 composition root has four
+// responsibilities:
 //
 //  1. Load runtime configuration from CLEAN_CODE_* env vars +
 //     optional config file (`internal/config`).
@@ -8,23 +8,31 @@
 //  2. Initialise a structured JSON logger with request-id
 //     propagation (`internal/logging`).
 //
-//  3. Serve `/healthz` and `/readyz` on the configured HTTP
-//     listener (`internal/health`). The handlers ship the
-//     production implementation -- /healthz returns 200 with the
-//     build identity, /readyz returns 503 until the mandatory PG
-//     pool, OTel exporter, and signing-key cache readiness checks
-//     have all registered green. Later stages wire those checks
-//     against the real subsystems; Stage 1.1 leaves them
-//     unregistered so /readyz stays 503 by design.
+//  3. Wire the Policy Steward signing-key cache
+//     (`internal/policy/keys`). The provider, master-key, and
+//     PostgreSQL handle come from config; the resulting
+//     `keys.Manager` is shared by the management read-side
+//     verbs and the evaluator gate. A `signing_key_cache`
+//     readiness check is registered against the health
+//     handler so `/readyz` only turns green once the KMS
+//     responds and the first key is loaded. A background
+//     refresh ticker reloads the cache every
+//     `signingKeyCacheRefreshInterval` so a sibling replica
+//     that rotates the active key is picked up by this
+//     replica within the refresh window.
 //
-// The binary is intentionally minimal -- the gRPC surfaces, the
-// Metric Ingestor, the Rule Engine, the Refactor Planner, etc.
-// arrive in later stages and bolt onto this composition root
-// without rewriting it.
+//  4. Serve `/healthz`, `/readyz`, and the
+//     `/v1/policy/keys/list_active` read verb on the
+//     configured HTTP listener.
+//
+// Future stages bolt the gRPC surfaces, the Metric Ingestor,
+// the Rule Engine, and the Refactor Planner onto this same
+// composition root.
 package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
@@ -34,11 +42,26 @@ import (
 	"syscall"
 	"time"
 
-	"forge/services/clean-code/internal/config"
-	"forge/services/clean-code/internal/health"
-	"forge/services/clean-code/internal/logging"
-	"forge/services/clean-code/internal/version"
+	_ "github.com/lib/pq"
+
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/config"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/health"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/logging"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/management"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/keys"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/version"
 )
+
+// signingKeyCacheRefreshInterval is the cadence at which the
+// long-running process re-reads the policy_signing_keys store
+// into its in-process cache. Five minutes is two orders of
+// magnitude faster than the 24h overlap window from tech-spec
+// Sec 8.2, so a sibling-replica rotation always propagates
+// well before the old key would have expired -- giving signing
+// the architectural slack the overlap was designed for
+// without delaying observability of a freshly-rotated key on
+// this replica.
+const signingKeyCacheRefreshInterval = 5 * time.Minute
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -78,18 +101,82 @@ func run(args []string) error {
 		"gate_degraded_policy", cfg.GateDegradedPolicy,
 		"policy_signing_required", cfg.PolicySigningRequired,
 		"refactor_effort_source", cfg.RefactorEffortSource,
+		"kms_provider", cfg.KMSProvider,
 	)
-
-	healthHandler := health.New(version.Version, version.Commit, version.BuildTime)
-
-	srv := &http.Server{
-		Addr:              cfg.HTTPAddr,
-		Handler:           healthHandler.Routes(),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	healthHandler := health.New(version.Version, version.Commit, version.BuildTime)
+
+	var (
+		db          *sql.DB
+		keysResult  *keys.BuildResult
+		stopRefresh func()
+		mgmt        *management.Handler
+	)
+
+	// --- Policy Steward signing-key wiring (Stage 5.1) ---
+	// Scaffold-mode (`KMSProvider == ""`) leaves the signing-
+	// key cache unwired and /readyz keeps its 503 by design;
+	// production deploys set `CLEAN_CODE_KMS_PROVIDER=local`
+	// and pair it with `CLEAN_CODE_KMS_MASTER_KEY_HEX` +
+	// `CLEAN_CODE_PG_URL` so a real `keys.Manager` is
+	// constructed.
+	if cfg.KMSProvider != "" {
+		bc := keys.BuildConfig{
+			KMSProvider:         cfg.KMSProvider,
+			KMSMasterKeyHex:     cfg.KMSMasterKeyHex,
+			Overlap:             time.Duration(cfg.PolicyPublishOverlapSeconds) * time.Second,
+			MintFirstKeyIfEmpty: true,
+		}
+		if cfg.PostgresURL != "" && cfg.KMSProvider == keys.KMSProviderLocal {
+			handle, openErr := sql.Open("postgres", cfg.PostgresURL)
+			if openErr != nil {
+				return fmt.Errorf("opening postgres: %w", openErr)
+			}
+			pingCtx, pingCancel := context.WithTimeout(ctx, 10*time.Second)
+			pingErr := handle.PingContext(pingCtx)
+			pingCancel()
+			if pingErr != nil {
+				_ = handle.Close()
+				return fmt.Errorf("pinging postgres: %w", pingErr)
+			}
+			db = handle
+			bc.DB = handle
+		}
+		buildCtx, buildCancel := context.WithTimeout(ctx, 30*time.Second)
+		built, buildErr := keys.Build(buildCtx, bc)
+		buildCancel()
+		if buildErr != nil {
+			if db != nil {
+				_ = db.Close()
+			}
+			return fmt.Errorf("policy/keys: Build: %w", buildErr)
+		}
+		keysResult = built
+		healthHandler.AddReadyCheck("signing_key_cache", health.Check(built.HealthCheck))
+		stopRefresh = built.Manager.StartRefresh(ctx, signingKeyCacheRefreshInterval, func(refreshErr error) {
+			log.Warn("policy/keys: background refresh failed",
+				"error", refreshErr.Error(),
+			)
+		})
+		mgmt = management.NewHandler(management.NewReader(built.Manager))
+		log.Info("policy signing-key cache wired",
+			"kms_provider", cfg.KMSProvider,
+			"postgres_configured", db != nil,
+			"overlap_seconds", cfg.PolicyPublishOverlapSeconds,
+			"refresh_interval", signingKeyCacheRefreshInterval.String(),
+		)
+	} else {
+		log.Warn("policy signing-key cache NOT wired (scaffold mode: CLEAN_CODE_KMS_PROVIDER is empty)")
+	}
+
+	srv := &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           rootMux(healthHandler, mgmt),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 
 	serveErrCh := make(chan error, 1)
 	go func() {
@@ -101,21 +188,36 @@ func run(args []string) error {
 		serveErrCh <- nil
 	}()
 
+	closeAll := func() {
+		if stopRefresh != nil {
+			stopRefresh()
+		}
+		if keysResult != nil && keysResult.Close != nil {
+			keysResult.Close()
+		}
+		if db != nil {
+			_ = db.Close()
+		}
+	}
+
 	select {
 	case <-ctx.Done():
 		log.Info("shutdown signal received; draining http listener")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
+			closeAll()
 			return fmt.Errorf("http shutdown: %w", err)
 		}
-		// wait for the goroutine to drain
 		if err := <-serveErrCh; err != nil {
+			closeAll()
 			return fmt.Errorf("http serve: %w", err)
 		}
+		closeAll()
 		log.Info("clean-coded stopped")
 		return nil
 	case err := <-serveErrCh:
+		closeAll()
 		if err != nil {
 			return fmt.Errorf("http serve: %w", err)
 		}

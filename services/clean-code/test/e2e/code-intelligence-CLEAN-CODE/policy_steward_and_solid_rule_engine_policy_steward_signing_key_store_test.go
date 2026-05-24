@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -50,76 +49,6 @@ type signingKeyStoreState struct {
 }
 
 // ---------- helpers ----------
-
-// repoRoot returns the absolute path of the repository root, discovered
-// via `go env GOMOD`.
-//
-// The test's Go module lives at services/clean-code/go.mod, so the repo
-// root is three directory levels above the go.mod path. We have to do
-// this work because `go test` runs with cwd set to the test package
-// directory (not the repo root), so relative paths used inside the test
-// binary cannot be interpreted naively.
-func repoRoot() (string, error) {
-	out, err := exec.Command("go", "env", "GOMOD").Output()
-	if err != nil {
-		return "", fmt.Errorf("`go env GOMOD`: %w", err)
-	}
-	goMod := strings.TrimSpace(string(out))
-	if goMod == "" || goMod == os.DevNull {
-		return "", fmt.Errorf("`go env GOMOD` returned %q; test is not running inside a Go module", goMod)
-	}
-	return filepath.Dir(filepath.Dir(filepath.Dir(goMod))), nil
-}
-
-// resolveComposeFiles returns the absolute paths of the docker-compose
-// files to use for the e2e harness, plus the repo root (which the docker
-// invocation uses as its working directory so that build contexts and
-// other paths inside the compose file resolve consistently).
-//
-// Resolution order:
-//  1. CLEAN_CODE_E2E_COMPOSE_FILE -- explicit override. Absolute paths
-//     are taken as-is; relative paths are resolved against the repo root.
-//  2. COMPOSE_FILE -- docker-compose's own env var. The CI workflow sets
-//     this. Resolved against the repo root when relative. Multiple files
-//     separated by filepath.ListSeparator (':' on Unix, ';' on Windows,
-//     matching docker compose's default) are supported.
-//  3. Default: <repo>/tests/e2e/phase-05-policy-engine/docker-compose.yml.
-func resolveComposeFiles() (files []string, repoDir string, err error) {
-	repoDir, err = repoRoot()
-	if err != nil {
-		return nil, "", err
-	}
-
-	resolveOne := func(p string) string {
-		if filepath.IsAbs(p) {
-			return p
-		}
-		return filepath.Join(repoDir, p)
-	}
-
-	if raw := os.Getenv("CLEAN_CODE_E2E_COMPOSE_FILE"); raw != "" {
-		for _, p := range filepath.SplitList(raw) {
-			if p == "" {
-				continue
-			}
-			files = append(files, resolveOne(p))
-		}
-	} else if raw := os.Getenv("COMPOSE_FILE"); raw != "" {
-		for _, p := range filepath.SplitList(raw) {
-			if p == "" {
-				continue
-			}
-			files = append(files, resolveOne(p))
-		}
-	} else {
-		files = []string{filepath.Join(repoDir, "tests", "e2e", "phase-05-policy-engine", "docker-compose.yml")}
-	}
-
-	if len(files) == 0 {
-		return nil, "", fmt.Errorf("no docker-compose file resolved; set CLEAN_CODE_E2E_COMPOSE_FILE or COMPOSE_FILE")
-	}
-	return files, repoDir, nil
-}
 
 // kmsRotateKey tells the kms-mock to rotate its signing key and returns
 // the previous key ID and private key material so we can sign payloads
@@ -214,10 +143,16 @@ func (s *signingKeyStoreState) aKeyRotationOccurredAtT0() error {
 	if s.kmsURL == "" {
 		return fmt.Errorf("CLEAN_CODE_KMS_URL is not set")
 	}
+	// The CI workflow extracts the policy-steward host port dynamically
+	// (`docker compose port policy-steward 8080`) and exports it as
+	// CLEAN_CODE_POLICY_STEWARD_URL. Because the host port is mapped
+	// dynamically, there is no fixed default that's safe to fall back to,
+	// so we require the env var explicitly — matching the CLEAN_CODE_KMS_URL
+	// contract above. Local-dev: export CLEAN_CODE_POLICY_STEWARD_URL after
+	// reading the mapped port from `docker compose port policy-steward 8080`.
 	s.policyStewardURL = os.Getenv("CLEAN_CODE_POLICY_STEWARD_URL")
 	if s.policyStewardURL == "" {
-		// Derive from compose service name convention.
-		s.policyStewardURL = "http://localhost:8082"
+		return fmt.Errorf("CLEAN_CODE_POLICY_STEWARD_URL is not set")
 	}
 
 	if err := s.kmsRotateKey(); err != nil {
@@ -285,28 +220,14 @@ func (s *signingKeyStoreState) theServiceInitialises() error {
 		pgURL = "postgres://localhost:5432/clean_code?sslmode=disable"
 	}
 
-	composeFiles, repoDir, err := resolveComposeFiles()
-	if err != nil {
-		return fmt.Errorf("resolving docker-compose file: %w", err)
-	}
-	for _, f := range composeFiles {
-		if _, statErr := os.Stat(f); statErr != nil {
-			return fmt.Errorf("docker-compose file %q not found (set CLEAN_CODE_E2E_COMPOSE_FILE or COMPOSE_FILE to override): %w", f, statErr)
-		}
-	}
-
 	// Try to start the policy-steward binary with the unreachable KMS
 	// and the policy-signing-required pin set to "v1 required".
 	// The binary should exit non-zero quickly.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	args := []string{"compose"}
-	for _, f := range composeFiles {
-		args = append(args, "-f", f)
-	}
-	args = append(args,
-		"--project-directory", repoDir,
+	cmd := exec.CommandContext(ctx, "docker", "compose",
+		"-f", "tests/e2e/phase-05-policy-engine/docker-compose.yml",
 		"run", "--rm",
 		"-e", "CLEAN_CODE_KMS_URL="+s.kmsURL,
 		"-e", "CLEAN_CODE_PG_URL="+pgURL,
@@ -315,24 +236,11 @@ func (s *signingKeyStoreState) theServiceInitialises() error {
 		"policy-steward",
 	)
 
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	cmd.Dir = repoDir
-	// Strip COMPOSE_FILE from the child env so its value cannot
-	// silently shadow the explicit -f arguments we just constructed.
-	childEnv := make([]string, 0, len(os.Environ()))
-	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "COMPOSE_FILE=") {
-			continue
-		}
-		childEnv = append(childEnv, kv)
-	}
-	cmd.Env = childEnv
-
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 
-	err = cmd.Run()
+	err := cmd.Run()
 	s.lastOutput = buf.String()
 
 	if err != nil {

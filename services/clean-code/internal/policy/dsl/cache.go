@@ -1,6 +1,7 @@
 package dsl
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/gofrs/uuid"
@@ -43,15 +44,19 @@ type Cache struct {
 // `ready` channel is closed once [Compile] returns; readers
 // `<-entry.ready` before reading `pred` / `err` (the
 // channel-close happens-before guarantee makes the read of
-// `pred` / `err` race-free after the receive). The
-// `panicVal` field carries a panic value if [Compile]
-// panicked; readers re-raise it so a buggy DSL doesn't
-// silently produce `(nil, nil)`.
+// `pred` / `err` race-free after the receive). If [Compile]
+// panics, the panic is captured as a synthetic err of the
+// form `internal: compile panicked: <value>` (see
+// [Cache.GetOrCompile]) so waiters and future lookups
+// receive an error rather than crashing -- avoiding a
+// fan-out cascade where one buggy Compile would otherwise
+// re-panic in N waiting goroutines. The panic still
+// propagates out of the ORIGINAL caller's frame so the bug
+// surfaces loudly in its stack trace.
 type cacheEntry struct {
-	ready    chan struct{}
-	pred     *Predicate
-	err      error
-	panicVal any
+	ready chan struct{}
+	pred  *Predicate
+	err   error
 }
 
 // NewCache constructs an empty [Cache].
@@ -110,12 +115,19 @@ func (c *Cache) GetOrCompile(policyVersionID uuid.UUID, source string, resolver 
 	// compile in parallel; concurrent callers for THIS
 	// key wait on entry.ready (see waitEntry).
 	//
-	// The defer captures any panic from [Compile] so
-	// waiters re-raise it rather than observing a silent
-	// (nil, nil) result.
+	// If [Compile] panics, the defer captures the panic
+	// value as a synthetic `internal: compile panicked: %v`
+	// error stored on entry.err BEFORE closing ready --
+	// concurrent waiters and future lookups for this key
+	// then observe an error rather than re-panicking, so
+	// a single buggy Compile cannot cascade into N
+	// goroutine crashes under high fan-out. The panic is
+	// still re-raised in this (the original) goroutine
+	// so the bug surfaces loudly in its stack trace
+	// rather than being silently demoted to an error.
 	defer func() {
 		if r := recover(); r != nil {
-			entry.panicVal = r
+			entry.err = fmt.Errorf("internal: compile panicked: %v", r)
 			close(entry.ready)
 			panic(r)
 		}
@@ -127,13 +139,16 @@ func (c *Cache) GetOrCompile(policyVersionID uuid.UUID, source string, resolver 
 	return pred, err
 }
 
-// waitEntry blocks until entry.ready closes, then re-raises
-// any compile-time panic or returns the cached result.
+// waitEntry blocks until entry.ready closes, then returns
+// the cached result. A panic from [Compile] is surfaced as
+// a synthetic `internal: compile panicked: ...` error on
+// entry.err -- waiters do NOT re-panic, so a single buggy
+// compile cannot cascade into N goroutine crashes under
+// high fan-out (the panic still propagates out of the
+// original caller's frame; only sibling waiters and future
+// lookups are demoted to errors).
 func waitEntry(entry *cacheEntry) (*Predicate, error) {
 	<-entry.ready
-	if entry.panicVal != nil {
-		panic(entry.panicVal)
-	}
 	return entry.pred, entry.err
 }
 

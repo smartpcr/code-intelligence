@@ -213,3 +213,68 @@ migration 0003). To back out:
 There is no DOWN-migration step required for backout because
 the existing append-only rows do not block the prior build.
 
+
+## Stage 5.3: `mgmt.override` write verb
+
+### Migration
+
+**None required.** The `clean_code.override` table (with the
+`override_reason_required_when_muted` CHECK constraint and the
+`override_rule_created_idx (rule_id, created_at DESC)` index)
+shipped in migration 0003 during Stage 1.4. Stage 5.3 is the
+first stage to actually write rows; no schema change is needed.
+
+### Env vars
+
+**None.** The verb reuses the existing `CLEAN_CODE_PG_URL`
+(append target) and the auth gateway's existing
+`X-OIDC-Subject` header contract that Stage 5.2 introduced. No
+KMS key is required -- the override row carries no signature
+column (kill-switch contract: the verb must work during a
+signing-key outage).
+
+### Per-rollout verification
+
+After deploying a new build:
+
+1. `/healthz` returns 200.
+2. `/readyz` returns 200 (steward wired).
+3. **Smoke-test the verb** with a known `rule_id` (the one the
+   smoke-test rulepack registers in Stage 5.2):
+
+   ```bash
+   curl -X POST \
+        -H 'Content-Type: application/json' \
+        -H 'X-OIDC-Subject: rollout-smoke@operator.local' \
+        --data '{"rule_id":"solid.srp.lcom4_high",
+                 "scope_filter":{"repo_id":"smoke","scope_kind":"repo","scope_signature_glob":"*"},
+                 "mute":true,"reason":"rollout smoke"}' \
+        https://clean-coded.example.com/v1/mgmt/override
+   ```
+
+   Expect 200 + `{"override_id":"..."}`. A 503 indicates the
+   steward is not wired; a 400 with "expires_at" or "actor_id"
+   in the error body indicates a client typing the body the
+   wrong way; a 401 indicates the gateway is not setting
+   `X-OIDC-Subject`.
+
+4. **Unmute the smoke row** with `mute=false` so the smoke
+   rule is not silenced for real evaluator traffic. The
+   evaluator (Stage 5.7) will read the LATEST row and see the
+   row is back to unmuted.
+
+5. The audit log shows `override` writes by the
+   `clean_code_policy_steward` role only.
+
+### Backout
+
+Stage 5.3 is purely additive (new route + first writes against
+the migration-0003 `override` table). To back out:
+
+1. Stop calling `mgmt.override` from the operator dashboard.
+2. Restart the pod with the previous build; the new route is
+   gone but the `override` rows remain. The evaluator (Stage
+   5.7) is not yet shipped, so the rows are inert.
+
+There is no DOWN-migration required for backout. The
+`override` table stays populated.

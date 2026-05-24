@@ -89,6 +89,34 @@ CREATE TABLE %[1]s.threshold (
     value           double precision           NOT NULL,
     created_at      timestamptz                NOT NULL DEFAULT now()
 );
+
+-- override (Stage 5.3) -- mirrors migration 0003 lines 488-546.
+-- Append-only mute lifecycle. NO expires_at, NO
+-- policy_version_id, NO created_by. actor_id is the OIDC
+-- subject; reason is NULL-able on unmute.
+--
+-- CHECK clause mirrors the PRODUCTION clause exactly:
+--   "mute=true implies reason IS NOT NULL".
+-- The production schema does NOT enforce non-whitespace
+-- reasons -- that is the validator's job (defence in depth,
+-- not in the DB). Keeping this test schema in lockstep with
+-- migration 0003 lines 526-528 guarantees that the bypass-
+-- validator tests below catch exactly what production catches:
+-- a NULL reason on a muted row, and nothing more.
+CREATE TABLE %[1]s.override (
+    override_id    uuid         PRIMARY KEY,
+    rule_id        text         NOT NULL,
+    scope_filter   jsonb        NOT NULL,
+    mute           boolean      NOT NULL,
+    reason         text,
+    actor_id       text         NOT NULL,
+    created_at     timestamptz  NOT NULL DEFAULT now(),
+    CONSTRAINT override_reason_required_when_muted
+        CHECK (mute = false OR reason IS NOT NULL)
+);
+
+CREATE INDEX override_rule_created_idx
+    ON %[1]s.override (rule_id, created_at DESC);
 `
 
 const stewardSchemaTeardownTemplate = `
@@ -564,5 +592,400 @@ func TestSQLStore_EvaluatorPicksUpActivatedVersion(t *testing.T) {
 	}
 	if err := st.VerifyPolicyVersionSignature(ctx, active); err != nil {
 		t.Fatalf("VerifyPolicyVersionSignature(SQL active): %v", err)
+	}
+}
+
+// TestSQLStore_OverrideRoundTrip pins the most basic SQL round-
+// trip for the Stage 5.3 `override` table: an Override row
+// inserted via [SQLStore.InsertOverride] reads back via
+// [SQLStore.LatestMatchingOverride] with bit-identical
+// scope_filter JSON, NULL-able reason, and UTC created_at.
+func TestSQLStore_OverrideRoundTrip(t *testing.T) {
+	_, store, ok := openStewardSQLStore(t)
+	if !ok {
+		return
+	}
+	ctx := context.Background()
+	seedSampleRulesInSQL(t, store)
+
+	id := uuid.Must(uuid.NewV4())
+	want := Override{
+		OverrideID: id,
+		RuleID:     "solid.srp.lcom4_high",
+		ScopeFilter: ScopeFilter{
+			RepoID:             "repo-a",
+			ScopeKind:          ScopeKindClass,
+			ScopeSignatureGlob: "com.example.legacy.*",
+		},
+		Mute:      true,
+		Reason:    "legacy code; planned refactor in Q3",
+		ActorID:   "alice@example.com",
+		CreatedAt: sampleClockStart(),
+	}
+	if err := store.InsertOverride(ctx, want); err != nil {
+		t.Fatalf("InsertOverride: %v", err)
+	}
+	got, ok2, err := store.LatestMatchingOverride(ctx, want.RuleID, CandidateScope{
+		RepoID: "repo-a", ScopeKind: ScopeKindClass, Signature: "com.example.legacy.Foo",
+	})
+	if err != nil {
+		t.Fatalf("LatestMatchingOverride: %v", err)
+	}
+	if !ok2 {
+		t.Fatal("LatestMatchingOverride: row not found after insert")
+	}
+	if got.OverrideID != want.OverrideID {
+		t.Errorf("OverrideID=%s, want %s", got.OverrideID, want.OverrideID)
+	}
+	if got.RuleID != want.RuleID {
+		t.Errorf("RuleID=%q, want %q", got.RuleID, want.RuleID)
+	}
+	if got.ScopeFilter != want.ScopeFilter {
+		t.Errorf("ScopeFilter=%+v, want %+v", got.ScopeFilter, want.ScopeFilter)
+	}
+	if got.Mute != want.Mute {
+		t.Errorf("Mute=%v, want %v", got.Mute, want.Mute)
+	}
+	if got.Reason != want.Reason {
+		t.Errorf("Reason=%q, want %q", got.Reason, want.Reason)
+	}
+	if got.ActorID != want.ActorID {
+		t.Errorf("ActorID=%q, want %q", got.ActorID, want.ActorID)
+	}
+	if !got.CreatedAt.Equal(want.CreatedAt) {
+		t.Errorf("CreatedAt=%s, want %s", got.CreatedAt, want.CreatedAt)
+	}
+	if got.CreatedAt.Location() != time.UTC {
+		t.Errorf("CreatedAt.Location()=%v, want UTC", got.CreatedAt.Location())
+	}
+}
+
+// TestSQLStore_OverrideUnmuteAllowsNullReason pins the
+// `override_reason_required_when_muted` CHECK constraint
+// behaviour: when `mute=false` the writer MUST be allowed to
+// land a NULL reason. The SQLStore passes NULL (not "") into
+// the bind so the CHECK passes.
+func TestSQLStore_OverrideUnmuteAllowsNullReason(t *testing.T) {
+	_, store, ok := openStewardSQLStore(t)
+	if !ok {
+		return
+	}
+	ctx := context.Background()
+	seedSampleRulesInSQL(t, store)
+
+	id := uuid.Must(uuid.NewV4())
+	o := Override{
+		OverrideID: id,
+		RuleID:     "solid.srp.lcom4_high",
+		ScopeFilter: ScopeFilter{
+			RepoID: "repo-a", ScopeKind: ScopeKindClass,
+			ScopeSignatureGlob: "com.example.*",
+		},
+		Mute:      false,
+		Reason:    "",
+		ActorID:   "alice@example.com",
+		CreatedAt: sampleClockStart(),
+	}
+	if err := store.InsertOverride(ctx, o); err != nil {
+		t.Fatalf("InsertOverride(unmute, empty reason): %v -- the SQLStore must pass NULL for reason on unmute", err)
+	}
+	got, ok2, err := store.LatestMatchingOverride(ctx, o.RuleID, CandidateScope{
+		RepoID: "repo-a", ScopeKind: ScopeKindClass, Signature: "com.example.Foo",
+	})
+	if err != nil {
+		t.Fatalf("LatestMatchingOverride: %v", err)
+	}
+	if !ok2 || got.Reason != "" {
+		t.Errorf("LatestMatchingOverride Reason=%q ok=%v, want empty string + true", got.Reason, ok2)
+	}
+}
+
+// TestSQLStore_OverrideMutedReasonNullIsRejectedByCheck pins
+// what the production `override_reason_required_when_muted`
+// CHECK actually catches: muted rows whose `reason` column is
+// SQL NULL. The SQLStore writer translates an empty-string
+// `Reason` to a SQL NULL bind (see [SQLStore.InsertOverride]
+// lines 423-428), so a muted row with `Reason: ""` reaches PG
+// as `reason = NULL` and is rejected. This is the schema-side
+// defense in depth; the Steward validator is the primary
+// defense and runs first.
+//
+// What this CHECK does NOT catch is whitespace-only reasons
+// on muted rows -- those are `reason IS NOT NULL` and pass.
+// See [TestSQLStore_OverrideMutedWhitespaceReasonAcceptedByCheck]
+// for the matching "production allows this" pin.
+func TestSQLStore_OverrideMutedReasonNullIsRejectedByCheck(t *testing.T) {
+	_, store, ok := openStewardSQLStore(t)
+	if !ok {
+		return
+	}
+	ctx := context.Background()
+	seedSampleRulesInSQL(t, store)
+
+	err := store.InsertOverride(ctx, Override{
+		OverrideID: uuid.Must(uuid.NewV4()),
+		RuleID:     "solid.srp.lcom4_high",
+		ScopeFilter: ScopeFilter{
+			RepoID: "repo-a", ScopeKind: ScopeKindClass,
+			ScopeSignatureGlob: "*",
+		},
+		Mute:      true,
+		Reason:    "", // writer maps "" -> NULL
+		ActorID:   "alice@example.com",
+		CreatedAt: sampleClockStart(),
+	})
+	if err == nil {
+		t.Fatal("InsertOverride(mute=true, reason=\"\"): err=nil -- override_reason_required_when_muted CHECK did not catch the NULL reason a muted row")
+	}
+}
+
+// TestSQLStore_OverrideMutedWhitespaceReasonAcceptedByCheck
+// pins the *boundary* of the production CHECK: a muted row
+// whose `reason` column is the string `"   "` is NOT NULL, so
+// the CHECK passes and PG accepts the row. This is the
+// rubber-duck "false confidence" pin: the database does NOT
+// enforce a non-whitespace reason; the Steward validator does.
+//
+// If a future maintainer assumes the CHECK guarantees a non-
+// whitespace reason and removes the validator's whitespace
+// check, this test still passes -- and the bypass-validator
+// case would silently land whitespace mute reasons in
+// production. The matching validator test that pins the
+// primary defense is
+// [TestSteward_Override_RejectsMuteWithoutReason] in
+// override_test.go.
+//
+// Together these two tests document the exact division of
+// labour between the validator (catches "" / whitespace) and
+// the CHECK (catches NULL only).
+func TestSQLStore_OverrideMutedWhitespaceReasonAcceptedByCheck(t *testing.T) {
+	_, store, ok := openStewardSQLStore(t)
+	if !ok {
+		return
+	}
+	ctx := context.Background()
+	seedSampleRulesInSQL(t, store)
+
+	err := store.InsertOverride(ctx, Override{
+		OverrideID: uuid.Must(uuid.NewV4()),
+		RuleID:     "solid.srp.lcom4_high",
+		ScopeFilter: ScopeFilter{
+			RepoID: "repo-a", ScopeKind: ScopeKindClass,
+			ScopeSignatureGlob: "*",
+		},
+		Mute:      true,
+		Reason:    "   ", // not "" -- writer passes literally
+		ActorID:   "alice@example.com",
+		CreatedAt: sampleClockStart(),
+	})
+	if err != nil {
+		t.Fatalf("InsertOverride(mute=true, reason=\"   \"): err=%v -- production CHECK only blocks NULL, not whitespace; the validator is the defense for whitespace", err)
+	}
+}
+
+// TestSQLStore_OverrideLatestRowWins pins the SQL ORDER BY
+// clause: two override rows for the same (rule_id,
+// scope_filter), latest `created_at` wins.
+func TestSQLStore_OverrideLatestRowWins(t *testing.T) {
+	_, store, ok := openStewardSQLStore(t)
+	if !ok {
+		return
+	}
+	ctx := context.Background()
+	seedSampleRulesInSQL(t, store)
+
+	filter := ScopeFilter{
+		RepoID: "repo-a", ScopeKind: ScopeKindClass,
+		ScopeSignatureGlob: "com.example.*",
+	}
+	t0 := sampleClockStart()
+	first := Override{
+		OverrideID: uuid.Must(uuid.NewV4()), RuleID: "solid.srp.lcom4_high",
+		ScopeFilter: filter, Mute: true, Reason: "noisy", ActorID: "alice",
+		CreatedAt: t0,
+	}
+	second := Override{
+		OverrideID: uuid.Must(uuid.NewV4()), RuleID: "solid.srp.lcom4_high",
+		ScopeFilter: filter, Mute: false, Reason: "",
+		ActorID:   "alice",
+		CreatedAt: t0.Add(time.Second),
+	}
+	if err := store.InsertOverride(ctx, first); err != nil {
+		t.Fatalf("InsertOverride first: %v", err)
+	}
+	if err := store.InsertOverride(ctx, second); err != nil {
+		t.Fatalf("InsertOverride second: %v", err)
+	}
+	got, ok2, err := store.LatestMatchingOverride(ctx, "solid.srp.lcom4_high", CandidateScope{
+		RepoID: "repo-a", ScopeKind: ScopeKindClass, Signature: "com.example.Foo",
+	})
+	if err != nil {
+		t.Fatalf("LatestMatchingOverride: %v", err)
+	}
+	if !ok2 {
+		t.Fatal("LatestMatchingOverride ok=false")
+	}
+	if got.OverrideID != second.OverrideID {
+		t.Errorf("LatestMatchingOverride OverrideID=%s, want %s (second/newer row)",
+			got.OverrideID, second.OverrideID)
+	}
+	if got.Mute {
+		t.Errorf("LatestMatchingOverride Mute=true; want false (unmute wins)")
+	}
+}
+
+// TestSQLStore_OverrideIgnoresOtherRulesAndScopes pins the
+// JSONB partition predicate of the SQLStore reader -- a row
+// with the same scope_filter but DIFFERENT rule_id, OR same
+// rule_id but DIFFERENT repo_id, MUST NOT match.
+func TestSQLStore_OverrideIgnoresOtherRulesAndScopes(t *testing.T) {
+	_, store, ok := openStewardSQLStore(t)
+	if !ok {
+		return
+	}
+	ctx := context.Background()
+	seedSampleRulesInSQL(t, store)
+
+	other := ScopeFilter{
+		RepoID: "repo-b", ScopeKind: ScopeKindClass,
+		ScopeSignatureGlob: "com.example.*",
+	}
+	if err := store.InsertOverride(ctx, Override{
+		OverrideID:  uuid.Must(uuid.NewV4()),
+		RuleID:      "solid.srp.lcom4_high",
+		ScopeFilter: other, Mute: true, Reason: "different repo",
+		ActorID:   "alice",
+		CreatedAt: sampleClockStart(),
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Look up the candidate under repo-a -- no row exists
+	// under that repo so we must miss.
+	_, ok2, err := store.LatestMatchingOverride(ctx, "solid.srp.lcom4_high", CandidateScope{
+		RepoID: "repo-a", ScopeKind: ScopeKindClass, Signature: "com.example.Foo",
+	})
+	if err != nil {
+		t.Fatalf("LatestMatchingOverride: %v", err)
+	}
+	if ok2 {
+		t.Error("LatestMatchingOverride matched across repo_id; SQL should filter by scope_filter->>'repo_id'")
+	}
+}
+
+// TestSQLStore_OverrideGlobMatchesSubScope pins the
+// production glob semantic at the SQL layer: an override
+// registered with glob `com.example.legacy.*` is found for any
+// concrete signature INSIDE that package. The SQL pre-filter
+// narrows to (rule_id, repo_id, scope_kind), then Go applies
+// [scopeGlobMatches] over the streamed rows.
+func TestSQLStore_OverrideGlobMatchesSubScope(t *testing.T) {
+	_, store, ok := openStewardSQLStore(t)
+	if !ok {
+		return
+	}
+	ctx := context.Background()
+	seedSampleRulesInSQL(t, store)
+
+	if err := store.InsertOverride(ctx, Override{
+		OverrideID:  uuid.Must(uuid.NewV4()),
+		RuleID:      "solid.srp.lcom4_high",
+		ScopeFilter: ScopeFilter{RepoID: "repo-a", ScopeKind: ScopeKindClass, ScopeSignatureGlob: "com.example.legacy.*"},
+		Mute:        true,
+		Reason:      "glob mute",
+		ActorID:     "alice",
+		CreatedAt:   sampleClockStart(),
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	got, found, err := store.LatestMatchingOverride(ctx, "solid.srp.lcom4_high", CandidateScope{
+		RepoID: "repo-a", ScopeKind: ScopeKindClass, Signature: "com.example.legacy.OrderProcessor",
+	})
+	if err != nil {
+		t.Fatalf("LatestMatchingOverride: %v", err)
+	}
+	if !found {
+		t.Fatal("LatestMatchingOverride found=false; glob com.example.legacy.* should match com.example.legacy.OrderProcessor")
+	}
+	if !got.Mute {
+		t.Errorf("Mute=false, want true")
+	}
+}
+
+// TestSQLStore_OverrideGlobSkipsNonMatchingRow pins the
+// rubber-duck #2 "no LIMIT" critique: when an older row's glob
+// matches but a NEWER row's glob does NOT match, the reader
+// MUST keep walking and find the older match (rather than
+// stopping at the newest scanned row).
+func TestSQLStore_OverrideGlobSkipsNonMatchingRow(t *testing.T) {
+	_, store, ok := openStewardSQLStore(t)
+	if !ok {
+		return
+	}
+	ctx := context.Background()
+	seedSampleRulesInSQL(t, store)
+
+	t0 := sampleClockStart()
+	// Older: glob matches the candidate.
+	if err := store.InsertOverride(ctx, Override{
+		OverrideID:  uuid.Must(uuid.NewV4()),
+		RuleID:      "solid.srp.lcom4_high",
+		ScopeFilter: ScopeFilter{RepoID: "repo-a", ScopeKind: ScopeKindClass, ScopeSignatureGlob: "com.example.legacy.*"},
+		Mute:        true,
+		Reason:      "older mute",
+		ActorID:     "alice",
+		CreatedAt:   t0,
+	}); err != nil {
+		t.Fatalf("seed older: %v", err)
+	}
+	// Newer (same partition, different glob): does NOT
+	// match the target candidate.
+	if err := store.InsertOverride(ctx, Override{
+		OverrideID:  uuid.Must(uuid.NewV4()),
+		RuleID:      "solid.srp.lcom4_high",
+		ScopeFilter: ScopeFilter{RepoID: "repo-a", ScopeKind: ScopeKindClass, ScopeSignatureGlob: "com.example.other.*"},
+		Mute:        false,
+		Reason:      "",
+		ActorID:     "bob",
+		CreatedAt:   t0.Add(time.Second),
+	}); err != nil {
+		t.Fatalf("seed newer: %v", err)
+	}
+	got, found, err := store.LatestMatchingOverride(ctx, "solid.srp.lcom4_high", CandidateScope{
+		RepoID: "repo-a", ScopeKind: ScopeKindClass, Signature: "com.example.legacy.Foo",
+	})
+	if err != nil {
+		t.Fatalf("LatestMatchingOverride: %v", err)
+	}
+	if !found {
+		t.Fatal("found=false; the older matching row was hidden behind a newer non-matching row (LIMIT 1 regression)")
+	}
+	if got.Reason != "older mute" {
+		t.Errorf("Reason=%q, want %q (older row should win after newer is skipped)", got.Reason, "older mute")
+	}
+}
+
+// TestSQLStore_RuleExistsByID exercises the logical-FK helper
+// added in Stage 5.3.
+func TestSQLStore_RuleExistsByID(t *testing.T) {
+	_, store, ok := openStewardSQLStore(t)
+	if !ok {
+		return
+	}
+	ctx := context.Background()
+	seedSampleRulesInSQL(t, store)
+
+	hit, err := store.RuleExistsByID(ctx, "solid.srp.lcom4_high")
+	if err != nil {
+		t.Fatalf("RuleExistsByID: %v", err)
+	}
+	if !hit {
+		t.Error("RuleExistsByID(solid.srp.lcom4_high)=false, want true after seeding")
+	}
+	miss, err := store.RuleExistsByID(ctx, "no.such.rule")
+	if err != nil {
+		t.Fatalf("RuleExistsByID(no.such.rule): %v", err)
+	}
+	if miss {
+		t.Error("RuleExistsByID(no.such.rule)=true, want false")
 	}
 }

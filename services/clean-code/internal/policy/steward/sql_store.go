@@ -296,7 +296,7 @@ func (s *SQLStore) ListRulesForPack(ctx context.Context, packID string) ([]Rule,
 	if err != nil {
 		return nil, fmt.Errorf("steward: SQLStore.ListRulesForPack: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make([]Rule, 0)
 	for rows.Next() {
 		var r Rule
@@ -378,6 +378,142 @@ func (s *SQLStore) InsertThreshold(ctx context.Context, t Threshold) error {
 		return fmt.Errorf("steward: SQLStore.InsertThreshold: %w", err)
 	}
 	return nil
+}
+
+// RuleExistsByID reports whether ANY row keyed by `ruleID` (any
+// version) is present in `clean_code.rule`. SELECT 1 plus LIMIT
+// 1 short-circuits at the first hit -- the rule_id may have
+// multiple versions but one is sufficient for the
+// `Override.rule_id` logical FK check.
+func (s *SQLStore) RuleExistsByID(ctx context.Context, ruleID string) (bool, error) {
+	stmt := fmt.Sprintf(
+		`SELECT 1 FROM %s WHERE rule_id = $1 LIMIT 1`,
+		s.qualify("rule"))
+	var one int
+	err := s.db.QueryRowContext(ctx, stmt, ruleID).Scan(&one)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("steward: SQLStore.RuleExistsByID: %w", err)
+	}
+	return true, nil
+}
+
+// InsertOverride appends `o` to `clean_code.override`. The
+// schema's CHECK `override_reason_required_when_muted`
+// surfaces as a 23514 SQLSTATE on misuse; the Steward
+// validator runs the same check application-side so a properly
+// validated request never trips the constraint.
+func (s *SQLStore) InsertOverride(ctx context.Context, o Override) error {
+	scopeJSON, err := json.Marshal(o.ScopeFilter)
+	if err != nil {
+		return fmt.Errorf("steward: SQLStore.InsertOverride: marshal scope_filter: %w", err)
+	}
+	stmt := fmt.Sprintf(
+		`INSERT INTO %s
+		   (override_id, rule_id, scope_filter, mute, reason, actor_id, created_at)
+		 VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7)`,
+		s.qualify("override"))
+	// `reason` is nullable in the DB; pass NULL when the
+	// caller supplied an empty string AND mute=false (the
+	// unmute shape -- the architecture allows an empty
+	// reason on unmute). For mute=true the validator
+	// rejected the empty case before we ever got here.
+	var reason any
+	if o.Reason == "" {
+		reason = nil
+	} else {
+		reason = o.Reason
+	}
+	_, err = s.db.ExecContext(ctx, stmt,
+		o.OverrideID.String(),
+		o.RuleID,
+		string(scopeJSON),
+		o.Mute,
+		reason,
+		o.ActorID,
+		o.CreatedAt.UTC(),
+	)
+	if err != nil {
+		var pqErr *pq.Error
+		if errors.As(err, &pqErr) && string(pqErr.Code) == pgSQLStateUniqueViolation {
+			return fmt.Errorf("steward: SQLStore.InsertOverride: duplicate override_id=%s: %w", o.OverrideID, err)
+		}
+		return fmt.Errorf("steward: SQLStore.InsertOverride: %w", err)
+	}
+	return nil
+}
+
+// LatestMatchingOverride returns the override row whose
+// `scope_filter` matches the candidate scope per the
+// architecture-pinned glob semantic. The SQL pre-filters by
+// (`rule_id`, `scope_filter->>'repo_id'`,
+// `scope_filter->>'scope_kind'`) so the partition is small
+// (operator-curated). Rows stream in
+// `(created_at DESC, override_id DESC)` order; we apply
+// [scopeGlobMatches] in Go and STOP at the first hit.
+//
+// There is intentionally NO `LIMIT` clause -- a bounded LIMIT
+// could hide an older matching glob behind a newer non-matching
+// row. The partition is small enough that streaming the
+// entire (rule_id, repo, kind) bucket is cheap, and the
+// rubber-duck #2 critique called out the bounded-limit risk.
+//
+// The `override_rule_created_idx (rule_id, created_at DESC)`
+// index from migration 0003 line 545 covers the rule_id
+// partition; the JSONB extractor predicates run inside the
+// partition.
+func (s *SQLStore) LatestMatchingOverride(ctx context.Context, ruleID string, candidate CandidateScope) (Override, bool, error) {
+	stmt := fmt.Sprintf(
+		`SELECT override_id, rule_id, scope_filter, mute, reason, actor_id, created_at
+		 FROM %s
+		 WHERE rule_id = $1
+		   AND scope_filter->>'repo_id' = $2
+		   AND scope_filter->>'scope_kind' = $3
+		 ORDER BY created_at DESC, override_id DESC`,
+		s.qualify("override"))
+	rows, err := s.db.QueryContext(ctx, stmt, ruleID, candidate.RepoID, string(candidate.ScopeKind))
+	if err != nil {
+		return Override{}, false, fmt.Errorf("steward: SQLStore.LatestMatchingOverride: query: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var (
+			idStr    string
+			o        Override
+			scopeRaw []byte
+			reasonNS sql.NullString
+		)
+		if err := rows.Scan(&idStr, &o.RuleID, &scopeRaw, &o.Mute, &reasonNS, &o.ActorID, &o.CreatedAt); err != nil {
+			return Override{}, false, fmt.Errorf("steward: SQLStore.LatestMatchingOverride: scan: %w", err)
+		}
+		if err := json.Unmarshal(scopeRaw, &o.ScopeFilter); err != nil {
+			return Override{}, false, fmt.Errorf("steward: SQLStore.LatestMatchingOverride: unmarshal scope_filter: %w", err)
+		}
+		match, err := scopeGlobMatches(o.ScopeFilter.ScopeSignatureGlob, candidate.Signature)
+		if err != nil {
+			return Override{}, false, err
+		}
+		if !match {
+			continue
+		}
+		parsed, err := uuid.FromString(idStr)
+		if err != nil {
+			return Override{}, false, fmt.Errorf("steward: SQLStore.LatestMatchingOverride: bad override_id %q: %w", idStr, err)
+		}
+		o.OverrideID = parsed
+		if reasonNS.Valid {
+			o.Reason = reasonNS.String
+		}
+		// First match in (created_at DESC, override_id DESC)
+		// order IS the latest-row-wins answer.
+		return o, true, nil
+	}
+	if err := rows.Err(); err != nil {
+		return Override{}, false, fmt.Errorf("steward: SQLStore.LatestMatchingOverride: rows: %w", err)
+	}
+	return Override{}, false, nil
 }
 
 // Compile-time check that SQLStore satisfies Store.

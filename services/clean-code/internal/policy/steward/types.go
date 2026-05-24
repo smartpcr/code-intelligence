@@ -2,6 +2,7 @@ package steward
 
 import (
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/gofrs/uuid"
@@ -189,6 +190,171 @@ type PublishRulepackRequest struct {
 	Rules         []RuleSpec `json:"rules"`
 }
 
+// ScopeKind is the closed set of scope kinds an Override's
+// `scope_filter.scope_kind` may carry. Matches the DB ENUM
+// `clean_code.scope_kind` declared in migration 0002 line 142
+// verbatim (`repo`, `package`, `file`, `class`, `interface`,
+// `method`, `block`).
+type ScopeKind string
+
+// Canonical scope kinds. Pinned to the seven values in
+// architecture Sec 5.2.1 line 1046 + migration 0002. New
+// values MUST land via a coordinated migration + this constant
+// list -- a free-form text scope_kind would defeat the
+// evaluator's switch-on-kind dispatch.
+const (
+	ScopeKindRepo      ScopeKind = "repo"
+	ScopeKindPackage   ScopeKind = "package"
+	ScopeKindFile      ScopeKind = "file"
+	ScopeKindClass     ScopeKind = "class"
+	ScopeKindInterface ScopeKind = "interface"
+	ScopeKindMethod    ScopeKind = "method"
+	ScopeKindBlock     ScopeKind = "block"
+)
+
+// IsValid reports whether k is a member of the closed scope
+// kind set declared in architecture Sec 5.2.1 line 1046.
+func (k ScopeKind) IsValid() bool {
+	switch k {
+	case ScopeKindRepo, ScopeKindPackage, ScopeKindFile,
+		ScopeKindClass, ScopeKindInterface, ScopeKindMethod, ScopeKindBlock:
+		return true
+	default:
+		return false
+	}
+}
+
+// ScopeFilter is the in-memory mirror of an `override.scope_filter`
+// JSONB row's `{repo_id, scope_kind, scope_signature_glob}`
+// shape per architecture Sec 5.3.6 line 1167. The Stage 5.3
+// implementation pins all three fields as REQUIRED for v1 (no
+// "global mute" semantics; the rubber-duck critique calls out
+// that an ambiguous `{}` filter would let an operator silently
+// mute every rule everywhere -- the canonical wildcard for
+// "every scope of this kind in this repo" is the glob `"*"`).
+//
+// The JSON tags match the architecture-mandated field names
+// verbatim so the serialised form survives a grep against the
+// spec.
+type ScopeFilter struct {
+	RepoID             string    `json:"repo_id"`
+	ScopeKind          ScopeKind `json:"scope_kind"`
+	ScopeSignatureGlob string    `json:"scope_signature_glob"`
+}
+
+// IsZero reports whether all three fields are empty. Used by
+// the validator to surface a precise error rather than three
+// separate "field X is empty" messages.
+func (f ScopeFilter) IsZero() bool {
+	return f.RepoID == "" && f.ScopeKind == "" && f.ScopeSignatureGlob == ""
+}
+
+// CandidateScope is the CONCRETE scope tuple the evaluator
+// surface passes to the Policy Steward to look up the active
+// mute state per architecture Sec 5.3.6 line 1171:
+//
+//	MAX(created_at) WHERE rule_id=$1 AND scope_filter matches the candidate scope
+//
+// Unlike [ScopeFilter] (which carries a GLOB the operator
+// registered), CandidateScope carries the LITERAL signature of
+// the scope under evaluation -- e.g. the fully-qualified class
+// name `com.example.legacy.Foo`, the file path
+// `src/internal/foo.go`, or the package coordinate
+// `com.example.legacy`. The reader translates "matches" as:
+//
+//   - scope_filter.repo_id     == candidate.RepoID,
+//   - scope_filter.scope_kind  == candidate.ScopeKind,
+//   - scopeGlobMatches(scope_filter.scope_signature_glob,
+//     candidate.Signature) == true.
+//
+// CandidateScope is purely an internal parameter type; it has
+// no wire form. The `mgmt.override` write verb carries
+// `ScopeFilter`, never `CandidateScope`. The evaluator surface
+// is the only caller; we omit JSON tags to keep the gate-time
+// hot path free of serialisation cost.
+type CandidateScope struct {
+	RepoID    string
+	ScopeKind ScopeKind
+	// Signature is the LITERAL scope signature being
+	// evaluated -- NOT a glob. The reader compares this
+	// string against the stored `scope_signature_glob`
+	// via [scopeGlobMatches]. Operators MUST pass the
+	// concrete identifier (`com.example.Foo`), not a
+	// pattern (`com.example.*`). An empty Signature is
+	// invalid -- the gate would otherwise match every
+	// stored override whose glob is `*`, masking upstream
+	// bugs that forget to compute the candidate's
+	// signature.
+	Signature string
+}
+
+// IsValid reports whether all three CandidateScope fields are
+// populated and the ScopeKind is in the canonical seven-value
+// set. Used by [Steward.LatestMatchingOverride] to refuse a
+// nonsensical read before scanning the store.
+func (c CandidateScope) IsValid() bool {
+	return strings.TrimSpace(c.RepoID) != "" &&
+		c.ScopeKind.IsValid() &&
+		strings.TrimSpace(c.Signature) != ""
+}
+
+// Override mirrors a row in `clean_code.override` per
+// architecture Sec 5.3.6 lines 1160-1170. The row is
+// append-only: the latest row by `created_at` for a given
+// `(rule_id, scope_filter)` pair defines the current mute
+// state (architecture Sec 5.3.6 line 1171, tech-spec Sec 10A
+// pin "mute lifecycle"). There is NO `expires_at` column
+// (tech-spec Sec 10A pins v1 to latest-row-wins without a
+// TTL) and NO `policy_version_id` column (overrides bind to
+// rules, not policy versions).
+type Override struct {
+	OverrideID  uuid.UUID   `json:"override_id"`
+	RuleID      string      `json:"rule_id"`
+	ScopeFilter ScopeFilter `json:"scope_filter"`
+	Mute        bool        `json:"mute"`
+	// Reason carries the operator's justification for the
+	// mute. The architecture requires it when `mute=true`
+	// (Sec 5.3.6 line 1169); the SQL CHECK constraint
+	// `override_reason_required_when_muted` enforces it at
+	// the database level. The Steward validator rejects
+	// whitespace-only reasons up front so a partial-init
+	// SQL write never produces a "logically empty" audit
+	// reason that nonetheless passes the NULL check.
+	Reason string `json:"reason,omitempty"`
+	// ActorID is the OIDC subject of the caller (architecture
+	// Sec 5.3.6 line 1170). The column name is `actor_id` --
+	// NOT `created_by`. The Stage 5.3 brief explicitly pins
+	// "NO `created_by` column".
+	ActorID   string    `json:"actor_id"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// OverrideRequest is the input shape of the `mgmt.override`
+// verb. The Stage 5.3 brief pins the request shape to exactly
+// `{scope_filter, rule_id, mute, reason}` plus an
+// implicit `actor_id` carried from the OIDC-authenticated
+// caller (NOT from the request body, which is operator-
+// spoofable).
+//
+// The verb refuses any caller-supplied `expires_at` field
+// (tech-spec Sec 10A "mute lifecycle" pin: v1 has no TTL).
+// Rejection happens at the HTTP layer via `DisallowUnknownFields`
+// rather than at this struct -- the Steward verb has no
+// `expires_at` to bind against, so a future caller that bypasses
+// the HTTP wire shape cannot smuggle it in either.
+type OverrideRequest struct {
+	RuleID      string      `json:"rule_id"`
+	ScopeFilter ScopeFilter `json:"scope_filter"`
+	Mute        bool        `json:"mute"`
+	Reason      string      `json:"reason"`
+	// ActorID is filled by the HTTP layer from the
+	// `X-OIDC-Subject` header (the trust boundary is the
+	// authenticating gateway, not the JSON body). The
+	// Steward verb rejects an empty ActorID with
+	// [ErrInvalidOverride].
+	ActorID string `json:"-"`
+}
+
 // Sentinel errors. Defined as exported sentinels so callers
 // can branch via `errors.Is` rather than string-matching the
 // message.
@@ -253,4 +419,34 @@ var (
 	// `policy.rulepack.remove` / `policy.override` --
 	// returns this sentinel.
 	ErrUnimplementedVerb = errors.New("steward: verb is not in the canonical policy.* surface (returns UNIMPLEMENTED per tech-spec Sec 8.5)")
+
+	// ErrInvalidOverride is returned by [Steward.Override]
+	// when the inbound payload fails shape validation
+	// (empty rule_id, malformed scope_filter, empty
+	// reason when `mute=true`, empty actor_id, etc.). The
+	// concrete validation reason is included in the wrapped
+	// error so the HTTP layer can echo a precise 400 body
+	// without the caller having to grep the source.
+	ErrInvalidOverride = errors.New("steward: invalid override request")
+
+	// ErrUnknownRule is returned by [Steward.Override] when
+	// the inbound `rule_id` does not reference any persisted
+	// rule_id lineage in `clean_code.rule`. Distinct from
+	// [ErrUnknownRuleRef] (which is the `policy.publish`
+	// rule_refs[i] FK miss); the Override row's logical FK
+	// is on `rule_id` ALONE (no `version` column on the
+	// row -- overrides bind to the rule lineage, not to a
+	// specific rule version).
+	ErrUnknownRule = errors.New("steward: rule_id does not reference any persisted rule (Override.rule_id FK)")
+
+	// ErrInvalidCandidateScope is returned by
+	// [Steward.LatestMatchingOverride] when the caller's
+	// [CandidateScope] is missing a required field (repo_id,
+	// scope_kind, or signature) or carries an unknown
+	// scope_kind. The gate-time hot path refuses such reads
+	// rather than silently returning ok=false, which would
+	// mask upstream bugs in the evaluator that fail to
+	// compute the candidate's concrete signature before
+	// asking "is this scope muted?".
+	ErrInvalidCandidateScope = errors.New("steward: invalid candidate scope (repo_id, scope_kind, and signature are all required)")
 )

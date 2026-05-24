@@ -285,3 +285,201 @@ are lost on process restart. The development warning log line
 `policy steward backed by in-memory store` signals which mode
 is active.
 
+
+## `mgmt.override` write verb (Stage 5.3)
+
+### What
+
+`mgmt.override` is the operator **mute / unmute kill switch**
+for individual rules at a chosen scope (architecture Sec 1.5.1
+row 5 + Sec 6.3 line 1357). The verb appends one `override` row
+per call; unmute is a fresh INSERT with `mute=false`. The
+evaluator (Stage 5.7) consults `MAX(created_at) WHERE rule_id
+= $1 AND scope_filter matches the candidate scope` so the
+**latest matching row wins**.
+
+### How `scope_filter matches the candidate scope`
+
+The evaluator carries a `CandidateScope{repo_id, scope_kind,
+signature}` and asks the steward for the latest override that
+matches it. "Match" means:
+
+1. `scope_filter.repo_id` == `candidate.repo_id` (exact)
+2. `scope_filter.scope_kind` == `candidate.scope_kind` (exact)
+3. `scope_filter.scope_signature_glob` matches
+   `candidate.signature` under simple glob vocab:
+   - `*` matches any sequence of characters (including empty,
+     and across `.` / `/`).
+   - `?` matches exactly one character.
+   - Every other rune is literal (no `[...]` classes, no
+     backslash escapes).
+   The pattern is anchored end-to-end -- `com.example.legacy.*`
+   matches `com.example.legacy.Foo` and `com.example.legacy.a.b`
+   but NOT `com.other.legacy.X`.
+
+The read is implemented in `Store.LatestMatchingOverride`. The
+SQL path pre-filters with a JSONB extractor (`scope_filter->>
+'repo_id'` and `scope_filter->>'scope_kind'`) so only the rows
+in the candidate's `(repo_id, scope_kind)` partition are
+streamed; the glob match is applied in Go in descending
+`(created_at, override_id)` order, stopping at the first hit.
+Crucially the query does **not** carry a `LIMIT`: a newer row
+under a non-matching glob must not hide an older row under a
+matching glob.
+
+### Wire shape
+
+```
+POST /v1/mgmt/override
+Content-Type: application/json
+X-OIDC-Subject: <caller OIDC sub>
+
+{
+  "rule_id": "solid.srp.lcom4_high",
+  "scope_filter": {
+    "repo_id": "repo-a",
+    "scope_kind": "class",
+    "scope_signature_glob": "com.example.legacy.*"
+  },
+  "mute":   true,
+  "reason": "legacy code; planned refactor in Q3"
+}
+```
+
+Response (HTTP 200) carries **only** the new override id --
+matching the architecture `mgmt.override(...) -> OverrideId`
+return type:
+
+```json
+{ "override_id": "f4c1...-uuid" }
+```
+
+### Required invariants
+
+- The body **MUST NOT** contain `expires_at` (v1 mute lifecycle
+  has no TTL -- tech-spec Sec 10A pin). `DisallowUnknownFields`
+  on the decoder returns **400** if you try.
+- The body **MUST NOT** contain `actor_id`. The OIDC subject is
+  sourced exclusively from the `X-OIDC-Subject` header. Bodies
+  carrying `actor_id` are rejected with **400**; missing or
+  empty `X-OIDC-Subject` returns **401**.
+- `scope_filter.scope_kind` must be one of the canonical seven
+  values: `repo, package, file, class, interface, method,
+  block`. Anything else -> 400.
+- `scope_filter.repo_id` and `scope_filter.scope_signature_glob`
+  MUST be non-empty (use `"*"` for the repo-wide wildcard --
+  the empty string is rejected). 400 on miss.
+- `reason` MUST be non-empty (after `TrimSpace`) when
+  `mute=true`. Empty / whitespace-only reasons return 400 at
+  the handler; the SQL CHECK constraint
+  `override_reason_required_when_muted` provides defence in
+  depth at the database. `reason` MAY be empty on unmute.
+- `rule_id` MUST reference a rule that has been registered via
+  `policy.publish_rulepack`. The verb performs a logical FK
+  check; an unknown rule returns 400.
+
+### Status codes
+
+| Code | Meaning |
+| ---- | ------- |
+| 200  | Override row appended; body is `{override_id}`. Note: in scaffold mode (`CLEAN_CODE_KMS_PROVIDER` unset) the Policy Steward is still wired with a null-object signer, so `mgmt.override` continues to serve 200 -- see the scaffold-mode matrix in "No signing-key precondition (kill-switch contract)" below. |
+| 400  | Malformed JSON, unknown field (including `expires_at` / `actor_id`), invalid `scope_kind`, empty `reason` on mute, or unknown `rule_id`. |
+| 401  | Missing or empty `X-OIDC-Subject` header. |
+| 405  | Any method other than POST. |
+| 500  | Internal error; opaque body. |
+| 503  | The Policy Steward is genuinely unreachable (the composition root failed to construct a writer, or the route was mounted against a nil writer). Under the Stage 5.3 + iter 3 composition root in `cmd/clean-coded/main.go`, `mgmt.override` does NOT 503 simply because the signing-key cache is unwired -- that case is wired explicitly to keep the kill switch operable. |
+
+### Trust boundary
+
+`X-OIDC-Subject` is set by the **auth gateway** after token
+validation. In any deployment where `clean-coded` is directly
+reachable from untrusted clients, the gateway MUST strip the
+header at the edge and re-inject the validated `sub` claim --
+otherwise a caller can spoof the actor. clean-coded does not
+re-validate the bearer token here because the gateway already
+did.
+
+### No signing-key precondition (kill-switch contract)
+
+Unlike `policy.publish`, `policy.activate`, and
+`policy.publish_rulepack`, `mgmt.override` **does not** require
+an active signing key. The override row carries no signature
+column, and the operator must be able to silence a noisy or
+broken rule even during a signing-key outage -- that is the
+worst time to deny an emergency mute. If the steward verbs
+above are returning 503 because the signing-key cache is
+unwired, `mgmt.override` still serves 200.
+
+The composition root encodes this contract by building the
+Policy Steward + write verbs UNCONDITIONALLY (Stage 5.3 +
+iter 3) -- not gated on `cfg.KMSProvider != ""`. When KMS is
+unset the steward is constructed with a **null-object signer**
+(`noActiveSigner`) so `Steward.Override` proceeds while the
+Stage 5.2 signing verbs surface `ErrNoActiveSigningKey` via
+the existing `len(ListActive()) == 0` branch. Pinned by
+`TestRootMux_ScaffoldModeOverrideMounted_200` and
+`TestBuildPolicyWriter_ScaffoldModeProducesWriter` (both in
+`cmd/clean-coded/routes_test.go`) plus
+`TestSteward_PublishRefusesWhenSignerNil` (in
+`internal/policy/steward/steward_test.go`).
+
+#### Scaffold-mode status-code matrix
+
+When the composition root runs with `CLEAN_CODE_KMS_PROVIDER`
+empty (scaffold mode, signing-key cache unwired):
+
+| Verb                              | Path                              | Scaffold mode | Reason |
+| --------------------------------- | --------------------------------- | ------------- | ------ |
+| `mgmt.override` (mute / unmute)   | `POST /v1/mgmt/override`          | **200** for a valid request against a registered rule | Kill-switch contract: the verb must remain operable during a signing-key outage. |
+| `policy.keys.list_active` (read)  | `GET /v1/policy/keys/list_active` | **503**       | The verb is mounted (not 404), but the signing-key cache is unwired. |
+| `policy.publish`                  | `POST /v1/policy/publish`         | **503**       | Refuses with `ErrNoActiveSigningKey` -- the null-object signer reports an empty active-key set. |
+| `policy.activate`                 | `POST /v1/policy/activate`        | **503**       | Same precondition as `policy.publish`. |
+| `policy.publish_rulepack`         | `POST /v1/policy/publish_rulepack`| **503**       | Same precondition. |
+| `policy.rulepack.add` / `.remove` | (legacy paths)                    | **501**       | Banned-verb canonical response (not part of the v1 surface). |
+| `policy.override` (legacy path)   | `POST /v1/policy/override`        | **501**       | Renamed; see "Historical: `policy.override`" below. |
+
+### Append-only / unmute flow
+
+To unmute, POST again with the **same** `scope_filter` and
+`mute=false`:
+
+```
+POST /v1/mgmt/override
+X-OIDC-Subject: bob@example.com
+{
+  "rule_id": "solid.srp.lcom4_high",
+  "scope_filter": { "repo_id": "repo-a", "scope_kind": "class",
+                    "scope_signature_glob": "com.example.legacy.*" },
+  "mute":   false,
+  "reason": ""
+}
+```
+
+The evaluator's latest-row read now sees `mute=false` for that
+`(rule_id, scope_filter)` pair. The previous `mute=true` row
+remains in the table for audit -- no UPDATE / DELETE primitives
+exist on the Store interface.
+
+### No automatic expiry
+
+A row planted years ago remains the active mute until an
+operator unmutes it. There is no scheduled "expire old
+overrides" job in v1. Aged-mute hygiene is surfaced via the
+`mgmt.insights.aged_mutes` read verb (a future stage); v1
+operators audit by querying the `override` table directly:
+
+```sql
+SELECT rule_id, scope_filter, mute, created_at
+  FROM clean_code.override
+  WHERE created_at < now() - interval '180 days'
+  ORDER BY created_at DESC;
+```
+
+### Historical: `policy.override`
+
+The draft surface listed a `policy.override` verb. The canonical
+name is `mgmt.override`; the legacy path is still mounted at
+`/v1/policy/override` and returns **501 Not Implemented** with
+a body identifying the rename so operators scripting against an
+older draft contract learn of the change without getting a
+404.

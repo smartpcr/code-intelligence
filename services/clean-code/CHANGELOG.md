@@ -4,6 +4,187 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 5.3 -- Override append-only mute lifecycle
+
+### Added
+
+- **`mgmt.override` write verb** (`POST /v1/mgmt/override`) --
+  the operator mute/unmute kill switch per architecture Sec
+  6.3 line 1357 + Sec 1.5.1 row 5. Management delegates to
+  the Policy Steward, which appends an `override(override_id,
+  rule_id, scope_filter JSONB, mute, reason, actor_id,
+  created_at)` row in the Policy / rules sub-store
+  (architecture Sec 5.3.6 lines 1160-1170; tech-spec Sec 10A
+  "mute lifecycle" pin). The handler returns
+  `{"override_id": "..."}` -- a single id, matching the
+  architecture `-> OverrideId` return type.
+- `Steward.Override(ctx, OverrideRequest)` verb +
+  `Steward.LatestMatchingOverride(ctx, ruleID, CandidateScope)`
+  read helper (the latter is the entry point the evaluator
+  (Stage 5.7) reads at gate time). The read semantic is
+  **candidate-scope/glob matching**, not exact JSON equality
+  (architecture Sec 5.3.6 line 1171 pin: `scope_filter matches
+  the candidate scope`). Glob vocab: `*` matches any rune
+  run (including empty, across dots/slashes), `?` matches one
+  rune, everything else literal; the pattern is anchored
+  end-to-end. Implemented in
+  `internal/policy/steward/scope_glob.go` with a cached
+  regexp.
+- New `Store` primitives: `RuleExistsByID` (logical-FK helper
+  on `Override.rule_id -> Rule.rule_id` -- a separate sibling
+  to `RuleExists(rule_id, version)`), `InsertOverride`, and
+  `LatestMatchingOverride`. The SQL implementation
+  pre-filters with the `scope_filter->>'repo_id'` and
+  `scope_filter->>'scope_kind'` JSONB extractors (so only the
+  candidate's `(repo_id, scope_kind)` partition is scanned)
+  and applies the glob match in Go in descending
+  `(created_at, override_id)` order. **No `LIMIT`** is used:
+  a newer non-matching row must not hide an older matching
+  glob.
+- `CandidateScope` value type + `IsValid()` predicate +
+  `ErrInvalidCandidateScope` sentinel for the read path. The
+  steward refuses an empty candidate (empty `repo_id`,
+  unknown `scope_kind`, or whitespace-only `signature`)
+  before consulting the store so the gate cannot fail-open
+  by silently matching nothing.
+- Sentinels: `ErrInvalidOverride` (shape validation),
+  `ErrUnknownRule` (FK miss), and `ErrInvalidCandidateScope`
+  (read-side validation). The first two map to HTTP 400.
+- `ScopeKind` typed enum + `ScopeFilter`/`Override`/
+  `OverrideRequest`/`CandidateScope` value types in the
+  steward package.
+- `VerbMgmtOverridePath` and `OIDCSubjectHeader` exported
+  constants for the canonical mount + auth header contract.
+- `noActiveSigner` null-object [Signer] in the steward
+  package (iter 3). Installed by `steward.New` whenever
+  `cfg.Signer == nil` so `s.signer` is never literally nil --
+  `VerifyPolicyVersionSignature` calls `s.signer.VerifyAny`
+  directly and would otherwise panic. The null object reports
+  no active keys, so the Stage 5.2 signing verbs surface
+  `ErrNoActiveSigningKey` via the existing
+  `len(ListActive()) == 0` branch while
+  `Steward.Override` (which doesn't consult the signer)
+  keeps serving 200.
+- `buildPolicyWriter(db, signer, log)` helper in
+  `cmd/clean-coded/main.go` (iter 3) -- the testable
+  composition seam that constructs the Steward +
+  `*management.PolicyWriter` UNCONDITIONALLY (not gated on
+  `cfg.KMSProvider != ""`). Pinned by
+  `TestBuildPolicyWriter_ScaffoldModeProducesWriter`.
+
+### Invariants pinned by tests
+
+- **NO `expires_at` column / wire field.** The
+  `DisallowUnknownFields` decoder rejects any caller-supplied
+  `expires_at` with 400; the migration 0003 schema also has no
+  such column. Pinned by
+  `TestPolicyWriter_Override_RejectsExpiresAt` +
+  `TestSQLStore_OverrideRoundTrip` (the SQL prep template
+  mirrors the migration shape, including the
+  `mute = false OR reason IS NOT NULL` CHECK constraint --
+  no whitespace-trim defence at the DB level; the validator
+  carries that contract).
+- **NO `policy_version_id` column.** Overrides bind to rules
+  (rule_id lineage), not to a specific policy version --
+  architecture Sec 5.3.6 line 1166. Encoded in the `Override`
+  struct (no field) and the SQL prep template (no column).
+- **`actor_id`, not `created_by`.** The HTTP layer sources
+  the OIDC subject from the `X-OIDC-Subject` header set by
+  the auth gateway. Bodies containing `actor_id` are
+  rejected with 400 to keep the trust boundary at the
+  gateway. Pinned by
+  `TestPolicyWriter_Override_RejectsBodyActorID`.
+- **Append-only.** The `Store` interface has no
+  `UpdateOverride` / `DeleteOverride`; unmute is a fresh
+  INSERT with `mute=false`. Pinned by
+  `TestStore_OverrideAppendOnlyInterfaceShape`.
+- **Latest-row-wins read semantics with glob matching.** Both
+  the in-memory store and the SQLStore order by
+  `(created_at DESC, override_id DESC)` and apply the
+  scope-signature glob match. The first matching row wins;
+  there is no `LIMIT` short-circuit. Pinned by
+  `TestSteward_Override_LatestRowWins`,
+  `TestStore_LatestMatchingOverrideTieBreakOnOverrideID`,
+  `TestSteward_LatestMatchingOverride_GlobMatchesSubScope`,
+  `TestSteward_LatestMatchingOverride_StarMatchesEverything`,
+  `TestSteward_LatestMatchingOverride_QuestionMarkMatchesOneChar`,
+  `TestSteward_LatestMatchingOverride_NewerBroadOverridesOlderLiteral`,
+  `TestSQLStore_OverrideLatestRowWins`,
+  `TestSQLStore_OverrideGlobMatchesSubScope`,
+  `TestSQLStore_OverrideGlobSkipsNonMatchingRow` (this last
+  pins the no-LIMIT defence -- a newer non-matching row
+  cannot mask an older matching glob).
+- **No signing-key precondition (kill-switch contract).**
+  Unlike Publish / Activate / PublishRulepack,
+  `Steward.Override` does NOT call `checkSigningKey`. The kill
+  switch must remain operable during a signing-key outage --
+  the worst time to deny an emergency mute. The contract is
+  enforced at three layers:
+
+  1. **Steward layer:** `Steward.Override` bypasses
+     `checkSigningKey`. Pinned by
+     `TestSteward_Override_NoSigningKeyAccepted`.
+  2. **HTTP handler layer:** `PolicyWriter.Override` does not
+     depend on a wired signer. Pinned by
+     `TestPolicyWriter_Override_AcceptsWithoutSigningKey`
+     (stub-driven).
+  3. **Composition-root layer (Stage 5.3 + iter 3):**
+     `cmd/clean-coded/main.go` builds the Steward +
+     `PolicyWriter` UNCONDITIONALLY -- not gated on
+     `cfg.KMSProvider != ""`. The Steward is constructed with
+     `Signer: nil`; `steward.New` installs a
+     [`noActiveSigner`] null object so `s.signer` is never
+     literally nil (which would have panicked
+     `VerifyPolicyVersionSignature`'s direct `s.signer.VerifyAny`
+     call). The null signer reports an empty active-key set,
+     which makes the Stage 5.2 verbs naturally return 503 via
+     the existing `len(ListActive()) == 0` branch while
+     Override proceeds. Pinned by
+     `TestSteward_NewRequiresStore` (the constructor now
+     accepts a nil Signer),
+     `TestSteward_PublishRefusesWhenSignerNil` (the null
+     object still keeps the signing verbs locked),
+     `TestBuildPolicyWriter_ScaffoldModeProducesWriter` (the
+     wiring helper produces a non-nil writer in scaffold
+     mode), and `TestRootMux_ScaffoldModeOverrideMounted_200`
+     (the composition root serves 200 on
+     `POST /v1/mgmt/override` with no KMS wired, while the
+     same mux still returns 503 on `POST /v1/policy/publish`).
+- **Reason required when `mute=true`.** The validator
+  rejects empty / whitespace-only reasons with 400 before
+  any persistence work; the SQL CHECK constraint
+  `override_reason_required_when_muted` (which only enforces
+  `mute = false OR reason IS NOT NULL`) guards the schema
+  side. Pinned by
+  `TestSteward_Override_RejectsMuteWithoutReason`,
+  `TestSQLStore_OverrideMutedReasonNullIsRejectedByCheck`,
+  and `TestSQLStore_OverrideMutedWhitespaceReasonAcceptedByCheck`
+  (the latter documents that the production CHECK does NOT
+  trim whitespace -- the validator carries that contract).
+- **No TTL.** An override row older than any reasonable
+  retention horizon (test plants 400 days in the past)
+  remains the active mute when no fresher row exists.
+  Pinned by `TestSteward_Override_OldRowRemainsActiveWithoutTTL`
+  (tech-spec Sec 10A "v1 mute lifecycle has no TTL").
+- **Read path refuses empty candidate.** The steward
+  short-circuits with `ErrInvalidCandidateScope` if the
+  evaluator hands it an empty `CandidateScope`. Pinned by
+  `TestSteward_LatestMatchingOverride_RejectsInvalidCandidate`.
+
+### Documentation
+
+- `docs/runbook.md` -- new "`mgmt.override` write verb (Stage
+  5.3)" section covering the POST body shape, the
+  `X-OIDC-Subject` trust boundary, the append-only mute /
+  unmute flow, latest-row-wins read semantics, the
+  glob-matching vocab (`*` / `?` / literal, end-to-end
+  anchored), no-TTL, and the kill-switch property (works
+  during signing-key outage).
+- `docs/rollout.md` -- Stage 5.3 entry; no new migrations
+  (the `clean_code.override` table shipped in migration 0003
+  during Stage 1.4), no new env vars; the gateway already
+  populates `X-OIDC-Subject` for the Stage 5.2 verbs.
+
 ## Stage 5.2 -- Policy publish/activate/rulepack verbs (iter 2 follow-ups)
 
 ### Added

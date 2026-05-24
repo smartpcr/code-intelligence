@@ -58,8 +58,9 @@ func readModulePath(dir string) (string, error) {
 }
 
 // runProbe compiles and executes a small Go program within the service
-// module, returning its combined stdout/stderr and exit code.
-func runProbe(svcRoot, source string) (string, int, error) {
+// module, returning its combined stdout/stderr and exit code. Any
+// probeArgs are forwarded to the compiled probe as os.Args[1:].
+func runProbe(svcRoot, source string, probeArgs ...string) (string, int, error) {
 	tmpDir, err := os.MkdirTemp(svcRoot, "e2e-ast-probe-")
 	if err != nil {
 		return "", -1, fmt.Errorf("creating probe dir: %w", err)
@@ -75,7 +76,8 @@ func runProbe(svcRoot, source string) (string, int, error) {
 		return "", -1, fmt.Errorf("relative path: %w", err)
 	}
 
-	cmd := exec.Command("go", "run", "./"+filepath.ToSlash(relDir))
+	cmdArgs := append([]string{"run", "./" + filepath.ToSlash(relDir)}, probeArgs...)
+	cmd := exec.Command("go", cmdArgs...)
 	cmd.Dir = svcRoot
 	cmd.Env = os.Environ()
 
@@ -106,9 +108,9 @@ type parserFleetState struct {
 
 // parseResultEntry captures the outcome of parsing a single fixture file.
 type parseResultEntry struct {
-	Language  string `json:"language"`
-	ScopeCount int  `json:"scope_count"`
-	FileOK    bool   `json:"file_ok"`
+	Language   string `json:"language"`
+	ScopeCount int    `json:"scope_count"`
+	FileOK     bool   `json:"file_ok"`
 }
 
 func (p *parserFleetState) aFixtureFilePerV1PinnedLanguage() error {
@@ -165,6 +167,10 @@ type result struct {
 }
 
 func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: probe <fixturesDir>")
+		os.Exit(2)
+	}
 	fixturesDir := os.Args[1]
 	languages := []string{"go", "python", "typescript", "java"}
 	results := make(map[string]result)
@@ -228,7 +234,7 @@ func main() {
 }
 `, modPath)
 
-	output, exitCode, err := runProbe(p.svcRoot, probe)
+	output, exitCode, err := runProbe(p.svcRoot, probe, p.fixturesDir)
 	if err != nil {
 		return fmt.Errorf("running parse probe: %w", err)
 	}
@@ -373,6 +379,10 @@ type result struct {
 }
 
 func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: probe <fixturesDir>")
+		os.Exit(2)
+	}
 	fixturesDir := os.Args[1]
 	goDir := filepath.Join(fixturesDir, "go")
 	entries, err := os.ReadDir(goDir)
@@ -444,7 +454,7 @@ func main() {
 }
 `, modPath)
 
-	output, exitCode, err := runProbe(r.svcRoot, probe)
+	output, exitCode, err := runProbe(r.svcRoot, probe, r.fixturesDir)
 	if err != nil {
 		return fmt.Errorf("running round-trip probe: %w", err)
 	}

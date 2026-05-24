@@ -123,7 +123,21 @@ func (h *Handler) ListActiveSigningKeys(w http.ResponseWriter, r *http.Request) 
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(body)
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		// Headers and the 200 status line are already on
+		// the wire, so we can't downgrade to 5xx -- the
+		// client will see a truncated body either way.
+		// Logging is the only signal an operator has to
+		// learn the response was malformed (broken pipe,
+		// client disconnected mid-write, transient writer
+		// failure, etc.). Mirrors the slog shape used by
+		// the 500 branch above so a single log query
+		// surfaces both failure modes.
+		slog.ErrorContext(r.Context(), "management.list_active encode failed",
+			"verb", "policy.keys.list_active",
+			"error", err.Error(),
+		)
+	}
 }
 
 // Routes returns an `http.ServeMux` ready to mount onto the

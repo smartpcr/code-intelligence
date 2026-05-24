@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -53,6 +52,14 @@ type signingKeyStoreState struct {
 // kmsRotateKey tells the kms-mock to rotate its signing key and returns
 // the previous key ID and private key material so we can sign payloads
 // with the "old" key.
+//
+// The kms-mock harness is REQUIRED to return both `previous_key_id` and
+// `previous_key_b64` (the base64-encoded Ed25519 private key) in its
+// response. If the mock omits the private key material we cannot proceed:
+// the policy-steward's verify endpoint resolves signatures against the
+// public keys it loaded from the KMS provider, so any key we fabricate
+// locally would not be recognised and the overlap-window scenario would
+// silently always fail. We therefore fail loudly here.
 func (s *signingKeyStoreState) kmsRotateKey() error {
 	resp, err := http.Post(s.kmsURL+"/v1/keys/rotate", "application/json", nil)
 	if err != nil {
@@ -72,22 +79,26 @@ func (s *signingKeyStoreState) kmsRotateKey() error {
 		return fmt.Errorf("decoding rotate response: %w", err)
 	}
 
-	if result.PreviousKeyB64 != "" {
-		keyBytes, err := base64.StdEncoding.DecodeString(result.PreviousKeyB64)
-		if err != nil {
-			return fmt.Errorf("decoding previous key: %w", err)
-		}
-		s.oldKey = ed25519.PrivateKey(keyBytes)
-	} else {
-		// kms-mock may not return the private key; generate a local
-		// Ed25519 pair and register it as a "previous" key via the mock.
-		_, priv, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			return fmt.Errorf("generating ed25519 key: %w", err)
-		}
-		s.oldKey = priv
+	if result.PreviousKeyID == "" {
+		return fmt.Errorf("kms-mock /v1/keys/rotate did not return previous_key_id; cannot identify the old key for the overlap-window scenario")
+	}
+	if result.PreviousKeyB64 == "" {
+		// The mock must expose the previous private-key material so the
+		// test can sign payloads with the old key. A locally generated
+		// key would not be registered with the policy-steward and the
+		// verify call would always fail in this branch -- masking the
+		// real behaviour under test. Fail fast with a clear diagnostic.
+		return fmt.Errorf("kms-mock /v1/keys/rotate did not return previous_key_b64; the e2e harness MUST expose previous-key material so signatures can be produced for the overlap-window scenario (key_id=%q)", result.PreviousKeyID)
 	}
 
+	keyBytes, err := base64.StdEncoding.DecodeString(result.PreviousKeyB64)
+	if err != nil {
+		return fmt.Errorf("decoding previous key: %w", err)
+	}
+	if l := len(keyBytes); l != ed25519.PrivateKeySize {
+		return fmt.Errorf("previous_key_b64 decoded to %d bytes; want %d (Ed25519 private key)", l, ed25519.PrivateKeySize)
+	}
+	s.oldKey = ed25519.PrivateKey(keyBytes)
 	s.oldKeyID = result.PreviousKeyID
 	return nil
 }

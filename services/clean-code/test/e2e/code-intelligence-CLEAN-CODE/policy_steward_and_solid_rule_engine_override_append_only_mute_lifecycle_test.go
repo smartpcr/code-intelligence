@@ -79,20 +79,10 @@ func (s *overrideMuteState) ensureDB() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
-		// Close the pool we just opened so we don't leak it on ping failure.
-		_ = db.Close()
 		return fmt.Errorf("pinging postgres: %w", err)
 	}
 	s.db = db
 	return nil
-}
-
-// closeDB releases the per-scenario connection pool, if one was opened.
-func (s *overrideMuteState) closeDB() {
-	if s.db != nil {
-		_ = s.db.Close()
-		s.db = nil
-	}
 }
 
 func (s *overrideMuteState) ensureStewardURL() {
@@ -247,6 +237,15 @@ func (s *overrideMuteState) noOverrideRowIsAppended() error {
 // (POST /v1/mgmt.override). The active mute is read through the
 // rule-engine evaluator API (GET /v1/evaluate/mute), exercising
 // the full service stack rather than querying the DB directly.
+//
+// After both POSTs succeed we explicitly set created_at on both rows
+// so the first row is unambiguously older than the second by 1 full
+// second. Relying on a wall-clock Sleep between the two HTTP round
+// trips is fragile under CI load: clock resolution coarser than the
+// sleep, a slow first POST followed by a fast second one, or two
+// inserts that land in the same wall-clock millisecond can all flip
+// the ordering and flake the test. This mirrors the backdating
+// pattern already used by the no-ttl-enforcement scenario.
 // ---------------------------------------------------------------------------
 
 func (s *overrideMuteState) twoOverrideRowsForSameScopeAndRuleWithMuteValuesThenValue(first, second string) error {
@@ -255,6 +254,14 @@ func (s *overrideMuteState) twoOverrideRowsForSameScopeAndRuleWithMuteValuesThen
 
 	firstMute := first == "true"
 	secondMute := second == "true"
+
+	// latest-row-wins is only meaningful when the two values differ — otherwise
+	// there is nothing to "win". The explicit-created_at fix below identifies
+	// the first row by its mute value, so equal values would also collapse the
+	// two rows into a single UPDATE target and break the timing guarantee.
+	if firstMute == secondMute {
+		return fmt.Errorf("latest-row-wins requires distinct mute values; got %q then %q", first, second)
+	}
 
 	// First override via steward API.
 	payload1 := map[string]interface{}{
@@ -270,10 +277,8 @@ func (s *overrideMuteState) twoOverrideRowsForSameScopeAndRuleWithMuteValuesThen
 		return fmt.Errorf("first override returned %d: %s", resp1.StatusCode, string(body1))
 	}
 
-	// Brief pause so second row gets a later created_at.
-	time.Sleep(50 * time.Millisecond)
-
-	// Second override via steward API.
+	// Second override via steward API. No wall-clock sleep between the two
+	// POSTs — the explicit UPDATE below establishes the ordering deterministically.
 	payload2 := map[string]interface{}{
 		"scope":   s.latestScope,
 		"rule_id": s.latestRuleID,
@@ -285,6 +290,35 @@ func (s *overrideMuteState) twoOverrideRowsForSameScopeAndRuleWithMuteValuesThen
 	}
 	if resp2.StatusCode >= 300 {
 		return fmt.Errorf("second override returned %d: %s", resp2.StatusCode, string(body2))
+	}
+
+	// Force a deterministic 1-second gap between the two rows' created_at
+	// in a single atomic UPDATE: the firstMute row gets NOW() - 1s, the
+	// secondMute row gets NOW(). NOW() is the transaction start time in
+	// Postgres, so both branches of the CASE see the same NOW() — they
+	// can't tie and can't get reordered by subsequent latency.
+	if err := s.ensureDB(); err != nil {
+		return fmt.Errorf("ensureDB for created_at backdating: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE mgmt_override
+		 SET created_at = CASE WHEN mute = $3
+		                       THEN NOW() - INTERVAL '1 second'
+		                       ELSE NOW()
+		                  END
+		 WHERE scope = $1 AND rule_id = $2`,
+		s.latestScope, s.latestRuleID, firstMute)
+	if err != nil {
+		return fmt.Errorf("setting deterministic created_at on override rows: %w", err)
+	}
+	// Defensive: confirm both rows were updated. Anything other than 2
+	// means the steward did not append both rows we expected, and the
+	// ordering guarantee no longer holds.
+	if n, err := res.RowsAffected(); err == nil && n != 2 {
+		return fmt.Errorf("expected 2 override rows for scope=%s rule_id=%s, got %d updated",
+			s.latestScope, s.latestRuleID, n)
 	}
 	return nil
 }
@@ -411,16 +445,6 @@ func (s *overrideMuteState) theRowRemainsTheActiveStateViaLatestRowWins() error 
 
 func InitializeScenario_policy_steward_and_solid_rule_engine_override_append_only_mute_lifecycle(ctx *godog.ScenarioContext) {
 	s := &overrideMuteState{}
-
-	// Release the per-scenario sql.DB pool so we don't leak a connection
-	// pool every time a scenario calls ensureDB(). godog invokes the
-	// ScenarioInitializer for every scenario, so each scenario gets a
-	// fresh overrideMuteState — without this hook each one would open
-	// its own pool and never close it.
-	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
-		s.closeDB()
-		return ctx, nil
-	})
 
 	// override-no-expires-field
 	ctx.Step(`^a "mgmt\.override" request with "([^"]*)" set to "([^"]*)"$`, s.aMgmtOverrideRequestWithExpiresAtSetTo)

@@ -4,153 +4,186 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
-## Stage 5.4 -- Predicate DSL evaluator
-
-### Iteration 3 -- canonical metric_kind set alignment
-
-- **`CanonicalMetricKinds` ingested-tier fix**:
-  `services/clean-code/internal/policy/dsl/sample.go` now lists
-  all three v1 ingested metric_kinds -- `coverage_line_ratio`,
-  `coverage_branch_ratio`, and `pass_first_try_ratio` --
-  matching implementation-plan.md line 31 ("Canonical 3
-  ingested metric_kinds") and tech-spec.md lines 302-304. The
-  prior set was missing the two coverage ratios, which would
-  have caused the parser canon-guard and `Threshold.Validate`
-  to reject otherwise-valid coverage-policy DSL predicates and
-  Threshold rows.
-- Regression tests added in a new `threshold_test.go`:
-  - `TestThreshold_Validate_AcceptsAllCanonicalMetricKinds`
-    iterates the entire closed set and confirms every member
-    survives `Threshold.Validate()`. Acts as the structural
-    regression guard against future drift between the canonical
-    map and the planning artifacts.
-  - `TestThreshold_Validate_RejectsLegacyCoverageAliases` pins
-    the counter-invariant: `coverage_line` / `coverage_branch`
-    bare names (the implementation-plan's negative-clause names)
-    remain rejected.
-  - `TestCompile_CoverageRatioThresholdEndToEnd` exercises the
-    realistic coverage-policy shape end-to-end via Compile +
-    Bind + Eval against a `Sample`.
-  - `TestCompile_RejectsLegacyCoverageAlias_AtParseTime` mirrors
-    the parser canon-guard rejection through the full Compile
-    surface.
-- Parser test additions in `parser_test.go`:
-  three new well-formed cases (`coverage_line_ratio_compare`,
-  `coverage_branch_ratio_compare`, `coverage_ratio_or_chain`)
-  and two new malformed cases pinning rejection of the bare
-  legacy aliases (`unknown_metric_kind_coverage_line_alias`,
-  `unknown_metric_kind_coverage_branch_alias`).
-
-### Iteration 2 -- evaluator feedback resolution
-
-- **Parser**: `parseAtom` now uniformly looks ahead one token after
-  parsing an operand: comparison-op → parse a comparison; no
-  comparison-op + bool-literal operand → accept as standalone atom;
-  otherwise → `ErrParse`. The prior iter consumed standalone
-  `true` / `false` BEFORE attempting a comparison, so
-  `false == degraded` and `true == false` parsed as trailing junk.
-  Standalone bool-typed FIELDS (e.g. `degraded`) remain rejected
-  per the documented grammar (`atom ::= ... | bool_literal`, not
-  `| bool_operand`).
-- **Threshold identity check**: `Bind` now verifies that
-  `Threshold.ThresholdID == requested UUID` after `resolver.Lookup`,
-  rejecting a stale or mis-keyed resolver before it can bind the
-  wrong row. Diagnostic surfaces `mismatched threshold_id <uuid>`
-  with line/column.
-- **Cache singleflight**: `Cache.GetOrCompile` no longer holds the
-  cache-wide write mutex across `Compile` / `resolver.Lookup`. The
-  miss path installs a placeholder `cacheEntry{ready chan struct{}}`
-  under the mutex, then releases the mutex BEFORE calling `Compile`.
-  Concurrent callers for the same key wait on `<-entry.ready`;
-  concurrent callers for DIFFERENT keys proceed in parallel.
-  Compile panics are recovered, stored on the entry, and re-raised
-  by waiters so a buggy DSL doesn't return silent `(nil, nil)`.
-- Added regression tests:
-  `TestParser_BoolLiteralSymmetric`,
-  `TestParser_RejectStandaloneBoolField`,
-  `TestEval_BoolLiteralOnLeft`,
-  `TestBind_RejectsMismatchedThresholdID`,
-  `TestCache_SlowMissDoesNotStallUnrelatedHits`,
-  `TestCache_SingleFlightSameKey`. Coverage now 84.8%.
+## Stage 5.3 -- Override append-only mute lifecycle
 
 ### Added
 
-- New package `internal/policy/dsl/` -- parser + evaluator for
-  the per-`Rule.predicate_dsl` predicate language described in
-  architecture Sec 5.3.1 / 5.3.2. Surface:
+- **`mgmt.override` write verb** (`POST /v1/mgmt/override`) --
+  the operator mute/unmute kill switch per architecture Sec
+  6.3 line 1357 + Sec 1.5.1 row 5. Management delegates to
+  the Policy Steward, which appends an `override(override_id,
+  rule_id, scope_filter JSONB, mute, reason, actor_id,
+  created_at)` row in the Policy / rules sub-store
+  (architecture Sec 5.3.6 lines 1160-1170; tech-spec Sec 10A
+  "mute lifecycle" pin). The handler returns
+  `{"override_id": "..."}` -- a single id, matching the
+  architecture `-> OverrideId` return type.
+- `Steward.Override(ctx, OverrideRequest)` verb +
+  `Steward.LatestMatchingOverride(ctx, ruleID, CandidateScope)`
+  read helper (the latter is the entry point the evaluator
+  (Stage 5.7) reads at gate time). The read semantic is
+  **candidate-scope/glob matching**, not exact JSON equality
+  (architecture Sec 5.3.6 line 1171 pin: `scope_filter matches
+  the candidate scope`). Glob vocab: `*` matches any rune
+  run (including empty, across dots/slashes), `?` matches one
+  rune, everything else literal; the pattern is anchored
+  end-to-end. Implemented in
+  `internal/policy/steward/scope_glob.go` with a cached
+  regexp.
+- New `Store` primitives: `RuleExistsByID` (logical-FK helper
+  on `Override.rule_id -> Rule.rule_id` -- a separate sibling
+  to `RuleExists(rule_id, version)`), `InsertOverride`, and
+  `LatestMatchingOverride`. The SQL implementation
+  pre-filters with the `scope_filter->>'repo_id'` and
+  `scope_filter->>'scope_kind'` JSONB extractors (so only the
+  candidate's `(repo_id, scope_kind)` partition is scanned)
+  and applies the glob match in Go in descending
+  `(created_at, override_id)` order. **No `LIMIT`** is used:
+  a newer non-matching row must not hide an older matching
+  glob.
+- `CandidateScope` value type + `IsValid()` predicate +
+  `ErrInvalidCandidateScope` sentinel for the read path. The
+  steward refuses an empty candidate (empty `repo_id`,
+  unknown `scope_kind`, or whitespace-only `signature`)
+  before consulting the store so the gate cannot fail-open
+  by silently matching nothing.
+- Sentinels: `ErrInvalidOverride` (shape validation),
+  `ErrUnknownRule` (FK miss), and `ErrInvalidCandidateScope`
+  (read-side validation). The first two map to HTTP 400.
+- `ScopeKind` typed enum + `ScopeFilter`/`Override`/
+  `OverrideRequest`/`CandidateScope` value types in the
+  steward package.
+- `VerbMgmtOverridePath` and `OIDCSubjectHeader` exported
+  constants for the canonical mount + auth header contract.
+- `noActiveSigner` null-object [Signer] in the steward
+  package (iter 3). Installed by `steward.New` whenever
+  `cfg.Signer == nil` so `s.signer` is never literally nil --
+  `VerifyPolicyVersionSignature` calls `s.signer.VerifyAny`
+  directly and would otherwise panic. The null object reports
+  no active keys, so the Stage 5.2 signing verbs surface
+  `ErrNoActiveSigningKey` via the existing
+  `len(ListActive()) == 0` branch while
+  `Steward.Override` (which doesn't consult the signer)
+  keeps serving 200.
+- `buildPolicyWriter(db, signer, log)` helper in
+  `cmd/clean-coded/main.go` (iter 3) -- the testable
+  composition seam that constructs the Steward +
+  `*management.PolicyWriter` UNCONDITIONALLY (not gated on
+  `cfg.KMSProvider != ""`). Pinned by
+  `TestBuildPolicyWriter_ScaffoldModeProducesWriter`.
 
-  - `dsl.Parse(src) (Node, error)` -- lex + parse + type-check
-    + closed-set canon-guard. Returns a `*dsl.Error` with
-    [Position] line/column on any failure (the Stage 5.4
-    acceptance criterion line 500 shape).
+### Invariants pinned by tests
 
-  - `dsl.Bind(node, src, resolver) (*Predicate, error)` --
-    resolves every `threshold('<uuid>')` atom against a
-    `ThresholdResolver`. Returns an `ErrBind`-kinded error
-    when a UUID is malformed or not in the policy's
-    `ThresholdRefs`. Multi-target Unwrap exposes the
-    underlying resolver error (e.g. `ErrUnknownThreshold`).
+- **NO `expires_at` column / wire field.** The
+  `DisallowUnknownFields` decoder rejects any caller-supplied
+  `expires_at` with 400; the migration 0003 schema also has no
+  such column. Pinned by
+  `TestPolicyWriter_Override_RejectsExpiresAt` +
+  `TestSQLStore_OverrideRoundTrip` (the SQL prep template
+  mirrors the migration shape, including the
+  `mute = false OR reason IS NOT NULL` CHECK constraint --
+  no whitespace-trim defence at the DB level; the validator
+  carries that contract).
+- **NO `policy_version_id` column.** Overrides bind to rules
+  (rule_id lineage), not to a specific policy version --
+  architecture Sec 5.3.6 line 1166. Encoded in the `Override`
+  struct (no field) and the SQL prep template (no column).
+- **`actor_id`, not `created_by`.** The HTTP layer sources
+  the OIDC subject from the `X-OIDC-Subject` header set by
+  the auth gateway. Bodies containing `actor_id` are
+  rejected with 400 to keep the trust boundary at the
+  gateway. Pinned by
+  `TestPolicyWriter_Override_RejectsBodyActorID`.
+- **Append-only.** The `Store` interface has no
+  `UpdateOverride` / `DeleteOverride`; unmute is a fresh
+  INSERT with `mute=false`. Pinned by
+  `TestStore_OverrideAppendOnlyInterfaceShape`.
+- **Latest-row-wins read semantics with glob matching.** Both
+  the in-memory store and the SQLStore order by
+  `(created_at DESC, override_id DESC)` and apply the
+  scope-signature glob match. The first matching row wins;
+  there is no `LIMIT` short-circuit. Pinned by
+  `TestSteward_Override_LatestRowWins`,
+  `TestStore_LatestMatchingOverrideTieBreakOnOverrideID`,
+  `TestSteward_LatestMatchingOverride_GlobMatchesSubScope`,
+  `TestSteward_LatestMatchingOverride_StarMatchesEverything`,
+  `TestSteward_LatestMatchingOverride_QuestionMarkMatchesOneChar`,
+  `TestSteward_LatestMatchingOverride_NewerBroadOverridesOlderLiteral`,
+  `TestSQLStore_OverrideLatestRowWins`,
+  `TestSQLStore_OverrideGlobMatchesSubScope`,
+  `TestSQLStore_OverrideGlobSkipsNonMatchingRow` (this last
+  pins the no-LIMIT defence -- a newer non-matching row
+  cannot mask an older matching glob).
+- **No signing-key precondition (kill-switch contract).**
+  Unlike Publish / Activate / PublishRulepack,
+  `Steward.Override` does NOT call `checkSigningKey`. The kill
+  switch must remain operable during a signing-key outage --
+  the worst time to deny an emergency mute. The contract is
+  enforced at three layers:
 
-  - `dsl.Compile(src, resolver) (*Predicate, error)` -- the
-    canonical Parse + Bind helper.
+  1. **Steward layer:** `Steward.Override` bypasses
+     `checkSigningKey`. Pinned by
+     `TestSteward_Override_NoSigningKeyAccepted`.
+  2. **HTTP handler layer:** `PolicyWriter.Override` does not
+     depend on a wired signer. Pinned by
+     `TestPolicyWriter_Override_AcceptsWithoutSigningKey`
+     (stub-driven).
+  3. **Composition-root layer (Stage 5.3 + iter 3):**
+     `cmd/clean-coded/main.go` builds the Steward +
+     `PolicyWriter` UNCONDITIONALLY -- not gated on
+     `cfg.KMSProvider != ""`. The Steward is constructed with
+     `Signer: nil`; `steward.New` installs a
+     [`noActiveSigner`] null object so `s.signer` is never
+     literally nil (which would have panicked
+     `VerifyPolicyVersionSignature`'s direct `s.signer.VerifyAny`
+     call). The null signer reports an empty active-key set,
+     which makes the Stage 5.2 verbs naturally return 503 via
+     the existing `len(ListActive()) == 0` branch while
+     Override proceeds. Pinned by
+     `TestSteward_NewRequiresStore` (the constructor now
+     accepts a nil Signer),
+     `TestSteward_PublishRefusesWhenSignerNil` (the null
+     object still keeps the signing verbs locked),
+     `TestBuildPolicyWriter_ScaffoldModeProducesWriter` (the
+     wiring helper produces a non-nil writer in scaffold
+     mode), and `TestRootMux_ScaffoldModeOverrideMounted_200`
+     (the composition root serves 200 on
+     `POST /v1/mgmt/override` with no KMS wired, while the
+     same mux still returns 503 on `POST /v1/policy/publish`).
+- **Reason required when `mute=true`.** The validator
+  rejects empty / whitespace-only reasons with 400 before
+  any persistence work; the SQL CHECK constraint
+  `override_reason_required_when_muted` (which only enforces
+  `mute = false OR reason IS NOT NULL`) guards the schema
+  side. Pinned by
+  `TestSteward_Override_RejectsMuteWithoutReason`,
+  `TestSQLStore_OverrideMutedReasonNullIsRejectedByCheck`,
+  and `TestSQLStore_OverrideMutedWhitespaceReasonAcceptedByCheck`
+  (the latter documents that the production CHECK does NOT
+  trim whitespace -- the validator carries that contract).
+- **No TTL.** An override row older than any reasonable
+  retention horizon (test plants 400 days in the past)
+  remains the active mute when no fresher row exists.
+  Pinned by `TestSteward_Override_OldRowRemainsActiveWithoutTTL`
+  (tech-spec Sec 10A "v1 mute lifecycle has no TTL").
+- **Read path refuses empty candidate.** The steward
+  short-circuits with `ErrInvalidCandidateScope` if the
+  evaluator hands it an empty `CandidateScope`. Pinned by
+  `TestSteward_LatestMatchingOverride_RejectsInvalidCandidate`.
 
-  - `Predicate.Eval(sample dsl.Sample) (bool, error)` -- pure
-    evaluation over a denormalised `Sample` (the MetricSample
-    columns plus the joined `ScopeBinding.scope_kind`).
-    Determinism is the `dsl-deterministic` Stage 5.4 test
-    scenario.
+### Documentation
 
-  - `dsl.Cache` -- `sync.RWMutex`-backed memo keyed by
-    `(policy_version_id, source string)`. Hot path is one
-    RLock + two map lookups + a closed-channel receive. Miss
-    path installs a placeholder `cacheEntry{ready}` under
-    the cache mutex and then RELEASES the mutex before
-    calling `Compile`, so concurrent compiles on different
-    keys never block each other and concurrent callers on
-    the same key de-duplicate via the `ready` channel
-    (singleflight). `Invalidate(policy_version_id)` drops a
-    retired policy's entries.
-
-- Grammar (BNF in `doc.go`):
-
-  ```
-  predicate      ::= or_expr
-  or_expr        ::= and_expr ( "OR" and_expr )*
-  and_expr       ::= not_expr ( "AND" not_expr )*
-  not_expr       ::= "NOT" not_expr | atom
-  atom           ::= "(" predicate ")" | threshold_call | comparison | bool_literal
-  threshold_call ::= "threshold" "(" string_literal ")"
-  comparison     ::= operand cmp_op operand
-  cmp_op         ::= "==" | "!=" | ">" | ">=" | "<" | "<="
-  operand        ::= field | string_literal | number_literal | bool_literal
-  field          ::= "metric_kind" | "scope_kind" | "value"
-                  |  "pack" | "source" | "degraded"
-  ```
-
-  Precedence (tightest to loosest): atoms < `NOT` < `AND` <
-  `OR`. Parens override.
-
-- Closed-set canon-guards on string literals -- the
-  `dsl-rejects-unknown-metric-kind` test scenario:
-  - `metric_kind` -- architecture Sec 1.4 catalogue.
-  - `scope_kind` -- migration 0002 `clean_code.scope_kind` enum.
-  - `pack` -- migration 0002 `clean_code.metric_sample_pack` enum.
-  - `source` -- migration 0002 `clean_code.metric_sample_source` enum.
-
-  A predicate like `metric_kind == 'lines_of_code'` is rejected
-  at `Parse` time with `ErrSemantic` and a `Position` pointing
-  at the offending literal.
-
-### Notes for downstream stages
-
-- Stage 5.5 / 5.6 rule-pack YAMLs MUST cite metric_kinds from
-  the canonical sets in `sample.go`. Adding a new metric_kind
-  requires (1) an entry in `CanonicalMetricKinds`, (2) a
-  Catalog row in `clean_code.metric_kind` (migration 0001),
-  and (3) a Compute Engine recipe.
-- Stage 5.7 SOLID Rule Engine consumes `dsl.Cache.GetOrCompile`
-  per `(active policy_version_id, rule.predicate_dsl)` and
-  iterates `Predicate.Eval` over the SHA's MetricSample rows.
+- `docs/runbook.md` -- new "`mgmt.override` write verb (Stage
+  5.3)" section covering the POST body shape, the
+  `X-OIDC-Subject` trust boundary, the append-only mute /
+  unmute flow, latest-row-wins read semantics, the
+  glob-matching vocab (`*` / `?` / literal, end-to-end
+  anchored), no-TTL, and the kill-switch property (works
+  during signing-key outage).
+- `docs/rollout.md` -- Stage 5.3 entry; no new migrations
+  (the `clean_code.override` table shipped in migration 0003
+  during Stage 1.4), no new env vars; the gateway already
+  populates `X-OIDC-Subject` for the Stage 5.2 verbs.
 
 ## Stage 5.2 -- Policy publish/activate/rulepack verbs (iter 2 follow-ups)
 

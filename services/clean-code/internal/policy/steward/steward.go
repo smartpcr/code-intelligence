@@ -67,9 +67,24 @@ type Steward struct {
 }
 
 // Config wires the Steward dependencies. Required fields:
-// [Config.Store] and [Config.Signer]. Optional: a clock and
-// uuid generator; tests inject deterministic shims via these
-// hooks.
+// [Config.Store]. Optional: [Config.Signer], a clock, and a
+// uuid generator.
+//
+// **Signer is optional**, encoding the Stage 5.3 kill-switch
+// contract: `mgmt.override` is the operator's emergency mute
+// for a noisy or broken rule and MUST remain operable when
+// the signing-key cache is unwired (architecture Sec 4.6 + Sec
+// 1.5.1 row 5; runbook "`mgmt.override` write verb" section).
+// When `Signer == nil`, the constructor installs a
+// [noActiveSigner] null object so the field is never literally
+// nil; the Stage 5.2 verbs (Publish, Activate,
+// PublishRulepack) then refuse with [ErrNoActiveSigningKey]
+// because the null signer reports an empty active-key set --
+// which is exactly the contract those verbs already enforce.
+// Override bypasses the signing-key precondition entirely and
+// works against a null-signer Steward.
+//
+// Tests inject deterministic shims via the optional fields.
 type Config struct {
 	Store  Store
 	Signer Signer
@@ -83,14 +98,22 @@ type Config struct {
 	UUIDGen func() (uuid.UUID, error)
 }
 
-// New constructs a Steward. Returns an error if Store or
-// Signer is nil.
+// New constructs a Steward. Returns an error only if Store is
+// nil. A nil Signer is replaced by a [noActiveSigner] null
+// object that reports an empty active-key set so the Stage 5.2
+// write verbs surface [ErrNoActiveSigningKey] in scaffold mode
+// while `Steward.Override` (Stage 5.3) keeps serving 200 --
+// the kill-switch contract pinned by
+// [TestSteward_Override_NoSigningKeyAccepted] and the
+// composition-root test
+// [TestRootMux_ScaffoldModeOverrideMounted_200].
 func New(cfg Config) (*Steward, error) {
 	if cfg.Store == nil {
 		return nil, errors.New("steward: New: Store is required")
 	}
-	if cfg.Signer == nil {
-		return nil, errors.New("steward: New: Signer is required")
+	signer := cfg.Signer
+	if signer == nil {
+		signer = noActiveSigner{}
 	}
 	clock := cfg.Clock
 	if clock == nil {
@@ -102,10 +125,44 @@ func New(cfg Config) (*Steward, error) {
 	}
 	return &Steward{
 		store:  cfg.Store,
-		signer: cfg.Signer,
+		signer: signer,
 		clock:  clock,
 		newID:  newID,
 	}, nil
+}
+
+// noActiveSigner is the null object the Steward installs when
+// the composition root constructs a Steward without a Signer
+// (scaffold mode: `CLEAN_CODE_KMS_PROVIDER` is unset). Every
+// method behaves as if no signing key is loaded:
+//
+//   - [Sign] returns [keys.ErrNoActiveKey], which the Publish
+//     verb already translates into [ErrNoActiveSigningKey].
+//   - [ListActive] returns the empty slice, so the
+//     [checkSigningKey] precondition the other Stage 5.2 verbs
+//     run surfaces [ErrNoActiveSigningKey] via the `len==0`
+//     branch.
+//   - [VerifyAny] returns [keys.ErrUnknownKey] so a caller
+//     that somehow lands on the verify path during scaffold
+//     mode hits a definite "this key is not available" error
+//     instead of a nil-pointer panic.
+//
+// The null object lives in this package (not in
+// `cmd/clean-coded`) so the Steward's invariant "`s.signer` is
+// never literally nil" stays internal to the steward package
+// and no production wiring code can accidentally bypass it.
+type noActiveSigner struct{}
+
+func (noActiveSigner) Sign(context.Context, []byte) (uuid.UUID, []byte, error) {
+	return uuid.Nil, nil, keys.ErrNoActiveKey
+}
+
+func (noActiveSigner) VerifyAny(context.Context, []byte, []byte) (uuid.UUID, error) {
+	return uuid.Nil, keys.ErrUnknownKey
+}
+
+func (noActiveSigner) ListActive(context.Context) ([]keys.ActiveKeyView, error) {
+	return nil, nil
 }
 
 // Publish implements the canonical `policy.publish` verb. The

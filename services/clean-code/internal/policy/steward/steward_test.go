@@ -421,19 +421,53 @@ func contains(s, sub string) bool {
 	return false
 }
 
-// TestSteward_NewRequiresStoreAndSigner pins the [New]
-// preconditions so a future caller that forgets to wire a
-// dependency hits a clear error rather than a nil panic.
-func TestSteward_NewRequiresStoreAndSigner(t *testing.T) {
+// TestSteward_NewRequiresStore pins the [New] precondition:
+// [Config.Store] is mandatory, [Config.Signer] is OPTIONAL.
+// The kill-switch contract (Stage 5.3) requires `mgmt.override`
+// to keep serving 200 in scaffold mode, so the constructor
+// installs a [noActiveSigner] null object instead of refusing.
+// The Stage 5.2 verbs still refuse with [ErrNoActiveSigningKey]
+// because that null object reports an empty active-key set --
+// see [TestSteward_PublishRefusesWhenSignerNil] for the positive
+// pin on the Stage 5.2 side.
+func TestSteward_NewRequiresStore(t *testing.T) {
 	t.Parallel()
 	if _, err := New(Config{}); err == nil {
 		t.Errorf("New(empty): err=nil; expected Store required")
 	}
-	if _, err := New(Config{Store: NewInMemoryStore()}); err == nil {
-		t.Errorf("New(no Signer): err=nil; expected Signer required")
-	}
 	if _, err := New(Config{Signer: newKeysManagerWithMintedKey(t)}); err == nil {
 		t.Errorf("New(no Store): err=nil; expected Store required")
+	}
+	// Stage 5.3 kill-switch contract: a steward constructed
+	// without a signer MUST be usable -- not an error.
+	st, err := New(Config{Store: NewInMemoryStore()})
+	if err != nil {
+		t.Fatalf("New(no Signer): err=%v; want nil (kill-switch contract: Signer is optional)", err)
+	}
+	if st == nil {
+		t.Fatalf("New(no Signer): steward is nil; want a real Steward backed by noActiveSigner")
+	}
+}
+
+// TestSteward_PublishRefusesWhenSignerNil pins the other half
+// of the Stage 5.3 kill-switch contract: a steward constructed
+// without a signer still REFUSES Publish (the signing verb)
+// with [ErrNoActiveSigningKey], because the null-object signer
+// reports an empty active-key set. This keeps the Stage 5.2
+// "no active key = 503" contract intact while letting Override
+// (Stage 5.3) bypass the precondition.
+func TestSteward_PublishRefusesWhenSignerNil(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := NewInMemoryStore()
+	seedSampleRulesInto(t, store)
+	st, err := New(Config{Store: store}) // no Signer wired
+	if err != nil {
+		t.Fatalf("New(no Signer): %v", err)
+	}
+	_, err = st.Publish(ctx, newSamplePublishRequest())
+	if !errors.Is(err, ErrNoActiveSigningKey) {
+		t.Fatalf("Publish on null-signer steward: err=%v; want ErrNoActiveSigningKey", err)
 	}
 }
 
@@ -569,7 +603,7 @@ func TestSteward_PublishMixedRefsAllOrNothing(t *testing.T) {
 
 	req := newSamplePublishRequest()
 	req.RuleRefs = []RuleRef{
-		{RuleID: "solid.srp.lcom4_high", Version: 1}, // valid
+		{RuleID: "solid.srp.lcom4_high", Version: 1},  // valid
 		{RuleID: "decoupling.cycles.any", Version: 1}, // not seeded
 	}
 	req.ThresholdRefs = []ThresholdRef{

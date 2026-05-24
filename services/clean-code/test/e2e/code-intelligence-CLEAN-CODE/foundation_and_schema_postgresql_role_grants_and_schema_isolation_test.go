@@ -65,8 +65,8 @@ func isPermissionDenied(err error) bool {
 
 // writerRoles lists every application-level writer role.
 var writerRoles = []string{
-	"clean_code_metric_ingestor",
-	"clean_code_aggregator",
+	"clean_code_ingestor",
+	"clean_code_xrepo_aggregator",
 	"clean_code_evaluator",
 	"clean_code_solid_batch",
 	"clean_code_wal_reconciler",
@@ -74,8 +74,8 @@ var writerRoles = []string{
 
 // nonAuditWriterRoles are roles that must NOT write audit tables.
 var nonAuditWriterRoles = []string{
-	"clean_code_metric_ingestor",
-	"clean_code_aggregator",
+	"clean_code_ingestor",
+	"clean_code_xrepo_aggregator",
 	"clean_code_policy_steward",
 	"clean_code_refactor_planner",
 	"clean_code_repo_indexer",
@@ -105,8 +105,8 @@ var measurementTables = []string{
 
 // roleOwnership maps each writer role to the tables it may INSERT into.
 var roleOwnership = map[string][]string{
-	"clean_code_metric_ingestor": {"metric_sample", "metric_retraction", "metric_sample_active"},
-	"clean_code_aggregator":     {"metric_sample", "metric_retraction", "metric_sample_active"},
+	"clean_code_ingestor":       {"metric_sample", "metric_retraction", "metric_sample_active"},
+	"clean_code_xrepo_aggregator":     {"metric_sample", "metric_retraction", "metric_sample_active"},
 	"clean_code_evaluator":      {"evaluation_run", "evaluation_verdict", "finding"},
 	"clean_code_solid_batch":    {"evaluation_run", "evaluation_verdict", "finding"},
 	"clean_code_wal_reconciler": {"evaluation_run", "evaluation_verdict", "finding"},
@@ -313,7 +313,7 @@ func (s *roleIsolationState) eachWriterRoleSucceedsOnOwnedTables() error {
 
 func (s *roleIsolationState) ingestorCanInsertMeasurementTables() error {
 	for _, table := range measurementTables {
-		err := s.execAsRole("clean_code_metric_ingestor", buildInsertSQL(table))
+		err := s.execAsRole("clean_code_ingestor", buildInsertSQL(table))
 		if err != nil {
 			return fmt.Errorf("ingestor INSERT into %s failed: %v", table, err)
 		}
@@ -323,7 +323,7 @@ func (s *roleIsolationState) ingestorCanInsertMeasurementTables() error {
 
 func (s *roleIsolationState) aggregatorCanInsertMeasurementTables() error {
 	for _, table := range measurementTables {
-		err := s.execAsRole("clean_code_aggregator", buildInsertSQL(table))
+		err := s.execAsRole("clean_code_xrepo_aggregator", buildInsertSQL(table))
 		if err != nil {
 			return fmt.Errorf("aggregator INSERT into %s failed: %v", table, err)
 		}
@@ -467,7 +467,7 @@ func (s *roleIsolationState) updateAndDeleteRevokedIncludingPublicOnAuditTables(
 // ---------------------------------------------------------------------------
 
 func (s *roleIsolationState) aggregatorInsertsRowWithPackSystemIntoMetricSample() error {
-	s.lastInsertErr = s.execAsRole("clean_code_aggregator", `
+	s.lastInsertErr = s.execAsRole("clean_code_xrepo_aggregator", `
 		INSERT INTO clean_code.metric_sample (repo_id, metric_name, value, pack)
 		VALUES ('00000000-0000-0000-0000-000000000001', 'e2e_agg_probe', 42, 'system')
 	`)
@@ -483,7 +483,7 @@ func (s *roleIsolationState) aggregatorMetricSampleInsertSucceeds() error {
 }
 
 func (s *roleIsolationState) aggregatorUpsertsMetricSampleActivePointer() error {
-	s.lastInsertErr = s.execAsRole("clean_code_aggregator", `
+	s.lastInsertErr = s.execAsRole("clean_code_xrepo_aggregator", `
 		INSERT INTO clean_code.metric_sample_active (repo_id, metric_name, sample_id)
 		VALUES ('00000000-0000-0000-0000-000000000001', 'e2e_agg_probe',
 			'00000000-0000-0000-0000-000000000099')
@@ -505,7 +505,7 @@ func (s *roleIsolationState) aggregatorMetricSampleActiveUpsertSucceeds() error 
 // The schema enforces this via a CHECK constraint or trigger that rejects
 // pack='base' writes from the aggregator role context.
 func (s *roleIsolationState) aggregatorAttemptsInsertWithPackBaseIntoMetricSample() error {
-	s.lastInsertErr = s.execAsRole("clean_code_aggregator", `
+	s.lastInsertErr = s.execAsRole("clean_code_xrepo_aggregator", `
 		INSERT INTO clean_code.metric_sample (repo_id, metric_name, value, pack)
 		VALUES ('00000000-0000-0000-0000-000000000001', 'e2e_agg_base_probe', 1, 'base')
 	`)

@@ -27,6 +27,8 @@ Feature: Catalog and Lifecycle schema migrations
 
   Scenario: scan-run-status-enum
     Given the scan_run table exists after migrate-up
+    When an INSERT supplies scan_run status 'running'
+    Then the scan_run insert succeeds
     When an INSERT supplies scan_run status 'orphaned'
     Then PostgreSQL rejects the scan_run insert with an enum constraint violation
     When an INSERT supplies scan_run status 'complete'

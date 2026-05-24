@@ -952,6 +952,21 @@ func InitializeScenario_policy_steward_and_solid_rule_engine_policy_publish_acti
 	ctx.Step(`^listing the "([^"]*)" verbs$`, s.listingThePolicyVerbs)
 	ctx.Step(`^exactly "([^"]*)" are registered$`, s.exactlyVerbsAreRegistered)
 	ctx.Step(`^a call to "([^"]*)" returns UNIMPLEMENTED$`, s.aCallToVerbReturnsUNIMPLEMENTED)
+
+	// FIX (review): close db + grpcConn after every scenario so connections
+	// don't leak until process exit. Without this, each scenario's lazy
+	// ensureDB / ensureGRPC opens a fresh pool that is never released.
+	ctx.After(func(ctx context.Context, _ *godog.Scenario, _ error) (context.Context, error) {
+		if s.db != nil {
+			_ = s.db.Close()
+			s.db = nil
+		}
+		if s.grpcConn != nil {
+			_ = s.grpcConn.Close()
+			s.grpcConn = nil
+		}
+		return ctx, nil
+	})
 }
 
 func TestE2E_policy_steward_and_solid_rule_engine_policy_publish_activate_and_rulepack_verbs(t *testing.T) {

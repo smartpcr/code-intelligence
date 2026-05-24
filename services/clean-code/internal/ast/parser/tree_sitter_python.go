@@ -81,7 +81,7 @@ func (w *pythonWalker) walk(n *sitter.Node, parentScopeID, parentQualified strin
 		case "import_statement", "import_from_statement":
 			w.handleImport(child)
 		case "class_definition":
-			w.handleClass(child, parentScopeID, parentQualified)
+			w.handleClass(child, parentScopeID, parentQualified, "")
 		case "function_definition", "async_function_definition":
 			w.handleFunction(child, parentScopeID, parentQualified, "")
 		case "decorated_definition":
@@ -142,7 +142,7 @@ func (w *pythonWalker) handleImport(n *sitter.Node) {
 	// module_name; the loop above handles those too.
 }
 
-func (w *pythonWalker) handleClass(n *sitter.Node, parentScopeID, parentQualified string) {
+func (w *pythonWalker) handleClass(n *sitter.Node, parentScopeID, parentQualified, decorators string) {
 	name := ""
 	if id := findChildByFieldName(n, "name"); id != nil {
 		name = strings.TrimSpace(nodeText(id, w.src))
@@ -170,6 +170,9 @@ func (w *pythonWalker) handleClass(n *sitter.Node, parentScopeID, parentQualifie
 		if looksLikeABC(strings.Join(bases, ",")) {
 			kind = ScopeKindInterface
 		}
+	}
+	if decorators != "" {
+		attrs["decorators"] = decorators
 	}
 	scope := &AstScope{
 		ScopeKind:     kind,
@@ -251,7 +254,7 @@ func (w *pythonWalker) handleDecorated(n *sitter.Node, parentScopeID, parentQual
 	joined := strings.Join(decorators, ",")
 	switch target.Type() {
 	case "class_definition":
-		w.handleClass(target, parentScopeID, parentQualified)
+		w.handleClass(target, parentScopeID, parentQualified, joined)
 	case "function_definition", "async_function_definition":
 		w.handleFunction(target, parentScopeID, parentQualified, joined)
 	}

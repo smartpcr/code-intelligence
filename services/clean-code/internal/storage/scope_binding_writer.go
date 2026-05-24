@@ -119,12 +119,23 @@ var (
 // upper bound the chunk-size constants stay strictly below.
 const pgMaxBindParameters = 65535
 
-// emptyAttrsJSON is the JSONB literal the writer falls back to
-// when a Candidate carries a nil / empty [json.RawMessage]
-// AttrsJSON. Mirrors the table DEFAULT (`'{}'::jsonb`) so the
-// round-tripped attrs is byte-identical whether the caller
-// passed nil or `[]byte("{}")` explicitly.
-var emptyAttrsJSON = json.RawMessage("{}")
+// emptyAttrsJSONLiteral is the JSONB literal the writer falls
+// back to when a Candidate carries a nil / empty
+// [json.RawMessage] AttrsJSON. Mirrors the table DEFAULT
+// (`'{}'::jsonb`) so the round-tripped attrs is byte-identical
+// whether the caller passed nil or `[]byte("{}")` explicitly.
+//
+// This is a `const string` (NOT a package-level
+// `json.RawMessage`/`[]byte`) on purpose: every fallback site
+// converts it to a FRESH `json.RawMessage("{}")` slice rather
+// than aliasing a shared backing array. A shared
+// `var emptyAttrsJSON = json.RawMessage("{}")` would let any
+// downstream mutation of one candidate's AttrsJSON (e.g. an
+// append) corrupt every other candidate that took the
+// fallback, AND would couple the writer's input slice to a
+// package-level default. Keeping the literal `const`-bound
+// keeps the fallback safe by construction.
+const emptyAttrsJSONLiteral = "{}"
 
 // ScopeBindingCandidate is the per-row input the writer accepts.
 // One Candidate corresponds to one logical scope observation;
@@ -339,14 +350,25 @@ func (w *ScopeBindingWriter) Write(ctx context.Context, candidates []ScopeBindin
 		if err := validateCandidate(candidates[i]); err != nil {
 			return ScopeBindingWriteResult{}, fmt.Errorf("storage: ScopeBindingWriter.Write: candidates[%d]: %w", i, err)
 		}
-		if len(candidates[i].AttrsJSON) == 0 {
-			candidates[i].AttrsJSON = emptyAttrsJSON
+		// Copy the candidate into resolved BEFORE applying the
+		// empty-AttrsJSON fallback so we never mutate
+		// `candidates[i]` -- Go slices share the underlying
+		// array and the caller owns the input slice. The
+		// fallback then writes a FRESHLY-ALLOCATED
+		// `json.RawMessage("{}")` per row so no two rows alias
+		// the same backing `[]byte` (a shared backing array
+		// would let a downstream mutation of one row's
+		// AttrsJSON corrupt every sibling that took the
+		// fallback -- see `emptyAttrsJSONLiteral`).
+		c := candidates[i]
+		if len(c.AttrsJSON) == 0 {
+			c.AttrsJSON = json.RawMessage(emptyAttrsJSONLiteral)
 		}
-		resolved[i].Candidate = candidates[i]
+		resolved[i].Candidate = c
 		keys[i] = naturalKey{
-			RepoID:    candidates[i].RepoID,
-			Kind:      candidates[i].Kind,
-			Signature: candidates[i].CanonicalSignature,
+			RepoID:    c.RepoID,
+			Kind:      c.Kind,
+			Signature: c.CanonicalSignature,
 		}
 	}
 
@@ -387,7 +409,7 @@ func (w *ScopeBindingWriter) Write(ctx context.Context, candidates []ScopeBindin
 	mintedScopeIDs := make(map[uuid.UUID]struct{})
 	result := ScopeBindingWriteResult{}
 	if len(missing) > 0 {
-		recheck, inserted, minted, err := w.writeFreshLocked(ctx, missing, groupByKey, candidates)
+		recheck, inserted, minted, err := w.writeFreshLocked(ctx, missing, groupByKey, resolved)
 		if err != nil {
 			return ScopeBindingWriteResult{}, err
 		}
@@ -476,7 +498,7 @@ func (w *ScopeBindingWriter) writeFreshLocked(
 	ctx context.Context,
 	missing []naturalKey,
 	groupByKey map[naturalKey]*group, // intra-batch dedupe groups
-	candidates []ScopeBindingCandidate, // for winner's CurrentSHA etc.
+	resolved []ScopeBindingResolved, // winner-of-group lookup; .Candidate has the empty-AttrsJSON fallback applied
 ) (map[naturalKey]existingRow, int, map[uuid.UUID]struct{}, error) {
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -524,7 +546,7 @@ func (w *ScopeBindingWriter) writeFreshLocked(
 		if !ok {
 			return nil, 0, nil, fmt.Errorf("storage: ScopeBindingWriter.Write: missing key %v has no dedupe group (writer bug)", k)
 		}
-		winner := candidates[g.winner]
+		winner := resolved[g.winner].Candidate
 		scopeID, err := scope.DeriveScopeID(winner.RepoID, winner.Kind, winner.CanonicalSignature, winner.CurrentSHA)
 		if err != nil {
 			return nil, 0, nil, fmt.Errorf("storage: ScopeBindingWriter.Write: derive scope_id for candidates[%d]: %w", g.winner, err)

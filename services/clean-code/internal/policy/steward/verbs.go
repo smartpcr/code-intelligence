@@ -28,10 +28,18 @@ const (
 	VerbPolicyPublishRulepack = "policy.publish_rulepack"
 )
 
-// CanonicalVerbs is the immutable closed set of `policy.*`
-// write-verb names. Returned by [Registry.Verbs]. The order
-// matches the architecture Sec 6.5 listing.
-var CanonicalVerbs = []string{
+// canonicalVerbs is the immutable closed set of `policy.*`
+// write-verb names. Returned (defensively copied) by
+// [Registry.Verbs]. The order matches the architecture Sec 6.5
+// listing.
+//
+// Kept unexported so importing packages cannot mutate the
+// backing array (e.g. `steward.CanonicalVerbs[0] = "evil"`),
+// which would otherwise leave [canonicalVerbSet] -- built once
+// at init -- in an inconsistent state relative to
+// [Registry.Verbs]. External callers must go through
+// [Registry.Verbs] (read) or [Registry.Lookup] (membership).
+var canonicalVerbs = []string{
 	VerbPolicyPublish,
 	VerbPolicyActivate,
 	VerbPolicyPublishRulepack,
@@ -39,10 +47,12 @@ var CanonicalVerbs = []string{
 
 // canonicalVerbSet is the same closed set materialised as a
 // map for O(1) lookup. Built once at package init from
-// [CanonicalVerbs] so the two slices can never drift.
+// [canonicalVerbs] so the two views can never drift -- safe
+// because [canonicalVerbs] is unexported and cannot be
+// reassigned or mutated from outside this package.
 var canonicalVerbSet = func() map[string]struct{} {
-	out := make(map[string]struct{}, len(CanonicalVerbs))
-	for _, v := range CanonicalVerbs {
+	out := make(map[string]struct{}, len(canonicalVerbs))
+	for _, v := range canonicalVerbs {
 		out[v] = struct{}{}
 	}
 	return out
@@ -71,8 +81,8 @@ type Registry struct{}
 // verb names. The returned slice is a defensive copy; callers
 // may not mutate it.
 func (Registry) Verbs() []string {
-	out := make([]string, len(CanonicalVerbs))
-	copy(out, CanonicalVerbs)
+	out := make([]string, len(canonicalVerbs))
+	copy(out, canonicalVerbs)
 	return out
 }
 
@@ -95,5 +105,5 @@ func (Registry) Lookup(name string) (string, error) {
 	if _, ok := canonicalVerbSet[name]; ok {
 		return name, nil
 	}
-	return "", fmt.Errorf("%w: %q (canonical set: %v)", ErrUnimplementedVerb, name, CanonicalVerbs)
+	return "", fmt.Errorf("%w: %q (canonical set: %v)", ErrUnimplementedVerb, name, canonicalVerbs)
 }

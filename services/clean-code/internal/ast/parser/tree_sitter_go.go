@@ -52,12 +52,14 @@ func (g *goParser) Parse(ctx context.Context, path string, content []byte) (*Ast
 	// file scope (mirrors the stdlib parser path so the same
 	// assertions hold under both build tags).
 	pkgName := ""
+	var packageClauseNode *sitter.Node
 	for i := uint32(0); i < root.NamedChildCount(); i++ {
 		c := root.NamedChild(int(i))
 		if c == nil {
 			continue
 		}
 		if c.Type() == "package_clause" {
+			packageClauseNode = c
 			for j := uint32(0); j < c.NamedChildCount(); j++ {
 				sub := c.NamedChild(int(j))
 				if sub == nil {
@@ -74,11 +76,23 @@ func (g *goParser) Parse(ctx context.Context, path string, content []byte) (*Ast
 	if pkgName != "" {
 		b.fileScope.Attrs = map[string]string{"package": pkgName}
 		b.fileScope.QualifiedName = joinQualified(pkgName, b.fileScope.Name)
+		// Pin the package scope's range to the `package_clause`
+		// token (not the whole file) so callers using
+		// `AstScope.Range` to distinguish "inside the package
+		// scope" from "inside the file scope" get a meaningful
+		// answer -- and so the cgo path matches the precise,
+		// narrow range emitted by the `!cgo` fallback
+		// (`astRangeFromPos(fset, file.Package, file.Package)`
+		// in `go.go`).
+		pkgRange := nodeRange(root)
+		if packageClauseNode != nil {
+			pkgRange = nodeRange(packageClauseNode)
+		}
 		pkgScope := &AstScope{
 			ScopeKind:     ScopeKindPackage,
 			Name:          pkgName,
 			QualifiedName: pkgName,
-			Range:         nodeRange(root),
+			Range:         pkgRange,
 			Attrs:         map[string]string{"language": LanguageGo},
 		}
 		pkgScopeID := b.addScope(pkgScope)

@@ -1,0 +1,215 @@
+// ast.proto -- canonical AST shape produced by the clean-code
+// service's AST adapter front end (architecture Sec 4.5,
+// tech-spec Sec 4.5 / Sec 8.6) and consumed by every recipe in
+// the foundation compute tier.
+//
+// Stage 2.1 of implementation-plan.md owns this file. The shape
+// here is normative: every per-language parser implementation
+// MUST produce a value of this type and every recipe MUST read
+// only fields defined here. New per-language attributes ride on
+// the open-ended `attrs` map rather than adding language-specific
+// proto fields, so adding a v2 language (per Sec 8.6 v1 pin
+// post-v1 extension model) does not require a proto schema bump.
+//
+// Versioning. Package is `clean_code.ast.v1`. A breaking change
+// requires a new package name (`clean_code.ast.v2`) so two
+// parser-fleet versions can co-exist during a rollout.
+//
+// Wire compatibility. Generated bindings are checked in at
+// `internal/ast/v1/ast.pb.go`; running `make proto` regenerates
+// them from this file. The check-in keeps `go build` / CI free
+// of a hard `protoc` dependency.
+
+syntax = "proto3";
+
+package clean_code.ast.v1;
+
+option go_package = "github.com/microsoft/code-intelligence/services/clean-code/internal/ast/v1;astv1";
+
+// ScopeKind is the canonical scope discriminator pinned by
+// architecture Sec 5.2.3 lines 1039-1050. Recipes MUST cite a
+// `scope_kind` from this enum -- post-v1 additions (e.g. a new
+// `lambda` kind) are a schema bump, not an in-place change.
+enum ScopeKind {
+  // Default proto3 zero value; must be rejected by writers.
+  SCOPE_KIND_UNSPECIFIED = 0;
+  // Whole repository -- exactly one per `(repo_id, sha)`.
+  SCOPE_KIND_REPO = 1;
+  // Source package / directory grouping (Go package, Python
+  // package, Java package, TypeScript folder module).
+  SCOPE_KIND_PACKAGE = 2;
+  // A single source file.
+  SCOPE_KIND_FILE = 3;
+  // A class declaration. For TypeScript also covers `class`
+  // declarations; for Go this is unused (Go uses `interface`
+  // for method-set polymorphism and struct types are flat).
+  SCOPE_KIND_CLASS = 4;
+  // An interface declaration (Go interface, Java interface,
+  // TypeScript interface, Python ABC subclasses).
+  SCOPE_KIND_INTERFACE = 5;
+  // A method / function declaration.
+  SCOPE_KIND_METHOD = 6;
+  // A nested block within a method (the smallest scope kind).
+  SCOPE_KIND_BLOCK = 7;
+}
+
+// AstRefKind discriminates whether an `AstRef.id` points at an
+// `AstScope.scope_id` or an `AstSymbol.symbol_id`. Using a
+// dedicated enum (rather than a oneof) keeps the wire shape
+// stable for `AstEdge` endpoints when call-graph edges land
+// (Stage 2.5 cycle / fan_in / fan_out recipes).
+enum AstRefKind {
+  AST_REF_KIND_UNSPECIFIED = 0;
+  AST_REF_KIND_SCOPE = 1;
+  AST_REF_KIND_SYMBOL = 2;
+}
+
+// AstRange identifies a contiguous byte range in the source
+// file. Lines and columns are 1-indexed (editor convention);
+// bytes are 0-indexed (Go convention). Producers MUST populate
+// all six fields so downstream rendering (Refactor Planner
+// citation surface, Insights UI) never has to re-tokenise.
+message AstRange {
+  uint32 start_byte = 1;
+  uint32 end_byte = 2;
+  uint32 start_line = 3;
+  uint32 end_line = 4;
+  uint32 start_col = 5;
+  uint32 end_col = 6;
+}
+
+// AstRef is the polymorphic endpoint type used by `AstEdge`.
+// `id` is either a `scope_id` or `symbol_id` depending on
+// `kind`; consumers MUST switch on `kind` before treating `id`
+// as one or the other.
+message AstRef {
+  AstRefKind kind = 1;
+  string id = 2;
+}
+
+// AstScope is a contiguous region of source code with a
+// well-defined `scope_kind` and a canonical signature. Stage
+// 2.1 (this stage) populates `scope_kind`, `name`,
+// `qualified_name`, `parameters`, `range`, `parent_scope_id`,
+// and `attrs`. Stage 2.2 mints `scope_id` and
+// `canonical_signature` from those fields per architecture Sec
+// 5.2.3 lines 1039-1050; Stage 2.1 leaves them empty.
+message AstScope {
+  // Deterministic uuid derived from `(repo_id, scope_kind,
+  // canonical_signature, first_seen_sha)`. Populated by Stage
+  // 2.2's scope identity writer; Stage 2.1 parsers leave it
+  // empty so the parser does not need a repo handle.
+  string scope_id = 1;
+  // Canonical discriminator (file/class/interface/method/...).
+  ScopeKind scope_kind = 2;
+  // Language-stable identifier (e.g. `pkg.Foo#bar(int)`).
+  // Populated by Stage 2.2; Stage 2.1 leaves it empty.
+  string canonical_signature = 3;
+  // Short, language-specific name (e.g. `Foo`, `bar`,
+  // `__init__`). For files this is the basename; for packages
+  // the last path segment.
+  string name = 4;
+  // Fully qualified, dot-separated path through enclosing
+  // scopes (e.g. `pkg.Foo.bar`). Stage 2.2 builds
+  // `canonical_signature` from this plus `parameters`.
+  string qualified_name = 5;
+  // Parameter type list for method scopes; empty for other
+  // scope kinds. Order matches the source declaration. Types
+  // are the language's surface syntax (e.g. `int`, `string`,
+  // `T`, `*Foo`).
+  repeated string parameters = 6;
+  // Source range; required for every scope.
+  AstRange range = 7;
+  // ID of the enclosing scope, if any (e.g. a method's parent
+  // is its class; a class's parent is its file). The file
+  // scope's parent is empty. Populated by parsers using a
+  // stable intra-file ordinal (Stage 2.1) and rewritten by
+  // Stage 2.2 to the durable `scope_id`.
+  string parent_scope_id = 8;
+  // Open-ended language-specific attributes (visibility,
+  // return type, modifiers, generic parameters, ...). Insert-
+  // time only -- once a `ScopeBinding` row is written by Stage
+  // 2.2 the attrs are frozen.
+  map<string, string> attrs = 9;
+}
+
+// AstSymbol is a named declaration inside a scope (a parameter,
+// a local variable, an imported identifier, a struct field).
+// Stage 2.1 emits the minimal set needed by recipes that read
+// identifiers (e.g. `coupling_between_objects` for type
+// references); richer symbol-table material can land in later
+// stages without a schema bump.
+message AstSymbol {
+  // Stable per-file identifier (intra-file ordinal). Stage 2.2
+  // may rewrite to a durable cross-file id when symbols become
+  // first-class scope-binding entries.
+  string symbol_id = 1;
+  string name = 2;
+  // Free-form symbol kind tag (`parameter`, `local`, `import`,
+  // `field`). The kind set is intentionally open so a per-
+  // language parser can introduce new categories without a
+  // proto bump.
+  string kind = 3;
+  // ID of the scope this symbol is declared in.
+  string scope_id = 4;
+  AstRange range = 5;
+  map<string, string> attrs = 6;
+}
+
+// AstEdge connects two `AstRef`s (scope-scope, scope-symbol, or
+// symbol-symbol). Used by Stage 2.5 fan_in / fan_out / cycle
+// recipes (the `kind` field carries `calls`, `imports`,
+// `extends`, `implements`, etc.).
+message AstEdge {
+  // Stable per-file identifier (intra-file ordinal).
+  string edge_id = 1;
+  // Edge category (`calls`, `extends`, `implements`,
+  // `imports`, `contains`, ...). Open enum -- per-language
+  // parsers can introduce new categories without a proto bump.
+  string kind = 2;
+  AstRef from = 3;
+  AstRef to = 4;
+  map<string, string> attrs = 5;
+}
+
+// AstFile is the output of one `Parser.Parse(ctx, path, bytes)`
+// call -- a self-contained canonical AST for a single source
+// file. Recipes ALWAYS read from `AstFile`; they never re-
+// tokenise the original source.
+message AstFile {
+  // ISO-style language tag matching the parser registry key
+  // (`go`, `python`, `typescript`, `java`). The
+  // four v1-pinned values are normative; a fifth value is
+  // rejected by the registry per tech-spec Sec 8.6.
+  string language = 1;
+  // Repo-relative path of the source file (forward-slash on
+  // all platforms; producers MUST normalise `\` -> `/`).
+  string path = 2;
+  // SHA-256 of the input bytes, hex-encoded. Used by the
+  // recipe layer to short-circuit when an unchanged file is
+  // re-parsed (cache hit) -- the file bytes alone determine
+  // the AST shape for a given parser version.
+  string content_sha256 = 3;
+  // Tree-sitter / grammar version pin used by the producer.
+  // Mirrors `recipe_manifest.grammar_version` so a future
+  // grammar upgrade lands as a new pinned version rather than
+  // a silent re-parse (tech-spec Sec 9.14).
+  string parser_version = 4;
+  // Scopes discovered in the file. Order is source order
+  // (a stable DFS traversal of the parse tree).
+  repeated AstScope scopes = 5;
+  // Symbols discovered in the file. Order is source order.
+  repeated AstSymbol symbols = 6;
+  // Edges discovered in the file. Order is source order.
+  repeated AstEdge edges = 7;
+  // Parse-time degraded reason (`tree_sitter_panic`,
+  // `unknown_grammar`, `parse_truncated`, ...). Empty when the
+  // parse was clean. Mirrors `MetricSample.degraded_reason`
+  // (architecture Sec 5.2.1 lines 994-1003) so a degraded
+  // parse can be carried forward into recipe output without
+  // re-encoding the reason.
+  string degraded_reason = 8;
+  // Open-ended per-file metadata (e.g. detected encoding,
+  // shebang interpreter).
+  map<string, string> attrs = 9;
+}

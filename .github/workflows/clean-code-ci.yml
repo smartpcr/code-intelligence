@@ -73,8 +73,43 @@ jobs:
       - name: make build
         run: make build
 
-      - name: make test
-        run: make test
+      - name: Verify C toolchain is present
+        # The `make test-cgo` step below is a HARD GATE for the
+        # tree-sitter-backed parser fleet (`//go:build cgo`). It
+        # requires gcc / cc / clang at compile time. ubuntu-latest
+        # ships gcc by default but if a future runner image
+        # rotation drops it, this probe surfaces the
+        # toolchain-missing failure with an actionable error BEFORE
+        # `go test` emits the more cryptic `cgo: C compiler "gcc"
+        # not found`. Resolves iter-4 evaluator items #2 / #3.
+        run: |
+          set -euo pipefail
+          for c in gcc cc clang; do
+            if command -v "$c" >/dev/null 2>&1; then
+              echo "found C compiler: $c -> $(command -v "$c")"
+              "$c" --version | head -n 1
+              exit 0
+            fi
+          done
+          echo "::error::no C compiler (gcc / cc / clang) found in PATH; make test-cgo will fail"
+          exit 1
+
+      - name: make test-nocgo
+        # Validate the `//go:build !cgo` lexer-fallback adapters
+        # for Python / TypeScript / Java (and the stdlib `go/parser`
+        # fallback for Go). MUST pass on every host -- this is the
+        # contract the !cgo build tag exists for.
+        run: make test-nocgo
+
+      - name: make test-cgo
+        # NON-OPTIONAL CI gate for the supported tree-sitter path:
+        # exercises `//go:build cgo` adapters for Go, Python,
+        # TypeScript, and Java via the real `smacker/go-tree-sitter`
+        # grammars. Will fail loudly if `cgo: C compiler "gcc" not
+        # found` (caught by the verify-c-toolchain probe above).
+        # Resolves iter-4 evaluator items #2 / #3 (CGO Tree-sitter
+        # path must be deterministically exercised in CI).
+        run: make test-cgo
 
       - name: make test-race
         # `make test` is portable (no `-race`); `make test-race`

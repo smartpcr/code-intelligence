@@ -59,8 +59,9 @@ func readModulePath(dir string) (string, error) {
 
 // runProbe compiles and executes a small Go program within the service
 // module, returning its combined stdout/stderr and exit code. Any
-// probeArgs are forwarded to the compiled probe as os.Args[1:].
-func runProbe(svcRoot, source string, probeArgs ...string) (string, int, error) {
+// trailing args are forwarded to the probe as command-line arguments,
+// so probes can read them via os.Args[1:].
+func runProbe(svcRoot, source string, args ...string) (string, int, error) {
 	tmpDir, err := os.MkdirTemp(svcRoot, "e2e-ast-probe-")
 	if err != nil {
 		return "", -1, fmt.Errorf("creating probe dir: %w", err)
@@ -76,7 +77,7 @@ func runProbe(svcRoot, source string, probeArgs ...string) (string, int, error) 
 		return "", -1, fmt.Errorf("relative path: %w", err)
 	}
 
-	cmdArgs := append([]string{"run", "./" + filepath.ToSlash(relDir)}, probeArgs...)
+	cmdArgs := append([]string{"run", "./" + filepath.ToSlash(relDir)}, args...)
 	cmd := exec.Command("go", cmdArgs...)
 	cmd.Dir = svcRoot
 	cmd.Env = os.Environ()

@@ -424,6 +424,16 @@ func validateActivateRequest(req ActivateRequest) error {
 // architecture Sec 5.3.1 logical FK by requiring each rule's
 // `pack_id` (inherited from the parent in [Steward.PublishRulepack])
 // to be non-empty.
+//
+// Duplicate-key check: rejects two entries that share the same
+// `(rule_id, version)` tuple at validation time, mirroring the
+// `ruleSeen` pattern in [validatePublishRequest]. Without this
+// guard, a caller submitting duplicates would otherwise see
+// either a [Store.ErrDuplicateRule] from the InMemoryStore or
+// a less specific PK-violation rollback from the SQL store --
+// both correct but neither pins the offending index. The
+// validation-time rejection produces a precise 400 with the
+// offending `rules[i]` index.
 func validatePublishRulepackRequest(req PublishRulepackRequest) error {
 	if strings.TrimSpace(req.PackID) == "" {
 		return fmt.Errorf("%w: pack_id must be non-empty", ErrInvalidRequest)
@@ -437,6 +447,7 @@ func validatePublishRulepackRequest(req PublishRulepackRequest) error {
 	if len(req.Rules) == 0 {
 		return fmt.Errorf("%w: rules must be non-empty (a rulepack with no rules is meaningless)", ErrInvalidRequest)
 	}
+	ruleSeen := make(map[RuleRef]struct{}, len(req.Rules))
 	for i, r := range req.Rules {
 		if strings.TrimSpace(r.RuleID) == "" {
 			return fmt.Errorf("%w: rules[%d].rule_id is empty", ErrInvalidRequest, i)
@@ -444,6 +455,11 @@ func validatePublishRulepackRequest(req PublishRulepackRequest) error {
 		if r.Version <= 0 {
 			return fmt.Errorf("%w: rules[%d].version=%d must be > 0", ErrInvalidRequest, i, r.Version)
 		}
+		key := RuleRef{RuleID: r.RuleID, Version: r.Version}
+		if _, dup := ruleSeen[key]; dup {
+			return fmt.Errorf("%w: rules[%d]={rule_id=%q, version=%d} duplicated within payload", ErrInvalidRequest, i, r.RuleID, r.Version)
+		}
+		ruleSeen[key] = struct{}{}
 		if !r.SeverityDefault.IsValid() {
 			return fmt.Errorf("%w: rules[%d].severity_default=%q not in {info,warn,block}", ErrInvalidRequest, i, r.SeverityDefault)
 		}

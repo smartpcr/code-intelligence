@@ -890,7 +890,16 @@ these is a release-blocker.
   906 for `MetricSample.created_at`; Sec 5.4.1-5.4.3 lines
   1190-1212 for `EvaluationRun.created_at`,
   `EvaluationVerdict.created_at`, `Finding.created_at`).
-  Retention is partition-drop only.
+  Retention is partition-drop only. **Stage 1.3 deferral:**
+  `MetricSample` partitioning ships in a later operational
+  migration -- the long-term shape declared here cannot coexist
+  with the other Sec 7.1.b pins in a single CREATE TABLE (see
+  the **partitioning-deferral pin** in Sec 7.1.b for the
+  PostgreSQL DDL rationale). Stage 1.3's 0002 migration creates
+  `metric_sample` unpartitioned and materialises
+  `sample_date_bucket` as a STORED GENERATED column so the
+  deferred partition migration has its sub-partition key
+  available without a separate column-add migration.
 
 ### 8.2 Numeric defaults
 
@@ -1069,6 +1078,22 @@ an upstream change as part of this PR.
 
 ```sql
 -- Append-only row store. Plain, no triggers, no flag columns.
+--
+-- Stage 1.3 NOTE: The `PARTITION BY LIST (metric_kind)` clause
+-- from the long-term shape is DEFERRED per the partitioning-
+-- deferral pin below. The 0002 migration creates this table
+-- UNPARTITIONED but materialises `sample_date_bucket` as a
+-- STORED GENERATED column so the deferred partition migration
+-- has its sub-partition key in place from day one. The
+-- generated expression uses `(created_at AT TIME ZONE 'UTC')`
+-- because PostgreSQL requires the GENERATED expression to be
+-- IMMUTABLE, and `date_trunc('month', timestamptz)` is STABLE
+-- whereas `date_trunc('month', timestamp)` is IMMUTABLE; the
+-- AT TIME ZONE cast with a literal constant tz returns a
+-- timezone-independent `timestamp` and is itself IMMUTABLE.
+-- Bucket boundary is the first of the calendar month at
+-- 00:00 UTC (deliberate; matches the cross-repo aggregate read
+-- pattern which is tz-agnostic).
 CREATE TABLE clean_code.metric_sample (
     sample_id      uuid PRIMARY KEY,
     repo_id        uuid NOT NULL,
@@ -1076,7 +1101,10 @@ CREATE TABLE clean_code.metric_sample (
     scope_id       uuid NOT NULL,
     metric_kind    text NOT NULL,
     metric_version int  NOT NULL,
-    value          double precision NOT NULL,
+    -- value is NULLABLE; the `metric_sample_value_present_unless_degraded`
+    -- CHECK enforces non-null on happy-path rows. See nullable-value
+    -- pin (Stage 1.3) immediately below.
+    value          double precision,
     pack           text NOT NULL,
     source         text NOT NULL,
     degraded       boolean NOT NULL DEFAULT false,
@@ -1085,9 +1113,17 @@ CREATE TABLE clean_code.metric_sample (
     attrs_json     jsonb,
     created_at     timestamptz NOT NULL DEFAULT now(),
     sample_date_bucket date GENERATED ALWAYS AS
-        (date_trunc('month', created_at)::date) STORED
-) PARTITION BY LIST (metric_kind);
--- per-metric_kind sub-partition by sample_date_bucket monthly
+        (date_trunc('month', (created_at AT TIME ZONE 'UTC'))::date) STORED,
+    CONSTRAINT metric_sample_value_present_unless_degraded
+        CHECK (value IS NOT NULL OR degraded = true),
+    CONSTRAINT metric_sample_degraded_reason_consistent
+        CHECK ((degraded = false AND degraded_reason IS NULL)
+            OR (degraded = true  AND degraded_reason IS NOT NULL))
+);
+-- Long-term shape (Stage 1.3-deferred): PARTITION BY LIST (metric_kind)
+-- with monthly sub-partitions keyed on `sample_date_bucket`. See
+-- the partitioning-deferral pin immediately below for rationale
+-- and the future operational migration plan.
 
 -- Tombstone log. Append-only; one row per retraction event.
 CREATE TABLE clean_code.metric_retraction (
@@ -1118,6 +1154,86 @@ CREATE TABLE clean_code.metric_sample_active (
 CREATE UNIQUE INDEX metric_sample_active_sample_id_uniq
     ON clean_code.metric_sample_active (sample_id);
 ```
+
+**Partitioning-deferral pin (Stage 1.3).** The long-term
+`metric_sample` shape declared in Sec 8.1.4 and originally
+sketched in the DDL block above as `PARTITION BY LIST
+(metric_kind)` with monthly sub-partitions on
+`sample_date_bucket` is **deferred** to a later operational
+migration. Three independent PostgreSQL 16 constraints
+prevent the long-term shape from coexisting with the other
+Sec 7.1.b pins in a single CREATE TABLE statement:
+
+1. **Single-column PK incompatible with partition key.** A
+   unique constraint on a partitioned PostgreSQL table MUST
+   include every partition-key column. `PARTITION BY LIST
+   (metric_kind)` therefore forces the PK to become
+   `(sample_id, metric_kind)` rather than `(sample_id)` alone.
+2. **FK target shape contradicts (1).** The
+   `metric_retraction.sample_id REFERENCES metric_sample
+   (sample_id)` FK and the architecture-mandated `metric_sample
+   _active.sample_id` reference both target `sample_id` alone.
+   A partitioned `metric_sample` cannot expose `sample_id`
+   alone as a UNIQUE constraint, so the single-column FK
+   shape cannot resolve.
+3. **GENERATED column cannot be a partition key in PG 16.**
+   The sub-partition scheme on `sample_date_bucket` as a
+   STORED GENERATED column is not directly implementable in
+   PG 16 -- the partition key must be an ordinary writer-
+   supplied column or a separate expression.
+
+These constraints are PostgreSQL DDL realities, not policy
+choices. Stage 1.3 accordingly creates `metric_sample`
+unpartitioned, with `sample_date_bucket` present as a STORED
+GENERATED column so the deferred operational partition
+migration has its monthly key available from day one. The
+deferred migration is a rewrite-cost transition (NOT a
+metadata-only one) and will likely also change the
+sub-partition key shape (e.g. to a writer-supplied
+`sample_date_bucket` rather than a GENERATED one) to work
+within (3); operator expectations are documented here so
+the rewrite is not a surprise. Identity / immutability /
+active-row semantics are independently enforced at the row +
+side-relation layer in the 0002 migration and are unaffected
+by the partitioning deferral.
+
+**Nullable-value pin (Stage 1.3).** The `metric_sample.value`
+column is **nullable** at the type level, with a row-level
+`metric_sample_value_present_unless_degraded` CHECK that
+enforces `value IS NOT NULL OR degraded = true`. This matches:
+
+1. **The system-tier fail-safe contract** at architecture
+   Sec 3.10 step 4 lines 637-657 and tech-spec Sec 4.2 lines
+   325-339: the Cross-Repo Aggregator **never silently drops**
+   a system-tier row when its upstream inputs are missing;
+   instead it writes the row with `degraded=true,
+   degraded_reason='samples_pending' | 'xrepo_edges_unavailable'`
+   so downstream `eval.gate` and Insights can surface the
+   freshness state.
+2. **Implementation-plan Stage 7.2 (lines 23, 674, 683):**
+   "the `value` column carries a best-effort partial
+   computation or `NULL` (NULL is allowed in the
+   `metric_sample.value` column when `degraded=true`); the
+   `samples_pending` counter still increments for
+   observability." Stage 7.2 cannot ship a NULL value against
+   a column-level `NOT NULL` declaration, so the schema must
+   permit the NULL up front.
+3. **Architecture Sec 5.2.1 line 900** types `value` as
+   `double` without an explicit `NOT NULL` assertion -- the
+   row-level CHECK is the canonical place to bind the
+   nullability to `degraded`.
+
+Foundation-tier (`source='computed'`) and ingested-tier
+(`source='ingested'`) rows always carry `degraded=false` per
+architecture Sec 5.2.1 line 903 and therefore always supply a
+non-null value; the CHECK rejects accidental writes of
+`degraded=false, value=NULL` so the happy path is fully
+guarded. The Audit replay path is unaffected because the
+field is insert-only per G3: once a row lands with
+`value=NULL`, that NULL is the permanent record of the
+degraded condition at that SHA.
+
+
 
 **Transactional pattern (Metric Ingestor, single writer per
 C5):**
@@ -1263,17 +1379,25 @@ REVOKE UPDATE, DELETE ON clean_code.evaluation_run, clean_code.evaluation_verdic
 
 **Partitioning conventions** (Sec 8.1.4):
 
-The `metric_sample` partitioning shape is pinned alongside the
-table CREATE in the active-row block above: `PARTITION BY LIST
-(metric_kind)` with monthly sub-partitions keyed on
-`sample_date_bucket`. The active-pointer table
-(`metric_sample_active`) is **not** partitioned -- it is the
-hot read path for SHA-pinned reads and benefits from the single
-B-tree on its primary key. Retention on `metric_sample` is
-partition-drop only (Sec 8.1.4); when a `metric_sample`
-partition is dropped, the corresponding `metric_sample_active`
-rows are dropped via FK cascade enforced at the application
-layer (the Metric Ingestor sweep, Sec 8.2 `periodic_sweep_cadence`).
+The `metric_sample` partitioning shape pinned in Sec 8.1.4 --
+`PARTITION BY LIST (metric_kind)` with monthly sub-partitions
+keyed on `sample_date_bucket` -- is the long-term operational
+target. Stage 1.3 ships `metric_sample` **unpartitioned** per
+the **partitioning-deferral pin** above: three PG 16 DDL
+constraints (single-column PK vs partition key, single-column
+FK target shape, GENERATED column as partition key) prevent the
+long-term shape from coexisting with the other Sec 7.1.b pins
+in a single CREATE TABLE. `sample_date_bucket` IS materialised
+in Stage 1.3 as a STORED GENERATED column so the deferred
+partition migration has its monthly key available from day
+one. The active-pointer table (`metric_sample_active`) is
+**not** partitioned -- it is the hot read path for SHA-pinned
+reads and benefits from the single B-tree on its primary key.
+Retention on `metric_sample` is partition-drop only post-
+deferral (Sec 8.1.4); when a `metric_sample` partition is
+dropped, the corresponding `metric_sample_active` rows are
+dropped via FK cascade enforced at the application layer (the
+Metric Ingestor sweep, Sec 8.2 `periodic_sweep_cadence`).
 
 **Enum types.** `degraded_reason` (C21; populates both
 `MetricSample.degraded_reason` and `EvaluationVerdict
@@ -1609,7 +1733,7 @@ you only read one section of this doc, read this one.
 |---|----------|-----|--------|
 | 1 | Storage engine | PostgreSQL 16+ | Sec 8.1.1 |
 | 2 | Schema isolation | dedicated `clean_code` schema | Sec 8.1.3 |
-| 3 | `MetricSample` partitioning | `(metric_kind, month)` | Sec 8.1.4 |
+| 3 | `MetricSample` partitioning | `(metric_kind, month)` long-term; **Stage 1.3 ships unpartitioned with `sample_date_bucket` materialised**; full PARTITION BY deferred per Sec 7.1.b partitioning-deferral pin | Sec 7.1.b, Sec 8.1.4 |
 | 4 | Active-row uniqueness | separate `metric_sample_active` pointer table with PK on the identity quintuple; `MetricSample` immutable | C1, C2, Sec 8.7 |
 | 5 | Metric / audit append-only | no `UPDATE` / `DELETE` grants on `MetricSample`; `UPDATE` only on `metric_sample_active` pointer | C2, C25, Sec 8.7 |
 | 6 | `scan_timeout` | 30 min | Sec 8.2 |

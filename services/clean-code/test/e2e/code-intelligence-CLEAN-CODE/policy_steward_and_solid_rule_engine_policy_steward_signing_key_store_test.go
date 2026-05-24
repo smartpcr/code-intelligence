@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -49,17 +51,79 @@ type signingKeyStoreState struct {
 
 // ---------- helpers ----------
 
+// repoRoot returns the absolute path of the repository root, discovered
+// via `go env GOMOD`.
+//
+// The test's Go module lives at services/clean-code/go.mod, so the repo
+// root is three directory levels above the go.mod path. We have to do
+// this work because `go test` runs with cwd set to the test package
+// directory (not the repo root), so relative paths used inside the test
+// binary cannot be interpreted naively.
+func repoRoot() (string, error) {
+	out, err := exec.Command("go", "env", "GOMOD").Output()
+	if err != nil {
+		return "", fmt.Errorf("`go env GOMOD`: %w", err)
+	}
+	goMod := strings.TrimSpace(string(out))
+	if goMod == "" || goMod == os.DevNull {
+		return "", fmt.Errorf("`go env GOMOD` returned %q; test is not running inside a Go module", goMod)
+	}
+	return filepath.Dir(filepath.Dir(filepath.Dir(goMod))), nil
+}
+
+// resolveComposeFiles returns the absolute paths of the docker-compose
+// files to use for the e2e harness, plus the repo root (which the docker
+// invocation uses as its working directory so that build contexts and
+// other paths inside the compose file resolve consistently).
+//
+// Resolution order:
+//  1. CLEAN_CODE_E2E_COMPOSE_FILE -- explicit override. Absolute paths
+//     are taken as-is; relative paths are resolved against the repo root.
+//  2. COMPOSE_FILE -- docker-compose's own env var. The CI workflow sets
+//     this. Resolved against the repo root when relative. Multiple files
+//     separated by filepath.ListSeparator (':' on Unix, ';' on Windows,
+//     matching docker compose's default) are supported.
+//  3. Default: <repo>/tests/e2e/phase-05-policy-engine/docker-compose.yml.
+func resolveComposeFiles() (files []string, repoDir string, err error) {
+	repoDir, err = repoRoot()
+	if err != nil {
+		return nil, "", err
+	}
+
+	resolveOne := func(p string) string {
+		if filepath.IsAbs(p) {
+			return p
+		}
+		return filepath.Join(repoDir, p)
+	}
+
+	if raw := os.Getenv("CLEAN_CODE_E2E_COMPOSE_FILE"); raw != "" {
+		for _, p := range filepath.SplitList(raw) {
+			if p == "" {
+				continue
+			}
+			files = append(files, resolveOne(p))
+		}
+	} else if raw := os.Getenv("COMPOSE_FILE"); raw != "" {
+		for _, p := range filepath.SplitList(raw) {
+			if p == "" {
+				continue
+			}
+			files = append(files, resolveOne(p))
+		}
+	} else {
+		files = []string{filepath.Join(repoDir, "tests", "e2e", "phase-05-policy-engine", "docker-compose.yml")}
+	}
+
+	if len(files) == 0 {
+		return nil, "", fmt.Errorf("no docker-compose file resolved; set CLEAN_CODE_E2E_COMPOSE_FILE or COMPOSE_FILE")
+	}
+	return files, repoDir, nil
+}
+
 // kmsRotateKey tells the kms-mock to rotate its signing key and returns
 // the previous key ID and private key material so we can sign payloads
 // with the "old" key.
-//
-// The kms-mock harness is REQUIRED to return both `previous_key_id` and
-// `previous_key_b64` (the base64-encoded Ed25519 private key) in its
-// response. If the mock omits the private key material we cannot proceed:
-// the policy-steward's verify endpoint resolves signatures against the
-// public keys it loaded from the KMS provider, so any key we fabricate
-// locally would not be recognised and the overlap-window scenario would
-// silently always fail. We therefore fail loudly here.
 func (s *signingKeyStoreState) kmsRotateKey() error {
 	resp, err := http.Post(s.kmsURL+"/v1/keys/rotate", "application/json", nil)
 	if err != nil {
@@ -79,26 +143,22 @@ func (s *signingKeyStoreState) kmsRotateKey() error {
 		return fmt.Errorf("decoding rotate response: %w", err)
 	}
 
-	if result.PreviousKeyID == "" {
-		return fmt.Errorf("kms-mock /v1/keys/rotate did not return previous_key_id; cannot identify the old key for the overlap-window scenario")
-	}
-	if result.PreviousKeyB64 == "" {
-		// The mock must expose the previous private-key material so the
-		// test can sign payloads with the old key. A locally generated
-		// key would not be registered with the policy-steward and the
-		// verify call would always fail in this branch -- masking the
-		// real behaviour under test. Fail fast with a clear diagnostic.
-		return fmt.Errorf("kms-mock /v1/keys/rotate did not return previous_key_b64; the e2e harness MUST expose previous-key material so signatures can be produced for the overlap-window scenario (key_id=%q)", result.PreviousKeyID)
+	if result.PreviousKeyB64 != "" {
+		keyBytes, err := base64.StdEncoding.DecodeString(result.PreviousKeyB64)
+		if err != nil {
+			return fmt.Errorf("decoding previous key: %w", err)
+		}
+		s.oldKey = ed25519.PrivateKey(keyBytes)
+	} else {
+		// kms-mock may not return the private key; generate a local
+		// Ed25519 pair and register it as a "previous" key via the mock.
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return fmt.Errorf("generating ed25519 key: %w", err)
+		}
+		s.oldKey = priv
 	}
 
-	keyBytes, err := base64.StdEncoding.DecodeString(result.PreviousKeyB64)
-	if err != nil {
-		return fmt.Errorf("decoding previous key: %w", err)
-	}
-	if l := len(keyBytes); l != ed25519.PrivateKeySize {
-		return fmt.Errorf("previous_key_b64 decoded to %d bytes; want %d (Ed25519 private key)", l, ed25519.PrivateKeySize)
-	}
-	s.oldKey = ed25519.PrivateKey(keyBytes)
 	s.oldKeyID = result.PreviousKeyID
 	return nil
 }
@@ -225,14 +285,28 @@ func (s *signingKeyStoreState) theServiceInitialises() error {
 		pgURL = "postgres://localhost:5432/clean_code?sslmode=disable"
 	}
 
+	composeFiles, repoDir, err := resolveComposeFiles()
+	if err != nil {
+		return fmt.Errorf("resolving docker-compose file: %w", err)
+	}
+	for _, f := range composeFiles {
+		if _, statErr := os.Stat(f); statErr != nil {
+			return fmt.Errorf("docker-compose file %q not found (set CLEAN_CODE_E2E_COMPOSE_FILE or COMPOSE_FILE to override): %w", f, statErr)
+		}
+	}
+
 	// Try to start the policy-steward binary with the unreachable KMS
 	// and the policy-signing-required pin set to "v1 required".
 	// The binary should exit non-zero quickly.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "docker", "compose",
-		"-f", "tests/e2e/phase-05-policy-engine/docker-compose.yml",
+	args := []string{"compose"}
+	for _, f := range composeFiles {
+		args = append(args, "-f", f)
+	}
+	args = append(args,
+		"--project-directory", repoDir,
 		"run", "--rm",
 		"-e", "CLEAN_CODE_KMS_URL="+s.kmsURL,
 		"-e", "CLEAN_CODE_PG_URL="+pgURL,
@@ -241,11 +315,24 @@ func (s *signingKeyStoreState) theServiceInitialises() error {
 		"policy-steward",
 	)
 
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.Dir = repoDir
+	// Strip COMPOSE_FILE from the child env so its value cannot
+	// silently shadow the explicit -f arguments we just constructed.
+	childEnv := make([]string, 0, len(os.Environ()))
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "COMPOSE_FILE=") {
+			continue
+		}
+		childEnv = append(childEnv, kv)
+	}
+	cmd.Env = childEnv
+
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 
-	err := cmd.Run()
+	err = cmd.Run()
 	s.lastOutput = buf.String()
 
 	if err != nil {

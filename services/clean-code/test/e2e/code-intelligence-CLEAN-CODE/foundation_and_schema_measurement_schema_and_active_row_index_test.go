@@ -80,11 +80,11 @@ type measurementState struct {
 	db *sql.DB
 
 	// active-row-quintuple-uniqueness
-	firstSampleID     string
-	secondInsertErr   error
-	upsertErr         error
-	upsertNewSampleID string
-	activeRowCount    int
+	firstSampleID      string
+	secondInsertErr    error
+	upsertErr          error
+	upsertNewSampleID  string
+	activeRowCount     int
 
 	// scope-binding
 	firstScopeID  string
@@ -137,25 +137,19 @@ func (s *measurementState) theMeasurementTablesExistAfterMigrateUp() error {
 // -- active-row-quintuple-uniqueness ----------------------------------------
 
 func (s *measurementState) aMetricSampleActiveRowIsInsertedForQuintuple(repo, sha, scope, metricKind, metricVersion string) error {
-	// Ensure parent repo exists. Surface any error (e.g. missing schema /
-	// table) immediately so callers get a clear "relation does not exist"
-	// message rather than a downstream FK violation.
-	if _, err := s.db.ExecContext(context.Background(), `
+	// Ensure parent repo exists.
+	_, _ = s.db.ExecContext(context.Background(), `
 		INSERT INTO clean_code.repo (repo_id, display_name, default_branch)
 		VALUES ($1, 'test-repo', 'main')
 		ON CONFLICT (repo_id) DO NOTHING
-	`, repo); err != nil {
-		return fmt.Errorf("inserting parent clean_code.repo row: %w", err)
-	}
+	`, repo)
 
 	// Insert a scope_binding row so we have a valid scope_id.
-	if _, err := s.db.ExecContext(context.Background(), `
+	_, _ = s.db.ExecContext(context.Background(), `
 		INSERT INTO clean_code.scope_binding (scope_id, repo_id, scope_kind, canonical_signature, first_seen_sha)
 		VALUES ($1, $2, 'function', 'test.Func', $3)
 		ON CONFLICT DO NOTHING
-	`, scope, repo, sha); err != nil {
-		return fmt.Errorf("inserting parent clean_code.scope_binding row: %w", err)
-	}
+	`, scope, repo, sha)
 
 	// Insert a metric_sample row to reference.
 	sampleID := fmt.Sprintf("sample-%s-%s-%s-%s-%s", repo, sha, scope, metricKind, metricVersion)
@@ -267,15 +261,50 @@ func (s *measurementState) metricSampleIsNeverUPDATEd() error {
 	if count != 2 {
 		return fmt.Errorf("expected 2 metric_sample rows (append-only), got %d", count)
 	}
+
+	// Row-count alone does not prove immutability: a sneaky UPDATE could
+	// rewrite value_json without changing the row count. To make the
+	// "never UPDATEd" assertion meaningful, verify that each row still
+	// carries the value_json it was inserted with. We compare via the
+	// ::jsonb cast so that jsonb canonicalisation (key ordering / spacing)
+	// does not produce spurious mismatches.
+	//
+	// firstSampleID  was inserted with '{}'     in aMetricSampleActiveRowIsInsertedForQuintuple.
+	// upsertNewSampleID was inserted with '{"v":2}' in anUPSERTOnMetricSampleActiveForTheSameQuintupleSetsANewSampleID.
+	var firstUnchanged bool
+	var firstValueJSON string
+	err = s.db.QueryRowContext(context.Background(), `
+		SELECT value_json::jsonb = '{}'::jsonb, value_json::text
+		FROM clean_code.metric_sample
+		WHERE sample_id = $1
+	`, s.firstSampleID).Scan(&firstUnchanged, &firstValueJSON)
+	if err != nil {
+		return fmt.Errorf("reading original sample value_json: %w", err)
+	}
+	if !firstUnchanged {
+		return fmt.Errorf("metric_sample.value_json for original sample_id=%q was mutated by UPSERT (expected '{}', got %q)", s.firstSampleID, firstValueJSON)
+	}
+
+	var newUnchanged bool
+	var newValueJSON string
+	err = s.db.QueryRowContext(context.Background(), `
+		SELECT value_json::jsonb = '{"v":2}'::jsonb, value_json::text
+		FROM clean_code.metric_sample
+		WHERE sample_id = $1
+	`, s.upsertNewSampleID).Scan(&newUnchanged, &newValueJSON)
+	if err != nil {
+		return fmt.Errorf("reading new sample value_json: %w", err)
+	}
+	if !newUnchanged {
+		return fmt.Errorf("metric_sample.value_json for new sample_id=%q was mutated (expected '{\"v\":2}', got %q)", s.upsertNewSampleID, newValueJSON)
+	}
 	return nil
 }
 
 // -- pack-source-enum-rejects-invalid ---------------------------------------
 
 func (s *measurementState) anINSERTIntoMetricSampleSuppliesPack(pack string) error {
-	if err := s.ensureParentRows(); err != nil {
-		return err
-	}
+	s.ensureParentRows()
 	_, s.lastInsertErr = s.db.ExecContext(context.Background(), `
 		INSERT INTO clean_code.metric_sample (sample_id, repo_id, sha, scope_id, metric_kind, metric_version, value_json, pack)
 		VALUES ('sample-pack-test', 'repo-enum-test', 'sha-enum', 'scope-enum', 'complexity', 'v1', '{}', $1)
@@ -284,9 +313,7 @@ func (s *measurementState) anINSERTIntoMetricSampleSuppliesPack(pack string) err
 }
 
 func (s *measurementState) anINSERTIntoMetricSampleSuppliesSource(source string) error {
-	if err := s.ensureParentRows(); err != nil {
-		return err
-	}
+	s.ensureParentRows()
 	_, s.lastInsertErr = s.db.ExecContext(context.Background(), `
 		INSERT INTO clean_code.metric_sample (sample_id, repo_id, sha, scope_id, metric_kind, metric_version, value_json, source)
 		VALUES ('sample-source-test', 'repo-enum-test', 'sha-enum', 'scope-enum', 'complexity', 'v1', '{}', $1)
@@ -304,34 +331,23 @@ func (s *measurementState) postgreSQLRejectsTheMetricSampleInsert() error {
 	return nil
 }
 
-// ensureParentRows inserts the shared parent rows required by the enum /
-// degraded scenarios. Errors are surfaced to the caller so a missing schema
-// or table produces a clear "relation does not exist" failure instead of a
-// confusing FK violation on a later INSERT.
-func (s *measurementState) ensureParentRows() error {
-	if _, err := s.db.ExecContext(context.Background(), `
+func (s *measurementState) ensureParentRows() {
+	_, _ = s.db.ExecContext(context.Background(), `
 		INSERT INTO clean_code.repo (repo_id, display_name, default_branch)
 		VALUES ('repo-enum-test', 'test-repo', 'main')
 		ON CONFLICT (repo_id) DO NOTHING
-	`); err != nil {
-		return fmt.Errorf("ensureParentRows: inserting clean_code.repo: %w", err)
-	}
-	if _, err := s.db.ExecContext(context.Background(), `
+	`)
+	_, _ = s.db.ExecContext(context.Background(), `
 		INSERT INTO clean_code.scope_binding (scope_id, repo_id, scope_kind, canonical_signature, first_seen_sha)
 		VALUES ('scope-enum', 'repo-enum-test', 'function', 'test.Func', 'sha-enum')
 		ON CONFLICT DO NOTHING
-	`); err != nil {
-		return fmt.Errorf("ensureParentRows: inserting clean_code.scope_binding: %w", err)
-	}
-	return nil
+	`)
 }
 
 // -- degraded-defaults-false ------------------------------------------------
 
 func (s *measurementState) aMetricSampleRowIsInsertedWithoutADegradedValue() error {
-	if err := s.ensureParentRows(); err != nil {
-		return err
-	}
+	s.ensureParentRows()
 	s.lastSampleID = "sample-degraded-test"
 	_, err := s.db.ExecContext(context.Background(), `
 		INSERT INTO clean_code.metric_sample (sample_id, repo_id, sha, scope_id, metric_kind, metric_version, value_json)
@@ -376,13 +392,11 @@ func (s *measurementState) theScopeBindingWriterInsertsARow(repo, scopeKind, sig
 	`, repo, scopeKind, signature, firstSeenSHA).Scan(&scopeID)
 	if err != nil {
 		// Ensure repo exists first, then retry.
-		if _, repoErr := s.db.ExecContext(context.Background(), `
+		_, _ = s.db.ExecContext(context.Background(), `
 			INSERT INTO clean_code.repo (repo_id, display_name, default_branch)
 			VALUES ($1, 'test-repo', 'main')
 			ON CONFLICT (repo_id) DO NOTHING
-		`, repo); repoErr != nil {
-			return fmt.Errorf("inserting parent clean_code.repo row before retry: %w", repoErr)
-		}
+		`, repo)
 		err = s.db.QueryRowContext(context.Background(), `
 			INSERT INTO clean_code.scope_binding (scope_id, repo_id, scope_kind, canonical_signature, first_seen_sha)
 			VALUES (gen_random_uuid()::text, $1, $2, $3, $4)

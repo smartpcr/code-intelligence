@@ -132,8 +132,156 @@ different packages hit the same database:
 | ------------------------------------------------------ | ----------------------- |
 | `internal/storage/migrate_test.go::TestRoundTrip_...`  | `clean_code` (canonical migration) |
 | `internal/policy/keys/sql_store_test.go::TestSQLStore_...` | `clean_code_keys_test` (isolated) |
+| `internal/policy/steward/sql_store_test.go::TestSQLStore_...` | `clean_code_steward_test` (isolated) |
 
 The storage round-trip `DROP SCHEMA clean_code CASCADE`s on prep,
-which is why the SQLStore live tests own a distinct schema. CI
-lanes that set `CLEAN_CODE_PG_URL` can run both packages in
+which is why both SQLStore live tests own distinct schemas. CI
+lanes that set `CLEAN_CODE_PG_URL` can run all three packages in
 parallel without interference.
+
+## Policy Steward write verbs (Stage 5.2)
+
+### What
+
+The Policy Steward owns the three canonical `policy.*` write
+verbs (tech-spec Sec 8.5 lines 963-970 + architecture Sec 6.5).
+All three are append-only -- no row is ever UPDATEd or DELETEd
+-- and all three require an active signing key in the
+[Stage 5.1 cache](#policy-steward-signing-key-cache-stage-5-1)
+before they will write.
+
+**Signing scope is narrow**: only `policy.publish` produces a
+signed row. The PolicyVersion table has a `signature bytea NOT
+NULL` column carrying an Ed25519 signature over the canonical
+JSON of `(rule_refs, threshold_refs, refactor_weights)`.
+`policy.activate` and `policy.publish_rulepack` REQUIRE that a
+signing key be loaded (so the service is in a state where
+signed writes work end-to-end) but do NOT write a signature
+column of their own -- the `policy_activation` and `rule_pack`
+/ `rule` tables have no signature column.
+
+| Verb                      | Writes signature? | Append-only? |
+| ------------------------- | ----------------- | ------------ |
+| `policy.publish`          | yes (`policy_version.signature`) | yes |
+| `policy.activate`         | no                | yes |
+| `policy.publish_rulepack` | no                | yes (pack + rules, transactionally) |
+
+### Write verbs
+
+| Verb                          | URL                                  | Status table |
+| ----------------------------- | ------------------------------------ | ------------ |
+| `policy.publish`              | `POST /v1/policy/publish`            | 200 / 400 / 405 / 500 / 503 |
+| `policy.activate`             | `POST /v1/policy/activate`           | 200 / 400 / 405 / 500 / 503 |
+| `policy.publish_rulepack`     | `POST /v1/policy/publish_rulepack`   | 200 / 400 / 405 / 409 / 500 / 503 |
+
+Banned historical-draft verbs return **501 Not Implemented**:
+
+- `POST /v1/policy/rulepack/add`     -> `{error:"unimplemented_verb", verb:"policy.rulepack.add"}`
+- `POST /v1/policy/rulepack/remove`  -> `{error:"unimplemented_verb", verb:"policy.rulepack.remove"}`
+- `POST /v1/policy/override`         -> `{error:"unimplemented_verb", verb:"policy.override"}`
+
+### `policy.publish` body
+
+```json
+{
+  "name": "default-v3",
+  "rule_refs": [{"rule_id": "solid.srp.lcom4_high", "version": 1}],
+  "threshold_refs": [],
+  "refactor_weights": {
+    "alpha": 0.4, "beta": 0.3, "gamma": 0.2, "delta": 0.1,
+    "effort_model_version": "v1.0",
+    "window_days": 90
+  }
+}
+```
+
+Response: the full `PolicyVersion` row including
+`policy_version_id`, `signature`, and `created_at`.
+
+**rule_refs / threshold_refs FK contract**: each `rule_refs`
+entry MUST reference an existing `(rule_id, version)` pair
+registered via a prior `policy.publish_rulepack` call. Each
+`threshold_refs` entry MUST reference an existing
+`threshold_id` row in `clean_code.threshold`. The migration
+keeps these references inside a JSONB document (not as proper
+SQL FKs) so the Policy Steward enforces them at write time --
+an unknown ref returns **400 Bad Request** with the offending
+`rule_id`/`version` (or `threshold_id`) in the body. The
+steward refuses BEFORE spending signing material, so a
+rejected request leaves no signature on the audit trail.
+Duplicate refs within the same payload also return 400.
+
+### `policy.activate` body
+
+```json
+{
+  "policy_version_id": "f4c1...-uuid",
+  "activated_by": "alice@example"
+}
+```
+
+The body MUST NOT contain a `scope` field -- v1 activation is
+global per deployment (architecture Sec 5.3.4 single-tenant
+pin). The HTTP handler decodes with `DisallowUnknownFields`, so
+a body carrying `scope` is rejected with 400 and a body that
+mentions `scope` in its error message; clients can self-correct
+without dashboard support.
+
+### `policy.publish_rulepack` body
+
+```json
+{
+  "pack_id": "solid.srp",
+  "version": 1,
+  "display_name": "Single Responsibility",
+  "description_md": "SOLID SRP rulepack.",
+  "rules": [
+    {
+      "rule_id": "solid.srp.lcom4_high",
+      "version": 1,
+      "predicate_dsl": "lcom4 > 0.7",
+      "severity_default": "block",
+      "description_md": "High LCOM4 -- methods share little state."
+    }
+  ]
+}
+```
+
+Response: `{rule_pack, rules}`. The pack + every rule row is
+appended in a **single transaction** -- a mid-batch failure
+rolls back both the pack and any earlier rules so an append-
+only store never carries a partial pack. A re-publish of the
+same `(pack_id, version)` returns 409 -- this is the append-
+only contract. None of the rows carry a signature column;
+`policy.publish_rulepack` is unsigned (only `policy.publish`
+signs).
+
+### Signing-key precondition
+
+All three verbs refuse when no signing key is active
+(`ErrNoActiveSigningKey` -> 503). The signing key must be
+wired via `CLEAN_CODE_KMS_PROVIDER=local` (or the in-memory
+provider for development). See "Policy Steward signing-key
+cache (Stage 5.1)" above.
+
+### Evaluator pickup
+
+A future `eval.gate` call resolves the active policy via the
+canonical lookup: read the latest `policy_activation` row,
+dereference its `policy_version_id`, verify the row's
+`signature`. The same path is exposed in code via
+`Steward.ActivePolicyVersion(ctx)` for integration tests.
+After `policy.activate(pvB)` runs, this query returns `pvB`
+even if `pvA` was activated first -- latest-row-wins by
+`created_at, activation_id DESC` (architecture Sec 5.3.4).
+
+### Storage backend
+
+When `CLEAN_CODE_PG_URL` is set, the steward writes rows to
+the canonical `clean_code.{policy_version, policy_activation,
+rule_pack, rule}` tables (migration 0003). Otherwise the
+composition root falls back to the in-memory store -- rows
+are lost on process restart. The development warning log line
+`policy steward backed by in-memory store` signals which mode
+is active.
+

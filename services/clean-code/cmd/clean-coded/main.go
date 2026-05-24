@@ -34,10 +34,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/config"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/health"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/logging"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/version"
+	"forge/services/clean-code/internal/config"
+	"forge/services/clean-code/internal/health"
+	"forge/services/clean-code/internal/logging"
+	"forge/services/clean-code/internal/version"
 )
 
 func main() {

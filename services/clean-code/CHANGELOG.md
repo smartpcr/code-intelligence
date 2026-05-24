@@ -4,6 +4,362 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 2.2 -- iter 4 follow-ups (evaluator feedback resolution)
+
+### Fixed
+
+- **`internal/ast/scope/identity.go`: doc comment on `var
+  Namespace` corrected.** Iter-3's comment said the namespace
+  was derived from `[uuid.NamespaceDNS]` while the code
+  correctly used `uuid.NamespaceURL`; evaluator iter-3 #1
+  flagged the mismatch because a future schema-bump reviewer
+  could trust the wrong word. Replaced with the accurate
+  `[uuid.NamespaceURL]` description plus an explicit
+  `(Iter 3's doc comment incorrectly named ...)` paragraph so
+  the prior-iter wrong claim is captured in the file's own
+  history. No code, namespace UUID, or test changed -- the
+  `TestNamespace_Pinned` literal still asserts
+  `5fa5937c-c012-5190-b7bd-0bd48f41de65` and still passes.
+- Grep-verified no `"DNS namespace"` prose remains in
+  `services/clean-code`; the only `NamespaceDNS` occurrences
+  are now (a) the new corrective paragraph in `identity.go`
+  and (b) the two `identity_test.go` doc lines that
+  intentionally call out `[uuid.NamespaceURL] vs
+  [uuid.NamespaceDNS]` as the kind of wrong-source edit the
+  golden test catches.
+
+## Stage 2.2 -- iter 3 follow-ups (evaluator feedback resolution)
+
+### Changed
+
+- **`storage.ScopeBindingWriter.insertFreshOn` now writes
+  `created_at` as an EXPLICIT column** (filled by the inline
+  `NOW()` SQL literal, not the DB DEFAULT). The brief lists
+  `created_at` as a writer-owned column; iter-1 / iter-2
+  silently relied on the table DEFAULT, leaving the column
+  value undocumented at the writer's call site. The change is:
+  - `scopeBindingInsertColumns` now lists 8 columns (was 7),
+    explicitly ending in `created_at`.
+  - `scopeBindingColumnCount` (the bound-PARAMETER count per
+    row) stays at 7; `NOW()` is a server-side SQL literal that
+    consumes no `$N` slot.
+  - `verifyRow` test helper SELECTs `created_at` and asserts
+    it is populated AND within a narrow wall-clock window
+    (catches column-shift bugs that would put e.g. the epoch
+    in this slot).
+  - New `TestScopeBindingWriter_CreatedAtPopulated` live PG
+    test pins the explicit emit + the G3 immutability
+    contract (a second observation does NOT mutate
+    `created_at`).
+  - The decision to use inline `NOW()` (rather than a
+    Go-side `time.Now()` parameter) is documented on
+    `scopeBindingInsertColumns`: the server's wall clock is
+    authoritative, saves one `$N` slot per row (matters for
+    the bound-parameter chunk-size budget), and keeps the
+    value observable in the INSERT's SQL text rather than
+    deferred to a DEFAULT clause an evaluator must
+    cross-reference. (Addresses evaluator iter-2 #1.)
+
+- **`internal/ast/scope/identity_test.go::TestNamespace_Pinned`
+  now compares against a LITERAL UUID string** (the new
+  `pinnedNamespaceUUID = "5fa5937c-c012-5190-b7bd-0bd48f41de65"`),
+  not a value recomputed from `scope.NamespaceURL` at test
+  time. Iter-2's `want := uuid.NewV5(uuid.NamespaceURL,
+  scope.NamespaceURL).String()` was tautological -- editing
+  `NamespaceURL` would update BOTH `scope.Namespace` and
+  `want` simultaneously and the assertion would still pass
+  even though every existing `scope_id` had silently drifted.
+  The literal pin makes namespace drift fail loudly. A
+  belt-and-braces re-derivation assertion catches the case
+  where the literal and the in-source inputs diverge (a
+  schema bump that needs operator review). (Addresses
+  evaluator iter-2 #2.)
+
+- **`storage.ScopeBindingWriter` lookup + insert paths now
+  CHUNK over PostgreSQL's 65535-parameter ceiling.** Iter-2
+  built one SQL statement per `Write()` call regardless of
+  batch size; the writer's own doc comments referenced
+  "single-repo scans of 10k scopes" as the worst-case
+  contention case, which at 7 params/row would have
+  overshot the ceiling at 9362 rows (and at 3 params/lookup
+  tuple, would have overshot at 21,845 keys). The change is:
+  - New `scopeBindingLookupChunkSize = 16384` (3 params/tuple
+    -> 49,152 params/statement) and
+    `scopeBindingInsertChunkSize = 8192` (7 params/row ->
+    57,344 params/statement). Both sit below the
+    65535-parameter ceiling with headroom for a future
+    column addition.
+  - `lookupExistingOn` now splits `keys` into chunks of
+    `scopeBindingLookupChunkSize` and merges results into a
+    single map; the caller does not see chunk boundaries.
+    The single-chunk helper is extracted as
+    `lookupExistingChunk` so the chunk loop is the only
+    place that owns the chunk-size policy.
+  - `insertFreshOn` now splits `rows` into chunks of
+    `scopeBindingInsertChunkSize` and runs INSERTs serially
+    on the supplied querier (so all statements share the
+    same session and the advisory lock the caller holds in
+    the locked-INSERT path). Sum of RETURNING counts across
+    chunks is returned. Single-chunk helper extracted as
+    `insertFreshChunk`.
+  - `insertFreshChunk` has a pre-flight
+    `len(rows) * scopeBindingColumnCount > pgMaxBindParameters`
+    guard so a future chunk-size raise that overshoots the
+    ceiling surfaces a precise pre-flight error rather than
+    a confusing driver-emitted "got N parameters, expected
+    at most 65535".
+  - Chunk-size vars are package-level `var` (not `const`) so
+    live tests can drop them to small values and exercise
+    multi-chunk fan-out without staging tens of thousands
+    of rows per test.
+  - New `TestScopeBindingWriter_ChunkingBoundary` live PG
+    test temporarily drops insert chunk size to 37 and
+    lookup chunk size to 29 (both PRIME so chunk boundaries
+    don't accidentally align), writes 300 distinct
+    candidates, and asserts: (a) every candidate's scope_id
+    matches `scope.DeriveScopeID` (no chunk-boundary
+    drift), (b) exactly 300 rows land, (c) a second Write
+    of the same candidates resolves entirely from the
+    multi-chunk LOOKUP path with zero new INSERTs.
+  - New `TestScopeBindingWriter_ChunkBoundaryParamCeilingGuard`
+    unit test (no live PG) hands `insertFreshChunk` 9363
+    rows directly and asserts the in-helper guard surfaces
+    the precise "exceeds PostgreSQL bound-parameter
+    ceiling" message. (Addresses evaluator iter-2 #3.)
+
+## Stage 2.2 -- iter 2 follow-ups (evaluator feedback resolution)
+
+### Changed
+
+- **`scope.BuildInterface` discriminator** -- emits `::class::`
+  (NOT `::interface::`) so the canonical signature is
+  BYTE-IDENTICAL to agent-memory's `classSignature` for the
+  same `(relPath, qualifiedName)`. agent-memory's
+  `services/agent-memory/internal/repoindexer/ast/dispatcher.go`
+  uses `classSignature` for "a Class / Interface node" without
+  distinguishing them at the signature layer; linked-mode
+  `agent_memory_node_id` resolution depends on this parity.
+  Class and interface are still independently distinguished by
+  the `scope_kind` discriminator, which is part of the
+  `scope_id` UUIDv5 pre-image -- so a class and an interface
+  with the same qualifiedName get the SAME `canonical_signature`
+  string but DIFFERENT `scope_id`s. (Reverses iter-1's
+  "self-consistent `::interface::`" decision; addresses
+  evaluator iter-1 #1.)
+
+- **`scope.BuildBlock` ordinal validation** -- the guard is now
+  `ordinal < 0` (was `ordinal <= 0`). Block ordinals are
+  0-based per agent-memory's `Block.Ordinal` doc ("0-based
+  position of this Block within its enclosing Method's Block
+  list") and `blockSignature` emits `#block_0_<kind>` for the
+  first block. Rejecting `0` would have broken parity for the
+  first emitted block of every method. (Addresses evaluator
+  iter-1 #2.)
+
+- **`storage.ScopeBindingWriter.Write` -- intra-batch dedupe
+  (G2 #3 fix)** -- candidates sharing
+  `(repo_id, scope_kind, canonical_signature)` are grouped
+  BEFORE deriving any `scope_id`. The FIRST occurrence in
+  input order wins: its CurrentSHA becomes the group's
+  `first_seen_sha`, its derived `scope_id` is broadcast to
+  every sibling slot, and only ONE row is INSERTed. Without
+  this fix two candidates with the same natural key but
+  different CurrentSHAs would derive DIFFERENT `scope_id`s
+  (first_seen_sha is part of the UUIDv5 pre-image) and both
+  land via the `(repo_id, scope_kind, canonical_signature,
+  first_seen_sha)` UNIQUE -- two rows for one logical scope.
+  Pinned by `TestScopeBindingWriter_BatchSameKeyDifferentSHAs`
+  (live PG). Sibling SHA divergences increment
+  `SHADivergences` for producer observability. (Addresses
+  evaluator iter-1 #3.)
+
+- **`storage.ScopeBindingWriter.Write` -- concurrent-writer
+  race (G2 #4 fix)** -- the fresh-INSERT path now runs inside
+  a transaction that holds a transaction-scoped
+  `pg_advisory_xact_lock(int4, int4)` per unique `repo_id` in
+  the batch (namespaced under int32 `0x434C4353` ("CLCS") so
+  the writer's lock space is isolated from any other component
+  sharing the PostgreSQL instance). The natural-key SELECT is
+  RE-RUN inside the lock so a racer that committed between the
+  unlocked fast-path SELECT and the lock acquisition is
+  observed and reused, NOT re-INSERTed. Lock keys are sorted
+  before acquisition (single `unnest`-driven SELECT round-trip)
+  so two writers with overlapping repo sets cannot deadlock.
+  Per-repo (NOT per-natural-key) granularity is exhaustion-
+  proof against `max_locks_per_transaction` at large batch
+  sizes -- a single-repo scan of 10k scopes acquires ONE lock.
+  Steady-state warm-read fast path: when the unlocked initial
+  SELECT finds every key, the writer returns WITHOUT opening a
+  transaction. Pinned by
+  `TestScopeBindingWriter_ConcurrentRaceDifferentSHAs` with
+  8 concurrent goroutines on a shared `*sql.DB` (live PG).
+  (Addresses evaluator iter-1 #4.)
+
+- **Helper refactor -- `lookupExistingOn` / `insertFreshOn`
+  take a `querier` interface** -- both helpers now accept
+  either `*sql.DB` (unlocked fast path) or `*sql.Tx` (locked
+  transaction body). The `*sql.Tx` is the load-bearing
+  argument for the race fix: a `*sql.DB`-based call inside a
+  locked transaction would borrow a different pooled
+  connection and the advisory lock (backend-local per session)
+  would be invisible to it, silently bypassing the fix.
+
+### Removed
+
+- `storage.ErrConflictingFirstSeenSHA` -- declared but never
+  returned. Producer-side SHA divergence is exposed via the
+  `ScopeBindingWriteResult.SHADivergences` counter; the
+  unreached error symbol was misleading. The natural-key
+  UNIQUE 23505 path now surfaces with a more accurate message
+  ("a bypass-the-writer write path landed first") because
+  with the advisory lock in place the only way to reach it is
+  for a producer outside this writer to INSERT.
+
+### Deferred
+
+- **Production wiring (evaluator iter-1 #5).** Implementation
+  plan line 183 calls for the writer to be wired behind the
+  Metric Ingestor. The Metric Ingestor itself is built in
+  Stage 3.2 (implementation-plan.md line 284 -- "Metric
+  Ingestor and ScanRun state machine"); the `internal/metric_ingestor/`
+  package does not exist in this stage's scope. Stage 3.2 will
+  call `storage.NewScopeBindingWriter` from the per-scan
+  ingest path. No production caller can be added within Stage
+  2.2 without speculatively scaffolding the Metric Ingestor
+  out of stage order.
+
+## Stage 2.2 -- Scope identity derivation and ScopeBinding writer
+
+### Added
+
+- **`internal/ast/scope/` package** -- owns the deterministic
+  identity and canonical-signature derivation for every
+  `scope_binding` row the service writes (architecture Sec
+  5.2.3 lines 1039-1050):
+  - `Kind` typed string + the closed seven-value enum
+    (`repo|package|file|class|interface|method|block`) with
+    `IsValid()` predicate matching the `clean_code.scope_kind`
+    PostgreSQL ENUM byte-for-byte (so a `Kind` value rides as
+    a `text` parameter cast to the enum server-side).
+  - `NormalizeSignature(s)` -- mirrors
+    `services/agent-memory/internal/repoindexer/ast/whitespace.go`
+    byte-for-byte (strip line+block comments, collapse Unicode
+    whitespace runs to a single ASCII space, strip space
+    adjacent to `,()[]{}<>:;`, trim) so a formatter-only commit
+    produces a byte-identical signature -- the architecture
+    §9.7 / §9.9 stability mitigation.
+  - Per-kind builders `BuildRepo`, `BuildPackage`, `BuildFile`,
+    `BuildClass`, `BuildInterface`, `BuildMethod`, `BuildBlock`
+    -- emit the canonical-signature strings using the same
+    recipe agent-memory uses for its `Node.canonical_signature`
+    so the cross-service `agent_memory_node_id` link is stable
+    when clean-code runs in `linked` mode. Paths (`dir`,
+    `relPath`) are NOT normalised; only `qualifiedName` and
+    joined `params` ride through the normaliser.
+  - `DeriveScopeID(repoID, kind, canonicalSignature, firstSeenSHA)`
+    -- deterministic UUIDv5 over `(repoID, kind, signature,
+    firstSeenSHA)` with NUL framing between fields, derived
+    under a pinned package-level `Namespace` UUID (itself a
+    UUIDv5 of `NamespaceURL` constant
+    `https://github.com/microsoft/code-intelligence/clean-code/scope#v1`).
+    SHA is NOT part of identity (G2): callers reuse the
+    persisted `first_seen_sha` across SHAs so the same
+    logical scope keeps the same `scope_id`. The
+    `TestNamespace_Pinned` golden test fails loudly if the
+    namespace ever drifts.
+  - Sentinel errors `ErrZeroRepoID`, `ErrInvalidKind`,
+    `ErrEmptyField`, `ErrEmbeddedNUL` for the validation
+    surface; NUL rejection is mandatory because NUL is the
+    framing delimiter in the DeriveScopeID pre-image.
+
+- **`internal/storage/scope_binding_writer.go`** --
+  `ScopeBindingWriter` performing batched, idempotent writes
+  into `<schema>.scope_binding`:
+  - `NewScopeBindingWriter(db)` / `NewScopeBindingWriterWithSchema(db, schema)`
+    constructor pair (matches the steward / keys SQLStore
+    convention; production reaches the former on the canonical
+    `clean_code` schema, tests reach the latter on the
+    isolated `clean_code_scope_test` schema).
+  - `Write(ctx, []ScopeBindingCandidate) -> ScopeBindingWriteResult`:
+    (1) validate every candidate (kind / signature / SHA /
+    NUL-byte / valid JSON guards) up-front so a bad input
+    cannot half-land; (2) SELECT existing rows by natural
+    key `(repo_id, scope_kind, canonical_signature)` so any
+    pre-existing `first_seen_sha` is reused (the LOAD-BEARING
+    G2 enforcement -- a buggy caller passing the current SHA
+    in place of the cached first_seen_sha does NOT mint a
+    second row); (3) derive `scope_id` via
+    `scope.DeriveScopeID` for every fresh candidate using
+    its `CurrentSHA` as first_seen_sha; (4) batched
+    `INSERT ... VALUES ... ON CONFLICT (scope_id) DO NOTHING
+    RETURNING scope_id` for the fresh set, with the
+    `scope_kind` placeholder cast to the schema-qualified
+    `<schema>.scope_kind` enum so the test schema and the
+    production schema both work.
+  - `ScopeBindingWriteResult` reports `Rows` (parallel to
+    input), `Inserted` (RETURNING count -- excludes
+    concurrent-writer races), `ReusedExisting` (natural-key
+    lookups that hit), and `SHADivergences` (informational
+    count of candidates whose `CurrentSHA` differed from the
+    persisted `first_seen_sha`; the writer always reuses the
+    persisted value).
+  - `pgSQLStateUniqueViolation = "23505"` mapped to a wrapped
+    error annotating the violated constraint so a concurrent
+    writer race (which can only happen when two pipelines
+    pass DIFFERENT `CurrentSHA`s for a brand-new tuple) is
+    distinguishable from a real bug.
+
+### Invariants pinned by tests
+
+- **G2 stability across SHAs.** A natural-key tuple first
+  observed at SHA A and observed again at SHA B resolves to
+  the SAME `scope_id` AND the persisted `first_seen_sha`
+  remains A. Pinned by `TestScopeBindingWriter_G2StableAcrossSHAs`
+  (live PG, skipped if `CLEAN_CODE_PG_URL` unset).
+- **Namespace UUID is locked.** Changing the
+  `NamespaceURL` constant (or the source namespace) would
+  silently drift every existing `scope_id`; the golden test
+  `TestNamespace_Pinned` re-derives the namespace from the
+  pinned URL and fails loudly on any mismatch.
+- **Closed-set scope_kind enum.** Adding a `scope_kind` value
+  requires also adding it to the PostgreSQL ENUM AND to the
+  architecture doc; the in-process `Kind.IsValid()` predicate
+  AND `TestKind_IsValid_ClosedSet` keep the three in lockstep.
+- **All seven kinds produce distinct scope_ids.** The same
+  `(repo_id, signature, first_seen_sha)` fed into every Kind
+  yields seven distinct UUIDs -- pinned by
+  `TestDeriveScopeID_AllKindsDistinct`.
+- **NUL bytes are reserved framing.** Every signature builder
+  AND `DeriveScopeID` itself rejects strings containing the
+  NUL byte with `ErrEmbeddedNUL`. Pinned by
+  `TestBuilders_RejectNUL` and `TestDeriveScopeID_Validation`.
+- **Idempotency.** Calling `Write` twice with the same batch
+  yields the same `Rows` on both calls and `Inserted=0` on the
+  second. Pinned by `TestScopeBindingWriter_Idempotent` (live PG).
+- **Duplicate batch entries collapse.** A batch containing the
+  same natural key twice produces ONE INSERT (both result rows
+  carry the same `scope_id`). Pinned by
+  `TestScopeBindingWriter_BatchWithDuplicates` (live PG).
+- **agent-memory canonical-signature parity.**
+  `TestNormalizeSignature_AgentMemoryParity` pins every example
+  from agent-memory's `whitespace.go` doc comment so a drift
+  surfaces immediately.
+
+### Changed
+
+- `go.mod`: module path corrected from `forge/services/clean-code`
+  back to `github.com/microsoft/code-intelligence/services/clean-code`.
+  Every existing internal package (`internal/policy/keys`,
+  `internal/policy/steward`, `internal/management`,
+  `internal/evaluator`, `cmd/clean-coded`, etc.) imports from
+  the `github.com/microsoft/...` path; the prior `forge/...`
+  rename in commit `30394c7` broke `go build` and every test
+  ran against a stale-cache binary. Fixing this was required
+  to land the Stage 2.2 changes (the new `internal/ast/scope`
+  package imports `gofrs/uuid` and is consumed by
+  `internal/storage`); without the fix nothing in the service
+  compiled.
+
 ## Stage 5.3 -- Override append-only mute lifecycle
 
 ### Added

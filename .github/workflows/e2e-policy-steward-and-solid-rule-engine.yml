@@ -15,8 +15,8 @@ env:
   COMPOSE_FILE: tests/e2e/phase-05-policy-engine/docker-compose.yml
 
 jobs:
-  e2e-policy-steward-signing-key-store:
-    name: "E2E – Policy Steward Signing Key Store"
+  e2e-policy-publish-activate-and-rulepack-verbs:
+    name: "E2E – Policy Publish Activate and Rulepack Verbs"
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -55,7 +55,7 @@ jobs:
         working-directory: services/clean-code
         run: |
           go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
-            -run TestE2E_policy_steward_and_solid_rule_engine_policy_steward_signing_key_store
+            -run TestE2E_policy_steward_and_solid_rule_engine_policy_publish_activate_and_rulepack_verbs
 
       - name: Tear down compose services
         if: always()

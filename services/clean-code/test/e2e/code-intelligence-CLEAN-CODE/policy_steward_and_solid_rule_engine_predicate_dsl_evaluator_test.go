@@ -16,6 +16,10 @@ import (
 	"github.com/cucumber/godog"
 )
 
+// defaultRuleEngineURL is the fallback base URL used when the
+// CLEAN_CODE_RULE_ENGINE_URL environment variable is not set.
+const defaultRuleEngineURL = "http://localhost:8083"
+
 // requireEnv returns the value of the named environment variable,
 // calling t.Skip when unset or empty.
 func requireEnv(t *testing.T, name string) string {
@@ -25,6 +29,17 @@ func requireEnv(t *testing.T, name string) string {
 		t.Skipf("environment variable %s is not set; skipping", name)
 	}
 	return v
+}
+
+// resolveRuleEngineURL returns the rule-engine base URL from the
+// CLEAN_CODE_RULE_ENGINE_URL environment variable, falling back to
+// defaultRuleEngineURL when unset. Centralising this resolution
+// ensures every scenario uses the same base URL.
+func resolveRuleEngineURL() string {
+	if v := os.Getenv("CLEAN_CODE_RULE_ENGINE_URL"); v != "" {
+		return v
+	}
+	return defaultRuleEngineURL
 }
 
 // ---------- shared types ----------
@@ -43,6 +58,15 @@ type predicateDSLState struct {
 	deterministicPredicate string
 	metricSample           map[string]interface{}
 	evalResults            []bool
+}
+
+// newPredicateDSLState constructs a predicateDSLState with the
+// rule-engine base URL pre-resolved, so individual step
+// implementations don't repeat the env lookup / fallback logic.
+func newPredicateDSLState() *predicateDSLState {
+	return &predicateDSLState{
+		ruleEngineURL: resolveRuleEngineURL(),
+	}
 }
 
 // ---------- helpers ----------
@@ -123,11 +147,6 @@ func (s *predicateDSLState) evalPredicate(predicate string, sample map[string]in
 // ---------- Scenario: dsl-rejects-unknown-metric-kind ----------
 
 func (s *predicateDSLState) aPredicateReferencingMetricKind(metricKind string) error {
-	s.ruleEngineURL = os.Getenv("CLEAN_CODE_RULE_ENGINE_URL")
-	if s.ruleEngineURL == "" {
-		s.ruleEngineURL = "http://localhost:8083"
-	}
-
 	// Build a predicate expression that references the given (invalid) metric_kind.
 	s.predicateExpr = fmt.Sprintf("metric_kind == '%s' && value > 100", metricKind)
 	return nil
@@ -173,11 +192,6 @@ func (s *predicateDSLState) itReturnsAValidationErrorNamingTheUnknownMetricKind(
 // ---------- Scenario: dsl-deterministic ----------
 
 func (s *predicateDSLState) theSamePredicateAndTheSameMetricSampleInput() error {
-	s.ruleEngineURL = os.Getenv("CLEAN_CODE_RULE_ENGINE_URL")
-	if s.ruleEngineURL == "" {
-		s.ruleEngineURL = "http://localhost:8083"
-	}
-
 	// Use a well-known canonical predicate and sample.
 	s.deterministicPredicate = "metric_kind == 'cyclomatic_complexity' && value > 10"
 	s.metricSample = map[string]interface{}{
@@ -214,7 +228,7 @@ func (s *predicateDSLState) itReturnsTheSameBooleanResult() error {
 // ---------- Godog wiring ----------
 
 func InitializeScenario_policy_steward_and_solid_rule_engine_predicate_dsl_evaluator(ctx *godog.ScenarioContext) {
-	s := &predicateDSLState{}
+	s := newPredicateDSLState()
 
 	// dsl-rejects-unknown-metric-kind
 	ctx.Step(`^a predicate referencing metric_kind "([^"]*)"$`, s.aPredicateReferencingMetricKind)

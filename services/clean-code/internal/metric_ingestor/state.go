@@ -1006,8 +1006,13 @@ func (sm *StateMachine) ProcessOne(ctx context.Context) (ProcessOneResult, error
 			// specifically. A ClaimSpecific that returns
 			// (zero, false, nil) means the row raced to
 			// another worker between the peek and the
-			// claim; we treat that as DidWork=false and
-			// let the next ProcessOne tick re-peek.
+			// claim; `continue` to the next peeked
+			// candidate so a single race doesn't cost the
+			// whole cadence cycle in Phase 3.5 multi-worker
+			// fan-out. If every remaining candidate also
+			// races or is not-ready, the loop falls through
+			// to the "no ready source in fanout" result
+			// below with DidWork=false.
 			claim, didClaim, err := sm.store.ClaimSpecificPendingCommit(ctx, cand.RepoID, cand.SHA, claimReq)
 			if err != nil {
 				return ProcessOneResult{}, fmt.Errorf("metric_ingestor: claim specific pending commit (%s @ %s): %w", cand.RepoID, cand.SHA, err)
@@ -1021,7 +1026,7 @@ func (sm *StateMachine) ProcessOne(ctx context.Context) (ProcessOneResult, error
 						"index", i,
 					)
 				}
-				return ProcessOneResult{DidWork: false}, nil
+				continue
 			}
 			return sm.runAndFinalize(ctx, claim)
 		}

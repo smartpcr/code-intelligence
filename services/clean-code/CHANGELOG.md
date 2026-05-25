@@ -4,6 +4,73 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 3.3 -- Active row uniqueness enforcement
+
+### Added
+
+- **`internal/metric_ingestor/pg_metric_sample_writer.go`** --
+  `PGMetricSampleWriter.WriteBatch` now UPSERTs the
+  `metric_sample_active` pointer row immediately after each
+  `metric_sample` INSERT, inside the SAME transaction. The
+  UPSERT shape is the canonical
+  `INSERT INTO clean_code.metric_sample_active (repo_id, sha,
+   scope_id, metric_kind, metric_version, sample_id) VALUES
+   (...) ON CONFLICT (repo_id, sha, scope_id, metric_kind,
+   metric_version) DO UPDATE SET sample_id = EXCLUDED.sample_id`
+  (tech-spec Sec 7.1.b lines 1070-1119 / architecture Sec
+  5.2.1 G2 lines 991-1003 / Sec 10A pin lines 1659-1675). No
+  procedural `swap_active` verb, trigger, or stored function
+  is used (implementation-plan Stage 3.3 iter 1 evaluator
+  item 1). The PRIMARY KEY on the quintuple
+  `(repo_id, sha, scope_id, metric_kind, metric_version)` is
+  the unique B-tree that enforces "at most one active row
+  per quintuple".
+- **`internal/metric_ingestor/pg_metric_sample_writer.go`** --
+  writer-side defensive sort: records are sorted by the
+  active-row quintuple (plus `sample_id` as stable
+  tiebreaker) before the INSERT and UPSERT passes. The sort
+  is performed on a defensive copy so the caller's slice is
+  not mutated. This pins a deterministic per-tx lock
+  acquisition order on `metric_sample_active`, eliminating
+  the cross-batch deadlock that would otherwise be possible
+  between two concurrent `WriteBatch` calls overlapping on
+  multiple quintuples.
+- **`internal/metric_ingestor/active_row_test.go`** -- new
+  test file pinning the Stage 3.3 SQL trace and contracts:
+  first-write inserts the pointer; re-ingest at the same
+  SHA re-points via the UPSERT's `ON CONFLICT DO UPDATE`
+  branch with NO `UPDATE`/`DELETE` against `metric_sample`
+  (G3 / C2); re-ingest after retraction succeeds with the
+  same SQL shape (retraction filtering is a read-time
+  concern); UPSERT failure rolls back the preceding
+  `metric_sample` INSERT (atomic-batch); deterministic lock
+  order is enforced even when records are submitted in
+  reverse-canonical order.
+- **`internal/metric_ingestor/pg_metric_sample_writer_test.go`** --
+  existing tests (HappyPath, MultiRowIsOneTx) updated to
+  expect the additional `INSERT INTO ... metric_sample_active
+  ... ON CONFLICT ... DO UPDATE` prepared statement plus its
+  per-record EXECs inside the same transaction.
+
+### Notes
+
+- Retraction (Stage 3.4) appends a `metric_retraction(sample_id)`
+  row and LEAVES the `metric_sample_active` pointer in place
+  (`DELETE` is REVOKEd on `metric_sample_active` from BOTH
+  writer roles per tech-spec Sec 7.2 / migration
+  `0004_roles.up.sql:415`). Readers (Insights, Evaluator,
+  Refactor Planner) filter retracted samples by joining
+  through `metric_retraction` (architecture Sec 5.2.2 lines
+  1035-1037). The writer in this stage never reads
+  `metric_retraction`; on a subsequent rescan at the same
+  SHA, the writer's UPSERT re-points the pointer to the new
+  sample and the prior retracted `metric_sample` row stays
+  as a tombstone per G3.
+- `metric_sample` is never UPDATEd or DELETEd by this
+  writer; the only modification it issues against the
+  Measurement sub-store is the side-relation UPSERT on
+  `metric_sample_active`.
+
 ## Stage 3.2 -- Metric Ingestor and ScanRun state machine
 
 ### Added (iters 1-11, cumulative summary)

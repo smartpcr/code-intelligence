@@ -1,11 +1,13 @@
 package metric_ingestor
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/gofrs/uuid"
@@ -16,6 +18,18 @@ import (
 // table name the writer targets. Schema-qualified at
 // statement-build time via [pq.QuoteIdentifier].
 const pgMetricSampleTable = "metric_sample"
+
+// pgMetricSampleActiveTable is the unqualified
+// `metric_sample_active` side relation the writer UPSERTs to
+// after each `metric_sample` INSERT. The composite FK
+// `metric_sample_active_sample_consistent_fk` (migration
+// `0002_measurement.up.sql:525-529`) pins the active-row
+// pointer's denormalized quintuple to the referenced sample's
+// own columns, so the UPSERT MUST land in the SAME transaction
+// AFTER the INSERT that creates the target row -- the FK is
+// immediate (not DEFERRABLE) and a UPSERT-before-INSERT order
+// would fail with foreign_key_violation.
+const pgMetricSampleActiveTable = "metric_sample_active"
 
 // pgScanRunTableForGuard is the unqualified table name the
 // per-batch producer-status guard SELECT targets. Pinned as
@@ -117,15 +131,61 @@ var ErrPGMetricSampleWriterUnknownProducerRunID = errors.New("metric_ingestor: P
 // shape (a NaN would technically satisfy "NOT NULL" but
 // would poison downstream aggregations).
 //
-// # Active-row UPSERT is NOT in this writer
+// # Active-row UPSERT (Stage 3.3 -- this writer)
 //
-// The `metric_sample_active` pointer relation (migration
-// line 506) is updated by a separate writer (Phase 3.3,
-// `stage-active-row-and-retraction-writer`). This writer
-// is the SAMPLE-side INSERT only. Conflating the two
-// would couple foundation-tier persistence to the
-// pointer-relation transaction lifecycle, which the
-// architecture explicitly separates.
+// After each `metric_sample` INSERT, WriteBatch UPSERTs the
+// matching `metric_sample_active` pointer row inside the
+// SAME transaction. The UPSERT shape is:
+//
+//	INSERT INTO clean_code.metric_sample_active
+//	    (repo_id, sha, scope_id, metric_kind, metric_version, sample_id)
+//	VALUES (...)
+//	ON CONFLICT (repo_id, sha, scope_id, metric_kind, metric_version)
+//	DO UPDATE SET sample_id = EXCLUDED.sample_id
+//
+// The `metric_sample_active` table's PRIMARY KEY on the
+// quintuple (migration `0002_measurement.up.sql:519`) carries
+// the architecture-mandated "at most one active row per
+// quintuple" invariant (architecture Sec 5.2.1 G2 lines
+// 991-1003 / tech-spec Sec 7.1.b lines 1070-1119 / Sec 10A pin
+// lines 1659-1675). The UPSERT is the ONLY canonical write
+// shape -- no procedural `swap_active` verb / trigger /
+// stored function exists in the canonical model (iter 1
+// evaluator item 1).
+//
+// Re-ingest semantics (tech-spec Sec 7.1.b):
+//
+//   - First write at a given quintuple INSERTs the pointer
+//     row pointing at the new sample_id (ON CONFLICT path
+//     not taken).
+//   - Re-ingest at the same quintuple either no-ops at the
+//     application layer (idempotent computation skips
+//     WriteBatch entirely) OR appends a NEW `metric_sample`
+//     row and the UPSERT's ON CONFLICT branch re-points
+//     `metric_sample_active.sample_id` to the new sample.
+//     The PRIOR `metric_sample` row stays in the table
+//     forever per G3 / C2 (no UPDATE / no DELETE on
+//     `metric_sample`).
+//
+// Retraction semantics (Stage 3.4 owns the verb, but this
+// writer's contract is pinned here for clarity): the
+// retraction verb appends a `metric_retraction(sample_id)`
+// row and LEAVES the `metric_sample_active` pointer row in
+// place (tech-spec REVOKEs `DELETE` on
+// `clean_code.metric_sample_active` from BOTH writer roles
+// at `0004_roles.up.sql:415` -- the pointer is never
+// removed). Readers filter retracted samples by joining
+// through `metric_retraction` per architecture Sec 5.2.2
+// lines 1035-1037. On a subsequent rescan at the same SHA,
+// this writer's UPSERT re-points the pointer to the new
+// `sample_id`; the prior retracted `metric_sample` row
+// stays as a tombstone per G3.
+//
+// Atomicity: INSERT into `metric_sample` and UPSERT into
+// `metric_sample_active` share ONE transaction per
+// WriteBatch call. A failure on the UPSERT rolls back the
+// preceding INSERT(s) so the active-row index is never left
+// in a half-state.
 //
 // # Post-finalize write fence (Stage 3.2 iter 17, scope
 // clarified iter 18)
@@ -195,6 +255,13 @@ func (w *PGMetricSampleWriter) qualifyMetricSample() string {
 	return pq.QuoteIdentifier(w.schema) + "." + pq.QuoteIdentifier(pgMetricSampleTable)
 }
 
+// qualifyMetricSampleActive returns
+// `"<schema>"."metric_sample_active"` for the active-row
+// UPSERT statement.
+func (w *PGMetricSampleWriter) qualifyMetricSampleActive() string {
+	return pq.QuoteIdentifier(w.schema) + "." + pq.QuoteIdentifier(pgMetricSampleActiveTable)
+}
+
 // qualifyScanRunForGuard returns `"<schema>"."scan_run"` for
 // the per-batch post-finalize guard SELECT.
 func (w *PGMetricSampleWriter) qualifyScanRunForGuard() string {
@@ -206,6 +273,20 @@ func (w *PGMetricSampleWriter) qualifyScanRunForGuard() string {
 // error the whole transaction rolls back (atomic-batch
 // semantics).
 //
+// Transaction shape (Stage 3.3):
+//
+//  1. BEGIN.
+//  2. Per-batch post-finalize guard SELECT
+//     (`scan_run FOR SHARE`).
+//  3. Prepare INSERT into `metric_sample`.
+//  4. For each record: validate + EXEC the INSERT.
+//  5. Prepare INSERT ... ON CONFLICT ... DO UPDATE on
+//     `metric_sample_active`.
+//  6. For each record: EXEC the UPSERT (re-points the
+//     active-row pointer to the new `sample_id` if a prior
+//     pointer existed, else INSERTs a fresh pointer).
+//  7. COMMIT.
+//
 // Empty `records` slice is a no-op per the
 // [MetricSampleWriter] contract (no transaction opened,
 // no error returned).
@@ -213,6 +294,14 @@ func (w *PGMetricSampleWriter) qualifyScanRunForGuard() string {
 // Each row's `attrs_json` is encoded as a Postgres jsonb
 // literal via [json.Marshal]; a nil map encodes as
 // `null` which the column accepts (it is nullable).
+//
+// Atomicity: a failure on ANY of the INSERT or UPSERT EXECs
+// rolls back the entire batch (including any preceding
+// INSERTs into `metric_sample`). This guarantees the
+// `metric_sample_active` PRIMARY KEY uniqueness invariant
+// holds across the writer's commit boundary -- a partial
+// write cannot land a `metric_sample` row whose active
+// pointer is missing or stale.
 func (w *PGMetricSampleWriter) WriteBatch(ctx context.Context, records []MetricSampleRecord) error {
 	if len(records) == 0 {
 		return nil
@@ -230,6 +319,26 @@ func (w *PGMetricSampleWriter) WriteBatch(ctx context.Context, records []MetricS
 		return perr
 	}
 
+	// Sort a defensive copy of `records` by the active-row
+	// quintuple (plus sample_id as a stable tiebreaker) BEFORE
+	// the INSERT / UPSERT passes. This pins a deterministic
+	// row-lock acquisition order on `metric_sample_active` so
+	// two concurrent `WriteBatch` calls with overlapping
+	// quintuples (e.g. parallel scans of related SHAs) cannot
+	// cross-lock and deadlock. The caller-owned slice is left
+	// untouched -- callers may iterate `records` after
+	// WriteBatch returns and observe the original order.
+	//
+	// This also pins the metric_sample INSERT order so the
+	// two passes see the same iteration, satisfying the
+	// composite FK `metric_sample_active_sample_consistent_fk`
+	// trivially (the metric_sample row for record N is
+	// inserted before the metric_sample_active UPSERT for
+	// record N).
+	sorted := make([]MetricSampleRecord, len(records))
+	copy(sorted, records)
+	sortMetricSampleRecordsForActiveRow(sorted)
+
 	insertSQL := fmt.Sprintf(
 		`INSERT INTO %s
 		    (sample_id, repo_id, sha, scope_id,
@@ -238,6 +347,27 @@ func (w *PGMetricSampleWriter) WriteBatch(ctx context.Context, records []MetricS
 		     producer_run_id, attrs_json)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		w.qualifyMetricSample(),
+	)
+
+	// Active-row UPSERT (Stage 3.3). The ON CONFLICT target
+	// is the quintuple PRIMARY KEY on `metric_sample_active`
+	// (migration `0002_measurement.up.sql:519`). On conflict
+	// the writer re-points the pointer to the new sample_id;
+	// the composite FK back to `metric_sample` is satisfied
+	// because the INSERT into `metric_sample` for this
+	// `sample_id` already committed-on-statement-end above.
+	//
+	// IMPORTANT: no procedural `swap_active` verb / trigger /
+	// stored function exists in the canonical model
+	// (implementation-plan Stage 3.3 iter 1 evaluator item 1).
+	// This UPSERT IS the canonical active-row swap.
+	upsertActiveSQL := fmt.Sprintf(
+		`INSERT INTO %s
+		    (repo_id, sha, scope_id, metric_kind, metric_version, sample_id)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 ON CONFLICT (repo_id, sha, scope_id, metric_kind, metric_version)
+		 DO UPDATE SET sample_id = EXCLUDED.sample_id`,
+		w.qualifyMetricSampleActive(),
 	)
 
 	tx, err := w.db.BeginTx(ctx, nil)
@@ -281,7 +411,7 @@ func (w *PGMetricSampleWriter) WriteBatch(ctx context.Context, records []MetricS
 	}
 	defer func() { _ = stmt.Close() }()
 
-	for i, rec := range records {
+	for i, rec := range sorted {
 		if err := validateMetricSampleRecord(rec); err != nil {
 			return fmt.Errorf("metric_ingestor: PGMetricSampleWriter records[%d] invalid: %w", i, err)
 		}
@@ -306,10 +436,67 @@ func (w *PGMetricSampleWriter) WriteBatch(ctx context.Context, records []MetricS
 		}
 	}
 
+	// Stage 3.3 active-row UPSERT pass. The metric_sample
+	// INSERTs above are visible to subsequent statements in
+	// this transaction (statement-end visibility), so the
+	// composite FK on metric_sample_active is satisfied for
+	// every record we are about to UPSERT. We iterate the
+	// same sorted slice so the lock-acquisition order is
+	// identical to the INSERT pass (and stable across calls).
+	stmtActive, err := tx.PrepareContext(ctx, upsertActiveSQL)
+	if err != nil {
+		return fmt.Errorf("metric_ingestor: PGMetricSampleWriter.Prepare UPSERT metric_sample_active: %w", err)
+	}
+	defer func() { _ = stmtActive.Close() }()
+
+	for i, rec := range sorted {
+		if _, err := stmtActive.ExecContext(ctx,
+			rec.RepoID,
+			rec.SHA,
+			rec.ScopeID,
+			rec.MetricKind,
+			rec.MetricVersion,
+			rec.SampleID,
+		); err != nil {
+			return fmt.Errorf("metric_ingestor: PGMetricSampleWriter records[%d] UPSERT metric_sample_active: %w", i, err)
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("metric_ingestor: PGMetricSampleWriter Commit: %w", err)
 	}
 	return nil
+}
+
+// sortMetricSampleRecordsForActiveRow sorts `records` in
+// place by the active-row quintuple plus `sample_id` as a
+// stable tiebreaker. The ordering pins the per-tx
+// row-lock acquisition order on `metric_sample_active`
+// across the INSERT and UPSERT passes so two concurrent
+// `WriteBatch` calls with overlapping quintuples cannot
+// cross-lock. UUID columns are compared as raw bytes (via
+// [bytes.Compare]) so the order is stable across UUID
+// versions (V4 / V7).
+func sortMetricSampleRecordsForActiveRow(records []MetricSampleRecord) {
+	sort.Slice(records, func(i, j int) bool {
+		a, b := records[i], records[j]
+		if c := bytes.Compare(a.RepoID[:], b.RepoID[:]); c != 0 {
+			return c < 0
+		}
+		if a.SHA != b.SHA {
+			return a.SHA < b.SHA
+		}
+		if c := bytes.Compare(a.ScopeID[:], b.ScopeID[:]); c != 0 {
+			return c < 0
+		}
+		if a.MetricKind != b.MetricKind {
+			return a.MetricKind < b.MetricKind
+		}
+		if a.MetricVersion != b.MetricVersion {
+			return a.MetricVersion < b.MetricVersion
+		}
+		return bytes.Compare(a.SampleID[:], b.SampleID[:]) < 0
+	})
 }
 
 // batchProducerRunID returns the producer_run_id shared by

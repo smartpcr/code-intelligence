@@ -190,15 +190,30 @@ func (h *RescanHandler) Rescan(w http.ResponseWriter, r *http.Request) {
 	res, runErr := h.indexer.OnNewSHA(r.Context(), req)
 	if runErr != nil {
 		status, code := classifyError(runErr)
-		if h.logger != nil && status >= 500 {
-			h.logger.Warn("repo_indexer rescan: writer-side failure",
-				"repo_id", payload.RepoID,
-				"sha", payload.SHA,
-				"err", runErr.Error(),
-				"code", code,
-			)
+		// 5xx responses must NOT leak the wrapped writer
+		// error to the caller -- see [Webhook] for the
+		// full rationale. `ErrCatalogWriterFailure` is
+		// built via `fmt.Errorf("%w: %v", ..., err)` so
+		// `runErr.Error()` can carry Postgres DSNs, SQL
+		// fragments, or pgx-internal context. The verbatim
+		// detail stays in the structured warning below;
+		// the JSON body carries the opaque
+		// [internalErrorMessage] placeholder. 4xx detail is
+		// the caller's own input echoed back (bad SHA,
+		// missing repo_id) and is safe to surface.
+		msg := runErr.Error()
+		if status >= 500 {
+			if h.logger != nil {
+				h.logger.Warn("repo_indexer rescan: writer-side failure",
+					"repo_id", payload.RepoID,
+					"sha", payload.SHA,
+					"err", runErr.Error(),
+					"code", code,
+				)
+			}
+			msg = internalErrorMessage
 		}
-		h.writeError(w, status, runErr.Error(), code)
+		h.writeError(w, status, msg, code)
 		return
 	}
 

@@ -44,12 +44,23 @@ func main() {
 	}
 	defer db.Close()
 
-	// Wait for Postgres to be ready.
+	// Wait for Postgres to be ready. Fail fast if the DB never comes up so
+	// that operators see a clear startup error instead of every subsequent
+	// request returning a cryptic "connection refused" 500 — the most
+	// common source of docker-compose E2E flake.
+	ready := false
+	var lastPingErr error
 	for i := 0; i < 30; i++ {
 		if err := db.Ping(); err == nil {
+			ready = true
 			break
+		} else {
+			lastPingErr = err
 		}
 		time.Sleep(time.Second)
+	}
+	if !ready {
+		log.Fatalf("postgres did not become ready after 30 s: %v", lastPingErr)
 	}
 
 	mux := http.NewServeMux()

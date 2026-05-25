@@ -114,8 +114,58 @@ func (b *scopeBuilder) addSymbol(s *AstSymbol) string {
 	return id
 }
 
-// build finalises and returns the canonical `*AstFile`.
+// AttrSourceBytes is the canonical `AstFile.Attrs` key carrying
+// the file's raw source bytes (stored as a string for proto
+// compatibility). Populated by [scopeBuilder.build] so every
+// parser-produced AstFile carries its source.
+//
+// Why on the parser, not the recipe seam: production lexical
+// duplication detection (architecture Sec 1.4.1 row 11 / e2e-
+// scenarios.md:426-430 whitespace-canonicalisation) is part
+// of the DEFAULT dispatch path. The `recipes/duplication_ratio.go`
+// recipe reads this attr first; without parser-side population
+// it would silently fall back to structural tokens for normal
+// parser output (the iter-4 evaluator regression at item 1).
+//
+// Memory: storing source on every AstFile roughly doubles the
+// parser's in-memory cost. Acceptable for Stage 2.5; future
+// stages may add a deterministic source cache and gate this
+// behind a parser option. Until then the population is
+// unconditional so the DEFAULT recipe always sees lexical
+// input.
+//
+// Mirror constant: `recipes.AttrSourceBytes` aliases this to
+// keep both packages locked to the same key.
+const AttrSourceBytes = "source_bytes"
+
+// AttrModulePath is the canonical `AstFile.Attrs` key carrying
+// the project's module path (e.g. `github.com/org/repo` for a
+// Go module). Populated by the composition root / scan layer
+// when the project's module metadata is known (e.g. by reading
+// `go.mod`). The `recipes/cycle_member.go` resolver uses this
+// attr to canonicalise module-qualified import targets without
+// relying on unsafe path-tail heuristics.
+//
+// When the attr is absent on every in-project AstFile, the
+// cycle_member resolver falls back to EXACT directory and
+// EXACT qualifiedName matches only -- the unsafe multi-segment
+// suffix tier from iter-4 has been REMOVED (iter-5 evaluator
+// item 2: `github.com/other/repo/internal/foo` external import
+// must NOT match a local `internal/foo` package).
+//
+// Mirror constant: `recipes.AttrModulePath` aliases this.
+const AttrModulePath = "module_path"
+
+// build finalises and returns the canonical `*AstFile`. The
+// builder populates `Attrs[AttrSourceBytes]` with `content` so
+// downstream recipes (e.g. duplication_ratio's lexical token
+// stream) can read the source without a second filesystem
+// pass. Recipes that don't need source bytes ignore the attr.
 func (b *scopeBuilder) build(language, path string, content []byte) *AstFile {
+	attrs := map[string]string{}
+	if len(content) > 0 {
+		attrs[AttrSourceBytes] = string(content)
+	}
 	return &AstFile{
 		Language:      language,
 		Path:          normalisePath(path),
@@ -124,6 +174,7 @@ func (b *scopeBuilder) build(language, path string, content []byte) *AstFile {
 		Scopes:        b.scopes,
 		Symbols:       b.symbols,
 		Edges:         b.edges,
+		Attrs:         attrs,
 	}
 }
 

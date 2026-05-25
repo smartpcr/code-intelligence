@@ -67,6 +67,50 @@ const AttrDecisionKind = "decision_kind"
 // set of attribute keys lives next to [AttrDecisionKind].
 const AttrCycleID = "cycle_id"
 
+// AttrSourceBytes is the per-AstFile [parser.AstFile.Attrs]
+// key the `duplication_ratio` recipe inspects to obtain the
+// file's raw source bytes for LEXICAL tokenisation. The
+// parser's `scopeBuilder.build` populates this attr at
+// AstFile construction time so the DEFAULT recipe (the one
+// `DefaultProjectRegistry()` registers) exercises lexical
+// mode for normal parser output -- the e2e contract at
+// e2e-scenarios.md:426-430 (whitespace-canonical duplication
+// detection). When absent or empty, the recipe falls through
+// to its [SourceLoader] seam and ultimately to the
+// structural-token fallback.
+//
+// Why on AstFile.Attrs rather than the recipe's SourceLoader
+// callback? PURITY (recipe contract `recipe.go:227-237`:
+// "Same `*parser.AstFile` in -> same drafts out"). When the
+// bytes live on the AstFile itself, the recipe's output is a
+// pure function of its input AstFile -- no cwd dependency,
+// no filesystem dependency, no time-of-day dependency.
+//
+// Defined as an alias to [parser.AttrSourceBytes] so the
+// parser and recipe stay locked to the same key (rubber-duck
+// finding iter-5: a divergent literal in either package would
+// silently break lexical mode again).
+const AttrSourceBytes = parser.AttrSourceBytes
+
+// AttrModulePath is the per-AstFile [parser.AstFile.Attrs] key
+// the `cycle_member` recipe inspects to obtain the project's
+// module path (e.g. `github.com/org/repo` for a Go module).
+// When at least one in-project AstFile carries the attr, the
+// cycle_member resolver uses it as the authoritative source
+// of import-target canonicalisation: an import like
+// `github.com/org/repo/internal/foo` is stripped to
+// `internal/foo` before retrying the exact-dir match.
+//
+// When the attr is absent on every in-project AstFile, the
+// resolver falls back to EXACT directory and EXACT
+// qualifiedName matches only -- iter-5 evaluator item 2
+// removed the unsafe multi-segment suffix tier that could
+// false-positive on external imports whose tail matched an
+// in-project directory.
+//
+// Defined as an alias to [parser.AttrModulePath].
+const AttrModulePath = parser.AttrModulePath
+
 // AttrSourceLine and AttrSourceFile are per-sample
 // [MetricSampleDraft.Attrs] keys recipes MAY populate so the
 // Insights / Refactor Planner surfaces can render a citation

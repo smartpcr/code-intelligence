@@ -142,3 +142,48 @@ func assertAtLeast(t *testing.T, hist map[ScopeKind]int, kind ScopeKind, want in
 		t.Errorf("scope_kind=%v count = %d; want >= %d", kind, got, want)
 	}
 }
+
+// TestParsers_PopulateSourceBytesAttr pins the iter-5 parser-
+// side contract: every per-language parser MUST stamp the
+// raw source bytes on `AstFile.Attrs[AttrSourceBytes]` so
+// the `recipes/duplication_ratio.go` recipe sees lexical
+// input in the DEFAULT dispatch path (iter-5 evaluator
+// item 1). Without parser-side population, default-
+// constructed recipes silently fall back to structural
+// tokens for normal parser output.
+//
+// The test runs against every registered language to make
+// sure no parser route bypasses the canonical `build()`
+// path.
+func TestParsers_PopulateSourceBytesAttr(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		lang    string
+		parser  Parser
+		path    string
+		fixture string
+	}{
+		{"go", &goParser{}, "sample.go", "sample.go"},
+		{"python", &pythonParser{}, "sample.py", "sample.py"},
+		{"typescript", &tsParser{}, "sample.ts", "sample.ts"},
+		{"java", &javaParser{}, "Sample.java", "Sample.java"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.lang, func(t *testing.T) {
+			t.Parallel()
+			content := readFixture(t, tc.lang, tc.fixture)
+			out, err := tc.parser.Parse(context.Background(), tc.path, content)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			got, ok := out.GetAttrs()[AttrSourceBytes]
+			if !ok {
+				t.Fatalf("AstFile.Attrs[%q] not set; recipes/duplication_ratio.go relies on this for lexical mode (iter-5 evaluator item 1)", AttrSourceBytes)
+			}
+			if got != string(content) {
+				t.Fatalf("AstFile.Attrs[%q] differs from source content (len got=%d, want=%d)", AttrSourceBytes, len(got), len(content))
+			}
+		})
+	}
+}

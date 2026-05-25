@@ -201,12 +201,11 @@ func (s *DirectoryAstFileSource) Files(ctx context.Context, scanRun ScanRunConte
 	}
 
 	var (
-		filesWalked   int
-		filesParsed   int
-		filesSkipped  int
-		results       []*parser.AstFile
-		paths         []string
-		pathToContent = map[string][]byte{}
+		filesWalked  int
+		filesParsed  int
+		filesSkipped int
+		results      []*parser.AstFile
+		paths        []string
 	)
 
 	walkErr := filepath.WalkDir(commitRoot, func(path string, d os.DirEntry, walkErr error) error {
@@ -246,12 +245,14 @@ func (s *DirectoryAstFileSource) Files(ctx context.Context, scanRun ScanRunConte
 			return nil
 		}
 
+		// Defer the read to the post-sort pass below so
+		// iteration order is deterministic regardless of
+		// WalkDir's directory-order quirks across
+		// platforms. We capture only the relative path
+		// here; the content is read, consumed, and
+		// dropped per-file in the second pass so at most
+		// one file's bytes are pinned at any moment.
 		paths = append(paths, relPosix)
-		pathToContent[relPosix] = nil
-		// Read file content lazily after we have the
-		// full sorted path list, so the iteration order
-		// is deterministic regardless of WalkDir's
-		// directory-order quirks across platforms.
 		return nil
 	})
 	if walkErr != nil {
@@ -268,7 +269,6 @@ func (s *DirectoryAstFileSource) Files(ctx context.Context, scanRun ScanRunConte
 		if err != nil {
 			return nil, fmt.Errorf("metric_ingestor: DirectoryAstFileSource read %q: %w", absPath, err)
 		}
-		pathToContent[relPosix] = content
 		_, ok := parser.DetectLanguage(relPosix, content)
 		if !ok {
 			filesSkipped++

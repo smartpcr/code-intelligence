@@ -218,16 +218,19 @@ storyId: "code-intelligence:CLEAN-CODE"
 - [ ] Implement `recipes/depth_of_inheritance.go` emitting `metric_kind='depth_of_inheritance'` at scope_kind `class` (architecture Sec 1.4.1 row 7).
 - [ ] Implement `recipes/interface_width.go` emitting `metric_kind='interface_width'` at canonical scope_kinds `class`, `interface` (architecture Sec 1.4.1 row 8) -- public surface size.
 - [ ] Implement `recipes/coupling_between_objects.go` emitting `metric_kind='coupling_between_objects'` at scope_kind `class`.
-- [ ] Register all six in `recipes/registry.go` keyed by metric_kind with `pack='solid'`, `source='computed'`; emit a startup log listing them.
+- [ ] Implement `recipes/lsp_violation.go` emitting `metric_kind='lsp_violation'` at scope_kind `method` with `value=1` iff the overriding method strengthens its parent's precondition or weakens its postcondition per the AST-level signature comparison (architecture Sec 1.4.1 row 13, Sec 3.5.1.c lines 514-525). Also record the boolean fact on `MetricSample.attrs_json.lsp_violation` for forensics (mirrors the `cycle_member` dual-encoding pattern). Emits `value=0` for overrides whose contract is compatible so the LSP rule (Stage 5.5 `solid.lsp.override_violation`) sees an explicit non-firing sample rather than a silent absence.
+- [ ] Register all seven in `recipes/registry.go` keyed by metric_kind with `pack='solid'`, `source='computed'`; emit a startup log listing them.
 - [ ] Add language-tagged fixture tests asserting each recipe emits exactly the canonical `metric_kind` value (no `cyclomatic_complexity` / `lines_of_code` aliases anywhere; iter 1 evaluator item 3).
 
 ### Dependencies
 - phase-ast-adapter-and-foundation-tier-compute/stage-base-pack-foundation-recipes
 
 ### Test Scenarios
-- [ ] Scenario: solid-recipes-only-canonical-kinds -- Given the registry after init, When listing `pack='solid'` recipes, Then the metric_kinds are exactly `{lcom4, fan_in, fan_out, depth_of_inheritance, interface_width, coupling_between_objects}`.
+- [ ] Scenario: solid-recipes-only-canonical-kinds -- Given the registry after init, When listing `pack='solid'` recipes, Then the metric_kinds are exactly `{lcom4, fan_in, fan_out, depth_of_inheritance, interface_width, coupling_between_objects, lsp_violation}`.
 - [ ] Scenario: lcom4-class-known-value -- Given a Java class fixture with two disjoint method clusters sharing no fields, When the lcom4 recipe runs, Then it emits `value=2`.
 - [ ] Scenario: cbo-counts-distinct-targets -- Given a class referencing four distinct external classes, When the coupling_between_objects recipe runs, Then it emits `value=4`.
+- [ ] Scenario: lsp-violation-strengthens-precondition -- Given a Java fixture where a subclass override adds a `if (x < 0) throw` check the parent does NOT have, When the lsp_violation recipe runs, Then it emits `value=1` for the method scope and stamps `attrs_json.lsp_violation = "true"`.
+- [ ] Scenario: lsp-violation-compatible-override -- Given a subclass override whose precondition and postcondition match the parent's, When the lsp_violation recipe runs, Then it emits `value=0` (the explicit non-firing sample the LSP override rule expects).
 
 ## Stage 2.5: Cycle and duplication recipes
 
@@ -524,7 +527,7 @@ storyId: "code-intelligence:CLEAN-CODE"
 
 ### Test Scenarios
 - [ ] Scenario: solid-rulepacks-load -- Given the five SOLID rulepack files, When the Policy Steward loads them, Then all five appear as `rule_pack` rows with `pack='solid'` and the contained predicates parse cleanly.
-- [ ] Scenario: solid-rulepacks-only-canonical-kinds -- Given the loaded predicates, When scanning their metric_kind references, Then each is one of `{lcom4, fan_in, fan_out, depth_of_inheritance, interface_width, coupling_between_objects, modification_count_in_window}` and no non-canonical alias appears.
+- [ ] Scenario: solid-rulepacks-only-canonical-kinds -- Given the loaded predicates, When scanning their metric_kind references, Then each is one of `{lcom4, fan_in, fan_out, depth_of_inheritance, interface_width, coupling_between_objects, modification_count_in_window, lsp_violation}` and no non-canonical alias appears.
 - [ ] Scenario: ocp-uses-fan-in -- Given the loaded OCP rulepack, When inspecting its inputs, Then they are exactly `{fan_in, modification_count_in_window}` (NOT `depth_of_inheritance`; canon-guard against iter 3 drift item 14).
 
 ## Stage 5.6: Decoupled functional areas rule pack

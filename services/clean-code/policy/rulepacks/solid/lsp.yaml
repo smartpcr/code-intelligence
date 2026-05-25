@@ -1,0 +1,154 @@
+# clean-code Stage 5.5 -- SOLID / Liskov Substitution rule pack
+#
+# Architecture references:
+#   - Sec 1.3 "SOLID coding principles" (goal 2): the LSP
+#     smell is a subclass that cannot be substituted for its
+#     parent because it weakens postconditions or strengthens
+#     preconditions.
+#   - Sec 1.4.1 canonical metric_kind (lines 100, 105):
+#       * `depth_of_inheritance` (class scope, pack=solid):
+#         "DIT. Drives LSP rule."
+#       * `lsp_violation` (method scope, pack=solid, row 13):
+#         "AST-level Liskov override-signature indicator.
+#         value=1 iff an overriding method strengthens its
+#         parent's precondition or weakens its postcondition;
+#         value=0 otherwise. Drives the LSP override rule.
+#         Emitted by Stage 2.4 (Adapter, Section 3.2) as a
+#         first-class `MetricSample` row -- this is the
+#         DSL-expressible projection of the same boolean
+#         fact also recorded in
+#         `MetricSample.attrs_json.lsp_violation`."
+#   - Sec 3.5.1.c SOLID input recipe for LSP (lines 514-525):
+#     "Inputs: `depth_of_inheritance` (class) plus an AST-
+#     level 'overrides parent precondition / weakens
+#     postcondition' predicate from the Adapter (Section
+#     3.2). Recorded as a single boolean `lsp_violation`
+#     attribute on the `MetricSample.attrs_json` AND
+#     projected as a first-class `metric_kind='lsp_violation'`
+#     row (Section 1.4.1 row 13, scope_kind='method',
+#     value=0|1) so the Policy DSL can consume the indicator
+#     directly."
+#   - tech-spec Sec 4.3 (line 349-350): "LSP joins on
+#     `depth_of_inheritance`".
+#   - implementation-plan Stage 5.5 (line 514): "LSP rule
+#     consuming `metric_kind='depth_of_inheritance'` plus
+#     override-method-signature checks emitted by Stage 2.4."
+#   - implementation-plan Stage 2.4 (this stage's producer):
+#     adds `recipes/lsp_violation.go` to the SOLID-pack
+#     foundation recipe set; emits one row per overriding
+#     method.
+#
+# # Override-method-signature checks (canonical projection)
+#
+# The architecture canonical catalogue (Sec 1.4.1 row 13)
+# declares `lsp_violation` as a first-class `pack='solid'`
+# metric_kind at scope `method`, value=0|1. The DSL parser
+# accepts the literal via the canon-guard in
+# `internal/policy/dsl/sample.go::CanonicalMetricKinds`
+# (architecture-mirrored block). The same boolean fact is
+# ALSO retained on `MetricSample.attrs_json.lsp_violation`
+# for forensics; the `metric_kind` row is the path the
+# Policy DSL -- which exposes only columnar fields
+# `{metric_kind, scope_kind, pack, source, value, degraded}`
+# and not `attrs_json` -- consumes. This dual-encoding
+# pattern mirrors `cycle_member` (Section 1.4.1 row 10), a
+# 0/1 metric_kind whose detail (the cycle id) lives on
+# `attrs_json.cycle_id`.
+#
+# # The v1 rules
+#
+# Two rules, both consumed by the Stage 5.7 SOLID rule
+# engine:
+#   - `solid.lsp.depth_of_inheritance_high` -- the
+#     class-scoped DIT threshold (deep hierarchies are LSP-
+#     fragile because each override layer can silently
+#     weaken postconditions / strengthen preconditions).
+#   - `solid.lsp.override_violation` -- the method-scoped
+#     LSP boolean indicator, firing whenever Stage 2.4 emits
+#     `metric_kind='lsp_violation'` with `value > 0` (i.e.
+#     value == 1). This consumes the override-method-
+#     signature check the brief mandates.
+#
+# # Threshold rationale (v1 defaults)
+#
+#   - depth_of_inheritance >= 4: a class with DIT >= 4 has
+#     four ancestor levels in its inheritance chain -- the
+#     canonical Chidamber-Kemerer "deep hierarchy" band.
+#     Deep hierarchies are LSP-fragile: each level can
+#     silently strengthen a precondition or weaken a
+#     postcondition. Java's `Object` counts as level 0 in
+#     this metric so a domain class four levels below
+#     `Object` is the warning threshold.
+#   - lsp_violation > 0: the metric is a 0/1 indicator
+#     (value=1 when Stage 2.4 detects an override that
+#     weakens a postcondition or strengthens a
+#     precondition). Any non-zero value fires the rule;
+#     `> 0` is preferred over `>= 1` so a future fractional
+#     confidence-weighted indicator (e.g. 0.5 for "ambiguous
+#     override signature") would still trip the rule.
+#
+# # Why per-rule scope_kind binding
+#
+# `depth_of_inheritance` is class-scoped per architecture
+# Sec 1.4.1 line 100. `lsp_violation` is method-scoped: the
+# override check is naturally a method-level operation
+# (Stage 2.4 inspects each overriding method's pre/post-
+# condition signatures vs the parent's). Without the
+# explicit scope binding the DIT rule could accidentally
+# match a future scope-extended sample and the
+# `lsp_violation` rule could fire on a class-scoped
+# aggregation that does not yet exist.
+#
+# # pack_id convention
+#
+# `<family>.<subname>` per migration
+# `0003_policy_audit_refactor.up.sql` line 200.
+pack_id: solid.lsp
+version: 1
+display_name: SOLID -- Liskov Substitution
+description_md: |-
+  Two v1 rules. The first fires on classes with
+  `depth_of_inheritance` >= 4 (deep hierarchies are LSP-
+  fragile). The second fires on methods whose Stage 2.4
+  override-signature check emits the `lsp_violation` 0/1
+  indicator (a violation of the Liskov substitution
+  contract -- the override weakens a postcondition or
+  strengthens a precondition relative to the parent). The
+  `lsp_violation` metric_kind is the DSL-expressible
+  projection of the architecture's `MetricSample.attrs_json`
+  boolean attribute (Sec 3.5.1.c) and is enumerated in
+  `dsl.CanonicalMetricKinds` alongside the existing
+  `cycle_member` 0/1 indicator.
+rules:
+  - rule_id: solid.lsp.depth_of_inheritance_high
+    version: 1
+    predicate_dsl: "metric_kind == 'depth_of_inheritance' AND scope_kind == 'class' AND value >= 4"
+    severity_default: warn
+    description_md: |-
+      Class `depth_of_inheritance` (DIT) >= 4 -- four or
+      more ancestor levels above the class. Deep hierarchies
+      make Liskov substitution fragile: each override layer
+      is a chance to silently weaken a postcondition or
+      strengthen a precondition. Suggested refactor:
+      collapse intermediate abstract levels, prefer
+      composition over inheritance (DIP), or split the
+      hierarchy into role-specific traits / mixins.
+  - rule_id: solid.lsp.override_violation
+    version: 1
+    predicate_dsl: "metric_kind == 'lsp_violation' AND scope_kind == 'method' AND value > 0"
+    severity_default: warn
+    description_md: |-
+      Method overrides its parent in a way that violates
+      the Liskov substitution principle -- typically by
+      strengthening a precondition (rejecting inputs the
+      parent accepts) or weakening a postcondition
+      (delivering less than the parent guarantees). Stage
+      2.4 emits this 0/1 indicator on the `MetricSample`
+      row for the overriding method when its signature /
+      AST-level contract check fails. Suggested refactor:
+      keep the override compatible with the parent's
+      contract (the Liskov rule), promote the divergent
+      behaviour into a sibling type that does NOT extend
+      the parent, or refactor the parent's contract to
+      accommodate the broader behaviour explicitly.
+

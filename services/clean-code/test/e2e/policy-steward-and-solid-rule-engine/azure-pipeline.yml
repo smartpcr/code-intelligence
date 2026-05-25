@@ -41,21 +41,26 @@ stages:
 
           - script: |
               # No external secrets — compose exports all URLs via mapped ports.
+              # Use ##vso[task.setvariable] so these env vars persist into subsequent
+              # steps, matching how the GitHub Actions workflow writes to $GITHUB_ENV.
               KMS_PORT=$(docker compose -f $(COMPOSE_FILE) port kms-mock 8080 | cut -d: -f2)
               PG_PORT=$(docker compose -f $(COMPOSE_FILE) port postgres 5432 | cut -d: -f2)
               STEWARD_PORT=$(docker compose -f $(COMPOSE_FILE) port policy-steward 8080 | cut -d: -f2)
               RULE_ENGINE_PORT=$(docker compose -f $(COMPOSE_FILE) port rule-engine 8080 | cut -d: -f2)
               OTEL_PORT=$(docker compose -f $(COMPOSE_FILE) port otel-collector 4317 | cut -d: -f2)
-              export CLEAN_CODE_KMS_URL="http://localhost:${KMS_PORT}"
-              export CLEAN_CODE_PG_URL="postgres://postgres:postgres@localhost:${PG_PORT}/clean_code?sslmode=disable"
-              export CLEAN_CODE_POLICY_STEWARD_URL="http://localhost:${STEWARD_PORT}"
-              export CLEAN_CODE_RULE_ENGINE_URL="http://localhost:${RULE_ENGINE_PORT}"
-              export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:${OTEL_PORT}"
-              cd services/clean-code
+              echo "##vso[task.setvariable variable=CLEAN_CODE_KMS_URL]http://localhost:${KMS_PORT}"
+              echo "##vso[task.setvariable variable=CLEAN_CODE_PG_URL]postgres://postgres:postgres@localhost:${PG_PORT}/clean_code?sslmode=disable"
+              echo "##vso[task.setvariable variable=CLEAN_CODE_POLICY_STEWARD_URL]http://localhost:${STEWARD_PORT}"
+              echo "##vso[task.setvariable variable=CLEAN_CODE_RULE_ENGINE_URL]http://localhost:${RULE_ENGINE_PORT}"
+              echo "##vso[task.setvariable variable=CLEAN_CODE_OTEL_ENDPOINT]http://localhost:${OTEL_PORT}"
+            displayName: "Export compose-provided env vars"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
               go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
                 -run TestE2E_policy_steward_and_solid_rule_engine_decoupled_functional_areas_rule_pack
-            displayName: "Export compose URLs and run E2E tests"
-            workingDirectory: $(Build.SourcesDirectory)
+            displayName: "Run E2E tests"
+            workingDirectory: $(Build.SourcesDirectory)/services/clean-code
 
           - script: |
               docker compose -f $(COMPOSE_FILE) down -v --remove-orphans

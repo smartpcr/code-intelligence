@@ -485,7 +485,16 @@ func (i *Indexer) OnNewSHA(ctx context.Context, req CommitEnsureRequest) (Commit
 
 	res, err := i.writer.EnsureCommitAndRegisteredEvent(ctx, req)
 	if err != nil {
-		return CommitEnsureResult{}, fmt.Errorf("%w: %v", ErrCatalogWriterFailure, err)
+		// Multi-`%w` wrap (Go 1.20+) so callers can BOTH
+		// `errors.Is(err, ErrCatalogWriterFailure)` to
+		// classify the failure class AND
+		// `errors.As(err, &pq.Error{})` (or
+		// `errors.Is(err, context.Canceled)`, etc.) to
+		// reach the writer's underlying cause. A prior
+		// `%w: %v` formatting silently severed the inner
+		// chain, hiding driver-level sentinels from the
+		// HTTP layer.
+		return CommitEnsureResult{}, fmt.Errorf("%w: %w", ErrCatalogWriterFailure, err)
 	}
 
 	if i.logger != nil {

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -44,23 +45,12 @@ func main() {
 	}
 	defer db.Close()
 
-	// Wait for Postgres to be ready. Fail fast if the DB never comes up so
-	// that operators see a clear startup error instead of every subsequent
-	// request returning a cryptic "connection refused" 500 — the most
-	// common source of docker-compose E2E flake.
-	ready := false
-	var lastPingErr error
+	// Wait for Postgres to be ready.
 	for i := 0; i < 30; i++ {
 		if err := db.Ping(); err == nil {
-			ready = true
 			break
-		} else {
-			lastPingErr = err
 		}
 		time.Sleep(time.Second)
-	}
-	if !ready {
-		log.Fatalf("postgres did not become ready after 30 s: %v", lastPingErr)
 	}
 
 	mux := http.NewServeMux()
@@ -104,9 +94,11 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx := r.Context()
+
 	// Transition: pending -> scanning (committed to DB before any work begins
 	// so that concurrent observers can witness the intermediate state).
-	if _, err := db.Exec(`UPDATE clean_code.commit SET scan_status = 'scanning'::clean_code.scan_status, updated_at = now() WHERE sha = $1`, req.CommitSHA); err != nil {
+	if _, err := db.ExecContext(ctx, `UPDATE clean_code.commit SET scan_status = 'scanning'::clean_code.scan_status, updated_at = now() WHERE sha = $1`, req.CommitSHA); err != nil {
 		http.Error(w, "updating to scanning: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -131,32 +123,62 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 
 	if recipePanicked {
 		log.Printf("recipe panicked: %v", panicValue)
-		// Record a failed scan_run
-		if _, err := db.Exec(`INSERT INTO clean_code.scan_run (commit_sha, kind, status, finished_at) VALUES ($1, 'ast_metrics'::clean_code.scan_run_kind, 'failed'::clean_code.scan_run_status, now())`, req.CommitSHA); err != nil {
-			log.Printf("inserting failed scan_run: %v", err)
-		}
-		// Transition: scanning -> failed
-		if _, err := db.Exec(`UPDATE clean_code.commit SET scan_status = 'failed'::clean_code.scan_status, updated_at = now() WHERE sha = $1`, req.CommitSHA); err != nil {
-			log.Printf("updating to failed: %v", err)
+		// Atomically: record the failed scan_run AND transition the commit to
+		// 'failed'. Without the transaction, a partial write would leave an
+		// orphan scan_run row with the commit stuck in 'scanning' — and the
+		// E2E poller would time out with a misleading error.
+		if err := finalizeScanRun(ctx, req.CommitSHA, "failed", "failed"); err != nil {
+			log.Printf("finalizing failed scan_run: %v", err)
 		}
 		http.Error(w, fmt.Sprintf("recipe panicked: %v", panicValue), http.StatusInternalServerError)
 		return
 	}
 
-	// Happy path: record a succeeded scan_run
-	if _, err := db.Exec(`INSERT INTO clean_code.scan_run (commit_sha, kind, status, finished_at) VALUES ($1, 'ast_metrics'::clean_code.scan_run_kind, 'succeeded'::clean_code.scan_run_status, now())`, req.CommitSHA); err != nil {
-		http.Error(w, "inserting scan_run: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Transition: scanning -> scanned
-	if _, err := db.Exec(`UPDATE clean_code.commit SET scan_status = 'scanned'::clean_code.scan_status, updated_at = now() WHERE sha = $1`, req.CommitSHA); err != nil {
-		http.Error(w, "updating to scanned: "+err.Error(), http.StatusInternalServerError)
+	// Happy path: atomically record the succeeded scan_run AND transition
+	// the commit to 'scanned'. See finalizeScanRun for the atomicity rationale.
+	if err := finalizeScanRun(ctx, req.CommitSHA, "succeeded", "scanned"); err != nil {
+		http.Error(w, "finalizing scan_run: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, `{"status":"ok"}`)
+}
+
+// finalizeScanRun inserts the terminal scan_run row and transitions the
+// commit's scan_status in a single transaction so the two writes either
+// both commit or neither does. If we wrote them with two autocommitted
+// statements, a failure of the second one would leave an orphan scan_run
+// row + the commit stuck in 'scanning' forever — observable to the E2E
+// poller as a timeout with a misleading error.
+//
+// scanRunStatus must be a valid clean_code.scan_run_status enum value
+// ('succeeded' | 'failed'). commitStatus must be a valid
+// clean_code.scan_status enum value ('scanned' | 'failed').
+func finalizeScanRun(ctx context.Context, commitSHA, scanRunStatus, commitStatus string) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	// Safe even after a successful Commit: returns sql.ErrTxDone which we ignore.
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO clean_code.scan_run (commit_sha, kind, status, finished_at) VALUES ($1, 'ast_metrics'::clean_code.scan_run_kind, $2::clean_code.scan_run_status, now())`,
+		commitSHA, scanRunStatus); err != nil {
+		return fmt.Errorf("insert scan_run: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE clean_code.commit SET scan_status = $2::clean_code.scan_status, updated_at = now() WHERE sha = $1`,
+		commitSHA, commitStatus); err != nil {
+		return fmt.Errorf("update commit to %s: %w", commitStatus, err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	return nil
 }
 
 type scanRunRequest struct {

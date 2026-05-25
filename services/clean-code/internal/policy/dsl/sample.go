@@ -44,7 +44,7 @@ type Sample struct {
 	DegradedReason string
 }
 
-// CanonicalMetricKinds is the closed set of `metric_kind`
+// canonicalMetricKinds is the closed set of `metric_kind`
 // values architecture Sec 1.4 (lines 81-125) pins as the
 // v1 catalogue. The DSL parser refuses any string literal
 // in a `metric_kind == '...'` comparison that is not in this
@@ -59,20 +59,18 @@ type Sample struct {
 // composer. The set is curated by architecture Sec 1.4 and
 // any extension here MUST be cross-referenced to that section.
 //
-// DO NOT MUTATE: this map is treated as an immutable closed
-// set by the parser's canon-guard (parser.go validateStringLit
-// and the `dsl-rejects-unknown-metric-kind` test scenario).
-// Inserting or deleting entries at runtime silently bypasses
-// that guard and lets non-canonical metric_kinds slip into
-// compiled predicates. Callers MUST treat this as read-only:
-// only the literal at-rest declaration below may add entries.
-// The variable is exported for in-package iteration (e.g.
-// [TestThreshold_Validate_AcceptsAllCanonicalMetricKinds] and
-// parser.go's error-message helper) and for godoc visibility;
-// a follow-up refactor will unexport it to `canonicalMetricKinds`
-// once those call sites migrate to the [ListCanonicalMetricKinds]
-// helper added below.
-var CanonicalMetricKinds = map[string]struct{}{
+// UNEXPORTED so external callers cannot mutate the closed
+// set at runtime. The package surface is the read-only
+// [IsCanonicalMetricKind] predicate and the snapshot
+// [ListCanonicalMetricKinds] accessor; neither allows the
+// caller to insert or delete entries. The parser's
+// canon-guard depends on this set being immutable for the
+// life of the process -- a mutation would silently let
+// non-canonical metric_kinds slip into compiled predicates.
+// In-package call sites (parser.go's error-message helper,
+// [Threshold.Validate], the threshold-validate tests) read
+// via the lowercase identifier directly.
+var canonicalMetricKinds = map[string]struct{}{
 	// Foundation tier / pack=base (architecture Sec 1.4.1).
 	"cyclo":                        {},
 	"cognitive_complexity":         {},
@@ -110,32 +108,32 @@ var CanonicalMetricKinds = map[string]struct{}{
 }
 
 // IsCanonicalMetricKind reports whether s is a member of the
-// closed [CanonicalMetricKinds] set.
+// closed canonical metric_kind set.
 func IsCanonicalMetricKind(s string) bool {
-	_, ok := CanonicalMetricKinds[s]
+	_, ok := canonicalMetricKinds[s]
 	return ok
 }
 
 // ListCanonicalMetricKinds returns the canonical metric_kind
 // set as a sorted slice of fresh strings. The returned slice
 // is a new allocation each call, so mutation by the caller
-// cannot leak back into the underlying [CanonicalMetricKinds]
-// canon-guard set. Prefer this helper over ranging over the
-// exported map when constructing error messages or surfacing
-// the catalogue to callers outside this file.
+// cannot leak back into the underlying canon-guard set. This
+// is the ONLY supported way for callers outside this package
+// to enumerate the catalogue -- the backing map is
+// unexported so the closed set cannot be mutated at runtime.
 func ListCanonicalMetricKinds() []string {
-	return sortedKeys(CanonicalMetricKinds)
+	return sortedKeys(canonicalMetricKinds)
 }
 
-// CanonicalScopeKinds mirrors the `clean_code.scope_kind`
+// canonicalScopeKinds mirrors the `clean_code.scope_kind`
 // ENUM declared in migration 0002 line 142. Architecture Sec
 // 5.2.3 line 1046 lists the same closed set.
 //
-// DO NOT MUTATE: read-only canon-guard set; see the
-// [CanonicalMetricKinds] doc for the rationale. Prefer
-// [IsCanonicalScopeKind] / [ListCanonicalScopeKinds] over
-// direct map access.
-var CanonicalScopeKinds = map[string]struct{}{
+// UNEXPORTED so external callers cannot mutate the closed
+// canon-guard set; see the [canonicalMetricKinds] doc for
+// the rationale. The package surface is
+// [IsCanonicalScopeKind] / [ListCanonicalScopeKinds].
+var canonicalScopeKinds = map[string]struct{}{
 	"repo":      {},
 	"package":   {},
 	"file":      {},
@@ -146,9 +144,9 @@ var CanonicalScopeKinds = map[string]struct{}{
 }
 
 // IsCanonicalScopeKind reports whether s is a member of the
-// closed [CanonicalScopeKinds] set.
+// closed canonical scope_kind set.
 func IsCanonicalScopeKind(s string) bool {
-	_, ok := CanonicalScopeKinds[s]
+	_, ok := canonicalScopeKinds[s]
 	return ok
 }
 
@@ -156,18 +154,18 @@ func IsCanonicalScopeKind(s string) bool {
 // set as a sorted slice of fresh strings; see
 // [ListCanonicalMetricKinds] for the no-leak guarantee.
 func ListCanonicalScopeKinds() []string {
-	return sortedKeys(CanonicalScopeKinds)
+	return sortedKeys(canonicalScopeKinds)
 }
 
-// CanonicalPacks mirrors the `clean_code.metric_sample_pack`
+// canonicalPacks mirrors the `clean_code.metric_sample_pack`
 // ENUM declared in migration 0002 line 103. Architecture Sec
 // 5.2.1 line 901 names the same closed set.
 //
-// DO NOT MUTATE: read-only canon-guard set; see the
-// [CanonicalMetricKinds] doc for the rationale. Prefer
-// [IsCanonicalPack] / [ListCanonicalPacks] over direct map
-// access.
-var CanonicalPacks = map[string]struct{}{
+// UNEXPORTED so external callers cannot mutate the closed
+// canon-guard set; see the [canonicalMetricKinds] doc for
+// the rationale. The package surface is [IsCanonicalPack] /
+// [ListCanonicalPacks].
+var canonicalPacks = map[string]struct{}{
 	"base":     {},
 	"solid":    {},
 	"system":   {},
@@ -175,9 +173,9 @@ var CanonicalPacks = map[string]struct{}{
 }
 
 // IsCanonicalPack reports whether s is a member of the closed
-// [CanonicalPacks] set.
+// canonical pack set.
 func IsCanonicalPack(s string) bool {
-	_, ok := CanonicalPacks[s]
+	_, ok := canonicalPacks[s]
 	return ok
 }
 
@@ -185,27 +183,27 @@ func IsCanonicalPack(s string) bool {
 // sorted slice of fresh strings; see [ListCanonicalMetricKinds]
 // for the no-leak guarantee.
 func ListCanonicalPacks() []string {
-	return sortedKeys(CanonicalPacks)
+	return sortedKeys(canonicalPacks)
 }
 
-// CanonicalSources mirrors the `clean_code.metric_sample_source`
+// canonicalSources mirrors the `clean_code.metric_sample_source`
 // ENUM declared in migration 0002 line 115. Architecture Sec
 // 5.2.1 line 902 names the same closed set.
 //
-// DO NOT MUTATE: read-only canon-guard set; see the
-// [CanonicalMetricKinds] doc for the rationale. Prefer
-// [IsCanonicalSource] / [ListCanonicalSources] over direct
-// map access.
-var CanonicalSources = map[string]struct{}{
+// UNEXPORTED so external callers cannot mutate the closed
+// canon-guard set; see the [canonicalMetricKinds] doc for
+// the rationale. The package surface is [IsCanonicalSource]
+// / [ListCanonicalSources].
+var canonicalSources = map[string]struct{}{
 	"computed": {},
 	"derived":  {},
 	"ingested": {},
 }
 
 // IsCanonicalSource reports whether s is a member of the
-// closed [CanonicalSources] set.
+// closed canonical source set.
 func IsCanonicalSource(s string) bool {
-	_, ok := CanonicalSources[s]
+	_, ok := canonicalSources[s]
 	return ok
 }
 
@@ -213,7 +211,7 @@ func IsCanonicalSource(s string) bool {
 // sorted slice of fresh strings; see [ListCanonicalMetricKinds]
 // for the no-leak guarantee.
 func ListCanonicalSources() []string {
-	return sortedKeys(CanonicalSources)
+	return sortedKeys(canonicalSources)
 }
 
 // sortedKeys returns the keys of set as a sorted slice. The

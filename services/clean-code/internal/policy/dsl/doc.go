@@ -1,5 +1,6 @@
 // Package dsl is the parser + evaluator for the Stage 5.4
-// predicate DSL described in architecture Sec 5.3.2.
+// predicate DSL described in architecture Sec 5.3.1 line 1101
+// (the `predicate_dsl` text column on `clean_code.rule`).
 //
 // Each [Rule] row in the Policy / rules sub-store carries a
 // `predicate_dsl` text column (architecture Sec 5.3.1 line
@@ -36,11 +37,15 @@
 //
 //   - The [Parser] does parse-time validation of closed-set
 //     literals (`metric_kind`, `scope_kind`, `pack`, `source`)
-//     against the canonical sets pinned in [CanonicalMetricKinds],
-//     [CanonicalScopeKinds], [CanonicalPacks], [CanonicalSources].
-//     This is the canon-guard called out by the
-//     `dsl-rejects-unknown-metric-kind` test scenario in the
-//     Stage 5.4 implementation plan.
+//     against the canonical sets surfaced by
+//     [IsCanonicalMetricKind] / [ListCanonicalMetricKinds],
+//     [IsCanonicalScopeKind] / [ListCanonicalScopeKinds],
+//     [IsCanonicalPack] / [ListCanonicalPacks], and
+//     [IsCanonicalSource] / [ListCanonicalSources]. The
+//     backing maps are unexported so the closed sets cannot
+//     be mutated at runtime. This is the canon-guard called
+//     out by the `dsl-rejects-unknown-metric-kind` test
+//     scenario in the Stage 5.4 implementation plan.
 //
 //   - The [Bind] step resolves `threshold('<uuid>')` calls
 //     against the policy's [Threshold] set ONCE per

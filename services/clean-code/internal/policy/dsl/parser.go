@@ -425,25 +425,25 @@ func canonGuard(field Node, lit Node) error {
 		if !IsCanonicalMetricKind(sl.Value) {
 			return newError(ErrSemantic, sl.pos,
 				"unknown metric_kind %q (architecture Sec 1.4 canonical set: %s)",
-				sl.Value, listCanonical(CanonicalMetricKinds))
+				sl.Value, listCanonical(canonicalMetricKinds))
 		}
 	case "scope_kind":
 		if !IsCanonicalScopeKind(sl.Value) {
 			return newError(ErrSemantic, sl.pos,
 				"unknown scope_kind %q (canonical: %s)",
-				sl.Value, listCanonical(CanonicalScopeKinds))
+				sl.Value, listCanonical(canonicalScopeKinds))
 		}
 	case "pack":
 		if !IsCanonicalPack(sl.Value) {
 			return newError(ErrSemantic, sl.pos,
 				"unknown pack %q (canonical: %s)",
-				sl.Value, listCanonical(CanonicalPacks))
+				sl.Value, listCanonical(canonicalPacks))
 		}
 	case "source":
 		if !IsCanonicalSource(sl.Value) {
 			return newError(ErrSemantic, sl.pos,
 				"unknown source %q (canonical: %s)",
-				sl.Value, listCanonical(CanonicalSources))
+				sl.Value, listCanonical(canonicalSources))
 		}
 	}
 	return nil

@@ -4,6 +4,303 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 5.4 -- Predicate DSL evaluator
+
+> **Scope of this CHANGELOG entry.** This is the formal
+> Stage 5.4 record. The `internal/policy/dsl/` source files
+> listed under "Added" landed in the predicate-DSL workstream
+> across the prior iterations of this branch (parser /
+> evaluator / cache / sample / threshold / errors / tests
+> were already present and green before this iter; this iter
+> did not re-create them). The iter that landed THIS
+> CHANGELOG section also added the operator-facing
+> `docs/runbook.md` and `docs/rollout.md` Stage 5.4 sections
+> (see the "Documentation" subsection). A subsequent doc-fix
+> iter unexported the canonical-set maps in `sample.go` and
+> corrected the architecture-section citation here; the
+> grammar, evaluator contract, cache shape, and invariant
+> set are unchanged.
+
+### Added
+
+- **`internal/policy/dsl/` package: parser + evaluator for the
+  predicate DSL described in architecture Sec 5.3.1 line 1101
+  (the `predicate_dsl` text column on the `Rule` row).** The
+  package compiles a `predicate_dsl` text column (the
+  per-`Rule` column at architecture Sec 5.3.1 line 1101) into
+  a boolean function over `MetricSample` rows and exposes a
+  per-`policy_version_id` cache so the Rule Engine (Stage 5.7)
+  re-evaluates every active rule on the hot path without
+  re-parsing. Files:
+  - `doc.go` -- package preamble pinning the grammar
+    (`predicate ::= or_expr | ...`), the Stage 5.4 purity
+    contract ("Predicates are pure functions over MetricSample
+    rows -- no side effects, no IO"), the cache semantics, and
+    the threshold-ID identity check.
+  - `lexer.go` / `lexer_test.go` -- byte-level tokenizer that
+    tracks 1-indexed line + column on every token so any
+    structured error carries a `Position` (the Stage 5.4
+    implementation-plan line 500 acceptance criterion:
+    "rejection of malformed ones with line/column error
+    messages"). Single-quoted string literals with `\\`, `\'`,
+    `\n`, `\t` escapes; `#`-prefixed line comments;
+    case-insensitive `AND`/`OR`/`NOT`; negative number
+    literals (`value < -0.5`) so inline comparisons stay
+    symmetric with Threshold rows that carry negative
+    `velocity_trend` values.
+  - `parser.go` / `parser_test.go` -- hand-written recursive
+    descent parser with one-token lookahead and the
+    precedence ladder `OR < AND < NOT < atom`. The atom
+    production covers `(...)`, `threshold('<uuid>')`,
+    `cmp_op` comparisons, and bare `bool_literal` atoms. The
+    parser performs **parse-time type unification** (a
+    comparison's operands have a unifying type) and a
+    **closed-set canon-guard** that rejects any string literal
+    on the LHS or RHS of a `metric_kind` / `scope_kind` /
+    `pack` / `source` comparison that is not in the canonical
+    set (the `dsl-rejects-unknown-metric-kind` Stage 5.4 test
+    scenario).
+  - `ast.go` -- typed AST nodes (`OrNode`, `AndNode`,
+    `NotNode`, `CompareNode`, `ThresholdNode`, `FieldNode`,
+    `StringLitNode`, `NumberLitNode`, `BoolLitNode`). Every
+    node carries its source `Position` so an evaluation-time
+    or bind-time error points at the offending byte.
+  - `evaluator.go` / `evaluator_test.go` -- `Bind` resolves
+    every `ThresholdNode` against a `ThresholdResolver` ONCE
+    per compilation; the bound predicate captures the resolved
+    `*Threshold` pointer and `Eval` never reaches back. `Eval`
+    is a pure function of its `Sample` argument: no IO, no
+    locks, no maps, no goroutine state -- the
+    `dsl-deterministic` Stage 5.4 test scenario relies on
+    this.
+  - `threshold.go` / `threshold_test.go` -- `ThresholdOp`
+    closed-set ENUM (`gt`/`ge`/`lt`/`le`/`eq`) matching the
+    `clean_code.threshold.op` column from migration 0003,
+    `Threshold` struct (DSL-local mirror of
+    `steward.Threshold`), `ThresholdResolver` interface, and a
+    canonical `MapResolver` implementation. `Threshold.Validate`
+    re-applies the canon-guard so a hand-built Threshold in a
+    test cannot bypass the closed sets.
+  - `sample.go` -- `Sample` is the denormalised
+    `MetricSample` view the evaluator consumes. The DSL
+    grammar references both `metric_kind` (which lives on the
+    `metric_sample` row directly) and `scope_kind` (which
+    lives on the `scope_binding` row referenced by
+    `metric_sample.scope_id`); callers MUST denormalise the
+    `scope_kind` into `Sample.ScopeKind` at batch-load time so
+    `Eval` stays pure. Pins the four canonical closed sets
+    behind the read-only accessors `IsCanonicalMetricKind` /
+    `ListCanonicalMetricKinds`, `IsCanonicalScopeKind` /
+    `ListCanonicalScopeKinds`, `IsCanonicalPack` /
+    `ListCanonicalPacks`, and `IsCanonicalSource` /
+    `ListCanonicalSources`. The backing maps are unexported
+    (`canonicalMetricKinds` and siblings) so external callers
+    cannot mutate the closed canon-guard sets at runtime; the
+    accessor helpers return fresh sorted slices that cannot
+    leak back into the underlying sets.
+  - `errors.go` -- structured `*Error` shape with `Kind`,
+    `Pos`, `Msg`, and an optional `Cause`. Sentinels `ErrLex`,
+    `ErrParse`, `ErrSemantic`, `ErrType`, `ErrBind`;
+    `errors.Is` walks both `Kind` and `Cause` via the Go 1.20+
+    multi-target Unwrap protocol so callers can branch on
+    either dimension against the same wrapped error.
+  - `cache.go` / `cache_test.go` -- `Cache` memoises compiled
+    `*Predicate` instances per `(policy_version_id, source)`
+    pair. Hot path is `RWMutex.RLock` + two map lookups + a
+    closed-channel receive (single-digit nanoseconds). The
+    miss path installs a per-entry placeholder under the cache
+    mutex and then RELEASES the mutex before calling
+    `Compile`, giving the cache singleflight de-duplication
+    on the SAME `(policy, source)` key while letting unrelated
+    compilations run concurrently.
+
+### Invariants pinned by tests
+
+- **Predicates are pure.** `Predicate.Eval` is a pure function
+  of its `Sample` argument -- no IO, no locks, no maps, no
+  resolver calls. `ThresholdResolver` is consulted ONCE per
+  `Compile`; the resolved `*Threshold` is captured on the
+  `ThresholdNode` and read directly during evaluation. Pinned
+  by `TestCache_ResolverConsultedOnlyOnMiss` (100 hot-path
+  hits after the initial miss invoke the resolver exactly 1
+  time) and `TestEval_DeterministicSameInputs` (the
+  `dsl-deterministic` Stage 5.4 test scenario).
+- **Closed-set canon-guard at parse time.** The parser rejects
+  any string literal on either side of a `metric_kind` /
+  `scope_kind` / `pack` / `source` comparison that is not in
+  the canonical set, with `ErrSemantic` and the offending
+  literal's `Position`. The
+  `dsl-rejects-unknown-metric-kind` Stage 5.4 test scenario
+  is the canonical case (`'lines_of_code'` rejected in favour
+  of `'loc'`). Pinned by the `unknown_metric_kind` /
+  `unknown_scope_kind` / `unknown_pack` / `unknown_source`
+  rows in `TestParser_RejectsMalformed` plus
+  `TestEval_StringOnLeft` (which exercises the canon-guard
+  with the literal on the LHS).
+- **Canonical metric_kind set matches the merged planning
+  artifacts.** `ListCanonicalMetricKinds()` enumerates the
+  three tiers pinned by architecture Sec 1.4 and the v1
+  ingested catalogue at implementation-plan line 31 /
+  tech-spec Sec 4.1.X lines 302-304: base (`cyclo`,
+  `cognitive_complexity`,
+  `loc`, `cycle_member`, `duplication_ratio`,
+  `modification_count_in_window`), solid (`lcom4`, `fan_in`,
+  `fan_out`, `depth_of_inheritance`, `interface_width`,
+  `coupling_between_objects`), system (`xrepo_dep_depth`,
+  `arch_debt_ratio`, `velocity_trend`, `arch_fitness`,
+  `blast_radius`, `xservice_test_reliability`,
+  `knowledge_index`), and ingested (`coverage_line_ratio`,
+  `coverage_branch_ratio`, `pass_first_try_ratio`). The
+  legacy aliases `coverage_line` / `coverage_branch` are
+  NEVER written and are rejected by the canon-guard. Pinned
+  by `TestThreshold_Validate_AcceptsAllCanonicalMetricKinds`
+  (ranges over the closed set), the
+  `unknown_metric_kind_coverage_line_alias` /
+  `unknown_metric_kind_coverage_branch_alias` rows in
+  `TestParser_RejectsMalformed`,
+  `TestThreshold_Validate_RejectsLegacyCoverageAliases`, and
+  `TestCompile_RejectsLegacyCoverageAlias_AtParseTime` (full
+  `Compile()` round-trip).
+- **`threshold('<uuid>')` triple-check.** A bound
+  `threshold(t)` atom evaluates true iff ALL of:
+  `sample.metric_kind == t.MetricKind`,
+  `sample.scope_kind == t.ScopeKind`, AND
+  `sample.value <op> t.Value` per `t.Op`. A `metric_kind` or
+  `scope_kind` mismatch returns false (not an error). Pinned
+  by `TestEval_ThresholdAtom` (mismatch cases on both
+  dimensions) and `TestEval_ThresholdCoversAllOps` (every
+  `ThresholdOp` against a fixed `Value=12` reading).
+- **`Bind` identity check on the resolved `Threshold`.** If a
+  resolver returns a `Threshold` whose `ThresholdID` does not
+  match the UUID requested by `threshold('<uuid>')`, `Bind`
+  returns `ErrBind` with the offending position rather than
+  silently binding the wrong row. Threshold rows are
+  immutable (architecture G3) and uniquely keyed by their own
+  `threshold_id`, so any mismatch indicates an upstream bug.
+  Pinned by `TestBind_RejectsMismatchedThresholdID`.
+- **`Bind` re-validates the resolved Threshold against the
+  canon-guard.** A `Threshold` row that somehow landed with a
+  non-canonical `metric_kind` is rejected at `Bind` time
+  rather than silently evaluated. Pinned by
+  `TestBind_InvalidThresholdMetricKindRejected`.
+- **Nil resolver is legal IFF no threshold() atom is
+  referenced.** Rule owners whose predicate carries no
+  `threshold('<uuid>')` atom do not need to synthesise an
+  empty resolver. Pinned by
+  `TestBind_NilResolverWithoutThresholdRefIsOK` /
+  `TestBind_NilResolverWithThresholdRefIsError`.
+- **Bool-literal operand symmetry.** `false == degraded`,
+  `true == false`, `degraded == false`, `true == true` all
+  parse identically: the parser reads a LEFT operand first and
+  then decides based on the next token whether it is a
+  standalone `bool_literal` atom or the start of a comparison.
+  Standalone field references (`degraded`, `metric_kind`,
+  ...) remain rejected -- the documented atom set includes
+  `bool_literal` but NOT `bool_field`. Pinned by
+  `TestParser_BoolLiteralSymmetric`,
+  `TestParser_RejectStandaloneBoolField`, and
+  `TestEval_BoolLiteralOnLeft`.
+- **`ErrLex` / `ErrParse` / `ErrSemantic` / `ErrType` /
+  `ErrBind` errors carry a non-zero `Position`.** The Stage
+  5.4 implementation-plan line 500 acceptance criterion
+  ("rejection of malformed ones with line/column error
+  messages") is enforced by `TestParser_RejectsMalformed`
+  (every error subcase asserts `Pos.IsZero() == false`) and
+  `TestParser_PositionPointsAtOffendingToken` (an unknown
+  metric_kind literal at column 16 reports `Pos{1, 16}`, not
+  the start of the predicate).
+- **Cache singleflight on the same key.** Many concurrent
+  callers requesting the SAME `(policy_version, source)`
+  de-duplicate via the per-entry `ready` channel: `Compile`
+  runs at most once and every caller returns the same
+  `*Predicate` pointer (and the same error). A naive
+  "release the mutex before Compile" without an in-flight
+  placeholder would allow every racing caller to compile
+  independently and would return distinct pointers. Pinned
+  by `TestCache_SingleFlightSameKey` (32 goroutines + a
+  blocking resolver: `resolver.lookups == 1`, all 32
+  `results[i] == results[0]`).
+- **Cache mutex is NOT held across `Compile`.** A slow
+  `ThresholdResolver.Lookup` on one `(policy, source)` does
+  NOT stall hits or compilations for an unrelated
+  `(policy, source)`. Pinned by
+  `TestCache_SlowMissDoesNotStallUnrelatedHits` (a
+  same-policy/different-source compile and a
+  different-policy compile both complete within 500ms while
+  the gated slow compile is still blocked inside the
+  resolver).
+- **Cache hot path is concurrent.** 32 goroutines x 100
+  iterations against a seeded cache observe `compileCount ==
+  1` and every caller observes the same `*Predicate`. Pinned
+  by `TestCache_HotPathIsConcurrent`.
+- **Cache errors are memoised.** A predicate that fails the
+  canon-guard returns the same error string on every
+  subsequent `GetOrCompile`; we do not retry a deterministic
+  parse failure on each rule-engine cycle. Pinned by
+  `TestCache_CachesErrors`.
+- **Per-policy isolation.** Cache entries for different
+  `policy_version_id` values are stored in independent inner
+  maps; `Cache.LenForPolicy` reports the per-policy count.
+  Pinned by `TestCache_PerPolicyIsolation` and
+  `TestCache_ConcurrentDistinctSources` (16 goroutines x 6
+  sources end with `LenForPolicy == 6`).
+- **`Cache.Invalidate` reclaims memory; it is not a
+  correctness boundary.** `PolicyVersion` rows are immutable
+  (architecture G5) so a `GetOrCompile` call that races with
+  `Invalidate` may re-install an entry for the invalidated
+  policy after `Invalidate` returns; this is acceptable
+  because re-compiling a "retired" policy is semantically
+  equivalent. Documented on `Cache.Invalidate`; pinned by
+  `TestCache_Invalidate` (drops the per-policy entry to zero
+  on the immediate hit path; an `Invalidate` of an unknown
+  policy is a no-op).
+- **Compile panic safety.** If `Compile` panics, the cache
+  captures the panic value as a synthetic
+  `internal: compile panicked: %v` error stored on
+  `entry.err` BEFORE closing `ready`. Concurrent waiters and
+  future lookups observe an error rather than re-panicking,
+  so a single buggy `Compile` cannot cascade into N goroutine
+  crashes under high fan-out. The panic still propagates out
+  of the ORIGINAL caller's frame so the bug surfaces loudly
+  in its stack trace. Documented on `cacheEntry` and
+  `Cache.GetOrCompile`.
+
+### Documentation
+
+- `docs/runbook.md` -- new "Predicate DSL evaluator (Stage
+  5.4)" section covering the grammar, the canonical
+  metric_kind / scope_kind / pack / source closed sets, the
+  `threshold('<uuid>')` triple-check, the per-
+  `policy_version_id` cache shape (hot path / miss path /
+  singleflight), the `ErrLex` / `ErrParse` / `ErrSemantic` /
+  `ErrType` / `ErrBind` error shape, and operator triage for
+  the common rejection cases (unknown metric_kind, mismatched
+  threshold_id, malformed UUID, type mismatch, unterminated
+  string).
+- `docs/rollout.md` -- new "Stage 5.4: Predicate DSL
+  evaluator" section. No migration required (the DSL is a
+  library-only addition consumed by the Stage 5.7 Rule
+  Engine); no env vars required; per-rollout verification
+  runs `go test ./internal/policy/dsl/... -race -count=1`.
+  Backout is a binary revert -- new `predicate_dsl` strings
+  that landed via `policy.publish_rulepack` remain in
+  PostgreSQL but the previous build does not compile them, so
+  the rule simply does not fire until the binary is
+  re-deployed.
+
+### Notes
+
+- The DSL is consumed by the Stage 5.7 Rule Engine, which is
+  out of scope for this workstream. The Rule Engine performs
+  the `metric_sample JOIN scope_binding` projection that
+  populates `Sample.ScopeKind` and wraps the policy's
+  `ThresholdRefs` in a `MapResolver` before handing the
+  `(policy_version_id, predicate_dsl)` pair to `Cache.GetOrCompile`.
+- `Predicate.Source()` returns the original DSL text so a
+  future Insights / admin surface can round-trip the active
+  rules into operator-facing output without keeping a parallel
+  string copy.
+
 ## Stage 2.2 -- iter 4 follow-ups (evaluator feedback resolution)
 
 ### Fixed

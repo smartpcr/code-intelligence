@@ -140,7 +140,7 @@ After deploying a new build, confirm:
          {
            "rule_id": "solid.srp.lcom4_high",
            "version": 1,
-           "predicate_dsl": "lcom4 > 0.7",
+           "predicate_dsl": "metric_kind == 'lcom4' AND value > 0.7",
            "severity_default": "block",
            "description_md": "High LCOM4 -- methods share little state."
          }
@@ -278,3 +278,135 @@ the migration-0003 `override` table). To back out:
 
 There is no DOWN-migration required for backout. The
 `override` table stays populated.
+
+
+## Stage 5.4: Predicate DSL evaluator
+
+### Migration
+
+**None required.** The Stage 5.4 work is a pure-Go library
+(`services/clean-code/internal/policy/dsl/`) consumed in-process
+by the Rule Engine (Stage 5.7). The DSL does not introduce a
+new table, a new ENUM, or a new index. The `predicate_dsl` text
+column already lives on `clean_code.rule` (shipped in migration
+0003 during Stage 1.4) and is written by `policy.publish_rulepack`
+(Stage 5.2).
+
+### Env vars
+
+**None.** The DSL has no IO -- no Postgres dependency, no KMS
+dependency, no HTTP client. The evaluator's purity contract
+("Predicates are pure functions over MetricSample rows -- no
+side effects, no IO", Stage 5.4 brief) means the deployment
+unit is the binary itself.
+
+### Pre-requisites
+
+This stage is consumed by the Stage 5.7 Rule Engine. The DSL
+itself is library-only and has no readiness check -- it ships
+"on" whenever the binary that links it ships. The only
+deployment dependency is the Stage 5.2 publish flow that
+populates `Rule.predicate_dsl`; without that, the Rule Engine
+has no predicates to compile.
+
+### Per-rollout verification
+
+After deploying a new build, confirm the DSL test suite passes
+against the binary's source tree (the tests are pure-Go and do
+NOT require Postgres or KMS to be wired):
+
+```bash
+cd services/clean-code
+go test ./internal/policy/dsl/... -race -count=1
+```
+
+The `-race` flag is **required**:
+`TestCache_HotPathIsConcurrent`,
+`TestCache_ConcurrentDistinctSources`,
+`TestCache_SlowMissDoesNotStallUnrelatedHits`, and
+`TestCache_SingleFlightSameKey` exercise the cache's
+concurrency contract and depend on the race detector to catch
+any regression that re-introduces a data race on the entry
+map or per-entry placeholder.
+
+Expected output:
+
+```text
+ok  github.com/microsoft/code-intelligence/services/clean-code/internal/policy/dsl   <duration>s
+```
+
+There is no HTTP smoke-test for Stage 5.4 because the DSL does
+not mount any verb. Smoke-testing the rule-execution path
+arrives with Stage 5.7 (Rule Engine); for Stage 5.4, "the
+binary compiles and the test suite is green" is the
+verification.
+
+### Canonical metric_kind catalogue
+
+The DSL canon-guard refuses any `metric_kind` literal outside
+the closed set pinned in
+`services/clean-code/internal/policy/dsl/sample.go`. Operators
+publishing a new rulepack should cross-reference the candidate
+predicates against this catalogue **before** running
+`policy.publish_rulepack`.
+
+**Where parse-time validation actually fires.** Stage 5.4 ships
+the parser as a pure library; the publish verb
+(`steward.PublishRulepack`,
+`services/clean-code/internal/policy/steward/steward.go:281-315`
+and `validatePublishRulepackRequest` at
+`services/clean-code/internal/policy/steward/steward.go:494-528`)
+does **not** invoke the DSL parser. It only enforces shape
+checks: non-empty `pack_id` / `display_name` / `rules`,
+non-empty `rule_id` and `predicate_dsl` per rule, no duplicate
+`(rule_id, version)`, and a valid `severity_default` ENUM. A
+rule whose `predicate_dsl` references a non-canonical alias
+will therefore publish successfully and the rulepack will land
+in PostgreSQL. The canon-guard fires LATER, when the Stage 5.7
+Rule Engine loads the rule and calls `dsl.Compile` (via
+`dsl.Cache.GetOrCompile`): compilation fails with `ErrSemantic`
+carrying the offending position, the cache records the failure
+under the policy version, and the rule stays **inactive** for
+that policy version instead of blocking decisions. Operators
+should treat publish success as "the row is durably stored",
+not "the predicate is valid"; pre-flight validation is the
+operator's responsibility until publish-time parse validation
+is wired in (tracked as a follow-up against the Stage 5.7
+Rule Engine workstream).
+
+The canonical v1 set is:
+
+- **base:** `cyclo`, `cognitive_complexity`, `loc`,
+  `cycle_member`, `duplication_ratio`,
+  `modification_count_in_window`
+- **solid:** `lcom4`, `fan_in`, `fan_out`,
+  `depth_of_inheritance`, `interface_width`,
+  `coupling_between_objects`
+- **system:** `xrepo_dep_depth`, `arch_debt_ratio`,
+  `velocity_trend`, `arch_fitness`, `blast_radius`,
+  `xservice_test_reliability`, `knowledge_index`
+- **ingested:** `coverage_line_ratio`,
+  `coverage_branch_ratio`, `pass_first_try_ratio`
+
+Legacy aliases `coverage_line` / `coverage_branch` /
+`lines_of_code` are **NEVER written** (implementation-plan
+line 31 negative clause) and are rejected by the canon-guard.
+
+### Backout
+
+Stage 5.4 is purely additive (a new Go package; no migrations,
+routes, env vars, or runtime state). To back out:
+
+1. Revert the binary to the previous build.
+2. Any `predicate_dsl` strings that landed via
+   `policy.publish_rulepack` on the new build remain in
+   PostgreSQL (append-only sub-store; G3 immutability). The
+   previous build does not compile them, so the corresponding
+   rules simply do not fire until the binary is re-deployed.
+3. No data is lost; no policy version needs to be retired.
+
+Because the DSL is library-only, there is no rollback
+sequencing concern. A previous binary that lacks the DSL
+package would have shipped without the Rule Engine consumer
+anyway (the Rule Engine arrives at Stage 5.7); a backout
+preceding Stage 5.7 is a no-op at the persistence layer.

@@ -239,7 +239,7 @@ without dashboard support.
     {
       "rule_id": "solid.srp.lcom4_high",
       "version": 1,
-      "predicate_dsl": "lcom4 > 0.7",
+      "predicate_dsl": "metric_kind == 'lcom4' AND value > 0.7",
       "severity_default": "block",
       "description_md": "High LCOM4 -- methods share little state."
     }
@@ -483,3 +483,236 @@ name is `mgmt.override`; the legacy path is still mounted at
 a body identifying the rename so operators scripting against an
 older draft contract learn of the change without getting a
 404.
+
+## Predicate DSL evaluator (Stage 5.4)
+
+### What
+
+`internal/policy/dsl/` is the parser + evaluator for the
+**predicate DSL** that lives on each `Rule.predicate_dsl` text
+column (architecture Sec 5.3.1 line 1101). Each rule's
+predicate is a boolean function over a `MetricSample` row; the
+Rule Engine (Stage 5.7) compiles the predicate once per
+`(policy_version_id, source)` pair, then re-evaluates it
+against every active sample for every SHA on the hot path.
+
+The package ships **no HTTP verb and no background goroutine**.
+It is a pure-Go library consumed in-process by the Rule Engine,
+so there is no readiness check, no env var, and no migration to
+roll out -- a binary that includes the DSL package is the
+deployment unit.
+
+### Grammar
+
+```text
+predicate      ::= or_expr
+or_expr        ::= and_expr ( "OR" and_expr )*
+and_expr       ::= not_expr ( "AND" not_expr )*
+not_expr       ::= "NOT" not_expr | atom
+atom           ::= "(" predicate ")"
+                |  threshold_call
+                |  comparison
+                |  bool_literal
+threshold_call ::= "threshold" "(" string_literal ")"
+comparison     ::= operand cmp_op operand
+cmp_op         ::= "==" | "!=" | ">" | ">=" | "<" | "<="
+operand        ::= field | string_literal | number_literal | bool_literal
+field          ::= "metric_kind" | "scope_kind" | "value"
+                |  "pack" | "source" | "degraded"
+```
+
+Precedence: `NOT` binds tightest, then `AND`, then `OR`.
+Parentheses override. Keywords `AND`/`OR`/`NOT` are
+case-insensitive (SQL convention); field names and string
+literals are case-sensitive (they match the database ENUM
+labels verbatim).
+
+Lexer details:
+
+- String literals are single-quoted (`'lcom4'`). Supported
+  escapes inside the string body: `\\`, `\'`, `\n`, `\t`.
+- Number literals: `'-'? [0-9]+ ( '.' [0-9]+ )?`. Scientific
+  notation is **not** supported in v1. Leading `-` is
+  consumed only when immediately followed by a digit, so
+  inline negative comparisons (`value < -0.5`) parse the
+  same way they would against a `velocity_trend` Threshold
+  row that stored a negative reading.
+- Comments: `#`-prefixed to end of line. Useful when a
+  `predicate_dsl` string is embedded in a YAML rulepack and
+  the author wants to annotate the rule.
+
+### Canonical closed sets
+
+The parser rejects any string literal on either side of a
+comparison whose field is one of `metric_kind`, `scope_kind`,
+`pack`, `source` and whose value is not in the canonical set.
+This is the **canon-guard** (the
+`dsl-rejects-unknown-metric-kind` Stage 5.4 test scenario).
+The canonical sets are pinned in
+`services/clean-code/internal/policy/dsl/sample.go`:
+
+| Field         | Canonical values                                                                                                                                                                                                                                                                                          |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `metric_kind` | base: `cyclo`, `cognitive_complexity`, `loc`, `cycle_member`, `duplication_ratio`, `modification_count_in_window`; solid: `lcom4`, `fan_in`, `fan_out`, `depth_of_inheritance`, `interface_width`, `coupling_between_objects`; system: `xrepo_dep_depth`, `arch_debt_ratio`, `velocity_trend`, `arch_fitness`, `blast_radius`, `xservice_test_reliability`, `knowledge_index`; ingested: `coverage_line_ratio`, `coverage_branch_ratio`, `pass_first_try_ratio` |
+| `scope_kind`  | `repo`, `package`, `file`, `class`, `interface`, `method`, `block`                                                                                                                                                                                                                                       |
+| `pack`        | `base`, `solid`, `system`, `ingested`                                                                                                                                                                                                                                                                    |
+| `source`      | `computed`, `derived`, `ingested`                                                                                                                                                                                                                                                                        |
+
+**Legacy aliases are NEVER written and are rejected:**
+`coverage_line` and `coverage_branch` (use the `_ratio`
+suffixed canonical names); `lines_of_code` (use `loc`).
+Implementation-plan line 31 pins the negative clause.
+
+### `threshold('<uuid>')` triple-check
+
+A `threshold('<uuid>')` atom references a `Threshold` row from
+the Policy / rules sub-store (architecture Sec 5.3.5) by its
+`threshold_id` UUID. The UUID **MUST** be in the active
+`PolicyVersion.ThresholdRefs` set -- the
+"application-layer FK" contract from migration 0003 line 462
+("the FK target is enforced by the writer, not by SQL"). The
+DSL `Bind` step enforces this at compile time so the hot path
+never errors on unresolved refs.
+
+A bound `threshold(t)` atom evaluates `true` iff ALL of:
+
+1. `sample.metric_kind == t.MetricKind`
+2. `sample.scope_kind == t.ScopeKind`
+3. `sample.value <op> t.Value` per `t.Op`
+
+A `metric_kind` or `scope_kind` mismatch returns `false`
+(not an error) -- a rule that fires on `lcom4` simply does
+not match a sample for `fan_in`. A missing `sample.value`
+(e.g. a degraded sample with `HasValue=false`) returns
+`false` rather than erroring; the Rule Engine separately
+records the `degraded` flag.
+
+`Bind` also rejects a resolver that returns a `Threshold`
+whose `ThresholdID` does not match the requested UUID --
+Threshold rows are immutable (architecture G3) and uniquely
+keyed by their own `threshold_id`, so any mismatch indicates
+an upstream bug.
+
+### Cache shape
+
+`Cache` memoises compiled `*Predicate` instances per
+`(policy_version_id, source string)` pair. The Stage 5.4
+brief: "Cache parsed predicates per `policy_version_id` so
+re-evaluation is hot-path cheap."
+
+- **Hot path:** `RWMutex.RLock` + two map lookups + a
+  closed-channel receive. Single-digit nanoseconds.
+- **Miss path:** install a per-entry placeholder under the
+  cache mutex, then RELEASE the mutex before calling
+  `Compile`. The actual parse + `ThresholdResolver.Lookup`
+  runs WITHOUT the cache mutex held.
+  - Concurrent compiles on DIFFERENT keys never block each
+    other (a slow resolver on one `(policy, source)` does
+    NOT stall hits or compiles for another).
+  - Concurrent compiles on the SAME `(policy, source)`
+    de-duplicate via the placeholder's `ready` channel
+    (the singleflight property): `Compile` runs at most
+    once per key and every caller returns the same
+    `*Predicate` (or the same error).
+- **`Invalidate`:** drops every entry for a policy version.
+  This is a **memory-reclamation hint**, not a hard
+  correctness boundary: a `GetOrCompile` that races with
+  `Invalidate` may re-install an entry for the invalidated
+  policy after `Invalidate` returns. This is acceptable
+  because `PolicyVersion` rows are immutable (G5), so a
+  re-compiled "retired" policy version is semantically
+  equivalent.
+- **Errors are cached.** A predicate that fails the
+  canon-guard returns the same `ErrSemantic` on every
+  subsequent `GetOrCompile` -- we do not retry a
+  deterministic parse failure on each Rule Engine cycle.
+- **Panics in `Compile` do not cascade.** If `Compile`
+  panics, the entry stores a synthetic
+  `internal: compile panicked: <value>` error and closes
+  `ready`; concurrent waiters and future lookups observe
+  an error rather than re-panicking. The panic still
+  propagates out of the original caller's frame so the bug
+  surfaces loudly in its stack trace.
+
+### Error shapes
+
+Every parse / bind failure returns a structured `*dsl.Error`
+with `Kind`, `Pos`, `Msg`, and (optionally) `Cause`. The
+canonical wire format is:
+
+```text
+dsl: <kind>: <line>:<column>: <message>
+```
+
+The `Kind` is one of:
+
+| Kind            | When                                                                                                                                                                                                                              |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dsl.ErrLex`    | Tokenizer failure: bare `=`, unterminated string literal, illegal character, unsupported escape, dangling `.` in a number.                                                                                                        |
+| `dsl.ErrParse`  | Syntactic failure: unexpected token, missing closing paren, trailing junk after the predicate, `threshold()` with no argument or a non-string argument, `AND` / `OR` with no RHS.                                                  |
+| `dsl.ErrSemantic` | Closed-set canon-guard failure: a `metric_kind` / `scope_kind` / `pack` / `source` literal that is not in the canonical set; an unknown field name in an operand position.                                                       |
+| `dsl.ErrType`   | Type-unification failure: a comparison whose operands have different static types (`value == 'foo'`), or an ordering operator on a non-numeric operand (`metric_kind > 'cyclo'`), or `degraded == 1`.                              |
+| `dsl.ErrBind`   | `Bind`-time failure: `threshold('<uuid>')` argument is not a valid UUID, or its UUID is not in the resolver's set (wraps `dsl.ErrUnknownThreshold`); the resolver returned a Threshold whose `ThresholdID` does not match the requested UUID; a resolver-returned Threshold fails the closed-set re-validation. |
+
+Callers branch with `errors.Is(err, dsl.ErrParse)` etc. When a
+`Bind` failure wraps an underlying cause (e.g.
+`ErrUnknownThreshold`), `errors.Is` matches both targets via
+the Go 1.20+ multi-target Unwrap protocol.
+
+The `Pos` field is **never zero** on a parse / bind failure --
+the Stage 5.4 implementation-plan line 500 acceptance
+criterion ("rejection of malformed ones with line/column
+error messages") is enforced by `TestParser_RejectsMalformed`
+and `TestParser_PositionPointsAtOffendingToken`.
+
+### Operator triage
+
+Common rule-engine error surfaces and how to recover:
+
+| Error message snippet                                | Likely cause                                                                                                                                                                                                          | Fix                                                                                                                                                                |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `unknown metric_kind "lines_of_code"`                | The rule pack used a non-canonical alias. The canonical name is `loc`.                                                                                                                                                | Re-publish the rulepack with `metric_kind == 'loc'`. The list of canonical names is printed in the error message.                                                  |
+| `unknown metric_kind "coverage_line"` (or `_branch`) | Legacy coverage-metric name. The v1 canon uses the `_ratio` suffix.                                                                                                                                                   | Re-publish with `coverage_line_ratio` / `coverage_branch_ratio`. The bare names are NEVER written by the Metric Ingestor (implementation-plan line 31).            |
+| `unknown scope_kind "function"`                      | The rule pack used a non-canonical scope kind. The canonical set is `repo, package, file, class, interface, method, block`.                                                                                           | Re-publish with the correct scope kind (probably `method`).                                                                                                        |
+| `type mismatch in comparison: number == string`      | A `value == '...'` comparison; the `value` field is numeric.                                                                                                                                                          | Quote-strip the literal (`value == 0`) or compare against a `string` field.                                                                                        |
+| `ordering operator > requires numeric operands`      | Using `<`, `<=`, `>`, `>=` on a string field (`metric_kind > 'cyclo'`).                                                                                                                                               | Use `==` / `!=` for closed-set string fields.                                                                                                                      |
+| `threshold('<uuid>') ...not a valid UUID`            | The string argument is not a UUID (typo or stale templating).                                                                                                                                                         | Re-publish the rulepack with a correctly-formatted UUID. Threshold rows are queried out of the Policy / rules sub-store.                                           |
+| `threshold('<uuid>') threshold_id not registered`    | The rule references a threshold UUID that is not in the active `PolicyVersion.ThresholdRefs`. The application-layer FK enforced by the Steward at publish time -- but a runtime drift indicates a stale policy view.   | Confirm the Steward holds the threshold row (the publish that registered it succeeded) and the resolver wired to `Compile` includes it. Re-activate the policy if needed. |
+| `threshold('<uuid>') resolver returned mismatched threshold_id` | A hand-rolled `ThresholdResolver` returned a row keyed by a different `threshold_id`. Threshold rows are immutable and uniquely keyed (architecture G3) -- silently binding the wrong row would gate the wrong predicate. | Triage the resolver implementation; the canonical `dsl.MapResolver` cannot trigger this because it keys by `threshold_id` and the row carries the same value.       |
+| `unterminated string literal`                        | A `'` was opened but never closed before EOF or a newline.                                                                                                                                                            | Close the string. Newlines inside literals are rejected -- use `\n` if the literal genuinely contains a newline.                                                   |
+| `expected '==' but got '=...'`                       | A bare `=` was used (typical paste from SQL `WHERE` clause).                                                                                                                                                          | Use `==` for equality. Boolean negation is `NOT`, not `!`.                                                                                                         |
+
+A predicate that fails to compile leaves its rule **inactive**
+in the Rule Engine -- the rule does not block any decision
+because it cannot be evaluated. Operators should treat a
+parse / bind error as a **deployment-blocking** condition
+because the safety-rule failed open. The Rule Engine surfaces
+the failure via its own emit channel (Stage 5.7); the DSL
+package itself does not log.
+
+### When to invalidate
+
+Stage 5.4 callers do **not** need to invalidate the cache on
+every rule edit. Each `PolicyVersion` row is immutable
+(architecture G5); a new edit produces a new
+`policy_version_id` and lands in a fresh inner map. The
+existing entries for the prior policy version stay valid
+until the operator explicitly retires that policy version,
+at which point `Cache.Invalidate(policy_version_id)` reclaims
+the inner map's memory. `Invalidate` does not stall in-flight
+compiles; it returns immediately and the freshly-installed
+inner map for any subsequent compile shadows the dropped one.
+
+### Verification: running the suite
+
+```bash
+cd services/clean-code
+go test ./internal/policy/dsl/... -race -count=1
+```
+
+The `-race` flag is required: `TestCache_HotPathIsConcurrent`,
+`TestCache_ConcurrentDistinctSources`,
+`TestCache_SlowMissDoesNotStallUnrelatedHits`, and
+`TestCache_SingleFlightSameKey` exercise the cache's
+concurrency contract and require the race detector to catch
+a regression that re-introduces a data race.

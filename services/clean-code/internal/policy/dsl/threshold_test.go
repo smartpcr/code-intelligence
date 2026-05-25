@@ -17,7 +17,7 @@ import (
 // + `coverage_branch_ratio` were missing).
 func TestThreshold_Validate_AcceptsAllCanonicalMetricKinds(t *testing.T) {
 	t.Parallel()
-	for mk := range CanonicalMetricKinds {
+	for _, mk := range ListCanonicalMetricKinds() {
 		mk := mk
 		t.Run(mk, func(t *testing.T) {
 			t.Parallel()

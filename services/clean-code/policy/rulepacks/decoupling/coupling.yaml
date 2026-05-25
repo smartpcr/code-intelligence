@@ -1,0 +1,117 @@
+# clean-code Stage 5.6 -- decoupling / coupling rule pack
+#
+# Architecture references:
+#   - Sec 1.3 "Decoupled functional areas" (CR1).
+#   - Sec 1.4.1 canonical metric_kinds (`architecture.md`
+#     lines 98-102):
+#       * `fan_in` (method, class, file): incoming references.
+#       * `fan_out` (method, class, file): outgoing references.
+#       * `coupling_between_objects` (class): CBO per Chidamber-
+#         Kemerer.
+#   - Sec 5.3.5 `threshold` rows: the v1 contract is that
+#     decoupling thresholds live in the `Threshold` catalog so
+#     operators can re-tune without republishing the rulepack
+#     itself (implementation-plan Stage 5.6 line 534 "with
+#     thresholds from `Threshold` rows").
+#
+# v1 scope-coverage decision:
+#   The architecture pins `fan_in` and `fan_out` as valid at
+#   THREE canonical scopes (method, class, file) but the
+#   decoupling rulepack ships ONE canonical Threshold row per
+#   metric_kind in v1, bound to `scope_kind=class`. Rationale:
+#     - Each `threshold('<uuid>')` atom binds to exactly one
+#       (metric_kind, scope_kind) pair (see `evalThreshold` in
+#       `dsl/evaluator.go`), so multi-scope coverage requires
+#       MULTIPLE rules / multiple Threshold rows, not one rule
+#       with a "scope union" predicate.
+#     - Class scope is the join-point that both Chidamber-Kemerer
+#       CBO and the SOLID DIP / OCP rules (Sec 3.5.1.b, .e) also
+#       analyse, so a class-scope fan_in / fan_out finding
+#       composes cleanly with the SOLID family.
+#     - Operators can extend coverage to method or file scope by
+#       seeding additional Threshold rows via the
+#       `steward.Store.InsertThreshold` primitive (used by
+#       migration tooling and per-deploy operator scripts;
+#       there is no `policy.*` write verb that mutates the
+#       Threshold catalogue in v1, per architecture Sec 6.5)
+#       and republishing this rulepack at `version=2` with
+#       extra rules that reference the new UUIDs. The canonical
+#       v1 set deliberately ships the minimum coverage the
+#       SOLID surface needs.
+#
+# Each predicate below is a single `threshold('<uuid>')` atom
+# (architecture Sec 5.3.5 + DSL grammar in `dsl/parser.go`).
+# The DSL `threshold(t)` atom evaluates true iff ALL of:
+#   - `sample.metric_kind == t.metric_kind`
+#   - `sample.scope_kind  == t.scope_kind`
+#   - `t.op.Compare(sample.value, t.value) == true`
+# so the metric_kind/scope_kind binding lives on the
+# referenced Threshold row, not in the predicate text. This
+# matches the implementation-plan Stage 5.6 wording "with
+# thresholds from `Threshold` rows" verbatim.
+#
+# Canonical threshold UUIDs (derived in
+# `policy/rulepacks/decoupling/thresholds.go` via
+# `uuid.NewV5(decoupling.Namespace, "<metric_kind>")` and
+# pinned by `TestCanonicalThresholdIDs_MatchYAML`):
+#   - 1e105766-3e02-5b49-b5be-49a787fd8e04 -- fan_in (class, >20)
+#   - d3a40d02-4b95-54c6-98fa-22793b425346 -- fan_out (class, >20)
+#   - fd6a0f05-ecbf-56cb-9e97-e6a83cc6a13e -- coupling_between_objects (class, >12)
+#
+# All three rules fire at severity=warn; the operator can
+# escalate via `mgmt.override` -> a higher-severity policy
+# version (Stage 5.3 mute / unmute lifecycle).
+#
+# pack_id convention: `<family>.<subname>` per the
+# `clean_code.rule_pack.pack_id` column comment in migration
+# `0003_policy_audit_refactor.up.sql` line 200. The
+# `decoupling` family groups cycles / coupling / duplication
+# so each file is its own rule_pack row keyed on
+# `(pack_id, version)` -- the family prefix `decoupling.*` is
+# a partition convention, not a literal pack_id.
+pack_id: decoupling.coupling
+version: 1
+display_name: Decoupling -- coupling thresholds
+description_md: |-
+  Three rules that watch the canonical coupling metric_kinds
+  (`fan_in`, `fan_out`, `coupling_between_objects`) and warn
+  when a scope's value exceeds the threshold pinned in
+  `clean_code.threshold`. Threshold UUIDs are seeded by
+  `decoupling.SeedThresholds` at bootstrap; the v1 default
+  cut-offs are 20 / 20 / 12 respectively. Operators re-tune
+  by inserting a new Threshold row and republishing this
+  rulepack at `version=2` against the new UUID.
+rules:
+  - rule_id: decoupling.fan_in_high
+    version: 1
+    predicate_dsl: "threshold('1e105766-3e02-5b49-b5be-49a787fd8e04')"
+    severity_default: warn
+    description_md: |-
+      Scope's `fan_in` exceeds the seeded threshold (v1
+      default: class scope, op=gt, value=20). Combined with
+      high `modification_count_in_window` this is the
+      canonical OCP smell (Sec 3.5.1.b); on its own it is a
+      coupling hot-spot that benefits from extracting a
+      stable interface.
+  - rule_id: decoupling.fan_out_high
+    version: 1
+    predicate_dsl: "threshold('d3a40d02-4b95-54c6-98fa-22793b425346')"
+    severity_default: warn
+    description_md: |-
+      Scope's `fan_out` exceeds the seeded threshold (v1
+      default: class scope, op=gt, value=20); the canonical
+      Shotgun Surgery smell. Suggested refactor: invert
+      dependencies (DIP) so the outgoing edges flow through
+      a single abstraction, or split the class along the
+      responsibility boundaries (SRP).
+  - rule_id: decoupling.cbo_high
+    version: 1
+    predicate_dsl: "threshold('fd6a0f05-ecbf-56cb-9e97-e6a83cc6a13e')"
+    severity_default: warn
+    description_md: |-
+      Class `coupling_between_objects` exceeds the seeded
+      threshold (v1 default: class scope, op=gt, value=12;
+      Chidamber-Kemerer banding). The class is entangled
+      with too many other classes; even a small change
+      tends to ripple. Suggested refactor: extract
+      collaborator interfaces and depend on the abstractions.

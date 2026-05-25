@@ -85,12 +85,18 @@ func TestRootMux_ListActiveMounted(t *testing.T) {
 // `docs/runbook.md` (Stage 5.3 "No signing-key precondition").
 func TestBuildPolicyWriter_ScaffoldModeProducesWriter(t *testing.T) {
 	t.Parallel()
-	pw, closeDB, err := buildPolicyWriter(nil, nil, nil)
+	pw, stew, store, closeDB, err := buildPolicyWriter(nil, nil, nil)
 	if err != nil {
 		t.Fatalf("buildPolicyWriter(nil, nil, nil): err=%v; want nil", err)
 	}
 	if pw == nil {
 		t.Fatalf("buildPolicyWriter(nil, nil, nil): writer is nil; want a real PolicyWriter (kill-switch contract)")
+	}
+	if stew == nil {
+		t.Fatalf("buildPolicyWriter(nil, nil, nil): steward is nil; want a real *steward.Steward so the decoupling Bootstrap path can wire onto the same instance the HTTP surface serves")
+	}
+	if store == nil {
+		t.Fatalf("buildPolicyWriter(nil, nil, nil): store is nil; want a real steward.Store so SeedThresholds can write")
 	}
 	if closeDB {
 		t.Errorf("buildPolicyWriter(nil, nil, nil): closeDB=true; want false (no db handle was opened)")
@@ -117,7 +123,7 @@ func TestBuildPolicyWriter_ScaffoldModeProducesWriter(t *testing.T) {
 func TestRootMux_ScaffoldModeOverrideMounted_200(t *testing.T) {
 	t.Parallel()
 
-	if _, _, err := buildPolicyWriter(nil, nil, nil); err != nil {
+	if _, _, _, _, err := buildPolicyWriter(nil, nil, nil); err != nil {
 		// Sanity check: the composition helper itself must
 		// succeed in scaffold mode. The wiring invariant is
 		// already pinned by TestBuildPolicyWriter_ScaffoldModeProducesWriter;

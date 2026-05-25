@@ -484,6 +484,79 @@ a body identifying the rename so operators scripting against an
 older draft contract learn of the change without getting a
 404.
 
+## SOLID rule packs (Stage 5.5)
+
+### What
+
+`cmd/clean-coded/main.go` calls `solid.Bootstrap(ctx, steward)`
+at startup, which publishes **5 SOLID rulepacks (9 rules total)**
+into the Policy Steward store via the same `RulePack` + `Rule`
+verbs that Stage 5.2 exposes externally. Bootstrap is
+idempotent: a re-run on a populated store reports
+`PublishedPacks == 0`.
+
+Rule inventory (`policy/rulepacks/solid/`):
+
+| Pack       | Rules | Inputs (`metric_kind`)                                                |
+| ---------- | ----- | --------------------------------------------------------------------- |
+| `solid.srp`| 2     | `lcom4` (class), `interface_width` (class)                            |
+| `solid.ocp`| 2     | `fan_in` (class), `modification_count_in_window` (file)               |
+| `solid.lsp`| 2     | `depth_of_inheritance` (class), `lsp_violation` (method, 0/1)         |
+| `solid.isp`| 1     | `interface_width` (interface)                                         |
+| `solid.dip`| 2     | `fan_out` (class), `coupling_between_objects` (class)                 |
+
+### Stage 2.4 producer dependency (LSP override rule)
+
+The `solid.lsp.override_violation` rule consumes
+`metric_kind='lsp_violation'` rows at `scope_kind='method'`,
+`value ∈ {0, 1}`. The producer of those rows is the
+**Stage 2.4 `recipes/lsp_violation.go` recipe** (Adapter,
+architecture Sec 3.2 + Sec 1.4.1 row 13), which is **scheduled
+but not yet implemented** -- see `implementation-plan.md`
+Stage 2.4 step "Implement `recipes/lsp_violation.go`"
+(line 221) and the two scoring scenarios
+`lsp-violation-strengthens-precondition` /
+`lsp-violation-compatible-override` (lines 232-233).
+
+Until Stage 2.4 lands, the LSP override rule is in **published
+but data-starved** state: it parses, signs, and serves on
+`policy.publish` like any other rule, but the rule engine
+finds zero `metric_kind='lsp_violation'` input rows in
+`clean_code.metric_sample` and therefore emits zero
+violations. The other 8 rules are unaffected and fire on
+the foundation metrics already produced by Stage 2.4 recipes
+(`lcom4`, `fan_in`, `fan_out`, `depth_of_inheritance`,
+`interface_width`, `coupling_between_objects`) and the
+Stage 2.6 materialiser (`modification_count_in_window`).
+
+Operators can confirm the data-starved state with:
+
+```bash
+psql "$CLEAN_CODE_PG_URL" -c "
+  SELECT count(*) FROM clean_code.metric_sample
+  WHERE metric_kind = 'lsp_violation';"
+```
+
+A `0` result before Stage 2.4 ships is expected. After Stage
+2.4 lands, the same query will return one row per overriding
+method analysed.
+
+### Configuration
+
+No new env vars. Bootstrap reuses the Stage 5.1 signing-key
+cache and Stage 5.2 RulePack writer; both must be ready
+(`/readyz` → 200) before bootstrap can publish.
+
+### Verification
+
+After deploy:
+
+```bash
+curl -fsS http://$POD:8080/v1/policy/rulepack/list_published \
+  | jq '[.packs[] | select(.pack_id | startswith("solid."))] | length'
+# 5
+```
+
 
 ## ingest.churn webhook -- scaffold mode (Stage 2.6 iter 6)
 

@@ -59,6 +59,7 @@ import (
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/repo_indexer"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/version"
 	"github.com/microsoft/code-intelligence/services/clean-code/policy/rulepacks/decoupling"
+	"github.com/microsoft/code-intelligence/services/clean-code/policy/rulepacks/solid"
 )
 
 // signingKeyCacheRefreshInterval is the cadence at which the
@@ -405,6 +406,52 @@ func run(args []string) error {
 		)
 	} else {
 		log.Warn("decoupling rulepacks NOT bootstrapped (scaffold mode: no signing key wired)")
+	}
+
+	// --- Stage 5.5 SOLID rulepack bootstrap ---
+	// When a real signing key is wired (production /
+	// production-like deploys), publish the five SOLID
+	// rulepacks (`solid.srp`, `solid.ocp`, `solid.lsp`,
+	// `solid.isp`, `solid.dip`) via
+	// `policy.publish_rulepack`. This realises the
+	// implementation-plan Stage 5.5 line 517 criterion "Each
+	// rulepack is signed and ingested via
+	// `policy.publish_rulepack` at startup if absent" AND the
+	// e2e scenario `solid-rulepacks-load` at the
+	// composition-root level. Bootstrap is idempotent --
+	// `steward.ErrDuplicateRulePack` / `ErrDuplicateRule` are
+	// treated as the benign "already bootstrapped" outcome, so
+	// every process boot calls it safely.
+	//
+	// Unlike the Stage 5.6 decoupling family, the SOLID
+	// family does NOT seed Threshold rows -- every cut-off is
+	// a literal in the YAML predicate text -- so this call
+	// takes only the Steward (no Store).
+	//
+	// In scaffold mode (`signer == nil`) the bootstrap is
+	// skipped because `steward.PublishRulepack` would refuse
+	// with `ErrNoActiveSigningKey`.
+	if signer != nil {
+		bootCtx, bootCancel := context.WithTimeout(ctx, 30*time.Second)
+		bootResult, bootErr := solid.Bootstrap(bootCtx, stew)
+		bootCancel()
+		if bootErr != nil {
+			log.Error("SOLID rulepack bootstrap failed",
+				"error", bootErr.Error(),
+				"published_packs", bootResult.PublishedPacks,
+				"published_rules", bootResult.PublishedRules,
+			)
+			if policyCloseDB && db != nil {
+				_ = db.Close()
+			}
+			return fmt.Errorf("policy/rulepacks/solid: Bootstrap: %w", bootErr)
+		}
+		log.Info("SOLID rulepacks bootstrapped",
+			"published_packs", bootResult.PublishedPacks,
+			"published_rules", bootResult.PublishedRules,
+		)
+	} else {
+		log.Warn("SOLID rulepacks NOT bootstrapped (scaffold mode: no signing key wired)")
 	}
 
 	// --- Stage 3.1 Repo Indexer wiring ---

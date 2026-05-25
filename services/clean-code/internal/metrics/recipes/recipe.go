@@ -14,15 +14,19 @@ import (
 // rows from Sec 1.4.1 rows 1-3, 10-12) OR [PackSolid] (the
 // lcom4 / fan_in / fan_out / depth_of_inheritance /
 // interface_width / coupling_between_objects rows from Sec
-// 1.4.1 rows 4-9); both are computed-tier emissions
-// (`source='computed'`). The [Pack] type exists so a
-// non-canonical literal (e.g. `"basic"`, `"foundation"`) is a
-// compile error rather than a string drift that lands in
-// PostgreSQL. The [newDraft] helper enforces the
-// `pack in {base, solid}` constraint at runtime; recipes
-// pin their per-row pack to a specific literal so per-recipe
-// tests catch a base recipe accidentally emitting `solid` (or
-// vice versa).
+// 1.4.1 rows 4-9 PLUS the `lsp_violation` row from Sec 1.4.1
+// row 13 -- the Liskov override-signature 0/1 indicator,
+// emitted by the Stage 2.4 `recipes/lsp_violation.go` recipe
+// at scope_kind `method`, the producer the Stage 5.5
+// `solid.lsp.override_violation` rule consumes); both packs
+// are computed-tier emissions (`source='computed'`). The
+// [Pack] type exists so a non-canonical literal (e.g.
+// `"basic"`, `"foundation"`) is a compile error rather than
+// a string drift that lands in PostgreSQL. The [newDraft]
+// helper enforces the `pack in {base, solid}` constraint at
+// runtime; recipes pin their per-row pack to a specific
+// literal so per-recipe tests catch a base recipe
+// accidentally emitting `solid` (or vice versa).
 type Pack string
 
 // Source is the closed enum of `MetricSample.source` values

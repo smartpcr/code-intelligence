@@ -209,6 +209,92 @@ Newest at the top. Stage references map to
   HMAC missing / valid / bad, constructor panic guards,
   JSON round-trip).
 
+## Stage 5.5 -- SOLID rulepack bootstrap
+
+### Added (iter 4)
+
+- **Operator-facing tracking docs for the Stage 2.4 producer
+  follow-up** (iter-3 evaluator residual item, non-blocking):
+    - `services/clean-code/docs/runbook.md` -- new "SOLID rule
+      packs (Stage 5.5)" section near the tail (~line 487+)
+      with the 5-pack/9-rule inventory table AND a dedicated
+      "Stage 2.4 producer dependency (LSP override rule)"
+      sub-section explaining the data-starved-state contract
+      and how to verify it via psql.
+    - `services/clean-code/docs/rollout.md` -- new "Stage 5.5:
+      SOLID rulepack bootstrap" section inserted between the
+      existing Stage 5.2 "Backout" and Stage 5.3 sections,
+      with the same inventory table, a "Stage 2.4 producer
+      dependency (carry-forward follow-up)" sub-section, and
+      per-rollout verification commands (`curl` against
+      `list_published`, `psql` count-by-pack).
+    - This CHANGELOG entry (Stage 5.5) itself. The dependency
+      is now recorded in **five** places so it cannot be
+      quietly dropped: architecture.md Sec 1.4.1 row 13,
+      implementation-plan.md Stage 2.4 line 221 + scenarios
+      lines 232-233, runbook.md Stage 5.5, rollout.md Stage 5.5,
+      and this CHANGELOG.
+- **No source/test edits this iter.** Iter 3 already shipped
+  the rulepack code, tests, bootstrap wiring, DSL canon-guard
+  entry, architecture/implementation-plan updates, and
+  producer-surface doc comment. Iter 4 closes the iter-3
+  evaluator's single residual "keep tracked" item by adding
+  operator-visible carry-forward notes in the docs the
+  workstream brief listed as targets (`runbook.md`,
+  `rollout.md`, `CHANGELOG.md`).
+
+### Added (iter 1-3)
+
+- **5 SOLID rulepack YAMLs** at
+  `services/clean-code/policy/rulepacks/solid/`:
+  `srp.yaml` (2 rules), `ocp.yaml` (2), `lsp.yaml` (2),
+  `isp.yaml` (1), `dip.yaml` (2) = **9 rules total**.
+- **Go infrastructure** in the same package: `loader.go`
+  (YAML -> steward.RulePack), `walk.go` (filesystem
+  enumeration), `bootstrap.go` (idempotent publish entry
+  point, returns `BootstrapResult{PublishedPacks,
+  PublishedRules, Packs}`).
+- **Bootstrap wired into the composition root** at
+  `services/clean-code/cmd/clean-coded/main.go`, called after
+  `decoupling.Bootstrap`.
+- **Tests** (25 in `solid_test.go` + `bootstrap_test.go`):
+  per-pack rule counts, DSL canonical-kind coverage,
+  scope/value contracts, the dual-rule LSP coverage
+  (`TestLSPRules_UseDITAndOverrideViolation` +
+  `TestLSPRule_FiresOnOverrideViolation`), and the
+  9-rules/5-packs bootstrap assertion
+  (`TestBootstrap_PublishesFivePacksAndNineRules`).
+- **DSL canon-guard expanded** at
+  `services/clean-code/internal/policy/dsl/sample.go` to
+  accept `lsp_violation` as a SOLID-pack canonical
+  `metric_kind` (architecture Sec 1.4.1 row 13, method scope,
+  0/1 boolean projection of the
+  `MetricSample.attrs_json.lsp_violation` fact).
+- **Recipe surface doc updated** at
+  `services/clean-code/internal/metrics/recipes/recipe.go`
+  Pack-enum docstring to enumerate the `lsp_violation` output
+  alongside the existing 6 SOLID-pack recipe outputs.
+- **Planning artifacts kept consistent**:
+  `docs/stories/code-intelligence-CLEAN-CODE/architecture.md`
+  Sec 1.4.1 row 13 added, Sec 3.5.1.c dual-encoding prose
+  extended; `implementation-plan.md` Stage 2.4 gained the
+  `recipes/lsp_violation.go` step + two scoring scenarios,
+  Stage 5.5 canonical-kinds scenario extended to 8 kinds.
+
+### Stage 2.4 dependency (carry-forward follow-up)
+
+`solid.lsp.override_violation` consumes
+`metric_kind='lsp_violation'` rows emitted by the Stage 2.4
+`recipes/lsp_violation.go` recipe. **That recipe is scheduled
+in `implementation-plan.md` Stage 2.4 line 221 but not yet
+implemented.** Until Stage 2.4 ships, the rule publishes and
+signs cleanly but evaluates against an empty input set --
+the operator-facing data-starved-state guidance lives in
+`docs/runbook.md` Stage 5.5 and `docs/rollout.md` Stage 5.5.
+The other 8 SOLID rules are independent of this dependency
+and operate on metric_kinds already produced by Stage 2.4
+foundation recipes and the Stage 2.6 materialiser.
+
 ## Stage 2.6 -- `modification_count_in_window` materialiser + Metric Ingestor coordinator
 
 ### Changed (iter 22)

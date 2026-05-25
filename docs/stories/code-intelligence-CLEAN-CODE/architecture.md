@@ -103,6 +103,7 @@ metric_kind)`.
 | 10 | `cycle_member` | file, package | base | 1 iff the scope participates in a strongly-connected component in the import graph; cycle id in `attrs_json`. Drives decoupling rule. |
 | 11 | `duplication_ratio` | file, package | base | Fraction of tokens that recur as a clone of length >= 50. |
 | 12 | `modification_count_in_window` | file, method | base | Count of touching commits in the last `PolicyVersion.refactor_weights.window_days` window (Section 5.3.3); materialised by the Metric Ingestor on `ingest.churn` arrival (Section 3.1 case 3, Section 3.5.1.b). |
+| 13 | `lsp_violation` | method | solid | AST-level Liskov override-signature indicator. `value=1` iff an overriding method strengthens its parent's precondition or weakens its postcondition (Section 3.5.1.c); `value=0` otherwise. Drives the LSP override rule. Emitted by Stage 2.4 (Adapter, Section 3.2) as a first-class `MetricSample` row -- this is the DSL-expressible projection of the same boolean fact also recorded in `MetricSample.attrs_json.lsp_violation` (the latter retained for forensics). The dual encoding mirrors `cycle_member` (row 10), which is likewise a 0/1 AST-derived structural metric_kind whose detail (the cycle id) lives in `attrs_json`. |
 
 #### 1.4.2 System tier (`pack='system'`)
 
@@ -515,7 +516,16 @@ foundation-tier metric kinds; it composes the metrics in Section
   (class) plus an AST-level "overrides parent precondition / weakens
   postcondition" predicate from the Adapter (Section 3.2). Recorded
   as a single boolean `lsp_violation` attribute on the
-  `MetricSample.attrs_json`.
+  `MetricSample.attrs_json` AND projected as a first-class
+  `metric_kind='lsp_violation'` row (Section 1.4.1 row 13,
+  `scope_kind='method'`, `value=0|1`) so the Policy DSL --
+  which exposes only the columnar `{metric_kind, scope_kind, pack,
+  source, value, degraded}` fields and not `attrs_json` -- can
+  consume the indicator directly. The dual encoding (attrs_json
+  boolean for forensics + projected `metric_kind` row for DSL
+  consumption) mirrors `cycle_member` (Section 1.4.1 row 10), which
+  also surfaces the structural fact as a 0/1 metric_kind while
+  retaining detail (the cycle id) on `attrs_json`.
 - **d. ISP (Interface Segregation).** Inputs: `interface_width`
   (class, interface), `fan_in` (interface). A wide interface
   consumed by a small subset of its methods is the smell.

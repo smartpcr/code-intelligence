@@ -213,6 +213,103 @@ migration 0003). To back out:
 There is no DOWN-migration step required for backout because
 the existing append-only rows do not block the prior build.
 
+## Stage 5.5: SOLID rulepack bootstrap
+
+### What changes at rollout
+
+`cmd/clean-coded/main.go` calls `solid.Bootstrap(ctx, steward)`
+after `decoupling.Bootstrap`, publishing **5 SOLID rulepacks /
+9 rules** via the same Steward verbs Stage 5.2 exposes
+externally. Bootstrap is idempotent: re-runs against an
+already-populated store report `PublishedPacks == 0` (see
+`policy/rulepacks/solid/bootstrap.go`).
+
+Inventory (matches the table in `docs/runbook.md` Stage 5.5):
+
+| Pack         | Rules                                                                       |
+| ------------ | --------------------------------------------------------------------------- |
+| `solid.srp`  | `solid.srp.lcom4_high`, `solid.srp.interface_width_high`                    |
+| `solid.ocp`  | `solid.ocp.fan_in_high`, `solid.ocp.modification_count_high`                |
+| `solid.lsp`  | `solid.lsp.depth_of_inheritance_high`, `solid.lsp.override_violation`       |
+| `solid.isp`  | `solid.isp.interface_width_high`                                            |
+| `solid.dip`  | `solid.dip.fan_out_high`, `solid.dip.coupling_between_objects_high`         |
+
+### Stage 2.4 producer dependency (carry-forward follow-up)
+
+`solid.lsp.override_violation` reads `metric_kind='lsp_violation'`
+at `scope_kind='method'`. That row is emitted by the **Stage 2.4
+`recipes/lsp_violation.go` recipe** (architecture Sec 1.4.1
+row 13, Sec 3.5.1.c dual encoding, implementation-plan Stage 2.4
+line 221).
+
+**The recipe is scheduled but not implemented yet.** Until
+Stage 2.4 lands, the rule publishes cleanly but fires zero
+violations because there are no input rows. The other 8 SOLID
+rules are independent of Stage 2.4's LSP step and operate on
+metric_kinds (`lcom4`, `fan_in`, `fan_out`,
+`depth_of_inheritance`, `interface_width`,
+`coupling_between_objects`, `modification_count_in_window`)
+that Stage 2.4 foundation recipes and Stage 2.6 materialiser
+already produce.
+
+Tracking handoff (this dependency is recorded in three places
+so it cannot be quietly dropped):
+
+1. `docs/stories/code-intelligence-CLEAN-CODE/architecture.md`
+   Sec 1.4.1 row 13 -- canonical catalogue declares the
+   metric_kind.
+2. `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`
+   Stage 2.4 step "Implement `recipes/lsp_violation.go`"
+   (line 221) plus the two e2e scoring scenarios
+   `lsp-violation-strengthens-precondition` and
+   `lsp-violation-compatible-override` (lines 232-233).
+3. This rollout note + `docs/runbook.md` Stage 5.5
+   (operator-facing data-starved-state guidance).
+
+### Per-rollout verification
+
+After deploying a build that includes Stage 5.5:
+
+```bash
+curl -fsS http://$POD:8080/v1/policy/rulepack/list_published \
+  | jq '[.packs[] | select(.pack_id | startswith("solid."))] | length'
+# 5
+```
+
+```bash
+psql "$CLEAN_CODE_PG_URL" -c \
+  "SELECT pack_id, count(*) FROM clean_code.rule
+   WHERE pack_id LIKE 'solid.%' GROUP BY pack_id ORDER BY pack_id;"
+#  solid.dip | 2
+#  solid.isp | 1
+#  solid.lsp | 2
+#  solid.ocp | 2
+#  solid.srp | 2
+```
+
+A row count of `0` for `solid.lsp` after deploy means
+bootstrap failed -- check `/readyz` for the signing-key cache
+(Stage 5.1) and the Steward writer (Stage 5.2). A count of
+`2` confirms both LSP rules published;
+`solid.lsp.override_violation` will sit data-starved until
+Stage 2.4 ships.
+
+### Backout
+
+Stage 5.5 is purely additive (new `rule_pack` + `rule` rows
+under the existing migration-0003 schema). To back out:
+
+1. Restart the pod with a build that does not call
+   `solid.Bootstrap`; the new rows remain (append-only) but
+   no new SOLID rules are published.
+2. Any policy already activated that referenced a `solid.*`
+   rule continues to evaluate against the persisted `rule`
+   row (the references are JSON-FK by `(rule_id, version)`,
+   not Go-link by symbol).
+
+There is no DOWN-migration required for backout. The
+`solid.*` rows stay populated.
+
 
 ## Stage 5.3: `mgmt.override` write verb
 

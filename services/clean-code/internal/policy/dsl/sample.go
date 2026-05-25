@@ -87,6 +87,27 @@ var CanonicalMetricKinds = map[string]struct{}{
 	"depth_of_inheritance":     {},
 	"interface_width":          {},
 	"coupling_between_objects": {},
+	// LSP override-signature signal (architecture Sec 1.4.1
+	// row 13 and Sec 3.5.1.c lines 514-525). `lsp_violation`
+	// is a first-class canonical metric_kind at `scope_kind=
+	// 'method'`, `pack='solid'`, `source='computed'` with
+	// `value=1` when an overriding method strengthens its
+	// parent's precondition or weakens its postcondition (an
+	// LSP-violating override) and `value=0` otherwise. The
+	// producer is the Stage 2.4 `recipes/lsp_violation.go`
+	// recipe (implementation-plan Stage 2.4) -- it ALSO
+	// stamps the same boolean on `MetricSample.attrs_json.
+	// lsp_violation` for forensics, exactly mirroring the
+	// `cycle_member` dual-encoding precedent (above, row 10:
+	// 0/1 metric_kind + `attrs_json.cycle_id` detail). The
+	// DSL only exposes the columnar fields
+	// `{metric_kind, scope_kind, pack, source, value,
+	// degraded}` -- not `attrs_json` -- so the projected
+	// `metric_kind` row is the path the Stage 5.5 LSP
+	// override rule (`solid.lsp.override_violation`)
+	// consumes. The architecture Sec 1.4.1 row 13 entry is
+	// the normative declaration; this map mirrors it.
+	"lsp_violation": {},
 	// System tier / pack=system (architecture Sec 1.4.2).
 	"xrepo_dep_depth":           {},
 	"arch_debt_ratio":           {},

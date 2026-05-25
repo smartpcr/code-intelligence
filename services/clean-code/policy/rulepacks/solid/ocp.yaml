@@ -1,0 +1,124 @@
+# clean-code Stage 5.5 -- SOLID / Open-Closed rule pack
+#
+# Architecture references:
+#   - Sec 1.3 "SOLID coding principles" (goal 2): the OCP
+#     smell is a class that ought to be closed for
+#     modification but is in fact frequently edited AND
+#     widely depended-on.
+#   - Sec 1.4.1 canonical metric_kinds:
+#       * line 98 `fan_in` (method, class, file scope,
+#         pack=solid): "Number of incoming call sites.
+#         Drives OCP / DIP rules."
+#       * line 105 `modification_count_in_window` (file,
+#         method scope, pack=base): "Count of touching
+#         commits in the last
+#         `PolicyVersion.refactor_weights.window_days`
+#         window".
+#   - Sec 3.5.1.b SOLID input recipe for OCP: "Inputs:
+#     `fan_in` (class), `modification_count_in_window`
+#     (class). A class that is widely depended-on
+#     (`fan_in >= threshold`) and frequently edited
+#     (`modification_count_in_window >= threshold`) is the
+#     canonical OCP smell." Note: the Sec 1.4.1 row pins
+#     `modification_count_in_window` to `file, method` scope;
+#     the Sec 3.5.1.b "class" wording reflects that the Rule
+#     Engine (Stage 5.7) joins file-scope churn to the
+#     contained classes when composing the canonical OCP
+#     finding. The v1 RULE here therefore fires on FILE
+#     scope (the canonical materialiser scope) and the engine
+#     composes the class-level smell downstream.
+#   - tech-spec Sec 4.3 (SOLID rule packs, lines 341-351):
+#     "OCP joins on `fan_in` (architecture Sec 1.4.1 row 5
+#     brief)". The OCP rulepack inputs are exactly
+#     `{fan_in, modification_count_in_window}` -- NOT
+#     `depth_of_inheritance` (which drives LSP, not OCP;
+#     the iter-1 evaluator item 10 canon-guard against this
+#     drift is enforced by `TestOCPRules_UsesFanInAndModificationCount`
+#     in `solid_test.go`).
+#
+# # Why two rules and not one compound predicate
+#
+# The DSL evaluator operates on a single [dsl.Sample] at a
+# time; there is no cross-sample join. The OCP "AND" smell
+# ("class is widely depended-on AND frequently edited") is
+# therefore composed by the Stage 5.7 Rule Engine from the
+# two input signals defined here. Each rule fires at
+# severity=warn on its own; the engine elevates to a
+# class-level OCP finding when both fire on the same scope
+# in the same SHA.
+#
+# # Threshold rationale (v1 defaults)
+#
+#   - fan_in >= 20: a class with 20+ incoming call sites is
+#     "widely depended-on" by the Chidamber-Kemerer
+#     fan-coupling band (same cut-off the decoupling family
+#     uses for fan_in via `decoupling/thresholds.go`;
+#     intentional alignment so a finding on this rule
+#     correlates with the decoupling.fan_in_high finding).
+#   - modification_count_in_window >= 10: 10+ touching
+#     commits inside the policy's `window_days` window (per
+#     `PolicyVersion.refactor_weights.window_days`,
+#     architecture Sec 5.3.3) marks the file as a churn
+#     hot-spot. The Refactor Planner (Stage 6) uses the same
+#     signal to rank hot-spots for the
+#     `extract_method_responsibility` task kind.
+#
+# # Materialiser dependency (NOT in Stage 2.4)
+#
+# The `modification_count_in_window` materialiser is the
+# Stage 2.6 metric ingestor recipe (see implementation-plan
+# Stage 5.5 Dependencies line 523:
+# `stage-modification-count-in-window-materialiser`). Per
+# iter-1 evaluator item 10 the dependency lives HERE in the
+# RULE definition (this pack consumes the materialised
+# samples), NOT in the Stage 2.4 SOLID-pack-foundation
+# recipe stage -- Stage 2.4 owns lcom4 / fan_in /
+# depth_of_inheritance / interface_width / CBO, NOT the
+# churn-derived count.
+#
+# # pack_id convention
+#
+# `<family>.<subname>` per migration
+# `0003_policy_audit_refactor.up.sql` line 200; mirrors the
+# `solid.srp`, `solid.dip` examples named there.
+pack_id: solid.ocp
+version: 1
+display_name: SOLID -- Open-Closed
+description_md: |-
+  Two input rules feeding the canonical OCP smell: a class
+  widely depended-on (`fan_in` high) AND frequently edited
+  (`modification_count_in_window` high). The rules fire
+  independently at severity=warn; the Stage 5.7 Rule Engine
+  composes the class-level smell by joining same-SHA hits
+  on the same scope tree (file -> contained classes).
+
+  Inputs are exactly `{fan_in, modification_count_in_window}`
+  -- NOT `depth_of_inheritance`, which is the LSP signal.
+rules:
+  - rule_id: solid.ocp.fan_in_high
+    version: 1
+    predicate_dsl: "metric_kind == 'fan_in' AND scope_kind == 'class' AND value >= 20"
+    severity_default: warn
+    description_md: |-
+      Class `fan_in` >= 20 -- the class is widely
+      depended-on. On its own this is a coupling hot-spot;
+      combined with high `modification_count_in_window` on
+      the containing file it is the canonical OCP smell:
+      a class that ought to be closed for modification is
+      being routinely edited despite many call sites
+      depending on its current shape.
+  - rule_id: solid.ocp.modification_count_high
+    version: 1
+    predicate_dsl: "metric_kind == 'modification_count_in_window' AND scope_kind == 'file' AND value >= 10"
+    severity_default: warn
+    description_md: |-
+      File `modification_count_in_window` >= 10 -- the file
+      was touched in 10+ commits inside the policy's
+      `window_days` window (architecture Sec 5.3.3). Marks
+      the file as a churn hot-spot; combined with a widely
+      depended-on class inside the file (high `fan_in`) it
+      is the canonical OCP smell. Suggested refactor:
+      stabilise the public contract via the Open-Closed
+      Principle (extract abstract base / strategy / template
+      method patterns) so further behaviour changes do not
+      modify the existing class.

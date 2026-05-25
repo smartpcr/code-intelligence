@@ -49,6 +49,7 @@ import (
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/health"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/logging"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/management"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/keys"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/steward"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/version"
@@ -105,6 +106,15 @@ func run(args []string) error {
 		"refactor_effort_source", cfg.RefactorEffortSource,
 		"kms_provider", cfg.KMSProvider,
 	)
+
+	// Construct the canonical Stage 2.3 base-pack metric
+	// recipe registry and emit the startup log line listing
+	// the registered recipes (implementation-plan Stage 2.3
+	// line 201). The registry is constructed unconditionally
+	// so the startup snapshot lands in every boot's log even
+	// before the Compute Engine wiring (later stages) consumes
+	// the registry to dispatch recipes per AstFile.
+	_ = recipes.DefaultRegistryWithLog(log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

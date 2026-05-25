@@ -329,16 +329,20 @@ func InitializeScenario_repo_indexer_and_metric_ingestor_repo_indexer_and_commit
 	ctx.Step(`^no value "([^"]*)" exists in the enum$`, enumState.noValueExistsInTheEnum)
 
 	// --- Scenario: new-sha-inserts-pending ---
+	// shaState is only used by the new-sha-inserts-pending scenario. The
+	// commit-states-only-canonical scenario uses enumState above and does
+	// not touch the indexer DB connection, so we only allocate shaState
+	// for the scenario that actually needs it. The @setup-compose tag is
+	// declared at the Feature level and applies to all scenarios, so it
+	// cannot distinguish between them; we gate on scenario name instead.
 	var shaState *newSHAState
 
 	ctx.Before(func(bctx context.Context, sc *godog.Scenario) (context.Context, error) {
-		for _, tag := range sc.Tags {
-			if tag.Name == "@setup-compose" {
-				// This scenario needs the full compose stack.
-				break
-			}
+		if sc.Name == "new-sha-inserts-pending" {
+			shaState = newNewSHAState()
+		} else {
+			shaState = nil
 		}
-		shaState = newNewSHAState()
 		return bctx, nil
 	})
 

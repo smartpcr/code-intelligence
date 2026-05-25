@@ -29,13 +29,23 @@ func requireEnv(t *testing.T, name string) string {
 }
 
 // serviceRoot returns the absolute path to the services/clean-code
-// directory by walking up from this source file's location.
-func serviceRoot() string {
-	_, thisFile, _, _ := runtime.Caller(0)
+// directory by walking up from this source file's location. It returns
+// an error if runtime.Caller cannot recover the source path (e.g. the
+// binary was stripped of debug info) or if filepath.Abs fails, so that
+// callers surface a clear root-cause error instead of operating on an
+// empty/wrong path.
+func serviceRoot() (string, error) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		return "", fmt.Errorf("serviceRoot: runtime.Caller(0) failed to recover source file path")
+	}
 	dir := filepath.Dir(thisFile)
 	root := filepath.Join(dir, "..", "..", "..")
-	abs, _ := filepath.Abs(root)
-	return abs
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("serviceRoot: resolving absolute path for %q: %w", root, err)
+	}
+	return abs, nil
 }
 
 // readModulePath extracts the module path from go.mod in dir.
@@ -145,14 +155,22 @@ type modCountMaterialiserState struct {
 }
 
 func (s *modCountMaterialiserState) churnRowsForScopeDatedWithinTheLast90Days(scope string) error {
-	s.svcRoot = serviceRoot()
+	root, err := serviceRoot()
+	if err != nil {
+		return fmt.Errorf("resolving service root: %w", err)
+	}
+	s.svcRoot = root
 	s.scope = scope
 	s.withinDays = true
 	return nil
 }
 
 func (s *modCountMaterialiserState) churnRowsForScopeDatedOlderThan90Days(scope string) error {
-	s.svcRoot = serviceRoot()
+	root, err := serviceRoot()
+	if err != nil {
+		return fmt.Errorf("resolving service root: %w", err)
+	}
+	s.svcRoot = root
 	s.scope = scope
 	s.withinDays = false
 	return nil
@@ -330,7 +348,10 @@ func InitializeScenario_ast_adapter_and_foundation_tier_compute_modification_cou
 // ---------------------------------------------------------------------------
 
 func TestE2E_ast_adapter_and_foundation_tier_compute_modification_count_in_window_materialiser(t *testing.T) {
-	svcRoot := serviceRoot()
+	svcRoot, err := serviceRoot()
+	if err != nil {
+		t.Fatalf("resolving service root: %v", err)
+	}
 	if !materProbeExists(svcRoot) {
 		t.Skip("internal/metrics/materialisers package not found; skipping until impl branch lands")
 	}

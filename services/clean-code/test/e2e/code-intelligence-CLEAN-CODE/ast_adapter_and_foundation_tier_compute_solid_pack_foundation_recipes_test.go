@@ -4,7 +4,9 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,9 +15,16 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cucumber/godog"
 )
+
+// probeTimeout bounds how long a single `go run` probe may take, including
+// any first-run module download/build. CI runners that stall on module proxy
+// fetches or filesystem locks must surface as a test failure rather than a
+// silent hang that eventually trips the outer test runner's hard kill.
+const probeTimeout = 2 * time.Minute
 
 // requireEnv returns the value of the named environment variable,
 // calling t.Skip when unset or empty.
@@ -72,7 +81,10 @@ func readModulePath(dir string) (string, error) {
 }
 
 // runProbe compiles and executes a small Go program within the service
-// module, returning its combined stdout/stderr and exit code.
+// module, returning its combined stdout/stderr and exit code. The probe
+// is bounded by probeTimeout so a hung `go run` (e.g. module proxy stall
+// or build cache contention) fails fast in CI instead of dangling until
+// the surrounding test harness kills the run.
 func runProbe(svcRoot, source string) (string, int, error) {
 	tmpDir, err := os.MkdirTemp(svcRoot, "e2e-solid-recipe-probe-")
 	if err != nil {
@@ -89,7 +101,10 @@ func runProbe(svcRoot, source string) (string, int, error) {
 		return "", -1, fmt.Errorf("relative path: %w", err)
 	}
 
-	cmd := exec.Command("go", "run", "./"+filepath.ToSlash(relDir))
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "go", "run", "./"+filepath.ToSlash(relDir))
 	cmd.Dir = svcRoot
 	cmd.Env = os.Environ()
 
@@ -99,6 +114,13 @@ func runProbe(svcRoot, source string) (string, int, error) {
 
 	exitCode := 0
 	if err := cmd.Run(); err != nil {
+		// If the context deadline fired, surface that explicitly so the
+		// caller sees a timeout error rather than a generic non-zero exit.
+		// CommandContext kills the child on deadline, which usually arrives
+		// here as an *exec.ExitError; check ctx.Err() to disambiguate.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return buf.String(), -1, fmt.Errorf("probe timed out after %s; combined output:\n%s", probeTimeout, buf.String())
+		}
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 		} else {
@@ -210,7 +232,7 @@ type lcom4KnownValueState struct {
 	value   int
 }
 
-func (s *lcom4KnownValueState) aJavaClassFixtureWithTwoDisjointMethodClustersSharingNoFields() error {
+func (s *lcom4KnownValueState) aJavaClassFixtureWithTwoDisjointMethodClustersShareingNoFields() error {
 	s.svcRoot = serviceRoot()
 	return nil
 }
@@ -464,7 +486,7 @@ func InitializeScenario_ast_adapter_and_foundation_tier_compute_solid_pack_found
 	ctx.Step(`^the metric_kinds are exactly "([^"]*)"$`, reg.theMetricKindsAreExactly)
 
 	// lcom4-class-known-value
-	ctx.Step(`^a Java class fixture with two disjoint method clusters sharing no fields$`, lcom4.aJavaClassFixtureWithTwoDisjointMethodClustersSharingNoFields)
+	ctx.Step(`^a Java class fixture with two disjoint method clusters sharing no fields$`, lcom4.aJavaClassFixtureWithTwoDisjointMethodClustersShareingNoFields)
 	ctx.Step(`^the lcom4 recipe runs$`, func() error {
 		err := lcom4.theLcom4RecipeRuns()
 		if err == nil {

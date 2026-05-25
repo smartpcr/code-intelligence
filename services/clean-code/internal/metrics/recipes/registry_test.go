@@ -11,19 +11,28 @@ import (
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
 
-// TestDefaultRegistry_BaseRecipesOnlyCanonicalKinds is
-// implementation-plan Stage 2.3 scenario
-// `base-recipes-only-canonical-kinds` (line 208): the
-// registry after init lists EXACTLY
-// `{cyclo, cognitive_complexity, loc}`. Forbidden aliases
-// (`cyclomatic_complexity`, `lines_of_code`,
-// `function_length`, `parameter_count`, `nesting_depth`) MUST
-// NOT appear.
-func TestDefaultRegistry_BaseRecipesOnlyCanonicalKinds(t *testing.T) {
+// TestDefaultRegistry_FoundationTierRecipes is the
+// implementation-plan Stage 2.3 + 2.4 scenario
+// `foundation-tier-recipes-only-canonical-kinds` (lines 208,
+// 221): the registry after init lists EXACTLY the six
+// foundation-tier metric_kinds in sorted order --
+// `{cognitive_complexity, cyclo, fan_in, fan_out, lcom4,
+// loc}`. Forbidden aliases (`cyclomatic_complexity`,
+// `lines_of_code`, `function_length`, `parameter_count`,
+// `nesting_depth`, `incoming_calls`, `outgoing_calls`,
+// `cohesion`) MUST NOT appear.
+func TestDefaultRegistry_FoundationTierRecipes(t *testing.T) {
 	t.Parallel()
 	reg := recipes.DefaultRegistry()
 	got := reg.MetricKinds()
-	want := []string{"cognitive_complexity", "cyclo", "loc"}
+	want := []string{
+		"cognitive_complexity",
+		"cyclo",
+		"fan_in",
+		"fan_out",
+		"lcom4",
+		"loc",
+	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("DefaultRegistry().MetricKinds() = %v, want %v", got, want)
 	}
@@ -31,6 +40,8 @@ func TestDefaultRegistry_BaseRecipesOnlyCanonicalKinds(t *testing.T) {
 	forbidden := []string{
 		"cyclomatic_complexity", "lines_of_code", "function_length",
 		"parameter_count", "nesting_depth", "cognitive",
+		"incoming_calls", "outgoing_calls", "cohesion",
+		"fanin", "fan-in", "fanout", "fan-out",
 	}
 	for _, bad := range forbidden {
 		if reg.Lookup(bad) != nil {
@@ -45,10 +56,17 @@ func TestDefaultRegistry_BaseRecipesOnlyCanonicalKinds(t *testing.T) {
 func TestDefaultRegistry_DispatchByMetricKind(t *testing.T) {
 	t.Parallel()
 	reg := recipes.DefaultRegistry()
-	for _, k := range []string{"cyclo", "cognitive_complexity", "loc"} {
+	for _, k := range []string{
+		"cyclo",
+		"cognitive_complexity",
+		"loc",
+		"lcom4",
+		"fan_in",
+		"fan_out",
+	} {
 		r := reg.Lookup(k)
 		if r == nil {
-			t.Errorf("Lookup(%q) returned nil; canonical base-pack recipe missing", k)
+			t.Errorf("Lookup(%q) returned nil; canonical foundation-tier recipe missing", k)
 			continue
 		}
 		if got := r.MetricKind(); got != k {
@@ -129,17 +147,17 @@ func TestRegistry_NilSafeLookup(t *testing.T) {
 // composition root MUST be able to emit one structured log
 // line listing every registered recipe at startup. The line
 // is required so operator-side observability can confirm
-// "this binary booted with these three base-pack recipes"
+// "this binary booted with these foundation-tier recipes"
 // against the `recipe_manifest` row architecture Sec 1.5
 // pins.
 //
 // The test captures the line into an in-memory JSON handler
 // and asserts:
 //   - the line's message is the canonical "metric recipes registered" string,
-//   - the line's count == 3 (the Stage 2.3 base pack),
-//   - the line lists ALL three metric_kinds in sorted order,
+//   - the line's count == 6 (the Stage 2.3 base pack + Stage 2.4 SOLID foundation),
+//   - the line lists ALL six metric_kinds in sorted order,
 //   - the line lists matching `metric_kind_versions` tokens,
-//   - the line carries pack='base' / source='computed'.
+//   - the line carries packs=['base','solid'] (sorted distinct) / source='computed'.
 func TestRegistry_LogRegistered_EmitsStartupLine(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
@@ -159,24 +177,40 @@ func TestRegistry_LogRegistered_EmitsStartupLine(t *testing.T) {
 	if got := rec["component"]; got != "recipes.registry" {
 		t.Errorf("component=%v, want %q", got, "recipes.registry")
 	}
-	if got := rec["count"]; got != float64(3) {
-		t.Errorf("count=%v, want 3 (Stage 2.3 base pack: cyclo, cognitive_complexity, loc)", got)
-	}
-	if got := rec["pack"]; got != "base" {
-		t.Errorf("pack=%v, want %q", got, "base")
+	if got := rec["count"]; got != float64(6) {
+		t.Errorf("count=%v, want 6 (Stage 2.3 base + Stage 2.4 SOLID: cyclo, cognitive_complexity, loc, lcom4, fan_in, fan_out)", got)
 	}
 	if got := rec["source"]; got != "computed" {
 		t.Errorf("source=%v, want %q", got, "computed")
 	}
+	packs, _ := rec["packs"].([]any)
+	wantPacks := []any{"base", "solid"}
+	if !reflect.DeepEqual(packs, wantPacks) {
+		t.Errorf("packs=%v, want %v (sorted distinct)", packs, wantPacks)
+	}
 	// metric_kinds and metric_kind_versions are emitted as
 	// slices; JSON decodes them as []interface{}.
 	kinds, _ := rec["metric_kinds"].([]any)
-	wantKinds := []any{"cognitive_complexity", "cyclo", "loc"}
+	wantKinds := []any{
+		"cognitive_complexity",
+		"cyclo",
+		"fan_in",
+		"fan_out",
+		"lcom4",
+		"loc",
+	}
 	if !reflect.DeepEqual(kinds, wantKinds) {
 		t.Errorf("metric_kinds=%v, want %v (sorted)", kinds, wantKinds)
 	}
 	versions, _ := rec["metric_kind_versions"].([]any)
-	wantVersions := []any{"cognitive_complexity:v1", "cyclo:v1", "loc:v1"}
+	wantVersions := []any{
+		"cognitive_complexity:v1",
+		"cyclo:v1",
+		"fan_in:v1",
+		"fan_out:v1",
+		"lcom4:v1",
+		"loc:v1",
+	}
 	if !reflect.DeepEqual(versions, wantVersions) {
 		t.Errorf("metric_kind_versions=%v, want %v", versions, wantVersions)
 	}
@@ -228,7 +262,15 @@ func TestDefaultRegistryWithLog_LogsAndReturns(t *testing.T) {
 	if reg == nil {
 		t.Fatalf("DefaultRegistryWithLog returned nil")
 	}
-	if got, want := reg.MetricKinds(), []string{"cognitive_complexity", "cyclo", "loc"}; !reflect.DeepEqual(got, want) {
+	want := []string{
+		"cognitive_complexity",
+		"cyclo",
+		"fan_in",
+		"fan_out",
+		"lcom4",
+		"loc",
+	}
+	if got := reg.MetricKinds(); !reflect.DeepEqual(got, want) {
 		t.Errorf("MetricKinds()=%v, want %v", got, want)
 	}
 	if !strings.Contains(buf.String(), "metric recipes registered") {

@@ -230,6 +230,21 @@ func run(args []string) error {
 		)
 	}
 
+	// Construct the canonical Stage 2.5 project-level base-
+	// pack registry (cycle_member + duplication_ratio) and
+	// emit its startup log line. These recipes are
+	// dispatched separately from the per-file [Registry]
+	// because their value requires the WHOLE project's
+	// `*AstFile` set (SCC detection / cross-file token
+	// concat) and they implement [ProjectRecipe.ComputeProject]
+	// in addition to the per-file [Recipe] interface. Wiring
+	// the project-level registry HERE -- in the same
+	// composition-root section as the per-file registry --
+	// makes both base-pack registries visible in the boot
+	// snapshot, mirroring implementation-plan Stage 2.5
+	// expectations alongside Stage 2.3 line 201.
+	_ = recipes.DefaultProjectRegistryWithLog(log)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

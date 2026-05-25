@@ -157,3 +157,87 @@ func freshRange(ordinal int) *astv1.AstRange {
 
 // build returns the assembled `*AstFile`.
 func (b *astBuilder) build() *astv1.AstFile { return b.file }
+
+// addPackage attaches a `SCOPE_KIND_PACKAGE` scope to the
+// builder's file and rewires the file scope's
+// `parent_scope_id` to point at it. This mirrors the Stage
+// 2.1 parser fleet's emission shape -- every `AstFile` ships
+// a package scope that parents the file scope (see
+// `internal/ast/parser/go.go` package-scope construction).
+//
+// The package's `name` and `qualifiedName` are both set to
+// `pkgName` so the cycle_member recipe's package-name index
+// matches an `imports`-edge target of `qualified:<pkgName>`.
+func (b *astBuilder) addPackage(pkgName string) *astv1.AstScope {
+	pkg := &astv1.AstScope{
+		ScopeKind:     astv1.ScopeKind_SCOPE_KIND_PACKAGE,
+		Name:          pkgName,
+		QualifiedName: pkgName,
+		Range: &astv1.AstRange{
+			StartByte: 0,
+			EndByte:   1,
+			StartLine: 1,
+			EndLine:   1,
+			StartCol:  1,
+			EndCol:    1,
+		},
+	}
+	b.assignID(pkg)
+	b.file.Scopes = append(b.file.Scopes, pkg)
+	b.currentFile.ParentScopeId = pkg.GetScopeId()
+	return pkg
+}
+
+// addSymbol appends a `*AstSymbol` to the builder's file with
+// the given `kind` and `name`, attached to `parent` (or the
+// file scope when `parent` is nil). Used by duplication_ratio
+// tests to inflate the structural-token stream past the
+// 50-token window threshold.
+func (b *astBuilder) addSymbol(parent *astv1.AstScope, kind, name string) *astv1.AstSymbol {
+	if parent == nil {
+		parent = b.currentFile
+	}
+	sym := &astv1.AstSymbol{
+		Name:    name,
+		Kind:    kind,
+		ScopeId: parent.GetScopeId(),
+		Range:   freshRange(b.nextOrdinal),
+	}
+	// Give every symbol a unique synthetic id derived from
+	// the ordinal counter so a test that bulk-adds symbols
+	// still produces unique entries.
+	sym.SymbolId = parserLocalID(b.nextOrdinal) + ":sym"
+	b.nextOrdinal++
+	b.file.Symbols = append(b.file.Symbols, sym)
+	return sym
+}
+
+// addImportEdge appends an `"imports"`-kind `AstEdge` whose
+// source is the builder's file scope and whose target is the
+// `qualified:<target>` form the parser uses (see
+// `internal/ast/parser/internal.go:externalScopeRef`).
+func (b *astBuilder) addImportEdge(target string) *astv1.AstEdge {
+	edge := &astv1.AstEdge{
+		Kind: "imports",
+		From: &astv1.AstRef{
+			Kind: astv1.AstRefKind_AST_REF_KIND_SCOPE,
+			Id:   b.currentFile.GetScopeId(),
+		},
+		To: &astv1.AstRef{
+			Kind: astv1.AstRefKind_AST_REF_KIND_SCOPE,
+			Id:   "qualified:" + target,
+		},
+	}
+	b.file.Edges = append(b.file.Edges, edge)
+	return edge
+}
+
+// setModulePath stamps `Attrs[module_path]` on the builder's
+// file so the cycle_member recipe can canonicalise module-
+// qualified import targets (e.g. strip `github.com/org/repo/`
+// from `github.com/org/repo/internal/foo` before looking up
+// `internal/foo` in the dir-index). Used by the iter-5
+// module-path canonicalisation tests.
+func (b *astBuilder) setModulePath(modulePath string) {
+	b.file.Attrs["module_path"] = modulePath
+}

@@ -106,8 +106,35 @@ func TestRecipeInterfaceConformance(t *testing.T) {
 	if cy.Version() == 0 || co.Version() == 0 {
 		t.Errorf("Version returns zero: cy=%d co=%d", cy.Version(), co.Version())
 	}
+	if cy.Pack() != recipes.PackBase || co.Pack() != recipes.PackBase {
+		t.Errorf("base-pack recipes Pack(): cy=%q co=%q, want base", cy.Pack(), co.Pack())
+	}
 	if cy.AppliesTo(nil) || co.AppliesTo(nil) {
 		t.Errorf("AppliesTo(nil) must be false")
+	}
+}
+
+// TestSolidRecipesInterfaceConformance asserts the three
+// Stage 2.4 SOLID-pack recipes implement [recipes.Recipe]
+// with Pack()==PackSolid.
+func TestSolidRecipesInterfaceConformance(t *testing.T) {
+	t.Parallel()
+	var l recipes.Recipe = recipes.NewLCOM4Recipe()
+	var fi recipes.Recipe = recipes.NewFanInRecipe()
+	var fo recipes.Recipe = recipes.NewFanOutRecipe()
+	for _, r := range []recipes.Recipe{l, fi, fo} {
+		if r.MetricKind() == "" {
+			t.Errorf("MetricKind empty for solid-pack recipe")
+		}
+		if r.Version() == 0 {
+			t.Errorf("Version returns zero for %q", r.MetricKind())
+		}
+		if r.Pack() != recipes.PackSolid {
+			t.Errorf("Pack() = %q for %q, want %q", r.Pack(), r.MetricKind(), recipes.PackSolid)
+		}
+		if r.AppliesTo(nil) {
+			t.Errorf("AppliesTo(nil) must be false for %q", r.MetricKind())
+		}
 	}
 }
 

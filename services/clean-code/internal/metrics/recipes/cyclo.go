@@ -100,6 +100,10 @@ func (r *CycloRecipe) MetricKind() string { return cycloMetricKind }
 // Version implements [Recipe].
 func (r *CycloRecipe) Version() int { return cycloVersion }
 
+// Pack implements [Recipe]. cyclo is in the `base` pack
+// (architecture Sec 1.4.1 row 1).
+func (r *CycloRecipe) Pack() Pack { return PackBase }
+
 // AppliesTo implements [Recipe]. Returns true iff the AST is
 // non-nil, NOT degraded, AND the producer advertised the
 // `decision_blocks` capability via [AttrDecisionBlocks].

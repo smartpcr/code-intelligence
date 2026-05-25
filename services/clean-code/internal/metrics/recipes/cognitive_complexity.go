@@ -99,6 +99,10 @@ func (r *CognitiveComplexityRecipe) Version() int {
 	return cognitiveComplexityVersion
 }
 
+// Pack implements [Recipe]. cognitive_complexity is in the
+// `base` pack (architecture Sec 1.4.1 row 2).
+func (r *CognitiveComplexityRecipe) Pack() Pack { return PackBase }
+
 // AppliesTo implements [Recipe]. Same gate shape as
 // [CycloRecipe.AppliesTo]: refuse nil, refuse when the
 // producer did not advertise decision-block children, refuse

@@ -48,6 +48,27 @@ const MaxBodyBytes = 1 << 20 // 1 MiB
 // the caller MUST see the detail to correct the request.
 const internalErrorMessage = "internal error"
 
+// hmacFailureMessage is the fixed, sentinel-free message
+// every 401 (HMAC verification failure) response carries in
+// its [ErrorBody.Error] field. The taxonomy (missing /
+// malformed / mismatch / empty-secret) is preserved in the
+// [ErrorBody.Code] field for operator triage; the
+// human-readable message is intentionally identical across
+// every failure mode so an UNAUTHENTICATED caller cannot
+// probe the request contract by reading the 401 body.
+//
+// Rationale: `fmt.Errorf("HMAC verification failed: %v",
+// vErr)` would otherwise embed the wrapped sentinel text
+// (e.g. "repo_indexer: missing HMAC signature header" vs
+// "repo_indexer: malformed HMAC signature header (want
+// sha256=<hex>)" vs "repo_indexer: HMAC signature does not
+// match request body") — each shape leaks a different
+// signal an attacker can use to choose the next probe.
+// Operators still see the verbatim sentinel in the
+// structured warning logged BEFORE the response is written,
+// so triage signal is preserved server-side.
+const hmacFailureMessage = "HMAC verification failed"
+
 // WebhookPayload is the canonical in-process form of a
 // Git push-event webhook the Repo Indexer accepts. The
 // wire-format is JSON; field tags match the runbook-side
@@ -105,7 +126,11 @@ type Response struct {
 // documented canonical literals (see [classifyError]).
 //
 // 4xx bodies carry the detailed message that pinpoints the
-// caller-supplied mistake. 5xx bodies carry the canonical
+// caller-supplied mistake, EXCEPT 401 HMAC-verification
+// failures which carry the fixed [hmacFailureMessage]
+// placeholder so an unauthenticated caller cannot
+// differentiate missing-vs-malformed-vs-mismatch by
+// reading the body. 5xx bodies carry the canonical
 // [internalErrorMessage] placeholder so a wrapped writer
 // error (Postgres DSN, SQL fragment, pgx context) cannot
 // leak through to a publisher's request log.
@@ -195,7 +220,12 @@ func NewWebhookHandlerWithHMAC(indexer *Indexer, hmacSecret []byte, logger *slog
 //  3. HMAC verification (when configured): the body bytes
 //     are verified BEFORE the Content-Type header is
 //     inspected. An invalid or missing signature returns
-//     401 + a structured code.
+//     401 + a structured code. The 401 body's `error`
+//     field is the fixed [hmacFailureMessage] -- the
+//     missing-vs-malformed-vs-mismatch taxonomy lives in
+//     the `code` field only, so an unauthenticated caller
+//     cannot read the body to learn which failure mode
+//     fired.
 //  4. Content-Type check: the header is parsed via
 //     [mime.ParseMediaType] and must equal
 //     `application/json`. Parameters (e.g.
@@ -237,13 +267,18 @@ func (h *WebhookHandler) Webhook(w http.ResponseWriter, r *http.Request) {
 		if vErr := VerifyHMAC(body, sig, h.hmacSecret); vErr != nil {
 			code := classifyHMACError(vErr)
 			if h.logger != nil {
+				// Verbatim sentinel goes to the operator-side
+				// log; the 401 body below carries only the
+				// fixed [hmacFailureMessage] so an
+				// unauthenticated caller cannot read the
+				// taxonomy out of the response.
 				h.logger.Warn("repo_indexer webhook: HMAC verification failed",
 					"remote_addr", r.RemoteAddr,
 					"code", code,
+					"err", vErr.Error(),
 				)
 			}
-			h.writeError(w, http.StatusUnauthorized,
-				fmt.Sprintf("HMAC verification failed: %v", vErr), code)
+			h.writeError(w, http.StatusUnauthorized, hmacFailureMessage, code)
 			return
 		}
 	}

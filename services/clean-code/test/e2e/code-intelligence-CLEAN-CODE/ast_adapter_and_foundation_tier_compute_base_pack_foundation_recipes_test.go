@@ -12,10 +12,22 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/cucumber/godog"
 )
+
+// requireEnv returns the value of the named environment variable,
+// calling t.Skip when unset or empty.
+func requireEnv(t *testing.T, name string) string {
+	t.Helper()
+	v := os.Getenv(name)
+	if v == "" {
+		t.Skipf("environment variable %s is not set; skipping", name)
+	}
+	return v
+}
 
 // serviceRoot returns the absolute path to the services/clean-code
 // directory by walking up from this source file's location.
@@ -60,9 +72,33 @@ func readModulePath(dir string) (string, error) {
 	return "", fmt.Errorf("module directive not found in go.mod")
 }
 
+// probeMu serializes runProbe calls so that probe temp dirs never
+// coexist inside the module tree across goroutines, even if a future
+// caller adds t.Parallel() or godog Concurrency > 1.
+//
+// The temp dir MUST live inside svcRoot (see runProbe doc) so creating
+// it "outside the module" is not a viable alternative — serialization
+// is therefore the correct guard.
+var probeMu sync.Mutex
+
 // runProbe compiles and executes a small Go program within the service
 // module, returning its combined stdout/stderr and exit code.
+//
+// The temp dir lives inside svcRoot on purpose: the probe source
+// imports module-internal packages such as
+// "<modpath>/internal/metrics/recipes", which `go run` can only
+// resolve when the source file is inside the parent module. Placing
+// the temp dir under os.TempDir() would put the file outside the
+// module and break those imports.
+//
+// To prevent multiple in-tree probe directories from coexisting under
+// concurrent callers, runProbe acquires probeMu for its entire
+// lifetime: each invocation creates its tmpDir, runs the probe to
+// completion, removes the tmpDir, then releases the lock.
 func runProbe(svcRoot, source string) (string, int, error) {
+	probeMu.Lock()
+	defer probeMu.Unlock()
+
 	tmpDir, err := os.MkdirTemp(svcRoot, "e2e-base-recipe-probe-")
 	if err != nil {
 		return "", -1, fmt.Errorf("creating probe dir: %w", err)

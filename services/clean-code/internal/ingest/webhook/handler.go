@@ -32,7 +32,10 @@
 //   - Method: `POST`
 //   - Path:   `/v1/ingest/churn`
 //   - Body:   JSON-encoded [churn.Payload]
-//   - Content-Type: `application/json` (anything else returns 415).
+//   - Content-Type: the media type must be `application/json`.
+//     Media-type parameters such as `charset=utf-8` are
+//     accepted (matched via [mime.ParseMediaType]); any other
+//     media type returns 415.
 //
 // Response:
 //
@@ -56,6 +59,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 
 	"github.com/gofrs/uuid"
@@ -188,7 +192,11 @@ type ErrorBody struct {
 //     BEFORE the Content-Type header is inspected. An invalid
 //     or missing signature returns 401 + a structured code;
 //     the writer is NOT reached.
-//  4. Content-Type check (`application/json` -- 415 if not).
+//  4. Content-Type check: the header is parsed via
+//     [mime.ParseMediaType] and the resulting media type must
+//     equal `application/json`. Parameters (e.g.
+//     `charset=utf-8`) are accepted; any other media type
+//     returns 415.
 //  5. JSON decode + payload validation (400 on shape errors).
 //  6. Ingestor.Run dispatch.
 func (h *ChurnIngestHandler) ChurnWebhook(w http.ResponseWriter, r *http.Request) {
@@ -237,7 +245,20 @@ func (h *ChurnIngestHandler) ChurnWebhook(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	if ct := r.Header.Get("Content-Type"); ct != "application/json" {
+	// Parse the Content-Type via mime.ParseMediaType so that
+	// the common `application/json; charset=utf-8` variant
+	// (sent by Go's `http.NewRequest` with certain body
+	// types, curl with explicit charset, and most JS fetch
+	// implementations) is accepted alongside the bare
+	// `application/json` form. ParseMediaType also
+	// lower-cases the media type for us, so callers using
+	// `Application/JSON` succeed as well -- media types are
+	// case-insensitive per RFC 7231 Sec 3.1.1.1. A missing
+	// or unparseable Content-Type yields an empty mediaType,
+	// which falls into the 415 branch.
+	ct := r.Header.Get("Content-Type")
+	mediaType, _, _ := mime.ParseMediaType(ct)
+	if mediaType != "application/json" {
 		h.writeError(w, http.StatusUnsupportedMediaType,
 			fmt.Sprintf("ChurnWebhook expects Content-Type: application/json (got %q)", ct),
 			"UNSUPPORTED_MEDIA_TYPE")

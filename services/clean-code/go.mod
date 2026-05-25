@@ -3,6 +3,7 @@ module github.com/microsoft/code-intelligence/services/clean-code
 go 1.25.1
 
 require (
+	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/cucumber/godog v0.15.1
 	github.com/gofrs/uuid v4.3.1+incompatible
 	github.com/lib/pq v1.12.3

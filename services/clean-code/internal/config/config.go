@@ -199,6 +199,26 @@ const (
 	// without the other is a configuration error that fails
 	// fast at startup.
 	EnvEnableScaffoldChurnWebhook = "CLEAN_CODE_ENABLE_SCAFFOLD_CHURN_WEBHOOK"
+
+	// EnvEnableScaffoldIndexerWebhook is the explicit
+	// operator-facing opt-in for the Stage 3.1 scaffold-mode
+	// Repo Indexer webhook + CLI rescan trigger. It accepts
+	// any non-empty boolean value (canonical form `true`).
+	// Setting it constitutes acknowledging the SCAFFOLD-MODE
+	// LIMITATION that when no `CLEAN_CODE_PG_URL` is wired the
+	// webhook persists commits + repo_events into an in-memory
+	// writer and DATA IS LOST ON RESTART (the production
+	// PG-backed [repo_indexer.PGCatalogWriter] is wired
+	// automatically when [EnvPGURL] is set).
+	//
+	// Both `/v1/indexer/webhook` and `/v1/indexer/rescan` are
+	// mounted iff this flag AND [EnvWebhookHMACSecret] are
+	// set; the indexer reuses the SHARED external-ingest HMAC
+	// secret (architecture Sec 8.5 -- every external
+	// `ingest.*` and `indexer.*` surface verifies request
+	// bodies against the same secret). One without the other
+	// is a configuration error that fails fast at startup.
+	EnvEnableScaffoldIndexerWebhook = "CLEAN_CODE_ENABLE_SCAFFOLD_INDEXER_WEBHOOK"
 )
 
 // MinWebhookHMACSecretBytes is the minimum length (in bytes,
@@ -311,6 +331,16 @@ type Config struct {
 	// churn webhook. See [EnvEnableScaffoldChurnWebhook] for
 	// the explicit "data lost on restart" rationale.
 	EnableScaffoldChurnWebhook bool
+
+	// --- Stage 3.1 Repo Indexer webhook (scaffold mode) ---
+
+	// EnableScaffoldIndexerWebhook is the explicit
+	// operator-acknowledged opt-in for the Stage 3.1
+	// scaffold-mode Repo Indexer webhook + CLI rescan
+	// trigger. See [EnvEnableScaffoldIndexerWebhook] for the
+	// rationale. The indexer reuses [WebhookHMACSecret] (the
+	// SHARED external-ingest HMAC secret).
+	EnableScaffoldIndexerWebhook bool
 }
 
 // Defaults returns a Config populated with the canonical
@@ -447,9 +477,13 @@ func (c Config) Validate() error {
 		return fmt.Errorf("config: %s=true requires %s to be set (HMAC verification is mandatory when the webhook is mounted)",
 			EnvEnableScaffoldChurnWebhook, EnvWebhookHMACSecret)
 	}
-	if !c.EnableScaffoldChurnWebhook && c.WebhookHMACSecret != "" {
-		return fmt.Errorf("config: %s is set but %s is not; the webhook stays UNMOUNTED until both are set (avoids an unintended public surface)",
-			EnvWebhookHMACSecret, EnvEnableScaffoldChurnWebhook)
+	if !c.EnableScaffoldChurnWebhook && c.WebhookHMACSecret != "" && !c.EnableScaffoldIndexerWebhook {
+		return fmt.Errorf("config: %s is set but neither %s nor %s is set; the webhooks stay UNMOUNTED until at least one opt-in flag is enabled (avoids an unintended public surface)",
+			EnvWebhookHMACSecret, EnvEnableScaffoldChurnWebhook, EnvEnableScaffoldIndexerWebhook)
+	}
+	if c.EnableScaffoldIndexerWebhook && c.WebhookHMACSecret == "" {
+		return fmt.Errorf("config: %s=true requires %s to be set (HMAC verification is mandatory when the Repo Indexer webhook is mounted)",
+			EnvEnableScaffoldIndexerWebhook, EnvWebhookHMACSecret)
 	}
 	if c.WebhookHMACSecret != "" && len(c.WebhookHMACSecret) < MinWebhookHMACSecretBytes {
 		return fmt.Errorf("config: %s must be at least %d bytes long (got %d); use a CSPRNG-generated secret such as `head -c 32 /dev/urandom | base64`",
@@ -482,6 +516,7 @@ func readEnvOverrides() map[string]string {
 		EnvKMSMasterKeyHex,
 		EnvWebhookHMACSecret,
 		EnvEnableScaffoldChurnWebhook,
+		EnvEnableScaffoldIndexerWebhook,
 	}
 	out := make(map[string]string, len(keys))
 	for _, k := range keys {
@@ -560,6 +595,15 @@ func applyOverrides(cfg *Config, overrides map[string]string) error {
 				cfg.EnableScaffoldChurnWebhook = true
 			case "0", "false", "no", "off":
 				cfg.EnableScaffoldChurnWebhook = false
+			default:
+				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
+			}
+		case EnvEnableScaffoldIndexerWebhook:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "1", "true", "yes", "on":
+				cfg.EnableScaffoldIndexerWebhook = true
+			case "0", "false", "no", "off":
+				cfg.EnableScaffoldIndexerWebhook = false
 			default:
 				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
 			}

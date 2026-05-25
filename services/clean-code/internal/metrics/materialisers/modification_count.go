@@ -121,7 +121,17 @@ const (
 	AttrProvenanceValue = "ingested"
 	// AttrWindowDays carries the window size the materialiser
 	// used so a downstream reader can recompute the count's
-	// time bounds without consulting `PolicyVersion`.
+	// time bounds without consulting `PolicyVersion`. The
+	// value is stamped as the DECIMAL-STRING form of the
+	// integer (e.g. `"90"`, not the JSON number `90`) per the
+	// recipes-package `Attrs map[string]string` convention.
+	// Operator-pinned by the recovery-loop answer to slug
+	// `window-days-attr-numeric-or-string` (iter-14 RECOVERY
+	// block) -> "string \"90\" (current materialiser output,
+	// recipes-package convention)". A future JSON-serializer
+	// phase MAY coerce the attr to a numeric token when
+	// emitting `attrs_json`; the in-memory Attrs value at the
+	// materialiser boundary MUST remain a string.
 	AttrWindowDays = "window_days"
 )
 

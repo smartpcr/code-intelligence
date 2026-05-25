@@ -3,6 +3,7 @@ package materialisers_test
 import (
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -906,5 +907,60 @@ func TestMaterialise_ProjectsFromMaterialiseWithDetails(t *testing.T) {
 		if drafts[i].Scope.QualifiedName != emissions[i].Draft.Scope.QualifiedName {
 			t.Errorf("[%d] Scope.QualifiedName differs", i)
 		}
+	}
+}
+
+// TestMaterialiser_WindowDaysAttrSerializesAsString_OperatorPin
+// anchors the operator-resolved open question
+// `window-days-attr-numeric-or-string` (resolved as
+// `string "90"`) into a dedicated assertion that fails
+// IMMEDIATELY if a future refactor coerces the attr to a JSON
+// number at the Attrs-map boundary. The recipes-package Attrs
+// type is `map[string]string` (architecture Sec 1.4.1 row 12
+// + recipes.MetricSampleDraft), so the materialiser MUST stamp
+// the integer `windowDays` as its decimal string form. A
+// downstream JSON-serializer phase MAY coerce to a number when
+// emitting to `attrs_json`, but the in-memory Attrs value MUST
+// remain a string at the materialiser boundary.
+//
+// Pinned by the operator answer to the recovery-loop question
+// (iter-14 RECOVERY block, slug
+// `window-days-attr-numeric-or-string`).
+func TestMaterialiser_WindowDaysAttrSerializesAsString_OperatorPin(t *testing.T) {
+	t.Parallel()
+	rows := []materialisers.ChurnRow{
+		row(fooBarRef(), "sha1", 1),
+	}
+	drafts := materialisers.NewMaterialiserWithClock(materialisers.DefaultWindowDays, fixedClock(refNow)).Materialise(rows)
+	if len(drafts) != 1 {
+		t.Fatalf("len(drafts) = %d, want 1", len(drafts))
+	}
+	v, ok := drafts[0].Attrs[materialisers.AttrWindowDays]
+	if !ok {
+		t.Fatalf("Attrs[%q] missing -- materialiser MUST stamp window_days on every draft", materialisers.AttrWindowDays)
+	}
+	if v != "90" {
+		t.Errorf("Attrs[%q] = %q, want %q (operator pin: window-days-attr-numeric-or-string -> string \"90\")",
+			materialisers.AttrWindowDays, v, "90")
+	}
+	// Defence-in-depth: the value MUST be byte-identical to the
+	// decimal-string form of the int, not (e.g.) `"90 "` from a
+	// fmt.Sprintf("%d ", ...) typo. Comparing against
+	// `strconv.Itoa` (the materialiser's actual serializer) is
+	// the strongest assertion that doesn't reach into private
+	// state.
+	if v != strconv.Itoa(materialisers.DefaultWindowDays) {
+		t.Errorf("Attrs[%q] = %q, want %q (strconv.Itoa(DefaultWindowDays) parity)",
+			materialisers.AttrWindowDays, v, strconv.Itoa(materialisers.DefaultWindowDays))
+	}
+	// And confirm the operator's recipes-package convention: the
+	// Attrs map is `map[string]string`, so the value is *already*
+	// a string by Go's type system. The reflect check below is
+	// belt-and-braces in case a future refactor swaps to
+	// `map[string]any`.
+	rt := reflect.TypeOf(drafts[0].Attrs[materialisers.AttrWindowDays])
+	if rt.Kind() != reflect.String {
+		t.Errorf("Attrs[%q] runtime type = %s, want string (operator pin: recipes-package map[string]string convention)",
+			materialisers.AttrWindowDays, rt.Kind())
 	}
 }

@@ -6,6 +6,42 @@ Newest at the top. Stage references map to
 
 ## Stage 2.6 -- `modification_count_in_window` materialiser + Metric Ingestor coordinator
 
+### Changed (iter 16)
+
+- **Operator-pinned `window_days` attr serialization anchored
+  in code + a dedicated regression test**: the recovery-loop
+  open question `window-days-attr-numeric-or-string` (iter-14
+  RECOVERY block) was answered by the operator as
+  *"string \"90\" (current materialiser output,
+  recipes-package convention)"*. Iter-15 declared convergence
+  but produced no diff, so the evaluator rejected it
+  (score 0). This iter lands the pinned decision as a real
+  artefact:
+    - `internal/metrics/materialisers/modification_count.go`
+      -- the `AttrWindowDays` docstring now cites the operator
+      pin verbatim ("string \"90\" ... recipes-package
+      convention") and references the JSON-serializer-phase
+      coercion caveat. A `grep -nF
+      "window-days-attr-numeric-or-string"` over the
+      materialiser tree now lands a single canonical anchor.
+    - `internal/metrics/materialisers/modification_count_test.go`
+      -- new test
+      `TestMaterialiser_WindowDaysAttrSerializesAsString_OperatorPin`
+      asserts (i) the literal `"90"` value, (ii) byte
+      parity with `strconv.Itoa(DefaultWindowDays)`, and
+      (iii) `reflect.TypeOf(...).Kind() == reflect.String` as
+      a defence against a future swap to `map[string]any`.
+- **Convergence-resolution-D recorded for the
+  notes-file-audit-conflict recovery-loop question**: the
+  operator answered slug `notes-file-audit-conflict` with D
+  (convergence -- declare the workstream technically complete
+  and pin the `.forge/iter-notes.md` audit-narrative gap as a
+  Forge-framework follow-up, not a workstream defect). This
+  CHANGELOG entry is the workstream-side record of that
+  resolution; no source files were touched on its behalf
+  because the gap is in the Forge audit framework, not the
+  clean-code service.
+
 ### Changed (iter 8)
 
 - **CHANGELOG narrative scrubbed of phantom-sentinel literal

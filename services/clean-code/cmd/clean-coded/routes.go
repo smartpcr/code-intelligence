@@ -6,6 +6,7 @@ import (
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/health"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/webhook"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/management"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/repo_indexer"
 )
 
 // rootMux assembles a single `http.ServeMux` that hosts every
@@ -69,7 +70,22 @@ import (
 // empty active-key set. The signing-key-dependent read verb
 // `policy.keys.list_active` likewise serves 503 in scaffold
 // mode.
-func rootMux(healthHandler *health.Handler, mgmt *management.Handler, policy *management.PolicyWriter, churnIngest *webhook.ChurnIngestHandler) *http.ServeMux {
+// `indexerWebhook` MAY be nil for the legacy `TestRootMux_*`
+// tests that pre-date the Stage 3.1 Repo Indexer wiring; in
+// production wiring the composition root constructs a non-nil
+// [repo_indexer.WebhookHandler] (when
+// `CLEAN_CODE_ENABLE_SCAFFOLD_INDEXER_WEBHOOK=1` AND a HMAC
+// secret is supplied) and the `/v1/indexer/webhook` route is
+// mounted. When `indexerWebhook` is nil the path is
+// intentionally LEFT UNMOUNTED so a request returns the
+// standard 404 -- the "verb does not exist in this build"
+// semantic the tests expect.
+//
+// `indexerRescan` follows the same nil-tolerant pattern at
+// the distinct `/v1/indexer/rescan` route -- distinct from the
+// webhook so operators can rate-limit or authorise CLI
+// rescan triggers independently of the Git webhook surface.
+func rootMux(healthHandler *health.Handler, mgmt *management.Handler, policy *management.PolicyWriter, churnIngest *webhook.ChurnIngestHandler, indexerWebhook *repo_indexer.WebhookHandler, indexerRescan *repo_indexer.RescanHandler) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthHandler.Healthz)
 	mux.HandleFunc("/readyz", healthHandler.Readyz)
@@ -96,6 +112,20 @@ func rootMux(healthHandler *health.Handler, mgmt *management.Handler, policy *ma
 	// path (evaluator iter-4 #1 + #2 structural fix).
 	if churnIngest != nil {
 		mux.HandleFunc(webhook.Path, churnIngest.ChurnWebhook)
+	}
+
+	// Stage 3.1: mount the Repo Indexer webhook + CLI rescan
+	// trigger when the composition root wired them. Both
+	// routes dispatch to the same [repo_indexer.Indexer]
+	// which is the SOLE writer of new `commit` rows
+	// (architecture G1). They are mounted independently so
+	// either surface can be disabled by leaving the
+	// corresponding handler nil in main.go.
+	if indexerWebhook != nil {
+		mux.HandleFunc(repo_indexer.Path, indexerWebhook.Webhook)
+	}
+	if indexerRescan != nil {
+		mux.HandleFunc(repo_indexer.RescanPath, indexerRescan.Rescan)
 	}
 	return mux
 }

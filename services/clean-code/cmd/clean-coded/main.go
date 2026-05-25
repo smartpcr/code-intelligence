@@ -56,6 +56,7 @@ import (
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/keys"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/steward"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/repo_indexer"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/version"
 	"github.com/microsoft/code-intelligence/services/clean-code/policy/rulepacks/decoupling"
 )
@@ -259,6 +260,36 @@ func run(args []string) error {
 		signer      steward.Signer
 	)
 
+	// --- Open the shared *sql.DB once, before any subsystem
+	// -- consumes it (Stage 3.1 iter-3 fix: previously the
+	// open lived inside the `KMSProvider != ""` branch, so
+	// `CLEAN_CODE_PG_URL` was silently ignored in scaffold-
+	// mode wiring -- the Repo Indexer would fall back to its
+	// in-memory writer even when an operator had pointed it
+	// at a real PG instance).
+	//
+	// The handle is owned by `run` for the process lifetime;
+	// the `closeAll` deferred cleanup at the end of `run`
+	// calls `db.Close()` if non-nil. Subsystems (`keys.Build`,
+	// `buildPolicyWriter`, `repo_indexer.NewPGCatalogWriter`)
+	// all receive the SAME `*sql.DB` value so connection-pool
+	// sizing happens once at the driver level instead of N
+	// times per subsystem.
+	if cfg.PostgresURL != "" {
+		handle, openErr := sql.Open("postgres", cfg.PostgresURL)
+		if openErr != nil {
+			return fmt.Errorf("opening postgres: %w", openErr)
+		}
+		pingCtx, pingCancel := context.WithTimeout(ctx, 10*time.Second)
+		pingErr := handle.PingContext(pingCtx)
+		pingCancel()
+		if pingErr != nil {
+			_ = handle.Close()
+			return fmt.Errorf("pinging postgres: %w", pingErr)
+		}
+		db = handle
+	}
+
 	// --- Policy Steward signing-key wiring (Stage 5.1) ---
 	// Scaffold-mode (`KMSProvider == ""`) leaves the signing-
 	// key cache unwired and the signing-key-dependent read
@@ -286,20 +317,8 @@ func run(args []string) error {
 			Overlap:             time.Duration(cfg.PolicyPublishOverlapSeconds) * time.Second,
 			MintFirstKeyIfEmpty: true,
 		}
-		if cfg.PostgresURL != "" && cfg.KMSProvider == keys.KMSProviderLocal {
-			handle, openErr := sql.Open("postgres", cfg.PostgresURL)
-			if openErr != nil {
-				return fmt.Errorf("opening postgres: %w", openErr)
-			}
-			pingCtx, pingCancel := context.WithTimeout(ctx, 10*time.Second)
-			pingErr := handle.PingContext(pingCtx)
-			pingCancel()
-			if pingErr != nil {
-				_ = handle.Close()
-				return fmt.Errorf("pinging postgres: %w", pingErr)
-			}
-			db = handle
-			bc.DB = handle
+		if db != nil && cfg.KMSProvider == keys.KMSProviderLocal {
+			bc.DB = db
 		}
 		buildCtx, buildCancel := context.WithTimeout(ctx, 30*time.Second)
 		built, buildErr := keys.Build(buildCtx, bc)
@@ -388,9 +407,62 @@ func run(args []string) error {
 		log.Warn("decoupling rulepacks NOT bootstrapped (scaffold mode: no signing key wired)")
 	}
 
+	// --- Stage 3.1 Repo Indexer wiring ---
+	//
+	// Construction is deferred to here (after the policy
+	// steward + buildPolicyWriter complete) because the
+	// PG-backed catalog writer reuses the SAME `*sql.DB`
+	// handle the policy-keys cache and steward use. The
+	// handle itself was opened earlier (above the KMS
+	// branch) so it is non-nil whenever
+	// `CLEAN_CODE_PG_URL` is configured -- the iter-3 fix
+	// to evaluator item 2 ("PG persistence is not actually
+	// selected by CLEAN_CODE_PG_URL alone"): previously the
+	// open lived inside `KMSProvider != "" &&
+	// KMSProvider == "local"`, so a PG URL with an empty /
+	// non-local KMS provider would silently fall back to
+	// the in-memory writer.
+	var indexerWebhook *repo_indexer.WebhookHandler
+	var indexerRescan *repo_indexer.RescanHandler
+	if cfg.EnableScaffoldIndexerWebhook {
+		var catalog repo_indexer.CatalogWriter
+		if db != nil {
+			pgWriter, pgErr := repo_indexer.NewPGCatalogWriter(db)
+			if pgErr != nil {
+				return fmt.Errorf("repo_indexer: NewPGCatalogWriter: %w", pgErr)
+			}
+			catalog = pgWriter
+			log.Info("repo_indexer catalog writer wired to PostgreSQL",
+				"backend", "pg",
+				"trigger", "CLEAN_CODE_PG_URL configured",
+			)
+		} else {
+			catalog = repo_indexer.NewInMemoryCatalogWriter()
+			log.Warn("repo_indexer webhook mounted in SCAFFOLD MODE -- writer is in-memory and rows are LOST on restart",
+				"reason", "no CLEAN_CODE_PG_URL configured",
+				"production_persistence_lands_in", "Phase 3.2 (Metric Ingestor lifecycle transitions)",
+			)
+		}
+		idx := repo_indexer.NewIndexer(catalog, log)
+		indexerWebhook = repo_indexer.NewWebhookHandlerWithHMAC(idx, []byte(cfg.WebhookHMACSecret), log)
+		indexerRescan = repo_indexer.NewRescanHandlerWithHMAC(idx, []byte(cfg.WebhookHMACSecret), log)
+		log.Warn("repo_indexer routes mounted",
+			"webhook_path", repo_indexer.Path,
+			"rescan_path", repo_indexer.RescanPath,
+			"max_body_bytes", repo_indexer.MaxBodyBytes,
+			"hmac_required", true,
+			"hmac_header", repo_indexer.HMACSignatureHeader,
+		)
+	} else {
+		log.Info("repo_indexer webhook + rescan NOT MOUNTED",
+			"reason", "scaffold-mode opt-in not set",
+			"to_enable", "set CLEAN_CODE_ENABLE_SCAFFOLD_INDEXER_WEBHOOK=true AND CLEAN_CODE_WEBHOOK_HMAC_SECRET=<secret>",
+		)
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           rootMux(healthHandler, mgmt, policy, churnWebhook),
+		Handler:           rootMux(healthHandler, mgmt, policy, churnWebhook, indexerWebhook, indexerRescan),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

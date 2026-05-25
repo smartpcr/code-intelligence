@@ -35,6 +35,7 @@ func (s sliceAstSource) Files(_ context.Context, _ metric_ingestor.ScanRunContex
 type trackingRecipe struct {
 	kind             string
 	version          int
+	pack             recipes.Pack
 	appliesToReturns bool
 	computeDrafts    []recipes.MetricSampleDraft
 	appliesToCalls   int
@@ -43,6 +44,16 @@ type trackingRecipe struct {
 
 func (r *trackingRecipe) MetricKind() string { return r.kind }
 func (r *trackingRecipe) Version() int       { return r.version }
+
+// Pack returns the recipe's pack stamp. iter-3 added this
+// method when the [recipes.Recipe] interface gained Pack as
+// a required method (stage 3.0); the test helper had drifted
+// behind the contract. The zero-value `pack` (empty string)
+// is intentionally NOT defaulted to `PackBase` so a test
+// that forgets to populate it surfaces the omission via the
+// pack-validation guard at draft-construction time.
+func (r *trackingRecipe) Pack() recipes.Pack { return r.pack }
+
 func (r *trackingRecipe) AppliesTo(_ *parser.AstFile) bool {
 	r.appliesToCalls++
 	return r.appliesToReturns
@@ -91,7 +102,7 @@ func TestRegistryBackedDispatcher_EmptyAstSource_DefaultRegistry(t *testing.T) {
 func TestRegistryBackedDispatcher_NonEmptyAstSource_IteratesRegistry(t *testing.T) {
 	t.Parallel()
 	reg := recipes.NewRegistry()
-	r := &trackingRecipe{kind: "test_kind", version: 1, appliesToReturns: false}
+	r := &trackingRecipe{kind: "test_kind", version: 1, pack: recipes.PackBase, appliesToReturns: false}
 	reg.Register(r)
 
 	source := sliceAstSource{files: []*parser.AstFile{{}, {}}}
@@ -118,7 +129,7 @@ func TestRegistryBackedDispatcher_NonEmptyAstSource_IteratesRegistry(t *testing.
 func TestRegistryBackedDispatcher_RecipeApplies_ComputeIsCalled(t *testing.T) {
 	t.Parallel()
 	reg := recipes.NewRegistry()
-	r := &trackingRecipe{kind: "test_kind", version: 1, appliesToReturns: true /* no drafts */}
+	r := &trackingRecipe{kind: "test_kind", version: 1, pack: recipes.PackBase, appliesToReturns: true /* no drafts */}
 	reg.Register(r)
 
 	source := sliceAstSource{files: []*parser.AstFile{{}, {}, {}}}
@@ -150,7 +161,7 @@ func TestRegistryBackedDispatcher_DraftsProduced_PersistenceUnimplemented(t *tes
 	t.Parallel()
 	reg := recipes.NewRegistry()
 	r := &trackingRecipe{
-		kind: "test_kind", version: 1, appliesToReturns: true,
+		kind: "test_kind", version: 1, pack: recipes.PackBase, appliesToReturns: true,
 		computeDrafts: []recipes.MetricSampleDraft{
 			{MetricKind: "test_kind", MetricVersion: 1, Pack: recipes.PackBase, Source: recipes.SourceComputed, Value: 1},
 		},
@@ -233,8 +244,8 @@ func TestRegistryBackedDispatcher_DefaultRegistry_NonEmptySource(t *testing.T) {
 	if err := d.Dispatch(context.Background(), mustScanRun(t), metric_ingestor.FoundationInput{}); err != nil {
 		t.Fatalf("Dispatch DefaultRegistry: err=%v, want nil", err)
 	}
-	if got := len(reg.Recipes()); got != 3 {
-		t.Errorf("DefaultRegistry recipes = %d, want 3 (cyclo, cognitive_complexity, loc)", got)
+	if got := len(reg.Recipes()); got != 6 {
+		t.Errorf("DefaultRegistry recipes = %d, want 6 (cyclo, cognitive_complexity, loc, lcom4, fan_in, fan_out)", got)
 	}
 }
 

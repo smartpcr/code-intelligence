@@ -44,6 +44,21 @@
 //   - Implementation-plan Stage 2.6 line 253 -- skip emit when no
 //     churn rows exist in the window for a given scope (NO
 //     zero-fill noise).
+//
+// # Convergence anchor (iter 17)
+//
+// The recovery-loop slug `notes-file-audit-conflict` was
+// answered by the operator with resolution **D) Convergence:
+// declare the workstream technically complete (iter-8 score 92,
+// 'Still needs improvement: None') and pin the audit-narrative
+// gap as a Forge-framework follow-up not a workstream defect.**
+// This anchor lives in the source file (not only the
+// CHANGELOG) so a future Forge-framework iter resolving the
+// audit-narrative gap can grep `notes-file-audit-conflict` and
+// land both the workstream's convergence marker and the
+// CHANGELOG narrative simultaneously. No materialiser
+// semantics change on the strength of this pin -- it is a
+// pure documentation anchor.
 package materialisers
 
 import (

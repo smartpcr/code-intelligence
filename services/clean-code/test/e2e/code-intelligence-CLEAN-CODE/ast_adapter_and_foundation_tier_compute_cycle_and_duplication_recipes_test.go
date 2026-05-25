@@ -423,7 +423,8 @@ func InitializeScenario_ast_adapter_and_foundation_tier_compute_cycle_and_duplic
 	// duplication-ratio-bounded-zero-to-one
 	ctx.Step(`^a source corpus with known duplicated blocks$`, dup.aSourceCorpusWithKnownDuplicatedBlocks)
 	ctx.Step(`^the duplication_ratio recipe runs at scope_kind "([^"]*)"$`, dup.theDuplicationRatioRecipeRunsAtScopeKind)
-	ctx.Step(`^the emitted value is between (\d+) and (\d+) inclusive$`, dup.theEmittedValueIsBetweenAndInclusive)
+	// Accept integer or decimal bounds (e.g. "0 and 1" or "0.0 and 1.0"); godog coerces both to float64.
+	ctx.Step(`^the emitted value is between (\d+(?:\.\d+)?) and (\d+(?:\.\d+)?) inclusive$`, dup.theEmittedValueIsBetweenAndInclusive)
 	ctx.Step(`^the row scope_kind is in "([^"]*)"$`, dup.theRowScopeKindIsIn)
 	ctx.Step(`^the duplication_ratio recipe NEVER emits at scope_kind "([^"]*)" or "([^"]*)"$`, dup.theDuplicationRatioRecipeNEVEREmitsAtScopeKindOr)
 }

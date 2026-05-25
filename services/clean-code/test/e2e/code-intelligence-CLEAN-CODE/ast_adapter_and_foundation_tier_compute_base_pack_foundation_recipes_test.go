@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cucumber/godog"
 )
@@ -81,10 +82,84 @@ func readModulePath(dir string) (string, error) {
 	return "", fmt.Errorf("module directive not found in go.mod")
 }
 
+// probeDirPrefix is the well-known prefix for probe scratch
+// directories created by runProbe. Centralised so the sweep below and
+// any future tooling (.gitignore entry, CI cleanup hook) reference one
+// canonical string.
+const probeDirPrefix = "e2e-base-recipe-probe-"
+
+// probeStaleThreshold defines how old an orphaned probe directory must
+// be before sweepStaleProbeDirs will remove it. The threshold is
+// generous (5 minutes) so a probe that is still running for another
+// test in the same `go test` invocation is never collected by a
+// concurrent sweep. Probes themselves complete in seconds, so any
+// directory older than this is almost certainly an orphan from a
+// killed prior run.
+const probeStaleThreshold = 5 * time.Minute
+
+// sweepStaleProbeDirs removes orphan probeDirPrefix* directories under
+// svcRoot whose mtime is older than probeStaleThreshold. This addresses
+// the case where a previous test run was hard-killed (SIGKILL, OS
+// shutdown, IDE kill button) before runProbe's deferred os.RemoveAll
+// could execute, leaving directories in the working tree that pollute
+// `git status` and risk accidental commits.
+//
+// We deliberately apply an age filter rather than indiscriminately
+// removing every match: probe directories are created inside svcRoot
+// (see runProbe doc for why that is mandatory), so if two tests in
+// the same package ran concurrently a naive sweep would race and
+// delete an actively-running probe. Probes finish in seconds; any
+// directory older than probeStaleThreshold cannot belong to a live
+// probe.
+//
+// Sweep errors are intentionally swallowed: this is best-effort
+// hygiene, never a hard failure path for the test.
+func sweepStaleProbeDirs(svcRoot string) {
+	entries, err := os.ReadDir(svcRoot)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), probeDirPrefix) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) <= probeStaleThreshold {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(svcRoot, e.Name()))
+	}
+}
+
 // runProbe compiles and executes a small Go program within the service
 // module, returning its combined stdout/stderr and exit code.
+//
+// The scratch directory MUST be created inside svcRoot (not in
+// os.TempDir() or t.TempDir()) because the probe source imports
+//
+//	<module>/internal/metrics/recipes
+//
+// and Go's internal/ visibility rule forbids importers that live
+// outside the tree rooted at the parent of the internal directory
+// (here: svcRoot). A probe placed under os.TempDir() fails to compile
+// with "use of internal package not allowed", and a synthetic go.mod
+// with a `replace` directive does NOT bypass the rule because the
+// check is performed against the importer's source location on disk,
+// not against module identity.
+//
+// To mitigate orphan probeDirPrefix* directories left behind when a
+// prior run was killed before its deferred os.RemoveAll executed, the
+// caller invokes sweepStaleProbeDirs at the start of each probe. The
+// age filter inside that sweep prevents collisions with concurrent
+// in-flight probes in the same test binary.
 func runProbe(svcRoot, source string) (string, int, error) {
-	tmpDir, err := os.MkdirTemp(svcRoot, "e2e-base-recipe-probe-")
+	sweepStaleProbeDirs(svcRoot)
+
+	tmpDir, err := os.MkdirTemp(svcRoot, probeDirPrefix)
 	if err != nil {
 		return "", -1, fmt.Errorf("creating probe dir: %w", err)
 	}

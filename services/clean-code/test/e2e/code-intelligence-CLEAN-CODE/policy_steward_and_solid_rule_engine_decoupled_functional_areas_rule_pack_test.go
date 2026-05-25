@@ -17,7 +17,10 @@ import (
 )
 
 // requireEnv returns the value of the named environment variable,
-// calling t.Skip when unset or empty.
+// calling t.Skip when unset or empty. This is preferred over silently
+// falling back to localhost defaults because it makes a missing CI
+// configuration obvious in the test output instead of producing
+// confusing connection errors against http://localhost.
 func requireEnv(t *testing.T, name string) string {
 	t.Helper()
 	v := os.Getenv(name)
@@ -58,29 +61,10 @@ type rulePackEntry struct {
 // Helpers
 // ---------------------------------------------------------------------------
 
-func (s *decouplingRulePackState) ensureStewardURL() {
-	if s.stewardURL != "" {
-		return
-	}
-	s.stewardURL = os.Getenv("CLEAN_CODE_POLICY_STEWARD_URL")
-	if s.stewardURL == "" {
-		s.stewardURL = "http://localhost:8082"
-	}
-}
-
-func (s *decouplingRulePackState) ensureRuleEngineURL() {
-	if s.ruleEngineURL != "" {
-		return
-	}
-	s.ruleEngineURL = os.Getenv("CLEAN_CODE_RULE_ENGINE_URL")
-	if s.ruleEngineURL == "" {
-		s.ruleEngineURL = "http://localhost:8083"
-	}
-}
-
 // stewardGet sends a GET request to the policy-steward HTTP API.
+// stewardURL is populated in TestE2E_* via requireEnv before the godog
+// suite runs, so by the time any step calls this helper the URL is set.
 func (s *decouplingRulePackState) stewardGet(path string) (int, []byte, error) {
-	s.ensureStewardURL()
 	client := &http.Client{Timeout: 15 * time.Second}
 	req, err := http.NewRequest(http.MethodGet, s.stewardURL+path, nil)
 	if err != nil {
@@ -97,7 +81,6 @@ func (s *decouplingRulePackState) stewardGet(path string) (int, []byte, error) {
 
 // stewardPost sends a JSON POST to the policy-steward HTTP API.
 func (s *decouplingRulePackState) stewardPost(path string, payload interface{}) (int, []byte, error) {
-	s.ensureStewardURL()
 	jsonBody, err := json.Marshal(payload)
 	if err != nil {
 		return 0, nil, fmt.Errorf("marshalling request: %w", err)
@@ -119,7 +102,6 @@ func (s *decouplingRulePackState) stewardPost(path string, payload interface{}) 
 
 // ruleEnginePost sends a JSON POST to the rule-engine HTTP API.
 func (s *decouplingRulePackState) ruleEnginePost(path string, payload interface{}) (int, []byte, error) {
-	s.ensureRuleEngineURL()
 	jsonBody, err := json.Marshal(payload)
 	if err != nil {
 		return 0, nil, fmt.Errorf("marshalling request: %w", err)
@@ -193,7 +175,6 @@ func findCycleMemberRule(packs []rulePackEntry) *rulePackEntry {
 // ======================================================================
 
 func (s *decouplingRulePackState) theThreeDecouplingRulepackFiles() error {
-	s.ensureStewardURL()
 	return nil
 }
 
@@ -229,7 +210,6 @@ func (s *decouplingRulePackState) rulePacksExistWithParsedPredicates() error {
 // ======================================================================
 
 func (s *decouplingRulePackState) aMetricSampleWithMetricKindAndValue(metricKind string, value int) error {
-	s.ensureRuleEngineURL()
 	s.metricSample = map[string]interface{}{
 		"metric_kind": metricKind,
 		"value":       value,
@@ -314,8 +294,11 @@ func (s *decouplingRulePackState) itReturnsTrue() error {
 // Godog wiring
 // ---------------------------------------------------------------------------
 
-func InitializeScenario_policy_steward_and_solid_rule_engine_decoupled_functional_areas_rule_pack(ctx *godog.ScenarioContext) {
-	s := &decouplingRulePackState{}
+func InitializeScenario_policy_steward_and_solid_rule_engine_decoupled_functional_areas_rule_pack(ctx *godog.ScenarioContext, stewardURL, ruleEngineURL string) {
+	s := &decouplingRulePackState{
+		stewardURL:    stewardURL,
+		ruleEngineURL: ruleEngineURL,
+	}
 
 	// Scenario: decoupling-loads
 	ctx.Step(`^the three decoupling rulepack files$`, s.theThreeDecouplingRulepackFiles)
@@ -329,8 +312,18 @@ func InitializeScenario_policy_steward_and_solid_rule_engine_decoupled_functiona
 }
 
 func TestE2E_policy_steward_and_solid_rule_engine_decoupled_functional_areas_rule_pack(t *testing.T) {
+	// Resolve service URLs up front. requireEnv calls t.Skip with a
+	// clear message when an env var is unset, so a misconfigured CI
+	// run surfaces as a visible skip instead of silently running
+	// against http://localhost:8082/8083 and producing confusing
+	// connection-refused failures.
+	stewardURL := requireEnv(t, "CLEAN_CODE_POLICY_STEWARD_URL")
+	ruleEngineURL := requireEnv(t, "CLEAN_CODE_RULE_ENGINE_URL")
+
 	suite := godog.TestSuite{
-		ScenarioInitializer: InitializeScenario_policy_steward_and_solid_rule_engine_decoupled_functional_areas_rule_pack,
+		ScenarioInitializer: func(ctx *godog.ScenarioContext) {
+			InitializeScenario_policy_steward_and_solid_rule_engine_decoupled_functional_areas_rule_pack(ctx, stewardURL, ruleEngineURL)
+		},
 		Options: &godog.Options{
 			Format:   "pretty",
 			Paths:    []string{"policy_steward_and_solid_rule_engine_decoupled_functional_areas_rule_pack.feature"},

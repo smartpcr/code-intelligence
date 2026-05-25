@@ -4,6 +4,157 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 5.6 -- Decoupled functional areas rule pack
+
+### Added
+
+- **`policy/rulepacks/decoupling/cycles.yaml`** -- canonical
+  `pack_id='decoupling.cycles'` rule_pack file declaring one
+  rule (`decoupling.cycle_member`, severity `block`) that
+  fires when a scope's `cycle_member` sample is `> 0`. Matches
+  the implementation-plan Stage 5.6 line 533 brief "block when
+  any module in a watched scope is in a cycle". The
+  `decoupling-loads` and `cycles-rule-fires-on-cycle-member`
+  test scenarios are pinned by
+  `policy/rulepacks/decoupling/{decoupling_test.go,bootstrap_test.go}`.
+- **`policy/rulepacks/decoupling/coupling.yaml`** --
+  `pack_id='decoupling.coupling'` rulepack with three rules
+  (`decoupling.fan_in_high`, `decoupling.fan_out_high`,
+  `decoupling.cbo_high`) covering exactly the three-metric
+  closed set `{fan_in, fan_out, coupling_between_objects}`
+  per the Stage 5.6 brief. Each predicate is a single
+  `threshold('<uuid>')` atom that resolves -- via the
+  canonical [`decoupling.Resolver`] -- to a
+  [`steward.Threshold`] row seeded by
+  [`decoupling.SeedThresholds`] (v1 defaults: 20 / 20 / 12).
+  Operators re-tune by inserting a new Threshold row and
+  republishing this rulepack at `version=2` against the new
+  UUID -- the implementation-plan Stage 5.6 line 534 contract
+  "with thresholds from `Threshold` rows".
+- **`policy/rulepacks/decoupling/duplication.yaml`** --
+  `pack_id='decoupling.duplication'` rulepack with one rule
+  (`decoupling.duplication_ratio_high`) whose predicate is a
+  single `threshold('<uuid>')` atom that resolves to a
+  `duplication_ratio` Threshold row (file scope, op=gt,
+  value=0.20).
+- **`policy/rulepacks/decoupling/thresholds.go`** -- canonical
+  source of truth for the four decoupling threshold UUIDs.
+  Each ID is a v5 UUID derived from a single
+  [`decoupling.Namespace`] seed (mirrors the
+  `internal/ast/scope/identity.go` pattern). Exports
+  [`SeedThresholds(ctx, store)`] (inserts the four rows into
+  `clean_code.threshold` via [`steward.Store.InsertThreshold`],
+  stamping each row's `CreatedAt` with a single `time.Now().UTC()`
+  capture so the four rows share one atomic seeding instant in
+  the audit log)
+  and [`Resolver()`] (returns a [`dsl.MapResolver`] for the
+  Rule Engine and the canon-guard tests).
+- **`policy/rulepacks/decoupling/bootstrap.go`** --
+  [`decoupling.Bootstrap(ctx, *steward.Steward, steward.Store)`]
+  -- the canonical startup hook the composition root calls
+  (see `cmd/clean-coded/main.go::run()` where the call
+  lives, gated on `signer != nil` so scaffold-mode boots
+  are skipped). Seeds the four Threshold rows + invokes
+  `steward.PublishRulepack` for each loaded YAML, treating
+  [`steward.ErrDuplicateRulePack`] / [`ErrDuplicateRule`] as
+  the idempotent "already bootstrapped" outcome.
+- **`cmd/clean-coded/main.go`** -- the production composition
+  root now invokes `decoupling.Bootstrap` after building the
+  Policy Steward, gated on `signer != nil` (scaffold-mode
+  boots without a wired signing key are skipped because
+  `policy.publish_rulepack`'s precondition would refuse them).
+  Bootstrap result counters (inserted thresholds / published
+  packs / published rules) are emitted as structured-log
+  fields on the `decoupling rulepacks bootstrapped` startup
+  line. The helper `buildPolicyWriter` is extended to return
+  the inner `*steward.Steward` and `steward.Store` alongside
+  the existing `*management.PolicyWriter` so the Bootstrap
+  call attaches to the SAME steward instance the HTTP
+  surface serves.
+- **`policy/rulepacks/decoupling/loader.go`** -- embed.FS-backed
+  [`LoadAll()`] that strict-decodes the three YAMLs via
+  `yaml.v3 KnownFields(true)` and validates the per-file and
+  cross-file invariants (family prefix, PK uniqueness, etc.).
+- **`policy/rulepacks/decoupling/{decoupling,bootstrap}_test.go`**
+  + `walk.go` + `cmd/clean-coded/bootstrap_test.go` -- 27 tests pinning:
+  - **canonical UUIDs match the YAML literals**
+    (`TestCanonicalThresholdIDs_MatchYAML`,
+    `TestNamespace_Pinned`),
+  - all three files declare `pack_id='decoupling.<subname>'`,
+  - every `predicate_dsl` parses cleanly via [`dsl.Parse`],
+  - every rule's metric_kind reference (whether literal OR
+    threshold-bound via the canonical [`Resolver`]) is in
+    [`dsl.CanonicalMetricKinds`] -- this is the
+    implementation-plan brief's "test asserting each predicate
+    references only canonical metric_kinds",
+  - every `severity_default` is in `{info, warn, block}`,
+  - no `(rule_id, version)` or `(pack_id, version)` pair is
+    duplicated across files,
+  - `cycles.yaml` rule fires on a
+    `(metric_kind='cycle_member', value=1)` sample and does
+    NOT fire on `value=0`,
+  - `coupling.yaml` covers exactly the
+    `{fan_in, fan_out, coupling_between_objects}` set
+    (sourced via resolver-bound metric_kind),
+  - `duplication.yaml` references only `duplication_ratio`,
+  - **end-to-end bootstrap**
+    (`TestBootstrap_PublishesThreePacksAndFiveRules`)
+    constructs a real wired [`steward.Steward`] (in-memory KMS
+    + Store + minted signing key), invokes
+    [`decoupling.Bootstrap`], and asserts (a) all 4 Threshold
+    rows present, (b) all 3 RulePack rows present via
+    `store.GetRulePack`, (c) all 5 Rule rows present via
+    `store.ListRulesForPack`, (d) every persisted predicate
+    parses cleanly. This realises the `decoupling-loads` e2e
+    scenario's "`pack='decoupling'` rule_packs exist with
+    parsed predicates" clause end-to-end.
+  - **composition-root wiring**
+    (`cmd/clean-coded/bootstrap_test.go::TestBuildPolicyWriter_WiresStewardAndStoreForBootstrap`)
+    calls the production `buildPolicyWriter` helper, then
+    `decoupling.Bootstrap` on the returned (steward, store)
+    tuple -- exactly the call shape `run()` performs.
+    Proves the wiring landing point: a follow-up edit that
+    refactors `buildPolicyWriter`'s signature so Bootstrap
+    can no longer find the inner Steward fails this test.
+  - **CreatedAt stamping**
+    (`TestSeedThresholds_StampsCreatedAt`) -- each persisted
+    Threshold row carries a non-zero, UTC, recent timestamp.
+    Guards against the silent-bug failure mode where
+    `InsertThreshold` (which writes `t.CreatedAt.UTC()`
+    verbatim) persists `0001-01-01` on every row.
+  - **idempotency**
+    (`TestBootstrap_IsIdempotent`, `TestSeedThresholds_Idempotent`),
+  - **predicate semantics** end-to-end: the coupling
+    `fan_in_high` rule fires for value=21 (above 20) and does
+    NOT fire at the boundary value=20
+    (`TestBootstrap_CouplingRuleFiresOnFanInAbove20`);
+    duplication fires for ratio=0.25 and does NOT fire at
+    0.20 (`TestBootstrap_DuplicationRuleFiresOnRatioAbove20pct`),
+  - signing-key precondition is honoured
+    (`TestBootstrap_RefusesWithoutSigningKey`).
+
+### Notes
+
+- The four canonical decoupling threshold UUIDs are
+  v5-derived from the namespace seed
+  `"clean-code/policy/rulepacks/decoupling/v1"`. Bumping the
+  trailing `/v1` to `/v2` is how operators rotate the entire
+  canonical threshold set without colliding with the v1 IDs.
+- Architecture Sec 1.4.1 pins `fan_in` and `fan_out` to the
+  canonical scope set `{method, class, file}`; the v1
+  decoupling rulepack ships one Threshold row per metric_kind
+  at `scope_kind=class` (the SOLID-family join point).
+  Operators extend coverage to method or file scope by
+  seeding additional Threshold rows and republishing the
+  coupling rulepack at `version=2`. The class-scope-only v1
+  shape is documented inline in `coupling.yaml`.
+- Threshold rows are seeded via the
+  `steward.Store.InsertThreshold` primitive (migration tooling
+  or per-deploy operator scripts). There is no `policy.*`
+  canonical write verb that mutates the Threshold catalogue
+  in v1; the `coupling.yaml` header documents this contract
+  inline rather than naming a hypothetical admin verb.
+
 ## Stage 2.2 -- iter 4 follow-ups (evaluator feedback resolution)
 
 ### Fixed

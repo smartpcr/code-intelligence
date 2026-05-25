@@ -29,13 +29,23 @@ func requireEnv(t *testing.T, name string) string {
 }
 
 // serviceRoot returns the absolute path to the services/clean-code
-// directory by walking up from this source file's location.
-func serviceRoot() string {
-	_, thisFile, _, _ := runtime.Caller(0)
+// directory by walking up from this source file's location. It returns
+// an error rather than a garbage path when runtime.Caller(0) fails
+// (e.g. in a stripped binary) or when filepath.Abs cannot resolve the
+// joined path, so callers surface a clear cause instead of every probe
+// failing with a confusing "no such file" deep inside go run.
+func serviceRoot() (string, error) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		return "", fmt.Errorf("runtime.Caller(0) returned ok=false; cannot determine service root (stripped binary or unusual build?)")
+	}
 	dir := filepath.Dir(thisFile)
 	root := filepath.Join(dir, "..", "..", "..")
-	abs, _ := filepath.Abs(root)
-	return abs
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolving absolute path of %q: %w", root, err)
+	}
+	return abs, nil
 }
 
 // recipesPackageExists checks whether internal/metrics/recipes has at
@@ -116,7 +126,11 @@ type registryCanonicalState struct {
 }
 
 func (s *registryCanonicalState) theRecipeRegistryAfterInit() error {
-	s.svcRoot = serviceRoot()
+	root, err := serviceRoot()
+	if err != nil {
+		return fmt.Errorf("locating service root: %w", err)
+	}
+	s.svcRoot = root
 	return nil
 }
 
@@ -220,7 +234,11 @@ type cycloKnownValueState struct {
 }
 
 func (s *cycloKnownValueState) aGoFixtureMethodWithTwoIfBranchesAndOneForLoop() error {
-	s.svcRoot = serviceRoot()
+	root, err := serviceRoot()
+	if err != nil {
+		return fmt.Errorf("locating service root: %w", err)
+	}
+	s.svcRoot = root
 	return nil
 }
 
@@ -380,7 +398,11 @@ type locPhysicalLinesState struct {
 }
 
 func (s *locPhysicalLinesState) aFortyTwoLinePythonSourceFileFixture() error {
-	s.svcRoot = serviceRoot()
+	root, err := serviceRoot()
+	if err != nil {
+		return fmt.Errorf("locating service root: %w", err)
+	}
+	s.svcRoot = root
 	return nil
 }
 
@@ -519,7 +541,10 @@ func InitializeScenario_ast_adapter_and_foundation_tier_compute_base_pack_founda
 }
 
 func TestE2E_ast_adapter_and_foundation_tier_compute_base_pack_foundation_recipes(t *testing.T) {
-	svcRoot := serviceRoot()
+	svcRoot, err := serviceRoot()
+	if err != nil {
+		t.Fatalf("determining service root: %v", err)
+	}
 	if !recipesPackageExists(svcRoot) {
 		t.Skip("internal/metrics/recipes package not found; skipping until impl branch lands")
 	}

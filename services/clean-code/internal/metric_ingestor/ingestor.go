@@ -34,9 +34,16 @@ var ErrMissingChurnPayloadForExternalPerRow = errors.New("metric_ingestor: ScanR
 // dispatcher ignores it and returns nil. Test fakes likewise
 // carry no fields.
 type FoundationInput struct {
-	// Reserved for Phase 3.2 fields. The zero value is
-	// meaningful (the noop dispatcher always returns nil
-	// regardless).
+	// SHA is the parent ScanRun's `commit.sha`. Stamped on
+	// every emitted `MetricSampleRecord.SHA` so the
+	// foundation-tier rows the dispatcher persists share
+	// the bound SHA with the rest of the ScanRun (G2:
+	// `MetricSample.sha` is the discriminator that joins a
+	// foundation draft to its commit). The Stage 3.2 state
+	// machine threads the claimed [ScanRunClaim.SHA] into
+	// this field; tests that drive the dispatcher directly
+	// may leave it empty when persistence is disabled.
+	SHA string
 }
 
 // FoundationRecipeDispatcher runs the foundation-tier recipe

@@ -235,7 +235,7 @@ func seedOneRuleInto(t *testing.T, s steward.Store, ruleID string) {
 func TestRootMux_ChurnWebhookMounted_RoundtripWritesSample(t *testing.T) {
 	t.Parallel()
 	// Build the production-shape Ingestor (the same primitives
-	// `buildMetricIngestorScaffold` wires).
+	// `buildMetricIngestor` wires).
 	fixedNow := func() time.Time {
 		return time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC)
 	}

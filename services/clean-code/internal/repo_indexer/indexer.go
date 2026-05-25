@@ -320,22 +320,29 @@ func NewInMemoryCatalogWriter() *InMemoryCatalogWriter {
 // PG implementation's documented contract (atomic insert
 // + registered-event ensure).
 //
-// PostgreSQL-shape mapping (for the writer that lands
-// later):
+// PostgreSQL-shape mapping (the production writer at
+// `internal/repo_indexer/pg_writer.go:181-249`):
 //
 //	BEGIN;
+//	-- per-repo dedup is via advisory lock, NOT a unique
+//	-- partial index. The only `repo_event` index is the
+//	-- non-unique `repo_event_repo_created_idx
+//	-- (repo_id, created_at DESC)` at
+//	-- `migrations/0001_catalog_lifecycle.up.sql:330-331`.
+//	SELECT pg_advisory_xact_lock(NS, hash32(repo_id));
 //	INSERT INTO clean_code.commit
 //	    (repo_id, sha, parent_sha, committed_at)
 //	    VALUES ($1, $2, NULLIF($3, ''), $4)
 //	    ON CONFLICT (repo_id, sha) DO NOTHING
 //	    RETURNING 1;            -- xRow.Scan -> CommitInserted
 //	-- if CommitInserted=false, COMMIT and return early.
+//	SELECT 1 FROM clean_code.repo_event
+//	    WHERE repo_id = $1 AND kind = 'registered' LIMIT 1;
+//	-- if no row, INSERT it (advisory lock serialises this
+//	-- branch so two concurrent first-SHA deliveries cannot
+//	-- both INSERT):
 //	INSERT INTO clean_code.repo_event
-//	    (repo_id, kind)
-//	    VALUES ($1, 'registered')
-//	    ON CONFLICT DO NOTHING  -- relies on the unique
-//	    RETURNING 1;            -- partial index on
-//	-- xRow.Scan -> EventInserted             -- (repo_id) WHERE kind='registered'
+//	    (repo_id, kind) VALUES ($1, 'registered');
 //	COMMIT;
 func (w *InMemoryCatalogWriter) EnsureCommitAndRegisteredEvent(_ context.Context, req CommitEnsureRequest) (CommitEnsureResult, error) {
 	w.mu.Lock()

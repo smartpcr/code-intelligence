@@ -269,6 +269,8 @@ func (r *FanOutRecipe) emit(ast *parser.AstFile, s *parser.AstScope, kind scope.
 			Kind:          kind,
 			QualifiedName: s.GetQualifiedName(),
 			Path:          ast.GetPath(),
+			// iter-5 evaluator item 3: see fan_in.go.
+			Params: s.GetParameters(),
 		},
 		nil,
 		fanOutDirectlyEmittedKinds,

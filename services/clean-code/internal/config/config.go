@@ -129,6 +129,14 @@ const (
 	EnvHTTPAddr                     = "CLEAN_CODE_HTTP_ADDR"
 	EnvPrometheusAddr               = "CLEAN_CODE_PROMETHEUS_ADDR"
 	EnvOTelEndpoint                 = "CLEAN_CODE_OTEL_ENDPOINT"
+	// EnvAstScanRoot points at the local on-disk root the
+	// Metric Ingestor's [DirectoryAstFileSource] walks.
+	// Layout convention is `<root>/<repo_id>/<sha>/...`.
+	// Empty leaves the source as the
+	// [EmptyAstFileSource] scaffold (Phase 4 supplies the
+	// PG-backed AST cache that replaces both).
+	EnvAstScanRoot = "CLEAN_CODE_AST_SCAN_ROOT"
+
 	// EnvPGURL is the canonical env var name for the PostgreSQL
 	// DSN (per docs/stories/code-intelligence-CLEAN-CODE/
 	// e2e-scenarios.md table at line 41-49). The Go field on
@@ -341,6 +349,18 @@ type Config struct {
 	// rationale. The indexer reuses [WebhookHMACSecret] (the
 	// SHARED external-ingest HMAC secret).
 	EnableScaffoldIndexerWebhook bool
+
+	// --- Stage 3.2 Metric Ingestor scan-source ---
+
+	// AstScanRoot points at the local on-disk root the
+	// Metric Ingestor's directory-backed [AstFileSource]
+	// walks. Layout convention is
+	// `<AstScanRoot>/<repo_id>/<sha>/...`. Empty in
+	// scaffold deploys -- the dispatcher falls back to the
+	// [EmptyAstFileSource], which yields no files and
+	// emits a `ast_files_seen=0` log line per dispatch.
+	// Phase 4 replaces both with the PG-backed AST cache.
+	AstScanRoot string
 }
 
 // Defaults returns a Config populated with the canonical
@@ -517,6 +537,7 @@ func readEnvOverrides() map[string]string {
 		EnvWebhookHMACSecret,
 		EnvEnableScaffoldChurnWebhook,
 		EnvEnableScaffoldIndexerWebhook,
+		EnvAstScanRoot,
 	}
 	out := make(map[string]string, len(keys))
 	for _, k := range keys {
@@ -607,6 +628,8 @@ func applyOverrides(cfg *Config, overrides map[string]string) error {
 			default:
 				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
 			}
+		case EnvAstScanRoot:
+			cfg.AstScanRoot = v
 		default:
 			return fmt.Errorf("unknown config key %q", k)
 		}

@@ -174,6 +174,12 @@ func (r *CycloRecipe) Compute(ast *parser.AstFile) []MetricSampleDraft {
 				Kind:          scope.KindMethod,
 				QualifiedName: m.GetQualifiedName(),
 				Path:          ast.GetPath(),
+				// iter-5 evaluator item 3: thread the
+				// parameter type list so overloaded
+				// methods sharing (path, qualifiedName)
+				// mint DISTINCT canonical signatures via
+				// `scope.BuildMethod`'s `params` arg.
+				Params: m.GetParameters(),
 			},
 			nil,
 			cycloAllowedKinds,

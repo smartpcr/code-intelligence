@@ -5,6 +5,205 @@ production-tier environment. The instructions assume Postgres
 14+ is already running and the `clean_code_*` roles have been
 created via the `0004_roles.up.sql` migration.
 
+## Stage 3.2: Metric Ingestor and ScanRun state machine
+
+### One-time bootstrap (per environment)
+
+1. **Apply migration `0006_repo_url`** against the shared
+   Postgres instance. The migration:
+   * adds the `repo_url` column to `clean_code.repo`;
+   * installs the WRITE-ONCE trigger
+     `tg_repo_url_write_once` and the backing PL/pgSQL
+     function;
+   * grants `INSERT (repo_url)` + `UPDATE (repo_url)` on
+     `clean_code.repo` to `clean_code_management` ONLY
+     (see `0006_repo_url.up.sql:127-141`). The Repo Indexer
+     is **not** granted INSERT/UPDATE on `repo_url`; the
+     column is Management-owned. The `clean_code_metric_ingestor`
+     role's `UPDATE (scan_status)` on `clean_code.commit`
+     was granted by the earlier `0004_roles.up.sql`
+     migration -- 0006 does NOT touch `commit.scan_status`
+     grants.
+
+   Verify with:
+
+   ```bash
+   psql "$CLEAN_CODE_PG_URL" -c "\d clean_code.repo" \
+     | grep -E "repo_url|tg_repo_url_write_once"
+   psql "$CLEAN_CODE_PG_URL" -c "\dt+ clean_code.commit"
+   ```
+
+   Expect the `repo_url` column on `repo`, the
+   `tg_repo_url_write_once` trigger on `repo`, and the
+   `clean_code.commit` table to be present (its
+   `scan_status` column was added by an earlier 0003-era
+   migration).
+
+2. **Back-fill `repo_url` for existing repos** (skip if
+   this is a fresh environment). Today's
+   `internal/management/register_repo.go` helper is the
+   only WRITE-ONCE-safe path; the Stage 1.2 follow-up
+   workstream `ws-...-stage-mgmt-register-repo-repo-url`
+   adds the HTTP verb. The helper uses
+   `INSERT INTO clean_code.repo (...) VALUES (...) ON
+   CONFLICT (repo_id) DO NOTHING` (see
+   `register_repo.go:204-213`), so re-running it against
+   an already-registered `repo_id` is a no-op. Operators
+   that need to back-fill `repo_url` for a row that was
+   inserted WITHOUT one (legacy data) must `UPDATE
+   clean_code.repo SET repo_url = $1 WHERE repo_id = $2
+   AND repo_url IS NULL` -- the WRITE-ONCE trigger allows
+   the NULL→non-NULL transition but rejects any subsequent
+   change. The `COALESCE(EXCLUDED.repo_url, repo.repo_url)`
+   shape used in the e2e fixture is a test-only helper and
+   does NOT appear in the production helper.
+
+3. **Set the env vars** on the long-running process. The
+   metric ingestor inherits its config from the
+   service-wide knobs -- there is intentionally no
+   `CLEAN_CODE_METRIC_INGESTOR_*` namespace today.
+
+   | Env var                              | Value                                                                  |
+   | ------------------------------------ | ---------------------------------------------------------------------- |
+   | `CLEAN_CODE_PG_URL`                  | postgres connection string with `clean_code_metric_ingestor` role auth |
+   | `CLEAN_CODE_AST_SCAN_ROOT`           | `/var/lib/clean-code/checkouts` (or wherever your indexer puts them)   |
+   | `CLEAN_CODE_PERIODIC_SWEEP_CADENCE`  | Sweeper tick interval (Go duration; default is the value in `config.go`) |
+   | `CLEAN_CODE_SCAN_TIMEOUT`            | Per-scan timeout passed to `WithStateMachineTimeout`                   |
+
+   Production deploys MUST set BOTH `CLEAN_CODE_PG_URL`
+   and `CLEAN_CODE_AST_SCAN_ROOT`. The composition root
+   (`cmd/clean-coded/main.go:402-448`) is strict about the
+   pairing:
+
+   - **Both set** → `PGScanRunStore` +
+     `DirectoryAstFileSource` are wired and the sweeper
+     launches.
+   - **`CLEAN_CODE_PG_URL` set, `CLEAN_CODE_AST_SCAN_ROOT`
+     unset** → the process **fails to start** with a
+     non-zero exit and the actionable boot error
+     "CLEAN_CODE_AST_SCAN_ROOT is REQUIRED when
+     CLEAN_CODE_PG_URL is configured" (see
+     `main.go:438-448`). It does NOT silently fall back to
+     `EmptyAstFileSource`; iter-4 made this fail-fast
+     after an evaluator finding that a production process
+     could otherwise start against live PG without ever
+     processing pending commits.
+   - **`CLEAN_CODE_PG_URL` unset** → scaffold mode. The
+     composition root logs `metric ingestor sweep loop
+     NOT STARTED (scaffold mode: CLEAN_CODE_AST_SCAN_ROOT
+     unset)` (`main.go:454-460`), closes `sweepDone`
+     immediately, and does NOT launch the sweeper. The
+     HTTP surface still serves; nothing claims commits.
+     This is dev-loop only.
+
+### Per-rollout verification
+
+After deploying a new build, confirm:
+
+1. `/healthz` returns 200 within 5s of pod-ready.
+2. `/readyz` flips to 200 within 30s. Note: Stage 3.2 does
+   NOT register an `ast_source` ready-check; the AST
+   source availability is enforced inside the state
+   machine's pre-flight (`WithStateMachineSourceProbe`),
+   not on the `/readyz` surface. The only `/readyz` probe
+   registered today is `signing_key_cache` (Policy
+   Steward, Stage 5.1).
+3. The first sweeper tick (after
+   `CLEAN_CODE_PERIODIC_SWEEP_CADENCE`) fires and emits a
+   structured log line of the form:
+
+   ```
+   metric_ingestor.sweeper start kind=full sha_binding=single
+   ```
+
+4. Query PG to confirm BOTH state machines moved together.
+   The `clean_code.commit` table is keyed by
+   `(repo_id, sha)` -- there is no `commit_id` column.
+   `clean_code.scan_run` carries `repo_id` plus `to_sha`
+   (non-null for `sha_binding='single'` per the
+   `scan_run_sha_binding_consistent` CHECK constraint in
+   `0001_catalog_lifecycle.up.sql`):
+
+   ```sql
+   SELECT c.repo_id, c.sha, c.scan_status,
+          r.scan_run_id, r.status
+   FROM clean_code.commit c
+   LEFT JOIN clean_code.scan_run r
+          ON r.repo_id = c.repo_id
+         AND r.to_sha  = c.sha
+         AND r.sha_binding = 'single'
+   WHERE c.repo_id = '<the repo you watched>'
+     AND c.sha     = '<the SHA you watched>';
+   ```
+
+   Expect `(commit.scan_status, scan_run.status)` to be
+   one of `('scanning','running')` mid-sweep,
+   `('scanned','succeeded')` on success, or
+   `('failed','failed')` on failure -- never any other
+   pairing.
+
+5. The audit log shows `commit.scan_status` UPDATEs by
+   `clean_code_metric_ingestor` ONLY -- no other role. If
+   you see another role writing to that column, the Phase
+   1.5 role grants regressed and the deploy MUST be rolled
+   back.
+
+### Key constraints to watch
+
+- **`repo_url` is WRITE-ONCE.** Any attempt to UPDATE the
+  column to a different value raises SQLSTATE 23514 from
+  the `tg_repo_url_write_once()` trigger, with the literal
+  message template (per
+  `migrations/0006_repo_url.up.sql:179`)
+  `clean_code.repo.repo_url is WRITE-ONCE: cannot change
+  from %L to %L for repo_id %L` -- the `%L` placeholders
+  are filled by `format()` with the old URL, the new URL,
+  and the affected `repo_id`. If your back-fill script
+  trips this, you have a real source-of-truth ambiguity
+  (the same repo registered twice with different URLs) --
+  resolve at the policy layer, do NOT disable the trigger.
+- **Canonical state alphabet.** Anything other than
+  `pending`, `scanning`, `scanned`, `failed` on
+  `commit.scan_status` or anything other than `running`,
+  `succeeded`, `failed` on `scan_run.status` is a bug. The
+  state constants live in
+  `internal/metric_ingestor/state.go` and are pinned by
+  the conformance suite under
+  `test/conformance/canonical_states_test.go` (when
+  present).
+
+### Backout
+
+Stage 3.2 is additive on top of Stage 3.1's commit lifecycle:
+
+1. **Stop the sweep loop first.** Unset
+   `CLEAN_CODE_AST_SCAN_ROOT` (or rotate it to a path the
+   pod cannot read) and restart the pod. The next
+   `Sweeper` tick will refuse to claim a pending commit
+   because the AST source probe is unhealthy.
+2. **Wait for any `'scanning'` commits to finalize.**
+   Query
+   `SELECT COUNT(*) FROM clean_code.commit WHERE scan_status='scanning';`
+   and wait for it to drop to zero (typically <30s; the
+   sweep's PG transaction is short and bounded by
+   `CLEAN_CODE_SCAN_TIMEOUT`).
+3. **Optionally replay migration 0006 down.** The down
+   migration drops the trigger and function BEFORE
+   dropping the `repo_url` column, and revokes the
+   targeted role grants. Existing `scan_run` rows and
+   `commit.scan_status` values stay populated -- the
+   Stage 3.1 lifecycle keeps working without 0006 in
+   place. There is NO destructive backout of recorded
+   metric_sample rows.
+4. Restart the pod with the previous build; the AST
+   source probe will report "not wired" and the sweeper
+   will tick without claiming any pending commits until
+   the next deploy.
+
+There is no application-layer rollback of recorded
+metric samples or finalized scan_runs; those are
+append-only audit history by design.
+
 ## Stage 5.1: Policy Steward signing-key store
 
 ### One-time bootstrap (per environment)

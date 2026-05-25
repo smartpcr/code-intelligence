@@ -88,7 +88,7 @@ func (s *scanStatusEnumState) weEnumerateItsValuesViaAllScanStatuses() error {
 	defer db.Close()
 
 	rows, err := db.QueryContext(context.Background(), `
-		SELECT unnest(enum_range(NULL::clean_code.scan_status))::text
+		SELECT unnest(enum_range(NULL::clean_code.commit_scan_status))::text
 	`)
 	if err != nil {
 		return fmt.Errorf("querying scan_status enum: %w", err)
@@ -194,10 +194,20 @@ func (s *newSHAState) aRunningRepoIndexerConnectedToPostgreSQL() error {
 
 func (s *newSHAState) theDatabaseIsMigratedAndSeeded() error {
 	// Ensure the repo fixture row exists (mirrors seed-fixtures-phase-03).
+	//
+	// iter-7 evaluator item 2: include `repo_url` so the
+	// Metric Ingestor's PG canonical-signature path
+	// (`PGRepoURLLookup.LookupRepoURL` -> `repo_url` column
+	// added in migration 0006_repo_url.up.sql) finds a
+	// non-NULL value. The lookup raises
+	// `ErrRepoURLLookupNotFound` on NULL, which would abort
+	// any downstream scope_binding write -- fixtures that
+	// drive scans MUST supply this column.
 	_, err := s.db.ExecContext(context.Background(), `
-		INSERT INTO clean_code.repo (repo_id, display_name, default_branch)
-		VALUES ($1, 'e2e-test-repo', 'main')
-		ON CONFLICT (repo_id) DO NOTHING
+		INSERT INTO clean_code.repo (repo_id, display_name, default_branch, repo_url)
+		VALUES ($1, 'e2e-test-repo', 'main', 'https://example.com/e2e/test-repo')
+		ON CONFLICT (repo_id) DO UPDATE
+		    SET repo_url = COALESCE(clean_code.repo.repo_url, EXCLUDED.repo_url)
 	`, s.repoID)
 	if err != nil {
 		return fmt.Errorf("ensuring repo fixture: %w", err)
@@ -208,11 +218,32 @@ func (s *newSHAState) theDatabaseIsMigratedAndSeeded() error {
 func (s *newSHAState) aWebhookPayloadForANewSHAIsProcessed(sha string) error {
 	s.sha = sha
 
-	// Clean up any previous test data for this SHA.
+	// Clean up any previous test data so the scenario is
+	// idempotent across re-runs.
+	//
+	// - `clean_code.commit` is keyed by (repo_id, sha); delete
+	//   the per-SHA row so the webhook re-creates it.
+	// - `clean_code.repo_event` has NO `commit_sha` column
+	//   (schema: event_id, repo_id, kind, payload_json,
+	//   created_at -- see `migrations/0001_catalog_lifecycle.up.sql:298-319`).
+	//   The only index on `repo_event` is the NON-unique
+	//   `repo_event_repo_created_idx (repo_id, created_at DESC)`
+	//   at `migrations/0001_catalog_lifecycle.up.sql:330-331`;
+	//   there is NO unique partial index on
+	//   `(repo_id) WHERE kind='registered'`. Deduplication of
+	//   the registered event is enforced by the PG writer's
+	//   per-repo advisory-lock + SELECT-then-INSERT pattern at
+	//   `internal/repo_indexer/pg_writer.go:181-249`
+	//   (`SELECT pg_advisory_xact_lock(NS, hash32(repo_id))`
+	//   then `SELECT 1 FROM repo_event WHERE repo_id=$1
+	//   AND kind='registered' LIMIT 1`, INSERT only if missing).
+	//   Delete the prior 'registered' event by repo_id so the
+	//   advisory-lock branch re-fires and the COUNT assertion
+	//   below sees the freshly-INSERTed row.
 	_, _ = s.db.ExecContext(context.Background(),
-		`DELETE FROM clean_code.repo_event WHERE commit_sha = $1`, sha)
+		`DELETE FROM clean_code.repo_event WHERE repo_id = $1::uuid AND kind = 'registered'`, s.repoID)
 	_, _ = s.db.ExecContext(context.Background(),
-		`DELETE FROM clean_code.commit WHERE sha = $1`, sha)
+		`DELETE FROM clean_code.commit WHERE repo_id = $1::uuid AND sha = $2`, s.repoID, sha)
 
 	// Build webhook payload matching the indexer's expected format.
 	payload := map[string]interface{}{
@@ -285,21 +316,36 @@ func (s *newSHAState) aSingleRepoEventWithKindIsAppended(expectedKind string) er
 	var count int
 	var kind string
 	for {
+		// repo_event is per-REPO (see `migrations/0001_catalog_lifecycle.up.sql:298-319`
+		// -- no `commit_sha` column). The indexer writes one
+		// `kind='registered'` event per repo via the
+		// advisory-lock + SELECT-then-INSERT dedup in
+		// `internal/repo_indexer/pg_writer.go:181-249`
+		// (there is NO unique partial index on
+		// `(repo_id) WHERE kind='registered'` -- the only
+		// `repo_event` index is the non-unique
+		// `repo_event_repo_created_idx (repo_id, created_at DESC)`
+		// at `migrations/0001_catalog_lifecycle.up.sql:330-331`).
+		// Filter by both repo_id and the expected kind so the
+		// COUNT is "at least one REGISTERED event for THIS
+		// repo" -- robust against the fixture repo
+		// accumulating later `retired` / `mode_changed`
+		// events in adjacent scenarios.
 		err := s.db.QueryRowContext(ctx, `
-			SELECT COUNT(*), MIN(kind::text) FROM clean_code.repo_event
-			WHERE commit_sha = $1
-		`, s.sha).Scan(&count, &kind)
+			SELECT COUNT(*), COALESCE(MIN(kind::text), '') FROM clean_code.repo_event
+			WHERE repo_id = $1::uuid AND kind = $2::clean_code.repo_event_kind
+		`, s.repoID, expectedKind).Scan(&count, &kind)
 		if err == nil && count > 0 {
 			break
 		}
 		if ctx.Err() != nil {
-			return fmt.Errorf("timed out waiting for repo_event for sha=%s", s.sha)
+			return fmt.Errorf("timed out waiting for repo_event(repo_id=%s, kind=%s)", s.repoID, expectedKind)
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
 
 	if count != 1 {
-		return fmt.Errorf("expected exactly 1 repo_event for sha=%s, got %d", s.sha, count)
+		return fmt.Errorf("expected exactly 1 repo_event(repo_id=%s, kind=%s), got %d", s.repoID, expectedKind, count)
 	}
 	if kind != expectedKind {
 		return fmt.Errorf("expected repo_event kind=%q, got %q", expectedKind, kind)

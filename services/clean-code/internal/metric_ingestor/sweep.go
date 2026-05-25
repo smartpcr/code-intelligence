@@ -219,6 +219,15 @@ type ScanRunContext struct {
 	// [churn.Payload.RepoID] ([ErrRepoIDMismatch]) so a
 	// caller cannot cross-repo a batch.
 	RepoID uuid.UUID
+	// SHA is the parent ScanRun's `to_sha` (sha_binding='single')
+	// -- the commit SHA the foundation recipes scan against.
+	// Optional at the [Validate] layer because the churn-only
+	// `external_per_row` sweep does not require it. The
+	// foundation-tier dispatcher pulls the SHA off
+	// [FoundationInput.SHA] (threaded by [IngestorAstScanner])
+	// AND the AstFileSource MAY consult [ScanRunContext.SHA]
+	// for its on-disk layout convention.
+	SHA string
 }
 
 // Validate returns nil iff the context satisfies every

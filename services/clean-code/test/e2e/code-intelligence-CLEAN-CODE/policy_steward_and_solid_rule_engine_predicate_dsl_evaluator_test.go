@@ -16,10 +16,6 @@ import (
 	"github.com/cucumber/godog"
 )
 
-// defaultRuleEngineURL is the fallback base URL used when the
-// CLEAN_CODE_RULE_ENGINE_URL environment variable is not set.
-const defaultRuleEngineURL = "http://localhost:8083"
-
 // requireEnv returns the value of the named environment variable,
 // calling t.Skip when unset or empty.
 func requireEnv(t *testing.T, name string) string {
@@ -31,17 +27,6 @@ func requireEnv(t *testing.T, name string) string {
 	return v
 }
 
-// resolveRuleEngineURL returns the rule-engine base URL from the
-// CLEAN_CODE_RULE_ENGINE_URL environment variable, falling back to
-// defaultRuleEngineURL when unset. Centralising this resolution
-// ensures every scenario uses the same base URL.
-func resolveRuleEngineURL() string {
-	if v := os.Getenv("CLEAN_CODE_RULE_ENGINE_URL"); v != "" {
-		return v
-	}
-	return defaultRuleEngineURL
-}
-
 // ---------- shared types ----------
 
 // predicateDSLState carries state across Given/When/Then steps for
@@ -50,23 +35,15 @@ type predicateDSLState struct {
 	ruleEngineURL string
 
 	// dsl-rejects-unknown-metric-kind
-	predicateExpr   string
-	parseStatusCode int
-	parseRespBody   string
+	unknownMetricKind string
+	predicateExpr     string
+	parseStatusCode   int
+	parseRespBody     string
 
 	// dsl-deterministic
 	deterministicPredicate string
 	metricSample           map[string]interface{}
 	evalResults            []bool
-}
-
-// newPredicateDSLState constructs a predicateDSLState with the
-// rule-engine base URL pre-resolved, so individual step
-// implementations don't repeat the env lookup / fallback logic.
-func newPredicateDSLState() *predicateDSLState {
-	return &predicateDSLState{
-		ruleEngineURL: resolveRuleEngineURL(),
-	}
 }
 
 // ---------- helpers ----------
@@ -128,10 +105,7 @@ func (s *predicateDSLState) evalPredicate(predicate string, sample map[string]in
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBytes, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			return false, fmt.Errorf("evaluate returned %d; additionally failed to read response body: %w", resp.StatusCode, readErr)
-		}
+		respBytes, _ := io.ReadAll(resp.Body)
 		return false, fmt.Errorf("evaluate returned %d: %s", resp.StatusCode, string(respBytes))
 	}
 
@@ -147,6 +121,16 @@ func (s *predicateDSLState) evalPredicate(predicate string, sample map[string]in
 // ---------- Scenario: dsl-rejects-unknown-metric-kind ----------
 
 func (s *predicateDSLState) aPredicateReferencingMetricKind(metricKind string) error {
+	s.ruleEngineURL = os.Getenv("CLEAN_CODE_RULE_ENGINE_URL")
+	if s.ruleEngineURL == "" {
+		s.ruleEngineURL = "http://localhost:8083"
+	}
+
+	// Capture the metric kind from the Given step so the Then step can
+	// assert against the same value that was supplied by the feature
+	// file, rather than a hard-coded literal.
+	s.unknownMetricKind = metricKind
+
 	// Build a predicate expression that references the given (invalid) metric_kind.
 	s.predicateExpr = fmt.Sprintf("metric_kind == '%s' && value > 100", metricKind)
 	return nil
@@ -168,10 +152,17 @@ func (s *predicateDSLState) itReturnsAValidationErrorNamingTheUnknownMetricKind(
 		return fmt.Errorf("expected 4xx validation error, got %d; body: %s", s.parseStatusCode, s.parseRespBody)
 	}
 
-	// The response body should mention the unknown metric_kind "lines_of_code".
+	if s.unknownMetricKind == "" {
+		return fmt.Errorf("unknownMetricKind was not captured from the Given step; ensure the Given step runs before this Then step")
+	}
+
+	// The response body should mention the unknown metric_kind that was
+	// supplied by the Given step. Compare case-insensitively because the
+	// service may normalise case when echoing the offending value.
 	lower := strings.ToLower(s.parseRespBody)
-	if !strings.Contains(lower, "lines_of_code") {
-		return fmt.Errorf("expected response to name the unknown metric_kind 'lines_of_code', got: %s", s.parseRespBody)
+	expected := strings.ToLower(s.unknownMetricKind)
+	if !strings.Contains(lower, expected) {
+		return fmt.Errorf("expected response to name the unknown metric_kind %q, got: %s", s.unknownMetricKind, s.parseRespBody)
 	}
 
 	// Should also indicate it's a validation / unknown-metric error.
@@ -192,6 +183,11 @@ func (s *predicateDSLState) itReturnsAValidationErrorNamingTheUnknownMetricKind(
 // ---------- Scenario: dsl-deterministic ----------
 
 func (s *predicateDSLState) theSamePredicateAndTheSameMetricSampleInput() error {
+	s.ruleEngineURL = os.Getenv("CLEAN_CODE_RULE_ENGINE_URL")
+	if s.ruleEngineURL == "" {
+		s.ruleEngineURL = "http://localhost:8083"
+	}
+
 	// Use a well-known canonical predicate and sample.
 	s.deterministicPredicate = "metric_kind == 'cyclomatic_complexity' && value > 10"
 	s.metricSample = map[string]interface{}{
@@ -228,7 +224,7 @@ func (s *predicateDSLState) itReturnsTheSameBooleanResult() error {
 // ---------- Godog wiring ----------
 
 func InitializeScenario_policy_steward_and_solid_rule_engine_predicate_dsl_evaluator(ctx *godog.ScenarioContext) {
-	s := newPredicateDSLState()
+	s := &predicateDSLState{}
 
 	// dsl-rejects-unknown-metric-kind
 	ctx.Step(`^a predicate referencing metric_kind "([^"]*)"$`, s.aPredicateReferencingMetricKind)

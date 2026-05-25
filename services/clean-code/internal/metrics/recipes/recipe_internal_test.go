@@ -137,21 +137,57 @@ func TestNewDraft_PanicsOnEmptyAllowedKinds(t *testing.T) {
 	)
 }
 
-// TestNewDraft_PanicsOnWrongPack -- only `PackBase` is
-// allowed at the foundation-tier helper. Drift to `solid`,
-// `system`, or any literal would land a bad row.
+// TestNewDraft_PanicsOnWrongPack -- only the two computed-
+// tier packs (`base`, `solid`) are allowed at the
+// foundation-tier helper. Drift to `ingested` / `system`
+// (the webhook / aggregator packs) panics. Per-recipe tests
+// catch the narrower "this specific recipe must emit
+// `base` (or `solid`)" drift via the [MetricSampleDraft.Pack]
+// assertions in each recipe's per-emission test.
 func TestNewDraft_PanicsOnWrongPack(t *testing.T) {
 	t.Parallel()
-	sr := validScopeRef()
-	recover_must_panic_with(t,
-		func() {
-			_ = newDraft(
-				"cyclo", 1, PackSolid, SourceComputed,
-				1.0, sr, nil,
-				[]scope.Kind{scope.KindMethod, scope.KindFile},
+	cases := []struct {
+		name string
+		bad  Pack
+	}{
+		{"PackIngested (webhook drift)", PackIngested},
+		{"PackSystem (aggregator drift)", PackSystem},
+		{"empty (unset)", Pack("")},
+		{"foundation (typo drift)", Pack("foundation")},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(string(tc.bad), func(t *testing.T) {
+			t.Parallel()
+			sr := validScopeRef()
+			recover_must_panic_with(t,
+				func() {
+					_ = newDraft(
+						"cyclo", 1, tc.bad, SourceComputed,
+						1.0, sr, nil,
+						[]scope.Kind{scope.KindMethod, scope.KindFile},
+					)
+				},
+				`pack="base"`, `"solid"`, "computed-tier",
 			)
-		},
-		"pack=\"base\"", "got \"solid\"",
+		})
+	}
+}
+
+// TestNewDraft_AcceptsPackSolid -- the foundation-tier
+// helper accepts BOTH `PackBase` (rows 1-3, 10-12 of Sec
+// 1.4.1) AND `PackSolid` (rows 4-9). A call with PackSolid
+// MUST NOT panic; the per-recipe tests catch a base recipe
+// accidentally choosing solid (or vice versa).
+func TestNewDraft_AcceptsPackSolid(t *testing.T) {
+	t.Parallel()
+	sr := validScopeRef()
+	sr.Kind = scope.KindClass
+	// MUST NOT panic.
+	_ = newDraft(
+		"lcom4", 1, PackSolid, SourceComputed,
+		1.0, sr, nil,
+		[]scope.Kind{scope.KindClass},
 	)
 }
 

@@ -97,16 +97,23 @@ func (reg *Registry) Recipes() []Recipe {
 }
 
 // DefaultRegistry returns a fresh registry populated with
-// the canonical Stage 2.3 base-pack recipes: cyclo,
-// cognitive_complexity, loc. The three are the entirety of
-// the `pack='base'` AST-emitted set at this stage
-// (`cycle_member` and `duplication_ratio` land in Stage 2.5,
-// `modification_count_in_window` lands in Stage 2.6 as a
-// materialiser, not a recipe).
+// the canonical Stage 2.3 + 2.4 foundation-tier recipes:
 //
-// The exact registered set is asserted by the
-// `base-recipes-only-canonical-kinds` test scenario
-// (implementation-plan Stage 2.3 line 208).
+//   - Stage 2.3 base pack: `cyclo`, `cognitive_complexity`,
+//     `loc` (architecture Sec 1.4.1 rows 1-3).
+//   - Stage 2.4 SOLID pack foundation: `lcom4`, `fan_in`,
+//     `fan_out` (architecture Sec 1.4.1 rows 4-6).
+//
+// The base pack is the entirety of `pack='base'` AST-emitted
+// kinds at this stage (`cycle_member` and `duplication_ratio`
+// land in Stage 2.5, `modification_count_in_window` lands in
+// Stage 2.6 as a materialiser, not a recipe). The SOLID
+// foundation set is the three structural-coupling /
+// cohesion recipes pinned by impl-plan Stage 2.4 line 221.
+//
+// The exact registered set is asserted by
+// [TestDefaultRegistry_FoundationTierRecipes] (the renamed
+// successor of `base-recipes-only-canonical-kinds`).
 //
 // DefaultRegistry is INTENTIONALLY side-effect-free: it does
 // NOT touch any logger. The composition root (clean-coded
@@ -116,9 +123,14 @@ func (reg *Registry) Recipes() []Recipe {
 // implementation-plan Stage 2.3 line 201.
 func DefaultRegistry() *Registry {
 	reg := NewRegistry()
+	// Stage 2.3 base pack.
 	reg.Register(NewCycloRecipe())
 	reg.Register(NewCognitiveComplexityRecipe())
 	reg.Register(NewLocRecipe())
+	// Stage 2.4 SOLID pack foundation (impl-plan line 221).
+	reg.Register(NewLCOM4Recipe())
+	reg.Register(NewFanInRecipe())
+	reg.Register(NewFanOutRecipe())
 	return reg
 }
 
@@ -143,7 +155,7 @@ func DefaultRegistryWithLog(logger *slog.Logger) *Registry {
 
 // LogRegistered emits a single deterministic INFO-level
 // structured log line listing every registered recipe by
-// metric_kind + version, in sorted order
+// metric_kind + version + pack, in sorted order
 // (implementation-plan Stage 2.3 line 201).
 //
 // The line carries:
@@ -156,6 +168,15 @@ func DefaultRegistryWithLog(logger *slog.Logger) *Registry {
 //     "<metric_kind>:v<version>" tokens (the same set the
 //     `recipe_manifest` row will eventually pin -- architecture
 //     Sec 1.5 "definitional snapshot").
+//   - `packs`: the SORTED DISTINCT slice of metric-pack labels
+//     across the registered recipes (e.g. `["base", "solid"]`
+//     once Stage 2.4 lands). Replaces the prior single-pack
+//     literal -- the registry now hosts recipes from multiple
+//     packs.
+//   - `source`: literal "computed" -- the entire foundation
+//     tier emits `source='computed'` rows (architecture Sec
+//     1.4.1 column 4 is `source` on the metric ROW; every
+//     row this registry's recipes emit is computed-tier).
 //
 // LogRegistered is a no-op when `reg == nil` or
 // `logger == nil`; both cases are well-defined ("nothing to
@@ -168,6 +189,7 @@ func (reg *Registry) LogRegistered(logger *slog.Logger) {
 	}
 	kinds := reg.MetricKinds()
 	versions := make([]string, 0, len(kinds))
+	packSet := map[Pack]bool{}
 	for _, k := range kinds {
 		r, ok := reg.byKind[k]
 		if !ok || r == nil {
@@ -178,13 +200,19 @@ func (reg *Registry) LogRegistered(logger *slog.Logger) {
 			continue
 		}
 		versions = append(versions, fmt.Sprintf("%s:v%d", k, r.Version()))
+		packSet[r.Pack()] = true
 	}
+	packs := make([]string, 0, len(packSet))
+	for p := range packSet {
+		packs = append(packs, string(p))
+	}
+	sort.Strings(packs)
 	logger.Info("metric recipes registered",
 		slog.String("component", "recipes.registry"),
 		slog.Int("count", len(kinds)),
 		slog.Any("metric_kinds", kinds),
 		slog.Any("metric_kind_versions", versions),
-		slog.String("pack", string(PackBase)),
+		slog.Any("packs", packs),
 		slog.String("source", string(SourceComputed)),
 	)
 }

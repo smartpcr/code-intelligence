@@ -15,8 +15,8 @@ env:
   COMPOSE_FILE: tests/e2e/phase-05-policy-engine/docker-compose.yml
 
 jobs:
-  e2e-predicate-dsl-evaluator:
-    name: "E2E – Predicate DSL Evaluator"
+  e2e-decoupled-functional-areas-rule-pack:
+    name: "E2E – Decoupled Functional Areas Rule Pack"
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -44,18 +44,20 @@ jobs:
           # Extract the mapped host ports from the running compose services.
           KMS_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port kms-mock 8080 | cut -d: -f2)
           PG_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port postgres 5432 | cut -d: -f2)
-          RULE_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port rule-engine 8080 | cut -d: -f2)
+          STEWARD_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port policy-steward 8080 | cut -d: -f2)
+          RULE_ENGINE_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port rule-engine 8080 | cut -d: -f2)
           OTEL_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port otel-collector 4317 | cut -d: -f2)
           echo "CLEAN_CODE_KMS_URL=http://localhost:${KMS_PORT}" >> "$GITHUB_ENV"
           echo "CLEAN_CODE_PG_URL=postgres://postgres:postgres@localhost:${PG_PORT}/clean_code?sslmode=disable" >> "$GITHUB_ENV"
-          echo "CLEAN_CODE_RULE_ENGINE_URL=http://localhost:${RULE_PORT}" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_POLICY_STEWARD_URL=http://localhost:${STEWARD_PORT}" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_RULE_ENGINE_URL=http://localhost:${RULE_ENGINE_PORT}" >> "$GITHUB_ENV"
           echo "CLEAN_CODE_OTEL_ENDPOINT=http://localhost:${OTEL_PORT}" >> "$GITHUB_ENV"
 
       - name: Run E2E tests
         working-directory: services/clean-code
         run: |
           go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
-            -run TestE2E_policy_steward_and_solid_rule_engine_predicate_dsl_evaluator
+            -run TestE2E_policy_steward_and_solid_rule_engine_decoupled_functional_areas_rule_pack
 
       - name: Tear down compose services
         if: always()

@@ -25,6 +25,29 @@ const Path = "/v1/indexer/webhook"
 // degenerate publisher from blocking the writer.
 const MaxBodyBytes = 1 << 20 // 1 MiB
 
+// internalErrorMessage is the opaque message every 5xx
+// response carries in its [ErrorBody.Error] field. The
+// reviewer-facing rationale (tech-spec Sec 8.5 "minimise
+// blast radius of a leaky error"):
+//
+//   - [ErrCatalogWriterFailure] wraps the underlying writer
+//     error with `: %v` (see indexer.go), so the verbatim
+//     `runErr.Error()` may carry a Postgres DSN, SQL
+//     fragment, pgx-internal context, or stack-trace
+//     fragments from `database/sql`.
+//   - A publisher's request log absorbs the response body
+//     1:1; leaking driver context there gives an attacker
+//     who controls the publisher a free reconnaissance
+//     channel.
+//   - Operators still see the full error verbatim in the
+//     structured warning logged BEFORE the response is
+//     written, so triage signal is preserved server-side.
+//
+// 4xx responses keep their detailed message: those describe
+// a caller-supplied mistake (bad SHA, missing repo_id) and
+// the caller MUST see the detail to correct the request.
+const internalErrorMessage = "internal error"
+
 // WebhookPayload is the canonical in-process form of a
 // Git push-event webhook the Repo Indexer accepts. The
 // wire-format is JSON; field tags match the runbook-side
@@ -80,6 +103,12 @@ type Response struct {
 // ErrorBody is the JSON envelope the handler emits on a
 // 4xx / 5xx response. The `code` field is one of the
 // documented canonical literals (see [classifyError]).
+//
+// 4xx bodies carry the detailed message that pinpoints the
+// caller-supplied mistake. 5xx bodies carry the canonical
+// [internalErrorMessage] placeholder so a wrapped writer
+// error (Postgres DSN, SQL fragment, pgx context) cannot
+// leak through to a publisher's request log.
 type ErrorBody struct {
 	Error string `json:"error"`
 	Code  string `json:"code"`
@@ -251,15 +280,28 @@ func (h *WebhookHandler) Webhook(w http.ResponseWriter, r *http.Request) {
 	res, runErr := h.indexer.OnNewSHA(r.Context(), req)
 	if runErr != nil {
 		status, code := classifyError(runErr)
-		if h.logger != nil && status >= 500 {
-			h.logger.Warn("repo_indexer webhook: writer-side failure",
-				"repo_id", payload.RepoID,
-				"sha", payload.SHA,
-				"err", runErr.Error(),
-				"code", code,
-			)
+		// 5xx responses must NOT leak the wrapped writer
+		// error to the caller -- `ErrCatalogWriterFailure`
+		// is built via `fmt.Errorf("%w: %v", ..., err)` so
+		// `runErr.Error()` can carry Postgres DSNs, SQL
+		// fragments, or pgx-internal context. The verbatim
+		// detail stays in the structured warning below;
+		// the JSON body carries the opaque placeholder.
+		// 4xx detail is the caller's own input echoed back
+		// (bad SHA, missing repo_id) and is safe to surface.
+		msg := runErr.Error()
+		if status >= 500 {
+			if h.logger != nil {
+				h.logger.Warn("repo_indexer webhook: writer-side failure",
+					"repo_id", payload.RepoID,
+					"sha", payload.SHA,
+					"err", runErr.Error(),
+					"code", code,
+				)
+			}
+			msg = internalErrorMessage
 		}
-		h.writeError(w, status, runErr.Error(), code)
+		h.writeError(w, status, msg, code)
 		return
 	}
 
@@ -292,6 +334,12 @@ func (h *WebhookHandler) Webhook(w http.ResponseWriter, r *http.Request) {
 //   - [ErrZeroCommittedAt]       -> 400 / ZERO_COMMITTED_AT
 //   - [ErrCatalogWriterFailure]  -> 500 / WRITER_FAILURE
 //   - any other error            -> 500 / INTERNAL_ERROR
+//
+// Callers MUST treat a 5xx status as authoritative for
+// "do not surface the wrapped error message to the caller"
+// -- see [Webhook] / [RescanHandler.Rescan] which gate on
+// `status >= 500` to swap in the opaque
+// [internalErrorMessage] placeholder.
 func classifyError(err error) (status int, code string) {
 	switch {
 	case errors.Is(err, ErrZeroRepoID):

@@ -268,9 +268,7 @@ func (s *solidRulePackState) thePolicyStewardIsReachable() error {
 
 func (s *solidRulePackState) theFiveSOLIDRulepackFilesFor(nameList string) error {
 	// Parse the expected principle names from the step argument.
-	// The feature line is:
-	//   Given the five SOLID rulepack files for "srp", "ocp", "lsp", "isp", "dip"
-	// so `nameList` is the comma-separated tail: `"srp", "ocp", "lsp", "isp", "dip"`.
+	// e.g. `"srp", "ocp", "lsp", "isp", "dip"`
 	parts := strings.Split(nameList, ",")
 	if len(parts) != 5 {
 		return fmt.Errorf("expected 5 principle names, got %d from %q", len(parts), nameList)
@@ -304,9 +302,6 @@ func (s *solidRulePackState) exactlyNRulePackRowsExistWithPack(expected int, pac
 
 func (s *solidRulePackState) eachRulePackMapsToOneOf(nameList string) error {
 	// Build expected set from the step argument.
-	// The feature line is:
-	//   And each rule_pack maps to one of "srp", "ocp", "lsp", "isp", "dip"
-	// so `nameList` is the comma-separated tail with embedded quotes.
 	parts := strings.Split(nameList, ",")
 	expected := make(map[string]bool, len(parts))
 	for _, p := range parts {
@@ -488,20 +483,12 @@ func InitializeScenario_policy_steward_and_solid_rule_engine_solid_rule_packs(ct
 	ctx.Step(`^the Policy Steward is reachable$`, s.thePolicyStewardIsReachable)
 
 	// Scenario: solid-rulepacks-load
-	//
-	// The feature step contains five separately-quoted tokens:
-	//   Given the five SOLID rulepack files for "srp", "ocp", "lsp", "isp", "dip"
-	// so the regex must capture the entire comma-separated tail with `(.+)`
-	// rather than a single `"([^"]*)"` group (which would only match `srp`
-	// and then fail at end-of-line, leaving the step undefined).  The
-	// handler splits on `,` and trims whitespace + quotes per element.
-	ctx.Step(`^the five SOLID rulepack files for (.+)$`,
+	ctx.Step(`^the five SOLID rulepack files for "([^"]*)"$`,
 		s.theFiveSOLIDRulepackFilesFor)
 	ctx.Step(`^the Policy Steward loads them$`,
 		s.thePolicyStewardLoadsThem)
 	ctx.Step(`^exactly (\d+) rule_pack rows exist with pack "([^"]*)"$`,
 		s.exactlyNRulePackRowsExistWithPack)
-	// Same multi-quoted-token shape as the "five SOLID rulepack files" step.
 	ctx.Step(`^each rule_pack maps to one of (.+)$`,
 		s.eachRulePackMapsToOneOf)
 	ctx.Step(`^every rule_pack has a non-empty predicate that parses without error$`,

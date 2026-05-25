@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -111,11 +112,38 @@ type DirectoryAstFileSource struct {
 	// process.
 	MaxFileBytes int64
 	// SkipPatterns lists path globs (relative to the
-	// per-commit root) the walker should skip. Each
-	// entry is matched against the relative path via
-	// [filepath.Match]. Useful for skipping vendor
-	// directories that would otherwise dwarf the real
-	// source tree.
+	// per-commit root, forward-slash separated) the
+	// walker should skip. Each entry is matched via
+	// [path.Match] against BOTH directories AND files:
+	//
+	//   - When a directory's relative path matches, the
+	//     walker returns [filepath.SkipDir] and the
+	//     entire subtree is pruned -- the walker never
+	//     descends into it. This is what makes a single
+	//     `"vendor"` entry effective: the vendored tree
+	//     is never traversed, no matter how deep it is.
+	//   - When a file's relative path matches, the file
+	//     is skipped (counted in `files_skipped`) but
+	//     sibling files are still considered.
+	//
+	// Pattern syntax follows shell-glob semantics via
+	// [path.Match], which does NOT cross `/` separators:
+	// `*` matches a single path segment, never a
+	// directory boundary. Practical consequences:
+	//
+	//   - To prune a top-level vendored tree, pass the
+	//     directory's relative path (e.g. `"vendor"` or
+	//     `"third_party"`); these match the directory
+	//     itself, so the walker prunes at the top.
+	//   - `"vendor/*"` matches only the direct children
+	//     of `vendor/` (files OR sub-directories), so
+	//     `vendor/sub/foo.go` is NOT matched by it. Use
+	//     `"vendor"` instead to skip the whole tree.
+	//   - `"*.pb.go"` skips matching leaves at the
+	//     repository root only. Generated-file globs
+	//     that should fire at any depth are out of
+	//     scope here -- [path.Match] has no doublestar
+	//     (`**`) and adding one is a future enhancement.
 	SkipPatterns []string
 	// Logger receives ONE structured INFO line per
 	// scan call summarising files-walked / files-parsed
@@ -208,37 +236,71 @@ func (s *DirectoryAstFileSource) Files(ctx context.Context, scanRun ScanRunConte
 		paths        []string
 	)
 
-	walkErr := filepath.WalkDir(commitRoot, func(path string, d os.DirEntry, walkErr error) error {
+	walkErr := filepath.WalkDir(commitRoot, func(walkPath string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+
+		rel, err := filepath.Rel(commitRoot, walkPath)
+		if err != nil {
+			return fmt.Errorf("filepath.Rel(%q, %q): %w", commitRoot, walkPath, err)
+		}
+		relPosix := filepath.ToSlash(rel)
+
+		// Apply SkipPatterns to BOTH directories and files.
+		// For directories, returning [filepath.SkipDir]
+		// prunes the entire subtree so the walker never
+		// descends into (e.g.) vendor/ -- this is what
+		// makes a single `"vendor"` entry effective at any
+		// commit-tree depth without traversing every leaf
+		// file inside it. Before this change SkipPatterns
+		// ran on files only, which meant the walker still
+		// recursed into vendor/ in full and only filtered
+		// leaves whose relative path happened to match the
+		// glob (failing entirely for nested entries since
+		// [path.Match]'s `*` does not cross `/`).
+		//
+		// The commit-root itself shows up here as
+		// relPosix=="." -- we MUST NOT match patterns
+		// against it (a stray `"."` entry would otherwise
+		// abort the whole walk with [filepath.SkipDir] on
+		// the root).
+		//
+		// We use [path.Match] rather than [filepath.Match]
+		// because the relative path has been normalized to
+		// forward slashes via [filepath.ToSlash]; on
+		// Windows [filepath.Match] treats `\` as the
+		// separator and `/` as a literal, which would
+		// silently let `*` cross what the developer wrote
+		// as a `/` boundary. [path.Match] is forward-slash
+		// only and behaves identically on every platform.
+		if relPosix != "." {
+			for _, pat := range s.SkipPatterns {
+				matched, matchErr := path.Match(pat, relPosix)
+				if matchErr != nil {
+					return fmt.Errorf("invalid SkipPatterns entry %q: %w", pat, matchErr)
+				}
+				if matched {
+					if d.IsDir() {
+						return filepath.SkipDir
+					}
+					filesSkipped++
+					return nil
+				}
+			}
+		}
+
 		if d.IsDir() {
 			return nil
 		}
 		filesWalked++
 
-		rel, err := filepath.Rel(commitRoot, path)
-		if err != nil {
-			return fmt.Errorf("filepath.Rel(%q, %q): %w", commitRoot, path, err)
-		}
-		relPosix := filepath.ToSlash(rel)
-		for _, pat := range s.SkipPatterns {
-			matched, matchErr := filepath.Match(pat, relPosix)
-			if matchErr != nil {
-				return fmt.Errorf("invalid SkipPatterns entry %q: %w", pat, matchErr)
-			}
-			if matched {
-				filesSkipped++
-				return nil
-			}
-		}
-
 		info, err := d.Info()
 		if err != nil {
-			return fmt.Errorf("os.DirEntry.Info(%q): %w", path, err)
+			return fmt.Errorf("os.DirEntry.Info(%q): %w", walkPath, err)
 		}
 		if info.Size() > maxBytes {
 			filesSkipped++

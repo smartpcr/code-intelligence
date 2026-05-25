@@ -104,7 +104,10 @@ func (s *predicateDSLState) evalPredicate(predicate string, sample map[string]in
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBytes, _ := io.ReadAll(resp.Body)
+		respBytes, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return false, fmt.Errorf("evaluate returned %d; additionally failed to read response body: %w", resp.StatusCode, readErr)
+		}
 		return false, fmt.Errorf("evaluate returned %d: %s", resp.StatusCode, string(respBytes))
 	}
 

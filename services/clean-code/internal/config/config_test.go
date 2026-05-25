@@ -32,6 +32,8 @@ func clearCleanCodeEnv(t *testing.T) {
 		EnvPolicyPublishOverlapSeconds,
 		EnvKMSProvider,
 		EnvKMSMasterKeyHex,
+		EnvWebhookHMACSecret,
+		EnvEnableScaffoldChurnWebhook,
 	} {
 		t.Setenv(k, "")
 	}
@@ -359,4 +361,170 @@ func TestValidate_RejectsBadLogLevel(t *testing.T) {
 	if err := cfg.Validate(); err == nil {
 		t.Fatalf("Validate: want error for log-level=verbose; got nil")
 	}
+}
+
+// --- Stage 2.6 iter 6: scaffold churn-webhook env interlock ---
+
+// TestChurnWebhook_HMACEnvFields_DefaultsAreEmpty pins that
+// neither env var is set by default. Production deployments
+// that don't opt in must observe a fully unmounted webhook
+// (evaluator iter-5 #3 -- scaffold-mode persistence loses data,
+// so it must be off by default).
+func TestChurnWebhook_HMACEnvFields_DefaultsAreEmpty(t *testing.T) {
+	clearCleanCodeEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.WebhookHMACSecret != "" {
+		t.Errorf("WebhookHMACSecret: want empty, got %q", cfg.WebhookHMACSecret)
+	}
+	if cfg.EnableScaffoldChurnWebhook {
+		t.Errorf("EnableScaffoldChurnWebhook: want false, got true")
+	}
+}
+
+// TestChurnWebhook_HMACEnvFields_BothSetIsValid pins the
+// "both-or-neither" interlock's accept-both branch: setting
+// EnableScaffoldChurnWebhook=true AND a non-empty HMAC secret
+// is the valid scaffold-mode opt-in.
+func TestChurnWebhook_HMACEnvFields_BothSetIsValid(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvWebhookHMACSecret, "test-secret-32-bytes-or-more-please!!")
+	t.Setenv(EnvEnableScaffoldChurnWebhook, "true")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.EnableScaffoldChurnWebhook {
+		t.Errorf("EnableScaffoldChurnWebhook: want true, got false")
+	}
+	if cfg.WebhookHMACSecret != "test-secret-32-bytes-or-more-please!!" {
+		t.Errorf("WebhookHMACSecret round-trip mismatch: %q", cfg.WebhookHMACSecret)
+	}
+}
+
+// TestChurnWebhook_HMACEnvFields_EnableWithoutSecretRejected
+// pins the both-or-neither interlock: opting the webhook in
+// without a secret is the dangerous footgun (mounted, no auth).
+// Load surfaces the misconfig as a Validate error so the process
+// fails fast at startup.
+func TestChurnWebhook_HMACEnvFields_EnableWithoutSecretRejected(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvEnableScaffoldChurnWebhook, "true")
+	// Secret intentionally NOT set.
+	_, err := Load()
+	if err == nil {
+		t.Fatalf("Load: want error for enable=true with empty secret; got nil")
+	}
+	if !strings.Contains(err.Error(), "CLEAN_CODE_WEBHOOK_HMAC_SECRET") {
+		t.Errorf("error should name the missing env var, got %v", err)
+	}
+}
+
+// TestChurnWebhook_HMACEnvFields_SecretWithoutEnableRejected
+// pins the inverse of the previous test: configuring a secret
+// but NOT opting the webhook in is also a misconfig (the
+// secret will be discarded silently otherwise -- the operator
+// probably intended to enable the webhook). Load surfaces this
+// as a Validate error.
+func TestChurnWebhook_HMACEnvFields_SecretWithoutEnableRejected(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvWebhookHMACSecret, "test-secret-32-bytes-or-more-please!!")
+	// Enable flag intentionally NOT set.
+	_, err := Load()
+	if err == nil {
+		t.Fatalf("Load: want error for secret with enable=false; got nil")
+	}
+	if !strings.Contains(err.Error(), "CLEAN_CODE_ENABLE_SCAFFOLD_CHURN_WEBHOOK") {
+		t.Errorf("error should name the missing env var, got %v", err)
+	}
+}
+
+// TestChurnWebhook_HMACEnvFields_BooleanParsingClosedSet pins
+// the closed set of accepted boolean literals for the enable
+// flag: standard {true,false,1,0,yes,no,on,off}. Bad literals
+// surface as a Load error so an operator typo (e.g. "True ") is
+// caught at boot.
+func TestChurnWebhook_HMACEnvFields_BooleanParsingClosedSet(t *testing.T) {
+	// Strong enough to clear the iter-7 length guard
+	// ([MinWebhookHMACSecretBytes]); content is irrelevant
+	// for the boolean-parser branches under test.
+	strongSecret := "boolean-parser-test-secret-please-be-32-plus-bytes"
+	for _, v := range []string{"true", "1", "TRUE", "True"} {
+		v := v
+		t.Run("accepts/"+v, func(t *testing.T) {
+			clearCleanCodeEnv(t)
+			t.Setenv(EnvWebhookHMACSecret, strongSecret)
+			t.Setenv(EnvEnableScaffoldChurnWebhook, v)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load(%q): %v", v, err)
+			}
+			if !cfg.EnableScaffoldChurnWebhook {
+				t.Errorf("EnableScaffoldChurnWebhook(%q): want true", v)
+			}
+		})
+	}
+	for _, v := range []string{"yeah", "absolutely", "2"} {
+		v := v
+		t.Run("rejects/"+v, func(t *testing.T) {
+			clearCleanCodeEnv(t)
+			t.Setenv(EnvWebhookHMACSecret, strongSecret)
+			t.Setenv(EnvEnableScaffoldChurnWebhook, v)
+			if _, err := Load(); err == nil {
+				t.Errorf("Load(%q): want error for non-boolean literal; got nil", v)
+			}
+		})
+	}
+}
+
+// TestChurnWebhook_HMACEnvFields_MinSecretLengthEnforced pins
+// evaluator iter-6 #5: a non-empty secret SHORTER than
+// [MinWebhookHMACSecretBytes] must be rejected at startup so
+// a one-character typo or copy-paste truncation cannot mount a
+// trivially brute-forceable HMAC boundary. Tests at exactly
+// (min-1) and (min) the boundary.
+func TestChurnWebhook_HMACEnvFields_MinSecretLengthEnforced(t *testing.T) {
+	// Just-under-minimum -> reject.
+	t.Run("rejects-31-bytes", func(t *testing.T) {
+		clearCleanCodeEnv(t)
+		shortSecret := strings.Repeat("x", MinWebhookHMACSecretBytes-1)
+		t.Setenv(EnvWebhookHMACSecret, shortSecret)
+		t.Setenv(EnvEnableScaffoldChurnWebhook, "true")
+		_, err := Load()
+		if err == nil {
+			t.Fatalf("Load: want error for %d-byte secret; got nil", len(shortSecret))
+		}
+		if !strings.Contains(err.Error(), "at least") {
+			t.Errorf("error should explain the minimum-length guard, got %v", err)
+		}
+		if !strings.Contains(err.Error(), EnvWebhookHMACSecret) {
+			t.Errorf("error should name %s, got %v", EnvWebhookHMACSecret, err)
+		}
+	})
+	// Exactly minimum -> accept.
+	t.Run("accepts-32-bytes", func(t *testing.T) {
+		clearCleanCodeEnv(t)
+		exactSecret := strings.Repeat("x", MinWebhookHMACSecretBytes)
+		t.Setenv(EnvWebhookHMACSecret, exactSecret)
+		t.Setenv(EnvEnableScaffoldChurnWebhook, "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: want no error for %d-byte secret; got %v", len(exactSecret), err)
+		}
+		if cfg.WebhookHMACSecret != exactSecret {
+			t.Errorf("WebhookHMACSecret round-trip mismatch")
+		}
+	})
+	// Empty -> still accepted (means "webhook disabled"); the
+	// both-or-neither interlock takes precedence over the
+	// length guard. This is the default production state.
+	t.Run("accepts-empty-when-enable-flag-false", func(t *testing.T) {
+		clearCleanCodeEnv(t)
+		// Both unset -> webhook off, no length-guard hit.
+		if _, err := Load(); err != nil {
+			t.Errorf("Load with both env vars unset: want nil; got %v", err)
+		}
+	})
 }

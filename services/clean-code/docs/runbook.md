@@ -483,3 +483,113 @@ name is `mgmt.override`; the legacy path is still mounted at
 a body identifying the rename so operators scripting against an
 older draft contract learn of the change without getting a
 404.
+
+
+## ingest.churn webhook -- scaffold mode (Stage 2.6 iter 6)
+
+### What
+
+Stage 2.6 ships the `modification_count_in_window` materialiser
+plus a churn-payload webhook
+([`webhook.ChurnIngestHandler`](../internal/ingest/webhook/handler.go))
+that drives [`metric_ingestor.Ingestor.Run`](../internal/metric_ingestor/ingestor.go).
+The webhook is **off by default** in production builds: it is
+mounted on the `rootMux` iff BOTH env vars below are set.
+
+This is intentional. The Stage 2.6 composition root uses an
+**in-memory** `MetricSampleWriter` -- materialised rows survive
+in the process heap but are LOST on restart. Phase 3.2
+(`stage-metric-ingestor-and-scanrun-state-machine`) lands the
+`pgx`-backed batch writer that persists to `metric_sample` /
+`metric_sample_active` in the same ScanRun transaction; until
+then the webhook is a **scaffold** that an operator MUST opt
+into knowingly.
+
+### Configuration (env vars)
+
+| Env var                                       | Meaning                                                                                                                                                                                  | Required when                              |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| `CLEAN_CODE_ENABLE_SCAFFOLD_CHURN_WEBHOOK`    | `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`. Mount the webhook at `/v1/ingest/churn`. Defaults to **`false`** -- production deploys leave the path returning 404.                       | always (defaults to `false`)               |
+| `CLEAN_CODE_WEBHOOK_HMAC_SECRET`        | Shared secret for HMAC-SHA256 verification of every request body. Long-lived; rotate by issuing a new value to every publisher AND the service AT THE SAME TIME (no overlap support yet). | when the enable flag is `true`             |
+
+`config.Validate` enforces a **both-or-neither** interlock:
+
+- Both unset (default) -> webhook unmounted, `POST /v1/ingest/churn` returns 404.
+- Both set -> webhook mounted with HMAC verification active.
+- Enable=true with empty secret -> `config.Load` returns an error (process fails to start; prevents unauthenticated mount).
+- Secret set with Enable=false -> `config.Load` returns an error (catches a likely operator typo where the enable flag was forgotten).
+
+### Wire shape
+
+```
+POST /v1/ingest/churn HTTP/1.1
+Content-Type: application/json
+X-Hub-Signature-256: sha256=<lowercase-hex HMAC-SHA256(body, secret)>
+
+{
+  "repo_id":   "11111111-2222-3333-4444-555555555555",
+  "rows": [
+    { "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "file_path":   "internal/foo.go",
+      "modified_at": "2026-05-23T12:00:00Z" }
+  ]
+}
+```
+
+The handler computes HMAC-SHA256(body, secret) using
+[`webhook.SignHMAC`](../internal/ingest/webhook/hmac.go) and
+constant-time-compares against the header digest using
+[`crypto/hmac.Equal`](https://pkg.go.dev/crypto/hmac#Equal). On
+mismatch the response is **401** + a structured error code
+(`HMAC_MISSING_SIGNATURE`, `HMAC_MALFORMED_SIGNATURE`,
+`HMAC_SIGNATURE_MISMATCH`, `HMAC_EMPTY_SECRET`). The HMAC check
+runs BEFORE Content-Type validation so an unauthenticated caller
+cannot probe the contract through differential 401-vs-415
+responses.
+
+### Status codes
+
+| Code | Meaning |
+| ---- | ------- |
+| 200  | Payload accepted, materialiser ran, in-memory writer holds the rows until restart. |
+| 400  | Body missing `repo_id`, malformed JSON, unknown field, invalid SHA (must be 40 hex chars), zero `modified_at`. |
+| 401  | HMAC verification failed -- see the per-code subtypes above. |
+| 404  | The webhook is not mounted (scaffold opt-in not flipped). |
+| 405  | Any method other than `POST`. |
+| 413  | Body exceeds the 16 MiB limit (`webhook.MaxBodyBytes`). |
+| 415  | `Content-Type` is not `application/json`. |
+| 422  | Scope resolution failed -- e.g. the `ScopeResolver` returned an error, the zero UUID, or (Stage 2.6) a non-file scope. Code `SCOPE_RESOLUTION_FAILED`; see "Stage 2.6 hydration: file scope ONLY" below for the method-scope deferral. |
+| 500  | Writer rejected the row (the in-memory writer never produces 500; this surfaces when Phase 3.2 swaps in the PG-backed writer and an INSERT fails). |
+
+### Stage 2.6 hydration: file scope ONLY
+
+The Stage 2.6 churn hydrator
+(`internal/ingest/churn/churn.go::Hydrate`) currently mints
+**file-scope** `MetricSampleSeed` records only -- if the resolved
+scope is anything other than `Kind == scope.KindFile` the row is
+rejected by wrapping `ErrScopeResolutionFailed` (see
+`internal/ingest/churn/churn.go:538-540`). The webhook's
+`classifyError` (`internal/ingest/webhook/handler.go:359-360`)
+maps `ErrScopeResolutionFailed` to **HTTP 422** + the error code
+`SCOPE_RESOLUTION_FAILED` -- the same response shape any
+scope-resolver failure surfaces, so a publisher can treat
+"file-scope hydration only" as one branch of
+`SCOPE_RESOLUTION_FAILED` rather than a Stage-2.6-specific
+status code. The Stage 2.6 brief's reference scenario names a
+method-scope tag (`pkg.Foo.bar`); that case is
+**deferred to Stage 4** when the AST-driven `scope_binding`
+reader replaces today's `AutoMapScopeResolver`. Until then,
+publishers MUST emit one row per FILE PATH, not one row per
+method. The materialiser itself
+([`internal/metrics/materialisers/modification_count.go`](../internal/metrics/materialisers/modification_count.go))
+already supports method-scope seeds; only the churn-payload
+hydrator is gated.
+
+### Acceptance checklist (before enabling in production)
+
+- [ ] You have read this section's "What" paragraph and understand the in-memory persistence implication.
+- [ ] You have rotated `CLEAN_CODE_WEBHOOK_HMAC_SECRET` to a value NOT in source control.
+- [ ] Every CI publisher has been updated to compute and send the `X-Hub-Signature-256` header.
+- [ ] You have set `CLEAN_CODE_ENABLE_SCAFFOLD_CHURN_WEBHOOK=true` AND `CLEAN_CODE_WEBHOOK_HMAC_SECRET=<value>`.
+- [ ] Restart `clean-coded`. The startup log line `ingest.churn webhook mounted in SCAFFOLD MODE -- writer is in-memory and rows are LOST on restart` confirms the mount.
+- [ ] You have a plan to upgrade to Phase 3.2 BEFORE the in-memory loss becomes operationally painful (e.g. a backfill job that re-POSTs the last N hours of churn on every restart).

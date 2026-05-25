@@ -225,6 +225,10 @@ func (r *LocRecipe) MetricKind() string { return locMetricKind }
 // Version implements [Recipe].
 func (r *LocRecipe) Version() int { return locVersion }
 
+// Pack implements [Recipe]. loc is in the `base` pack
+// (architecture Sec 1.4.1 row 3).
+func (r *LocRecipe) Pack() Pack { return PackBase }
+
 // AppliesTo implements [Recipe]. Returns true iff the AST is
 // non-nil AND NOT degraded. Unlike cyclo / cognitive the loc
 // recipe does NOT need the `decision_blocks` capability --

@@ -9,10 +9,20 @@ import (
 
 // Pack is the closed enum of `MetricSample.pack` values
 // (architecture Sec 5.2.1 line 901). Foundation-tier recipes
-// in this package always emit [PackBase]; the [Pack] type
-// exists so a non-canonical literal (e.g. `"basic"`,
-// `"foundation"`) is a compile error rather than a string
-// drift that lands in PostgreSQL.
+// in this package emit either [PackBase] (the cyclo /
+// cognitive_complexity / loc / cycle_member / duplication_ratio
+// rows from Sec 1.4.1 rows 1-3, 10-12) OR [PackSolid] (the
+// lcom4 / fan_in / fan_out / depth_of_inheritance /
+// interface_width / coupling_between_objects rows from Sec
+// 1.4.1 rows 4-9); both are computed-tier emissions
+// (`source='computed'`). The [Pack] type exists so a
+// non-canonical literal (e.g. `"basic"`, `"foundation"`) is a
+// compile error rather than a string drift that lands in
+// PostgreSQL. The [newDraft] helper enforces the
+// `pack in {base, solid}` constraint at runtime; recipes
+// pin their per-row pack to a specific literal so per-recipe
+// tests catch a base recipe accidentally emitting `solid` (or
+// vice versa).
 type Pack string
 
 // Source is the closed enum of `MetricSample.source` values
@@ -53,6 +63,59 @@ const (
 // `Attrs["decision_blocks"] = "true"` on the emitted
 // `*AstFile` so this package's recipes light up automatically.
 const AttrDecisionBlocks = "decision_blocks"
+
+// AttrCallEdges is the file-level [parser.AstFile.Attrs] key
+// producers stamp when their emitted `*AstFile.Edges` slice
+// includes call-graph edges (`edge.kind == EdgeKindCalls`).
+// The fan_in and fan_out recipes (architecture Sec 1.4.1 rows
+// 5-6) AND the lcom4 recipe (Sec 1.4.1 row 4 -- it needs
+// intra-class call connectivity in addition to shared-field
+// connectivity per Hitz & Montazeri) all gate
+// [Recipe.AppliesTo] on this flag, so today's Stage 2.1
+// parsers -- which emit only `imports`, `extends`,
+// `implements`, `contains` edges -- silently produce zero
+// drafts rather than landing misleading `fan_in=0` /
+// `fan_out=0` / `lcom4=method_count` rows.
+//
+// IMPORTANT for lcom4: stamping `call_edges="true"` ALONE
+// is necessary but NOT sufficient -- lcom4 ALSO requires
+// [AttrFieldAccesses] = "true". See [AttrFieldAccesses] doc
+// for the dual-capability rationale.
+//
+// A future parser stage that walks call sites and emits
+// `calls` edges MUST stamp `Attrs["call_edges"] = "true"` on
+// the emitted `*AstFile` so the SOLID recipes light up
+// automatically.
+const AttrCallEdges = "call_edges"
+
+// AttrFieldAccesses is the file-level [parser.AstFile.Attrs]
+// key producers stamp when their emitted `*AstFile.Edges`
+// slice includes field-access edges
+// (`edge.kind in {EdgeKindReadsField, EdgeKindWritesField,
+// EdgeKindUsesField}`) targeting class-level
+// `AstSymbol(Kind=SymbolKindField)` entries.
+//
+// IMPORTANT: stamping `field_accesses="true"` ALONE does
+// NOT light up the lcom4 recipe. The lcom4 recipe
+// (architecture Sec 1.4.1 row 4) gates [Recipe.AppliesTo]
+// on BOTH [AttrFieldAccesses] AND [AttrCallEdges] being
+// "true" -- the classical LCOM4 algorithm (Hitz & Montazeri)
+// treats two methods as connected if EITHER they share a
+// field OR one calls the other, so a producer that surfaces
+// only field accesses would silently under-report cohesion
+// on delegation-heavy classes (a Facade whose methods chain
+// other methods without ever touching fields would look
+// maximally non-cohesive at LCOM4 = method count). The
+// dual-capability gate prevents that misleading row from
+// landing.
+//
+// A future parser stage that walks `this.field` / `self.field`
+// / `obj.field` accesses MUST stamp
+// `Attrs["field_accesses"] = "true"` AND
+// `Attrs["call_edges"] = "true"` on the emitted `*AstFile` so
+// the lcom4 recipe lights up automatically (a parser that
+// stamps only one of the two will keep lcom4 dark by design).
+const AttrFieldAccesses = "field_accesses"
 
 // AttrDecisionKind is the per-block-scope [parser.AstScope.Attrs]
 // key carrying the canonical decision-point taxonomy below.
@@ -110,6 +173,37 @@ const AttrSourceBytes = parser.AttrSourceBytes
 //
 // Defined as an alias to [parser.AttrModulePath].
 const AttrModulePath = parser.AttrModulePath
+
+// EdgeKindCalls is the canonical [parser.AstEdge.Kind] string
+// for a call-graph edge: one method (or scope contained in a
+// method) calls another. Pinned here so the fan_in / fan_out
+// recipes and any future producer cite the SAME literal; a
+// `grep -nF "calls"` lands the contract.
+const EdgeKindCalls = "calls"
+
+// EdgeKindReadsField, EdgeKindWritesField, EdgeKindUsesField
+// are the canonical [parser.AstEdge.Kind] strings for field-
+// access edges -- one method reads / writes / generically
+// accesses an [AstSymbol] whose own kind is
+// [SymbolKindField]. The lcom4 recipe treats all three as
+// "the method uses this field" for connectivity purposes
+// (Hitz & Montazeri LCOM4: two methods are connected if they
+// share at least one instance variable). Producers MAY emit a
+// subset (e.g. only `reads_field` if the parser cannot
+// distinguish reads from writes); the recipe accepts any of
+// the three.
+const (
+	EdgeKindReadsField  = "reads_field"
+	EdgeKindWritesField = "writes_field"
+	EdgeKindUsesField   = "uses_field"
+)
+
+// SymbolKindField is the canonical [parser.AstSymbol.Kind]
+// string for an instance / class-level field declaration.
+// Other symbol kinds the parser fleet emits (`parameter`,
+// `local`, `import`) are NOT treated as fields by the lcom4
+// recipe's connectivity graph.
+const SymbolKindField = "field"
 
 // AttrSourceLine and AttrSourceFile are per-sample
 // [MetricSampleDraft.Attrs] keys recipes MAY populate so the
@@ -295,6 +389,16 @@ type Recipe interface {
 	// metric_version) apart from "value drift at the same
 	// metric_version".
 	Version() int
+	// Pack returns the recipe's metric pack
+	// (architecture Sec 1.4.1 column 3) -- the {base, solid,
+	// decoupling, evolution} bucket the metric belongs to.
+	// Returned at the Recipe level (not just per-draft) so
+	// the startup log line + manifest snapshot can carry the
+	// pack labels deterministically.
+	//
+	// MUST match the Pack value the recipe stamps on every
+	// draft via [newDraft]; mismatch is a programmer bug.
+	Pack() Pack
 	// AppliesTo returns true iff `Compute` is allowed to run
 	// on this AST. A recipe that returns false silently
 	// produces NO drafts at this stage -- this is how the
@@ -374,8 +478,11 @@ func newDraft(
 	attrs map[string]string,
 	allowedKinds []scope.Kind,
 ) MetricSampleDraft {
-	if pack != PackBase {
-		panic(fmt.Sprintf("recipes: foundation-tier draft must have pack=%q, got %q", PackBase, pack))
+	if pack != PackBase && pack != PackSolid {
+		panic(fmt.Sprintf(
+			"recipes: foundation-tier draft must have pack=%q or %q (the two computed-tier packs per architecture Sec 5.2.1 line 901), got %q",
+			PackBase, PackSolid, pack,
+		))
 	}
 	if source != SourceComputed {
 		panic(fmt.Sprintf("recipes: foundation-tier draft must have source=%q, got %q", SourceComputed, source))
@@ -437,15 +544,42 @@ func hasDecisionCapability(ast *parser.AstFile) bool {
 	return ast.GetAttrs()[AttrDecisionBlocks] == "true"
 }
 
+// hasCallEdgesCapability reports whether the AST producer
+// stamped [AttrCallEdges] = "true" on the file-level attrs.
+// The fan_in / fan_out recipes gate on this so today's Stage
+// 2.1 parsers -- which emit `imports`/`extends`/`implements`/
+// `contains` but not `calls` -- produce zero drafts rather
+// than landing misleading zero rows.
+func hasCallEdgesCapability(ast *parser.AstFile) bool {
+	if ast == nil {
+		return false
+	}
+	return ast.GetAttrs()[AttrCallEdges] == "true"
+}
+
+// hasFieldAccessesCapability reports whether the AST producer
+// stamped [AttrFieldAccesses] = "true" on the file-level
+// attrs. The lcom4 recipe gates on this so an AST without
+// field-access edges does NOT emit `lcom4` rows whose
+// connectivity graph is empty (every method would be its own
+// component -> misleading high LCOM4 for cohesive classes).
+func hasFieldAccessesCapability(ast *parser.AstFile) bool {
+	if ast == nil {
+		return false
+	}
+	return ast.GetAttrs()[AttrFieldAccesses] == "true"
+}
+
 // scopeIndex is the cached parent/child topology of a single
 // `*parser.AstFile`. Walking the scope list once per Compute
 // keeps the algorithm O(N + E) rather than re-scanning per
 // method. Children are returned in source order (the parser
 // is contractually source-ordered, Sec 4.5).
 type scopeIndex struct {
-	byID     map[string]*parser.AstScope
-	children map[string][]*parser.AstScope
-	file     *parser.AstScope
+	byID        map[string]*parser.AstScope
+	children    map[string][]*parser.AstScope
+	file        *parser.AstScope
+	symbolsByID map[string]*parser.AstSymbol
 }
 
 // buildIndex constructs a [scopeIndex] from an `*AstFile`. The
@@ -455,8 +589,9 @@ type scopeIndex struct {
 // exists MUST check `idx.file != nil` after the call.
 func buildIndex(ast *parser.AstFile) scopeIndex {
 	idx := scopeIndex{
-		byID:     map[string]*parser.AstScope{},
-		children: map[string][]*parser.AstScope{},
+		byID:        map[string]*parser.AstScope{},
+		children:    map[string][]*parser.AstScope{},
+		symbolsByID: map[string]*parser.AstSymbol{},
 	}
 	for _, s := range ast.GetScopes() {
 		if s == nil {
@@ -468,6 +603,12 @@ func buildIndex(ast *parser.AstFile) scopeIndex {
 		if s.GetScopeKind() == parser.ScopeKindFile && idx.file == nil {
 			idx.file = s
 		}
+	}
+	for _, sym := range ast.GetSymbols() {
+		if sym == nil {
+			continue
+		}
+		idx.symbolsByID[sym.GetSymbolId()] = sym
 	}
 	return idx
 }
@@ -524,4 +665,96 @@ func less(a, b *parser.AstScope) bool {
 		}
 	}
 	return a.GetScopeId() < b.GetScopeId()
+}
+
+// scopesByKind returns every scope of the given kind in
+// source order. Used by recipes that fan out one draft per
+// class (`lcom4`) or per class+method+file (`fan_in`,
+// `fan_out`). The returned slice is fresh -- callers may
+// freely mutate it.
+func (idx scopeIndex) scopesByKind(kind parser.ScopeKind) []*parser.AstScope {
+	out := make([]*parser.AstScope, 0)
+	for _, s := range idx.byID {
+		if s.GetScopeKind() == kind {
+			out = append(out, s)
+		}
+	}
+	sortByRange(out)
+	return out
+}
+
+// subtreeIDs returns the set of scope_ids for `rootID` plus
+// every descendant scope (via repeated `parent_scope_id`
+// traversal). The set INCLUDES `rootID` itself so subtree-
+// membership tests can be a single map lookup.
+//
+// The traversal short-circuits on cycles: a scope cannot be
+// re-visited. (The producer is contractually acyclic, but
+// recipes must not panic on a malformed AST.)
+func (idx scopeIndex) subtreeIDs(rootID string) map[string]bool {
+	out := map[string]bool{}
+	if rootID == "" {
+		return out
+	}
+	if _, ok := idx.byID[rootID]; !ok {
+		return out
+	}
+	stack := []string{rootID}
+	for len(stack) > 0 {
+		n := len(stack) - 1
+		cur := stack[n]
+		stack = stack[:n]
+		if out[cur] {
+			continue
+		}
+		out[cur] = true
+		for _, ch := range idx.children[cur] {
+			if ch == nil {
+				continue
+			}
+			if !out[ch.GetScopeId()] {
+				stack = append(stack, ch.GetScopeId())
+			}
+		}
+	}
+	return out
+}
+
+// refEnclosingScope resolves a [parser.AstRef] to the scope
+// that owns its endpoint -- the scope_id directly for a
+// SCOPE-kind ref; the `AstSymbol.ScopeId` for a SYMBOL-kind
+// ref. Returns "" when the ref is nil, has empty id, or
+// points at a symbol the index does not know (an external
+// or malformed reference). Callers MUST distinguish "" from
+// a valid scope_id.
+func (idx scopeIndex) refEnclosingScope(ref *parser.AstRef) string {
+	if ref == nil {
+		return ""
+	}
+	id := ref.GetId()
+	if id == "" {
+		return ""
+	}
+	switch ref.GetKind() {
+	case parser.RefKindScope:
+		if _, ok := idx.byID[id]; ok {
+			return id
+		}
+		return ""
+	case parser.RefKindSymbol:
+		sym, ok := idx.symbolsByID[id]
+		if !ok || sym == nil {
+			return ""
+		}
+		owner := sym.GetScopeId()
+		if owner == "" {
+			return ""
+		}
+		if _, ok := idx.byID[owner]; !ok {
+			return ""
+		}
+		return owner
+	default:
+		return ""
+	}
 }

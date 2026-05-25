@@ -1,0 +1,55 @@
+trigger: none
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - services/clean-code/**
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  GO_VERSION: "1.25.1"
+  COMPOSE_FILE: tests/e2e/phase-03-indexer-ingestor/docker-compose.yml
+
+stages:
+  - stage: e2e_repo_indexer_and_commit_lifecycle
+    displayName: "E2E – Repo Indexer and Commit Lifecycle"
+    jobs:
+      - job: run_e2e
+        displayName: "Run godog E2E tests"
+        timeoutInMinutes: 20
+        steps:
+          - task: GoTool@0
+            inputs:
+              version: $(GO_VERSION)
+            displayName: "Install Go $(GO_VERSION)"
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) up -d --build
+            displayName: "Start compose services"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
+              PG_PORT=$(docker compose -f $(COMPOSE_FILE) port postgres 5432 | cut -d: -f2)
+              INDEXER_PORT=$(docker compose -f $(COMPOSE_FILE) port indexer 8080 | cut -d: -f2)
+              OTEL_PORT=$(docker compose -f $(COMPOSE_FILE) port otel-collector 4317 | cut -d: -f2)
+              export CLEAN_CODE_PG_URL="postgres://postgres:postgres@localhost:${PG_PORT}/clean_code?sslmode=disable"
+              export CLEAN_CODE_INDEXER_URL="http://localhost:${INDEXER_PORT}"
+              export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:${OTEL_PORT}"
+              make migrate-up
+              make seed-fixtures-phase-03
+              cd services/clean-code
+              go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
+                -run TestE2E_repo_indexer_and_metric_ingestor_repo_indexer_and_commit_lifecycle
+            displayName: "Export compose URLs, bootstrap, and run E2E tests"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) down -v --remove-orphans
+            displayName: "Tear down compose services"
+            workingDirectory: $(Build.SourcesDirectory)
+            condition: always()

@@ -59,10 +59,15 @@ const locVersion = 1
 // The two sets are wired separately so the architecture's
 // scope-applicability table (`{file, package, repo}`) is
 // still pinned at this layer (the helper guard accepts any
-// of the three -- forward-compatible for the materialiser /
-// aggregator that emits the upper-tier rows via the SAME
-// `newDraft` helper) without forcing this per-file recipe to
-// emit at scope_kinds it cannot authoritatively compute.
+// of the three for the materialiser / aggregator that emits
+// the upper-tier rows via the SAME `newDraft` helper) without
+// forcing this per-file recipe to emit at scope_kinds it
+// cannot authoritatively compute. THIS recipe's Compute path
+// passes [locDirectlyEmittedKinds] to [newDraft] -- the
+// narrow set -- so the panic guard catches an accidental
+// `package` / `repo` draft from a per-file Compute call; the
+// downstream materialiser / aggregator (Sec 5.2.5 / Sec 3.10)
+// passes [locAllowedKinds] when IT routes through `newDraft`.
 //
 // # Algorithm (file scope)
 //
@@ -120,7 +125,11 @@ const locVersion = 1
 // stages will route their emissions through the SAME
 // [newDraft] helper with the SAME [locAllowedKinds] slice;
 // the helper's per-recipe guard already accepts `file`,
-// `package`, and `repo` at the panic boundary.
+// `package`, and `repo` at the panic boundary when given
+// that wider set. This recipe's per-file Compute call
+// deliberately passes the NARROW [locDirectlyEmittedKinds]
+// so an accidental `package` / `repo` draft from a per-file
+// path is caught by the same guard.
 //
 // # Scope kinds (canonical seven-enum)
 //
@@ -161,6 +170,14 @@ type LocRecipe struct{}
 // helper. Including them here means the per-recipe panic
 // guard accepts the future emission paths without rewriting
 // the shared helper.
+//
+// THIS file's per-file [LocRecipe.Compute] call deliberately
+// does NOT pass `locAllowedKinds` to [newDraft] -- it passes
+// the narrower [locDirectlyEmittedKinds] so an accidental
+// `package` / `repo` draft from the per-file path is caught
+// at the panic boundary. The downstream materialiser /
+// aggregator code (when it lands at Stage 2.6 / Sec 3.10)
+// reuses `locAllowedKinds` at its own `newDraft` site.
 var locAllowedKinds = []scope.Kind{scope.KindFile, scope.KindPackage, scope.KindRepo}
 
 // locDirectlyEmittedKinds is the subset of [locAllowedKinds]
@@ -168,6 +185,18 @@ var locAllowedKinds = []scope.Kind{scope.KindFile, scope.KindPackage, scope.Kind
 // element: `file`. Kept as a named variable so a `grep -nF
 // "locDirectlyEmittedKinds"` lands one definition site and
 // the recipe's emission-shape contract is auditable.
+//
+// Derived at package init from [locAllowedKinds] (rather
+// than declared as an independent literal) so the
+// subset relationship the recipe doc PROMISES -- "the
+// directly-emitted set is a subset of the schema
+// applicability set" -- is enforced in CODE, not just prose.
+// A future edit that drops `scope.KindFile` from
+// `locAllowedKinds` (which review would reject, since Sec
+// 1.4.1 row 3 pins the closed set) surfaces as an init-time
+// panic at the next test run rather than landing a `loc`
+// recipe that silently emits zero drafts (the empty-slice
+// path would be silent at runtime; the panic is loud).
 //
 // See [LocRecipe] doc "Package and repo rows (NOT this
 // recipe)" for why the recipe does NOT emit at `package` /
@@ -177,7 +206,14 @@ var locAllowedKinds = []scope.Kind{scope.KindFile, scope.KindPackage, scope.Kind
 // rows would break the writer's `(repo_id, sha, scope_id,
 // metric_kind, metric_version)` uniqueness invariant
 // (architecture Sec 5.2.1 line 905).
-var locDirectlyEmittedKinds = []scope.Kind{scope.KindFile}
+var locDirectlyEmittedKinds = func() []scope.Kind {
+	for _, k := range locAllowedKinds {
+		if k == scope.KindFile {
+			return []scope.Kind{k}
+		}
+	}
+	panic("recipes: locAllowedKinds is missing scope.KindFile -- the per-file loc recipe MUST emit at a scope_kind in the applicability set (Sec 1.4.1 row 3)")
+}()
 
 // NewLocRecipe returns a stateless [LocRecipe]. Safe for
 // concurrent Compute calls.
@@ -224,6 +260,16 @@ func (r *LocRecipe) AppliesTo(ast *parser.AstFile) bool {
 // uniqueness invariant; the downstream materialiser (impl-
 // plan Stage 2.6) SUMs file rows into package rows and the
 // aggregator (Sec 3.10) SUMs into repo rows.
+//
+// The `allowedKinds` slice passed to [newDraft] is the
+// NARROW [locDirectlyEmittedKinds] (`{file}`) -- NOT the
+// wider [locAllowedKinds] (`{file, package, repo}`). The
+// wider applicability set is reserved for downstream
+// materialiser / aggregator code (which calls `newDraft`
+// from its own site); using it HERE would weaken the
+// per-recipe panic guard so an accidental `package` /
+// `repo` draft from this per-file path would slip through
+// undetected, in direct violation of the doc above.
 func (r *LocRecipe) Compute(ast *parser.AstFile) []MetricSampleDraft {
 	if ast == nil {
 		return nil
@@ -267,7 +313,7 @@ func (r *LocRecipe) Compute(ast *parser.AstFile) []MetricSampleDraft {
 				Path:          ast.GetPath(),
 			},
 			nil,
-			locAllowedKinds,
+			locDirectlyEmittedKinds,
 		),
 	}
 }

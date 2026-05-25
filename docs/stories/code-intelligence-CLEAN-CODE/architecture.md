@@ -781,10 +781,25 @@ preserves the single-writer-per-sub-store rule.
    own SHA.
 2. Webhook enqueues a `ScanRun(kind='external_per_row',
    sha_binding='per_row', to_sha=NULL)` job for the Ingestor.
-3. Ingestor emits one `MetricSample` row per payload row, each
-   referencing its own SHA from the payload. Per G2 the
-   `(repo_id, sha, scope_id, metric_kind, metric_version)` key is
-   unique across rows.
+3. Per metric_kind, the Ingestor uses the appropriate writer:
+   - For raw per-row sample kinds (e.g. the future `velocity_trend`
+     / `knowledge_index` system-tier inputs, which need to retain
+     per-commit fidelity), the Ingestor emits **one `MetricSample`
+     row per payload row**, each referencing its own SHA from the
+     payload. Per G2 the
+     `(repo_id, sha, scope_id, metric_kind, metric_version)` key
+     remains unique across rows because the SHA differs.
+   - For **computed-window** kinds whose value is an aggregate
+     over the payload's rows (the canonical example is
+     `modification_count_in_window` -- arch Sec 1.4.1 row 12 -- a
+     COUNT of unique in-window SHAs per scope), the
+     `modification_count_materialiser` (a computing writer per
+     tech-spec Sec 4.1.1 lines 287-291 + Sec 4.11 lines 444-454)
+     emits **one `MetricSample` row per scope**, stamped with the
+     LATEST in-window SHA. The `(repo_id, sha, scope_id,
+     metric_kind, metric_version)` key is still unique because
+     only one row per scope is emitted for this metric_kind in
+     this ScanRun.
 4. Ingestor closes the `ScanRun`. Aggregator materialises
    `velocity_trend` / `knowledge_index` system-tier rows on its
    next tick.

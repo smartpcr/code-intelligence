@@ -436,7 +436,7 @@ Feature: Window default for `modification_count_in_window` materialiser is 90 da
   Scenario: Window default is 90 days and is read from the materialiser config (NOT from the AST adapter)
     Given the materialiser config has no `window_days` override
     When the `modification_count` materialiser runs over a synthetic churn stream
-    Then the count covers commits whose `committer_date` is within the last 90 days
+    Then the count covers commits whose `modified_at` is within the last 90 days
      And the emitted row's `attrs_json.window_days` field equals `90`
      And the AST adapter does NOT read or honour the `window_days` config (it is not a producer of this kind)
 ```

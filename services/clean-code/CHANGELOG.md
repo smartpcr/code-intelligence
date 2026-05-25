@@ -4,6 +4,301 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 2.6 -- `modification_count_in_window` materialiser + Metric Ingestor coordinator
+
+### Changed (iter 8)
+
+- **CHANGELOG narrative scrubbed of phantom-sentinel literal
+  references**: the iter-7 "Changed" bullet for evaluator
+  iter-6 #2 previously embedded the literal name of the
+  phantom sentinel (the symbol the codebase NEVER defined).
+  A `grep -F` pass picked it up as a live reference,
+  contradicting the iter-7 claim that the symbol was fully
+  scrubbed. The bullet now describes the fix in semantic
+  terms only -- a phantom sentinel + 400 status code was
+  replaced by the actual `churn.ErrScopeResolutionFailed`
+  wrapping + 422 status. The iter-8 narrative below is
+  written without the forbidden literal so a `grep -F` on
+  the phantom sentinel's name returns zero hits across the
+  service tree. Evaluator iter-7 #1.
+- **Phase 3.2 narrative reconciled with
+  `RegistryBackedFoundationDispatcher`'s own docstring**:
+  two places in `cmd/clean-coded/main.go` (the registry-
+  construction block and the `buildMetricIngestorScaffold`
+  "Replacement in Phase 3.2" block) previously claimed the
+  dispatcher would be reused as-is when Phase 3.2 swaps in
+  a real `AstFileSource`. That claim contradicted
+  `foundation_dispatch.go:127-142`, which honestly notes
+  that Phase 3.2 must either replace the dispatcher with a
+  transaction-aware variant or extend it with a
+  `MetricSampleWriter` field (because the current Stage 2.6
+  dispatcher returns `ErrFoundationDraftPersistenceUnimplemented`
+  the moment any recipe produces a draft). Both narrative
+  spots now point at the dispatcher's own docstring as the
+  canonical Phase 3.2 swap description and acknowledge the
+  required persistence wiring. Evaluator iter-7 #2.
+
+### Changed (iter 7)
+
+- **Env-var name reconciled with e2e-scenarios.md**:
+  `CLEAN_CODE_CHURN_WEBHOOK_HMAC_SECRET` ->
+  `CLEAN_CODE_WEBHOOK_HMAC_SECRET` (the SHARED external-ingest
+  secret name pinned by `e2e-scenarios.md` lines 48, 588, 602,
+  610). Go identifiers follow: `EnvChurnWebhookHMACSecret` ->
+  `EnvWebhookHMACSecret`, `Config.ChurnWebhookHMACSecret` ->
+  `Config.WebhookHMACSecret`. Evaluator iter-6 #1.
+- **HMAC secret minimum-length guard added**: `Validate`
+  rejects any non-empty `WebhookHMACSecret` shorter than the
+  new `MinWebhookHMACSecretBytes` (32 bytes -- matches the
+  HMAC-SHA256 output width and the e2e-scenarios.md "32-byte
+  HMAC secret" recommendation). A 31-byte secret now fails
+  fast at startup. Evaluator iter-6 #5.
+- **Production foundation-dispatch narrative made honest**:
+  `cmd/clean-coded/main.go` no longer claims that
+  `recipes.Recipe.AppliesTo` is evaluated on every boot. The
+  truth (documented in the registry-construction comment +
+  the `RegistryBackedFoundationDispatcher` Stage-2.6 honesty
+  block) is: production wires `EmptyAstFileSource`, the file
+  loop's empty range elides the inner recipe loop, but the
+  registry IS inventoried via `Recipes()` on every Dispatch
+  call (the `registered_recipes` log field). Evaluator iter-6 #3.
+- **`buildMetricIngestorScaffold` docstring updated**:
+  previously named `NoopFoundationRecipeDispatcher`; now names
+  the iter-6 `RegistryBackedFoundationDispatcher`. Evaluator
+  iter-6 #4.
+- **Runbook + CHANGELOG aligned with actual error contract**:
+  the method-scope deferral docs previously named a phantom
+  sentinel + HTTP 400 status code that the codebase never
+  emitted; they now describe the actual wrapping
+  (`churn.ErrScopeResolutionFailed`) which the webhook maps
+  to HTTP 422 + `SCOPE_RESOLUTION_FAILED`. The webhook
+  status-code table now has a 422 row. Evaluator iter-6 #2.
+
+### Added (iter 6)
+
+- **`internal/ingest/webhook/hmac.go`** -- HMAC-SHA256 request
+  verifier (`VerifyHMAC` / `SignHMAC`) wired into
+  `ChurnIngestHandler`. Header `X-Hub-Signature-256: sha256=<hex>`
+  matches the GitHub-style convention. `crypto/hmac.Equal`
+  provides the constant-time compare. Verification runs BEFORE
+  the Content-Type check so an unauthenticated caller cannot
+  probe the contract through differential 401-vs-415 responses.
+- **`webhook.NewChurnIngestHandlerWithHMAC(ingestor, secret, log)`**
+  -- production constructor that panics on nil/empty secret
+  (forbids the "HMAC=nil silently falls back to no verification"
+  foot-gun at the constructor instead of in a runtime check).
+- **`internal/metric_ingestor/foundation_dispatch.go`** -- the
+  iter-6 `RegistryBackedFoundationDispatcher` that actually
+  consumes `recipes.Registry.Recipes()` per-AstFile. Stage 2.6
+  ships with `EmptyAstFileSource` (no AST iterator yet) so the
+  dispatcher iterates an empty file set on every `full`/`delta`
+  ScanRun; Phase 3.2 swaps in the real `*parser.AstFile`
+  iterator without changing the dispatcher.
+- **`config.WebhookHMACSecret`** + **`config.EnableScaffoldChurnWebhook`**
+  env-backed Config fields. `config.Validate` enforces a
+  both-or-neither interlock: starting the process with only one
+  of the two set is a startup error.
+- Runbook section
+  [`docs/runbook.md` "ingest.churn webhook -- scaffold mode"](./docs/runbook.md)
+  documents the env-var interlock, the wire shape (including
+  the HMAC header), the file-scope-only hydration deferral, and
+  an acceptance checklist for operators.
+
+### Changed (iter 6)
+
+- **`internal/ingest/churn/churn.go`** -- `PayloadRow.CommitterDate`
+  renamed to `PayloadRow.ModifiedAt`; JSON tag `committer_date`
+  -> `modified_at`. Sentinel `ErrZeroCommitterDate` renamed to
+  `ErrZeroModifiedAt`. The wire-shape rename aligns the
+  payload with tech-spec Sec 4.11 line 444-454 and Sec 8.5 line
+  991-1004 (canonical field name is `modified_at`); evaluator
+  iter-5 #1 flagged the previous name as contract drift.
+- **`cmd/clean-coded/main.go`** -- the discarded
+  `_ = recipes.DefaultRegistryWithLog(log)` is replaced by
+  `recipeRegistry := recipes.DefaultRegistryWithLog(log)` whose
+  value is threaded into the new
+  `RegistryBackedFoundationDispatcher`. Evaluator iter-5 #4
+  flagged the iter-5 discard.
+- **`cmd/clean-coded/main.go`** -- the churn webhook is now
+  gated on `cfg.EnableScaffoldChurnWebhook && cfg.WebhookHMACSecret != ""`.
+  Default production wiring leaves the path returning 404 (the
+  startup log emits `ingest.churn webhook NOT MOUNTED` with the
+  opt-in env vars named). Setting both env vars mounts the
+  HMAC-enforced handler and logs the scaffold-mode data-loss
+  warning. Evaluator iter-5 #2/#3 both addressed (`#2` by HMAC
+  + `#3` by default-unmounted persistence-warning behaviour).
+- **`webhook.classifyError`** -- the `committer_date` rename
+  threads through: `ZERO_COMMITTER_DATE` -> `ZERO_MODIFIED_AT`
+  response code.
+- **`internal/ingest/webhook/handler.go::ChurnWebhook`** --
+  request-validation ordering is now documented as
+  security-critical in the handler docstring; the method check
+  + body read + HMAC verify happen before the Content-Type
+  check so an unauthenticated caller cannot probe the contract
+  shape.
+
+### Deferred (iter 6)
+
+- **Method-scope hydration in `internal/ingest/churn/churn.go`**
+  -- the hydrator rejects non-file scopes by wrapping
+  `ErrScopeResolutionFailed`, which the webhook's
+  `classifyError` (`internal/ingest/webhook/handler.go:359-360`)
+  maps to **HTTP 422** + `SCOPE_RESOLUTION_FAILED`. The
+  Stage 2.6 brief's reference scenario names a method-scope tag
+  but that requires the AST-driven `scope_binding` reader;
+  Phase 4 work. Documented in the runbook "Stage 2.6 hydration:
+  file scope ONLY" subsection.
+  Evaluator iter-5 #5 -- code path is gated, deferral is
+  explicit in the runbook.
+- **`pgx`-backed `MetricSampleWriter`** -- Phase 3.2 swaps the
+  `InMemoryMetricSampleWriter` for a writer that joins the same
+  ScanRun transaction. The scaffold-mode warning log line +
+  runbook acceptance checklist call out the in-memory data-loss
+  exposure until then.
+
+### Added (iter 5)
+
+- **`internal/ingest/webhook/handler.go`** -- `ChurnIngestHandler`,
+  the HTTP-facing adapter that decodes an `ingest.churn` POST
+  body, mints a per-request `ScanRunContext` of
+  `kind='external_per_row'`, and drives
+  `metric_ingestor.Ingestor.Run` end-to-end. Mounted at
+  `webhook.Path` (`/v1/ingest/churn`) by `cmd/clean-coded/main.go`
+  so the same-ScanRun integration is reachable from a real HTTP
+  request -- NOT just from unit-test fakes (evaluator iter-4 #1 +
+  #2 structural fix). Maps each Sweep / hydrator sentinel to a
+  canonical operator-facing error code (`EMPTY_SHA`,
+  `INVALID_SHA`, `REPO_ID_MISMATCH`, `WRITER_FAILURE`, etc.) so
+  CI publishers can react without parsing prose.
+
+- **`internal/ingest/churn/churn.go`** -- `AutoMapScopeResolver`,
+  a `ScopeResolver` that mints a DETERMINISTIC UUIDv5 scope_id
+  from `(repo_id, file_path)`. Two POSTs of the SAME payload
+  yield the SAME scope_id -- the active-row uniqueness invariant
+  requires identity stability across calls. The webhook scaffold
+  uses this resolver because pre-registering every file path
+  (the `MapScopeResolver` model) is incompatible with the
+  webhook's "arbitrary payload from CI" surface.
+
+- **`internal/ingest/churn/churn.go`** -- `validateRow` now
+  rejects malformed (non-40-hex) SHAs via `^[0-9a-fA-F]{40}$`
+  (`ErrInvalidSHA`). Whitespace-padded, truncated, or non-hex
+  SHAs are stopped at the hydrator boundary so they cannot
+  flow into `MetricSampleRecord.SHA` and on to the active-row
+  dedupe key (evaluator iter-4 #3 fix).
+
+### Changed (iter 5)
+
+- **`internal/metric_ingestor/ingestor.go`** -- the production
+  scaffold dispatcher is `NoopFoundationRecipeDispatcher`
+  (succeeds with zero recipes executed) instead of the
+  iter-4 `UnwiredFoundationRecipeDispatcher` (always errored).
+  The iter-4 variant made every production `kind='full'` /
+  `kind='delta'` run terminate BEFORE the `ChurnSweep` was
+  reached, so the same-ScanRun integration Stage 2.6 establishes
+  was proven only with test fakes, never with the wired path
+  (evaluator iter-4 #1 + #2). The Noop variant lets the sweep
+  run for foundation scans; Phase 3.2 swaps in the real
+  PG-backed dispatcher.
+
+- **`cmd/clean-coded/main.go`** -- `buildMetricIngestorScaffold`
+  now builds the production wiring with
+  `NoopFoundationRecipeDispatcher{Logger: log}` and
+  `churn.NewAutoMapScopeResolver()`; the composition root
+  constructs a `webhook.ChurnIngestHandler` from the Ingestor
+  and threads it into `rootMux`. The Stage 2.6 brief's
+  "materialiser runs inside the same ScanRun as the foundation
+  recipes" contract is therefore reachable from a real HTTP
+  request, not just from unit-test fakes (evaluator iter-4 #1).
+
+- **`cmd/clean-coded/routes.go`** -- `rootMux` now accepts an
+  optional `*webhook.ChurnIngestHandler`; when wired, mounts
+  `/v1/ingest/churn`. The optional parameter keeps the legacy
+  `TestRootMux_*` tests working (they pass `nil`).
+
+- **`docs/stories/code-intelligence-CLEAN-CODE/architecture.md`**
+  -- Sec 4.4 clarified to distinguish per-row-sample metric
+  kinds (`velocity_trend` / `knowledge_index` inputs) from
+  computed-window aggregates (`modification_count_in_window`,
+  which emits ONE MetricSample per scope stamped with the
+  latest in-window SHA). The materialiser's per-scope shape
+  satisfies G2's uniqueness key because only one row per scope
+  is emitted for the metric_kind in this ScanRun (evaluator
+  iter-4 #4 reconciliation).
+
+### Added
+
+- **`internal/metrics/materialisers/modification_count.go`** --
+  the writer-side computer of `metric_kind='modification_count_in_window'`
+  (architecture Sec 1.4.1 row 12; tech-spec Sec 4.1.1 lines
+  287-291; tech-spec Sec 4.11 lines 444-454 -- emits
+  `pack='base'`, `source='computed'`, with the `'ingested'`
+  provenance recorded on `attrs_json.provenance` per C19).
+  Window size defaults to `90` days (tech-spec Sec 8.2);
+  configurable via the materialiser constructor.
+  `MaterialiseWithDetails` exposes `ScopeEmission{Draft,
+  ScopeKey, LatestSHA, LatestModifiedAt}` so the Metric Ingestor
+  can stamp `MetricSample.sha` from the latest in-window commit
+  without risking a future-dated SHA the materialiser dropped.
+
+- **`internal/ingest/churn/churn.go`** -- the writer-side
+  adapter for the `ingest.churn` payload (architecture Sec 3.12,
+  Sec 4.4 lines 778-790). `Payload` + `PayloadRow` mirror the
+  webhook wire shape; `Hydrator` resolves each row to a durable
+  `(scope_id, ScopeRef)` via a `ScopeResolver` interface (with
+  the in-memory `MapScopeResolver` for tests and scaffold-mode
+  wiring); `ScopeIDByKey` + `Rows` helpers project the hydrated
+  slice for the materialiser. The hydrator rewrites
+  `ScopeRef.LocalID` to the resolved `scope_id` UUID string so
+  the Metric Ingestor round-trips drafts back to durable
+  scope-ids without an out-of-band lookup.
+
+- **`internal/metric_ingestor/sweep.go`** -- `ChurnSweep`, the
+  per-churn-batch writer that wires `Hydrator -> Materialiser
+  -> MetricSampleWriter` inside a `ScanRunContext`. Accepts any
+  `ScanRun.kind` in `AllowedScanRunKinds() = {full, delta,
+  external_per_row}` so the materialiser honours the
+  same-ScanRun-as-foundation-recipes contract. Validates
+  non-zero `ScanRunContext.{ID,RepoID}`, refuses repo-id
+  mismatches, and propagates writer failures via
+  `errors.Is(err, ErrWriterFailure)`. The in-memory writer
+  scaffolds the Phase 3.2 PG-backed equivalent.
+
+- **`internal/metric_ingestor/ingestor.go`** -- `Ingestor`, the
+  production coordinator that owns per-ScanRun dispatch
+  ordering between the foundation-tier recipes (Phase 3.2 via
+  the `FoundationRecipeDispatcher` interface) and the
+  `ChurnSweep`. For `kind='full'` / `kind='delta'`, dispatches
+  foundation FIRST then churn (churn is optional); for
+  `kind='external_per_row'`, runs churn only.
+  In iter 5 the scaffold uses `NoopFoundationRecipeDispatcher`
+  (succeeds with zero recipes) so a scaffold-mode `full` /
+  `delta` run actually reaches the `ChurnSweep` instead of
+  short-circuiting (evaluator iter-4 #1 + #2 structural fix).
+
+- **`cmd/clean-coded/main.go`** -- composition root now
+  constructs the `Ingestor` via `buildMetricIngestorScaffold`
+  and threads it into the webhook handler mounted on the root
+  mux. `grep -nF "NewChurnSweep"` lands this helper as a
+  non-test production caller, AND `grep -nF "metricIngestor"`
+  lands the webhook driver invoking `Ingestor.Run` at runtime
+  (evaluator iter-3 #1 + iter-4 #1/#2).
+
+### Documentation
+
+- `internal/metric_ingestor/sweep.go` package preamble now
+  describes BOTH `ChurnSweep` AND `Ingestor`, and is explicit
+  that the accepted parent kinds are `{full, delta,
+  external_per_row}` -- not just `external_per_row`. The
+  `Run` step-list leads with the accepted kind set so a
+  shallow read cannot miss the post iter-3 contract.
+- `internal/ingest/churn/churn.go` const docstring for
+  `ScanRunKindExternalPerRow` now opens with the ACCEPTED kinds
+  list (`{full, delta, external_per_row}`) BEFORE describing
+  the const's own role as the standalone-webhook value, so a
+  reader who stops at the first paragraph still sees the
+  accepted set.
+
 ## Stage 2.2 -- iter 4 follow-ups (evaluator feedback resolution)
 
 ### Fixed

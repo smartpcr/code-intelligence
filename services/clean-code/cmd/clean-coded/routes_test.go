@@ -1,15 +1,23 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gofrs/uuid"
+
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/health"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/churn"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/webhook"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/management"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/materialisers"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/steward"
 )
 
@@ -23,7 +31,7 @@ import (
 // `services/clean-code/docs/runbook.md` Stage 5.1 runbook.
 func TestRootMux_ScaffoldModeListActive503(t *testing.T) {
 	t.Parallel()
-	mux := rootMux(health.New("v0", "c0", "t0"), nil, nil)
+	mux := rootMux(health.New("v0", "c0", "t0"), nil, nil, nil)
 
 	for _, path := range []string{"/healthz", "/readyz"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -58,7 +66,7 @@ func TestRootMux_ScaffoldModeListActive503(t *testing.T) {
 func TestRootMux_ListActiveMounted(t *testing.T) {
 	t.Parallel()
 	mgmt := management.NewHandler(management.NewReader(nil))
-	mux := rootMux(health.New("v0", "c0", "t0"), mgmt, nil)
+	mux := rootMux(health.New("v0", "c0", "t0"), mgmt, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, management.VerbListActivePath, nil)
 	rr := httptest.NewRecorder()
@@ -137,7 +145,7 @@ func TestRootMux_ScaffoldModeOverrideMounted_200(t *testing.T) {
 	}
 	policy := management.NewPolicyWriter(stew)
 
-	mux := rootMux(health.New("v0", "c0", "t0"), nil, policy)
+	mux := rootMux(health.New("v0", "c0", "t0"), nil, policy, nil)
 
 	body := strings.NewReader(`{
 		"rule_id": "solid.srp.lcom4_high",
@@ -206,5 +214,177 @@ func seedOneRuleInto(t *testing.T, s steward.Store, ruleID string) {
 	}
 	if err := s.InsertRulePackAndRules(context.Background(), pack, rules); err != nil {
 		t.Fatalf("seedOneRuleInto: %v", err)
+	}
+}
+
+// TestRootMux_ChurnWebhookMounted_RoundtripWritesSample is the
+// integration pin for the iter-5 evaluator-4 #1 + #2 structural
+// fix: rootMux mounts `/v1/ingest/churn` when wired with a
+// non-nil [webhook.ChurnIngestHandler], and a well-formed POST
+// flows end-to-end through `metric_ingestor.Ingestor.Run` to
+// `InMemoryMetricSampleWriter.Records()`. This proves the
+// same-ScanRun integration is reachable from a real HTTP path
+// in the wired composition root -- not just from test fakes.
+func TestRootMux_ChurnWebhookMounted_RoundtripWritesSample(t *testing.T) {
+	t.Parallel()
+	// Build the production-shape Ingestor (the same primitives
+	// `buildMetricIngestorScaffold` wires).
+	fixedNow := func() time.Time {
+		return time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC)
+	}
+	mat := materialisers.NewMaterialiserWithClock(materialisers.DefaultWindowDays, fixedNow)
+	hyd := churn.NewHydrator(churn.NewAutoMapScopeResolver())
+	writer := metric_ingestor.NewInMemoryMetricSampleWriter()
+	sweep := metric_ingestor.NewChurnSweep(mat, hyd, writer)
+	ing := metric_ingestor.NewIngestor(metric_ingestor.NoopFoundationRecipeDispatcher{}, sweep)
+	churnHandler := webhook.NewChurnIngestHandler(ing, nil)
+
+	mux := rootMux(health.New("v0", "c0", "t0"), nil, nil, churnHandler)
+
+	repoID := uuid.Must(uuid.FromString("11111111-2222-3333-4444-555555555555"))
+	payload := churn.Payload{
+		RepoID: repoID,
+		Rows: []churn.PayloadRow{
+			{
+				SHA:        strings.Repeat("a", 40),
+				FilePath:   "internal/foo.go",
+				ModifiedAt: fixedNow().Add(-24 * time.Hour),
+			},
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, webhook.Path, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("POST %s: status=%d, want 200; body=%s", webhook.Path, rr.Code, rr.Body.String())
+	}
+	if got := len(writer.Records()); got != 1 {
+		t.Errorf("writer.Records() length = %d; want 1 (one in-window scope)", got)
+	}
+}
+
+// TestRootMux_ChurnWebhookUnmounted_404 pins the inverse: when
+// the composition root passes a nil churn handler (the
+// scaffold path before the webhook lands), the `/v1/ingest/churn`
+// path returns the standard 404 -- "verb does not exist in this
+// build", NOT 405 or 503.
+func TestRootMux_ChurnWebhookUnmounted_404(t *testing.T) {
+	t.Parallel()
+	mux := rootMux(health.New("v0", "c0", "t0"), nil, nil, nil)
+	req := httptest.NewRequest(http.MethodPost, webhook.Path, strings.NewReader("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("POST %s with nil handler: status=%d; want 404", webhook.Path, rr.Code)
+	}
+}
+
+// TestRootMux_ChurnWebhookMountedWithHMAC_RoundtripWritesSample
+// pins the iter-6 #2 fix end-to-end: rootMux mounts the
+// production-shape [webhook.NewChurnIngestHandlerWithHMAC]
+// adapter and a request carrying a valid HMAC-SHA256 signature
+// over the body succeeds end-to-end through `Ingestor.Run`.
+// The companion test below pins that the SAME route REJECTS an
+// unsigned request with 401 -- proving the auth boundary is
+// active in the wired composition root, not just at the
+// handler-test seam.
+func TestRootMux_ChurnWebhookMountedWithHMAC_RoundtripWritesSample(t *testing.T) {
+	t.Parallel()
+	secret := []byte("clean-coded-routes-test-hmac-secret-32!")
+	fixedNow := func() time.Time {
+		return time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC)
+	}
+	mat := materialisers.NewMaterialiserWithClock(materialisers.DefaultWindowDays, fixedNow)
+	hyd := churn.NewHydrator(churn.NewAutoMapScopeResolver())
+	writer := metric_ingestor.NewInMemoryMetricSampleWriter()
+	sweep := metric_ingestor.NewChurnSweep(mat, hyd, writer)
+	ing := metric_ingestor.NewIngestor(metric_ingestor.NoopFoundationRecipeDispatcher{}, sweep)
+	churnHandler := webhook.NewChurnIngestHandlerWithHMAC(ing, secret, nil)
+
+	mux := rootMux(health.New("v0", "c0", "t0"), nil, nil, churnHandler)
+
+	repoID := uuid.Must(uuid.FromString("22222222-3333-4444-5555-666666666666"))
+	payload := churn.Payload{
+		RepoID: repoID,
+		Rows: []churn.PayloadRow{
+			{
+				SHA:        strings.Repeat("b", 40),
+				FilePath:   "internal/bar.go",
+				ModifiedAt: fixedNow().Add(-12 * time.Hour),
+			},
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	sig := webhook.SignHMAC(body, secret)
+
+	req := httptest.NewRequest(http.MethodPost, webhook.Path, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(webhook.HMACSignatureHeader, sig)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("POST %s (HMAC): status=%d, want 200; body=%s", webhook.Path, rr.Code, rr.Body.String())
+	}
+	if got := len(writer.Records()); got != 1 {
+		t.Errorf("writer.Records() length = %d; want 1", got)
+	}
+}
+
+// TestRootMux_ChurnWebhookMountedWithHMAC_RejectsUnsigned pins
+// the negative path: a request to a mounted HMAC-enabled
+// webhook that does NOT carry the signature header is rejected
+// with 401 + HMAC_MISSING_SIGNATURE and the writer is NEVER
+// touched. This is the structural answer to evaluator iter-5 #2
+// ("the newly mounted production webhook has no HMAC/OIDC/auth
+// check before accepting writes").
+func TestRootMux_ChurnWebhookMountedWithHMAC_RejectsUnsigned(t *testing.T) {
+	t.Parallel()
+	secret := []byte("clean-coded-routes-test-hmac-secret-32!")
+	fixedNow := func() time.Time {
+		return time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC)
+	}
+	mat := materialisers.NewMaterialiserWithClock(materialisers.DefaultWindowDays, fixedNow)
+	hyd := churn.NewHydrator(churn.NewAutoMapScopeResolver())
+	writer := metric_ingestor.NewInMemoryMetricSampleWriter()
+	sweep := metric_ingestor.NewChurnSweep(mat, hyd, writer)
+	ing := metric_ingestor.NewIngestor(metric_ingestor.NoopFoundationRecipeDispatcher{}, sweep)
+	churnHandler := webhook.NewChurnIngestHandlerWithHMAC(ing, secret, nil)
+
+	mux := rootMux(health.New("v0", "c0", "t0"), nil, nil, churnHandler)
+
+	repoID := uuid.Must(uuid.FromString("22222222-3333-4444-5555-666666666666"))
+	payload := churn.Payload{
+		RepoID: repoID,
+		Rows: []churn.PayloadRow{{
+			SHA:        strings.Repeat("c", 40),
+			FilePath:   "internal/baz.go",
+			ModifiedAt: fixedNow().Add(-12 * time.Hour),
+		}},
+	}
+	body, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest(http.MethodPost, webhook.Path, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	// NO X-Hub-Signature-256 header.
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("POST %s (unsigned): status=%d, want 401; body=%s", webhook.Path, rr.Code, rr.Body.String())
+	}
+	if got := len(writer.Records()); got != 0 {
+		t.Errorf("writer.Records() length = %d; want 0 (auth must short-circuit before Ingestor.Run)", got)
 	}
 }

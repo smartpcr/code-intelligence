@@ -156,7 +156,59 @@ const (
 	// inject this via their secret manager (env var, k8s
 	// Secret, etc.) and never check it into source.
 	EnvKMSMasterKeyHex = "CLEAN_CODE_KMS_MASTER_KEY_HEX"
+
+	// EnvWebhookHMACSecret is the shared HMAC-SHA256 secret
+	// every external `ingest.*` webhook verifies request
+	// bodies against via the `X-Hub-Signature-256` header
+	// (tech-spec Sec 8.5 "REST + HMAC-signed";
+	// e2e-scenarios.md lines 48/588/602/610 pin this exact
+	// env-var name as the SHARED external-ingest secret). The
+	// value is the raw secret string (NOT hex-encoded; the
+	// hex sits in the header). NEVER logged.
+	//
+	// # Minimum strength
+	//
+	// `Validate` rejects any non-empty value shorter than
+	// [MinWebhookHMACSecretBytes] (32 bytes -- matches the
+	// HMAC-SHA256 output width and the e2e-scenarios.md
+	// "32-byte HMAC secret" recommendation at line 588). A
+	// one-character secret would defeat the auth boundary;
+	// 32 bytes is a practical guard against operator typos
+	// and copy-paste truncation. Use a CSPRNG to generate it:
+	// `head -c 32 /dev/urandom | base64`.
+	//
+	// # When unset (default)
+	//
+	// The webhook is NOT MOUNTED at all in production wiring
+	// -- the route returns the standard 404 ("verb does not
+	// exist in this build"), keeping an unauthenticated
+	// `Ingestor.Run` driver out of production until either
+	// the HMAC layer or the Phase 3.12 production hardening
+	// lands.
+	EnvWebhookHMACSecret = "CLEAN_CODE_WEBHOOK_HMAC_SECRET" //nolint:gosec // env var name, not a credential
+
+	// EnvEnableScaffoldChurnWebhook is the explicit
+	// operator-facing opt-in for the Stage 2.6 scaffold-mode
+	// churn webhook. It accepts any non-empty value (the
+	// canonical form is `true`); setting it constitutes
+	// acknowledging the SCAFFOLD-MODE LIMITATION that the
+	// webhook persists into an in-memory writer and DATA IS
+	// LOST ON RESTART (the production-grade PG-backed writer
+	// lands in Phase 3.2). The webhook is mounted iff BOTH
+	// this flag AND [EnvWebhookHMACSecret] are set; one
+	// without the other is a configuration error that fails
+	// fast at startup.
+	EnvEnableScaffoldChurnWebhook = "CLEAN_CODE_ENABLE_SCAFFOLD_CHURN_WEBHOOK"
 )
+
+// MinWebhookHMACSecretBytes is the minimum length (in bytes,
+// i.e. `len(string)`) the loader enforces on
+// [EnvWebhookHMACSecret] when it is set. Matches the
+// HMAC-SHA256 output width and the e2e-scenarios.md "32-byte
+// HMAC secret" guidance (line 588). Pinned as a const so a
+// future operator pin to a different floor is a one-line
+// change.
+const MinWebhookHMACSecretBytes = 32
 
 // Config is the in-memory shape of the service's runtime
 // configuration. Every field is exported so wired packages can
@@ -243,6 +295,22 @@ type Config struct {
 	// of the AES-256 master key the LocalSealedKMS uses.
 	// Required when `KMSProvider == "local"`. NEVER logged.
 	KMSMasterKeyHex string
+
+	// --- Stage 2.6 churn webhook (scaffold mode) ---
+
+	// WebhookHMACSecret is the shared HMAC-SHA256 secret used
+	// by every external `ingest.*` webhook to verify request
+	// bodies. See [EnvWebhookHMACSecret] for the operator-
+	// facing contract and [MinWebhookHMACSecretBytes] for the
+	// minimum-length guard. Empty in scaffold mode leaves the
+	// webhook UNMOUNTED. NEVER logged.
+	WebhookHMACSecret string
+
+	// EnableScaffoldChurnWebhook is the explicit
+	// operator-acknowledged opt-in for the Stage 2.6 scaffold
+	// churn webhook. See [EnvEnableScaffoldChurnWebhook] for
+	// the explicit "data lost on restart" rationale.
+	EnableScaffoldChurnWebhook bool
 }
 
 // Defaults returns a Config populated with the canonical
@@ -366,6 +434,27 @@ func (c Config) Validate() error {
 	if c.KMSProvider != "local" && c.KMSMasterKeyHex != "" {
 		return fmt.Errorf("config: kms-master-key-hex is set but kms-provider=%q is not \"local\"", c.KMSProvider)
 	}
+	// Stage 2.6 scaffold-churn-webhook interlock: BOTH the
+	// HMAC secret AND the explicit opt-in flag must be set to
+	// enable the webhook; setting only one is always a
+	// misconfiguration (an opt-in with no HMAC = unauthenticated
+	// surface; HMAC without opt-in = unwanted surface). A
+	// non-empty secret must also clear the minimum-length
+	// guard ([MinWebhookHMACSecretBytes]) so an operator typo
+	// or copy-paste truncation cannot mount a trivially
+	// brute-forceable HMAC boundary (evaluator iter-6 #5).
+	if c.EnableScaffoldChurnWebhook && c.WebhookHMACSecret == "" {
+		return fmt.Errorf("config: %s=true requires %s to be set (HMAC verification is mandatory when the webhook is mounted)",
+			EnvEnableScaffoldChurnWebhook, EnvWebhookHMACSecret)
+	}
+	if !c.EnableScaffoldChurnWebhook && c.WebhookHMACSecret != "" {
+		return fmt.Errorf("config: %s is set but %s is not; the webhook stays UNMOUNTED until both are set (avoids an unintended public surface)",
+			EnvWebhookHMACSecret, EnvEnableScaffoldChurnWebhook)
+	}
+	if c.WebhookHMACSecret != "" && len(c.WebhookHMACSecret) < MinWebhookHMACSecretBytes {
+		return fmt.Errorf("config: %s must be at least %d bytes long (got %d); use a CSPRNG-generated secret such as `head -c 32 /dev/urandom | base64`",
+			EnvWebhookHMACSecret, MinWebhookHMACSecretBytes, len(c.WebhookHMACSecret))
+	}
 	return nil
 }
 
@@ -391,6 +480,8 @@ func readEnvOverrides() map[string]string {
 		EnvPolicyPublishOverlapSeconds,
 		EnvKMSProvider,
 		EnvKMSMasterKeyHex,
+		EnvWebhookHMACSecret,
+		EnvEnableScaffoldChurnWebhook,
 	}
 	out := make(map[string]string, len(keys))
 	for _, k := range keys {
@@ -461,6 +552,17 @@ func applyOverrides(cfg *Config, overrides map[string]string) error {
 			cfg.KMSProvider = v
 		case EnvKMSMasterKeyHex:
 			cfg.KMSMasterKeyHex = v
+		case EnvWebhookHMACSecret:
+			cfg.WebhookHMACSecret = v
+		case EnvEnableScaffoldChurnWebhook:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "1", "true", "yes", "on":
+				cfg.EnableScaffoldChurnWebhook = true
+			case "0", "false", "no", "off":
+				cfg.EnableScaffoldChurnWebhook = false
+			default:
+				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
+			}
 		default:
 			return fmt.Errorf("unknown config key %q", k)
 		}

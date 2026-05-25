@@ -57,6 +57,7 @@ import (
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/keys"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/steward"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/version"
+	"github.com/microsoft/code-intelligence/services/clean-code/policy/rulepacks/decoupling"
 )
 
 // signingKeyCacheRefreshInterval is the cadence at which the
@@ -334,12 +335,57 @@ func run(args []string) error {
 	// `signer` is the zero interface; `steward.New` installs a
 	// null-object signer in that case. The persistence backend
 	// follows the same `db != nil` rule as the keys subsystem.
-	policy, policyCloseDB, policyErr := buildPolicyWriter(db, signer, log)
+	policy, stew, stewStore, policyCloseDB, policyErr := buildPolicyWriter(db, signer, log)
 	if policyErr != nil {
 		if policyCloseDB && db != nil {
 			_ = db.Close()
 		}
 		return fmt.Errorf("policy/steward: %w", policyErr)
+	}
+
+	// --- Stage 5.6 decoupling rulepack bootstrap ---
+	// When a real signing key is wired (production /
+	// production-like deploys), seed the four canonical
+	// decoupling Threshold rows and publish the three
+	// decoupling rulepacks (`decoupling.cycles`,
+	// `decoupling.coupling`, `decoupling.duplication`) via
+	// `policy.publish_rulepack`. This realises the
+	// implementation-plan Stage 5.6 line 536 criterion
+	// "Signed and loaded as `pack='decoupling'` rule_packs"
+	// AND the e2e scenario `decoupling-loads` at the
+	// composition-root level. Bootstrap is idempotent --
+	// `steward.ErrDuplicateRulePack` / `ErrDuplicateRule`
+	// are treated as the benign "already bootstrapped"
+	// outcome, so every process boot calls it safely.
+	//
+	// In scaffold mode (`signer == nil`) the bootstrap is
+	// skipped because `steward.PublishRulepack` would refuse
+	// with `ErrNoActiveSigningKey`. The composition root
+	// emits a warning so the operator sees the skip in the
+	// boot log.
+	if signer != nil {
+		bootCtx, bootCancel := context.WithTimeout(ctx, 30*time.Second)
+		bootResult, bootErr := decoupling.Bootstrap(bootCtx, stew, stewStore)
+		bootCancel()
+		if bootErr != nil {
+			log.Error("decoupling rulepack bootstrap failed",
+				"error", bootErr.Error(),
+				"inserted_thresholds", bootResult.InsertedThresholds,
+				"published_packs", bootResult.PublishedPacks,
+				"published_rules", bootResult.PublishedRules,
+			)
+			if policyCloseDB && db != nil {
+				_ = db.Close()
+			}
+			return fmt.Errorf("policy/rulepacks/decoupling: Bootstrap: %w", bootErr)
+		}
+		log.Info("decoupling rulepacks bootstrapped",
+			"inserted_thresholds", bootResult.InsertedThresholds,
+			"published_packs", bootResult.PublishedPacks,
+			"published_rules", bootResult.PublishedRules,
+		)
+	} else {
+		log.Warn("decoupling rulepacks NOT bootstrapped (scaffold mode: no signing key wired)")
 	}
 
 	srv := &http.Server{
@@ -412,10 +458,21 @@ func run(args []string) error {
 //     Stage 5.2 verbs return `[steward.ErrNoActiveSigningKey]`
 //     via the existing `len(ListActive)==0` branch.
 //
-// Returns the `*management.PolicyWriter`, a `closeDBOnError`
-// boolean the caller uses to decide whether to close `db` on a
-// failure (true when this helper opened internal state that
-// makes the db handle unsafe to reuse), and an error.
+// Returns:
+//   - The `*management.PolicyWriter` mounted on the HTTP surface.
+//   - The inner `*steward.Steward` -- exposed so the
+//     composition root can invoke the Stage 5.6 decoupling
+//     bootstrap (`decoupling.Bootstrap`) against the SAME
+//     steward instance the HTTP surface serves.
+//   - The inner `steward.Store` -- exposed for the same
+//     bootstrap reason (`SeedThresholds` writes directly via
+//     `Store.InsertThreshold`, bypassing the policy.* verb
+//     surface which has no `policy.publish_threshold` verb in
+//     v1; see thresholds.go package doc).
+//   - A `closeDBOnError` boolean the caller uses to decide
+//     whether to close `db` on a failure (true when this helper
+//     opened internal state that makes the db handle unsafe to
+//     reuse), and an error.
 //
 // Pinned by:
 //   - `TestBuildPolicyWriter_ScaffoldModeProducesWriter` (the
@@ -426,7 +483,7 @@ func run(args []string) error {
 //     `POST /v1/mgmt/override` AND still serves 503 at
 //     `POST /v1/policy/publish` under the SAME scaffold-mode
 //     mux)
-func buildPolicyWriter(db *sql.DB, signer steward.Signer, log *slog.Logger) (*management.PolicyWriter, bool, error) {
+func buildPolicyWriter(db *sql.DB, signer steward.Signer, log *slog.Logger) (*management.PolicyWriter, *steward.Steward, steward.Store, bool, error) {
 	var (
 		stewStore    steward.Store
 		closeDBOnErr bool
@@ -434,7 +491,7 @@ func buildPolicyWriter(db *sql.DB, signer steward.Signer, log *slog.Logger) (*ma
 	if db != nil {
 		sqlStore, err := steward.NewSQLStore(db)
 		if err != nil {
-			return nil, true, fmt.Errorf("NewSQLStore: %w", err)
+			return nil, nil, nil, true, fmt.Errorf("NewSQLStore: %w", err)
 		}
 		stewStore = sqlStore
 		if log != nil {
@@ -451,7 +508,7 @@ func buildPolicyWriter(db *sql.DB, signer steward.Signer, log *slog.Logger) (*ma
 		Signer: signer, // MAY be nil in scaffold mode -- steward.New installs a null-object signer
 	})
 	if err != nil {
-		return nil, closeDBOnErr, fmt.Errorf("New: %w", err)
+		return nil, nil, nil, closeDBOnErr, fmt.Errorf("New: %w", err)
 	}
 	if log != nil {
 		log.Info("policy steward wired",
@@ -459,7 +516,7 @@ func buildPolicyWriter(db *sql.DB, signer steward.Signer, log *slog.Logger) (*ma
 			"signing_key_cache", signer != nil,
 		)
 	}
-	return management.NewPolicyWriter(stew), closeDBOnErr, nil
+	return management.NewPolicyWriter(stew), stew, stewStore, closeDBOnErr, nil
 }
 
 // buildMetricIngestorScaffold constructs the Stage 2.6

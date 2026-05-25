@@ -156,6 +156,11 @@ func (r *CognitiveComplexityRecipe) Compute(ast *parser.AstFile) []MetricSampleD
 				Kind:          scope.KindMethod,
 				QualifiedName: m.GetQualifiedName(),
 				Path:          ast.GetPath(),
+				// iter-5 evaluator item 3: parameter list
+				// disambiguates overloaded methods --
+				// `scope.BuildMethod` renders this into
+				// the canonical signature.
+				Params: m.GetParameters(),
 			},
 			nil,
 			cognitiveComplexityAllowedKinds,

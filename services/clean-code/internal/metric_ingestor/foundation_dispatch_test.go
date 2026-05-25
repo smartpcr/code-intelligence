@@ -262,3 +262,188 @@ func TestEmptyAstFileSource_AlwaysEmpty(t *testing.T) {
 		t.Errorf("EmptyAstFileSource.Files: files=%v, want nil", files)
 	}
 }
+
+// TestRegistryBackedDispatcher_Persistence_HappyPath pins the
+// Stage 3.2 "drafts -> MetricSampleRecord -> WriteBatch" path
+// (iter 2 evaluator item 4). A wired Writer + a non-empty SHA
+// makes the dispatcher convert each draft to a record and
+// persist the batch in one call. Each record stamps:
+//
+//   - ProducerRunID = ScanRunContext.ID
+//   - RepoID        = ScanRunContext.RepoID
+//   - SHA           = FoundationInput.SHA
+//   - SampleID      = SampleIDFactory()
+//   - ScopeID       = Scopes.ResolveScopeIDs(...)[i]
+//   - {MetricKind, MetricVersion, Pack, Source, Value, Attrs}
+//     copied verbatim from the draft.
+func TestRegistryBackedDispatcher_Persistence_HappyPath(t *testing.T) {
+	t.Parallel()
+	reg := recipes.NewRegistry()
+	r := &trackingRecipe{
+		kind: "cyclo", version: 7, pack: recipes.PackBase, appliesToReturns: true,
+		computeDrafts: []recipes.MetricSampleDraft{
+			{
+				MetricKind: "cyclo", MetricVersion: 7,
+				Pack: recipes.PackBase, Source: recipes.SourceComputed, Value: 4,
+				Scope: recipes.ScopeRef{
+					Kind:          "method",
+					QualifiedName: "github.com/test/pkg.Foo()",
+					Path:          "pkg/foo.go",
+				},
+				Attrs: map[string]string{"file": "pkg/foo.go"},
+			},
+			{
+				MetricKind: "cyclo", MetricVersion: 7,
+				Pack: recipes.PackBase, Source: recipes.SourceComputed, Value: 9,
+				Scope: recipes.ScopeRef{
+					Kind:          "method",
+					QualifiedName: "github.com/test/pkg.Bar()",
+					Path:          "pkg/bar.go",
+				},
+			},
+		},
+	}
+	reg.Register(r)
+
+	writer := metric_ingestor.NewInMemoryMetricSampleWriter()
+	sampleCounter := uint32(0)
+	d := &metric_ingestor.RegistryBackedFoundationDispatcher{
+		Registry: reg,
+		AstFiles: sliceAstSource{files: []*parser.AstFile{{}}},
+		Writer:   writer,
+		SampleIDFactory: func() (uuid.UUID, error) {
+			sampleCounter++
+			return uuid.Must(uuid.FromString(
+				"00000000-0000-0000-0000-0000000000" + twoHex(sampleCounter))), nil
+		},
+	}
+	scan := mustScanRun(t)
+	err := d.Dispatch(context.Background(), scan, metric_ingestor.FoundationInput{
+		SHA: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+	})
+	if err != nil {
+		t.Fatalf("Dispatch with writer wired: err=%v, want nil", err)
+	}
+	records := writer.Records()
+	if len(records) != 2 {
+		t.Fatalf("InMemoryMetricSampleWriter.Records = %d, want 2", len(records))
+	}
+	for i, rec := range records {
+		if rec.ProducerRunID != scan.ID {
+			t.Errorf("records[%d].ProducerRunID = %s, want %s", i, rec.ProducerRunID, scan.ID)
+		}
+		if rec.RepoID != scan.RepoID {
+			t.Errorf("records[%d].RepoID = %s, want %s", i, rec.RepoID, scan.RepoID)
+		}
+		if rec.SHA != "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" {
+			t.Errorf("records[%d].SHA = %q, want the FoundationInput SHA", i, rec.SHA)
+		}
+		if rec.SampleID == uuid.Nil {
+			t.Errorf("records[%d].SampleID is zero", i)
+		}
+		if rec.ScopeID == uuid.Nil {
+			t.Errorf("records[%d].ScopeID is zero -- resolver should have minted a deterministic UUID", i)
+		}
+		if rec.MetricKind != "cyclo" {
+			t.Errorf("records[%d].MetricKind = %q, want cyclo", i, rec.MetricKind)
+		}
+		if rec.MetricVersion != 7 {
+			t.Errorf("records[%d].MetricVersion = %d, want 7", i, rec.MetricVersion)
+		}
+	}
+	// G2 determinism: scope IDs for the two distinct
+	// qualified names MUST differ (the resolver derives a
+	// UUIDv5 from the QualifiedName + SHA + Kind).
+	if records[0].ScopeID == records[1].ScopeID {
+		t.Errorf("records[0..1].ScopeID collided: %s -- distinct QualifiedNames must produce distinct scope_ids",
+			records[0].ScopeID)
+	}
+	// Values copied through unchanged.
+	if records[0].Value != 4 || records[1].Value != 9 {
+		t.Errorf("records.Value = [%v, %v], want [4, 9]", records[0].Value, records[1].Value)
+	}
+}
+
+// twoHex formats n as a 2-character zero-padded hex string,
+// used by the test sample-ID factory to mint
+// "00000000-0000-0000-0000-000000000001",
+// "00000000-0000-0000-0000-000000000002", ... deterministically.
+func twoHex(n uint32) string {
+	const hex = "0123456789abcdef"
+	if n > 0xff {
+		n = n & 0xff
+	}
+	return string([]byte{hex[(n>>4)&0xf], hex[n&0xf]})
+}
+
+// TestRegistryBackedDispatcher_Persistence_RequiresSHA pins
+// ErrFoundationSHAMissing: a wired Writer + an empty
+// FoundationInput.SHA must refuse to write rather than
+// silently stamping the zero string on metric_sample.sha.
+func TestRegistryBackedDispatcher_Persistence_RequiresSHA(t *testing.T) {
+	t.Parallel()
+	reg := recipes.NewRegistry()
+	r := &trackingRecipe{
+		kind: "loc", version: 1, pack: recipes.PackBase, appliesToReturns: true,
+		computeDrafts: []recipes.MetricSampleDraft{
+			{
+				MetricKind: "loc", MetricVersion: 1,
+				Pack: recipes.PackBase, Source: recipes.SourceComputed, Value: 1,
+				Scope: recipes.ScopeRef{Kind: "file", QualifiedName: "pkg/x.go", Path: "pkg/x.go"},
+			},
+		},
+	}
+	reg.Register(r)
+
+	writer := metric_ingestor.NewInMemoryMetricSampleWriter()
+	d := &metric_ingestor.RegistryBackedFoundationDispatcher{
+		Registry: reg,
+		AstFiles: sliceAstSource{files: []*parser.AstFile{{}}},
+		Writer:   writer,
+	}
+	err := d.Dispatch(context.Background(), mustScanRun(t), metric_ingestor.FoundationInput{})
+	if !errors.Is(err, metric_ingestor.ErrFoundationSHAMissing) {
+		t.Fatalf("Dispatch without SHA: err=%v, want errors.Is ErrFoundationSHAMissing", err)
+	}
+	if got := len(writer.Records()); got != 0 {
+		t.Errorf("Writer.Records = %d, want 0 (no rows persisted when SHA is missing)", got)
+	}
+}
+
+// TestRegistryBackedDispatcher_Persistence_WriterErrorPropagates
+// proves a WriteBatch failure is wrapped (not swallowed) so
+// the state machine transitions the commit to `failed`.
+func TestRegistryBackedDispatcher_Persistence_WriterErrorPropagates(t *testing.T) {
+	t.Parallel()
+	reg := recipes.NewRegistry()
+	r := &trackingRecipe{
+		kind: "loc", version: 1, pack: recipes.PackBase, appliesToReturns: true,
+		computeDrafts: []recipes.MetricSampleDraft{
+			{
+				MetricKind: "loc", MetricVersion: 1,
+				Pack: recipes.PackBase, Source: recipes.SourceComputed, Value: 1,
+				Scope: recipes.ScopeRef{Kind: "file", QualifiedName: "pkg/x.go", Path: "pkg/x.go"},
+			},
+		},
+	}
+	reg.Register(r)
+
+	wantErr := errors.New("simulated WriteBatch failure")
+	d := &metric_ingestor.RegistryBackedFoundationDispatcher{
+		Registry: reg,
+		AstFiles: sliceAstSource{files: []*parser.AstFile{{}}},
+		Writer:   failingMetricSampleWriter{err: wantErr},
+	}
+	err := d.Dispatch(context.Background(), mustScanRun(t), metric_ingestor.FoundationInput{
+		SHA: "0123456789012345678901234567890123456789",
+	})
+	if err == nil || !errors.Is(err, wantErr) {
+		t.Fatalf("Dispatch with failing writer: err=%v, want wrapping of writer error", err)
+	}
+}
+
+type failingMetricSampleWriter struct{ err error }
+
+func (f failingMetricSampleWriter) WriteBatch(_ context.Context, _ []metric_ingestor.MetricSampleRecord) error {
+	return f.err
+}

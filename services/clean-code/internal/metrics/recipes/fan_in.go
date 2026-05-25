@@ -303,6 +303,12 @@ func (r *FanInRecipe) emit(ast *parser.AstFile, s *parser.AstScope, kind scope.K
 			Kind:          kind,
 			QualifiedName: s.GetQualifiedName(),
 			Path:          ast.GetPath(),
+			// iter-5 evaluator item 3: GetParameters is
+			// only populated by the parser for method
+			// scopes (nil for class/file/package); the
+			// canonical-signature helper ignores it for
+			// non-method kinds. Pass-through is safe.
+			Params: s.GetParameters(),
 		},
 		nil,
 		fanInDirectlyEmittedKinds,

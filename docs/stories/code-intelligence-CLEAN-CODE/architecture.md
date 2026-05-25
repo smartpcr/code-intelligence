@@ -874,6 +874,7 @@ against. Every table belongs to exactly one G1 sub-store
 | --- | --- | --- |
 | `repo_id` | uuid | Primary key. |
 | `display_name` | text | Free-form. |
+| `repo_url` | text? | Operator-supplied canonical repo URL (e.g. `https://github.com/org/repo`). Nullable for back-compat with rows inserted before migration `0006_repo_url.up.sql`; new rows inserted via `mgmt.register_repo` MUST supply a non-empty URL. **WRITE-ONCE post-registration** -- changing this value would break canonical-signature parity (Section 5.2.1) and the G2 guarantee, because every `scope_binding.canonical_signature` for the repo embeds this URL as the per-repo stamp. The Metric Ingestor's `PGRepoURLLookup` reads this column once per `ResolveScopeIDs` call (cached for the process lifetime); `display_name` was REJECTED as the URL source (iter-6 evaluator item 1) because it is free-form per this section's row 2 and covered by Management UPDATE grants (`mgmt.rename_repo`). |
 | `mode` | enum | `embedded` (default; operator pin `ast-mode-default`, Section 1.6) or `linked`. Determines AST Adapter mode (Section 3.2). |
 | `default_branch` | text | E.g. `main`. |
 | `default_branch_head` | text? | Head SHA of `default_branch`, cached by the Repo Indexer on push/merge webhooks so the Insights surface can answer "what's current?" with a single-row read instead of scanning `Commit`. Nullable until the first scan lands. The composite index `(repo_id, default_branch_head)` (implementation-plan Stage 1.2) backs the index-only-scan shape. The Repo Indexer (Section 3.3) is the only writer. |

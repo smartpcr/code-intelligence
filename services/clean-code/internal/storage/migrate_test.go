@@ -1361,6 +1361,212 @@ func TestPolicySigningKeysDownSQLDropsOwnObjects(t *testing.T) {
 	}
 }
 
+// TestDiscoverMigrations_findsStage32Pair pins discovery of the
+// Stage 3.2 `0006_repo_url` pair. iter-7 evaluator follow-up
+// asked for direct migration round-trip coverage of the
+// WRITE-ONCE trigger; this discovery test is the structural
+// pre-condition: if the pair stops being discovered, every
+// subsequent assertion below fails noisily rather than silently
+// degrading to "schema is fine, just missing the column".
+func TestDiscoverMigrations_findsStage32Pair(t *testing.T) {
+	t.Parallel()
+	dir, err := MigrationDir(callerDir(t))
+	if err != nil {
+		t.Fatalf("MigrationDir: %v", err)
+	}
+	migs, err := DiscoverMigrations(dir)
+	if err != nil {
+		t.Fatalf("DiscoverMigrations(%q): %v", dir, err)
+	}
+	var got *Migration
+	for i := range migs {
+		if migs[i].Version == "0006" {
+			got = &migs[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("DiscoverMigrations(%q) missing the Stage 3.2 "+
+			"0006_repo_url pair", dir)
+	}
+	if got.Name != "repo_url" {
+		t.Errorf("Stage 3.2 migration name = %q, want %q",
+			got.Name, "repo_url")
+	}
+	if _, err := os.Stat(got.UpPath); err != nil {
+		t.Errorf("up path %q: %v", got.UpPath, err)
+	}
+	if _, err := os.Stat(got.DownPath); err != nil {
+		t.Errorf("down path %q: %v", got.DownPath, err)
+	}
+}
+
+// TestRepoURLUpSQLBodyMentionsExpectedObjects pins the
+// structural shape of the Stage 3.2
+// `0006_repo_url.up.sql` migration so a regression that
+// silently drops the WRITE-ONCE trigger (iter-7 evaluator
+// item 4) or a column-level grant (iter-7 evaluator item 2)
+// surfaces in `go test ./...` -- BEFORE any developer ever
+// gets a chance to run the live-PostgreSQL round-trip.
+//
+// The contract this test pins:
+//
+//   - The repo_url column is added as `text NULL` (back-compat
+//     with pre-0006 rows; NULL is the "not yet back-filled"
+//     state the application-side `PGRepoURLLookup` surfaces as
+//     `ErrRepoURLLookupNotFound`).
+//   - Management gets column-level INSERT + UPDATE grants on
+//     `repo_url` (iter-6 evaluator item 1 -- canonical writer
+//     for the column). The UPDATE grant is INTENTIONALLY
+//     present despite the WRITE-ONCE policy because a DBA-run
+//     back-fill UPDATE must work without superuser escalation;
+//     the trigger below is the actual immutability guard.
+//   - A `BEFORE UPDATE OF repo_url` trigger exists, backed by
+//     a PL/pgSQL function that rejects post-set changes with
+//     SQLSTATE 23514 (check_violation). This is the iter-7
+//     evaluator item 4 defence-in-depth fix.
+//   - The trigger function's guard is `IS DISTINCT FROM` (not
+//     plain `!=`) so a NULL OLD value is treated as a back-fill
+//     transition, and a `SET repo_url = repo_url` no-op is
+//     allowed (some ORMs emit these).
+//   - The function is `LANGUAGE plpgsql` (required for the
+//     `IF ... RAISE` control flow).
+func TestRepoURLUpSQLBodyMentionsExpectedObjects(t *testing.T) {
+	t.Parallel()
+	dir, err := MigrationDir(callerDir(t))
+	if err != nil {
+		t.Fatalf("MigrationDir: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "0006_repo_url.up.sql"))
+	if err != nil {
+		t.Fatalf("read up.sql: %v", err)
+	}
+	sql := strings.ReplaceAll(string(body), "\r\n", "\n")
+	code := sqlCodeOnly(sql)
+
+	wantSubstrs := []string{
+		// Column shape.
+		"ALTER TABLE clean_code.repo",
+		"ADD COLUMN IF NOT EXISTS repo_url text NULL",
+		// Column-level grants -- Management is the canonical
+		// writer per C5 row 1; the iter-7 evaluator item 2 fix.
+		"GRANT INSERT (repo_url) ON clean_code.repo TO clean_code_management",
+		"GRANT UPDATE (repo_url) ON clean_code.repo TO clean_code_management",
+		// WRITE-ONCE trigger function (iter-7 evaluator item 4).
+		"CREATE OR REPLACE FUNCTION clean_code.tg_repo_url_write_once()",
+		"RETURNS trigger",
+		"LANGUAGE plpgsql",
+		// The guard MUST use IS DISTINCT FROM so NULL handling
+		// (back-fill) and the SET repo_url = repo_url no-op both
+		// pass through. A plain `!=` would crash on NULLs and
+		// drop a redundant set with an error.
+		"IS DISTINCT FROM OLD.repo_url",
+		// SQLSTATE 23514 (check_violation) is the canonical
+		// shape; the application's PG driver maps this to
+		// pq.Error.Code "23514" so callers can branch on it.
+		"ERRCODE = '23514'",
+		// Trigger wiring -- BEFORE UPDATE OF repo_url so the
+		// firing surface is narrowed to the column we care
+		// about (not every UPDATE on `repo`).
+		"DROP TRIGGER IF EXISTS tg_repo_url_write_once ON clean_code.repo",
+		"CREATE TRIGGER tg_repo_url_write_once",
+		"BEFORE UPDATE OF repo_url ON clean_code.repo",
+		"FOR EACH ROW",
+		"EXECUTE FUNCTION clean_code.tg_repo_url_write_once()",
+	}
+	for _, want := range wantSubstrs {
+		if !strings.Contains(sql, want) {
+			t.Errorf("0006 up.sql missing required substring %q", want)
+		}
+	}
+
+	// Forbidden patterns -- run against the code-only view so
+	// documentary mentions inside `--` comments do not trip
+	// false positives.
+	forbiddenCodePatterns := []struct {
+		pat    string
+		reason string
+	}{
+		// Repo Indexer must NEVER gain INSERT/UPDATE on
+		// repo_url -- Management owns this column (C5 row 1).
+		// A future migration that accidentally extends the
+		// grant trips this guard.
+		{
+			pat: "GRANT INSERT (repo_url) ON clean_code.repo TO clean_code_repo_indexer",
+			reason: "Repo Indexer is NOT the writer for repo_url; " +
+				"Management owns this column (C5 row 1).",
+		},
+		{
+			pat: "GRANT UPDATE (repo_url) ON clean_code.repo TO clean_code_repo_indexer",
+			reason: "Repo Indexer is NOT the writer for repo_url; " +
+				"Management owns this column (C5 row 1).",
+		},
+		// Tightening to NOT NULL is reserved for the Stage 1.2
+		// follow-up workstream (after a one-off back-fill).
+		// Doing it in this migration would error on every
+		// existing repo row in a populated catalog.
+		{
+			pat: "ALTER COLUMN repo_url SET NOT NULL",
+			reason: "Tightening repo_url to NOT NULL is reserved " +
+				"for the Stage 1.2 follow-up (after a DBA back-fill); " +
+				"doing it here would error on every pre-0006 row.",
+		},
+	}
+	for _, fp := range forbiddenCodePatterns {
+		if strings.Contains(code, fp.pat) {
+			t.Errorf("0006 up.sql contains forbidden pattern %q -- %s",
+				fp.pat, fp.reason)
+		}
+	}
+}
+
+// TestRepoURLDownSQLDropsTriggerAndColumn pins the down half:
+// the rollback MUST drop both the WRITE-ONCE trigger AND the
+// function (PostgreSQL would cascade the trigger when the
+// column drops, but naming both keeps the rollback idempotent
+// and explicit). It MUST NOT touch the schema or roles --
+// those belong to 0001 / 0004 respectively.
+func TestRepoURLDownSQLDropsTriggerAndColumn(t *testing.T) {
+	t.Parallel()
+	dir, err := MigrationDir(callerDir(t))
+	if err != nil {
+		t.Fatalf("MigrationDir: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "0006_repo_url.down.sql"))
+	if err != nil {
+		t.Fatalf("read down.sql: %v", err)
+	}
+	sql := strings.ReplaceAll(string(body), "\r\n", "\n")
+	wantDrops := []string{
+		// Trigger + function dropped BEFORE the column so a
+		// half-applied rollback (trigger gone, column still
+		// there) leaves the rest of the down idempotent.
+		"DROP TRIGGER IF EXISTS tg_repo_url_write_once ON clean_code.repo",
+		"DROP FUNCTION IF EXISTS clean_code.tg_repo_url_write_once()",
+		"ALTER TABLE clean_code.repo",
+		"DROP COLUMN IF EXISTS repo_url",
+	}
+	for _, want := range wantDrops {
+		if !strings.Contains(sql, want) {
+			t.Errorf("0006 down.sql missing required DROP %q", want)
+		}
+	}
+	// Must NOT drop roles or the schema -- those belong to
+	// 0004 / 0001 respectively. Run against the code-only
+	// view so documentary mentions inside `--` comments do
+	// not trip false positives.
+	code := sqlCodeOnly(sql)
+	if strings.Contains(code, "DROP ROLE") {
+		t.Errorf("0006 down.sql contains DROP ROLE -- roles are " +
+			"created by 0004 and are cluster-wide; 0006 down must " +
+			"only unwind its own objects.")
+	}
+	if strings.Contains(code, "DROP SCHEMA") {
+		t.Errorf("0006 down.sql contains DROP SCHEMA -- only " +
+			"0001_catalog_lifecycle.down.sql should DROP SCHEMA.")
+	}
+}
+
 // TestRoundTrip_upDownLeavesSchemaEmpty is the integration test
 // for implementation-plan Stage 1.2 scenario "catalog-up-down":
 //
@@ -1531,6 +1737,20 @@ func TestRoundTrip_upDownLeavesSchemaEmpty(t *testing.T) {
 	})
 	t.Run("policy-signing-keys-grants", func(t *testing.T) {
 		assertPolicySigningKeysGrants(t, psql, url)
+	})
+
+	// Stage 3.2 ("Metric Ingestor and ScanRun state machine")
+	// live-PG canon-guards for the iter-7 evaluator follow-up
+	// (non-blocking item: migration round-trip coverage for
+	// 0006_repo_url trigger/grants). These run inside the same
+	// up/down round-trip so the WRITE-ONCE behavior is pinned
+	// against the actual installed trigger, not just SQL
+	// source-text.
+	t.Run("repo-url-write-once-trigger", func(t *testing.T) {
+		assertRepoURLWriteOnceTrigger(t, psql, url)
+	})
+	t.Run("repo-url-management-grants", func(t *testing.T) {
+		assertRepoURLManagementGrants(t, psql, url)
 	})
 
 	// Revert in reverse lexical order. Per the Makefile
@@ -1755,6 +1975,238 @@ SELECT pg_get_constraintdef(c.oid)
 			t.Errorf("clean_code.%s foreign keys = %#v; want %#v",
 				c.table, got, want)
 		}
+	}
+}
+
+// assertRepoURLWriteOnceTrigger pins the runtime behavior of
+// the `tg_repo_url_write_once` trigger installed by
+// 0006_repo_url.up.sql. The structural test
+// (TestRepoURLUpSQLBodyMentionsExpectedObjects) pins the SQL
+// source-text shape; this assertion pins what the trigger
+// actually DOES against a live PostgreSQL:
+//
+//   - A row INSERTed with NULL repo_url stays NULL.
+//   - The NULL -> non-NULL transition is allowed (one-shot
+//     back-fill of pre-0006 rows).
+//   - The redundant `SET repo_url = repo_url` no-op is allowed
+//     (some ORMs emit these on partial-column updates; the
+//     trigger's IS DISTINCT FROM guard short-circuits).
+//   - Any change to a non-NULL repo_url is rejected with
+//     SQLSTATE 23514 (check_violation). The rejection surfaces
+//     the trigger's RAISE EXCEPTION message text.
+//
+// Each subtest seeds its own scratch repo and tears it down on
+// completion so re-runs under `go test -count=N` stay
+// idempotent.
+//
+// iter-7 evaluator non-blocking item: direct migration
+// round-trip coverage for 0006_repo_url trigger enforcement
+// beyond static SQL review.
+func assertRepoURLWriteOnceTrigger(t *testing.T, psql, url string) {
+	t.Helper()
+	// Use a fixed scratch display_name so the test cleanup
+	// can target this test's rows without affecting sibling
+	// subtests.
+	const scratch = "repo-url-write-once-scratch"
+	const originalURL = "https://example.com/org/original-repo"
+	const replacementURL = "https://example.com/org/attacker-repo"
+
+	// Best-effort precondition cleanup so a prior failed run
+	// doesn't leave a row that would skew the test.
+	_ = runPSQLInline(t, psql, url, fmt.Sprintf(
+		"DELETE FROM clean_code.repo WHERE display_name = %s;",
+		pgLiteral(scratch)))
+	// Final cleanup so re-runs under -count=N stay idempotent
+	// AND so the round-trip's `drop schema` cleanup is a no-op
+	// even if this assertion fails mid-way.
+	t.Cleanup(func() {
+		_ = runPSQLInline(t, psql, url, fmt.Sprintf(
+			"DELETE FROM clean_code.repo WHERE display_name = %s;",
+			pgLiteral(scratch)))
+	})
+
+	// Step 1: INSERT with NULL repo_url -- pre-0006-style row.
+	// No trigger fire (the trigger is BEFORE UPDATE, not
+	// BEFORE INSERT).
+	if err := runPSQLInline(t, psql, url, fmt.Sprintf(
+		"INSERT INTO clean_code.repo (display_name, default_branch, repo_url) "+
+			"VALUES (%s, 'main', NULL);", pgLiteral(scratch))); err != nil {
+		t.Fatalf("INSERT with NULL repo_url: %v", err)
+	}
+
+	// Step 2: NULL -> non-NULL back-fill -- ALLOWED.
+	if err := runPSQLInline(t, psql, url, fmt.Sprintf(
+		"UPDATE clean_code.repo SET repo_url = %s WHERE display_name = %s;",
+		pgLiteral(originalURL), pgLiteral(scratch))); err != nil {
+		t.Fatalf("UPDATE NULL -> %q: %v (expected to succeed -- "+
+			"the trigger MUST allow back-fill of pre-0006 rows)", originalURL, err)
+	}
+	// Sanity-check the value actually landed.
+	got, err := runPSQLQuery(t, psql, url, fmt.Sprintf(
+		"SELECT repo_url FROM clean_code.repo WHERE display_name = %s;",
+		pgLiteral(scratch)))
+	if err != nil {
+		t.Fatalf("SELECT repo_url after back-fill: %v", err)
+	}
+	if strings.TrimSpace(got) != originalURL {
+		t.Fatalf("repo_url after back-fill = %q, want %q",
+			strings.TrimSpace(got), originalURL)
+	}
+
+	// Step 3: SET repo_url = repo_url (no-op) -- ALLOWED.
+	// Some ORMs emit redundant assignments on partial-column
+	// updates; the trigger MUST short-circuit on
+	// `NEW.repo_url IS DISTINCT FROM OLD.repo_url` = false.
+	if err := runPSQLInline(t, psql, url, fmt.Sprintf(
+		"UPDATE clean_code.repo SET repo_url = repo_url "+
+			"WHERE display_name = %s;", pgLiteral(scratch))); err != nil {
+		t.Fatalf("UPDATE SET repo_url = repo_url (no-op): %v "+
+			"(expected to succeed -- IS DISTINCT FROM guards the no-op)", err)
+	}
+
+	// Step 4: post-set change -- REJECTED with SQLSTATE 23514.
+	// runPSQLInline returns a non-nil error; we surface its
+	// combined output so the test log shows the RAISE EXCEPTION
+	// message text.
+	err = runPSQLInline(t, psql, url, fmt.Sprintf(
+		"UPDATE clean_code.repo SET repo_url = %s WHERE display_name = %s;",
+		pgLiteral(replacementURL), pgLiteral(scratch)))
+	if err == nil {
+		t.Fatalf("UPDATE %q -> %q: err=nil; want SQLSTATE 23514 "+
+			"check_violation -- the WRITE-ONCE trigger MUST reject "+
+			"post-set changes", originalURL, replacementURL)
+	}
+	// The error wraps psql's combined stderr/stdout. We look
+	// for either the SQLSTATE code (matches `psql:...: ERROR:
+	// ...` formatted output) OR the trigger's literal
+	// message text ("is WRITE-ONCE"). Both signals are
+	// present in the same line of psql output, so requiring
+	// either keeps the assertion robust against psql output
+	// format variations across versions.
+	errText := err.Error()
+	if !strings.Contains(errText, "23514") && !strings.Contains(errText, "WRITE-ONCE") {
+		t.Fatalf("UPDATE rejection error did not mention SQLSTATE "+
+			"23514 or 'WRITE-ONCE'; got: %v", err)
+	}
+
+	// Step 5: confirm the value did NOT change.
+	got, err = runPSQLQuery(t, psql, url, fmt.Sprintf(
+		"SELECT repo_url FROM clean_code.repo WHERE display_name = %s;",
+		pgLiteral(scratch)))
+	if err != nil {
+		t.Fatalf("SELECT repo_url after rejected UPDATE: %v", err)
+	}
+	if strings.TrimSpace(got) != originalURL {
+		t.Fatalf("repo_url after rejected UPDATE = %q, want %q "+
+			"(trigger rejection MUST leave the value unchanged)",
+			strings.TrimSpace(got), originalURL)
+	}
+}
+
+// assertRepoURLManagementGrants pins the runtime privilege
+// behavior of the column-level grants added by
+// 0006_repo_url.up.sql. The structural test
+// (TestRepoURLUpSQLBodyMentionsExpectedObjects) pins the
+// presence of the GRANT statements; this assertion pins what
+// they actually authorise / forbid against a live PostgreSQL:
+//
+//   - The Management role can INSERT a row WITH repo_url
+//     supplied (canonical registration path -- iter-7
+//     evaluator item 2 fix).
+//   - The Management role can SELECT the column (every writer
+//     role inherits SELECT via the cross-sub-store grant in
+//     0004_roles.up.sql:227-260).
+//   - The Repo Indexer role CANNOT INSERT into clean_code.repo
+//     at all -- repo registration is Management-owned per C5
+//     row 1.
+//   - The Metric Ingestor role CANNOT UPDATE repo_url -- the
+//     column is Management-owned even though Metric Ingestor
+//     can SELECT it for the canonical-signature stamp.
+//
+// iter-7 evaluator non-blocking item: round-trip coverage of
+// 0006_repo_url grants beyond static SQL review.
+func assertRepoURLManagementGrants(t *testing.T, psql, url string) {
+	t.Helper()
+	const scratch = "repo-url-grants-scratch"
+	const operatorURL = "https://example.com/org/grants-test"
+
+	// Best-effort precondition cleanup; final cleanup wired
+	// to t.Cleanup so failures mid-way still tidy up.
+	_ = runPSQLInline(t, psql, url, fmt.Sprintf(
+		"DELETE FROM clean_code.repo WHERE display_name = %s;",
+		pgLiteral(scratch)))
+	t.Cleanup(func() {
+		_ = runPSQLInline(t, psql, url, fmt.Sprintf(
+			"DELETE FROM clean_code.repo WHERE display_name = %s;",
+			pgLiteral(scratch)))
+	})
+
+	// (1) Management CAN insert WITH repo_url. We wrap in
+	// BEGIN..COMMIT with SET LOCAL ROLE so the grant matrix
+	// is exercised exactly. SET LOCAL constrains the role
+	// switch to the transaction; COMMIT resets it.
+	managementInsert := fmt.Sprintf(`BEGIN;
+SET LOCAL ROLE clean_code_management;
+INSERT INTO clean_code.repo (display_name, default_branch, repo_url)
+  VALUES (%s, 'main', %s);
+COMMIT;`, pgLiteral(scratch), pgLiteral(operatorURL))
+	if err := runPSQLInline(t, psql, url, managementInsert); err != nil {
+		t.Fatalf("Management INSERT WITH repo_url: %v "+
+			"(C5 row 1 + iter-7 evaluator item 2 require this to succeed)", err)
+	}
+
+	// (2) Management CAN SELECT repo_url. The cross-sub-store
+	// SELECT grant in 0004_roles.up.sql covers all columns;
+	// this is a sanity check that 0006 did not regress it.
+	managementSelect := fmt.Sprintf(`BEGIN;
+SET LOCAL ROLE clean_code_management;
+SELECT repo_url FROM clean_code.repo WHERE display_name = %s;
+COMMIT;`, pgLiteral(scratch))
+	if err := runPSQLInline(t, psql, url, managementSelect); err != nil {
+		t.Fatalf("Management SELECT repo_url: %v "+
+			"(every writer role MUST be able to SELECT repo_url)", err)
+	}
+
+	// (3) Repo Indexer CANNOT INSERT into clean_code.repo at
+	// all -- C5 row 1 reserves repo registration for
+	// Management. The expected failure mode is SQLSTATE 42501
+	// (insufficient_privilege).
+	repoIndexerInsert := fmt.Sprintf(`BEGIN;
+SET LOCAL ROLE clean_code_repo_indexer;
+INSERT INTO clean_code.repo (display_name, default_branch, repo_url)
+  VALUES ('repo-indexer-attempt-%s', 'main', %s);
+COMMIT;`, scratch, pgLiteral(operatorURL))
+	err := runPSQLInline(t, psql, url, repoIndexerInsert)
+	if err == nil {
+		t.Fatalf("Repo Indexer INSERT into clean_code.repo: err=nil; " +
+			"want SQLSTATE 42501 -- Repo Indexer must NOT be able " +
+			"to register repos (C5 row 1 owner is Management).")
+	}
+	if !strings.Contains(err.Error(), pgPermissionDeniedSQLState) &&
+		!strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("Repo Indexer INSERT rejection did not mention "+
+			"SQLSTATE %s or 'permission denied'; got: %v",
+			pgPermissionDeniedSQLState, err)
+	}
+
+	// (4) Metric Ingestor CANNOT UPDATE repo_url (even though
+	// the trigger would allow a NULL->non-NULL back-fill;
+	// the grant is the outer guard). Expected failure mode is
+	// again SQLSTATE 42501.
+	metricIngestorUpdate := fmt.Sprintf(`BEGIN;
+SET LOCAL ROLE clean_code_metric_ingestor;
+UPDATE clean_code.repo SET repo_url = %s WHERE display_name = %s;
+COMMIT;`, pgLiteral("https://example.com/org/metric-ingestor-attempt"), pgLiteral(scratch))
+	err = runPSQLInline(t, psql, url, metricIngestorUpdate)
+	if err == nil {
+		t.Fatalf("Metric Ingestor UPDATE repo_url: err=nil; " +
+			"want SQLSTATE 42501 -- the column is Management-owned.")
+	}
+	if !strings.Contains(err.Error(), pgPermissionDeniedSQLState) &&
+		!strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("Metric Ingestor UPDATE rejection did not mention "+
+			"SQLSTATE %s or 'permission denied'; got: %v",
+			pgPermissionDeniedSQLState, err)
 	}
 }
 
@@ -3462,4 +3914,172 @@ func assertPolicySigningKeysGrants(t *testing.T, psql, url string) {
 			t.Errorf("forbidden grant present %q; tech-spec Sec 7.2 writer isolation breached. Full grants:\n%s", g, out)
 		}
 	}
+}
+
+
+// TestDiscoverMigrations_findsStage32SeedPair pins the
+// iter-18 fix for the production catalog-seed role-grant
+// mismatch (the iter-17 evaluator's item 1). The Metric
+// Ingestor connection cannot INSERT into
+// `clean_code.metric_kind` (grant lives on
+// `clean_code_policy_steward` per
+// `migrations/0004_roles.up.sql:350-355`), so the seven
+// foundation rows are seeded by a schema-owner migration
+// instead of by application startup.
+//
+// This test pins discovery of the 0007 pair (up + down)
+// so a future refactor that orphans one half surfaces in
+// `go test ./...` BEFORE the round-trip integration test
+// even has a chance to run.
+func TestDiscoverMigrations_findsStage32SeedPair(t *testing.T) {
+t.Parallel()
+dir, err := MigrationDir(callerDir(t))
+if err != nil {
+t.Fatalf("MigrationDir: %v", err)
+}
+migs, err := DiscoverMigrations(dir)
+if err != nil {
+t.Fatalf("DiscoverMigrations(%q): %v", dir, err)
+}
+var got *Migration
+for i := range migs {
+if migs[i].Version == "0007" {
+got = &migs[i]
+break
+}
+}
+if got == nil {
+t.Fatalf("DiscoverMigrations(%q) missing the Stage 3.2 "+
+"0007_seed_foundation_metric_kinds pair", dir)
+}
+if got.Name != "seed_foundation_metric_kinds" {
+t.Errorf("Stage 3.2 seed migration name = %q, want %q",
+got.Name, "seed_foundation_metric_kinds")
+}
+if _, err := os.Stat(got.UpPath); err != nil {
+t.Errorf("up path %q: %v", got.UpPath, err)
+}
+if _, err := os.Stat(got.DownPath); err != nil {
+t.Errorf("down path %q: %v", got.DownPath, err)
+}
+}
+
+// TestSeedFoundationMetricKindsUpSQLBodyMentionsExpectedObjects
+// pins the structural shape of
+// `0007_seed_foundation_metric_kinds.up.sql`. The seven
+// foundation kinds + their (kind, version) pairs MUST be
+// present so the metric_sample FK
+// (`migrations/0002_measurement.up.sql:348-350`) is always
+// satisfied for a fresh schema. A regression that drops
+// one of the seven (or bumps a version without also
+// bumping the in-process producer at
+// `internal/metric_ingestor/metric_kind_catalog.go`)
+// surfaces here.
+func TestSeedFoundationMetricKindsUpSQLBodyMentionsExpectedObjects(t *testing.T) {
+t.Parallel()
+dir, err := MigrationDir(callerDir(t))
+if err != nil {
+t.Fatalf("MigrationDir: %v", err)
+}
+body, err := os.ReadFile(filepath.Join(dir,
+"0007_seed_foundation_metric_kinds.up.sql"))
+if err != nil {
+t.Fatalf("read up.sql: %v", err)
+}
+sql := strings.ReplaceAll(string(body), "\r\n", "\n")
+
+wantSubstrs := []string{
+// Idempotence -- per the table COMMENT at
+// `0001_catalog_lifecycle.up.sql:283-286`, a
+// Steward-curated row MUST NOT be overwritten by
+// re-running the seed migration. ON CONFLICT DO
+// NOTHING preserves Steward precedence; the
+// in-process VerifyMetricKindCatalog (called at
+// startup) surfaces (kind, version) drift between
+// the Steward row and the in-process producer.
+"ON CONFLICT (metric_kind) DO NOTHING",
+// All seven foundation kinds. Six come from the
+// recipe registry at
+// `internal/metrics/recipes/registry.go:124-135`;
+// the seventh is the modification_count_in_window
+// materialiser at
+// `internal/metrics/materialisers/modification_count.go`.
+"'cyclo'",
+"'cognitive_complexity'",
+"'loc'",
+"'lcom4'",
+"'fan_in'",
+"'fan_out'",
+"'modification_count_in_window'",
+// Wrapped in a transaction so a partial seed is
+// impossible -- either all seven land or none do.
+"BEGIN",
+"COMMIT",
+// Targets the canonical catalog table -- a typo
+// against `metric_kinds` (plural) would silently
+// land in a non-existent table and crash with a
+// 42P01 (undefined_table).
+"INSERT INTO clean_code.metric_kind",
+}
+for _, want := range wantSubstrs {
+if !strings.Contains(sql, want) {
+t.Errorf("0007 up.sql missing required substring %q", want)
+}
+}
+}
+
+// TestSeedFoundationMetricKindsDownSQLDeletesSeededRows
+// pins the rollback shape. The down migration MUST DELETE
+// exactly the rows the up migration INSERTed (and no
+// others). FK ON DELETE RESTRICT from `metric_sample`
+// blocks the DELETE once metric_sample rows reference a
+// kind -- the comment in the down file documents this.
+func TestSeedFoundationMetricKindsDownSQLDeletesSeededRows(t *testing.T) {
+t.Parallel()
+dir, err := MigrationDir(callerDir(t))
+if err != nil {
+t.Fatalf("MigrationDir: %v", err)
+}
+body, err := os.ReadFile(filepath.Join(dir,
+"0007_seed_foundation_metric_kinds.down.sql"))
+if err != nil {
+t.Fatalf("read down.sql: %v", err)
+}
+sql := strings.ReplaceAll(string(body), "\r\n", "\n")
+code := sqlCodeOnly(sql)
+
+if !strings.Contains(code, "DELETE FROM clean_code.metric_kind") {
+t.Errorf("0007 down.sql missing DELETE FROM clean_code.metric_kind")
+}
+// The down must enumerate every kind the up seeded;
+// a partial down would leave orphan rows the next up
+// would silently skip via ON CONFLICT DO NOTHING.
+// Check against the raw SQL (sqlCodeOnly strips string
+// literals; the kind names ARE string literals).
+wantKinds := []string{
+"'cyclo'",
+"'cognitive_complexity'",
+"'loc'",
+"'lcom4'",
+"'fan_in'",
+"'fan_out'",
+"'modification_count_in_window'",
+}
+for _, want := range wantKinds {
+if !strings.Contains(sql, want) {
+t.Errorf("0007 down.sql missing kind %q", want)
+}
+}
+// Roles + schema belong to 0004 / 0001 respectively;
+// 0007 down must only unwind its own rows.
+if strings.Contains(code, "DROP ROLE") {
+t.Errorf("0007 down.sql contains DROP ROLE")
+}
+if strings.Contains(code, "DROP SCHEMA") {
+t.Errorf("0007 down.sql contains DROP SCHEMA")
+}
+if strings.Contains(code, "DROP TABLE") {
+t.Errorf("0007 down.sql contains DROP TABLE -- " +
+"only delete rows, not the table.")
+}
 }

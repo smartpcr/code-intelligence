@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/gofrs/uuid"
+
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/parser"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/scope"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
 
@@ -29,17 +32,140 @@ var ErrFoundationAstFilesUnwired = errors.New("metric_ingestor: RegistryBackedFo
 
 // ErrFoundationDraftPersistenceUnimplemented is returned by
 // [RegistryBackedFoundationDispatcher.Dispatch] when a recipe
-// produces draft rows at Stage 2.6. Persisting foundation-tier
-// drafts requires the Phase 3.2 PG-backed [MetricSampleWriter]
-// transaction wiring (so the drafts share a transaction with
-// the churn sweep, enforcing the active-row uniqueness
-// invariant). The Stage 2.6 production wiring uses
-// [EmptyAstFileSource] which produces zero drafts; this error
-// fires only in tests that exercise a non-empty AST source +
-// non-empty registry, proving the dispatcher's iteration logic
-// is real without inventing fake `sha` / `scope_id` values for
-// the [MetricSampleRecord] columns the Phase 3.2 writer mints.
-var ErrFoundationDraftPersistenceUnimplemented = errors.New("metric_ingestor: foundation-tier draft persistence is not implemented at Stage 2.6 (Phase 3.2 supplies the transaction-aware writer)")
+// produces draft rows AND no [MetricSampleWriter] is wired.
+// Before Stage 3.2 the entire foundation tier surfaced this
+// error whenever drafts were produced because the
+// transaction-aware writer did not yet exist; Stage 3.2 lands
+// the writer and the dispatcher now persists drafts when
+// [RegistryBackedFoundationDispatcher.Writer] is non-nil. The
+// sentinel is RETAINED (not removed) so callers that
+// deliberately wire a dispatcher without a writer
+// (e.g. iteration-logic tests, configuration-validation tests)
+// keep the "you forgot the writer" surface they pin on.
+var ErrFoundationDraftPersistenceUnimplemented = errors.New("metric_ingestor: foundation-tier draft persistence requires RegistryBackedFoundationDispatcher.Writer to be wired")
+
+// ErrFoundationSHAMissing is returned when a wired Writer
+// would persist a draft but [FoundationInput.SHA] is empty.
+// Every persisted [MetricSampleRecord] MUST stamp the
+// claimed commit's SHA on its row (architecture Sec 5.2.1 --
+// `MetricSample.sha` is part of the active-row natural key);
+// silently writing the zero string would smuggle a bogus row
+// into the active index.
+var ErrFoundationSHAMissing = errors.New("metric_ingestor: FoundationInput.SHA is required when a Writer is wired")
+
+// FoundationScopeResolver translates a batch of recipe-emitted
+// [recipes.ScopeRef] values (intra-file `local:N` placeholders +
+// canonical signature seeds) into the durable
+// `scope_binding.scope_id` UUIDs the [MetricSampleRecord]
+// requires. The seam exists because foundation drafts carry
+// only the parser's intra-file placeholder; minting the
+// durable UUID belongs to the Ingestor, not the recipe (G1:
+// recipes never mint UUIDs).
+//
+// # Batched contract (iter-3 evaluator item 3/4)
+//
+// The interface accepts a slice of refs rather than a single
+// ref so production resolvers can amortise a single PG
+// transaction (advisory lock + SELECT + INSERT) across all
+// scopes a scan emits. The returned slice MUST be parallel to
+// the input slice: `ids[i]` is the resolved `scope_id` for
+// `refs[i]`. A length mismatch is a contract violation; the
+// dispatcher treats `len(ids) != len(refs)` as a fatal error.
+//
+// # Production resolver
+//
+// The production resolver is [PGScopeBindingResolver]
+// (`pg_scope_binding_resolver.go`), which delegates to
+// [storage.ScopeBindingWriter.Write]. That writer takes a
+// pg_advisory_xact_lock per repo, looks up each candidate by
+// natural key, reuses the persisted `first_seen_sha` when a
+// row already exists, and INSERTs fresh rows otherwise. G2
+// stability ("the same logical scope produces the same
+// scope_id across SHAs") is supplied BY the writer's
+// natural-key lookup -- the resolver itself is a thin
+// adapter.
+//
+// # Scaffold / in-memory resolver
+//
+// [DefaultFoundationScopeResolver] is the scaffold-mode
+// resolver used when no `*sql.DB` is wired. It calls
+// [scope.DeriveScopeID] directly with the scan SHA as
+// `first_seen_sha`. G2 stability is provided only WITHIN a
+// single SHA (re-running the dispatcher at the same SHA
+// emits the same scope_id); cross-SHA stability requires the
+// PG resolver.
+type FoundationScopeResolver interface {
+	// ResolveScopeIDs returns the durable
+	// `scope_binding.scope_id` UUIDs for the given batch of
+	// refs against `repoID` and `sha`. The returned slice
+	// MUST be parallel to `refs` (same length, same order);
+	// callers zip back to drafts by index. Implementations
+	// SHOULD batch a single PG round-trip rather than N
+	// independent calls.
+	ResolveScopeIDs(ctx context.Context, repoID uuid.UUID, refs []recipes.ScopeRef, sha string) ([]uuid.UUID, error)
+}
+
+// DefaultFoundationScopeResolver is the scaffold-mode
+// [FoundationScopeResolver]. It calls
+// [BuildCanonicalSignatureForRefURL] (with a
+// [SyntheticRepoURLLookup]-supplied stamp) to build the
+// canonical signature (per-kind dispatch via `scope.Build*`)
+// and then [scope.DeriveScopeID](repoID, ref.Kind,
+// signature, sha) to mint the scope_id. The scan SHA is
+// used as `first_seen_sha`, which is sufficient for tests
+// and in-memory deployments but does NOT provide cross-SHA
+// G2 stability. Production deployments wire
+// [PGScopeBindingResolver] which delegates to the writer's
+// natural-key lookup for persistent G2 stability AND uses
+// [PGRepoURLLookup] for real-URL parity (iter-5 evaluator
+// item 2).
+//
+// iter-4 evaluator item 1: builds canonical signatures via
+// the same [BuildCanonicalSignatureForRefURL] helper as the
+// PG resolver so the canonical signature shape is byte-
+// identical regardless of mode (the URL stamp differs --
+// scaffold uses synthetic; PG-mode reads
+// `clean_code.repo.repo_url` via [PGRepoURLLookup]).
+type DefaultFoundationScopeResolver struct {
+	// URLs supplies the per-repo URL stamp the signature
+	// helper uses. nil falls back to [SyntheticRepoURLLookup]
+	// (the iter-4 behaviour), so existing tests that pin
+	// the `clean-code-repo:<repoID>` literal continue to
+	// pass.
+	URLs RepoURLLookup
+}
+
+// ResolveScopeIDs implements [FoundationScopeResolver].
+func (d DefaultFoundationScopeResolver) ResolveScopeIDs(ctx context.Context, repoID uuid.UUID, refs []recipes.ScopeRef, sha string) ([]uuid.UUID, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	urls := d.URLs
+	if urls == nil {
+		urls = SyntheticRepoURLLookup{}
+	}
+	repoURL, err := urls.LookupRepoURL(ctx, repoID)
+	if err != nil {
+		return nil, fmt.Errorf("metric_ingestor: DefaultFoundationScopeResolver.LookupRepoURL (repo_id=%s): %w", repoID, err)
+	}
+	ids := make([]uuid.UUID, len(refs))
+	for i, ref := range refs {
+		if ref.QualifiedName == "" && ref.Kind != scope.KindRepo {
+			return nil, fmt.Errorf("metric_ingestor: ScopeRef.QualifiedName is empty for refs[%d] kind=%q", i, ref.Kind)
+		}
+		sig, sigErr := BuildCanonicalSignatureForRefURL(repoURL, ref)
+		if sigErr != nil {
+			return nil, fmt.Errorf("metric_ingestor: DefaultFoundationScopeResolver.BuildCanonicalSignatureForRefURL refs[%d]: %w", i, sigErr)
+		}
+		id, err := scope.DeriveScopeID(repoID, ref.Kind, sig, sha)
+		if err != nil {
+			return nil, fmt.Errorf("metric_ingestor: derive scope_id for refs[%d] kind=%q name=%q sha=%q: %w",
+				i, ref.Kind, ref.QualifiedName, sha, err)
+		}
+		ids[i] = id
+	}
+	return ids, nil
+}
 
 // AstFileSource is the seam between a foundation-tier
 // dispatcher and the AST parser fleet (Phase 4). The interface
@@ -50,17 +176,14 @@ var ErrFoundationDraftPersistenceUnimplemented = errors.New("metric_ingestor: fo
 // Stage 2.6 because the AST parser fleet itself does not yet
 // expose a streaming reader.
 //
-// # Stage 2.6 wiring
+// # Stage 3.2 wiring
 //
-// The production composition root in `cmd/clean-coded/main.go`
-// supplies [EmptyAstFileSource] -- AST parsing lands in Phase
-// 4 (`phase-ast-adapter-and-foundation-tier-compute`), so a
-// Stage 2.6 `full`/`delta` scan correctly iterates zero AST
-// files. The [RegistryBackedFoundationDispatcher] honours the
-// "registry actually consumed" requirement (evaluator iter-5
-// #4) by iterating the registry's recipes over whatever the
-// source yields -- zero today, the full per-language AST
-// stream after Phase 4 wires the real source.
+// The composition root in `cmd/clean-coded/main.go` wires
+// [DirectoryAstFileSource] when `cfg.AstScanRoot` is set
+// (Stage 3.2 brief item 3 -- "drives the recipe registry over
+// the parsed AST"). When `cfg.AstScanRoot` is unset the root
+// falls back to [EmptyAstFileSource] so a deployment without
+// a checkout-resolver upstream still boots.
 type AstFileSource interface {
 	// Files returns every `*parser.AstFile` the dispatcher
 	// should run recipes against for `scanRun`. The order
@@ -78,15 +201,16 @@ type AstFileSource interface {
 
 // EmptyAstFileSource is the Stage 2.6 scaffold
 // [AstFileSource]. Its [Files] method always returns
-// (nil, nil) -- AST parsing is Phase 4's responsibility, so a
-// Stage 2.6 production scan iterates zero files. The
-// composition-root structural value of the type is that the
-// [RegistryBackedFoundationDispatcher] DOES wire the recipes
-// registry through its dispatch loop -- the loop body just
-// never executes because the source is empty.
+// (nil, nil) -- a deployment with no on-disk checkout
+// upstream falls back to this so the dispatcher still
+// completes cleanly with zero drafts.
 //
-// Replaced by a real `pgx`-backed reader in Phase 4
-// (`stage-ast-adapter-and-foundation-tier-compute`).
+// Phase 4 (`stage-ast-adapter-and-foundation-tier-compute`)
+// replaces this scaffold with the parser-fleet adapter that
+// loads from `clean_code.ast_file`. Stage 3.2 also ships
+// [DirectoryAstFileSource] which walks a local directory --
+// it's a real source for environments where the checkout
+// resolver materialises working trees on disk.
 type EmptyAstFileSource struct{}
 
 // Files implements [AstFileSource] by returning (nil, nil).
@@ -96,11 +220,11 @@ func (EmptyAstFileSource) Files(_ context.Context, _ ScanRunContext) ([]*parser.
 
 // RegistryBackedFoundationDispatcher is the production
 // [FoundationRecipeDispatcher] wired by the composition root.
-// It honours the iter-5 #4 structural requirement: the
-// [recipes.Registry] constructed at startup MUST flow into
-// the dispatcher and be consumed by the dispatch loop -- the
-// prior `_ = recipes.DefaultRegistryWithLog(log)` discard
-// shape was the evaluator's blocking complaint.
+// It iterates the recipes registry over every AST file the
+// source yields. With a wired [Writer] + [Scopes] resolver,
+// produced drafts are converted to [MetricSampleRecord]s and
+// persisted via [MetricSampleWriter.WriteBatch] in one batch
+// per dispatch call.
 //
 // # Dispatch loop
 //
@@ -109,37 +233,38 @@ func (EmptyAstFileSource) Files(_ context.Context, _ ScanRunContext) ([]*parser.
 // [Registry] has registered. A recipe's [recipes.Recipe.Compute]
 // is invoked iff its [recipes.Recipe.AppliesTo] returns true
 // -- mirroring the architecture Sec 8.6 line 1008 contract.
-// Drafts produced by a Compute call are COUNTED but NOT
-// persisted at Stage 2.6; the rationale is documented on
-// [ErrFoundationDraftPersistenceUnimplemented].
+// Produced drafts are accumulated and, if a Writer is wired,
+// persisted in one batch at the end of the dispatch call.
 //
-// # Stage 2.6 honesty
+// # Iteration honesty
 //
-// The production wiring supplies [EmptyAstFileSource], so the
-// loop body never executes in a real binary. The dispatcher
-// reports `ast_files_seen=0, recipes_evaluated=0,
-// drafts_produced=0` via [Logger]. Tests that exercise a
-// non-empty fake [AstFileSource] prove the iteration logic
-// works -- the registry is consumed for every yielded file,
-// AppliesTo is called per (file, recipe) pair, and drafts are
-// counted.
+// When the source yields zero files the dispatcher reports
+// `ast_files_seen=0, recipes_evaluated=0, drafts_produced=0,
+// drafts_persisted=0` via [Logger]. Tests that exercise a
+// non-empty fake source prove the iteration logic works --
+// the registry is consumed for every yielded file, AppliesTo
+// is called per (file, recipe) pair, and drafts are counted
+// and persisted (when a writer is wired).
 //
-// # Phase 3.2 swap
+// # Writer wiring
 //
-// Phase 3.2 (`stage-metric-ingestor-and-scanrun-state-machine`)
-// replaces the dispatcher with a transaction-aware variant
-// that:
+// The Stage 3.2 composition root wires
+// [Writer] = [PGMetricSampleWriter] (when `cfg.PostgresURL`
+// is set) or [InMemoryMetricSampleWriter] (scaffold mode).
+// Tests that exercise the iteration logic without a real
+// writer wire `Writer = nil` -- in that mode, a dispatch
+// call that PRODUCES drafts returns
+// [ErrFoundationDraftPersistenceUnimplemented] (an explicit
+// wiring-bug signal).
 //
-//  1. Reads `*parser.AstFile`s from the PG-backed
-//     `clean_code.ast_file` cache (the Phase 4 writer's
-//     persistence layer).
-//  2. Persists drafts into `clean_code.metric_sample` inside
-//     the SAME transaction as the [ChurnSweep]'s writes (the
-//     cross-producer atomicity guarantee Sec 5.2.2 / G2
-//     requires).
+// # ProducerRunID minting
 //
-// The [Registry] dependency stays unchanged; only the source
-// + the per-draft persistence move.
+// The [Writer] receives [MetricSampleRecord.ProducerRunID]
+// set to [ScanRunContext.ID] (the active ScanRun) and
+// [MetricSampleRecord.SampleID] minted via
+// [SampleIDFactory] (default: [uuid.NewV4]). Tests can
+// inject a deterministic factory via [SampleIDFactory] to
+// pin the IDs.
 type RegistryBackedFoundationDispatcher struct {
 	// Registry is the foundation-tier recipe registry. The
 	// composition root constructs it via
@@ -148,17 +273,35 @@ type RegistryBackedFoundationDispatcher struct {
 	// consults [recipes.Registry.Recipes].
 	Registry *recipes.Registry
 	// AstFiles is the per-ScanRun source of `*parser.AstFile`s
-	// the dispatcher iterates. Production: [EmptyAstFileSource]
-	// at Stage 2.6. Tests: a slice-backed fake.
+	// the dispatcher iterates. Production:
+	// [DirectoryAstFileSource] (or [EmptyAstFileSource] when
+	// the deployment has no on-disk checkouts). Tests: a
+	// slice-backed fake.
 	AstFiles AstFileSource
+	// Writer persists every produced draft via
+	// [MetricSampleWriter.WriteBatch]. MAY be nil -- in nil
+	// mode the dispatcher still iterates the registry and
+	// counts drafts, but a dispatch call that produced any
+	// drafts returns [ErrFoundationDraftPersistenceUnimplemented].
+	Writer MetricSampleWriter
+	// Scopes resolves recipe-emitted [recipes.ScopeRef] values
+	// to durable `scope_binding.scope_id` UUIDs. MAY be nil;
+	// the dispatcher falls back to
+	// [DefaultFoundationScopeResolver] (which derives the UUID
+	// via [scope.DeriveScopeID] using the scan SHA).
+	Scopes FoundationScopeResolver
+	// SampleIDFactory mints each persisted record's `sample_id`.
+	// MAY be nil; falls back to [uuid.NewV4]. Tests inject a
+	// deterministic factory to pin IDs.
+	SampleIDFactory func() (uuid.UUID, error)
 	// Logger receives ONE structured INFO line per Dispatch
 	// call summarising the dispatch counts. MAY be nil.
 	Logger *slog.Logger
 }
 
 // Dispatch implements [FoundationRecipeDispatcher]. See the
-// type-level docstring for the loop contract.
-func (d *RegistryBackedFoundationDispatcher) Dispatch(ctx context.Context, scanRun ScanRunContext, _ FoundationInput) error {
+// type-level docstring for the loop + persistence contract.
+func (d *RegistryBackedFoundationDispatcher) Dispatch(ctx context.Context, scanRun ScanRunContext, input FoundationInput) error {
 	if d.Registry == nil {
 		return ErrFoundationRegistryUnwired
 	}
@@ -175,7 +318,7 @@ func (d *RegistryBackedFoundationDispatcher) Dispatch(ctx context.Context, scanR
 	var (
 		astFilesSeen     = len(files)
 		recipesEvaluated int
-		draftsProduced   int
+		drafts           []recipes.MetricSampleDraft
 	)
 	for _, ast := range files {
 		for _, r := range recipesByKind {
@@ -183,38 +326,96 @@ func (d *RegistryBackedFoundationDispatcher) Dispatch(ctx context.Context, scanR
 			if !r.AppliesTo(ast) {
 				continue
 			}
-			drafts := r.Compute(ast)
-			draftsProduced += len(drafts)
+			drafts = append(drafts, r.Compute(ast)...)
 		}
 	}
 
-	if d.Logger != nil {
-		d.Logger.Info("foundation recipe dispatcher: scan complete",
-			"component", "metric_ingestor.RegistryBackedFoundationDispatcher",
-			"scan_run_id", scanRun.ID,
-			"scan_run_kind", scanRun.Kind,
-			"repo_id", scanRun.RepoID,
-			"registered_recipes", len(recipesByKind),
-			"ast_files_seen", astFilesSeen,
-			"recipes_evaluated", recipesEvaluated,
-			"drafts_produced", draftsProduced,
-			"drafts_persisted", 0,
-			"persistence_layer", "Phase 3.2 (not wired at Stage 2.6)",
-		)
+	draftsProduced := len(drafts)
+	draftsPersisted := 0
+
+	defer func() {
+		if d.Logger != nil {
+			d.Logger.Info("foundation recipe dispatcher: scan complete",
+				"component", "metric_ingestor.RegistryBackedFoundationDispatcher",
+				"scan_run_id", scanRun.ID,
+				"scan_run_kind", scanRun.Kind,
+				"repo_id", scanRun.RepoID,
+				"registered_recipes", len(recipesByKind),
+				"ast_files_seen", astFilesSeen,
+				"recipes_evaluated", recipesEvaluated,
+				"drafts_produced", draftsProduced,
+				"drafts_persisted", draftsPersisted,
+				"persistence_wired", d.Writer != nil,
+			)
+		}
+	}()
+
+	if draftsProduced == 0 {
+		return nil
 	}
 
-	if draftsProduced > 0 {
-		// Stage 2.6 honesty: a Compute call that actually
-		// produced drafts means a test fixture wired a
-		// non-empty AST source. The Stage 2.6 contract is
-		// EXPLICITLY that foundation-tier draft persistence
-		// is Phase 3.2's job (the transaction-aware writer
-		// is the only place `(sha, scope_id, sample_id)` can
-		// be minted safely). Surfacing the unimplemented
-		// path as a structured error is more honest than
-		// inventing fake `sha`/`scope_id` values to write.
+	if d.Writer == nil {
+		// Iteration-logic tests pin this surface to prove
+		// "you forgot to wire a writer" is loud, not silent.
 		return fmt.Errorf("%w: drafts_produced=%d, ast_files_seen=%d",
 			ErrFoundationDraftPersistenceUnimplemented, draftsProduced, astFilesSeen)
 	}
+	if input.SHA == "" {
+		return fmt.Errorf("%w: drafts_produced=%d", ErrFoundationSHAMissing, draftsProduced)
+	}
+
+	scopes := d.Scopes
+	if scopes == nil {
+		scopes = DefaultFoundationScopeResolver{}
+	}
+	sampleFactory := d.SampleIDFactory
+	if sampleFactory == nil {
+		sampleFactory = uuid.NewV4
+	}
+
+	// iter-3 evaluator items 3+4: resolve all scope_ids
+	// in ONE batched call so [PGScopeBindingResolver] can
+	// amortise a single advisory-locked transaction across
+	// the whole batch (rather than N round-trips). The
+	// returned slice MUST be parallel to refs; we treat a
+	// length mismatch as a fatal contract violation.
+	refs := make([]recipes.ScopeRef, len(drafts))
+	for i, draft := range drafts {
+		refs[i] = draft.Scope
+	}
+	scopeIDs, scopeErr := scopes.ResolveScopeIDs(ctx, scanRun.RepoID, refs, input.SHA)
+	if scopeErr != nil {
+		return fmt.Errorf("metric_ingestor: dispatch resolve scope_ids: %w", scopeErr)
+	}
+	if len(scopeIDs) != len(refs) {
+		return fmt.Errorf("metric_ingestor: dispatch resolve scope_ids: got %d ids for %d refs (resolver contract violation)",
+			len(scopeIDs), len(refs))
+	}
+
+	records := make([]MetricSampleRecord, 0, len(drafts))
+	for i, draft := range drafts {
+		sampleID, idErr := sampleFactory()
+		if idErr != nil {
+			return fmt.Errorf("metric_ingestor: dispatch draft[%d] mint sample_id: %w", i, idErr)
+		}
+		records = append(records, MetricSampleRecord{
+			SampleID:      sampleID,
+			RepoID:        scanRun.RepoID,
+			SHA:           input.SHA,
+			ScopeID:       scopeIDs[i],
+			MetricKind:    draft.MetricKind,
+			MetricVersion: draft.MetricVersion,
+			Pack:          draft.Pack,
+			Source:        draft.Source,
+			Value:         draft.Value,
+			Attrs:         draft.Attrs,
+			ProducerRunID: scanRun.ID,
+		})
+	}
+
+	if err := d.Writer.WriteBatch(ctx, records); err != nil {
+		return fmt.Errorf("metric_ingestor: dispatch WriteBatch: %w", err)
+	}
+	draftsPersisted = len(records)
 	return nil
 }

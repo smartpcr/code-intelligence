@@ -322,6 +322,30 @@ type ScopeRef struct {
 	// Path is the repo-relative file path
 	// (`AstFile.GetPath()`).
 	Path string
+	// Params is the ordered list of parameter type tokens
+	// for [scope.KindMethod] refs (copied verbatim from
+	// `AstScope.GetParameters()`). The Metric Ingestor
+	// threads this slice into `scope.BuildMethod` as its
+	// `params` argument so overloaded methods that share a
+	// (path, qualifiedName) -- legal in C#, C++, Java,
+	// Kotlin, Scala and several other targets -- mint
+	// DISTINCT canonical signatures and therefore distinct
+	// `scope_binding.scope_id`s. iter-5 evaluator item 3
+	// closed the prior collision shape where
+	// [BuildCanonicalSignatureForRef] passed a literal
+	// `nil` to `scope.BuildMethod`.
+	//
+	// Non-method kinds (file, class, interface, package,
+	// repo, block) ignore this field; recipes emitting
+	// non-method scopes MAY leave it nil or empty.
+	//
+	// Order matters: parameter tokens are joined in
+	// declaration order by `scope.BuildMethod`. Recipes
+	// MUST emit them in the same order the parser produced
+	// them (the parser canonicalises to source-position
+	// order); permuting tokens would change the rendered
+	// signature without changing the logical method.
+	Params []string
 }
 
 // MetricSampleDraft is one row's worth of recipe output. The

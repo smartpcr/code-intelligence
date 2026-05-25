@@ -4,6 +4,288 @@ Operational guide for the clean-code service. Add a new
 section here as each subsystem ships against the production
 composition root (`cmd/clean-coded/main.go`).
 
+## Metric Ingestor and ScanRun state machine (Stage 3.2)
+
+### What
+
+The Metric Ingestor subsystem is a stack of types in
+`internal/metric_ingestor/`:
+
+- `Sweeper` (`sweep_loop.go`) -- the long-running supervisor
+  that ticks at `CLEAN_CODE_PERIODIC_SWEEP_CADENCE` and calls
+  `StateMachine.ProcessOne` on each tick.
+- `StateMachine` (`state.go`) -- the one-turn orchestrator
+  that drives a single commit from `pending` to a terminal
+  state. Composed of: `ScanRunStore` (PG- or in-memory-backed,
+  the sole writer of `commit.scan_status`), `AstScanner`
+  (the adapter from `Ingestor.Run` to the scanner interface,
+  produced by `NewIngestorAstScanner`), and the optional
+  `AstSourceAvailability` probe.
+- `Ingestor` (`ingestor.go`) -- the per-scan orchestrator
+  composing the dispatcher and `ChurnSweep`. One
+  `(*Ingestor).Run` invocation drives the full per-scan
+  pipeline.
+
+One sweep, end-to-end, is:
+
+1. The `Sweeper` ticks; `StateMachine.ProcessOne` runs.
+   When an `AstSourceAvailability` probe is wired
+   (production: `DirectoryAstFileSource` doubles as the
+   probe), the state machine **peeks up to `probeFanout`
+   pending commits** (default 16, see
+   `internal/metric_ingestor/state.go:813`
+   `defaultProbeFanout`) via
+   `ScanRunStore.PeekNextPendingCommits`, iterates them
+   in commit-time order asking the probe whether each
+   commit's on-disk checkout has materialised, and
+   selects the FIRST ready candidate. This avoids
+   head-of-line blocking when the oldest commit's
+   checkout has not yet been written by the Repo
+   Indexer. If no probe is wired (in-memory / scaffold),
+   the legacy single-row `ClaimNextPendingCommit` path
+   is taken instead (`state.go:1047`).
+2. The state machine claims the selected row via
+   `ScanRunStore.ClaimSpecificPendingCommit(repoID, sha)`
+   when it came from the fanout pre-flight, or
+   `ScanRunStore.ClaimNextPendingCommit` when there was
+   no probe (legacy path). Either claim opens a
+   `scan_run(kind='full', sha_binding='single',
+   status='running')` row and transitions
+   `commit.scan_status` to `'scanning'` in ONE PG
+   transaction. A crash between these two writes cannot
+   leave a commit in `'scanning'` without an owning
+   `scan_run`.
+3. The state machine invokes `Ingestor.Run` via
+   `IngestorAstScanner.Scan`. The `Ingestor` resolves the
+   commit's `repo_url` via the lookup helper
+   (`internal/metric_ingestor/repo_url_lookup.go`) and
+   opens the AST source against the on-disk checkout
+   directory rooted at `CLEAN_CODE_AST_SCAN_ROOT`.
+4. The recipe-registry dispatcher
+   (`RegistryBackedFoundationDispatcher`) drives every
+   recipe over the parsed AST. Each recipe yields zero or
+   more `metric_sample` drafts; the PG writer
+   (`pg_metric_sample_writer.go:111-117`) issues a plain
+   `INSERT INTO clean_code.metric_sample (sample_id,
+   repo_id, sha, scope_id, metric_kind, metric_version,
+   value, pack, source, producer_run_id, attrs_json)
+   VALUES (...)` inside a transaction. There is no
+   `ON CONFLICT` clause; duplicates are prevented by the
+   caller minting fresh `sample_id`s per scan.
+5. The state machine finalizes via
+   `ScanRunStore.FinalizeScanRun`. The PG implementation
+   (`pg_scan_run_store.go:463-509`) runs ONE transaction
+   that `UPDATE clean_code.scan_run SET status = $1,
+   ended_at = $2 WHERE scan_run_id = ... AND status =
+   'running'` followed by `UPDATE clean_code.commit SET
+   scan_status = ... WHERE repo_id = ... AND sha = ... AND
+   scan_status = 'scanning'`. On success the pair is
+   (`scan_run.status='succeeded'`,
+   `commit.scan_status='scanned'`); on failure the pair is
+   (`scan_run.status='failed'`,
+   `commit.scan_status='failed'`). The metric_sample writer
+   is NOT inside this transaction -- successful inserts
+   from a sweep that subsequently fails its finalize are
+   left in place but attributed to a `scan_run.status='failed'`
+   row, which downstream readers filter on. There is
+   intentionally no `scan_run.error_class` / `error_message`
+   column in this workstream's schema; the failure reason
+   is recorded in the structured log line at finalize time.
+
+Only the four canonical Commit states (`pending`,
+`scanning`, `scanned`, `failed`) and three canonical
+ScanRun states (`running`, `succeeded`, `failed`) are
+ever written. The state alphabet is pinned in
+`internal/metric_ingestor/state.go` (the
+`ScanRunStatus*` constants + `AllScanRunStatuses` /
+`ValidateScanRunStatus` closed-set guards).
+
+### Configuration (env vars)
+
+The metric ingestor is wired in `cmd/clean-coded/main.go`
+(`buildMetricIngestor` + the sweeper construction below it)
+and consumes the existing service-wide config knobs -- it
+does NOT introduce a `CLEAN_CODE_METRIC_INGESTOR_*`
+namespace. The relevant env vars are:
+
+| Env var                           | Meaning                                                                                                                                                                                                          | Required when                       |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| `CLEAN_CODE_PG_URL`               | PostgreSQL connection URL. The pool MUST be reachable by the `clean_code_metric_ingestor` role. When empty, the composition root falls back to in-memory stores ([`metric_ingestor.NewInMemoryScanRunStore`]).   | always in production                |
+| `CLEAN_CODE_AST_SCAN_ROOT`        | Root directory under which per-repo checkouts live. The composition root reads it as the root of `DirectoryAstFileSource`; if empty the root falls back to `EmptyAstFileSource` (no work to do).                 | always in production                |
+| `CLEAN_CODE_PERIODIC_SWEEP_CADENCE` | The `Sweeper` tick interval (Go duration). Drives `WithSweeperCadence` in `cmd/clean-coded/main.go`. Default value lives in `internal/config/config.go`.                                                       | never (defaulted)                   |
+| `CLEAN_CODE_SCAN_TIMEOUT`         | Per-scan timeout passed to `WithStateMachineTimeout`. A sweep that exceeds this is aborted and the commit is marked `'failed'` rather than left in `'scanning'` indefinitely.                                    | never (defaulted)                   |
+
+There is intentionally NO `CLEAN_CODE_METRIC_INGESTOR_*`
+env-var namespace today; the metric ingestor inherits its
+config from the service-wide knobs above. Future stages
+that add per-subsystem tuning (e.g. multi-tenant batch
+sizing) may introduce a dedicated namespace; until then,
+operators should NOT set fictional env vars expecting
+them to work.
+
+Mode selection (per `cmd/clean-coded/main.go:402-460`):
+
+- **Production**: `CLEAN_CODE_PG_URL` is set AND
+  `CLEAN_CODE_AST_SCAN_ROOT` is set. The composition root
+  wires `PGScanRunStore` + `DirectoryAstFileSource` and
+  launches the sweeper.
+- **Fail-fast**: `CLEAN_CODE_PG_URL` is set but
+  `CLEAN_CODE_AST_SCAN_ROOT` is empty. The composition
+  root **refuses to start** and returns an actionable
+  error (`main.go:438-448`): "CLEAN_CODE_AST_SCAN_ROOT is
+  REQUIRED when CLEAN_CODE_PG_URL is configured -- the
+  Metric Ingestor sweep loop is the SOLE driver of
+  `commit.scan_status` transitions...". This is the
+  iter-4 evaluator structural fix: rather than silently
+  letting pending commits accumulate against a live PG
+  instance with no source of AST files, the process
+  exits non-zero so the operator sees the misconfiguration
+  at boot, not 30 minutes of silent backlog later.
+- **Scaffold mode**: `CLEAN_CODE_PG_URL` is empty (which
+  implies in-memory stores). The composition root logs
+  `metric ingestor sweep loop NOT STARTED (scaffold mode:
+  CLEAN_CODE_AST_SCAN_ROOT unset)` (`main.go:454-460`),
+  closes `sweepDone` immediately so shutdown does not
+  block, and the sweeper is **NEVER launched**. The HTTP
+  surface still serves; nothing claims commits. This is
+  acceptable for the dev loop only.
+
+### Source-availability pre-flight (NOT a `/readyz` probe)
+
+The composition root threads an `AstSourceAvailability`
+probe (`metric_ingestor.AstSourceAvailability`, defined in
+`internal/metric_ingestor/availability.go`) into the state
+machine via `WithStateMachineSourceProbe` (see
+`cmd/clean-coded/main.go:917-957`). The directory AST
+source itself implements `HasFilesFor`, so the probe is
+non-nil whenever `CLEAN_CODE_AST_SCAN_ROOT` is set; in
+scaffold mode the probe is nil and the pre-flight is
+disabled. When the probe is wired,
+`StateMachine.ProcessOne` peeks **up to `probeFanout`
+pending commits** (default 16 per
+`state.go:813`) and iterates them in commit-time order,
+claiming the FIRST one whose `HasFilesFor` returns true
+via `ClaimSpecificPendingCommit`
+(`state.go:950-1019`). Every skipped candidate stays in
+`'pending'` (no canonical edge crossed); if NO candidate
+in the fanout is ready, `ProcessOne` returns
+`DidWork=false` with `SkipReason=SourceNotReady` and the
+next tick re-peeks. This keeps the four-state Commit
+diagram intact AND avoids head-of-line blocking when the
+oldest commit's checkout hasn't yet landed on disk.
+
+The probe is plumbed into the state machine, NOT into
+`/readyz`. The composition root currently registers only
+the Policy-Steward signing-key cache ready-check via
+`healthHandler.AddReadyCheck("signing_key_cache", ...)`
+(see `cmd/clean-coded/main.go:526`); there is no
+`AddReadyCheck("ast_source", ...)` call today. Operators
+that want `/readyz` to reflect AST-source readiness should
+treat this as a follow-up workstream, not a Stage 3.2
+deliverable.
+
+### State-machine invariants
+
+- `commit.scan_status` is written ONLY by the Metric
+  Ingestor. The Phase 1.5 role grants restrict
+  `UPDATE (scan_status)` on `clean_code.commit` to the
+  `clean_code_metric_ingestor` role; any other writer
+  attempting an UPDATE that touches the column will get
+  PG `permission denied`. The Repo Indexer (Stage 3.1)
+  INSERTs the commit row with `scan_status='pending'`
+  default and never UPDATEs it.
+- `scan_run.status` transitions exactly once per row, from
+  `'running'` to either `'succeeded'` or `'failed'`. The
+  `scan_run` table is append-only-with-finalize; rows are
+  never deleted (audit + replay).
+- The commit + scan_run finalize is paired: a commit moves
+  to `'scanned'` IFF its owning scan_run moves to
+  `'succeeded'`, and to `'failed'` IFF the scan_run moves
+  to `'failed'`. The pairing is enforced in the sweep
+  transaction.
+
+### `repo_url` is WRITE-ONCE
+
+The `clean_code.repo.repo_url` column added by
+`migrations/0006_repo_url.up.sql` is enforced WRITE-ONCE at
+the DB level via `tg_repo_url_write_once()` (a `BEFORE
+UPDATE OF repo_url` trigger). An attempt to change the
+value to a different non-null URL raises SQLSTATE 23514
+with the literal `format()` template from
+`migrations/0006_repo_url.up.sql:179`:
+
+```
+clean_code.repo.repo_url is WRITE-ONCE: cannot change from %L to %L for repo_id %L
+```
+
+(the `%L` placeholders are filled in by PostgreSQL's
+`format()` with the existing URL, the proposed new URL,
+and the affected `repo_id`).
+
+This means:
+
+- `mgmt.register_repo` MUST be idempotent on the URL: the
+  in-process helper `internal/management/register_repo.go`
+  uses `ON CONFLICT (repo_id) DO NOTHING` in its INSERT
+  (see `register_repo.go:204-213`), so re-registering the
+  SAME `repo_id` is a no-op and the WRITE-ONCE trigger
+  never fires (the trigger is `BEFORE UPDATE`, and
+  `DO NOTHING` means no UPDATE runs). Re-registering the
+  SAME `repo_id` with a DIFFERENT `repo_url` is therefore
+  ALSO a no-op at this layer -- to mutate the URL, a
+  caller would have to issue an explicit UPDATE, which the
+  trigger then rejects with SQLSTATE 23514. The
+  `COALESCE(EXCLUDED.repo_url, repo.repo_url)` shape is
+  used by the e2e fixture only (see the e2e test cited
+  below).
+- The e2e scan-driving fixture inherits the same pattern;
+  see
+  `test/e2e/code-intelligence-CLEAN-CODE/repo_indexer_and_metric_ingestor_repo_indexer_and_commit_lifecycle_test.go`.
+- Operator runbook: if a URL must legitimately change
+  (e.g. repo migration from GitHub to internal Gitea),
+  DROP and recreate the repo row -- there is no UPDATE
+  path. This is intentional: the recipe sweep binds metric
+  samples to the URL recorded at scan time; mutating it
+  would silently rebind history.
+
+### Acceptance checklist (before enabling in production)
+
+- [ ] Migration 0006 has been applied (verify via
+  `\d clean_code.repo` -- `repo_url` column is present and
+  the trigger `tg_repo_url_write_once` shows on
+  `\dt+ clean_code.repo`).
+- [ ] Phase 1.5 role grants have been replayed so
+  `clean_code_metric_ingestor` is the SOLE grantee of
+  `UPDATE (scan_status)` on `clean_code.commit`.
+- [ ] `CLEAN_CODE_AST_SCAN_ROOT` points at a directory
+  that is reachable from the pod AND that the Repo
+  Indexer's checkout job populates.
+- [ ] `CLEAN_CODE_PG_URL` is set so the composition root
+  selects `PGScanRunStore` instead of the in-memory
+  fallback.
+- [ ] The first sweeper tick (after
+  `CLEAN_CODE_PERIODIC_SWEEP_CADENCE`) has produced at
+  least one row in `scan_run` AND moved at least one
+  `commit.scan_status` from `'pending'` to `'scanned'`.
+- [ ] On rollback, unwire the AST source dir / PG URL
+  BEFORE replaying migration 0006 down -- otherwise the
+  sweep will continue claiming pending commits during the
+  rollback window.
+
+### Stage 3.2 follow-ups (out of scope here)
+
+- `ws-...-stage-mgmt-register-repo-repo-url`: wires
+  `mgmt.register_repo` HTTP verb, back-fills `repo_url` for
+  legacy repo rows, tightens the column to `NOT NULL`.
+- Multi-tenant batch sizing: today the sweep claims one
+  pending commit per tick; a future stage may raise the
+  batch size and add a row-level lock to keep "sole writer"
+  inside a single process even when the deployment is
+  scaled wide.
+- Recipe-level retry policies: today a failed sweep marks
+  the commit `'failed'` permanently; a future stage may
+  expose a `mgmt.rescan` retry verb.
+
 ## Policy Steward signing-key cache (Stage 5.1)
 
 ### What

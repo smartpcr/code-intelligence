@@ -4,6 +4,211 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 3.1 -- Repo Indexer + canonical `ScanStatus` lifecycle
+
+### Added (iter 3)
+
+- **`internal/repo_indexer/rescan.go`** -- HMAC enforcement
+  for the CLI rescan trigger. New constructor
+  `NewRescanHandlerWithHMAC(idx, secret, logger)` (panics on
+  nil indexer or empty secret) carries an `hmacSecret []byte`
+  field; the existing `NewRescanHandler` is retained but now
+  documented as **test-only** (HMAC disabled).
+  `(*RescanHandler).Rescan` gains the canonical 6-step HMAC
+  verification block inserted between the body-size and
+  Content-Type checks -- the SAME verification used by the
+  webhook (architecture Sec 8.5: one shared external-ingest
+  secret). Iter-2 evaluator item #3 RESOLVED: the rescan
+  surface is no longer an unauthenticated write path.
+- **`internal/repo_indexer/pg_writer_sql_test.go`** (NEW) --
+  9 go-sqlmock-backed SQL behaviour tests for
+  `EnsureCommitAndRegisteredEvent` covering: (a) first-SHA
+  happy path inserts both rows, (b) duplicate redelivery is
+  a no-op (commit ON CONFLICT + event pre-existing), (c)
+  fresh commit on a registered repo inserts ONLY the commit,
+  (d) the commit INSERT names ONLY `(repo_id, sha,
+  parent_sha, committed_at)` and OMITS `scan_status` (the
+  iter-1 evaluator-item-2 architectural pin), (e) the
+  `NULLIF($3, '')` cast is present in the prepared
+  statement, (f) `ON CONFLICT (repo_id, sha) DO NOTHING
+  RETURNING 1` shape is preserved, (g) the event INSERT
+  binds the canonical past-tense `registered` literal,
+  (h) a commit-INSERT failure rolls back and propagates the
+  wrapped error, (i) an advisory-lock failure rolls back
+  before reaching the commit INSERT. Iter-2 evaluator item
+  #4 RESOLVED: the production writer's SQL shape is now
+  substantively tested. Adds `github.com/DATA-DOG/go-sqlmock
+  v1.5.2` to `go.mod` as a test dependency.
+- **`internal/repo_indexer/rescan_test.go`** -- positive +
+  negative HMAC coverage for the rescan surface:
+  `TestRescanHandler_HMAC_AcceptsSignedRequest`,
+  `TestRescanHandler_HMAC_RejectsMissingHeader` (asserts
+  401 + `HMAC_MISSING_SIGNATURE`),
+  `TestRescanHandler_HMAC_RejectsTamperedSignature`
+  (asserts 401 + `HMAC_SIGNATURE_MISMATCH`),
+  `TestNewRescanHandlerWithHMAC_PanicsOnNilIndexer`,
+  `TestNewRescanHandlerWithHMAC_PanicsOnEmptySecret`. Every
+  401 path also asserts the writer is NEVER reached so
+  authentication short-circuits cleanly before
+  `Indexer.OnNewSHA`.
+- **`cmd/clean-coded/routes_test.go`** --
+  `TestRootMux_IndexerRescanMounted_RejectsUnsigned`
+  (new) and updated
+  `TestRootMux_IndexerRescanMounted_RoundtripWritesCommit`
+  to wire HMAC end-to-end via
+  `NewRescanHandlerWithHMAC` + `SignHMAC`. The composition
+  root is now exercised with the production auth shape.
+
+### Changed (iter 3)
+
+- **`cmd/clean-coded/main.go`** -- `db` is now opened
+  whenever `cfg.PostgresURL != ""`, BEFORE the KMS branch
+  (previously the open was nested inside
+  `if cfg.KMSProvider != ""`, so a `CLEAN_CODE_PG_URL`-only
+  config silently fell back to the in-memory writer for the
+  indexer). The KMS branch is reduced to
+  `if db != nil && cfg.KMSProvider == keys.KMSProviderLocal {
+  bc.DB = db }`. Iter-2 evaluator item #2 RESOLVED: PG
+  persistence is now selected by `CLEAN_CODE_PG_URL` alone.
+  The indexer wiring block now calls
+  `repo_indexer.NewRescanHandlerWithHMAC(idx,
+  []byte(cfg.WebhookHMACSecret), log)` instead of the
+  HMAC-disabled constructor.
+
+### Fixed (iter 3) -- pre-existing failures unblocked
+
+- **`internal/metric_ingestor/foundation_dispatch_test.go`**
+  -- (a) test-only `*trackingRecipe` helper gained the
+  `Pack() recipes.Pack` method (the `recipes.Recipe`
+  interface added `Pack()` in stage 3.0; the test helper
+  had drifted behind the contract and was failing the
+  package's build), (b) recipe-count assertion at
+  `TestRegistryBackedDispatcher_DefaultRegistry_NonEmptySource`
+  bumped from `3` to `6` to match the live
+  `DefaultRegistry` (cyclo, cognitive_complexity, loc,
+  lcom4, fan_in, fan_out). These were the iter-2
+  open-questions surface; resolving them in-iter clears
+  the evaluator's hard gate on unanswered open questions.
+
+### Added (iter 2)
+
+- **`internal/repo_indexer/pg_writer.go`** -- production
+  `PGCatalogWriter` satisfying the `CatalogWriter` interface
+  defined in iter 1. Wraps both INSERTs (`clean_code.commit`
+  + `clean_code.repo_event`) in a single transaction guarded
+  by `pg_advisory_xact_lock(0x43435249, hash32(repo_id))` for
+  per-repo serialisation. Uses `ON CONFLICT (repo_id, sha) DO
+  NOTHING RETURNING 1` for the commit (DB DEFAULT supplies
+  `scan_status='pending'`) and a `SELECT 1 ... LIMIT 1`
+  existence check before the `repo_event` INSERT to preserve
+  the exactly-one-registered invariant. Constructor variants
+  `NewPGCatalogWriter` (default `clean_code` schema) and
+  `NewPGCatalogWriterWithSchema` reject nil DB / empty schema
+  fail-loud at composition root.
+- **`internal/repo_indexer/rescan.go`** -- CLI rescan trigger
+  handler at `RescanPath = "/v1/indexer/rescan"`. Same
+  validation chain as the webhook (method -> body size ->
+  Content-Type -> JSON decode), routed through the SAME
+  `Indexer.OnNewSHA` entrypoint. Distinct path so operators
+  can apply different auth and observability to the two
+  surfaces.
+- **Composition-root wiring** -- `cmd/clean-coded/main.go`
+  constructs the indexer + webhook + rescan handler after
+  `buildPolicyWriter` so the same `*sql.DB` handle is
+  reused. Falls back to `InMemoryCatalogWriter` in scaffold
+  mode when no `CLEAN_CODE_PG_URL` is set; emits a loud
+  "data lost on restart" warning. `cmd/clean-coded/routes.go`
+  extends `rootMux` with two nil-tolerant handler args.
+- **`internal/config/config.go`** -- new
+  `EnvEnableScaffoldIndexerWebhook` constant and
+  `EnableScaffoldIndexerWebhook` field. Validation interlock
+  requires both this flag AND `EnvWebhookHMACSecret` to be
+  set before either indexer route is mounted; setting the
+  HMAC secret without enabling EITHER opt-in flag is an
+  explicit configuration error.
+- **`cmd/clean-coded/routes_test.go`** -- four new tests
+  pinning the wired surface: webhook unmounted -> 404, HMAC
+  roundtrip writes a commit + registered event, unsigned
+  request -> 401 with writer untouched, rescan roundtrip
+  writes a pending commit through `Indexer.OnNewSHA`.
+
+### Fixed (iter 2)
+
+- **`services/clean-code/go.mod`** -- module declaration
+  corrected from `forge/services/clean-code` to
+  `github.com/microsoft/code-intelligence/services/clean-code`
+  (matches every existing import in the repo). Direct
+  requires added for `cucumber/godog`, `gofrs/uuid v4.3.1+incompatible`,
+  `lib/pq v1.10.9`; `go mod tidy` populated indirect
+  requires (`smacker/go-tree-sitter`, `grpc`, `protobuf`,
+  `yaml.v3`, `golang.org/x/*`, `genproto`). This unblocks
+  `go build ./...` and `go test ./internal/repo_indexer/...`
+  -- both ran red before this fix because every package's
+  imports referenced a path the module did not declare.
+  Structurally addresses evaluator iter-1 item #4.
+
+### Added (iter 1)
+
+- **`internal/repo_indexer/` package** -- new service that
+  consumes Git webhooks and CLI rescan triggers, INSERTs new
+  `clean_code.commit` rows, and appends `repo_event(kind='registered')`
+  events idempotently. Per architecture G1, the Repo Indexer
+  is the SOLE writer of new `commit` rows; it omits
+  `scan_status` from its INSERT so the DB column DEFAULT
+  (`'pending'`) supplies the initial value. The package never
+  UPDATEs `scan_status` -- the Metric Ingestor owns those
+  transitions (Stage 3.2 onward).
+- **`internal/repo_indexer/scan_status.go`** -- defines the
+  canonical `ScanStatus` Go enum with exactly four values:
+  `pending`, `scanning`, `scanned`, `failed`. Provides
+  `AllScanStatuses()`, `Validate()`, `IsTerminal()`,
+  `CanTransition(from, to)`, and `ValidateTransition`. The
+  transition diagram is `pending -> scanning -> scanned` on
+  success and `pending -> scanning -> failed` on error --
+  there are no `complete`, `superseded`, `orphaned`, or
+  `queued` states (iter-1 architecture canon, evaluator
+  item 2). Sentinel errors `ErrInvalidScanStatus` and
+  `ErrInvalidScanStatusTransition` are exported for callers
+  (Stage 3.2 Metric Ingestor) to wrap.
+- **`internal/repo_indexer/indexer.go`** -- `Indexer` service
+  with `OnNewSHA(CommitEnsureRequest)` entrypoint. The
+  request type validates `RepoID > 0`, `SHA` matches the
+  shared 40-char hex regex, optional `ParentSHA` (same regex
+  when present), non-zero `CommittedAt`, and an optional
+  `Ref` reserved for future `default_branch_head` work.
+  `CatalogWriter` is a single-method interface
+  (`EnsureCommitAndRegisteredEvent`) that encodes the
+  insert + event atomicity contract at the type level so
+  callers cannot leak a partial-write race. Ships an
+  `InMemoryCatalogWriter` fake (mutex-serialised) that
+  stamps `ScanStatusPending` and emits the past-tense
+  `kind='registered'` literal -- exactly what production
+  DB DEFAULT semantics produce.
+- **`internal/repo_indexer/webhook.go`** -- HTTP webhook at
+  `/v1/indexer/webhook` (constant `Path`). Validation order
+  is method -> body-size cap (1 MiB) -> HMAC ->
+  Content-Type (`application/json` with optional `charset=`)
+  -> JSON decode (`DisallowUnknownFields`) -> dispatch.
+  Errors are classified into stable structured codes
+  (`EMPTY_REPO_ID`, `EMPTY_SHA`, `INVALID_SHA`,
+  `INVALID_PARENT_SHA`, `ZERO_COMMITTED_AT`,
+  `WRITER_FAILURE`, HMAC variants) so downstream pipelines
+  can alert on the literal strings.
+- **`internal/repo_indexer/hmac.go`** -- standalone HMAC-SHA256
+  verifier for the `X-Hub-Signature-256` header
+  (rule-of-three duplication of the `internal/ingest/webhook`
+  helper; a future stage MAY extract the shared bits when a
+  third webhook surface joins).
+- **Tests**: `scan_status_test.go` (closed-set membership +
+  exhaustive 4x4 transition cross-product), `indexer_test.go`
+  (happy path, duplicate-no-op, multiple repos, validation
+  guards, writer-error wrap, panic guards, concurrent-delivery
+  linearisation, past-tense `registered` canon assertion),
+  `handler_test.go` (HTTP happy path, duplicate, method /
+  Content-Type / JSON / unknown-field / size-limit guards,
+  HMAC missing / valid / bad, constructor panic guards,
+  JSON round-trip).
+
 ## Stage 5.5 -- SOLID rulepack bootstrap
 
 ### Added (iter 4)

@@ -210,7 +210,7 @@ type lcom4KnownValueState struct {
 	value   int
 }
 
-func (s *lcom4KnownValueState) aJavaClassFixtureWithTwoDisjointMethodClustersShareingNoFields() error {
+func (s *lcom4KnownValueState) aJavaClassFixtureWithTwoDisjointMethodClustersSharingNoFields() error {
 	s.svcRoot = serviceRoot()
 	return nil
 }
@@ -464,7 +464,7 @@ func InitializeScenario_ast_adapter_and_foundation_tier_compute_solid_pack_found
 	ctx.Step(`^the metric_kinds are exactly "([^"]*)"$`, reg.theMetricKindsAreExactly)
 
 	// lcom4-class-known-value
-	ctx.Step(`^a Java class fixture with two disjoint method clusters sharing no fields$`, lcom4.aJavaClassFixtureWithTwoDisjointMethodClustersShareingNoFields)
+	ctx.Step(`^a Java class fixture with two disjoint method clusters sharing no fields$`, lcom4.aJavaClassFixtureWithTwoDisjointMethodClustersSharingNoFields)
 	ctx.Step(`^the lcom4 recipe runs$`, func() error {
 		err := lcom4.theLcom4RecipeRuns()
 		if err == nil {

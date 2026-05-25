@@ -137,18 +137,30 @@ func (s *cycleMemberState) theCycleMemberRecipeRuns() error {
 		return fmt.Errorf("reading module path: %w", err)
 	}
 
-	// The probe creates four Go source fixtures:
-	//   A imports B, B imports C, C imports A  → cycle participants
-	//   D imports nothing                      → not in cycle
-	// It runs the cycle_member recipe and collects all results.
+	// The probe hand-builds four *parser.AstFile fixtures that
+	// mirror what the Stage 2.1 parser fleet emits (one package
+	// scope per file, one file scope parented to it, an
+	// "imports" edge per dependency with `To.Id =
+	// "qualified:<target>"`). It then drives
+	// recipes.NewCycleMemberRecipe().ComputeProject(asts) -- the
+	// real recipes-package API surface -- and emits a JSON blob
+	// that the step assertions read.
+	//
+	//   a.go (package pkg_a) imports pkg_b
+	//   b.go (package pkg_b) imports pkg_c
+	//   c.go (package pkg_c) imports pkg_a   -> SCC participants
+	//   d.go (package pkg_d) no imports      -> outside cycle
 	probe := fmt.Sprintf(`package main
 
 import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 
-	"%s/internal/metrics/recipes"
+	"%[1]s/internal/ast/parser"
+	"%[1]s/internal/ast/scope"
+	"%[1]s/internal/metrics/recipes"
 )
 
 type fileResult struct {
@@ -162,40 +174,80 @@ type output struct {
 	AllScopeKinds []string     `+"`"+`json:"all_scope_kinds"`+"`"+`
 }
 
+// makeFile assembles a canonical *parser.AstFile with one
+// SCOPE_KIND_PACKAGE scope, one SCOPE_KIND_FILE scope parented
+// to it, and one "imports"-kind AstEdge per element in
+// 'imports'. The "qualified:<target>" prefix on the edge's
+// To.Id is the parser contract that the cycle_member recipe's
+// importTarget helper strips before resolving the target
+// against the package-name index (see
+// internal/metrics/recipes/cycle_member.go importTarget).
+func makeFile(filePath, pkgName string, imports []string) *parser.AstFile {
+	pkgID := "local:pkg:" + filePath
+	fileID := "local:file:" + filePath
+	af := &parser.AstFile{
+		Language: "go",
+		Path:     filePath,
+		Attrs:    map[string]string{},
+		Scopes: []*parser.AstScope{
+			{
+				ScopeId:       pkgID,
+				ScopeKind:     parser.ScopeKindPackage,
+				Name:          pkgName,
+				QualifiedName: pkgName,
+				Range:         &parser.AstRange{StartByte: 0, EndByte: 1, StartLine: 1, EndLine: 1, StartCol: 1, EndCol: 1},
+			},
+			{
+				ScopeId:       fileID,
+				ScopeKind:     parser.ScopeKindFile,
+				Name:          filePath,
+				QualifiedName: filePath,
+				ParentScopeId: pkgID,
+				Range:         &parser.AstRange{StartByte: 0, EndByte: 1, StartLine: 1, EndLine: 1, StartCol: 1, EndCol: 1},
+			},
+		},
+	}
+	for _, target := range imports {
+		af.Edges = append(af.Edges, &parser.AstEdge{
+			Kind: "imports",
+			From: &parser.AstRef{Kind: parser.RefKindScope, Id: fileID},
+			To:   &parser.AstRef{Kind: parser.RefKindScope, Id: "qualified:" + target},
+		})
+	}
+	return af
+}
+
 func main() {
-	// Four fixture files: A->B->C->A (cycle), D (isolated)
-	files := map[string]string{
-		"a.go": "package proj\nimport _ \"proj/b\"\n",
-		"b.go": "package proj\nimport _ \"proj/c\"\n",
-		"c.go": "package proj\nimport _ \"proj/a\"\n",
-		"d.go": "package proj\n",
+	asts := []*parser.AstFile{
+		makeFile("a.go", "pkg_a", []string{"pkg_b"}),
+		makeFile("b.go", "pkg_b", []string{"pkg_c"}),
+		makeFile("c.go", "pkg_c", []string{"pkg_a"}),
+		makeFile("d.go", "pkg_d", nil),
 	}
 
-	reg := recipes.NewRegistry()
-	reg.InitBasePack()
+	drafts := recipes.NewCycleMemberRecipe().ComputeProject(asts)
 
-	fileBytes := make(map[string][]byte, len(files))
-	for name, src := range files {
-		fileBytes[name] = []byte(src)
-	}
-
-	drafts, err := reg.RunCycleMemberRecipe(fileBytes)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "cycle_member recipe error: %%v\n", err)
-		os.Exit(1)
-	}
-
+	// AllScopeKinds captures EVERY emitted scope_kind so the
+	// "NEVER emits at scope_kind=module" guard can spot a
+	// non-canonical drift even on package-scope drafts.
 	allScopes := make([]string, len(drafts))
 	for i := range drafts {
-		allScopes[i] = drafts[i].ScopeKind
+		allScopes[i] = string(drafts[i].Scope.Kind)
 	}
 
+	// Results carries ONLY the file-scope drafts -- the step
+	// assertions look up by basename ("a.go", "b.go", "c.go",
+	// "d.go"); a package-scope draft would share the same
+	// basename via path.Base and corrupt the scope_kind check.
 	var results []fileResult
 	for _, d := range drafts {
+		if d.Scope.Kind != scope.KindFile {
+			continue
+		}
 		results = append(results, fileResult{
-			File:      d.ScopeID,
-			Value:     d.Value,
-			ScopeKind: d.ScopeKind,
+			File:      path.Base(d.Scope.Path),
+			Value:     int(d.Value),
+			ScopeKind: string(d.Scope.Kind),
 		})
 	}
 
@@ -296,9 +348,18 @@ func (s *dupRatioState) theDuplicationRatioRecipeRunsAtScopeKind(scopeKind strin
 		return fmt.Errorf("reading module path: %w", err)
 	}
 
-	// The probe creates a file with deliberately duplicated blocks,
-	// then runs the duplication_ratio recipe. The exact ratio depends
-	// on the impl, but it must be in [0,1] and only at canonical scopes.
+	// The probe hand-builds one *parser.AstFile fixture
+	// carrying duplicated content under
+	// Attrs[recipes.AttrSourceBytes] (the parser's source-bytes
+	// attr the duplication_ratio recipe inspects FIRST for
+	// lexical tokenisation -- see
+	// internal/metrics/recipes/duplication_ratio.go fileTokens
+	// tier 1). It then drives
+	// recipes.NewDuplicationRatioRecipe().Compute(ast) -- the
+	// real recipes-package API surface -- and emits a JSON blob
+	// for the step assertions. The exact ratio depends on the
+	// 50-token window detector; the contract under test is
+	// (a) value in [0,1] and (b) scope_kind in {file,package}.
 	probe := fmt.Sprintf(`package main
 
 import (
@@ -306,7 +367,8 @@ import (
 	"fmt"
 	"os"
 
-	"%s/internal/metrics/recipes"
+	"%[1]s/internal/ast/parser"
+	"%[1]s/internal/metrics/recipes"
 )
 
 type result struct {
@@ -320,32 +382,43 @@ type output struct {
 }
 
 func main() {
-	// Create a fixture with duplicated blocks: the same 5-line block
-	// repeated twice to guarantee a non-zero duplication ratio.
+	// A duplicated block repeated twice (with light variation
+	// in the wrapper function name) so the lexical detector
+	// has at least one non-trivial 50-token clone to flag.
 	duplicatedBlock := "func helper(x int) int {\n\ty := x * 2\n\tz := y + 1\n\treturn z\n}\n"
 	fixture := "package dup\n\n" + duplicatedBlock + "\n" +
 		"// duplicate below\n" +
 		"func helper2(x int) int {\n\ty := x * 2\n\tz := y + 1\n\treturn z\n}\n"
 
-	reg := recipes.NewRegistry()
-	reg.InitBasePack()
-
-	drafts, err := reg.RunRecipe("duplication_ratio", "fixture.go", []byte(fixture))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "duplication_ratio recipe error: %%v\n", err)
-		os.Exit(1)
+	ast := &parser.AstFile{
+		Language: "go",
+		Path:     "fixture.go",
+		Attrs: map[string]string{
+			recipes.AttrSourceBytes: fixture,
+		},
+		Scopes: []*parser.AstScope{
+			{
+				ScopeId:       "local:file:fixture.go",
+				ScopeKind:     parser.ScopeKindFile,
+				Name:          "fixture.go",
+				QualifiedName: "fixture.go",
+				Range:         &parser.AstRange{StartByte: 0, EndByte: 1, StartLine: 1, EndLine: 1, StartCol: 1, EndCol: 1},
+			},
+		},
 	}
+
+	drafts := recipes.NewDuplicationRatioRecipe().Compute(ast)
 
 	allScopes := make([]string, len(drafts))
 	for i := range drafts {
-		allScopes[i] = drafts[i].ScopeKind
+		allScopes[i] = string(drafts[i].Scope.Kind)
 	}
 
 	var results []result
 	for _, d := range drafts {
 		results = append(results, result{
-			Value:     d.FloatValue,
-			ScopeKind: d.ScopeKind,
+			Value:     d.Value,
+			ScopeKind: string(d.Scope.Kind),
 		})
 	}
 

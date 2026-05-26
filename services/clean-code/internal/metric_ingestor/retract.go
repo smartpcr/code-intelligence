@@ -462,7 +462,16 @@ func (d *RetractDispatcher) Dispatch(ctx context.Context, req RetractRequest) (R
 	}
 
 	endedAt := d.clock()
-	if err := d.scanStore.FinalizeRetractScanRun(ctx, scanRunID, ScanRunStatusSucceeded, endedAt); err != nil {
+	// Decouple the success-path finalize from caller
+	// cancellation: at this point the retraction row is
+	// already durable (Append above), so a client that
+	// cancels between Append and this Finalize must NOT
+	// leave the scan_run row stuck in `running` until the
+	// stale sweep reclaims it. Mirrors finalizeOrLog on
+	// the error path and matches the contract documented
+	// on Dispatch step 6.
+	finalizeCtx := context.WithoutCancel(ctx)
+	if err := d.scanStore.FinalizeRetractScanRun(finalizeCtx, scanRunID, ScanRunStatusSucceeded, endedAt); err != nil {
 		// The retraction row IS durable; we just couldn't
 		// flip scan_run.status. Caller sees the row + a
 		// non-nil finalize error so the sweep loop can

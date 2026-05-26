@@ -35,6 +35,13 @@ jobs:
           echo "CLEAN_CODE_WEBHOOK_HMAC_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
 
       - name: Start compose services
+        # CLEAN_CODE_WEBHOOK_HMAC_SECRET is set in $GITHUB_ENV above and is
+        # re-declared here to make the dependency explicit at the step level.
+        # The compose file forwards it into the webhook container via an
+        # `environment:` passthrough (`- CLEAN_CODE_WEBHOOK_HMAC_SECRET`),
+        # which reads the value from this step's shell environment.
+        env:
+          CLEAN_CODE_WEBHOOK_HMAC_SECRET: ${{ env.CLEAN_CODE_WEBHOOK_HMAC_SECRET }}
         run: docker compose -f ${{ env.COMPOSE_FILE }} up -d --build
 
       - name: Export compose-provided env vars

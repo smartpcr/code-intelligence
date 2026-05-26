@@ -93,7 +93,19 @@ type Engine struct {
 	// [RunResult] per `(repoID, sha, policyVersionID,
 	// scopeID, caller)` tuple within [Engine.runDedupTTL].
 	// Guarded by [Engine.recentMu]; entries are evicted
-	// lazily on lookup when older than the TTL.
+	// (a) lazily on lookup when older than the TTL and
+	// (b) by an amortised full-map sweep that runs once
+	// per [recentRunsSweepInterval] successful inserts via
+	// [Engine.sweepRecentRunsLocked]. Without (b), entries
+	// for SHAs that are evaluated once and never
+	// re-queried -- the common case for `batch_refresh`,
+	// where the dispatcher walks each `(repo, sha)` pair
+	// exactly once -- would accumulate permanently and
+	// leak the `[]uuid.UUID` finding-ID slices each entry
+	// carries. The sweep keeps the map bounded to roughly
+	// "inserts within the dedup window plus one sweep
+	// interval" without requiring a background goroutine
+	// (and the accompanying Engine.Close lifecycle).
 	//
 	// Used to satisfy implementation-plan Stage 5.7 line
 	// 559's "two parallel `eval.gate` calls produce a
@@ -102,9 +114,24 @@ type Engine struct {
 	// caller has released it (and stored its result in
 	// the cache), so the second caller short-circuits to
 	// the cached IDs rather than re-running the engine.
-	recentMu   sync.Mutex
-	recentRuns map[runCacheKey]runCacheEntry
+	recentMu          sync.Mutex
+	recentRuns        map[runCacheKey]runCacheEntry
+	recentRunsInserts int
 }
+
+// recentRunsSweepInterval is the number of successful
+// [Engine.storeRecentRun] inserts between full-map
+// sweeps of [Engine.recentRuns]. Chosen to amortise the
+// O(len(recentRuns)) sweep cost over many inserts while
+// still bounding the map's worst-case live size to
+// roughly "inserts within [Engine.runDedupTTL]" plus one
+// interval's overshoot. At low throughput the overshoot
+// is capped at the interval itself (stale entries
+// accumulate until the next trigger then drop in one
+// pass); at high throughput the map size tracks the
+// dedup-window working set because each sweep clears
+// everything older than the TTL.
+const recentRunsSweepInterval = 256
 
 // runCacheKey identifies a unique canonical run for the
 // in-process dedup cache. The key includes `caller` so that
@@ -298,12 +325,54 @@ func (e *Engine) lookupRecentRun(key runCacheKey) (RunResult, bool) {
 // storeRecentRun records a successful run in the dedup
 // cache so a subsequent parallel call for the SAME args
 // observes its IDs instead of minting duplicates.
+//
+// Every [recentRunsSweepInterval]'th insert also triggers
+// a full-map sweep via [Engine.sweepRecentRunsLocked] to
+// evict entries past the TTL. This is required because
+// [Engine.lookupRecentRun] only ever evicts the specific
+// key it was asked about, so keys that are inserted once
+// and never re-queried (the dominant pattern for the
+// `batch_refresh` dispatcher, which visits each
+// `(repo, sha)` exactly once) would otherwise pin their
+// `[]uuid.UUID` finding-ID slices in memory for the
+// lifetime of the process.
 func (e *Engine) storeRecentRun(key runCacheKey, result RunResult) {
 	e.recentMu.Lock()
 	defer e.recentMu.Unlock()
 	e.recentRuns[key] = runCacheEntry{
 		result: result,
 		ts:     e.clock(),
+	}
+	e.recentRunsInserts++
+	if e.recentRunsInserts >= recentRunsSweepInterval {
+		e.sweepRecentRunsLocked()
+		e.recentRunsInserts = 0
+	}
+}
+
+// sweepRecentRunsLocked evicts every entry in
+// [Engine.recentRuns] whose age (measured against a
+// single hoisted `e.clock()` reading so the cutoff is
+// consistent across the whole walk) exceeds
+// [Engine.runDedupTTL]. The eviction predicate mirrors
+// [Engine.lookupRecentRun]'s lazy-eviction check so
+// both paths agree on what "expired" means.
+//
+// The caller MUST hold [Engine.recentMu]. Map iteration
+// with concurrent `delete(m, k)` is well-defined by the
+// Go specification ("The iteration order over maps is
+// not specified ... if a map entry that has not yet
+// been reached is removed during iteration, the
+// corresponding iteration value will not be produced.
+// If a map entry is created during iteration, that
+// entry may be produced during the iteration or may be
+// skipped.").
+func (e *Engine) sweepRecentRunsLocked() {
+	now := e.clock()
+	for key, entry := range e.recentRuns {
+		if now.Sub(entry.ts) > e.runDedupTTL {
+			delete(e.recentRuns, key)
+		}
 	}
 }
 
@@ -369,6 +438,23 @@ func (e *Engine) runLocked(ctx context.Context, s Store, repoID uuid.UUID, sha s
 	samples, err := s.ListMetricSamples(ctx, repoID, sha, scopeID)
 	if err != nil {
 		return RunResult{}, fmt.Errorf("rule_engine: run: list samples: %w", err)
+	}
+
+	// Enforce the [ErrSampleSourceEmpty] contract documented
+	// on the sentinel (types.go) and on [Store.ListMetricSamples]
+	// (store.go): a `(nil, nil)` return combined with a
+	// non-empty rule set is a strong signal of a misconfigured
+	// store, NOT a legitimate "no samples yet" outcome.
+	// Legitimate "no samples" is a non-nil empty slice
+	// (`make([]Sample, 0)`) which both InMemoryStore and the
+	// SQL path already return; that case falls through to
+	// verdict=pass with zero findings. We only refuse the
+	// (nil, nil) shape so a wiring bug in a custom Store
+	// implementation surfaces loudly instead of masquerading
+	// as a successful no-op run.
+	if samples == nil && len(rules) > 0 {
+		return RunResult{}, fmt.Errorf("%w: repo_id=%s sha=%s rules=%d",
+			ErrSampleSourceEmpty, repoID, sha, len(rules))
 	}
 
 	// Resolve the topological parent for the prior-finding

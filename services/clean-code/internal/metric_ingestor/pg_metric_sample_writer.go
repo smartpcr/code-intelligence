@@ -411,13 +411,24 @@ func (w *PGMetricSampleWriter) WriteBatch(ctx context.Context, records []MetricS
 	}
 	defer func() { _ = stmt.Close() }()
 
-	for i, rec := range sorted {
+	// Errors below identify the failing record by `sample_id`
+	// (a stable UUID owned by the caller-supplied record) rather
+	// than by slice index. WriteBatch sorts a defensive copy of
+	// `records` for deterministic row-lock ordering, so the loop
+	// counter `i` here is the position in the SORTED slice and
+	// does NOT correspond to the caller's original input order
+	// -- reporting it would mislead post-mortem readers tracing a
+	// failed batch back to their input. `sample_id` is stamped by
+	// the foundation dispatcher (`foundation_dispatch.go`) and
+	// survives the sort, so the operator can grep the caller's
+	// batch by sample_id directly.
+	for _, rec := range sorted {
 		if err := validateMetricSampleRecord(rec); err != nil {
-			return fmt.Errorf("metric_ingestor: PGMetricSampleWriter records[%d] invalid: %w", i, err)
+			return fmt.Errorf("metric_ingestor: PGMetricSampleWriter sample_id=%s invalid: %w", rec.SampleID, err)
 		}
 		attrsJSON, err := encodeAttrsJSON(rec.Attrs)
 		if err != nil {
-			return fmt.Errorf("metric_ingestor: PGMetricSampleWriter records[%d] attrs encode: %w", i, err)
+			return fmt.Errorf("metric_ingestor: PGMetricSampleWriter sample_id=%s attrs encode: %w", rec.SampleID, err)
 		}
 		if _, err := stmt.ExecContext(ctx,
 			rec.SampleID,
@@ -432,7 +443,7 @@ func (w *PGMetricSampleWriter) WriteBatch(ctx context.Context, records []MetricS
 			rec.ProducerRunID,
 			attrsJSON,
 		); err != nil {
-			return fmt.Errorf("metric_ingestor: PGMetricSampleWriter records[%d] INSERT: %w", i, err)
+			return fmt.Errorf("metric_ingestor: PGMetricSampleWriter sample_id=%s INSERT: %w", rec.SampleID, err)
 		}
 	}
 
@@ -449,7 +460,13 @@ func (w *PGMetricSampleWriter) WriteBatch(ctx context.Context, records []MetricS
 	}
 	defer func() { _ = stmtActive.Close() }()
 
-	for i, rec := range sorted {
+	// As with the INSERT pass above, the loop counter is the
+	// position in the sorted slice (not the caller's input
+	// order). Error wrapping identifies the failing record by
+	// `sample_id` so post-mortem readers can correlate the
+	// failure back to the caller-supplied batch without needing
+	// to know the writer's internal sort order.
+	for _, rec := range sorted {
 		if _, err := stmtActive.ExecContext(ctx,
 			rec.RepoID,
 			rec.SHA,
@@ -458,7 +475,7 @@ func (w *PGMetricSampleWriter) WriteBatch(ctx context.Context, records []MetricS
 			rec.MetricVersion,
 			rec.SampleID,
 		); err != nil {
-			return fmt.Errorf("metric_ingestor: PGMetricSampleWriter records[%d] UPSERT metric_sample_active: %w", i, err)
+			return fmt.Errorf("metric_ingestor: PGMetricSampleWriter sample_id=%s UPSERT metric_sample_active: %w", rec.SampleID, err)
 		}
 	}
 

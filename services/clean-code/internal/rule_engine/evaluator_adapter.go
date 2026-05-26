@@ -2,6 +2,7 @@ package rule_engine
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/gofrs/uuid"
 
@@ -37,7 +38,16 @@ func NewEvaluatorAdapter(engine *Engine) *EvaluatorAdapter {
 
 // RunSync implements [evaluator.RuleEngine]. Delegates to
 // the underlying engine and projects the result onto the
-// string-typed verdict the evaluator surface expects.
+// typed [evaluator.Verdict] the evaluator surface expects.
+//
+// Validation: the projected verdict is checked via
+// [evaluator.Verdict.IsValid] so a non-canonical engine
+// rollup (`fail`/`gated`/...) is rejected here at the
+// adapter boundary BEFORE it reaches the gate. The Stage
+// 6.1 brief calls this out: "Verdict is the canonical
+// enum `pass | warn | block` with no other values" --
+// the closure is enforced at every trust boundary, not
+// just at construction.
 func (a *EvaluatorAdapter) RunSync(ctx context.Context, repoID uuid.UUID, sha string, scope *uuid.UUID, policyVersionID uuid.UUID) (evaluator.EngineRunResult, error) {
 	if a == nil || a.engine == nil {
 		return evaluator.EngineRunResult{}, ErrStoreUnwired
@@ -46,11 +56,15 @@ func (a *EvaluatorAdapter) RunSync(ctx context.Context, repoID uuid.UUID, sha st
 	if err != nil {
 		return evaluator.EngineRunResult{}, err
 	}
+	verdict := evaluator.Verdict(string(r.Verdict))
+	if !verdict.IsValid() {
+		return evaluator.EngineRunResult{}, fmt.Errorf("rule_engine: EvaluatorAdapter: non-canonical verdict %q (allowed: pass|warn|block)", r.Verdict)
+	}
 	return evaluator.EngineRunResult{
 		EvaluationRunID:     r.EvaluationRunID,
 		EvaluationVerdictID: r.EvaluationVerdictID,
 		FindingIDs:          r.FindingIDs,
-		Verdict:             string(r.Verdict),
+		Verdict:             verdict,
 	}, nil
 }
 

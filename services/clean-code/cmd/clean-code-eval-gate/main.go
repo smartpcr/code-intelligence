@@ -30,6 +30,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -43,6 +44,30 @@ import (
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/steward"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/rule_engine"
 )
+
+// maxRequestBodyBytes caps the JSON body size on both
+// `/v1/eval/gate` and `/v1/eval/replay`. The canonical
+// payload is a handful of UUIDs + strings (well under
+// 1 KiB in practice); 1 MiB is two orders of magnitude
+// of headroom and keeps a malicious client from
+// streaming an unbounded body and OOM'ing the gate
+// process.
+//
+// The cap is enforced with [http.MaxBytesReader] (not a
+// plain [io.LimitReader]) so the excess bytes are NEVER
+// buffered into memory: the reader returns a
+// *[http.MaxBytesError] synchronously the moment the
+// limit is crossed, the connection's read side is
+// closed, and the handler responds with 413 Request
+// Entity Too Large. Both handlers share the same
+// reader-wrap + [writeBodyReadError] pair so the two
+// surfaces have IDENTICAL body-size protection -- iter-N
+// review caught that [makeEvalHandler] used
+// `io.ReadAll(r.Body)` without a limit AND that
+// [makeReplayHandler] used `json.NewDecoder(r.Body)`
+// without one either, so the two routes were
+// inconsistently exposed.
+const maxRequestBodyBytes = 1 << 20
 
 func main() {
 	port := os.Getenv("PORT")
@@ -217,7 +242,16 @@ func main() {
 		DB:           db,
 		Steward:      stew,
 		StewardStore: stewardStore,
-		Engine:       &engineAdapter{e: engine},
+		// Iter-2 evaluator feedback #2: wire the
+		// canonical `rule_engine.NewEvaluatorAdapter`
+		// rather than a local duplicate so the
+		// production composition root actually
+		// exercises the package-level adapter and its
+		// embedded Verdict validation. The adapter
+		// also re-checks `evaluator.Verdict.IsValid`
+		// before returning, giving us a single
+		// canonical bridge between engine + gate.
+		Engine: rule_engine.NewEvaluatorAdapter(engine),
 		// KeyManager intentionally nil: the legacy
 		// signature-bundle [Gate.VerifyPolicy] surface
 		// is not the focus of Stage 5.7. The Evaluate
@@ -234,49 +268,66 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "ok")
 	})
+	// `/v1/eval/gate` is the CANONICAL Stage 6.1 verb
+	// `eval.gate(repo_id, sha, scope?)`. It REFUSES a
+	// `policy_version_id` in the body -- step (1) of the
+	// brief mandates that the gate resolve the active
+	// policy_version_id via the latest `policy_activation`
+	// row, and a caller-supplied override would let a
+	// rogue client bypass the steward's activation
+	// governance and pin findings to a non-active policy.
+	// The rejection is a 400 Bad Request.
 	mux.HandleFunc("/v1/eval/gate", makeEvalHandler(gate))
+	// `/v1/eval/replay` is a NON-CANONICAL admin/replay
+	// surface for batch tooling that needs to evaluate a
+	// SHA against a SPECIFIC policy_version_id (e.g.
+	// reconciler replay, dry-runs against a candidate
+	// policy that has not yet been activated). This path
+	// invokes [evaluator.Gate.Evaluate] directly --
+	// callers MUST be authenticated with an admin grant
+	// (see CHANGELOG / runbook for the role binding). It
+	// is intentionally a distinct route so the canonical
+	// verb's audit trail remains uniform.
+	mux.HandleFunc("/v1/eval/replay", makeReplayHandler(gate))
 
 	log.Printf("clean-code-eval-gate listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
 }
 
-// engineAdapter bridges the in-process [rule_engine.Engine]
-// onto the evaluator package's [evaluator.RuleEngine]
-// interface. The evaluator declares its own [RunResult]
-// shape ([evaluator.EngineRunResult]) so it does not have
-// to import `rule_engine` (which would create a cycle if
-// the engine ever needed to call back into evaluator).
-// This adapter is the canonical bridge between the two
-// shapes.
-type engineAdapter struct {
-	e *rule_engine.Engine
+// evalGateRequest is the JSON body the CANONICAL
+// `/v1/eval/gate` handler accepts. Mirrors the Stage 6.1
+// verb signature `eval.gate(repo_id, sha, scope?)` --
+// there is intentionally NO `policy_version_id` field.
+// Step (1) of the verb resolves the active
+// `policy_version_id` via the latest `policy_activation`
+// row, and a caller-supplied override would let a rogue
+// client pin findings to an inactive (or revoked) policy
+// and bypass the steward's activation governance.
+//
+// Callers that need an explicit `policy_version_id`
+// (batch tooling, reconciler replay, dry-runs against
+// candidate policies) MUST use `/v1/eval/replay` instead.
+type evalGateRequest struct {
+	RepoID string  `json:"repo_id"`
+	SHA    string  `json:"sha"`
+	Scope  *string `json:"scope,omitempty"`
 }
 
-func (a *engineAdapter) RunSync(ctx context.Context, repoID uuid.UUID, sha string, scope *uuid.UUID, policyVersionID uuid.UUID) (evaluator.EngineRunResult, error) {
-	out, err := a.e.RunSync(ctx, repoID, sha, scope, policyVersionID)
-	if err != nil {
-		return evaluator.EngineRunResult{}, err
-	}
-	return evaluator.EngineRunResult{
-		EvaluationRunID:     out.EvaluationRunID,
-		EvaluationVerdictID: out.EvaluationVerdictID,
-		FindingIDs:          out.FindingIDs,
-		Verdict:             string(out.Verdict),
-	}, nil
-}
-
-// evalRequest is the JSON body the /v1/eval/gate handler
-// accepts. `Scope` is optional -- the synchronous gate
-// path supports a per-scope evaluation when set.
-type evalRequest struct {
+// replayRequest is the JSON body the NON-CANONICAL
+// `/v1/eval/replay` admin/replay handler accepts. It
+// REQUIRES `policy_version_id` -- if omitted the handler
+// returns 400. Callers that just want the canonical
+// active-policy resolution should hit `/v1/eval/gate`
+// instead.
+type replayRequest struct {
 	RepoID          string  `json:"repo_id"`
 	SHA             string  `json:"sha"`
 	PolicyVersionID string  `json:"policy_version_id"`
 	Scope           *string `json:"scope,omitempty"`
 }
 
-// evalResponse is the JSON body the /v1/eval/gate handler
-// returns. Includes all three audit IDs (run, verdict,
+// evalResponse is the JSON body BOTH eval handlers
+// return. Includes all three audit IDs (run, verdict,
 // findings) on both happy and degraded paths so the
 // caller can render the audit trail uniformly.
 type evalResponse struct {
@@ -288,22 +339,99 @@ type evalResponse struct {
 	DegradedReason      string   `json:"degraded_reason,omitempty"`
 }
 
-// makeEvalHandler binds an HTTP handler to the supplied
-// [evaluator.Gate]. The handler decodes the request body,
-// delegates to [evaluator.Gate.Evaluate], and projects the
-// reply onto the canonical JSON shape above. Degraded
-// outcomes are returned with HTTP 200 + `degraded=true` so
-// the caller's UI can render them inline; only true error
+// rejectExtraPolicyVersionField parses the raw request
+// body and returns a non-nil error iff a caller smuggled
+// in a `policy_version_id` value. The check is a
+// defence-in-depth measure: the canonical
+// [evalGateRequest] struct has NO such field so Go's
+// default JSON decoder will silently drop the value, but
+// a misbehaving client should still be told its
+// override has been REJECTED rather than quietly
+// ignored. Iter-2 evaluator feedback #1 explicitly
+// requires this: "remove/reject that request field on
+// this verb or route it through a separate
+// non-canonical admin/replay surface."
+func rejectExtraPolicyVersionField(raw []byte) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	var sniff map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &sniff); err != nil {
+		// Body is not an object -- let the caller's
+		// strict decode produce the canonical error.
+		return nil
+	}
+	if _, ok := sniff["policy_version_id"]; ok {
+		return errors.New("policy_version_id is not accepted on the canonical eval.gate verb; the gate resolves the active policy via the latest policy_activation row -- use /v1/eval/replay for explicit-pvid invocations")
+	}
+	return nil
+}
+
+// writeBodyReadError maps a request-body read/decode
+// error to the canonical HTTP status. A
+// *[http.MaxBytesError] -- the sentinel
+// [http.MaxBytesReader] returns when a client tries to
+// stream more than [maxRequestBodyBytes] -- surfaces as
+// 413 Request Entity Too Large so the caller can tell
+// "your body is too big" apart from "your body is
+// malformed JSON". Every other read/decode error
+// surfaces as 400 Bad Request.
+//
+// Both handlers share this helper so the two routes
+// have IDENTICAL body-size protection and uniform error
+// shapes, closing the iter-N review gap where
+// `/v1/eval/gate` used `io.ReadAll(r.Body)` and
+// `/v1/eval/replay` used `json.NewDecoder(r.Body)`
+// without either applying a cap.
+func writeBodyReadError(w http.ResponseWriter, err error) {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		http.Error(w,
+			fmt.Sprintf("bad request: body exceeds %d bytes", maxErr.Limit),
+			http.StatusRequestEntityTooLarge)
+		return
+	}
+	http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+}
+
+// makeEvalHandler binds the CANONICAL `/v1/eval/gate`
+// handler to the supplied [evaluator.Gate]. The handler
+// invokes [evaluator.Gate.Gate] -- the verb method that
+// resolves the active `policy_version_id` via the
+// latest `policy_activation` row itself. It REFUSES a
+// caller-supplied `policy_version_id` field with a 400.
+//
+// Degraded outcomes are returned with HTTP 200 +
+// `degraded=true` so the caller's UI can render them
+// inline. `ErrNoActivePolicy` (fresh-deploy steady state)
+// maps to 409 Conflict so an operational state is NOT
+// conflated with a 500 internal failure. Only true error
 // conditions (invalid input, DB outage, ...) surface as
-// non-2xx.
+// 500.
+//
+// The request body is wrapped in [http.MaxBytesReader]
+// before [io.ReadAll] so a malicious client cannot
+// stream an unbounded body and OOM the gate process;
+// the cap is [maxRequestBodyBytes] and is enforced
+// identically on `/v1/eval/replay`.
 func makeEvalHandler(gate *evaluator.Gate) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		var req evalRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeBodyReadError(w, err)
+			return
+		}
+		if rerr := rejectExtraPolicyVersionField(raw); rerr != nil {
+			http.Error(w, "bad request: "+rerr.Error(), http.StatusBadRequest)
+			return
+		}
+		var req evalGateRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
 			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -312,9 +440,64 @@ func makeEvalHandler(gate *evaluator.Gate) http.HandlerFunc {
 			http.Error(w, "bad request: invalid repo_id: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		policyVersionID, err := uuid.FromString(req.PolicyVersionID)
+		var scope *uuid.UUID
+		if req.Scope != nil && *req.Scope != "" {
+			s, perr := uuid.FromString(*req.Scope)
+			if perr != nil {
+				http.Error(w, "bad request: invalid scope: "+perr.Error(), http.StatusBadRequest)
+				return
+			}
+			scope = &s
+		}
+
+		// Canonical Stage 6.1 verb path: gate resolves
+		// the active policy_version_id itself via the
+		// latest `clean_code.policy_activation` row.
+		result, evalErr := gate.Gate(r.Context(), repoID, req.SHA, scope)
+		writeEvalResponse(w, result, evalErr)
+	}
+}
+
+// makeReplayHandler binds the NON-CANONICAL
+// `/v1/eval/replay` admin handler to the supplied
+// [evaluator.Gate]. The handler REQUIRES a
+// `policy_version_id` and invokes
+// [evaluator.Gate.Evaluate] directly. It is intentionally
+// a distinct route so the canonical verb's audit trail
+// remains uniform.
+//
+// The request body is wrapped in [http.MaxBytesReader]
+// before the [json.Decoder] runs so the admin surface
+// has the same OOM protection as the canonical verb;
+// the cap is [maxRequestBodyBytes].
+func makeReplayHandler(gate *evaluator.Gate) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		var req replayRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeBodyReadError(w, err)
+			return
+		}
+		repoID, err := uuid.FromString(req.RepoID)
 		if err != nil {
-			http.Error(w, "bad request: invalid policy_version_id: "+err.Error(), http.StatusBadRequest)
+			http.Error(w, "bad request: invalid repo_id: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.PolicyVersionID == "" {
+			http.Error(w, "bad request: policy_version_id is required on /v1/eval/replay; use /v1/eval/gate for the canonical active-policy verb", http.StatusBadRequest)
+			return
+		}
+		policyVersionID, perr := uuid.FromString(req.PolicyVersionID)
+		if perr != nil {
+			http.Error(w, "bad request: invalid policy_version_id: "+perr.Error(), http.StatusBadRequest)
+			return
+		}
+		if policyVersionID == uuid.Nil {
+			http.Error(w, "bad request: policy_version_id is the zero uuid", http.StatusBadRequest)
 			return
 		}
 		var scope *uuid.UUID
@@ -327,33 +510,48 @@ func makeEvalHandler(gate *evaluator.Gate) http.HandlerFunc {
 			scope = &s
 		}
 		result, evalErr := gate.Evaluate(r.Context(), repoID, req.SHA, scope, policyVersionID)
-		// Degraded paths return a non-nil sentinel error
-		// alongside a populated result. The handler
-		// projects both into the same JSON shape; the
-		// sentinel itself is reflected in the
-		// `degraded_reason` field.
-		degradedExpected := errors.Is(evalErr, evaluator.ErrSamplesPending) ||
-			errors.Is(evalErr, evaluator.ErrPolicySignatureInvalid)
-		if evalErr != nil && !degradedExpected {
-			http.Error(w, "evaluator: "+evalErr.Error(), http.StatusInternalServerError)
-			return
-		}
-		findingIDs := make([]string, 0, len(result.FindingIDs))
-		for _, id := range result.FindingIDs {
-			findingIDs = append(findingIDs, id.String())
-		}
-		resp := evalResponse{
-			EvaluationRunID:     result.EvaluationRunID.String(),
-			EvaluationVerdictID: result.EvaluationVerdictID.String(),
-			FindingIDs:          findingIDs,
-			Verdict:             result.Verdict,
-			Degraded:            result.Degraded,
-			DegradedReason:      result.DegradedReason,
-		}
-		w.Header().Set("content-type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		if err := json.NewEncoder(w).Encode(resp); err != nil {
-			log.Printf("clean-code-eval-gate: encode response: %v", err)
-		}
+		writeEvalResponse(w, result, evalErr)
+	}
+}
+
+// writeEvalResponse shapes the [evaluator.EvaluateResult]
+// + error pair into the canonical [evalResponse] JSON.
+// Used by both handlers so the audit-trail shape is
+// uniform across `/v1/eval/gate` and `/v1/eval/replay`.
+func writeEvalResponse(w http.ResponseWriter, result evaluator.EvaluateResult, evalErr error) {
+	// Operational-state error: no activation row
+	// exists yet. Map to 409 so the caller can
+	// distinguish a fresh-deploy from a 500.
+	if errors.Is(evalErr, evaluator.ErrNoActivePolicy) {
+		http.Error(w, "evaluator: no active policy: activate a policy_version via the steward before invoking eval.gate", http.StatusConflict)
+		return
+	}
+	// Degraded paths return a non-nil sentinel error
+	// alongside a populated result. The handler
+	// projects both into the same JSON shape; the
+	// sentinel itself is reflected in the
+	// `degraded_reason` field.
+	degradedExpected := errors.Is(evalErr, evaluator.ErrSamplesPending) ||
+		errors.Is(evalErr, evaluator.ErrPolicySignatureInvalid)
+	if evalErr != nil && !degradedExpected {
+		http.Error(w, "evaluator: "+evalErr.Error(), http.StatusInternalServerError)
+		return
+	}
+	findingIDs := make([]string, 0, len(result.FindingIDs))
+	for _, id := range result.FindingIDs {
+		findingIDs = append(findingIDs, id.String())
+	}
+	resp := evalResponse{
+		EvaluationRunID:     result.EvaluationRunID.String(),
+		EvaluationVerdictID: result.EvaluationVerdictID.String(),
+		FindingIDs:          findingIDs,
+		Verdict:             string(result.Verdict),
+		Degraded:            result.Degraded,
+		DegradedReason:      string(result.DegradedReason),
+	}
+	w.Header().Set("content-type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("clean-code-eval-gate: encode response: %v", err)
 	}
 }

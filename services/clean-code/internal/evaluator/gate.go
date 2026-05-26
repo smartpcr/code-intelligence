@@ -56,6 +56,7 @@ type Gate struct {
 	policyReader  PolicyVersionReader
 	sigVerify     PolicySignatureVerifier
 	degradedStore DegradedRunStore
+	activation    PolicyActivationReader
 	newID         IDMinter
 	now           func() int64
 }

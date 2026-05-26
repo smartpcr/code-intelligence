@@ -426,16 +426,21 @@ func mountMgmtRoutes(mux *http.ServeMux, ingestorDB, mgmtDB *sql.DB) error {
 // defensively).
 //
 // The composition root constructs the following durable
-// chain (Stage 4.1 iter-2 evaluator items #1 #2 -- the
+// chain (Stage 4.1 iter-3 evaluator item #2 -- the
 // scan_run(payload_hash=...) lookup MUST be backed by
 // PostgreSQL so retries across restart / replica
 // short-circuit to the prior scan_run_id):
 //
 //   - [metric_ingestor.NewPGExternalScanRunStore] opens the
-//     scan_run row via `INSERT ... ON CONFLICT (kind,
+//     scan_run row via `INSERT ... ON CONFLICT (verb,
 //     payload_hash) WHERE payload_hash IS NOT NULL DO
 //     NOTHING RETURNING scan_run_id` against migration
-//     0009's partial unique index.
+//     0009's partial unique index
+//     `scan_run_payload_hash_verb_uniq`. The `(verb,
+//     payload_hash)` key (NOT `(kind, payload_hash)`)
+//     keeps two verbs that share a kind -- e.g. `churn`
+//     and future `defects`, both `external_per_row` --
+//     on independent idempotency tracks.
 //   - [webhook.NewPGScanRunRepository] adapts the
 //     metric_ingestor store onto the webhook
 //     [ScanRunRepository] seam.

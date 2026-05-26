@@ -412,13 +412,15 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Open the DURABLE scan_run row keyed on (kind,
-	// payload_hash). On a fresh payload this returns
-	// AlreadyExisted=false and we proceed to dispatch the
-	// verb handler. On a replay (across restart / replica)
-	// this returns AlreadyExisted=true and the prior
-	// scan_run_id; we short-circuit the verb handler and
-	// emit a replay envelope.
+	// Open the DURABLE scan_run row keyed on (verb,
+	// payload_hash) -- see migration 0009's partial unique
+	// index `scan_run_payload_hash_verb_uniq`. On a fresh
+	// payload this returns AlreadyExisted=false and we
+	// proceed to dispatch the verb handler. On a replay
+	// (across restart / replica) this returns
+	// AlreadyExisted=true and the prior scan_run_id; we
+	// short-circuit the verb handler and emit a replay
+	// envelope.
 	repoOpenedAt := r.now()
 	repoRes, repoErr := r.scanRunRepo.OpenExternal(req.Context(), ScanRunRepositoryRequest{
 		Verb:        verb,
@@ -440,7 +442,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	if repoRes.AlreadyExisted {
 		// Durable replay: a prior call already opened a
-		// scan_run with this (kind, payload_hash). Emit a
+		// scan_run with this (verb, payload_hash). Emit a
 		// minimal envelope using the stored scan_run_id.
 		// The Router does NOT re-execute the verb handler
 		// (the brief's invariant) and does NOT finalize

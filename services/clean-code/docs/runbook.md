@@ -1648,6 +1648,15 @@ secret-rotation table; the rotation flow stays the same.
 
 ### Iter 2 -- Durable `scan_run(payload_hash)` idempotency + Router mount
 
+> **Superseded by iter 3.** Iter 2 keyed the partial
+> unique index on `(kind, payload_hash)`. Iter 3 rekeyed
+> it on `(verb, payload_hash)` (index name
+> `scan_run_payload_hash_verb_uniq`) -- see the iter-3
+> section below for the canonical migration shape and
+> operator playbook. The iter-2 prose is preserved as
+> historical record only; do NOT use the SQL snippets in
+> this section directly.
+
 Iter 1 used the in-process `IdempotencyStore` as the source of
 truth for replay. Iter 2 inverts that: the durable
 `scan_run(kind, payload_hash)` row is now the authority; the
@@ -1778,20 +1787,85 @@ To enable in production:
 2. Set the three env vars in the operator's deployment
    secret store.
 3. Restart `clean-code-metric-ingestor` -- the startup log
-   line `webhook.router mounted at /v1/ingest/ signing_key_id=...`
-   confirms the mount.
+   line `mounted external-ingest webhook router` (emitted by
+   `cmd/clean-code-metric-ingestor/main.go: mountIngestRouter`
+   at INFO level) with structured fields `path`,
+   `signing_key_id`, and `verbs` confirms the mount. Sample
+   field shape (slog text encoder, secret values redacted):
+   `path=/v1/ingest/ signing_key_id=<id> verbs=[churn]`.
 
 #### Observability
 
-- Each `OpenExternal` and `Finalize` call logs at INFO with
-  `scan_run_id`, `kind`, `payload_hash[:8]`, and the
-  `AlreadyExisted` + `ExistingStatus` outcomes; the HMAC
-  step's existing structured codes (`HMAC_*`) remain
-  unchanged.
-- A durable replay logs `webhook.router durable_replay`
-  with the prior `scan_run_id`; a fresh open logs
-  `webhook.router scan_run_opened`; a finalize logs
-  `webhook.router scan_run_finalized status=succeeded|failed`.
+Stage 4.1 emits five structured-log lines from the Router
+itself (`internal/ingest/webhook/router.go`) plus one
+startup line from the composition root
+(`cmd/clean-code-metric-ingestor/main.go`); the underlying
+durable-claim primitives (`metric_ingestor.PGExternalScanRunStore`,
+`webhook.PGScanRunRepository`) do NOT carry an `slog`
+seam in v1 -- their behaviour surfaces through the
+Router's lines plus the catalog `scan_run` table itself.
+
+| Event | Level | slog message (verbatim) | Fields (verbatim) | Emitter (file:func) |
+|-------|-------|-------------------------|-------------------|---------------------|
+| Mount confirmation (startup) | INFO | `mounted external-ingest webhook router` | `path`, `signing_key_id`, `verbs` | `cmd/clean-code-metric-ingestor/main.go: mountIngestRouter` |
+| Fresh successful POST | INFO | `ingest webhook: success` | `verb`, `scan_run_id`, `payload_hash`, `scan_run_kind` | `router.go: Router.ServeHTTP` (after Commit) |
+| In-process replay (same-replica cache hit, fast path) | INFO | `ingest webhook: replay (cached scan_run_id, in-process)` | `verb`, `scan_run_id`, `payload_hash` | `router.go: Router.replayResponse` |
+| Durable replay (cross-process / cross-replica) | INFO | `ingest webhook: replay (durable scan_run_id, cross-process)` | `verb`, `scan_run_id`, `existing_status`, `payload_hash` | `router.go: Router.emitDurableReplay` |
+| HMAC short-circuit (any 401 path) | WARN | `ingest webhook: HMAC verification failed` | `verb`, `code` (one of the `HMAC_*` codes below), `err`, `remote_addr` | `router.go: Router.logHMACFailure` |
+| Internal failure (resolver, scan_run-open, verb-handler, idempotency-commit, marshal, etc.) | WARN | `ingest webhook: internal failure` | `verb`, `kind` (stage tag), `err`, `remote_addr` | `router.go: Router.logInternal` |
+
+The `code` field on `HMAC verification failed` and the
+`code` field on the 401 JSON error envelope (`ErrorBody.Code`)
+draw from the SAME closed set:
+
+| Code | Trigger | Source |
+|------|---------|--------|
+| `HMAC_MISSING_KEY_ID` | `X-Signing-Key-Id` header absent | `router.go: classifyKeyIDError` |
+| `HMAC_MALFORMED_KEY_ID` | header fails [ValidateSigningKeyID] | `router.go: classifyKeyIDError` |
+| `HMAC_UNKNOWN_KEY_ID` | header valid but resolver has no entry | `router.go: Router.ServeHTTP` ([ErrUnknownSigningKeyID] branch) |
+| `HMAC_MISSING_SIGNATURE` | `X-Hub-Signature-256` header absent | `handler.go: classifyHMACError` ([ErrHMACMissingHeader]) |
+| `HMAC_MALFORMED_SIGNATURE` | header not `sha256=<64 hex>` | `handler.go: classifyHMACError` ([ErrHMACMalformedHeader]) |
+| `HMAC_SIGNATURE_MISMATCH` | digest != recomputed body digest | `handler.go: classifyHMACError` ([ErrHMACSignatureMismatch]) |
+| `HMAC_EMPTY_SECRET` | resolver returned an empty secret (server-side misconfig) | `handler.go: classifyHMACError` ([ErrHMACEmptySecret]) |
+| `HMAC_INVALID` | any other HMAC-layer error (catch-all default) | `handler.go: classifyHMACError` (default arm) |
+
+Operator notes:
+
+- `grep -F "ingest webhook: HMAC verification failed"` against
+  the service log returns every 401 from the Router; the
+  `code` field on the same line names the failure mode.
+  `grep -F "HMAC_SIGNATURE_MISMATCH"` is the canonical query
+  for "publisher signed the wrong body".
+- `grep -F "ingest webhook: internal failure"` against the
+  service log returns every Router-internal 500. The `kind`
+  field is the stage tag (e.g. `resolver-internal-failure`,
+  `scan-run-open-failure`, `idempotency-commit-failure`,
+  `extract-metadata-failure`) so operators can disambiguate
+  which Router stage failed without re-reading the
+  pipeline code.
+- The `existing_status` field on a durable replay names
+  the prior terminal state of the `scan_run` row
+  (`succeeded` / `failed` / `running`). A
+  `running` value means a sibling replica is still
+  mid-execution -- publishers should poll
+  `GET /v1/scan_runs/{id}` for the terminal verdict.
+- The Router NEVER logs the `signing_key_id` value, the
+  HMAC secret, the supplied signature, or the computed
+  digest -- those would all leak side-channel information
+  useful for brute-force or replay attacks. The 401 JSON
+  envelope is similarly safe (it carries only the
+  `HMAC_*` code, no secret material).
+- DB-tier observability for the durable seam is the
+  `scan_run` catalog itself: a `SELECT verb,
+  payload_hash, status, started_at, ended_at FROM
+  clean_code.scan_run WHERE payload_hash IS NOT NULL
+  ORDER BY started_at DESC LIMIT 50` returns the same
+  view that operators ran against `scan_run` for
+  foundation-tier rows in Stage 3. A future iter MAY
+  add INFO logs at the `PGExternalScanRunStore` layer
+  if operator feedback shows the catalog query is
+  insufficient; until then the catalog table IS the
+  authoritative observability surface.
 
 
 ### Iter 3 -- Per-verb idempotency key + Finalize same-terminal contract

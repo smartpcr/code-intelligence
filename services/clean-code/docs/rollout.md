@@ -85,16 +85,40 @@ Migration 0009 is rewritten end-to-end.
 
 ### Iter-3 verification
 
-After the new binary is live, verify the
-per-verb idempotency:
+After the new binary is live, verify the per-verb
+idempotency at the durable layer. Stage 4.1 only mounts
+the `churn` verb in `RouterConfig.Verbs`
+(`cmd/clean-code-metric-ingestor/main.go`); the `coverage`
+/ `test_balance` / `defects` verbs land in Stages
+4.2 / 4.3 / 4.5 and will register against the same Router
+seam. Until those stages land, an unmounted verb returns
+`404 / VERB_NOT_FOUND`, so the live operator smoke test in
+Stage 4.1 verifies only `churn`:
 
 ```bash
-# Same body, two verbs -- both MUST succeed (200) with
-# DIFFERENT scan_run_ids:
-RESP_A=$(curl -s -X POST .../v1/ingest/churn  --data @body.json -H "X-Hub-Signature-256: sha256=...")
-RESP_B=$(curl -s -X POST .../v1/ingest/defects --data @body.json -H "X-Hub-Signature-256: sha256=...")
-[[ "$(jq -r .scan_run_id <<< "$RESP_A")" != "$(jq -r .scan_run_id <<< "$RESP_B")" ]] || echo "FAIL: per-verb idempotency regressed"
+# Stage 4.1 mounted verb -- replay invariant:
+RESP_A=$(curl -s -X POST .../v1/ingest/churn --data @body.json \
+            -H "X-Hub-Signature-256: sha256=..." \
+            -H "X-Signing-Key-Id: $CLEAN_CODE_WEBHOOK_SIGNING_KEY_ID")
+RESP_B=$(curl -s -X POST .../v1/ingest/churn --data @body.json \
+            -H "X-Hub-Signature-256: sha256=..." \
+            -H "X-Signing-Key-Id: $CLEAN_CODE_WEBHOOK_SIGNING_KEY_ID")
+# Second response MUST carry replayed=true with the same
+# scan_run_id as the first:
+[[ "$(jq -r .scan_run_id <<< "$RESP_A")" == "$(jq -r .scan_run_id <<< "$RESP_B")" ]] \
+    || { echo "FAIL: replay returned a different scan_run_id"; exit 1; }
+[[ "$(jq -r .replayed <<< "$RESP_B")" == "true" ]] \
+    || { echo "FAIL: second response missing replayed=true"; exit 1; }
 ```
+
+The per-verb idempotency boundary itself (two distinct
+verbs sharing a payload_hash MUST receive independent
+scan_run_ids) is verified by unit test
+`TestInMemoryScanRunRepository_OpenExternal_DifferentVerbs_SamePayload_GetIndependentRuns`
+and at the DB layer by migration 0009's partial unique
+index `scan_run_payload_hash_verb_uniq`. A live HTTP
+verification will be added in Stage 4.5 when `defects` is
+mounted alongside `churn`.
 
 ### Rollback (iter 3)
 
@@ -181,8 +205,11 @@ wired into the running service.
 
 - [ ] Roll the new `clean-code-metric-ingestor` binary.
       Confirm the startup log line
-      `webhook.router mounted at /v1/ingest/ signing_key_id=...`
-      and the existing
+      `mounted external-ingest webhook router` (INFO, with
+      structured fields `path=/v1/ingest/`,
+      `signing_key_id=<your id>`, and `verbs=[churn]` --
+      emitted from `cmd/clean-code-metric-ingestor/main.go:
+      mountIngestRouter`) and the existing
       `clean-code-metric-ingestor http listening`.
 
 - [ ] Smoke-test the durable replay using

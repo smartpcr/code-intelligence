@@ -313,9 +313,9 @@ func TestInMemoryScanRunRepository_OpenExternal_ConcurrentSameHash_CollapsesToOn
 // boundary: two distinct verbs (churn + defects) that share
 // `Kind=external_per_row` AND have the SAME payload_hash
 // MUST receive INDEPENDENT scan_run_ids, NOT collapse to a
-// single replay. A (kind, payload_hash) key would
-// incorrectly collide these. A (verb, payload_hash) key
-// keeps them separate.
+// single replay. A `(kind, payload_hash)` key (iter-2's
+// shape) would incorrectly collide these. The iter-3
+// `(verb, payload_hash)` key keeps them separate.
 func TestInMemoryScanRunRepository_OpenExternal_DifferentVerbs_SamePayload_GetIndependentRuns(t *testing.T) {
 	t.Parallel()
 	repo := webhook.NewInMemoryScanRunRepository()

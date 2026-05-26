@@ -66,9 +66,13 @@ func (p PayloadHash) Bytes() []byte {
 //   - `Verb` is the URL path segment (e.g. `churn`,
 //     `defects`). Two different verbs with the same body
 //     bytes get separate records (rubber-duck audit fix
-//     iter-1 #3: `(kind, payload_hash)` is too coarse;
-//     `churn` and `defects` both bind to
-//     `kind='external_per_row'`).
+//     iter-1 #3, hardened in iter-3: keying on `kind`
+//     alone would be too coarse because `churn` and
+//     `defects` both bind to `kind='external_per_row'`;
+//     iter-3's migration 0009 partial unique index
+//     `scan_run_payload_hash_verb_uniq` is keyed on
+//     `(verb, payload_hash)` for the same reason at the
+//     durable layer).
 //
 //   - `PayloadHash` is the [PayloadHash] of the canonical
 //     body.
@@ -120,13 +124,16 @@ type IdempotencyRecord struct {
 //
 // The v1 in-memory [InMemoryIdempotencyStore] is the seam
 // the Router consumes today. Phase 3.2's stage-metric-
-// ingestor-and-scanrun-state-machine will plug in a
+// ingestor-and-scanrun-state-machine plugs in a
 // PG-backed implementation that selects from
 // `clean_code.scan_run` with a partial unique index on
-// `(payload_hash, kind)` (the actual durable claim) and
-// translates the claim/commit/abort flow to a single
-// `INSERT ... ON CONFLICT DO NOTHING RETURNING` shape. The
-// interface here survives that swap.
+// `(verb, payload_hash) WHERE payload_hash IS NOT NULL`
+// (migration 0009; iter-3 evaluator item #2 hardened the
+// key from `(kind, payload_hash)` to `(verb,
+// payload_hash)` so two verbs sharing a kind cannot
+// collide) and translates the claim/commit/abort flow to
+// a single `INSERT ... ON CONFLICT DO NOTHING RETURNING`
+// shape. The interface here survives that swap.
 type IdempotencyStore interface {
 	// Claim is the atomic claim primitive. Returns
 	// `claimed=true` + `nil` record when the caller has

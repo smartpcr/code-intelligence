@@ -217,7 +217,7 @@ func seedSamplesForSHA(db *sql.DB, repoID, sha string) error {
 func discoverMetricSampleColumns(db *sql.DB) (map[string]bool, error) {
 	rows, err := db.Query(
 		`SELECT column_name FROM information_schema.columns
-		 WHERE table_name = 'metric_sample'`)
+		 WHERE table_schema = 'public' AND table_name = 'metric_sample'`)
 	if err != nil {
 		return nil, fmt.Errorf("querying information_schema: %w", err)
 	}
@@ -1014,7 +1014,7 @@ func (s *evalGateState) theInformationSchemaConfirmsNoScopeOrSettledAtColumns() 
 		var count int
 		err := s.db.QueryRow(
 			`SELECT COUNT(*) FROM information_schema.columns
-			 WHERE table_name = 'evaluation_verdict' AND column_name = $1`,
+				 WHERE table_schema = 'public' AND table_name = 'evaluation_verdict' AND column_name = $1`,
 			colName,
 		).Scan(&count)
 		if err != nil {

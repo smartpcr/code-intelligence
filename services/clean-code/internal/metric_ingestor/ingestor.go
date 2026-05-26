@@ -157,8 +157,17 @@ func (d NoopFoundationRecipeDispatcher) Dispatch(_ context.Context, scanRun Scan
 // declaratively.
 type RunRequest struct {
 	// ScanRun carries the parent ScanRun's metadata
-	// (architecture Sec 5.7). The [Ingestor] runs
-	// [ScanRunContext.Validate] before any dispatch.
+	// (architecture Sec 5.7). [Ingestor.Run] enforces
+	// non-zero [ScanRunContext.ID] and
+	// [ScanRunContext.RepoID] inline before any dispatch
+	// and rejects any [ScanRunContext.Kind] outside the
+	// dispatch switch via the `default` branch ->
+	// [ErrInvalidScanRunKind]. [ScanRunContext.Validate]
+	// is NOT reused here -- the Ingestor accepts a strict
+	// superset of [AllowedScanRunKinds] (it also dispatches
+	// `external_single` to the [CoverageSweep]), and
+	// Validate's churn-sweep-scoped allow-list would
+	// incorrectly reject that kind.
 	ScanRun ScanRunContext
 	// Foundation is the payload the
 	// [FoundationRecipeDispatcher] consumes. Passed
@@ -336,12 +345,27 @@ func (i *Ingestor) HasCoverageSweep() bool {
 //
 // Validation order (cheapest first):
 //
-//  1. [ScanRunContext.Validate] (non-zero ID + RepoID, kind
-//     in [AllowedScanRunKinds]).
-//  2. Per-kind churn-payload presence (above).
-//  3. [FoundationRecipeDispatcher.Dispatch] for foundation
+//  1. Inline structural guards: [RunRequest.ScanRun.ID] and
+//     [RunRequest.ScanRun.RepoID] are non-zero UUIDs
+//     ([ErrZeroScanRunID] / [ErrZeroRepoID]).
+//  2. Kind dispatch via the switch below. The `default`
+//     branch is the kind-validation safety net for any
+//     value outside the closed set
+//     {`full`, `delta`, `external_per_row`,
+//     `external_single`} and returns
+//     [ErrInvalidScanRunKind]. [ScanRunContext.Validate]
+//     is intentionally NOT reused here -- it is bound to
+//     the [ChurnSweep]'s [AllowedScanRunKinds] which omits
+//     `external_single`, so reusing it would incorrectly
+//     reject coverage-verb runs at the Ingestor boundary.
+//  3. Per-kind payload presence: churn for
+//     `external_per_row` ([ErrMissingChurnPayloadForExternalPerRow]),
+//     coverage for `external_single`
+//     ([ErrMissingCoveragePayloadForExternalSingle]).
+//  4. [FoundationRecipeDispatcher.Dispatch] for foundation
 //     kinds.
-//  4. [ChurnSweep.Run] when applicable.
+//  5. [ChurnSweep.Run] / [CoverageSweep.Run] when
+//     applicable.
 //
 // On any error, Run returns ([IngestorResult]{}, error) with
 // no further dispatch. The error wraps the underlying
@@ -416,11 +440,22 @@ func (i *Ingestor) Run(ctx context.Context, req RunRequest) (IngestorResult, err
 		}, nil
 
 	default:
-		// Unreachable: ScanRunContext.Validate already
-		// filtered the kind set. Returned as a safety net so
-		// a future expansion of allowedScanRunKinds that
-		// forgets to handle the new kind here surfaces
-		// loudly.
+		// Kind-validation safety net. This branch IS
+		// reachable: the Ingestor's inline guards above
+		// only check ID + RepoID, not Kind, so any value
+		// outside the closed dispatch set (an empty
+		// string, `retract`, a typo, or a future kind not
+		// yet wired here) lands here and is rejected with
+		// [ErrInvalidScanRunKind] before the writer
+		// pipeline can see an un-dispatched run.
+		// [ScanRunContext.Validate] is NOT reused at the
+		// top of Run because its allow-list omits
+		// `external_single` (it is scoped to the
+		// [ChurnSweep]'s [AllowedScanRunKinds]); doing the
+		// kind check here keeps the Ingestor's accepted
+		// set a strict superset of the per-sweep
+		// allow-lists without dragging the ChurnSweep's
+		// scope into the Ingestor surface.
 		return IngestorResult{}, fmt.Errorf("%w: %q (unhandled by Ingestor.Run)",
 			ErrInvalidScanRunKind, req.ScanRun.Kind)
 	}

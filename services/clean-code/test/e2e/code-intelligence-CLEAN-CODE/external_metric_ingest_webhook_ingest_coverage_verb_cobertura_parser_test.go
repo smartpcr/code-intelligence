@@ -307,44 +307,72 @@ func (s *coverageState) eachCoveredFileHasMetricSampleRowsWithMetricKindIN(kindL
 	return lastErr
 }
 
+// requiredConsecutiveZeroChecks / negativeAssertionPollInterval define the
+// polling discipline used by every negative-assertion step in this file.
+// We require COUNT(*) to be zero for N consecutive checks (N×interval of
+// quiescence) before declaring success – this guards against false-positive
+// passes where an async writer hasn't yet landed the forbidden rows.
+const (
+	requiredConsecutiveZeroChecks = 5
+	negativeAssertionPollInterval = 1 * time.Second
+	negativeAssertionTimeout      = 30 * time.Second
+)
+
+// pollForZeroCount runs `query` (which must return a single COUNT(*) int)
+// with the supplied args until COUNT(*) has been zero for
+// requiredConsecutiveZeroChecks polls in a row. Any non-zero count fails
+// immediately; any DB error is wrapped with `queryDesc`. A zero return
+// indicates the negative invariant held for N×interval of stability,
+// mirroring the polling pattern already used by the positive assertion.
+func (s *coverageState) pollForZeroCount(queryDesc, failDesc, query string, args ...interface{}) error {
+	ctx, cancel := context.WithTimeout(context.Background(), negativeAssertionTimeout)
+	defer cancel()
+
+	consecutiveZero := 0
+	for consecutiveZero < requiredConsecutiveZeroChecks {
+		var count int
+		if err := s.db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+			return fmt.Errorf("querying %s: %w", queryDesc, err)
+		}
+		if count != 0 {
+			return fmt.Errorf("%s, got %d", failDesc, count)
+		}
+		consecutiveZero++
+		if consecutiveZero < requiredConsecutiveZeroChecks {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("timed out waiting for stable zero count on %s: %w", queryDesc, ctx.Err())
+			case <-time.After(negativeAssertionPollInterval):
+			}
+		}
+	}
+	return nil
+}
+
 func (s *coverageState) noMetricSampleRowsExistWithMetricKindOr(kind1, kind2 string) error {
 	if s.scanRunID == "" {
 		return fmt.Errorf("no scan_run_id captured")
 	}
-	time.Sleep(2 * time.Second)
-
-	var count int
-	err := s.db.QueryRowContext(context.Background(), `
-		SELECT COUNT(*) FROM clean_code.metric_sample
-		WHERE scan_run_id = $1 AND metric_kind IN ($2, $3)
-	`, s.scanRunID, kind1, kind2).Scan(&count)
-	if err != nil {
-		return fmt.Errorf("querying metric_sample: %w", err)
-	}
-	if count != 0 {
-		return fmt.Errorf("expected 0 rows with kind in (%s,%s), got %d", kind1, kind2, count)
-	}
-	return nil
+	return s.pollForZeroCount(
+		"metric_sample",
+		fmt.Sprintf("expected 0 rows with kind in (%s,%s)", kind1, kind2),
+		`SELECT COUNT(*) FROM clean_code.metric_sample
+		 WHERE scan_run_id = $1 AND metric_kind IN ($2, $3)`,
+		s.scanRunID, kind1, kind2,
+	)
 }
 
 func (s *coverageState) noMetricSampleRowExistsForFilePath(filePath string) error {
 	if s.scanRunID == "" {
 		return fmt.Errorf("no scan_run_id captured")
 	}
-	time.Sleep(3 * time.Second)
-
-	var count int
-	err := s.db.QueryRowContext(context.Background(), `
-		SELECT COUNT(*) FROM clean_code.metric_sample
-		WHERE scan_run_id = $1 AND scope_id = $2
-	`, s.scanRunID, filePath).Scan(&count)
-	if err != nil {
-		return fmt.Errorf("querying metric_sample: %w", err)
-	}
-	if count != 0 {
-		return fmt.Errorf("expected 0 metric_sample for unbound file %s, got %d", filePath, count)
-	}
-	return nil
+	return s.pollForZeroCount(
+		"metric_sample",
+		fmt.Sprintf("expected 0 metric_sample for unbound file %s", filePath),
+		`SELECT COUNT(*) FROM clean_code.metric_sample
+		 WHERE scan_run_id = $1 AND scope_id = $2`,
+		s.scanRunID, filePath,
+	)
 }
 
 func (s *coverageState) theCounterIsIncremented(counterName string) error {

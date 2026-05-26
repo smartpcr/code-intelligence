@@ -16,8 +16,8 @@ variables:
   COMPOSE_FILE: tests/e2e/phase-03-indexer-ingestor/docker-compose.yml
 
 stages:
-  - stage: e2e_metric_ingestor_and_scanrun_state_machine
-    displayName: "E2E – Metric Ingestor and ScanRun State Machine"
+  - stage: e2e_active_row_uniqueness_enforcement
+    displayName: "E2E – Active Row Uniqueness Enforcement"
     jobs:
       - job: run_e2e
         displayName: "Run godog E2E tests"
@@ -44,7 +44,7 @@ stages:
               make seed-fixtures-phase-03
               cd services/clean-code
               go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
-                -run TestE2E_repo_indexer_and_metric_ingestor_metric_ingestor_and_scanrun_state_machine
+                -run TestE2E_repo_indexer_and_metric_ingestor_active_row_uniqueness_enforcement
             displayName: "Export compose URLs, bootstrap, and run E2E tests"
             workingDirectory: $(Build.SourcesDirectory)
 

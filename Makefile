@@ -32,4 +32,4 @@ test-phase-03:
 		CLEAN_CODE_INGESTOR_URL="http://localhost:$(INGESTOR_PORT)" \
 		CLEAN_CODE_OTEL_ENDPOINT="http://localhost:$(OTEL_PORT)" \
 		go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
-			-run TestE2E_repo_indexer_and_metric_ingestor_metric_ingestor_and_scanrun_state_machine
+			-run TestE2E_repo_indexer_and_metric_ingestor_active_row_uniqueness_enforcement

@@ -53,7 +53,6 @@ import (
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/webhook"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/management"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/materialisers"
 )
 
 // db is the metric-ingestor-role PG handle used by the legacy demo
@@ -503,19 +502,19 @@ func mountIngestRouter(mux *http.ServeMux, cfg config.Config, ingestorDB *sql.DB
 		cfg.WebhookSigningKeyID: []byte(cfg.WebhookHMACSecret),
 	})
 
-	// Churn verb: re-uses the same Ingestor + ChurnSweep
-	// chain the Stage 3.2 PG-backed metric-sample writer
-	// composes. The metric-sample writer is PG-backed when
-	// CLEAN_CODE_PG_URL is set (production).
-	mat := materialisers.NewMaterialiser(materialisers.DefaultWindowDays)
-	hyd := churn.NewHydrator(churn.NewAutoMapScopeResolver())
-	sampleWriter, err := metric_ingestor.NewPGMetricSampleWriter(ingestorDB)
+	// Churn verb (Stage 4.4 rewire): the verb writes ZERO
+	// `metric_sample` rows directly. It stages into the
+	// `clean_code.churn_event` table via [churn.Ingester]
+	// over the PG-backed [churn.PGChurnEventStore]; the
+	// `modification_count_in_window` materialiser is the
+	// SOLE writer of that metric_kind on a later pass
+	// (architecture Sec 4.4, implementation-plan Stage 4.4).
+	churnEventStore, err := churn.NewPGChurnEventStore(ingestorDB)
 	if err != nil {
-		return fmt.Errorf("NewPGMetricSampleWriter: %w", err)
+		return fmt.Errorf("NewPGChurnEventStore: %w", err)
 	}
-	sweep := metric_ingestor.NewChurnSweep(mat, hyd, sampleWriter)
-	ing := metric_ingestor.NewIngestor(metric_ingestor.NoopFoundationRecipeDispatcher{}, sweep)
-	churnHandler := webhook.NewChurnVerbHandler(ing)
+	churnIngester := churn.NewIngester(churnEventStore)
+	churnHandler := webhook.NewChurnVerbHandler(churnIngester)
 
 	router := webhook.NewRouter(webhook.RouterConfig{
 		Resolver:    resolver,

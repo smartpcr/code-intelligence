@@ -1225,6 +1225,7 @@ against. Every table belongs to exactly one G1 sub-store
 | `sha` | text |  |
 | `policy_version_id` | uuid |  |
 | `caller` | enum | `eval_gate` or `batch_refresh`. |
+| `scope_id` | uuid? | NULLABLE. Records the `scope?` argument of `rule_engine.RunSync(repo_id, sha, scope?, policy_version_id)` so cross-replica Store-level run dedup distinguishes a scoped `eval_gate` evaluation from an unscoped one (and from a different scope's evaluation). `NULL` represents the whole-SHA evaluation: the canonical `eval.gate` happy path with no scope argument, AND every `batch_refresh` run by construction. Non-null represents a per-scope `eval.gate` call. The Store's cross-replica dedup lookup matches with the null-safe `IS NOT DISTINCT FROM` operator so parallel calls landing on different replicas for the same `(repo_id, sha, policy_version_id, caller, scope_id)` tuple produce a single canonical run+verdict. Materialised by migration `0008_evaluation_run_scope_id` and the composite index `evaluation_run_dedup_idx(repo_id, sha, policy_version_id, caller, scope_id, created_at DESC)`. Pre-migration rows and Audit WAL reconciler replay rows retain meaningful semantics under the legacy nullable shape. |
 | `created_at` | timestamp | Append-only. |
 
 #### 5.4.3 EvaluationVerdict

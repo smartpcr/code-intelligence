@@ -63,3 +63,52 @@ stages:
             displayName: "Tear down compose services"
             workingDirectory: $(Build.SourcesDirectory)
             condition: always()
+
+  - stage: e2e_ingest_test_balance_verb
+    displayName: "E2E – Ingest test_balance Verb"
+    dependsOn: []
+    jobs:
+      - job: run_e2e
+        displayName: "Run godog E2E tests"
+        timeoutInMinutes: 20
+        steps:
+          - task: GoTool@0
+            inputs:
+              version: $(GO_VERSION)
+            displayName: "Install Go $(GO_VERSION)"
+
+          - script: |
+              SECRET=$(openssl rand -hex 32)
+              echo "##vso[task.setvariable variable=CLEAN_CODE_WEBHOOK_HMAC_SECRET;issecret=true]$SECRET"
+            displayName: "Generate ephemeral HMAC secret"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) up -d --build
+            displayName: "Start compose services"
+            workingDirectory: $(Build.SourcesDirectory)
+            env:
+              CLEAN_CODE_WEBHOOK_HMAC_SECRET: $(CLEAN_CODE_WEBHOOK_HMAC_SECRET)
+
+          - script: |
+              PG_PORT=$(docker compose -f $(COMPOSE_FILE) port postgres 5432 | cut -d: -f2)
+              WEBHOOK_PORT=$(docker compose -f $(COMPOSE_FILE) port webhook 8080 | cut -d: -f2)
+              OTEL_PORT=$(docker compose -f $(COMPOSE_FILE) port otel-collector 4317 | cut -d: -f2)
+              export CLEAN_CODE_PG_URL="postgres://postgres:postgres@localhost:${PG_PORT}/clean_code?sslmode=disable"
+              export CLEAN_CODE_WEBHOOK_URL="http://localhost:${WEBHOOK_PORT}"
+              export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:${OTEL_PORT}"
+              make migrate-up
+              make seed-repo-d
+              cd services/clean-code
+              go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
+                -run TestE2E_external_metric_ingest_webhook_ingest_test_balance_verb
+            displayName: "Export compose URLs, bootstrap, and run E2E tests"
+            workingDirectory: $(Build.SourcesDirectory)
+            env:
+              CLEAN_CODE_WEBHOOK_HMAC_SECRET: $(CLEAN_CODE_WEBHOOK_HMAC_SECRET)
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) down -v --remove-orphans
+            displayName: "Tear down compose services"
+            workingDirectory: $(Build.SourcesDirectory)
+            condition: always()

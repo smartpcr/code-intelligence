@@ -223,7 +223,7 @@ func (h *ChurnVerbHandler) Handle(ctx context.Context, body []byte, scanRunID uu
 }
 
 // ClassifyError implements [VerbErrorClassifier]. The closed
-// set maps every sentinel the [churn.Ingester] surfaces to a
+// set maps every sentinel the verb is willing to classify to a
 // canonical (status, code) pair so the Router emits the same
 // shapes the legacy direct mount returns (a publisher that
 // migrates from `/v1/ingest/churn` to `/v1/ingest/{verb}/churn`
@@ -235,11 +235,34 @@ func (h *ChurnVerbHandler) Handle(ctx context.Context, body []byte, scanRunID uu
 //   - [churn.ErrInvalidSHA]               -> 400 / INVALID_SHA
 //   - [churn.ErrEmptyFilePath]            -> 400 / EMPTY_FILE_PATH
 //   - [churn.ErrZeroModifiedAt]           -> 400 / ZERO_MODIFIED_AT
-//   - [churn.ErrScopeResolutionFailed]    -> 422 / SCOPE_RESOLUTION_FAILED
+//   - [churn.ErrScopeResolutionFailed]    -> 422 / SCOPE_RESOLUTION_FAILED  (forward-compat -- see note below)
 //   - [churn.ErrRepoIDMismatch]           -> 400 / REPO_ID_MISMATCH
 //   - [churn.ErrChurnEventWriteFailed]    -> 500 / WRITER_FAILURE
 //   - JSON decode failure                 -> 400 / BAD_REQUEST
 //   - any other error                     -> (0, "") -- defer to Router default
+//
+// # Stage 4.4 reachability of ErrScopeResolutionFailed
+//
+// In Stage 4.4 the verb dispatches to [churn.Ingester.Ingest],
+// which does NOT perform scope resolution -- that work is
+// deferred to the `modification_count_in_window` materialiser
+// on a later pass. The errors `Ingester.Ingest` can produce are
+// the [churn.Payload.Validate] / [churn.ValidateScanRunHandle]
+// sentinels plus [churn.ErrRepoIDMismatch],
+// [churn.ErrChurnEventWriteFailed], [churn.ErrZeroNow], and
+// [churn.ErrUUIDMintFailed] -- none of which wrap
+// [churn.ErrScopeResolutionFailed]. The arm is therefore
+// UNREACHABLE through the production Stage 4.4 call path; it
+// is retained for forward-compat because (a) the classification
+// table is the contract a future re-introduction of scope
+// resolution at this boundary MUST honour without re-deriving
+// the mapping, and (b) it stays aligned with the legacy direct
+// mount in handler.go (which DOES surface the sentinel through
+// its metric_ingestor chain) so the two mounts return the same
+// (422, SCOPE_RESOLUTION_FAILED) shape if the future code path
+// produces the sentinel. The unit test in churn_verb_test.go
+// pins the mapping so a future divergence surfaces at build
+// time, not at first request.
 func (h *ChurnVerbHandler) ClassifyError(err error) (int, string) {
 	switch {
 	case errors.Is(err, churn.ErrEmptyRepoID):
@@ -254,6 +277,16 @@ func (h *ChurnVerbHandler) ClassifyError(err error) (int, string) {
 		return http.StatusBadRequest, "EMPTY_FILE_PATH"
 	case errors.Is(err, churn.ErrZeroModifiedAt):
 		return http.StatusBadRequest, "ZERO_MODIFIED_AT"
+	// Forward-compat arm -- see "Stage 4.4 reachability of
+	// ErrScopeResolutionFailed" in the doc-comment above.
+	// churn.Ingester.Ingest does NOT perform scope resolution
+	// in Stage 4.4 (the materialiser handles it on a later
+	// pass), so this arm is unreachable through the production
+	// call path today. Kept aligned with handler.go's legacy
+	// mapping so a future re-introduction of scope resolution
+	// at this boundary surfaces the same (422,
+	// SCOPE_RESOLUTION_FAILED) shape without re-deriving the
+	// classification.
 	case errors.Is(err, churn.ErrScopeResolutionFailed):
 		return http.StatusUnprocessableEntity, "SCOPE_RESOLUTION_FAILED"
 	case errors.Is(err, churn.ErrRepoIDMismatch):
@@ -292,4 +325,3 @@ var (
 	// here, not at composition-root wiring time.
 	_ ChurnIngester = (*churn.Ingester)(nil)
 )
-

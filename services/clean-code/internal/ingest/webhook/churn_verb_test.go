@@ -84,7 +84,7 @@ func TestChurnVerbHandler_HappyPath_HonoursSuppliedScanRunID(t *testing.T) {
 	body := goodPayloadJSON(t)
 	scanRunID := uuid.Must(uuid.NewV7())
 
-	res, err := h.Handle(context.Background(), body, scanRunID)
+	res, err := h.Handle(context.Background(), webhook.VerbPayloadMetadata{}, body, scanRunID)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestChurnVerbHandler_RejectsBadJSON(t *testing.T) {
 	t.Parallel()
 	h, store := newChurnVerb(t)
 	scanRunID := uuid.Must(uuid.NewV7())
-	_, err := h.Handle(context.Background(), []byte("{not json"), scanRunID)
+	_, err := h.Handle(context.Background(), webhook.VerbPayloadMetadata{}, []byte("{not json"), scanRunID)
 	if err == nil {
 		t.Fatalf("Handle bad JSON: want error, got nil")
 	}
@@ -202,7 +202,7 @@ func TestChurnVerbHandler_RejectsUnknownFields(t *testing.T) {
 	t.Parallel()
 	h, _ := newChurnVerb(t)
 	body := []byte(`{"repo_id":"00000000-0000-0000-0000-000000000001","rows":[],"unknown_field":42}`)
-	_, err := h.Handle(context.Background(), body, uuid.Must(uuid.NewV7()))
+	_, err := h.Handle(context.Background(), webhook.VerbPayloadMetadata{}, body, uuid.Must(uuid.NewV7()))
 	if err == nil {
 		t.Fatalf("Handle with unknown field: want error, got nil")
 	}

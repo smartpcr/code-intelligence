@@ -34,7 +34,7 @@
 -- `internal/metric_ingestor.VerifyMetricKindCatalog` is the
 -- runtime SELECT-only fence that surfaces version drift
 -- between this seed and the in-process recipe versions
--- (cmd/clean-coded/main.go).
+-- (cmd/clean-code-metric-ingestor/main.go: verifyMetricKindCatalog).
 --
 -- Source-of-truth metadata table:
 --   `internal/metric_ingestor/metric_kind_catalog.go`
@@ -45,7 +45,8 @@
 --
 -- Down: `0007_seed_foundation_metric_kinds.down.sql` scopes
 -- its DELETE to the EXACT `(metric_kind, metric_version)`
--- tuples this UP inserts (all seven kinds at
+-- tuples this UP inserts (all nine kinds -- seven foundation
+-- + two external-ingest coverage kinds -- at
 -- `metric_version = 1`). A Steward-curated row at a
 -- DIFFERENT `metric_version` (>=2) is preserved by the
 -- tuple predicate. A Steward-curated row that pre-existed
@@ -110,6 +111,32 @@ VALUES ('modification_count_in_window', 1, 'foundation', 'base', 'count',
         'Number of file modifications observed within the configured '
         'window_days for a given scope '
         '(architecture Sec 1.4.1 row 12; tech-spec Sec 8.2).')
+ON CONFLICT (metric_kind) DO NOTHING;
+
+-- Foundation tier / ingested pack external coverage rows
+-- (architecture Sec 1.4.1 row 16; tech-spec Sec 4.1.1).
+-- These are the ONLY canonical coverage metric_kinds; the
+-- iter-1 evaluator removed `coverage_line` and
+-- `coverage_branch` aliases (item 4) so a `coverage_line`
+-- row MUST NOT be inserted by any downstream migration.
+-- Source-of-truth constants:
+--   `internal/ingest/coverage/cobertura.go` ->
+--     `MetricKindCoverageLineRatio`, `MetricKindCoverageBranchRatio`,
+--     `MetricVersion`.
+INSERT INTO clean_code.metric_kind
+       (metric_kind, metric_version, tier, pack, unit, description_md)
+VALUES ('coverage_line_ratio', 1, 'foundation', 'ingested', 'ratio',
+        'Per-file line-coverage ratio (lines_covered / lines_valid) '
+        'ingested from an external coverage publisher (Cobertura format) '
+        '(architecture Sec 1.4.1 row 16; tech-spec Sec 4.1.1).')
+ON CONFLICT (metric_kind) DO NOTHING;
+
+INSERT INTO clean_code.metric_kind
+       (metric_kind, metric_version, tier, pack, unit, description_md)
+VALUES ('coverage_branch_ratio', 1, 'foundation', 'ingested', 'ratio',
+        'Per-file branch-coverage ratio (branches_covered / branches_valid) '
+        'ingested from an external coverage publisher (Cobertura format) '
+        '(architecture Sec 1.4.1 row 16; tech-spec Sec 4.1.1).')
 ON CONFLICT (metric_kind) DO NOTHING;
 
 COMMIT;

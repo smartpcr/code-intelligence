@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 
 	"github.com/gofrs/uuid"
 )
@@ -14,10 +15,11 @@ import (
 // tech-spec Sec 8.5 -- `coverage`, `test_balance`, `churn`,
 // `defects` -- registers one implementation.
 //
-// Stage 4.1 ships ONE implementation: [ChurnVerbHandler]. The
-// remaining three verbs land in Stages 4.2-4.5 and plug into
-// the same interface; the Router does NOT change to add a
-// verb.
+// Stages 4.1 - 4.2 ship TWO implementations: [ChurnVerbHandler]
+// (Stage 4.1) and [CoverageVerbHandler] (Stage 4.2). The
+// remaining two verbs (`test_balance`, `defects`) land in
+// Stages 4.3 - 4.5 and plug into the same interface; the
+// Router does NOT change to add a verb.
 //
 // # Contract
 //
@@ -56,20 +58,53 @@ import (
 //
 //   - [ExtractMetadata] is called by the Router AFTER HMAC,
 //     verb, and content-type validation and BEFORE the
-//     idempotency claim. It parses the validated body and
-//     returns the (RepoID, SHA) tuple the Router needs to
-//     INSERT a durable scan_run row with `payload_hash` set
-//     (Stage 4.1 evaluator iter-1 #2). Returning an error
-//     short-circuits the Router into a structured 400/422
-//     response (mapped via [VerbErrorClassifier]); the
+//     payload_hash + idempotency claim. It receives the
+//     validated request headers (so verbs that carry
+//     `(repo_id, sha)` as HTTP headers -- e.g. test_balance,
+//     architecture Sec 6.4 line 1395 `ingest.test_balance(repo_id,
+//     sha, payload)`) can resolve the (RepoID, SHA) tuple
+//     without forcing those fields into the body. Returning
+//     an error short-circuits the Router into a structured
+//     400/422 response (mapped via [VerbErrorClassifier]); the
 //     idempotency claim and verb dispatch are NOT attempted.
+//     ExtractMetadata is the layer that validates UUID +
+//     SHA shapes and raises 400 sentinels.
 //
-//   - [Handle] materialises the validated body. The Router
-//     mints a fresh `scan_run_id` (returned by the
+//   - [CanonicalRequest] is called by the Router BEFORE
+//     HMAC verification and BEFORE [ExtractMetadata]. It MUST
+//     NOT validate metadata (validation lives in
+//     [ExtractMetadata], which runs AFTER auth). Each verb
+//     declares the canonical byte sequence the publisher
+//     signs and that the Router hashes for idempotency:
+//       * body-borne verbs (churn, defects): return `body`
+//         verbatim -- the publisher's HMAC over body is
+//         the canonical signature.
+//       * header-borne verbs (test_balance, coverage):
+//         return `body || 0x00 || normalised RepoID
+//         header || 0x00 || normalised SHA header`. The
+//         publisher MUST sign this canonical form so
+//         attempts to retarget the body to a different
+//         (repo, sha) by swapping headers fail HMAC.
+//     The Router uses the SAME bytes for `payload_hash`
+//     so two POSTs with identical bodies but different
+//     header targets do NOT collide on the idempotency
+//     claim. CanonicalRequest is intentionally lenient
+//     (no error return): it MUST emit bytes for any input
+//     (including malformed/missing headers) so that
+//     pre-auth probes cannot learn header taxonomy
+//     without a valid HMAC.
+//
+//   - [Handle] materialises the validated body under the
+//     metadata [ExtractMetadata] returned. The Router mints a
+//     fresh `scan_run_id` (returned by the
 //     ScanRunRepository.OpenExternal claim) and passes it in
 //     -- the handler MUST honour the id when persisting
 //     downstream records so the active-row uniqueness
 //     invariant (architecture Sec 5.2.1, tech-spec C1) holds.
+//     Passing `metadata` explicitly removes the double-decode
+//     trap iter-1 fell into (Handle had to re-parse the body
+//     just to find the RepoID); Handle now sees the resolved
+//     metadata directly.
 //
 // # Result envelope
 //
@@ -97,25 +132,98 @@ type VerbHandler interface {
 	// 0001 scan_run_sha_binding_consistent CHECK enforces).
 	SHABinding() string
 
-	// ExtractMetadata parses `body` and returns the
-	// [VerbPayloadMetadata] tuple the Router needs to open
-	// a durable scan_run row BEFORE dispatching Handle.
-	// MUST validate body shape sufficient to extract the
-	// metadata; deeper writer-side validation is the
+	// ExtractMetadata parses `headers` and/or `body` and
+	// returns the [VerbPayloadMetadata] tuple the Router
+	// needs to open a durable scan_run row BEFORE
+	// dispatching Handle. Verbs whose body carries
+	// `(repo_id, sha)` (e.g. churn, defects) consult `body`;
+	// verbs whose body is a bare row-array (e.g.
+	// test_balance, coverage) consult `headers` for
+	// [RepoIDHeader] and [SHAHeader]. MUST validate the
+	// metadata sufficient for the Router to open the
+	// scan_run row; deeper writer-side validation is the
 	// responsibility of [Handle]. Returns the verb's
 	// sentinel error on a missing / malformed metadata
 	// field so the Router's [VerbErrorClassifier] mapping
 	// produces the canonical 400 / 422.
-	ExtractMetadata(ctx context.Context, body []byte) (VerbPayloadMetadata, error)
+	ExtractMetadata(ctx context.Context, headers http.Header, body []byte) (VerbPayloadMetadata, error)
+
+	// CanonicalRequest returns the canonical byte sequence
+	// the publisher HMAC-signs and the Router hashes for
+	// `payload_hash`. Body-borne verbs return `body`
+	// verbatim; header-borne verbs MUST fold the target
+	// metadata (e.g. [RepoIDHeader] + [SHAHeader]) into the
+	// returned bytes using a stable canonicalisation
+	// (normalised case + trimmed whitespace) so the same
+	// logical target hashes to the same value.
+	//
+	// MUST NOT validate the headers or body (validation
+	// is owned by [ExtractMetadata] which runs AFTER auth).
+	// MUST NOT return an error: the Router calls
+	// CanonicalRequest BEFORE HMAC verification, so any
+	// pre-auth error path here would leak verb taxonomy to
+	// unauthenticated probes. Missing / malformed headers
+	// must produce stable canonical bytes (typically with
+	// empty header values) and fail HMAC verification
+	// downstream.
+	CanonicalRequest(headers http.Header, body []byte) []byte
 
 	// Handle materialises `body` under the supplied
-	// `scanRunID`. Returns the per-verb counter envelope on
+	// `metadata` (the [VerbPayloadMetadata] tuple
+	// [ExtractMetadata] already validated) and the
+	// Router-minted `scanRunID`. Passing metadata into
+	// Handle removes the iter-1 double-decode trap: Handle
+	// no longer has to re-parse the body to find the
+	// RepoID/SHA. Returns the per-verb counter envelope on
 	// success; any error short-circuits the Router into a
 	// structured response (status / code resolved via
 	// [VerbErrorClassifier] when implemented, else generic
 	// 500 / `INTERNAL_ERROR`).
-	Handle(ctx context.Context, body []byte, scanRunID uuid.UUID) (VerbHandleResult, error)
+	Handle(ctx context.Context, metadata VerbPayloadMetadata, body []byte, scanRunID uuid.UUID) (VerbHandleResult, error)
 }
+
+// RepoIDHeader is the canonical HTTP header carrying the
+// `clean_code.repo.repo_id` (UUID) the request targets.
+// Used by verbs whose body shape is a bare row-array (no
+// envelope) -- the architecture-level call signatures
+// (e.g. `ingest.test_balance(repo_id, sha, payload)` at
+// architecture Sec 6.4 line 1395) require both repo_id and
+// sha alongside the payload; the v1 transport surfaces
+// them as request headers so the body can match the
+// `e2e-scenarios.md` row-array shape verbatim.
+//
+// # Why a header (vs a body envelope)
+//
+// The docs (`e2e-scenarios.md:648`, `implementation-plan.md:396,400`)
+// specify the test_balance body as the bare JSON array
+// `[{"scope_id":...,"attempt_count":...,"pass_count":...}]`.
+// Putting `(repo_id, sha)` in headers preserves that body
+// shape verbatim. Header-borne verbs fold the canonical
+// (trimmed + lowercased) header value into the bytes
+// returned by [VerbHandler.CanonicalRequest], which the
+// Router uses for BOTH HMAC verification AND
+// `payload_hash`. Two POSTs with identical bodies but
+// different (repo, sha) targets therefore (a) cannot share
+// the same HMAC signature (the signed material differs),
+// and (b) cannot collide on the in-process idempotency
+// claim or the durable `(verb, payload_hash)` index.
+const RepoIDHeader = "X-Forge-Repo-ID"
+
+// SHAHeader is the canonical HTTP header carrying the
+// commit SHA the request targets. Required for verbs whose
+// scan_run carries `sha_binding='single'` (one SHA per
+// call: `ingest.coverage`, `ingest.test_balance`). Empty
+// for `sha_binding='per_row'` verbs (`ingest.churn`,
+// `ingest.defects`) -- each emitted row carries its own
+// SHA in the body, and `scan_run.to_sha` is NULL.
+//
+// # Format
+//
+// The publisher SHOULD send the canonical 40-character
+// lowercase hex commit SHA; per-verb validation may reject
+// non-canonical shapes (e.g. test_balance enforces the
+// `^[0-9a-fA-F]{40}$` regex).
+const SHAHeader = "X-Forge-SHA"
 
 // VerbPayloadMetadata is the tuple [VerbHandler.ExtractMetadata]
 // returns -- the parts of the validated body the Router needs
@@ -255,4 +363,3 @@ func canonicalSHABindingForKind(kind string) (string, bool) {
 		return "", false
 	}
 }
-

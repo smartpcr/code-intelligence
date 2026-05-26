@@ -9,6 +9,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/test_balance"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
@@ -147,8 +148,9 @@ func TestSeedMetricKindCatalog_RejectsEmptyFields(t *testing.T) {
 
 // TestMetricKindCatalogRowsForRegistry_CoversDefaultRegistry
 // pins that the canonical foundation-tier producers
-// (registered recipes PLUS the modification_count materialiser)
-// resolve to the metadata table; if a kind is added without a
+// (registered recipes PLUS the modification_count materialiser
+// PLUS the ingested pass_first_try_ratio kind) resolve to
+// the metadata table; if a kind is added without a
 // corresponding metadata entry, this test fails at compile
 // (build gate) and at run time.
 func TestMetricKindCatalogRowsForRegistry_CoversDefaultRegistry(t *testing.T) {
@@ -160,15 +162,20 @@ func TestMetricKindCatalogRowsForRegistry_CoversDefaultRegistry(t *testing.T) {
 	}
 	// 6 registered recipes (cyclo, cognitive_complexity, loc,
 	// lcom4, fan_in, fan_out) + 1 materialiser
-	// (modification_count_in_window) = 7 catalog rows.
-	const want = 7
+	// (modification_count_in_window) + 3 ingested kinds
+	// (pass_first_try_ratio, coverage_line_ratio,
+	// coverage_branch_ratio) = 10 catalog rows.
+	const want = 10
 	if got := len(rows); got != want {
-		t.Errorf("rows=%d, want %d (foundation registry + materialiser); got=%v", got, want, kindsOf(rows))
+		t.Errorf("rows=%d, want %d (foundation registry + materialiser + ingested); got=%v", got, want, kindsOf(rows))
 	}
 	expected := map[string]bool{
 		"cyclo": false, "cognitive_complexity": false, "loc": false,
 		"lcom4": false, "fan_in": false, "fan_out": false,
 		"modification_count_in_window": false,
+		"coverage_line_ratio":          false,
+		"coverage_branch_ratio":        false,
+		"pass_first_try_ratio":         false,
 	}
 	for _, r := range rows {
 		if _, ok := expected[r.MetricKind]; !ok {
@@ -180,7 +187,7 @@ func TestMetricKindCatalogRowsForRegistry_CoversDefaultRegistry(t *testing.T) {
 			t.Errorf("rows[%q].MetricVersion=%d (want >= 1)", r.MetricKind, r.MetricVersion)
 		}
 		if r.Tier != metric_ingestor.MetricKindTierFoundation {
-			t.Errorf("rows[%q].Tier=%q (want foundation -- the registry + materialiser are all foundation-tier)", r.MetricKind, r.Tier)
+			t.Errorf("rows[%q].Tier=%q (want foundation -- the registry + materialiser + ingested are all foundation-tier)", r.MetricKind, r.Tier)
 		}
 		if r.Unit == "" || r.DescriptionMD == "" {
 			t.Errorf("rows[%q] empty Unit (%q) or DescriptionMD (%q)", r.MetricKind, r.Unit, r.DescriptionMD)
@@ -190,6 +197,53 @@ func TestMetricKindCatalogRowsForRegistry_CoversDefaultRegistry(t *testing.T) {
 		if !seen {
 			t.Errorf("expected metric_kind=%q not produced by MetricKindCatalogRowsForRegistry", k)
 		}
+	}
+}
+
+// TestMetricKindCatalogRowsForRegistry_IncludesIngestedPassFirstTryRatio
+// is the Stage 4.3 iter-3 evaluator follow-up: the
+// composition-root VerifyMetricKindCatalog probe must SEE the
+// `pass_first_try_ratio` row that migration 0010 seeds, so
+// the catalog row builder MUST emit it with the EXACT
+// (kind, metric_version, tier, pack, unit) tuple the
+// migration writes. The test also pins that the version
+// the catalog builder reports matches the version the
+// `test_balance` producer stamps onto every emitted
+// MetricSample, so a producer version bump that forgets to
+// update [ingestedMetricKinds] fails this test (and hence
+// the build gate) at iteration time -- before drift can
+// reach production.
+func TestMetricKindCatalogRowsForRegistry_IncludesIngestedPassFirstTryRatio(t *testing.T) {
+	t.Parallel()
+	reg := recipes.DefaultRegistry()
+	rows, err := metric_ingestor.MetricKindCatalogRowsForRegistry(reg)
+	if err != nil {
+		t.Fatalf("MetricKindCatalogRowsForRegistry: err=%v, want nil", err)
+	}
+	var found *metric_ingestor.MetricKindCatalogRow
+	for i := range rows {
+		if rows[i].MetricKind == test_balance.MetricKind {
+			found = &rows[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("MetricKindCatalogRowsForRegistry: no row for metric_kind=%q -- VerifyMetricKindCatalog would NOT cover migration 0010", test_balance.MetricKind)
+	}
+	if got := found.MetricVersion; got != test_balance.MetricVersion {
+		t.Errorf("rows[%q].MetricVersion=%d; want %d (test_balance.MetricVersion -- update ingestedMetricKinds in metric_kind_catalog.go to track the producer)", test_balance.MetricKind, got, test_balance.MetricVersion)
+	}
+	if got := found.Tier; got != metric_ingestor.MetricKindTierFoundation {
+		t.Errorf("rows[%q].Tier=%q; want %q (architecture Sec 1.4.2 -- ingested kinds are foundation-tier)", test_balance.MetricKind, got, metric_ingestor.MetricKindTierFoundation)
+	}
+	if got, want := string(found.Pack), "ingested"; got != want {
+		t.Errorf("rows[%q].Pack=%q; want %q (migration 0010 inserts pack='ingested')", test_balance.MetricKind, got, want)
+	}
+	if got, want := found.Unit, "ratio"; got != want {
+		t.Errorf("rows[%q].Unit=%q; want %q (migration 0010 inserts unit='ratio')", test_balance.MetricKind, got, want)
+	}
+	if found.DescriptionMD == "" {
+		t.Errorf("rows[%q].DescriptionMD empty; want hand-curated text (foundationCatalogMetadata in metric_kind_catalog.go)", test_balance.MetricKind)
 	}
 }
 

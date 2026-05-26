@@ -9,6 +9,7 @@ import (
 
 	"github.com/lib/pq"
 
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/coverage"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/materialisers"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
@@ -78,12 +79,12 @@ const (
 // requires both PK natural-key columns to be populated for
 // the seeder's output to satisfy the downstream INSERT.
 type MetricKindCatalogRow struct {
-	MetricKind     string
-	MetricVersion  int
-	Tier           MetricKindTier
-	Pack           recipes.Pack
-	Unit           string
-	DescriptionMD  string
+	MetricKind    string
+	MetricVersion int
+	Tier          MetricKindTier
+	Pack          recipes.Pack
+	Unit          string
+	DescriptionMD string
 }
 
 // foundationCatalogMetadata is the hand-curated per-kind
@@ -136,6 +137,18 @@ var foundationCatalogMetadata = map[string]struct {
 		Unit:          "count",
 		DescriptionMD: "Number of file modifications observed within the configured window_days for a given scope (architecture Sec 1.4.1 row 12; tech-spec Sec 8.2).",
 	},
+	"coverage_line_ratio": {
+		Unit:          "ratio",
+		DescriptionMD: "Per-file line-coverage ratio (lines_covered / lines_valid) ingested from an external coverage publisher (architecture Sec 1.4.1 row 16; tech-spec Sec 4.1.1 -- the ONLY canonical line-coverage metric_kind, with `coverage_line` and `coverage_lines_covered_ratio` aliases removed per iter-1 evaluator item 4).",
+	},
+	"coverage_branch_ratio": {
+		Unit:          "ratio",
+		DescriptionMD: "Per-file branch-coverage ratio (branches_covered / branches_valid) ingested from an external coverage publisher (architecture Sec 1.4.1 row 16; tech-spec Sec 4.1.1 -- the ONLY canonical branch-coverage metric_kind, with `coverage_branch` and `coverage_branches_covered_ratio` aliases removed per iter-1 evaluator item 4).",
+	},
+	"pass_first_try_ratio": {
+		Unit:          "ratio",
+		DescriptionMD: "Fraction of test attempts that passed on the first try per scope; ingested via `ingest.test_balance` (architecture Sec 1.4.2; tech-spec Sec 8.5).",
+	},
 }
 
 // packToTier maps a [recipes.Pack] to the closed-set
@@ -155,26 +168,85 @@ func packToTier(p recipes.Pack) (MetricKindTier, error) {
 	}
 }
 
+// ingestedMetricKinds enumerates the foundation-tier kinds
+// that publishers UPLOAD through the `internal/ingest/...`
+// HTTP verbs (NOT in the recipe registry, NOT a
+// materialiser) but still write metric_sample rows through
+// the SAME [PGMetricSampleWriter]. Listing them here is what
+// makes the composition-root [VerifyMetricKindCatalog]
+// probe COVER the ingested-row migrations -- without this
+// list, a fresh process would come up against a catalog
+// missing the ingested kinds and only fail at the first
+// metric_sample INSERT, not at /readyz.
+//
+// COORDINATION RULE -- bumping the producer's version is a
+// THREE-step edit:
+//
+//  1. bump the producer's `Metric{Kind,Version}` constants
+//     (e.g. `internal/ingest/test_balance.MetricVersion`),
+//  2. bump the `Version` field below to match,
+//  3. land a `migrations/00XX_seed_<kind>_v<N>.up.sql` row
+//     for the new (kind, metric_version) tuple (existing
+//     catalog rows are immutable; the catalog stores one
+//     row per emitted version, not just the latest).
+//
+// We hand-curate (rather than importing producer constants
+// directly) because the producer packages depend on
+// [metric_ingestor] for `MetricSampleWriter`, so importing
+// the constants here would introduce a package import
+// cycle. The coordination rule above is enforced by the
+// VerifyMetricKindCatalog "version drift" check: a producer
+// that has bumped its constant without bumping this list
+// (or its migration) fails fast at startup with
+// [ErrMetricKindCatalogVersionDrift].
+//
+// Tier is implicit (`foundation`) because all ingested
+// kinds today live at architecture Sec 1.4.2's ingested
+// foundation-tier slot; if a future ingested kind needs
+// a different tier, add a Tier field to the struct.
+var ingestedMetricKinds = []struct {
+	Kind    string
+	Version int
+}{
+	// pass_first_try_ratio -- produced by
+	// `internal/ingest/test_balance.Writer` (Stage 4.3).
+	// MUST track `test_balance.MetricKind` /
+	// `test_balance.MetricVersion`.
+	{Kind: "pass_first_try_ratio", Version: 1},
+	// Coverage kinds (Stage 4.2) -- produced by the Cobertura
+	// parser in `internal/ingest/coverage` and uploaded via
+	// the `/v1/ingest/coverage` webhook. The coverage package
+	// does NOT import `metric_ingestor`, so referencing the
+	// producer constants here does NOT introduce an import
+	// cycle (the hand-curated string-literal rule above
+	// applies to producers that depend on
+	// [PGMetricSampleWriter]).
+	{Kind: coverage.MetricKindCoverageLineRatio, Version: coverage.MetricVersion},
+	{Kind: coverage.MetricKindCoverageBranchRatio, Version: coverage.MetricVersion},
+}
+
 // MetricKindCatalogRowsForRegistry returns the canonical
 // [MetricKindCatalogRow] slice for every recipe registered
 // in `reg` PLUS the foundation-tier materialiser
-// (`modification_count_in_window`) -- the latter is NOT a
-// recipe (the architecture splits AST-emitted kinds from
-// churn-derived kinds; see
-// `internal/metrics/materialisers/modification_count.go:74-89`)
-// but writes through the SAME [PGMetricSampleWriter] and so
-// shares the FK requirement on `clean_code.metric_kind`.
+// (`modification_count_in_window`) PLUS the foundation-tier
+// ingested kinds enumerated in [ingestedMetricKinds] (e.g.
+// `pass_first_try_ratio` from
+// `internal/ingest/test_balance`). All three sources write
+// through the SAME [PGMetricSampleWriter] and so share the
+// FK requirement on `clean_code.metric_kind`.
 //
 // Returns [ErrMetricKindCatalogMissingMetadata] (wrapped with
 // the offending metric_kind) on any kind that has no entry
 // in [foundationCatalogMetadata]. Adding a new recipe / new
-// materialiser is therefore a coordinated three-step edit:
+// materialiser / new ingested kind is therefore a coordinated
+// three-step edit:
 //
-//  1. land the recipe (`internal/metrics/recipes/<kind>.go`)
-//     or materialiser (`internal/metrics/materialisers/<kind>.go`),
-//  2. register it in `recipes.DefaultRegistry` (recipes path
-//     only -- materialisers are picked up implicitly),
-//  3. add the (unit, description) entry here.
+//  1. land the producer (recipe / materialiser / ingest writer),
+//  2. register it (recipes -> `recipes.DefaultRegistry`;
+//     materialisers -> picked up implicitly here;
+//     ingested -> append to [ingestedMetricKinds]),
+//  3. add the (unit, description) entry to
+//     [foundationCatalogMetadata].
 //
 // Skipping step 3 surfaces at startup, not at first
 // metric_sample write, which is the structural property the
@@ -184,7 +256,7 @@ func MetricKindCatalogRowsForRegistry(reg *recipes.Registry) ([]MetricKindCatalo
 		return nil, errors.New("metric_ingestor: MetricKindCatalogRowsForRegistry: registry is nil")
 	}
 
-	out := make([]MetricKindCatalogRow, 0, len(reg.Recipes())+1)
+	out := make([]MetricKindCatalogRow, 0, len(reg.Recipes())+1+len(ingestedMetricKinds))
 
 	for _, r := range reg.Recipes() {
 		kind := r.MetricKind()
@@ -225,6 +297,29 @@ func MetricKindCatalogRowsForRegistry(reg *recipes.Registry) ([]MetricKindCatalo
 		DescriptionMD: matMeta.DescriptionMD,
 	})
 
+	// Foundation-tier INGESTED kinds (Stage 4.2 coverage,
+	// Stage 4.3 test_balance, ...). NOT in the recipe
+	// registry (no AST adapter produces them) and not a
+	// materialiser (no recipe-emitted foundation row to
+	// derive from); they are publisher-uploaded through the
+	// `internal/ingest/...` HTTP verbs. The verb writers go
+	// through the same PGMetricSampleWriter so the FK must be
+	// satisfied for the writer's INSERTs to succeed.
+	for _, ik := range ingestedMetricKinds {
+		ingMeta, ok := foundationCatalogMetadata[ik.Kind]
+		if !ok {
+			return nil, fmt.Errorf("%w: metric_kind=%q (ingested metadata missing -- add to foundationCatalogMetadata)", ErrMetricKindCatalogMissingMetadata, ik.Kind)
+		}
+		out = append(out, MetricKindCatalogRow{
+			MetricKind:    ik.Kind,
+			MetricVersion: ik.Version,
+			Tier:          MetricKindTierFoundation,
+			Pack:          recipes.PackIngested,
+			Unit:          ingMeta.Unit,
+			DescriptionMD: ingMeta.DescriptionMD,
+		})
+	}
+
 	// Deterministic ordering for log reproducibility (G2).
 	sort.Slice(out, func(i, j int) bool { return out[i].MetricKind < out[j].MetricKind })
 	return out, nil
@@ -243,8 +338,8 @@ func MetricKindCatalogRowsForRegistry(reg *recipes.Registry) ([]MetricKindCatalo
 // role (NOT under the runtime `clean_code_metric_ingestor`
 // role, which lacks INSERT on `metric_kind` per
 // `migrations/0004_roles.up.sql:350-355`). The composition
-// root in `cmd/clean-coded/main.go` deliberately does NOT
-// call this function -- it calls only
+// root in `cmd/clean-code-metric-ingestor/main.go`
+// deliberately does NOT call this function -- it calls only
 // [VerifyMetricKindCatalog] (SELECT-only) to fail fast on
 // version drift between the in-process producer registry
 // and the rows the migration already seeded.
@@ -337,11 +432,13 @@ func SeedMetricKindCatalog(ctx context.Context, db *sql.DB, schema string, rows 
 // VerifyMetricKindCatalog confirms that every expected
 // `(metric_kind, metric_version)` pair in `rows` is reflected
 // in the on-disk `<schema>.metric_kind` table. This is the
-// PRODUCTION composition-root fence: `cmd/clean-coded/main.go`
-// invokes it immediately after opening the shared `*sql.DB`
-// and BEFORE building the Metric Ingestor, so a fresh
-// process refuses to come up against a catalog that would
-// FK-reject the first `metric_sample` write.
+// PRODUCTION composition-root fence:
+// `cmd/clean-code-metric-ingestor/main.go` invokes it
+// (via the `verifyMetricKindCatalog` helper) immediately
+// after opening the ingestor `*sql.DB` and BEFORE building
+// the sweep loop / mounting the routers, so a fresh process
+// refuses to come up against a catalog that would FK-reject
+// the first `metric_sample` write.
 //
 // SELECT-only -- the runtime `clean_code_metric_ingestor`
 // role has SELECT on `clean_code.metric_kind` via the

@@ -1111,10 +1111,13 @@ func (h *failingFakeVerbHandler) Verb() string        { return "churn" }
 func (h *failingFakeVerbHandler) ContentType() string { return "application/json" }
 func (h *failingFakeVerbHandler) ScanRunKind() string { return "external_per_row" }
 func (h *failingFakeVerbHandler) SHABinding() string  { return "per_row" }
-func (h *failingFakeVerbHandler) ExtractMetadata(ctx context.Context, body []byte) (webhook.VerbPayloadMetadata, error) {
+func (h *failingFakeVerbHandler) CanonicalRequest(_ http.Header, body []byte) []byte {
+	return body
+}
+func (h *failingFakeVerbHandler) ExtractMetadata(_ context.Context, _ http.Header, _ []byte) (webhook.VerbPayloadMetadata, error) {
 	return webhook.VerbPayloadMetadata{RepoID: h.repoID}, nil
 }
-func (h *failingFakeVerbHandler) Handle(ctx context.Context, body []byte, scanRunID uuid.UUID) (webhook.VerbHandleResult, error) {
+func (h *failingFakeVerbHandler) Handle(_ context.Context, _ webhook.VerbPayloadMetadata, _ []byte, _ uuid.UUID) (webhook.VerbHandleResult, error) {
 	return webhook.VerbHandleResult{}, h.err
 }
 

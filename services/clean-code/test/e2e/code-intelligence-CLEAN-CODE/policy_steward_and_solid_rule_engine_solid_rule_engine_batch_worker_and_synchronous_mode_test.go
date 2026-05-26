@@ -370,20 +370,16 @@ func (s *solidRuleEngineState) noFindingRowIsAppendedForThatScopeAndRule() error
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Scope the count to this run's SHA. The feature file hardcodes the
-	// scope string ("repo-a/src/BigClass.cs"), so without the sha filter
-	// stale finding rows from a prior run against the same DB would cause
-	// a false failure here. mutedSHA is generated per-run via uniqueSHA().
 	var count int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM finding WHERE scope_id = $1 AND rule_id = $2 AND sha = $3`,
-		s.mutedScope, s.mutedRuleID, s.mutedSHA).Scan(&count)
+		`SELECT COUNT(*) FROM finding WHERE scope_id = $1 AND rule_id = $2`,
+		s.mutedScope, s.mutedRuleID).Scan(&count)
 	if err != nil {
 		return fmt.Errorf("querying findings for muted scope: %w", err)
 	}
 	if count != 0 {
-		return fmt.Errorf("expected 0 findings for muted scope %s/%s at sha %s, got %d",
-			s.mutedScope, s.mutedRuleID, s.mutedSHA, count)
+		return fmt.Errorf("expected 0 findings for muted scope %s/%s, got %d",
+			s.mutedScope, s.mutedRuleID, count)
 	}
 	return nil
 }
@@ -669,34 +665,66 @@ func (s *solidRuleEngineState) allRowsWereCommittedInTheSameTransaction() error 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Verify atomicity: all three entity types reference the same run ID
-	// and all exist (if any were missing the prior steps would have failed,
-	// but we double-check counts here).
-	var runCount, verdictCount, findingCount int
+	// Atomicity proof via Postgres `xmin`: every row stores the xid of the
+	// transaction that inserted it. Rows inserted in the *same* transaction
+	// share an identical xmin; three sequential commits would produce three
+	// distinct xmins. Comparing xmin across evaluation_run, evaluation_verdict,
+	// and every finding for this run is therefore a strong proxy for "all
+	// rows were committed in the same transaction" — much stronger than just
+	// checking the rows exist.
+	//
+	// Caveat: VACUUM FREEZE could in theory rewrite xmin to FrozenTransactionId,
+	// but that only happens on long-lived rows well past freeze thresholds,
+	// not on rows we just inserted seconds earlier in this test.
+	var runXmin, verdictXmin string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM evaluation_run WHERE id = $1`, s.syncRunID).Scan(&runCount)
+		`SELECT xmin::text FROM evaluation_run WHERE id = $1`,
+		s.syncRunID).Scan(&runXmin)
 	if err != nil {
-		return fmt.Errorf("counting evaluation_run: %w", err)
+		return fmt.Errorf("reading evaluation_run xmin for run %s: %w", s.syncRunID, err)
 	}
-	err = s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM evaluation_verdict WHERE evaluation_run_id = $1`, s.syncRunID).Scan(&verdictCount)
-	if err != nil {
-		return fmt.Errorf("counting evaluation_verdict: %w", err)
-	}
-	err = s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM finding WHERE evaluation_run_id = $1`, s.syncRunID).Scan(&findingCount)
-	if err != nil {
-		return fmt.Errorf("counting findings: %w", err)
+	if runXmin == "" || runXmin == "0" {
+		return fmt.Errorf("evaluation_run xmin is empty/zero for run %s (unexpected)", s.syncRunID)
 	}
 
-	if runCount != 1 {
-		return fmt.Errorf("expected 1 evaluation_run, got %d", runCount)
+	err = s.db.QueryRowContext(ctx,
+		`SELECT xmin::text FROM evaluation_verdict WHERE evaluation_run_id = $1`,
+		s.syncRunID).Scan(&verdictXmin)
+	if err != nil {
+		return fmt.Errorf("reading evaluation_verdict xmin for run %s: %w", s.syncRunID, err)
 	}
-	if verdictCount != 1 {
-		return fmt.Errorf("expected 1 evaluation_verdict, got %d", verdictCount)
+	if verdictXmin != runXmin {
+		return fmt.Errorf("evaluation_verdict xmin=%s != evaluation_run xmin=%s "+
+			"(rows were NOT committed in the same transaction)",
+			verdictXmin, runXmin)
+	}
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, xmin::text FROM finding WHERE evaluation_run_id = $1`,
+		s.syncRunID)
+	if err != nil {
+		return fmt.Errorf("reading finding xmins for run %s: %w", s.syncRunID, err)
+	}
+	defer rows.Close()
+
+	var findingCount int
+	for rows.Next() {
+		var findingID, findingXmin string
+		if err := rows.Scan(&findingID, &findingXmin); err != nil {
+			return fmt.Errorf("scanning finding xmin row: %w", err)
+		}
+		if findingXmin != runXmin {
+			return fmt.Errorf("finding %s xmin=%s != evaluation_run xmin=%s "+
+				"(rows were NOT committed in the same transaction)",
+				findingID, findingXmin, runXmin)
+		}
+		findingCount++
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating finding xmins: %w", err)
 	}
 	if findingCount < 1 {
-		return fmt.Errorf("expected at least 1 finding, got %d", findingCount)
+		return fmt.Errorf("expected at least 1 finding for run %s, got 0", s.syncRunID)
 	}
 	return nil
 }
@@ -786,18 +814,6 @@ func InitializeScenario_policy_steward_and_solid_rule_engine_solid_rule_engine_b
 		s.allRowsWereCommittedInTheSameTransaction)
 	ctx.Step(`^the verdict column matches the severity rollup of unmuted findings$`,
 		s.theVerdictColumnMatchesSeverityRollupOfUnmutedFindings)
-
-	// FIX (review): close db after every scenario so connections don't leak
-	// until process exit. Without this, each scenario's lazy ensureDB opens
-	// a fresh pool that is never released, leaking ~4 pools across this
-	// suite's scenarios.
-	ctx.After(func(ctx context.Context, _ *godog.Scenario, _ error) (context.Context, error) {
-		if s.db != nil {
-			_ = s.db.Close()
-			s.db = nil
-		}
-		return ctx, nil
-	})
 }
 
 func TestE2E_policy_steward_and_solid_rule_engine_solid_rule_engine_batch_worker_and_synchronous_mode(t *testing.T) {

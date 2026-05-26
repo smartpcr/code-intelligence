@@ -4,6 +4,288 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 6.1 -- Evaluator gate verb and synchronous SOLID delegation
+
+### Iter 5 -- second canonical-verb fix in Stage 6.1 runbook
+
+Targeted doc-only fix addressing the iter-6 evaluator item:
+the Stage 6.1 operator-triage bullet for HTTP 200 with
+`degraded_reason='samples_pending'` referenced a fictional
+management-scoped scan-status verb that does NOT exist in
+the canonical set. The canonical `mgmt.*` set per
+implementation-plan.md:21 is `{mgmt.override,
+mgmt.register_repo, mgmt.set_mode, mgmt.retract_sample,
+mgmt.rescan, mgmt.read.*}`, and there is no
+management-scoped scan-status verb anywhere in the
+architecture or the implementation-plan. `scan_status` is
+actually a COLUMN on the `clean_code.commit` table (the
+Metric Ingestor is its sole writer per the Stage 3.2
+section of this runbook), not a callable verb.
+
+- **`docs/runbook.md:122-131`** (Stage 6.1 operator-triage
+  bullet for `samples_pending`): the inspection guidance
+  now reads "Inspect the underlying state with a direct
+  table read -- `SELECT scan_status FROM clean_code.commit
+  WHERE repo_id = '<uuid>' AND sha = '<hex>'` -- and wait
+  for the metric ingestor to catch up", with a cross-
+  reference to the Stage 3.2 runbook section that
+  documents `commit.scan_status` as the canonical
+  writer-owned column. After this fix a literal
+  `grep -rnF` for the prior non-canonical token returns
+  no hits in any product / doc file (the only remaining
+  hits are in `.forge/iter-notes.md`, which is git-
+  excluded scratch space describing the fix itself).
+
+After this fix, a broad sweep over the Stage 6.1 runbook
+and rollout sections shows ONLY canonical verb tokens
+appearing: `eval.gate` (canonical per impl-plan:21) and
+`policy.activate` (canonical per impl-plan:21). No other
+`mgmt.*` / `ingest.*` / `policy.*` / `eval.*` tokens
+appear in the Stage 6.1 sections, so there is no further
+opportunity for canonical-verb drift in the prose.
+
+This iter changes ONLY `docs/runbook.md` and this
+CHANGELOG; no Go source / test edits. `go build ./...`
+and the iter-2 test baseline both remain green.
+
+### Iter 4 -- canonical-verb fix in Stage 6.1 docs
+
+Targeted doc-only fix addressing the iter-5 evaluator item:
+the new Stage 6.1 sections added in iter 3 referenced the
+non-canonical `mgmt`-prefixed form of the activation verb
+as the remediation for the no-active-policy HTTP 409. The
+canonical verb name is `policy.activate` per architecture
+Sec 5.3.4 (architecture.md:1412), tech-spec Sec 8.5 lines
+963-970, and implementation-plan Scenario
+`runbook-references-canonical-verbs` (impl-plan:911) which
+explicitly enumerates the canonical verb set as
+`{mgmt.register_repo, mgmt.retract_sample, mgmt.rescan,
+mgmt.override, policy.publish, policy.activate, eval.gate}`.
+
+- **`docs/runbook.md:70`** (Stage 6.1 status-code matrix
+  row for 409): the no-active-policy remediation now reads
+  "Activate a policy via the canonical `policy.activate`
+  verb (`POST /v1/policy/activate` on the Policy Steward)
+  before invoking `eval.gate`."
+- **`docs/runbook.md:109-115`** (Stage 6.1 operator-triage
+  bullet for HTTP 409): replaced the prior non-canonical
+  prose with a curl example against the canonical
+  `POST /v1/policy/activate` route plus a cross-reference
+  to the Stage 5.2 `policy.activate` runbook section that
+  already documents the body schema (line 935) and the
+  request body shape (line 975).
+- **`docs/rollout.md:42-48`** (Stage 6.1 migration sequence
+  step 1): now reads "Activation is the canonical
+  `policy.activate` write verb on the Policy Steward
+  (`POST /v1/policy/activate`)" plus cross-references to
+  both the Stage 5.2 `policy.activate` runbook section
+  and the `## Stage 5.2: Policy publish/activate/rulepack
+  verbs` rollout section.
+
+After the replacements, the runbook and rollout reference
+ONLY the canonical verb name; the HTTP route
+(`POST /v1/policy/activate`) was already correctly named
+everywhere and is unchanged. No Go source / test edits this
+iter; `go build ./...` and the iter-2 test baseline
+(`go test ./internal/evaluator/ ./cmd/clean-code-eval-gate/`)
+both remain green.
+
+### Iter 3 -- operator documentation (runbook + rollout)
+
+Documentation-only iter; no Go source or test changes. The
+Stage 6.1 product behaviour shipped in iters 1-2 is already
+pass-quality per the iter-2 evaluator (score 93, "no
+remaining workstream-blocking issues") and the iter-3/4
+evaluators (both 89 -- regression purely on iter-notes
+narrative protocol, not on code). This iter closes the
+remaining workstream-target doc gap by adding operator-
+facing sections to two ground-truth-tracked files.
+
+- **`docs/runbook.md`**: NEW top-section
+  `## Stage 6.1 -- eval.gate verb and synchronous SOLID delegation`.
+  Documents (a) the two HTTP routes (canonical
+  `POST /v1/eval/gate` rejecting caller-supplied
+  `policy_version_id` with HTTP 400; admin
+  `POST /v1/eval/replay` accepting an explicit pvid),
+  (b) the shared response shape with the canonical
+  `pass | warn | block` verdict enum and the closed
+  `degraded_reason` set
+  (`samples_pending`, `policy_signature_invalid`,
+  `xrepo_edges_unavailable`; `percentile_stale` is
+  Insights-only and REJECTED at the gate's writer
+  boundary), (c) the HTTP status code matrix
+  (200 / 400 / 405 / 409 / 500), (d) the four-step
+  sequence per architecture Sec 3.7 lines 548-570
+  (resolve active policy → verify signature → check
+  samples readiness → delegate to `rule_engine.RunSync`),
+  and (e) an operator-triage checklist mapping each
+  observable response shape to its corrective action
+  (HTTP 409 → activate a policy; degraded=true → check
+  steward signing key OR wait for ingestor catchup; etc.).
+
+- **`docs/rollout.md`**: NEW top-section
+  `## Stage 6.1: eval.gate verb and synchronous SOLID delegation`.
+  Documents (a) the three behavioural changes vs. Stage
+  5.7 iter 4 (bypass rejection on canonical route; new
+  admin `/v1/eval/replay` route; HTTP 409 on no active
+  policy in place of the prior 500), (b) explicit
+  confirmation that no new env vars are introduced
+  (the Stage 5.7 iter 4 `CLEAN_CODE_EVALUATOR_PG_URL`
+  is reused unchanged), (c) the migration sequence
+  (ensure `policy_activation` row exists → verify
+  persisted signature → deploy the Stage 6.1 binary
+  → run cutover smoke test → run bypass-regression
+  smoke test), (d) the rollback procedure (binary swap
+  only; no DB rollback required since the audit-row
+  schema is unchanged), and (e) an observability
+  checklist naming two counters
+  (`clean_code_eval_gate_requests_total{route, status}`
+  and `clean_code_eval_gate_degraded_total{reason}`).
+
+These doc additions touch ONLY ground-truth-tracked files
+(`services/clean-code/docs/runbook.md`,
+`services/clean-code/docs/rollout.md`, and this
+`CHANGELOG.md`) and do not change Go source, tests, or
+behaviour. `go build ./...` and the iter-2 test baseline
+(`go test ./internal/evaluator/ ./cmd/clean-code-eval-gate/`)
+both remain green.
+
+### Iter 2 -- canonical-verb surface lockdown + production wiring + live audit test
+
+Addressed all three numbered items from iter 1 evaluator feedback.
+
+- **`cmd/clean-code-eval-gate/main.go`**:
+  - **REJECT `policy_version_id` on `/v1/eval/gate`**
+    (iter 1 evaluator #1). The canonical verb's contract
+    (architecture Sec 3.7) is `eval.gate(repo_id, sha,
+    scope?)` -- a caller-supplied pvid would bypass the
+    Steward's activation governance. The handler now
+    sniffs the raw body via `rejectExtraPolicyVersionField`
+    and returns HTTP 400 when the field is present; the
+    canonical `evalGateRequest` struct has NO `policy_version_id`
+    field.
+  - **NEW admin route `/v1/eval/replay`** for batch tooling /
+    reconciler replay / dry-runs that require an explicit
+    `policy_version_id`. Invokes `Gate.Evaluate` directly.
+    Uses a separate `replayRequest` struct; required field
+    returns HTTP 400 when omitted (with a pointer at
+    `/v1/eval/gate` for canonical callers).
+  - **Use `rule_engine.NewEvaluatorAdapter`** in the
+    composition root (iter 1 evaluator #2). Replaced the
+    duplicate local `engineAdapter` (now deleted; ~30
+    lines removed) with the canonical adapter. The
+    package-level adapter has a compile-time assertion
+    (`var _ evaluator.RuleEngine = (*EvaluatorAdapter)(nil)`)
+    and re-validates verdict canonicality so a smuggled
+    non-canonical value is rejected at the adapter
+    boundary.
+  - Extracted `writeEvalResponse` helper so both routes
+    project the audit shape uniformly.
+
+- **`cmd/clean-code-eval-gate/main_test.go`**:
+  - **INVERTED** `TestEvalHandler_ExplicitPolicyVersion_StillSupported`
+    (iter 1) into
+    `TestEvalHandler_ExplicitPolicyVersion_Rejected400`.
+    Asserts the canonical verb returns 400 + the body
+    points the caller at the admin route.
+  - Added `TestReplayHandler_AcceptsExplicitPolicyVersion`
+    and `TestReplayHandler_MissingPolicyVersion_Returns400`
+    to pin the new admin surface.
+
+- **`internal/evaluator/sql_degraded_store_live_test.go`**
+  (NEW, iter 1 evaluator #3): Live-PG SQL-backed
+  integration test wiring the PRODUCTION
+  `SQLDegradedRunStore` through `Gate.Gate`. Drives BOTH
+  degraded short-circuits (signature-invalid and
+  samples-pending) and asserts the canonical Audit schema
+  in the actual rows:
+  - ONE `evaluation_run` row with `caller='eval_gate'`,
+    non-null `policy_version_id`, non-null `created_at`,
+    matching `repo_id` and `sha`.
+  - ONE `evaluation_verdict` row with `evaluation_run_id`
+    FK matching (NEVER NULL), `verdict='warn'`,
+    `degraded=true`, `degraded_reason` matching the
+    canonical sentinel, non-null `created_at` (NEVER
+    `settled_at`).
+  - The Rule Engine is NOT invoked on either short-circuit
+    (the `liveStubEngine.called` flag stays false).
+
+  Uses an isolated schema (`clean_code_evaluator_live_test`),
+  reuses the `CLEAN_CODE_PG_URL` env-var pattern from
+  `rule_engine/sql_store_test.go`, and skips when the env
+  var is unset. Verified locally against PG 14: both
+  subtests pass.
+
+### Iter 1 -- canonical `eval.gate(repo_id, sha, scope?)` verb
+
+Closed the verb-signature gap left by Stage 5.7. The prior
+`Gate.Evaluate(ctx, repoID, sha, scope, policyVersionID)`
+expected the caller to supply `policy_version_id`, but the
+Stage 6.1 brief (architecture Sec 3.7 lines 548-570) defines
+the verb as `eval.gate(repo_id, sha, scope?)` -- step (1)
+requires the gate itself to "resolve active
+`policy_version_id` via latest `policy_activation` row".
+
+- **`internal/evaluator/gate_evaluate.go`**:
+  - Added `PolicyActivationReader` narrow port:
+    `ActivePolicyVersionID(ctx) (uuid.UUID, bool, error)`.
+  - Added `ErrNoActivePolicy` sentinel for the fresh-deploy
+    steady state (no activation row exists yet). NOT a
+    degraded reason (canonical set is
+    `samples_pending | policy_signature_invalid |
+    xrepo_edges_unavailable`); no audit row is written
+    because `evaluation_run.policy_version_id` is
+    non-nullable.
+  - Added `ErrActivationUnwired` sentinel so a
+    composition-root wiring bug is loudly distinguished
+    from the fresh-deploy `ErrNoActivePolicy` state.
+  - Added `Activation PolicyActivationReader` field to
+    `EvaluateConfig` and to `*Gate`.
+  - Added `Gate.Gate(ctx, repoID, sha, scope) (EvaluateResult, error)`
+    method: the canonical verb entry point. Resolves the
+    active `policy_version_id` then delegates to
+    `Gate.Evaluate` for steps (2)-(5) of the brief
+    (signature verify, sample readiness, sync rule engine
+    delegation, no-double-write). Defence in depth: a
+    `(uuid.Nil, true, nil)` reply from the activation
+    reader is rejected with an explicit error.
+
+- **`internal/evaluator/production_gate.go`**:
+  - Added `stewardActivationAdapter` bridging
+    `*steward.Steward.ActivePolicyVersion` (returns a
+    `(PolicyVersion, bool, error)`) onto the gate's
+    narrow `PolicyActivationReader` interface.
+  - Wired the adapter through `NewProductionGate` so the
+    production composition root supports `Gate.Gate`
+    out-of-the-box.
+
+- **`cmd/clean-code-eval-gate/main.go`**:
+  - `policy_version_id` is now OPTIONAL in the JSON
+    request body. Omitted → handler calls `Gate.Gate`
+    (canonical Stage 6.1 verb path). Supplied →
+    handler calls `Gate.Evaluate` (lower-level explicit
+    path, retained for batch tooling / replay).
+  - `ErrNoActivePolicy` maps to HTTP 409 Conflict so the
+    operational-state response is distinct from a 500
+    internal failure or the degraded `200 + warn` reply.
+
+- **Tests**:
+  - `internal/evaluator/gate_evaluate_test.go` adds nine
+    `TestGate_Gate_*` cases pinning: happy-path
+    resolution + delegation; no-activation returns
+    `ErrNoActivePolicy` with NO audit row; lookup-error
+    wrapping (no misclassification as `ErrNoActivePolicy`);
+    zero-uuid+ok rejection; unwired activation returns
+    `ErrActivationUnwired`; scope propagation; nil
+    receiver safety; signature-invalid degraded path via
+    resolved pvid; samples-pending degraded path via
+    resolved pvid.
+  - `cmd/clean-code-eval-gate/main_test.go` (NEW) adds
+    six handler-level tests: omitted pvid invokes verb;
+    no activation returns 409; explicit pvid still
+    supported; degraded path returns 200; bad method
+    returns 405; invalid repo_id returns 400.
+
 ## Stage 4.1 -- Webhook transport and HMAC verification
 
 ### Iter 9 (eliminate the lone surviving stale-sentinel quote from iter-8's changelog text)

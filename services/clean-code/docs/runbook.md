@@ -4,6 +4,139 @@ Operational guide for the clean-code service. Add a new
 section here as each subsystem ships against the production
 composition root (`cmd/clean-coded/main.go`).
 
+## Stage 6.1 -- `eval.gate` verb and synchronous SOLID delegation
+
+This section captures the operator-facing contract of the
+Stage 6.1 verb `eval.gate(repo_id, sha, scope?)`. See
+`cmd/clean-code-eval-gate/main.go` for the HTTP surface and
+`internal/evaluator/gate_evaluate.go` for the verb itself.
+
+### Two HTTP routes -- canonical vs. admin
+
+The `clean-code-eval-gate` binary exposes TWO routes; each
+has a distinct contract.
+
+- **`POST /v1/eval/gate`** (canonical). Body:
+  `{ "repo_id": "<uuid>", "sha": "<hex>", "scope": "<uuid?>" }`.
+  Per architecture Sec 3.7 lines 548-570, the verb's signature
+  is `eval.gate(repo_id, sha, scope?)` -- it does NOT take a
+  `policy_version_id`. Step (1) of the brief mandates that
+  the gate resolve the active `policy_version_id` itself via
+  the latest `clean_code.policy_activation` row. A
+  caller-supplied `policy_version_id` is REJECTED with HTTP
+  400 and an error body pointing the caller at
+  `/v1/eval/replay`. This guards against a rogue client
+  pinning findings to an inactive (or revoked) policy and
+  bypassing the steward's activation governance.
+
+- **`POST /v1/eval/replay`** (NON-CANONICAL admin). Body:
+  `{ "repo_id": "<uuid>", "sha": "<hex>", "policy_version_id": "<uuid>", "scope": "<uuid?>" }`.
+  Required for batch tooling, reconciler replay, and dry-runs
+  against a candidate policy that has not yet been activated.
+  Callers MUST be authenticated with an admin grant; bind
+  this route to an admin-only network path (e.g. internal
+  subnet, mTLS-gated) so unauthenticated clients cannot pin
+  evaluations to arbitrary policies.
+
+### HTTP response shape (both routes)
+
+Both routes return the same JSON shape on success:
+
+```json
+{
+  "evaluation_run_id":     "<uuid>",
+  "evaluation_verdict_id": "<uuid>",
+  "finding_ids":           ["<uuid>", ...],
+  "verdict":               "pass" | "warn" | "block",
+  "degraded":              false | true,
+  "degraded_reason":       "" | "policy_signature_invalid" | "samples_pending"
+}
+```
+
+Verdict is the canonical closed enum `pass | warn | block`
+(architecture Sec 5.4.2). `degraded_reason` is restricted to
+the eval.gate closed set: `samples_pending`,
+`policy_signature_invalid`, or `xrepo_edges_unavailable`.
+The Insights-only `percentile_stale` is REJECTED at the
+gate's writer boundary.
+
+### HTTP status code matrix
+
+| Status | Meaning |
+| --- | --- |
+| 200 OK | Happy path (engine-written run+verdict+findings) OR degraded short-circuit (`degraded=true`, `verdict=warn`, zero findings). |
+| 400 Bad Request | Invalid `repo_id`, invalid/missing `sha`, malformed JSON, OR `policy_version_id` smuggled into `/v1/eval/gate`. |
+| 405 Method Not Allowed | Non-POST. |
+| 409 Conflict | `ErrNoActivePolicy` -- no `clean_code.policy_activation` row exists yet (fresh-deploy steady state). Activate a policy via the canonical `policy.activate` verb (`POST /v1/policy/activate` on the Policy Steward) before invoking `eval.gate`. |
+| 500 Internal Server Error | Storage outage, broken adapter, non-canonical verdict from the engine. Inspect logs. |
+
+### Sequence per architecture Sec 3.7
+
+1. Resolve active `policy_version_id` via the latest
+   `clean_code.policy_activation` row. No row → HTTP 409
+   (NOT a degraded path: `evaluation_run.policy_version_id`
+   is non-nullable so no audit row can be written without
+   a pvid).
+2. Fetch the resolved `policy_version` row; verify the
+   persisted signature against the canonical bytes of THIS
+   policy_version. On mismatch take the
+   **`policy_signature_invalid` degraded short-circuit**:
+   ONE `evaluation_run(caller='eval_gate', ...)` + ONE
+   `evaluation_verdict(verdict='warn', degraded=true,
+   degraded_reason='policy_signature_invalid')` in one
+   transaction. Zero findings, NO Rule Engine invocation
+   (architecture Sec 1.6 `policy-signing-required` -- the
+   gate never blocks but always records the audit trail).
+3. Check Phase 2 sample readiness via
+   `clean_code.commit.scan_status`. If not `'scanned'`
+   take the **`samples_pending` degraded short-circuit**:
+   ONE run + ONE verdict (same shape as above but
+   `degraded_reason='samples_pending'`), zero findings,
+   no Rule Engine invocation.
+4. **Clean path**: delegate to
+   `rule_engine.RunSync(ctx, repoID, sha, scope, pvid)`.
+   The engine writes ONE `evaluation_run` + ONE
+   `evaluation_verdict` + N `finding` rows in ONE
+   transaction and returns their IDs. eval.gate does NOT
+   write its own `evaluation_verdict` row on the clean
+   path; the engine's verdict (severity-rollup: `block`
+   if any unmuted finding has `severity='block'`; `warn`
+   if any has `severity='warn'`; `pass` otherwise) is
+   canonical.
+
+### Operator triage
+
+- **HTTP 409 from `/v1/eval/gate`**: no active policy. Bind
+  one via the canonical `policy.activate` verb -- e.g.
+  `curl -fsS -X POST http://<steward>:8080/v1/policy/activate -d '{"policy_version_id":"<uuid>","actor_id":"<uuid>"}'`
+  (see the Stage 5.2 `policy.activate` section below for the
+  full body schema). No audit row is written for the 409
+  case; do NOT expect a `caller='eval_gate'` row in
+  `evaluation_run`.
+- **HTTP 200 with `degraded=true, degraded_reason='policy_signature_invalid'`**:
+  the persisted signature did not verify. Check the steward
+  signing key (was it rotated without re-signing the
+  policy?). The gate already wrote the audit row; replay
+  with the corrected signature via `/v1/eval/replay` once
+  the policy is re-signed.
+- **HTTP 200 with `degraded=true, degraded_reason='samples_pending'`**:
+  the SHA is not yet `scan_status='scanned'`. Inspect the
+  underlying state with a direct table read --
+  `SELECT scan_status FROM clean_code.commit WHERE repo_id = '<uuid>' AND sha = '<hex>'`
+  -- and wait for the metric ingestor to catch up
+  (`commit.scan_status` is written ONLY by the Metric
+  Ingestor's terminal-transition writer, documented in
+  the Stage 3.2 section below). The gate already wrote
+  the audit row so the caller has a record of "decision
+  made under samples-pending."
+- **HTTP 200 with `verdict='block'`, no degraded**: a SOLID
+  rule fired with `severity='block'`. Inspect
+  `evaluation_verdict.evaluation_run_id` → `finding` rows
+  for the rule_ids that blocked.
+- **HTTP 500**: storage outage OR the engine returned a
+  non-canonical verdict (`fail`/`gated`). Both are
+  programming errors; check logs.
+
 ## Stage 5.7 iter 4 -- production wiring updates
 
 This subsection captures the operator-facing changes that

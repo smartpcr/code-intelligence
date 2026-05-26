@@ -33,6 +33,35 @@ var ErrEngineUnwired = errors.New("evaluator: rule engine has not been wired int
 // storage outage does not look like a tampered policy.
 var ErrPolicyResolver = errors.New("evaluator: policy version resolver failed")
 
+// ErrNoActivePolicy is the sentinel returned by [Gate.Gate]
+// when the [PolicyActivationReader] reports `ok=false` --
+// no `clean_code.policy_activation` row has been written
+// yet (fresh-deploy steady state). Per architecture
+// Sec 3.7 lines 548-570 the gate's verb signature is
+// `eval.gate(repo_id, sha, scope?)` -- it resolves the
+// active `policy_version_id` itself; without one to bind
+// the rule pass to, the gate cannot run.
+//
+// This is NOT a degraded path (per Stage 6.1 brief the
+// degraded reasons are `samples_pending |
+// policy_signature_invalid | xrepo_edges_unavailable`
+// only). The gate writes NO audit row for this case --
+// `evaluation_run.policy_version_id` is non-nullable in
+// the canonical schema and there is no policy_version_id
+// to write. The caller (HTTP handler) projects this onto
+// a 409/503 operational-state response, distinct from a
+// 500 internal failure or the degraded `200 + warn` reply.
+var ErrNoActivePolicy = errors.New("evaluator: no active policy activation row exists yet")
+
+// ErrActivationUnwired is the sentinel returned by
+// [Gate.Gate] when the gate was constructed without an
+// activation reader. Distinct from [ErrNoActivePolicy] so
+// a composition-root wiring bug is NOT misclassified as
+// the fresh-deploy "no activation yet" steady state. The
+// gate fails LOUDLY on a missing dependency rather than
+// silently degrading.
+var ErrActivationUnwired = errors.New("evaluator: gate has no policy activation reader")
+
 // EvaluateResult is the canonical reply from [Gate.Evaluate].
 // All three IDs are always set -- even on the two short-
 // circuit degraded paths the gate still writes ONE
@@ -42,15 +71,19 @@ var ErrPolicyResolver = errors.New("evaluator: policy version resolver failed")
 //
 // `Degraded=true` is set ONLY on the two degraded paths
 // (signature-invalid or samples-not-ready). On the happy
-// path the field is left false; the [Verdict] string still
-// surfaces the engine's rollup (`pass` / `warn` / `block`).
+// path the field is left false; the [Verdict] enum still
+// surfaces the engine's rollup ([VerdictPass] / [VerdictWarn]
+// / [VerdictBlock]). Stage 6.1 brief: "Implement as a Go
+// enum `Verdict { Pass, Warn, Block }` with no other
+// values" -- the closure is enforced at the trust boundary
+// in [Gate.Evaluate] via [Verdict.IsValid].
 type EvaluateResult struct {
 	EvaluationRunID     uuid.UUID
 	EvaluationVerdictID uuid.UUID
 	FindingIDs          []uuid.UUID
-	Verdict             string
+	Verdict             Verdict
 	Degraded            bool
-	DegradedReason      string
+	DegradedReason      DegradedReason
 }
 
 // RuleEngine is the narrow port the gate calls on the
@@ -69,11 +102,18 @@ type RuleEngine interface {
 // in this package so the gate avoids importing the
 // `rule_engine` package (which would create a cycle if the
 // engine ever needed to call into evaluator).
+//
+// Verdict is the typed [Verdict] enum: the engine adapter
+// (production wiring) is responsible for projecting
+// `rule_engine.Verdict` onto this type. Stage 6.1 brief
+// item: "Verdict is the canonical enum `pass | warn |
+// block`" -- the adapter validates and the gate re-validates
+// in [Gate.Evaluate] before forwarding to the caller.
 type EngineRunResult struct {
 	EvaluationRunID     uuid.UUID
 	EvaluationVerdictID uuid.UUID
 	FindingIDs          []uuid.UUID
-	Verdict             string
+	Verdict             Verdict
 }
 
 // SampleReadinessReader is the narrow port the gate uses to
@@ -104,6 +144,37 @@ type SampleReadinessReader interface {
 // authorise evaluation of policy B).
 type PolicyVersionReader interface {
 	GetPolicyVersion(ctx context.Context, policyVersionID uuid.UUID) (steward.PolicyVersion, error)
+}
+
+// PolicyActivationReader is the narrow port [Gate.Gate]
+// uses to resolve the currently-active `policy_version_id`
+// from the latest `clean_code.policy_activation` row.
+// Production wiring is an adapter over
+// [steward.Steward.ActivePolicyVersion]; tests inject a
+// stub.
+//
+// The Stage 6.1 brief calls this out as step (1) of the
+// `eval.gate(repo_id, sha, scope?)` verb: "resolve active
+// `policy_version_id` via latest `policy_activation` row".
+// The verb signature deliberately does NOT take a
+// `policy_version_id` argument -- the gate resolves it
+// itself so the caller cannot pin an evaluation to a
+// non-active policy (which would be an audit / governance
+// gap).
+//
+// Returns `ok=false` when no activation row exists yet
+// (fresh-deploy steady state). The gate maps that onto
+// [ErrNoActivePolicy] and writes NO audit row -- the
+// canonical degraded reasons are constrained to
+// `samples_pending | policy_signature_invalid |
+// xrepo_edges_unavailable` per the Stage 6.1 brief and
+// `evaluation_run.policy_version_id` is non-nullable.
+//
+// Implementations MUST return an error if they see
+// `ok=true` with a zero `uuid.UUID` (defence in depth
+// against a broken upstream surface).
+type PolicyActivationReader interface {
+	ActivePolicyVersionID(ctx context.Context) (uuid.UUID, bool, error)
 }
 
 // PolicySignatureVerifier is the narrow port the gate uses
@@ -169,20 +240,29 @@ type DegradedRun struct {
 
 // DegradedVerdict is the row the gate writes into
 // `evaluation_verdict` on a degraded short-circuit. The
-// `Verdict` is `'warn'` per architecture Sec 3.7 lines
+// `Verdict` is [VerdictWarn] per architecture Sec 3.7 lines
 // 566-575 + operator pin `gate-degraded-policy=warn` from
 // Sec 1.6: the gate NEVER blocks on a degraded path
 // (signature-invalid or samples-pending), but it ALSO does
-// not silently pass -- it returns `warn` so the caller's
-// UI can flag the run for human attention. The
+// not silently pass -- it returns [VerdictWarn] so the
+// caller's UI can flag the run for human attention. The
 // `Degraded=true` / `DegradedReason` pair is surfaced
 // alongside the verdict via [EvaluateResult].
+//
+// `DegradedReason` is the typed [DegradedReason] enum
+// constrained to the eval.gate closed set
+// ([DegradedReasonSamplesPending],
+// [DegradedReasonPolicySignatureInvalid],
+// [DegradedReasonXRepoEdgesUnavailable]). `percentile_stale`
+// is admitted by the DB CHECK but is INSIGHTS-ONLY and the
+// gate / writer reject it via [DegradedReason.IsValidForGate]
+// per the Stage 6.1 brief.
 type DegradedVerdict struct {
 	VerdictID       uuid.UUID
 	EvaluationRunID uuid.UUID
-	Verdict         string
+	Verdict         Verdict
 	Degraded        bool
-	DegradedReason  string
+	DegradedReason  DegradedReason
 	CreatedAt       int64
 }
 
@@ -195,12 +275,19 @@ type IDMinter func() (uuid.UUID, error)
 // [Gate.NewGateWithEngine]. Every field is required in
 // production; tests may pass a partial bundle so long as
 // the test does not exercise the missing dependency.
+//
+// `Activation` is required by [Gate.Gate] (the canonical
+// `eval.gate(repo_id, sha, scope?)` verb -- Stage 6.1
+// brief step 1). It is OPTIONAL for [Gate.Evaluate], which
+// takes an explicit `policyVersionID` argument and so does
+// not need to resolve the active activation row.
 type EvaluateConfig struct {
 	Engine          RuleEngine
 	Readiness       SampleReadinessReader
 	PolicyReader    PolicyVersionReader
 	SignatureVerify PolicySignatureVerifier
 	DegradedStore   DegradedRunStore
+	Activation      PolicyActivationReader
 	NewID           IDMinter
 	Now             func() int64
 }
@@ -226,6 +313,7 @@ func NewGateWithEngine(g *Gate, cfg EvaluateConfig) *Gate {
 	g.policyReader = cfg.PolicyReader
 	g.sigVerify = cfg.SignatureVerify
 	g.degradedStore = cfg.DegradedStore
+	g.activation = cfg.Activation
 	g.newID = cfg.NewID
 	g.now = cfg.Now
 	return g
@@ -300,7 +388,7 @@ func (g *Gate) Evaluate(ctx context.Context, repoID uuid.UUID, sha string, scope
 	//    signature-invalid outcome takes the degraded
 	//    short-circuit path -- the engine is NOT invoked.
 	if err := g.sigVerify.VerifyPolicyVersionSignature(ctx, pv); err != nil {
-		return g.writeDegraded(ctx, repoID, sha, scope, policyVersionID, "policy_signature_invalid", fmt.Errorf("%w: %v", ErrPolicySignatureInvalid, err))
+		return g.writeDegraded(ctx, repoID, sha, scope, policyVersionID, DegradedReasonPolicySignatureInvalid, fmt.Errorf("%w: %v", ErrPolicySignatureInvalid, err))
 	}
 
 	// 3. Sample readiness: a SHA whose
@@ -314,7 +402,7 @@ func (g *Gate) Evaluate(ctx context.Context, repoID uuid.UUID, sha string, scope
 		return EvaluateResult{}, fmt.Errorf("evaluator: SamplesReady: %w", err)
 	}
 	if !ready {
-		return g.writeDegraded(ctx, repoID, sha, scope, policyVersionID, "samples_pending", ErrSamplesPending)
+		return g.writeDegraded(ctx, repoID, sha, scope, policyVersionID, DegradedReasonSamplesPending, ErrSamplesPending)
 	}
 
 	// 4. Happy path -- delegate to the rule engine. The
@@ -324,6 +412,18 @@ func (g *Gate) Evaluate(ctx context.Context, repoID uuid.UUID, sha string, scope
 	out, err := g.engine.RunSync(ctx, repoID, sha, scope, policyVersionID)
 	if err != nil {
 		return EvaluateResult{}, fmt.Errorf("evaluator: engine.RunSync: %w", err)
+	}
+	// Defensive: validate the engine adapter returned a
+	// canonical [Verdict]. The adapter SHOULD reject
+	// non-canonical values itself (rule_engine.Verdict is
+	// closed via its own switch), but a broken / stale
+	// adapter could smuggle `"fail"` / `"gated"` past --
+	// Stage 6.1 brief item: "Implement as a Go enum
+	// `Verdict { Pass, Warn, Block }` with no other
+	// values" -- the closure is enforced at every trust
+	// boundary, not just at construction.
+	if !out.Verdict.IsValid() {
+		return EvaluateResult{}, fmt.Errorf("evaluator: engine returned non-canonical verdict %q (allowed: pass|warn|block)", out.Verdict)
 	}
 	return EvaluateResult{
 		EvaluationRunID:     out.EvaluationRunID,
@@ -345,7 +445,24 @@ func (g *Gate) Evaluate(ctx context.Context, repoID uuid.UUID, sha string, scope
 // canonical whole-SHA evaluation; non-nil is the per-scope
 // call. Dropping it would make the degraded row lie about
 // the scope of the evaluation that was attempted.
-func (g *Gate) writeDegraded(ctx context.Context, repoID uuid.UUID, sha string, scope *uuid.UUID, policyVersionID uuid.UUID, reason string, retErr error) (EvaluateResult, error) {
+//
+// Stage 6.1 brief: reason is restricted to the eval.gate
+// closed set via [DegradedReason.IsValidForGate]. The two
+// callers above pass [DegradedReasonPolicySignatureInvalid]
+// and [DegradedReasonSamplesPending] respectively, but the
+// validator catches a future caller that tries to write a
+// `percentile_stale` degraded row through the gate -- the
+// "percentile-stale-not-on-gate" e2e scenario.
+func (g *Gate) writeDegraded(ctx context.Context, repoID uuid.UUID, sha string, scope *uuid.UUID, policyVersionID uuid.UUID, reason DegradedReason, retErr error) (EvaluateResult, error) {
+	if !reason.IsValidForGate() {
+		return EvaluateResult{}, fmt.Errorf("%w: %q (allowed: %s | %s | %s)",
+			ErrInvalidGateDegradedReason,
+			reason,
+			DegradedReasonSamplesPending,
+			DegradedReasonPolicySignatureInvalid,
+			DegradedReasonXRepoEdgesUnavailable,
+		)
+	}
 	runID, err := g.newID()
 	if err != nil {
 		return EvaluateResult{}, fmt.Errorf("evaluator: writeDegraded: mint run_id: %w", err)
@@ -366,7 +483,7 @@ func (g *Gate) writeDegraded(ctx context.Context, repoID uuid.UUID, sha string, 
 	verdict := DegradedVerdict{
 		VerdictID:       verdictID,
 		EvaluationRunID: runID,
-		Verdict:         "warn",
+		Verdict:         VerdictWarn,
 		Degraded:        true,
 		DegradedReason:  reason,
 		CreatedAt:       now,
@@ -378,7 +495,7 @@ func (g *Gate) writeDegraded(ctx context.Context, repoID uuid.UUID, sha string, 
 		EvaluationRunID:     runID,
 		EvaluationVerdictID: verdictID,
 		FindingIDs:          nil,
-		Verdict:             "warn",
+		Verdict:             VerdictWarn,
 		Degraded:            true,
 		DegradedReason:      reason,
 	}, retErr
@@ -388,4 +505,64 @@ func (g *Gate) writeDegraded(ctx context.Context, repoID uuid.UUID, sha string, 
 // so [NewGateWithEngine] tests can pin time.
 func defaultNowNanos() int64 {
 	return nowUnixNano()
+}
+
+// Gate is the canonical `eval.gate(repo_id, sha, scope?)`
+// verb entry point per architecture Sec 3.7 lines 548-570
+// and the Stage 6.1 brief. The verb signature deliberately
+// does NOT take a `policy_version_id` -- step (1) of the
+// brief is for the gate itself to "resolve active
+// `policy_version_id` via latest `policy_activation` row".
+//
+// Flow:
+//
+//  1. Resolve the active `policy_version_id` via the
+//     [PolicyActivationReader]. If no activation row
+//     exists (`ok=false`), return [ErrNoActivePolicy]
+//     and write NO audit row -- this is a fresh-deploy
+//     steady state, not a degraded condition (the
+//     canonical degraded reasons in the Stage 6.1 brief
+//     are `samples_pending | policy_signature_invalid |
+//     xrepo_edges_unavailable` only, and
+//     `evaluation_run.policy_version_id` is non-nullable).
+//  2. Delegate to [Gate.Evaluate] with the resolved
+//     `policy_version_id`. Steps (2)-(5) of the Stage 6.1
+//     brief (signature verify, sample readiness, sync
+//     rule engine delegation, no-double-write) are
+//     executed inside [Gate.Evaluate].
+//
+// A composition-root wiring bug (nil `activation` reader)
+// returns [ErrActivationUnwired], NOT [ErrNoActivePolicy] --
+// "no activation row exists" and "the gate was not wired
+// with an activation reader" are DIFFERENT states.
+func (g *Gate) Gate(ctx context.Context, repoID uuid.UUID, sha string, scope *uuid.UUID) (EvaluateResult, error) {
+	if g == nil {
+		return EvaluateResult{}, ErrGateUnwired
+	}
+	if g.activation == nil {
+		return EvaluateResult{}, ErrActivationUnwired
+	}
+	// Resolving the active policy_version_id BEFORE the
+	// trust-boundary input validation below mirrors the
+	// verb's contract: an unauthenticated caller cannot
+	// influence which policy_version the rules will run
+	// against. Step (1) of the Stage 6.1 brief is
+	// service-internal.
+	policyVersionID, ok, err := g.activation.ActivePolicyVersionID(ctx)
+	if err != nil {
+		return EvaluateResult{}, fmt.Errorf("evaluator: Gate: activation lookup: %w", err)
+	}
+	if !ok {
+		return EvaluateResult{}, ErrNoActivePolicy
+	}
+	if policyVersionID == uuid.Nil {
+		// Defence in depth: the adapter SHOULD reject
+		// `(ok=true, zero uuid)` itself, but the gate
+		// validates again so a broken adapter cannot
+		// smuggle a zero uuid through to
+		// [Gate.Evaluate] (which would reject it but
+		// with a less informative error).
+		return EvaluateResult{}, fmt.Errorf("evaluator: Gate: activation reader returned ok=true with zero policy_version_id")
+	}
+	return g.Evaluate(ctx, repoID, sha, scope, policyVersionID)
 }

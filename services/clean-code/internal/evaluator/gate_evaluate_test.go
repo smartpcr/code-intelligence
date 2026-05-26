@@ -94,6 +94,24 @@ func (s *stubDegradedStore) AppendDegradedRun(ctx context.Context, run DegradedR
 	return nil
 }
 
+// stubActivation is the [PolicyActivationReader] test
+// double. Records the last call so a test can assert
+// the gate invoked it.
+type stubActivation struct {
+	pvID       uuid.UUID
+	ok         bool
+	err        error
+	callCount  int
+}
+
+func (s *stubActivation) ActivePolicyVersionID(ctx context.Context) (uuid.UUID, bool, error) {
+	s.callCount++
+	if s.err != nil {
+		return uuid.Nil, false, s.err
+	}
+	return s.pvID, s.ok, nil
+}
+
 func newWiredGate(t *testing.T, eng *stubEngine, ready *stubReadiness, pr *stubPolicyReader, ver *stubVerifier, deg *stubDegradedStore) *Gate {
 	t.Helper()
 	g := NewGateWithEngine(NewGate(nil), EvaluateConfig{
@@ -102,6 +120,24 @@ func newWiredGate(t *testing.T, eng *stubEngine, ready *stubReadiness, pr *stubP
 		PolicyReader:    pr,
 		SignatureVerify: ver,
 		DegradedStore:   deg,
+		NewID:           uuid.NewV4,
+		Now:             func() int64 { return 1717000000000000000 },
+	})
+	return g
+}
+
+// newWiredGateWithActivation wires the full Stage 6.1 gate
+// (Evaluate dependencies + [PolicyActivationReader]) so
+// the [Gate.Gate] verb path is exercisable.
+func newWiredGateWithActivation(t *testing.T, eng *stubEngine, ready *stubReadiness, pr *stubPolicyReader, ver *stubVerifier, deg *stubDegradedStore, act *stubActivation) *Gate {
+	t.Helper()
+	g := NewGateWithEngine(NewGate(nil), EvaluateConfig{
+		Engine:          eng,
+		Readiness:       ready,
+		PolicyReader:    pr,
+		SignatureVerify: ver,
+		DegradedStore:   deg,
+		Activation:      act,
 		NewID:           uuid.NewV4,
 		Now:             func() int64 { return 1717000000000000000 },
 	})
@@ -405,5 +441,515 @@ func TestGate_Evaluate_Degraded_UnscopedCall_RecordsNilScope(t *testing.T) {
 	}
 	if deg.calls[0].run.ScopeID != nil {
 		t.Errorf("DegradedRun.ScopeID=%v; want nil for unscoped eval.gate call", *deg.calls[0].run.ScopeID)
+	}
+}
+
+// --- Stage 6.1 scenarios -----------------------------------
+//
+// `gate-delegates-synchronous-rule-pass` is covered by
+// `TestGate_Evaluate_HappyPath_DelegatesToEngine` above.
+// `degraded-maps-to-warn` is covered by
+// `TestGate_Evaluate_Degraded_SignatureInvalid` +
+// `TestGate_Evaluate_Degraded_SamplesPending`.
+// These additional tests address the remaining brief items.
+
+// TestGate_Evaluate_BlockOnSeverityBlockRollup pins the
+// "block on severity=block finding via the rollup" item
+// from the Stage 6.1 brief. The rollup itself is computed
+// inside the rule engine (architecture Sec 3.6 +
+// rule_engine.Engine.computeVerdict); the evaluator's
+// responsibility is to FORWARD the engine's verdict
+// faithfully, without inventing its own rollup or
+// double-writing. This test stubs the engine to return
+// VerdictBlock and asserts the gate surfaces it on the
+// happy path with no degraded short-circuit.
+func TestGate_Evaluate_BlockOnSeverityBlockRollup(t *testing.T) {
+	t.Parallel()
+	repoID := uuid.Must(uuid.NewV4())
+	pvID := uuid.Must(uuid.NewV4())
+	wantRunID := uuid.Must(uuid.NewV4())
+	wantVerdictID := uuid.Must(uuid.NewV4())
+	wantFinding := uuid.Must(uuid.NewV4())
+
+	eng := &stubEngine{out: EngineRunResult{
+		EvaluationRunID:     wantRunID,
+		EvaluationVerdictID: wantVerdictID,
+		FindingIDs:          []uuid.UUID{wantFinding},
+		Verdict:             VerdictBlock,
+	}}
+	ready := &stubReadiness{ready: true}
+	pr := &stubPolicyReader{}
+	ver := &stubVerifier{}
+	deg := &stubDegradedStore{}
+	g := newWiredGate(t, eng, ready, pr, ver, deg)
+
+	got, err := g.Evaluate(context.Background(), repoID, "sha1", nil, pvID)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if got.Verdict != VerdictBlock {
+		t.Errorf("got.Verdict=%q; want VerdictBlock", got.Verdict)
+	}
+	if got.Degraded {
+		t.Error("got.Degraded=true on block path; want false (block is a happy-path verdict)")
+	}
+	if got.EvaluationVerdictID != wantVerdictID {
+		t.Errorf("verdict_id not forwarded from engine: got=%s want=%s", got.EvaluationVerdictID, wantVerdictID)
+	}
+}
+
+// TestGate_Evaluate_HappyPath_DoesNotDoubleWriteVerdict pins
+// the Stage 6.1 brief item "eval.gate does NOT write its own
+// `evaluation_verdict` row on the clean path -- the verdict
+// that the engine wrote is the canonical one and eval.gate
+// simply reads it back to shape the response." The
+// invariant: on the happy path the degraded store is NEVER
+// invoked (the gate's only writer) and the engine is invoked
+// exactly once.
+func TestGate_Evaluate_HappyPath_DoesNotDoubleWriteVerdict(t *testing.T) {
+	t.Parallel()
+	repoID := uuid.Must(uuid.NewV4())
+	pvID := uuid.Must(uuid.NewV4())
+	engineRunID := uuid.Must(uuid.NewV4())
+	engineVerdictID := uuid.Must(uuid.NewV4())
+
+	eng := &stubEngine{out: EngineRunResult{
+		EvaluationRunID:     engineRunID,
+		EvaluationVerdictID: engineVerdictID,
+		FindingIDs:          nil,
+		Verdict:             VerdictPass,
+	}}
+	ready := &stubReadiness{ready: true}
+	pr := &stubPolicyReader{}
+	ver := &stubVerifier{}
+	deg := &stubDegradedStore{}
+	g := newWiredGate(t, eng, ready, pr, ver, deg)
+
+	got, err := g.Evaluate(context.Background(), repoID, "sha1", nil, pvID)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+
+	// 1. Engine invoked exactly once.
+	if !eng.called {
+		t.Fatal("engine.RunSync was not called on the clean path")
+	}
+
+	// 2. Degraded store NEVER invoked on the clean path.
+	if len(deg.calls) != 0 {
+		t.Errorf("degraded store invoked %d times on clean path; want 0 (eval.gate must not double-write the verdict)", len(deg.calls))
+	}
+
+	// 3. The verdict_id returned to the caller is the
+	//    engine's verdict_id -- proof the gate did not
+	//    invent a second one.
+	if got.EvaluationVerdictID != engineVerdictID {
+		t.Errorf("got.EvaluationVerdictID=%s; want engine's %s (eval.gate must FORWARD, not mint)", got.EvaluationVerdictID, engineVerdictID)
+	}
+	if got.EvaluationRunID != engineRunID {
+		t.Errorf("got.EvaluationRunID=%s; want engine's %s", got.EvaluationRunID, engineRunID)
+	}
+	if got.Degraded {
+		t.Error("got.Degraded=true on clean path; want false")
+	}
+	if got.DegradedReason != "" {
+		t.Errorf("got.DegradedReason=%q on clean path; want empty", got.DegradedReason)
+	}
+}
+
+// TestGate_Evaluate_RejectsNonCanonicalEngineVerdict pins the
+// defensive trust-boundary check (Stage 6.1 brief: "Implement
+// as a Go enum `Verdict { Pass, Warn, Block }` with no other
+// values"). A broken / stale rule_engine adapter that returns
+// `Verdict("fail")` must be REJECTED by the gate, NOT
+// surfaced to the caller as a fourth verdict value. The
+// engine adapter has its own validator; this is defence in
+// depth.
+func TestGate_Evaluate_RejectsNonCanonicalEngineVerdict(t *testing.T) {
+	t.Parallel()
+	repoID := uuid.Must(uuid.NewV4())
+	pvID := uuid.Must(uuid.NewV4())
+
+	eng := &stubEngine{out: EngineRunResult{
+		EvaluationRunID:     uuid.Must(uuid.NewV4()),
+		EvaluationVerdictID: uuid.Must(uuid.NewV4()),
+		Verdict:             Verdict("fail"), // non-canonical
+	}}
+	ready := &stubReadiness{ready: true}
+	pr := &stubPolicyReader{}
+	ver := &stubVerifier{}
+	deg := &stubDegradedStore{}
+	g := newWiredGate(t, eng, ready, pr, ver, deg)
+
+	_, err := g.Evaluate(context.Background(), repoID, "sha1", nil, pvID)
+	if err == nil {
+		t.Fatal("Evaluate: err=nil; want rejection of non-canonical engine verdict")
+	}
+}
+
+// TestGate_Evaluate_Degraded_VerdictIsTypedWarn pins the
+// typed-enum invariant for the degraded verdict the gate
+// writes. The architecture's `gate-degraded-policy=warn`
+// pin (Sec 1.6) says degraded paths MUST surface `warn`;
+// this test confirms the typed [VerdictWarn] constant is
+// the value, not a hand-spelled string literal.
+func TestGate_Evaluate_Degraded_VerdictIsTypedWarn(t *testing.T) {
+	t.Parallel()
+	repoID := uuid.Must(uuid.NewV4())
+	pvID := uuid.Must(uuid.NewV4())
+
+	eng := &stubEngine{}
+	ready := &stubReadiness{ready: true}
+	pr := &stubPolicyReader{}
+	ver := &stubVerifier{err: errors.New("ed25519: invalid signature")}
+	deg := &stubDegradedStore{}
+	g := newWiredGate(t, eng, ready, pr, ver, deg)
+
+	got, _ := g.Evaluate(context.Background(), repoID, "sha1", nil, pvID)
+
+	// Use the typed constant for comparison so a future
+	// rename of the canonical spelling stays in sync with
+	// this assertion. Comparing to the bare string
+	// literal "warn" would not break here, but the typed
+	// comparison is the documenting form.
+	if got.Verdict != VerdictWarn {
+		t.Errorf("got.Verdict=%q; want VerdictWarn (degraded path must surface typed warn)", got.Verdict)
+	}
+	if len(deg.calls) != 1 {
+		t.Fatalf("degraded store calls=%d; want 1", len(deg.calls))
+	}
+	if deg.calls[0].verdict.Verdict != VerdictWarn {
+		t.Errorf("persisted verdict=%q; want VerdictWarn", deg.calls[0].verdict.Verdict)
+	}
+	if deg.calls[0].verdict.DegradedReason != DegradedReasonPolicySignatureInvalid {
+		t.Errorf("persisted reason=%q; want DegradedReasonPolicySignatureInvalid", deg.calls[0].verdict.DegradedReason)
+	}
+}
+
+// --- Stage 6.1: `Gate.Gate` verb (resolves active policy) ---
+//
+// The Stage 6.1 brief defines the canonical
+// `eval.gate(repo_id, sha, scope?)` verb. Step (1):
+// "resolve active `policy_version_id` via latest
+// `policy_activation` row". The verb signature
+// deliberately does NOT take `policy_version_id` -- the
+// gate resolves it itself so the caller cannot pin an
+// evaluation to a non-active policy.
+
+// TestGate_Gate_HappyPath_ResolvesActiveAndDelegates pins
+// step (1) of the Stage 6.1 brief: `Gate.Gate` resolves
+// the active policy_version_id via the
+// [PolicyActivationReader] and delegates to
+// [Gate.Evaluate] with that resolved value. The engine
+// is then invoked exactly once and its verdict + IDs are
+// forwarded to the caller.
+func TestGate_Gate_HappyPath_ResolvesActiveAndDelegates(t *testing.T) {
+	t.Parallel()
+	repoID := uuid.Must(uuid.NewV4())
+	activePVID := uuid.Must(uuid.NewV4())
+	wantRunID := uuid.Must(uuid.NewV4())
+	wantVerdictID := uuid.Must(uuid.NewV4())
+	wantFinding := uuid.Must(uuid.NewV4())
+
+	eng := &stubEngine{out: EngineRunResult{
+		EvaluationRunID:     wantRunID,
+		EvaluationVerdictID: wantVerdictID,
+		FindingIDs:          []uuid.UUID{wantFinding},
+		Verdict:             VerdictPass,
+	}}
+	ready := &stubReadiness{ready: true}
+	pr := &stubPolicyReader{}
+	ver := &stubVerifier{}
+	deg := &stubDegradedStore{}
+	act := &stubActivation{pvID: activePVID, ok: true}
+	g := newWiredGateWithActivation(t, eng, ready, pr, ver, deg, act)
+
+	got, err := g.Gate(context.Background(), repoID, "sha1", nil)
+	if err != nil {
+		t.Fatalf("Gate: %v", err)
+	}
+	if act.callCount != 1 {
+		t.Errorf("activation reader called %d times; want exactly 1", act.callCount)
+	}
+	if !eng.called {
+		t.Fatal("engine.RunSync was not called -- Gate must delegate on the happy path")
+	}
+	// The engine must have been called with the
+	// resolver's policy_version_id, NOT some other
+	// value. This is the linchpin assertion for
+	// step (1).
+	if eng.lastPolicy != activePVID {
+		t.Errorf("engine saw policy_version_id=%s; want resolver's %s", eng.lastPolicy, activePVID)
+	}
+	// And the signature verifier saw the same one.
+	if ver.receivedPVID != activePVID {
+		t.Errorf("signature verifier saw pvid=%s; want active %s", ver.receivedPVID, activePVID)
+	}
+	if got.EvaluationRunID != wantRunID || got.EvaluationVerdictID != wantVerdictID {
+		t.Errorf("IDs not forwarded from engine: got=%+v", got)
+	}
+	if got.Verdict != VerdictPass {
+		t.Errorf("got.Verdict=%q; want pass", got.Verdict)
+	}
+	if got.Degraded {
+		t.Error("got.Degraded=true on happy path; want false")
+	}
+	if len(deg.calls) != 0 {
+		t.Errorf("degraded store written %d times on happy path; want 0", len(deg.calls))
+	}
+}
+
+// TestGate_Gate_NoActivation_ReturnsErrNoActivePolicy pins
+// the fresh-deploy steady state: when the activation
+// reader reports `ok=false`, `Gate.Gate` returns
+// [ErrNoActivePolicy] and writes NO audit row. The Stage
+// 6.1 brief's canonical degraded reasons are
+// `samples_pending | policy_signature_invalid |
+// xrepo_edges_unavailable` only, and
+// `evaluation_run.policy_version_id` is non-nullable --
+// there is no policy_version_id to write on this path.
+func TestGate_Gate_NoActivation_ReturnsErrNoActivePolicy(t *testing.T) {
+	t.Parallel()
+	repoID := uuid.Must(uuid.NewV4())
+
+	eng := &stubEngine{}
+	ready := &stubReadiness{ready: true}
+	pr := &stubPolicyReader{}
+	ver := &stubVerifier{}
+	deg := &stubDegradedStore{}
+	act := &stubActivation{ok: false}
+	g := newWiredGateWithActivation(t, eng, ready, pr, ver, deg, act)
+
+	_, err := g.Gate(context.Background(), repoID, "sha1", nil)
+	if !errors.Is(err, ErrNoActivePolicy) {
+		t.Fatalf("err=%v; want errors.Is(.., ErrNoActivePolicy)", err)
+	}
+	if eng.called {
+		t.Error("engine.RunSync called; want NOT called on no-activation path")
+	}
+	if len(deg.calls) != 0 {
+		t.Errorf("degraded store calls=%d; want 0 (no audit row on no-activation path)", len(deg.calls))
+	}
+	if ver.verifyCallCnt != 0 {
+		t.Errorf("signature verifier called %d times; want 0 (resolver short-circuited)", ver.verifyCallCnt)
+	}
+}
+
+// TestGate_Gate_ActivationLookupError_WrappedAndPropagated
+// pins that a transient activation-lookup error (DB outage,
+// etc.) is surfaced to the caller WITHOUT a misleading
+// degraded short-circuit. The error is wrapped (so
+// errors.Is on the underlying sentinel works) but NOT
+// silently masked.
+func TestGate_Gate_ActivationLookupError_WrappedAndPropagated(t *testing.T) {
+	t.Parallel()
+	repoID := uuid.Must(uuid.NewV4())
+	underlying := errors.New("postgres: connection refused")
+
+	eng := &stubEngine{}
+	ready := &stubReadiness{ready: true}
+	pr := &stubPolicyReader{}
+	ver := &stubVerifier{}
+	deg := &stubDegradedStore{}
+	act := &stubActivation{err: underlying}
+	g := newWiredGateWithActivation(t, eng, ready, pr, ver, deg, act)
+
+	_, err := g.Gate(context.Background(), repoID, "sha1", nil)
+	if err == nil {
+		t.Fatal("err=nil; want activation-lookup failure to propagate")
+	}
+	if !errors.Is(err, underlying) {
+		t.Errorf("err=%v; want errors.Is(.., underlying %q)", err, underlying)
+	}
+	// Critically: ErrNoActivePolicy MUST NOT match -- a
+	// transient lookup failure is not the fresh-deploy
+	// steady state.
+	if errors.Is(err, ErrNoActivePolicy) {
+		t.Error("err matches ErrNoActivePolicy on transient failure; should be distinct")
+	}
+	if eng.called {
+		t.Error("engine.RunSync called; want NOT called when activation lookup fails")
+	}
+	if len(deg.calls) != 0 {
+		t.Errorf("degraded store calls=%d; want 0", len(deg.calls))
+	}
+}
+
+// TestGate_Gate_ActivationReturnsZeroUUIDWithOK_Rejected
+// pins the defence-in-depth check: a broken activation
+// adapter that returns `(zero uuid, ok=true, nil)` MUST
+// be rejected by the gate rather than silently smuggled
+// into [Gate.Evaluate] (which would reject it but with a
+// less informative error).
+func TestGate_Gate_ActivationReturnsZeroUUIDWithOK_Rejected(t *testing.T) {
+	t.Parallel()
+	repoID := uuid.Must(uuid.NewV4())
+
+	eng := &stubEngine{}
+	ready := &stubReadiness{ready: true}
+	pr := &stubPolicyReader{}
+	ver := &stubVerifier{}
+	deg := &stubDegradedStore{}
+	act := &stubActivation{pvID: uuid.Nil, ok: true}
+	g := newWiredGateWithActivation(t, eng, ready, pr, ver, deg, act)
+
+	_, err := g.Gate(context.Background(), repoID, "sha1", nil)
+	if err == nil {
+		t.Fatal("err=nil; want rejection of (zero uuid, ok=true) reply")
+	}
+	if eng.called {
+		t.Error("engine called despite zero policy_version_id")
+	}
+}
+
+// TestGate_Gate_UnwiredActivation_ReturnsErrActivationUnwired
+// pins the composition-root wiring contract: a gate built
+// without an activation reader returns
+// [ErrActivationUnwired] -- distinct from
+// [ErrNoActivePolicy] so a wiring bug is not silently
+// misclassified as the fresh-deploy steady state.
+func TestGate_Gate_UnwiredActivation_ReturnsErrActivationUnwired(t *testing.T) {
+	t.Parallel()
+	// Wire everything EXCEPT the activation reader.
+	g := newWiredGate(t, &stubEngine{}, &stubReadiness{ready: true}, &stubPolicyReader{}, &stubVerifier{}, &stubDegradedStore{})
+
+	_, err := g.Gate(context.Background(), uuid.Must(uuid.NewV4()), "sha1", nil)
+	if !errors.Is(err, ErrActivationUnwired) {
+		t.Fatalf("err=%v; want errors.Is(.., ErrActivationUnwired)", err)
+	}
+	// Critically: do NOT match ErrNoActivePolicy --
+	// "no activation row" and "no activation reader
+	// wired" are different states.
+	if errors.Is(err, ErrNoActivePolicy) {
+		t.Error("err matches ErrNoActivePolicy on unwired gate; should be distinct")
+	}
+}
+
+// TestGate_Gate_PropagatesScopeToEvaluate pins that a
+// scoped `eval.gate(repo_id, sha, scope)` call propagates
+// the scope through [Gate.Gate] -> [Gate.Evaluate] -> the
+// engine (and onto degraded rows when the short-circuit
+// fires). The engine stub records the scope it saw on the
+// call.
+func TestGate_Gate_PropagatesScopeToEvaluate(t *testing.T) {
+	t.Parallel()
+	repoID := uuid.Must(uuid.NewV4())
+	activePVID := uuid.Must(uuid.NewV4())
+	scope := uuid.Must(uuid.NewV4())
+
+	eng := &stubEngine{out: EngineRunResult{
+		EvaluationRunID:     uuid.Must(uuid.NewV4()),
+		EvaluationVerdictID: uuid.Must(uuid.NewV4()),
+		Verdict:             VerdictPass,
+	}}
+	ready := &stubReadiness{ready: true}
+	pr := &stubPolicyReader{}
+	ver := &stubVerifier{}
+	deg := &stubDegradedStore{}
+	act := &stubActivation{pvID: activePVID, ok: true}
+	g := newWiredGateWithActivation(t, eng, ready, pr, ver, deg, act)
+
+	if _, err := g.Gate(context.Background(), repoID, "sha1", &scope); err != nil {
+		t.Fatalf("Gate: %v", err)
+	}
+	if eng.scopeRecorded == nil {
+		t.Fatal("engine saw scope=nil; want non-nil")
+	}
+	if *eng.scopeRecorded != scope {
+		t.Errorf("engine saw scope=%s; want %s", *eng.scopeRecorded, scope)
+	}
+}
+
+// TestGate_Gate_NilReceiver_ReturnsErrGateUnwired pins
+// nil-receiver safety: calling `Gate.Gate` on a nil
+// gate returns [ErrGateUnwired], NOT a panic.
+func TestGate_Gate_NilReceiver_ReturnsErrGateUnwired(t *testing.T) {
+	t.Parallel()
+	var g *Gate
+	_, err := g.Gate(context.Background(), uuid.Must(uuid.NewV4()), "sha1", nil)
+	if !errors.Is(err, ErrGateUnwired) {
+		t.Fatalf("err=%v; want errors.Is(.., ErrGateUnwired)", err)
+	}
+}
+
+// TestGate_Gate_Degraded_SignatureInvalid_AppliesViaResolvedPV
+// pins that the signature-invalid degraded short-circuit
+// (Stage 6.1 step 2) still fires correctly when Gate is
+// entered via the verb path. The degraded audit row carries
+// the resolver's policy_version_id, not zero or some other
+// value. The Rule Engine is NOT invoked.
+func TestGate_Gate_Degraded_SignatureInvalid_AppliesViaResolvedPV(t *testing.T) {
+	t.Parallel()
+	repoID := uuid.Must(uuid.NewV4())
+	activePVID := uuid.Must(uuid.NewV4())
+
+	eng := &stubEngine{}
+	ready := &stubReadiness{ready: true}
+	pr := &stubPolicyReader{}
+	ver := &stubVerifier{err: errors.New("ed25519: invalid signature")}
+	deg := &stubDegradedStore{}
+	act := &stubActivation{pvID: activePVID, ok: true}
+	g := newWiredGateWithActivation(t, eng, ready, pr, ver, deg, act)
+
+	got, err := g.Gate(context.Background(), repoID, "sha1", nil)
+	if !errors.Is(err, ErrPolicySignatureInvalid) {
+		t.Errorf("err=%v; want errors.Is(.., ErrPolicySignatureInvalid)", err)
+	}
+	if eng.called {
+		t.Error("engine.RunSync called on signature-invalid path; degraded short-circuit must not invoke the engine")
+	}
+	if !got.Degraded || got.DegradedReason != DegradedReasonPolicySignatureInvalid {
+		t.Errorf("got.Degraded=%t reason=%q; want true / policy_signature_invalid", got.Degraded, got.DegradedReason)
+	}
+	if got.Verdict != VerdictWarn {
+		t.Errorf("got.Verdict=%q; want warn (degraded path)", got.Verdict)
+	}
+	if len(deg.calls) != 1 {
+		t.Fatalf("degraded store calls=%d; want 1", len(deg.calls))
+	}
+	if deg.calls[0].run.PolicyVersionID != activePVID {
+		t.Errorf("degraded run wrote policy_version_id=%s; want resolver's %s",
+			deg.calls[0].run.PolicyVersionID, activePVID)
+	}
+}
+
+// TestGate_Gate_Degraded_SamplesPending_AppliesViaResolvedPV
+// pins that the samples-pending degraded short-circuit
+// (Stage 6.1 step 3) fires correctly via the verb path.
+// The degraded audit row carries the resolver's
+// policy_version_id and verdict='warn'; the Rule Engine
+// is NOT invoked.
+func TestGate_Gate_Degraded_SamplesPending_AppliesViaResolvedPV(t *testing.T) {
+	t.Parallel()
+	repoID := uuid.Must(uuid.NewV4())
+	activePVID := uuid.Must(uuid.NewV4())
+
+	eng := &stubEngine{}
+	ready := &stubReadiness{ready: false}
+	pr := &stubPolicyReader{}
+	ver := &stubVerifier{}
+	deg := &stubDegradedStore{}
+	act := &stubActivation{pvID: activePVID, ok: true}
+	g := newWiredGateWithActivation(t, eng, ready, pr, ver, deg, act)
+
+	got, err := g.Gate(context.Background(), repoID, "sha1", nil)
+	if !errors.Is(err, ErrSamplesPending) {
+		t.Errorf("err=%v; want errors.Is(.., ErrSamplesPending)", err)
+	}
+	if eng.called {
+		t.Error("engine.RunSync called on samples-pending path")
+	}
+	if !got.Degraded || got.DegradedReason != DegradedReasonSamplesPending {
+		t.Errorf("got.Degraded=%t reason=%q; want true / samples_pending", got.Degraded, got.DegradedReason)
+	}
+	if got.Verdict != VerdictWarn {
+		t.Errorf("got.Verdict=%q; want warn", got.Verdict)
+	}
+	if len(deg.calls) != 1 {
+		t.Fatalf("degraded store calls=%d; want 1", len(deg.calls))
+	}
+	if deg.calls[0].run.PolicyVersionID != activePVID {
+		t.Errorf("degraded run wrote policy_version_id=%s; want resolver's %s",
+			deg.calls[0].run.PolicyVersionID, activePVID)
 	}
 }

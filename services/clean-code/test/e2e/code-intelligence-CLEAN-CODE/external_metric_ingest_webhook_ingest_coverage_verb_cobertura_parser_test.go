@@ -84,9 +84,6 @@ type coverageState struct {
 	lastResponseBody []byte
 	uploadedFiles    []coverageFileRow
 	boundFiles       []string
-
-	// Before/after counter value for proving the increment.
-	counterValueBefore int
 }
 
 type coverageFileRow struct {
@@ -169,14 +166,6 @@ func (s *coverageState) scopeBindingsExistForTheFollowingFiles(table *godog.Tabl
 		}
 	}
 
-	// Snapshot metric_sample count BEFORE the upload for the counter
-	// before/after comparison (same pattern as defects-verb sibling).
-	err := s.db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM clean_code.metric_sample
-	`).Scan(&s.counterValueBefore)
-	if err != nil {
-		s.counterValueBefore = 0
-	}
 	return nil
 }
 
@@ -472,7 +461,10 @@ func (s *coverageState) checkPrometheusCounterDelta(counterName string) bool {
 			continue
 		}
 		var val float64
-		if _, err := fmt.Sscanf(parts[len(parts)-1], "%f", &val); err == nil && val > float64(s.counterValueBefore) {
+		// Counter starts at zero in the ephemeral compose environment, so any
+		// positive value proves the verb incremented it. We deliberately do not
+		// compare against a pre-upload snapshot of an unrelated DB row count.
+		if _, err := fmt.Sscanf(parts[len(parts)-1], "%f", &val); err == nil && val > 0 {
 			return true
 		}
 	}

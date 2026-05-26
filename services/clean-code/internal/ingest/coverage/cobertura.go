@@ -377,22 +377,42 @@ func validateFile(f *FileCoverage) error {
 
 // isSafeRepoRelativePath returns true iff `p` is a
 // non-empty repo-relative path that does not begin with
-// `/`, does not look like a Windows drive root, and does
-// not contain a `..` segment that could escape the repo
-// root.
+// `/` (or `\`), does not look like a Windows drive root,
+// and does not contain a `..` segment that could escape
+// the repo root.
+//
+// Backslashes are folded to forward slashes INSIDE this
+// function so the absolute-prefix and `..`-segment checks
+// catch a Windows-style traversal (e.g. `foo\..\..\secret`
+// or a leading `\Windows\evil`) even when the caller did
+// not run [normaliseFilePath] first. [ParseXML] already
+// folds via `normaliseFilePath` so its path is unaffected;
+// the local fold here is defence-in-depth for the
+// [Payload.Validate] -> [validateFile] path, which is
+// reachable when a Payload is constructed directly (an
+// integration test, an alternate verb, or any future
+// caller that builds a [FileCoverage] without going
+// through [ParseXML]).
 func isSafeRepoRelativePath(p string) bool {
 	if p == "" {
 		return false
 	}
-	if strings.HasPrefix(p, "/") {
+	// Fold backslashes to forward slashes so the
+	// downstream checks treat `foo\..\..\secret` and
+	// `foo/../../secret` identically. Without this fold
+	// `strings.Split(p, "/")` would yield a single
+	// segment for a backslash-only path and the `..`
+	// guard would miss it.
+	folded := strings.ReplaceAll(p, "\\", "/")
+	if strings.HasPrefix(folded, "/") {
 		return false
 	}
 	// Windows drive root pattern: "X:" possibly followed
 	// by "/" or "\". Anything matching is absolute.
-	if len(p) >= 2 && p[1] == ':' && ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) {
+	if len(folded) >= 2 && folded[1] == ':' && ((folded[0] >= 'A' && folded[0] <= 'Z') || (folded[0] >= 'a' && folded[0] <= 'z')) {
 		return false
 	}
-	for _, seg := range strings.Split(p, "/") {
+	for _, seg := range strings.Split(folded, "/") {
 		if seg == ".." {
 			return false
 		}

@@ -15,8 +15,8 @@ env:
   COMPOSE_FILE: tests/e2e/phase-05-policy-engine/docker-compose.yml
 
 jobs:
-  e2e-solid-rule-packs:
-    name: "E2E – SOLID Rule Packs"
+  e2e-solid-rule-engine-batch-worker-and-synchronous-mode:
+    name: "E2E – SOLID Rule Engine Batch Worker and Synchronous Mode"
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -57,7 +57,7 @@ jobs:
         working-directory: services/clean-code
         run: |
           go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
-            -run TestE2E_policy_steward_and_solid_rule_engine_solid_rule_packs
+            -run TestE2E_policy_steward_and_solid_rule_engine_solid_rule_engine_batch_worker_and_synchronous_mode
 
       - name: Tear down compose services
         if: always()

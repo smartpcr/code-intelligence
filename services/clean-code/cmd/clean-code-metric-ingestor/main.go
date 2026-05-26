@@ -64,6 +64,20 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "ok")
 }
 
+// writeJSON serialises body to JSON and writes it as the response with the
+// given status code. Prefer this helper over hand-rolling JSON via
+// fmt.Fprintf: encoding/json escapes embedded `"` and `\` in field values,
+// so the response is guaranteed well-formed even if a column type ever
+// widens from `uuid` to free-text. Content-Type is set before WriteHeader
+// per the net/http contract.
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		log.Printf("writeJSON: encode failed: %v", err)
+	}
+}
+
 type processRequest struct {
 	CommitSHA string `json:"commit_sha"`
 	RepoID    string `json:"repo_id"`
@@ -101,8 +115,10 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	if err == nil && existingSampleID != "" {
 		// Active, non-retracted sample exists — skip re-computation.
 		// sample_id and row count remain unchanged (idempotent).
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"status":"skipped","sample_id":"%s"}`, existingSampleID)
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status":    "skipped",
+			"sample_id": existingSampleID,
+		})
 		return
 	}
 
@@ -130,6 +146,8 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, `{"status":"ingested","sample_id":"%s"}`, newSampleID)
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":    "ingested",
+		"sample_id": newSampleID,
+	})
 }

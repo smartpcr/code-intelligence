@@ -15,8 +15,8 @@ env:
   COMPOSE_FILE: tests/e2e/phase-03-indexer-ingestor/docker-compose.yml
 
 jobs:
-  e2e-active-row-uniqueness-enforcement:
-    name: "E2E – Active Row Uniqueness Enforcement"
+  e2e-retraction-and-rescan-flow:
+    name: "E2E – Retraction and Rescan Flow"
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -36,10 +36,10 @@ jobs:
       - name: Export compose-provided env vars
         run: |
           PG_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port postgres 5432 | cut -d: -f2)
-          INGESTOR_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port ingestor 8080 | cut -d: -f2)
+          INDEXER_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port indexer 8080 | cut -d: -f2)
           OTEL_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port otel-collector 4317 | cut -d: -f2)
           echo "CLEAN_CODE_PG_URL=postgres://postgres:postgres@localhost:${PG_PORT}/clean_code?sslmode=disable" >> "$GITHUB_ENV"
-          echo "CLEAN_CODE_INGESTOR_URL=http://localhost:${INGESTOR_PORT}" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_INDEXER_URL=http://localhost:${INDEXER_PORT}" >> "$GITHUB_ENV"
           echo "CLEAN_CODE_OTEL_ENDPOINT=http://localhost:${OTEL_PORT}" >> "$GITHUB_ENV"
 
       - name: Bootstrap – migrate and seed
@@ -51,7 +51,7 @@ jobs:
         working-directory: services/clean-code
         run: |
           go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
-            -run TestE2E_repo_indexer_and_metric_ingestor_active_row_uniqueness_enforcement
+            -run TestE2E_repo_indexer_and_metric_ingestor_retraction_and_rescan_flow
 
       - name: Tear down compose services
         if: always()

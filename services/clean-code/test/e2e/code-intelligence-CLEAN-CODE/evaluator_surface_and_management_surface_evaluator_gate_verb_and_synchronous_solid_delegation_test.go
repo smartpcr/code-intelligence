@@ -169,39 +169,81 @@ func callEvalGate(evaluatorURL, sha, repoID, policyVersionID string, extras map[
 // recognises this SHA as having samples present (not degraded). The seeded data
 // from `make seed-phase-06` creates baseline samples for repo-a, but our
 // unique per-test SHAs need their own rows.
+//
+// The function discovers the actual metric_sample schema from information_schema
+// to select the correct column names, and fails fast if the schema is unknown.
 func seedSamplesForSHA(db *sql.DB, repoID, sha string) error {
-	_, err := db.Exec(
-		`INSERT INTO metric_sample (repo_id, sha, metric_name, value, created_at)
+	// Discover the metric_sample column names to select the right INSERT variant.
+	cols, err := discoverMetricSampleColumns(db)
+	if err != nil {
+		return fmt.Errorf("discovering metric_sample schema: %w", err)
+	}
+
+	// Determine which schema variant we're dealing with based on actual columns.
+	type schemaVariant struct {
+		nameCol string // column for metric name
+		tsCol   string // column for timestamp
+	}
+
+	var variant *schemaVariant
+	if cols["metric_name"] && cols["created_at"] {
+		variant = &schemaVariant{nameCol: "metric_name", tsCol: "created_at"}
+	} else if cols["name"] && cols["collected_at"] {
+		variant = &schemaVariant{nameCol: "name", tsCol: "collected_at"}
+	} else {
+		return fmt.Errorf("metric_sample schema does not match any known variant (columns: %v); "+
+			"cannot seed complete sample rows with metric names and values", colNames(cols))
+	}
+
+	query := fmt.Sprintf(
+		`INSERT INTO metric_sample (repo_id, sha, %s, value, %s)
 		 VALUES ($1, $2, 'cyclomatic_complexity', 5.0, NOW()),
 		        ($1, $2, 'coupling_between_objects', 2.0, NOW()),
 		        ($1, $2, 'lines_of_code', 100.0, NOW())
 		 ON CONFLICT DO NOTHING`,
-		repoID, sha,
+		variant.nameCol, variant.tsCol,
 	)
+
+	_, err = db.Exec(query, repoID, sha)
 	if err != nil {
-		// If the metric_sample table has a different schema, try a simpler insert
-		_, err2 := db.Exec(
-			`INSERT INTO metric_sample (repo_id, sha, name, value, collected_at)
-			 VALUES ($1, $2, 'cyclomatic_complexity', 5.0, NOW()),
-			        ($1, $2, 'coupling_between_objects', 2.0, NOW()),
-			        ($1, $2, 'lines_of_code', 100.0, NOW())
-			 ON CONFLICT DO NOTHING`,
-			repoID, sha,
-		)
-		if err2 != nil {
-			// Last resort: try with minimal columns
-			_, err3 := db.Exec(
-				`INSERT INTO metric_sample (repo_id, sha)
-				 VALUES ($1, $2)
-				 ON CONFLICT DO NOTHING`,
-				repoID, sha,
-			)
-			if err3 != nil {
-				return fmt.Errorf("seeding metric_sample (tried 3 schema variants): %w / %w / %w", err, err2, err3)
-			}
-		}
+		return fmt.Errorf("inserting metric_sample rows (schema: %s/%s): %w",
+			variant.nameCol, variant.tsCol, err)
 	}
 	return nil
+}
+
+// discoverMetricSampleColumns queries information_schema to return the set of
+// column names present in the metric_sample table.
+func discoverMetricSampleColumns(db *sql.DB) (map[string]bool, error) {
+	rows, err := db.Query(
+		`SELECT column_name FROM information_schema.columns
+		 WHERE table_name = 'metric_sample'`)
+	if err != nil {
+		return nil, fmt.Errorf("querying information_schema: %w", err)
+	}
+	defer rows.Close()
+
+	cols := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scanning column name: %w", err)
+		}
+		cols[name] = true
+	}
+	if len(cols) == 0 {
+		return nil, fmt.Errorf("metric_sample table not found or has no columns")
+	}
+	return cols, rows.Err()
+}
+
+// colNames returns a sorted comma-separated list of column names for error messages.
+func colNames(cols map[string]bool) string {
+	names := make([]string, 0, len(cols))
+	for name := range cols {
+		names = append(names, name)
+	}
+	return strings.Join(names, ", ")
 }
 
 // signPolicyForSHA requests a valid policy signature from the KMS mock service

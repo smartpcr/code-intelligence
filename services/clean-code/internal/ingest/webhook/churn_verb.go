@@ -7,34 +7,62 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/gofrs/uuid"
 
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/churn"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
 )
 
 // ChurnVerbHandler is the [VerbHandler] implementation for
 // the `ingest.churn` verb (architecture Sec 6.4 / tech-spec
-// Sec 8.5 row 3). It wraps a [metric_ingestor.Ingestor] and
-// translates the inbound JSON body into a
-// [metric_ingestor.RunRequest] with
-// `kind='external_per_row'` per the verb-to-kind matrix in
-// e2e-scenarios.md line 687.
+// Sec 8.5 row 3 / implementation-plan Stage 4.4 lines 410-425).
+//
+// # Stage 4.4 rewire (this iter)
+//
+// The handler now depends on a [ChurnIngester] -- the small
+// interface satisfied by [churn.Ingester] from the
+// `internal/ingest/churn` package -- INSTEAD of the legacy
+// `*metric_ingestor.Ingestor` chain. The contract pinned by
+// the brief is "the verb writes ZERO `metric_sample` rows
+// directly; it ONLY feeds the `modification_count_in_window`
+// materialiser via the `clean_code.churn_event` staging
+// table" (Stage 4.4 lines 410-425, e2e-scenarios.md lines
+// 658-664). [ChurnIngester] depends on [churn.ChurnEventWriter]
+// only -- it has NO `metric_sample` writer in its type
+// signature, so the import graph of THIS handler proves the
+// contract at the type level: `churn_verb.go` does not import
+// `metric_ingestor` after the rewire.
 //
 // # Why a separate type from ChurnIngestHandler
 //
 // [ChurnIngestHandler] is the legacy direct mount at the
 // fixed path `/v1/ingest/churn` (iter 5 structural fix --
-// see handler.go doc-comment). The Router introduced by
-// Stage 4.1 sits at `/v1/ingest/{verb}` and does the HMAC /
-// idempotency work above the per-verb handler. This type
-// is the seam through which the Router drives the SAME
-// underlying Ingestor without duplicating the HTTP
-// concerns (content-type parsing, error mapping, response
-// shaping) the Router already owns.
+// see handler.go doc-comment) and continues to use the
+// inline metric_sample path for now. The Router introduced
+// by Stage 4.1 sits at `/v1/ingest/{verb}` and is the path
+// the production composition root mounts via
+// [mountIngestRouter] in `cmd/clean-code-metric-ingestor/main.go`.
+// This Router-facing type is the seam through which Stage 4.4
+// swaps the inline path for the staging path WITHOUT
+// disturbing the legacy mount.
 type ChurnVerbHandler struct {
-	ingestor *metric_ingestor.Ingestor
+	ingester ChurnIngester
+	now      func() time.Time
+}
+
+// ChurnIngester is the minimal interface [ChurnVerbHandler]
+// depends on -- satisfied by [churn.Ingester]. Defined as a
+// package-local interface (rather than reaching into the
+// `churn` package's concrete type) so a future test fake or
+// alternate implementation can swap in without changing the
+// handler.
+//
+// The interface surface intentionally mirrors
+// [churn.Ingester.Ingest] verbatim: one method, value-type
+// handle, pointer payload, structured result.
+type ChurnIngester interface {
+	Ingest(ctx context.Context, handle churn.ScanRunHandle, payload *churn.Payload) (churn.IngestResult, error)
 }
 
 // errChurnJSONDecode is the sentinel the verb wraps every
@@ -45,18 +73,34 @@ type ChurnVerbHandler struct {
 var errChurnJSONDecode = errors.New("webhook/churn: JSON decode failed")
 
 // NewChurnVerbHandler constructs a [ChurnVerbHandler] bound
-// to `ingestor`. PANICS on a nil ingestor -- a verb handler
+// to `ingester`. PANICS on a nil ingester -- a verb handler
 // without a writer cannot service any request and the
 // composition-root misconfig should fail loudly at startup.
-func NewChurnVerbHandler(ingestor *metric_ingestor.Ingestor) *ChurnVerbHandler {
-	if ingestor == nil {
-		panic("webhook: NewChurnVerbHandler received nil Ingestor")
+//
+// The clock defaults to [time.Now]. Tests that need a
+// deterministic [churn.ScanRunHandle.OpenedAt] use
+// [NewChurnVerbHandlerWithClock].
+func NewChurnVerbHandler(ingester ChurnIngester) *ChurnVerbHandler {
+	if ingester == nil {
+		panic("webhook: NewChurnVerbHandler received nil ChurnIngester")
 	}
-	return &ChurnVerbHandler{ingestor: ingestor}
+	return &ChurnVerbHandler{ingester: ingester, now: time.Now}
+}
+
+// NewChurnVerbHandlerWithClock is the test-friendly
+// constructor. PANICS on any nil argument.
+func NewChurnVerbHandlerWithClock(ingester ChurnIngester, now func() time.Time) *ChurnVerbHandler {
+	if ingester == nil {
+		panic("webhook: NewChurnVerbHandlerWithClock received nil ChurnIngester")
+	}
+	if now == nil {
+		panic("webhook: NewChurnVerbHandlerWithClock received nil now()")
+	}
+	return &ChurnVerbHandler{ingester: ingester, now: now}
 }
 
 // Verb implements [VerbHandler].
-func (h *ChurnVerbHandler) Verb() string { return "churn" }
+func (h *ChurnVerbHandler) Verb() string { return churn.Verb }
 
 // ContentType implements [VerbHandler]. `ingest.churn` is
 // pinned to `application/json` per tech-spec Sec 8.5 row 3.
@@ -64,17 +108,19 @@ func (h *ChurnVerbHandler) ContentType() string { return "application/json" }
 
 // ScanRunKind implements [VerbHandler]. `ingest.churn` is
 // `external_per_row` per e2e-scenarios.md line 687 and
-// tech-spec Sec 4.11.
+// tech-spec Sec 4.11. Sourced from the canonical
+// [churn.Kind] constant so a refactor that rebrands the
+// scan_run kind enum surfaces here as a build break.
 func (h *ChurnVerbHandler) ScanRunKind() string {
-	return metric_ingestor.ScanRunKindExternalPerRow
+	return churn.Kind
 }
 
 // SHABinding implements [VerbHandler]. `external_per_row`
 // leaves `scan_run.to_sha` NULL because each emitted
-// metric_sample carries its own SHA. Migration 0001's
+// churn_event carries its own SHA. Migration 0001's
 // scan_run_sha_binding_consistent CHECK enforces this.
 func (h *ChurnVerbHandler) SHABinding() string {
-	return metric_ingestor.SHABindingPerRow
+	return churn.SHABinding
 }
 
 // ExtractMetadata implements [VerbHandler]. Decodes the
@@ -130,14 +176,26 @@ func (h *ChurnVerbHandler) CanonicalRequest(_ http.Header, body []byte) []byte {
 
 // Handle implements [VerbHandler]. Decodes `body` as a
 // [churn.Payload] (with DisallowUnknownFields), builds a
-// [metric_ingestor.ScanRunContext] stamped with
-// `scanRunID`, and dispatches to the underlying Ingestor.
+// [churn.ScanRunHandle] stamped with the Router-supplied
+// `scanRunID` plus the canonical verb / kind / sha-binding
+// constants from the `churn` package, and dispatches to the
+// staging [ChurnIngester] (NOT the legacy `metric_sample`
+// path -- Stage 4.4 wires this handler to write into the
+// `clean_code.churn_event` staging table; the
+// `modification_count_in_window` materialiser is the SOLE
+// writer of that metric_kind on a later pass).
 //
 // `metadata` is unused: the churn body already carries the
-// RepoID and is the authoritative source for the Ingestor's
-// ScanRunContext (the Router-supplied metadata was derived
-// from the SAME body bytes in [ExtractMetadata], so the two
-// are byte-equivalent).
+// RepoID and is the authoritative source for the
+// [churn.ScanRunHandle] (the Router-supplied metadata was
+// derived from the SAME body bytes in [ExtractMetadata], so
+// the two are byte-equivalent).
+//
+// On success returns a [VerbHandleResult] with
+// `FoundationDispatched=false` (external_per_row never
+// dispatches foundation per tech-spec Sec 4.11) and a detail
+// envelope shape `{churn_events_written, scan_run_id}`
+// recording the staged-row count for operator audit.
 func (h *ChurnVerbHandler) Handle(ctx context.Context, _ VerbPayloadMetadata, body []byte, scanRunID uuid.UUID) (VerbHandleResult, error) {
 	var payload churn.Payload
 	dec := json.NewDecoder(bytes.NewReader(body))
@@ -146,56 +204,92 @@ func (h *ChurnVerbHandler) Handle(ctx context.Context, _ VerbPayloadMetadata, bo
 		return VerbHandleResult{}, fmt.Errorf("%w: %v", errChurnJSONDecode, err)
 	}
 
-	scanRun := metric_ingestor.ScanRunContext{
-		ID:     scanRunID,
-		Kind:   metric_ingestor.ScanRunKindExternalPerRow,
-		RepoID: payload.RepoID,
+	// Build the pre-opened scan_run handle the Ingester
+	// validates against the canonical verb/kind matrix.
+	// OpenedAt is stamped from the handler's clock for audit
+	// only; the Ingester stamps a fresh clock reading for
+	// every churn_event.created_at separately.
+	handle := churn.ScanRunHandle{
+		ScanRunID:  scanRunID,
+		RepoID:     payload.RepoID,
+		Verb:       churn.Verb,
+		Kind:       churn.Kind,
+		SHABinding: churn.SHABinding,
+		ToSHA:      "",
+		OpenedAt:   h.now(),
 	}
-	res, runErr := h.ingestor.Run(ctx, metric_ingestor.RunRequest{
-		ScanRun: scanRun,
-		Churn:   &payload,
-	})
+
+	res, runErr := h.ingester.Ingest(ctx, handle, &payload)
 	if runErr != nil {
 		return VerbHandleResult{}, runErr
 	}
 
 	detail, err := json.Marshal(struct {
-		ChurnSamplesWritten int `json:"churn_samples_written"`
-		ChurnRowsHydrated   int `json:"churn_rows_hydrated"`
+		ChurnEventsWritten int       `json:"churn_events_written"`
+		ScanRunID          uuid.UUID `json:"scan_run_id"`
 	}{
-		ChurnSamplesWritten: res.ChurnSamplesWritten,
-		ChurnRowsHydrated:   res.ChurnRowsHydrated,
+		ChurnEventsWritten: res.EventsWritten,
+		ScanRunID:          res.ScanRunID,
 	})
 	if err != nil {
 		return VerbHandleResult{}, fmt.Errorf("marshalling churn detail: %w", err)
 	}
 
 	return VerbHandleResult{
-		ScanRunID:            scanRunID,
-		FoundationDispatched: res.FoundationDispatched,
+		ScanRunID: scanRunID,
+		// FoundationDispatched is always false for
+		// external_per_row -- the Stage 4.4 staging path
+		// has no foundation hook at all (the materialiser
+		// runs on a separate pass).
+		FoundationDispatched: false,
 		Detail:               json.RawMessage(detail),
 	}, nil
 }
 
-// ClassifyError implements [VerbErrorClassifier]. Mirrors
-// the legacy [ChurnIngestHandler] mapping so a Router-driven
-// request returns the same status / code shape as a direct
-// `/v1/ingest/churn` mount. The closed set:
+// ClassifyError implements [VerbErrorClassifier]. The closed
+// set maps every sentinel the verb is willing to classify to a
+// canonical (status, code) pair so the Router emits the same
+// shapes the legacy direct mount returns (a publisher that
+// migrates from `/v1/ingest/churn` to `/v1/ingest/{verb}/churn`
+// sees the same client-error vocabulary).
 //
-//   - [churn.ErrEmptyRepoID]            -> 400 / EMPTY_REPO_ID
-//   - [churn.ErrEmptyRows]              -> 400 / EMPTY_ROWS
-//   - [churn.ErrEmptySHA]               -> 400 / EMPTY_SHA
-//   - [churn.ErrInvalidSHA]             -> 400 / INVALID_SHA
-//   - [churn.ErrEmptyFilePath]          -> 400 / EMPTY_FILE_PATH
-//   - [churn.ErrZeroModifiedAt]         -> 400 / ZERO_MODIFIED_AT
-//   - [churn.ErrScopeResolutionFailed]  -> 422 / SCOPE_RESOLUTION_FAILED
-//   - [metric_ingestor.ErrRepoIDMismatch]-> 400 / REPO_ID_MISMATCH
-//   - [metric_ingestor.ErrZeroRepoID]   -> 400 / EMPTY_REPO_ID
-//   - [metric_ingestor.ErrWriterFailure]-> 500 / WRITER_FAILURE
-//   - any other error                   -> (0, "") -- defer to Router default
+//   - [churn.ErrEmptyRepoID]              -> 400 / EMPTY_REPO_ID
+//   - [churn.ErrEmptyRows]                -> 400 / EMPTY_ROWS
+//   - [churn.ErrEmptySHA]                 -> 400 / EMPTY_SHA
+//   - [churn.ErrInvalidSHA]               -> 400 / INVALID_SHA
+//   - [churn.ErrEmptyFilePath]            -> 400 / EMPTY_FILE_PATH
+//   - [churn.ErrZeroModifiedAt]           -> 400 / ZERO_MODIFIED_AT
+//   - [churn.ErrScopeResolutionFailed]    -> 422 / SCOPE_RESOLUTION_FAILED  (forward-compat -- see note below)
+//   - [churn.ErrRepoIDMismatch]           -> 400 / REPO_ID_MISMATCH
+//   - [churn.ErrChurnEventWriteFailed]    -> 500 / WRITER_FAILURE
+//   - JSON decode failure                 -> 400 / BAD_REQUEST
+//   - any other error                     -> (0, "") -- defer to Router default
+//
+// # Stage 4.4 reachability of ErrScopeResolutionFailed
+//
+// In Stage 4.4 the verb dispatches to [churn.Ingester.Ingest],
+// which does NOT perform scope resolution -- that work is
+// deferred to the `modification_count_in_window` materialiser
+// on a later pass. The errors `Ingester.Ingest` can produce are
+// the [churn.Payload.Validate] / [churn.ValidateScanRunHandle]
+// sentinels plus [churn.ErrRepoIDMismatch],
+// [churn.ErrChurnEventWriteFailed], [churn.ErrZeroNow], and
+// [churn.ErrUUIDMintFailed] -- none of which wrap
+// [churn.ErrScopeResolutionFailed]. The arm is therefore
+// UNREACHABLE through the production Stage 4.4 call path; it
+// is retained for forward-compat because (a) the classification
+// table is the contract a future re-introduction of scope
+// resolution at this boundary MUST honour without re-deriving
+// the mapping, and (b) it stays aligned with the legacy direct
+// mount in handler.go (which DOES surface the sentinel through
+// its metric_ingestor chain) so the two mounts return the same
+// (422, SCOPE_RESOLUTION_FAILED) shape if the future code path
+// produces the sentinel. The unit test in churn_verb_test.go
+// pins the mapping so a future divergence surfaces at build
+// time, not at first request.
 func (h *ChurnVerbHandler) ClassifyError(err error) (int, string) {
 	switch {
-	case errors.Is(err, churn.ErrEmptyRepoID), errors.Is(err, metric_ingestor.ErrZeroRepoID):
+	case errors.Is(err, churn.ErrEmptyRepoID):
 		return http.StatusBadRequest, "EMPTY_REPO_ID"
 	case errors.Is(err, churn.ErrEmptyRows):
 		return http.StatusBadRequest, "EMPTY_ROWS"
@@ -207,11 +301,21 @@ func (h *ChurnVerbHandler) ClassifyError(err error) (int, string) {
 		return http.StatusBadRequest, "EMPTY_FILE_PATH"
 	case errors.Is(err, churn.ErrZeroModifiedAt):
 		return http.StatusBadRequest, "ZERO_MODIFIED_AT"
+	// Forward-compat arm -- see "Stage 4.4 reachability of
+	// ErrScopeResolutionFailed" in the doc-comment above.
+	// churn.Ingester.Ingest does NOT perform scope resolution
+	// in Stage 4.4 (the materialiser handles it on a later
+	// pass), so this arm is unreachable through the production
+	// call path today. Kept aligned with handler.go's legacy
+	// mapping so a future re-introduction of scope resolution
+	// at this boundary surfaces the same (422,
+	// SCOPE_RESOLUTION_FAILED) shape without re-deriving the
+	// classification.
 	case errors.Is(err, churn.ErrScopeResolutionFailed):
 		return http.StatusUnprocessableEntity, "SCOPE_RESOLUTION_FAILED"
-	case errors.Is(err, metric_ingestor.ErrRepoIDMismatch):
+	case errors.Is(err, churn.ErrRepoIDMismatch):
 		return http.StatusBadRequest, "REPO_ID_MISMATCH"
-	case errors.Is(err, metric_ingestor.ErrWriterFailure):
+	case errors.Is(err, churn.ErrChurnEventWriteFailed):
 		return http.StatusInternalServerError, "WRITER_FAILURE"
 	default:
 		// A JSON-decode failure surfaces as a wrapped
@@ -240,4 +344,8 @@ func (h *ChurnVerbHandler) ClassifyError(err error) (int, string) {
 var (
 	_ VerbHandler         = (*ChurnVerbHandler)(nil)
 	_ VerbErrorClassifier = (*ChurnVerbHandler)(nil)
+	// The production [churn.Ingester] MUST satisfy our
+	// minimal [ChurnIngester] interface. A drift surfaces
+	// here, not at composition-root wiring time.
+	_ ChurnIngester = (*churn.Ingester)(nil)
 )

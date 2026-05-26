@@ -594,18 +594,35 @@ func mountIngestRouter(mux *http.ServeMux, cfg config.Config, ingestorDB *sql.DB
 		cfg.WebhookSigningKeyID: []byte(cfg.WebhookHMACSecret),
 	})
 
-	// Churn + coverage verbs share one Ingestor + one
-	// PG-backed MetricSampleWriter so all external ingest
-	// rows flow through the same `metric_sample` INSERT
-	// path. The Ingestor's per-kind switch (churn ->
-	// ChurnSweep; coverage -> CoverageSweep) dispatches by
-	// scan_run.kind.
-	mat := materialisers.NewMaterialiser(materialisers.DefaultWindowDays)
-	hyd := churn.NewHydrator(churn.NewAutoMapScopeResolver())
+	// Churn verb (Stage 4.4 rewire): the verb writes ZERO
+	// `metric_sample` rows directly. It stages into the
+	// `clean_code.churn_event` table via [churn.Ingester]
+	// over the PG-backed [churn.PGChurnEventStore]; the
+	// `modification_count_in_window` materialiser is the
+	// SOLE writer of that metric_kind on a later pass
+	// (architecture Sec 4.4, implementation-plan Stage 4.4).
+	churnEventStore, err := churn.NewPGChurnEventStore(ingestorDB)
+	if err != nil {
+		return fmt.Errorf("NewPGChurnEventStore: %w", err)
+	}
+	churnIngester := churn.NewIngester(churnEventStore)
+	churnHandler := webhook.NewChurnVerbHandler(churnIngester)
+
+	// Coverage + test_balance verbs continue to share the
+	// PG-backed [metric_ingestor.MetricSampleWriter]. The Stage
+	// 4.4 churn rewire above bypasses this writer entirely (the
+	// churn verb stages into `clean_code.churn_event` instead),
+	// but the legacy [metric_ingestor.Ingestor] is retained for
+	// the coverage verb's dispatch -- its constructor requires
+	// a churn-sweep argument, so the materialiser + hydrator +
+	// churnSweep chain stays constructed even though the churn
+	// handler no longer routes through it.
 	sampleWriter, err := metric_ingestor.NewPGMetricSampleWriter(ingestorDB)
 	if err != nil {
 		return fmt.Errorf("NewPGMetricSampleWriter: %w", err)
 	}
+	mat := materialisers.NewMaterialiser(materialisers.DefaultWindowDays)
+	hyd := churn.NewHydrator(churn.NewAutoMapScopeResolver())
 	churnSweep := metric_ingestor.NewChurnSweep(mat, hyd, sampleWriter)
 
 	// Coverage hydrator + sweep. The PG-backed resolver is
@@ -628,19 +645,18 @@ func mountIngestRouter(mux *http.ServeMux, cfg config.Config, ingestorDB *sql.DB
 
 	ing := metric_ingestor.NewIngestor(metric_ingestor.NoopFoundationRecipeDispatcher{}, churnSweep).
 		WithCoverageSweep(covSweep)
-	churnHandler := webhook.NewChurnVerbHandler(ing)
 	coverageHandler := webhook.NewCoverageVerbHandler(ing)
 
 	// Stage 4.3 (architecture Sec 1.4.2 / Sec 6.4 lines
 	// 1367-1368, tech-spec Sec 4.1.1): the test_balance verb
 	// shares the PG-backed [metric_ingestor.MetricSampleWriter]
-	// already built for churn -- both verbs persist into
-	// `clean_code.metric_sample` and the writer's transactional
-	// guard is reused. The verb's [test_balance.Writer] does NOT
-	// route through [metric_ingestor.Ingestor] because the
-	// Ingestor's churn-sweep coordinator only accepts
-	// `external_per_row` (the test_balance verb is
-	// `external_single`).
+	// already built for the coverage path -- both verbs persist
+	// into `clean_code.metric_sample` and the writer's
+	// transactional guard is reused. The verb's
+	// [test_balance.Writer] does NOT route through
+	// [metric_ingestor.Ingestor] because the Ingestor's
+	// churn-sweep coordinator only accepts `external_per_row`
+	// (the test_balance verb is `external_single`).
 	//
 	// Stage 4.3 iter-2 evaluator item 3: the writer ALSO
 	// upserts a `scope_binding` row per emitted record via

@@ -1,0 +1,84 @@
+trigger: none
+
+pr:
+  branches:
+    include:
+      - feature/clean-code
+      - "ws/code-intelligence-CLEAN-CODE/**"
+  paths:
+    include:
+      - services/clean-code/**
+      - tests/e2e/phase-03-indexer-ingestor/**
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  COMPOSE_FILE: tests/e2e/phase-03-indexer-ingestor/docker-compose.yml
+
+stages:
+  - stage: e2e_repo_indexer_and_metric_ingestor
+    displayName: "E2E — repo-indexer-and-metric-ingestor"
+    jobs:
+      - job: stale_scanrun_sweep_loop
+        displayName: "stale-scanrun-sweep-loop"
+        steps:
+          - checkout: self
+
+          - task: GoTool@0
+            inputs:
+              version: "1.25"
+            displayName: "Set up Go"
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) up -d --build
+            displayName: "Start compose stack"
+
+          - script: |
+              set -euo pipefail
+              deadline=$(( $(date +%s) + 90 ))
+              while :; do
+                healthy=true
+                for svc in postgres otel-collector indexer ingestor; do
+                  status=$(docker compose -f $(COMPOSE_FILE) ps --format json \
+                    | jq -r "select(.Service==\"$svc\") | .Health // .State" 2>/dev/null || echo "unknown")
+                  echo "  $svc -> $status"
+                  if [ "$status" != "healthy" ] && [ "$status" != "running" ]; then
+                    healthy=false
+                  fi
+                done
+                if $healthy; then echo "All services ready"; break; fi
+                if [ "$(date +%s)" -ge "$deadline" ]; then
+                  echo "##vso[task.logissue type=error]Services did not become healthy within 90s"
+                  docker compose -f $(COMPOSE_FILE) logs --tail=100
+                  exit 1
+                fi
+                sleep 3
+              done
+            displayName: "Wait for services"
+
+          - script: |
+              make migrate-up
+            displayName: "Run migrations"
+            env:
+              CLEAN_CODE_PG_URL: $(CLEAN_CODE_PG_URL)
+
+          - script: |
+              make seed-fixtures-phase-03
+            displayName: "Seed fixture data"
+            env:
+              CLEAN_CODE_PG_URL: $(CLEAN_CODE_PG_URL)
+
+          - script: |
+              cd services/clean-code
+              go test -tags e2e -v -run TestE2E_repo_indexer_and_metric_ingestor_stale_scanrun_sweep_loop \
+                ./test/e2e/code-intelligence-CLEAN-CODE/...
+            displayName: "Run E2E tests"
+            env:
+              CLEAN_CODE_PG_URL: $(CLEAN_CODE_PG_URL)
+              CLEAN_CODE_OTEL_ENDPOINT: $(CLEAN_CODE_OTEL_ENDPOINT)
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) down -v
+            displayName: "Tear down compose stack"
+            condition: always()

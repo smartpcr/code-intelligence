@@ -295,6 +295,29 @@ const (
 	// canonical Stage 1.2 `0001_catalog_lifecycle` schema does
 	// not have the columns these handlers write).
 	EnvEnableLegacyDemoAPI = "CLEAN_CODE_ENABLE_LEGACY_DEMO_API"
+
+	// EnvEnableExternalIngestWebhook is the explicit
+	// operator-facing opt-in for the Stage 4.1
+	// production-grade `/v1/ingest/{verb}` Router on the
+	// metric-ingestor binary. Default unset = NOT MOUNTED
+	// (the route returns the standard 404 -- no
+	// unauthenticated path can reach Ingestor.Run). Set this
+	// to any truthy value to mount the Router; the Router
+	// requires BOTH this flag AND [EnvWebhookHMACSecret] AND
+	// [EnvWebhookSigningKeyID] to be set -- one without the
+	// others is a configuration error that fails fast at
+	// startup. The Router persists scan_run rows with
+	// `payload_hash` set (migration 0009's partial unique
+	// index) so retries across restarts and replicas
+	// short-circuit to the prior scan_run_id.
+	EnvEnableExternalIngestWebhook = "CLEAN_CODE_ENABLE_EXTERNAL_INGEST_WEBHOOK"
+
+	// EnvWebhookSigningKeyID is the operator-facing key-id
+	// the publishers MUST send in the `X-Signing-Key-Id`
+	// header. Pinned per deployment; the Router rejects
+	// any other key-id with 401 / HMAC_UNKNOWN_KEY_ID.
+	// Empty when [EnvEnableExternalIngestWebhook] is unset.
+	EnvWebhookSigningKeyID = "CLEAN_CODE_WEBHOOK_SIGNING_KEY_ID" //nolint:gosec // env var name, not a credential
 )
 
 // MinWebhookHMACSecretBytes is the minimum length (in bytes,
@@ -458,6 +481,24 @@ type Config struct {
 	// error. See [EnvEnableLegacyDemoAPI].
 	EnableLegacyDemoAPI bool
 
+	// --- Stage 4.1 production-grade /v1/ingest/{verb}
+	//     Router ---
+
+	// EnableExternalIngestWebhook is the explicit operator
+	// opt-in for the Stage 4.1 production-grade
+	// `/v1/ingest/{verb}` Router. Default false (not
+	// mounted). Setting this true requires
+	// [WebhookHMACSecret] AND [WebhookSigningKeyID] to be
+	// set; one without the others fails fast at startup.
+	// See [EnvEnableExternalIngestWebhook].
+	EnableExternalIngestWebhook bool
+
+	// WebhookSigningKeyID is the canonical `signing_key_id`
+	// publishers MUST send in the `X-Signing-Key-Id` header.
+	// Empty when [EnableExternalIngestWebhook] is false.
+	// See [EnvWebhookSigningKeyID].
+	WebhookSigningKeyID string
+
 	// --- Stage 3.2 Metric Ingestor scan-source ---
 
 	// AstScanRoot points at the local on-disk root the
@@ -605,13 +646,34 @@ func (c Config) Validate() error {
 		return fmt.Errorf("config: %s=true requires %s to be set (HMAC verification is mandatory when the webhook is mounted)",
 			EnvEnableScaffoldChurnWebhook, EnvWebhookHMACSecret)
 	}
-	if !c.EnableScaffoldChurnWebhook && c.WebhookHMACSecret != "" && !c.EnableScaffoldIndexerWebhook {
-		return fmt.Errorf("config: %s is set but neither %s nor %s is set; the webhooks stay UNMOUNTED until at least one opt-in flag is enabled (avoids an unintended public surface)",
-			EnvWebhookHMACSecret, EnvEnableScaffoldChurnWebhook, EnvEnableScaffoldIndexerWebhook)
+	if !c.EnableScaffoldChurnWebhook && c.WebhookHMACSecret != "" && !c.EnableScaffoldIndexerWebhook && !c.EnableExternalIngestWebhook {
+		return fmt.Errorf("config: %s is set but none of %s / %s / %s is set; the webhooks stay UNMOUNTED until at least one opt-in flag is enabled (avoids an unintended public surface)",
+			EnvWebhookHMACSecret, EnvEnableScaffoldChurnWebhook, EnvEnableScaffoldIndexerWebhook, EnvEnableExternalIngestWebhook)
 	}
 	if c.EnableScaffoldIndexerWebhook && c.WebhookHMACSecret == "" {
 		return fmt.Errorf("config: %s=true requires %s to be set (HMAC verification is mandatory when the Repo Indexer webhook is mounted)",
 			EnvEnableScaffoldIndexerWebhook, EnvWebhookHMACSecret)
+	}
+	// Stage 4.1 production-grade /v1/ingest/{verb} Router
+	// interlock: enabling the Router requires BOTH a non-empty
+	// signing-key-id AND a non-empty HMAC secret. The Router
+	// rejects publishers that don't quote the configured
+	// signing_key_id, so a missing key-id would brick the
+	// surface; a missing secret would be an unauthenticated
+	// boundary.
+	if c.EnableExternalIngestWebhook {
+		if c.WebhookHMACSecret == "" {
+			return fmt.Errorf("config: %s=true requires %s to be set (HMAC verification is mandatory when the external-ingest Router is mounted)",
+				EnvEnableExternalIngestWebhook, EnvWebhookHMACSecret)
+		}
+		if c.WebhookSigningKeyID == "" {
+			return fmt.Errorf("config: %s=true requires %s to be set (the Router rejects any signing_key_id it does not recognise)",
+				EnvEnableExternalIngestWebhook, EnvWebhookSigningKeyID)
+		}
+	}
+	if c.WebhookSigningKeyID != "" && !c.EnableExternalIngestWebhook {
+		return fmt.Errorf("config: %s is set but %s is not; the signing key id is consumed only by the external-ingest Router",
+			EnvWebhookSigningKeyID, EnvEnableExternalIngestWebhook)
 	}
 	if c.WebhookHMACSecret != "" && len(c.WebhookHMACSecret) < MinWebhookHMACSecretBytes {
 		return fmt.Errorf("config: %s must be at least %d bytes long (got %d); use a CSPRNG-generated secret such as `head -c 32 /dev/urandom | base64`",
@@ -649,6 +711,8 @@ func readEnvOverrides() map[string]string {
 		EnvEnableScaffoldIndexerWebhook,
 		EnvDisableStaleSweep,
 		EnvEnableLegacyDemoAPI,
+		EnvEnableExternalIngestWebhook,
+		EnvWebhookSigningKeyID,
 		EnvAstScanRoot,
 	}
 	out := make(map[string]string, len(keys))
@@ -769,6 +833,17 @@ func applyOverrides(cfg *Config, overrides map[string]string) error {
 			default:
 				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
 			}
+		case EnvEnableExternalIngestWebhook:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "1", "true", "yes", "on":
+				cfg.EnableExternalIngestWebhook = true
+			case "0", "false", "no", "off":
+				cfg.EnableExternalIngestWebhook = false
+			default:
+				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
+			}
+		case EnvWebhookSigningKeyID:
+			cfg.WebhookSigningKeyID = v
 		case EnvAstScanRoot:
 			cfg.AstScanRoot = v
 		default:

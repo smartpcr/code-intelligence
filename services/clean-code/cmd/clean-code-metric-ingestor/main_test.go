@@ -298,3 +298,174 @@ func TestHandleHealthz_Returns200OK(t *testing.T) {
 		t.Errorf("body: got %q, want %q", body, "ok")
 	}
 }
+
+// TestMountIngestRouter_Disabled_NoMountNoError
+// (iter-3 evaluator item #3) pins the off-by-default
+// composition contract: when
+// [config.EnableExternalIngestWebhook] is false,
+// mountIngestRouter MUST return nil AND MUST NOT mount
+// anything on the supplied mux. A misroute of legitimate
+// traffic to RouterPath should yield 404, not 401, so an
+// operator can distinguish "service not opted in" from
+// "bad signature".
+func TestMountIngestRouter_Disabled_NoMountNoError(t *testing.T) {
+	mux := http.NewServeMux()
+	cfg := config.Defaults()
+	cfg.EnableExternalIngestWebhook = false
+
+	if err := mountIngestRouter(mux, cfg, nil, nil); err != nil {
+		t.Fatalf("mountIngestRouter (disabled): want nil error, got %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/ingest/churn", strings.NewReader(`{}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status on disabled mode: got %d, want 404 (router MUST NOT be mounted)", rec.Code)
+	}
+}
+
+// TestMountIngestRouter_EnabledNilDB_ReturnsError
+// pins the composition-root invariant: when the operator
+// opts in but the ingestor *sql.DB handle is nil, mount
+// MUST fail loudly with an error naming the nil DB so the
+// main() log line points the operator at the wiring bug
+// rather than panicking inside PG store construction.
+func TestMountIngestRouter_EnabledNilDB_ReturnsError(t *testing.T) {
+	mux := http.NewServeMux()
+	cfg := config.Defaults()
+	cfg.EnableExternalIngestWebhook = true
+	cfg.WebhookHMACSecret = strings.Repeat("k", 32)
+	cfg.WebhookSigningKeyID = "key-test-01"
+
+	err := mountIngestRouter(mux, cfg, nil, nil)
+	if err == nil {
+		t.Fatalf("mountIngestRouter: want non-nil error for nil DB, got nil")
+	}
+	if !strings.Contains(err.Error(), "ingestorDB is nil") {
+		t.Errorf("error message: want substring 'ingestorDB is nil', got %v", err)
+	}
+}
+
+// TestMountIngestRouter_EnabledEmptySigningKeyID_ReturnsError
+// pins the defence-in-depth guard inside mountIngestRouter
+// against a Validate-bypass (e.g. someone calling
+// mountIngestRouter with a hand-built Config rather than
+// going through Load). Empty signing_key_id MUST surface as
+// an error naming the env var.
+func TestMountIngestRouter_EnabledEmptySigningKeyID_ReturnsError(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mux := http.NewServeMux()
+	cfg := config.Defaults()
+	cfg.EnableExternalIngestWebhook = true
+	cfg.WebhookHMACSecret = strings.Repeat("k", 32)
+	cfg.WebhookSigningKeyID = "" // hand-built misconfiguration
+
+	err = mountIngestRouter(mux, cfg, db, nil)
+	if err == nil {
+		t.Fatalf("mountIngestRouter: want non-nil error for empty signing_key_id, got nil")
+	}
+	if !strings.Contains(err.Error(), config.EnvWebhookSigningKeyID) {
+		t.Errorf("error message: want substring %q for operator triage, got %v", config.EnvWebhookSigningKeyID, err)
+	}
+}
+
+// TestMountIngestRouter_EnabledEmptyHMACSecret_ReturnsError
+// is the symmetric guard for an empty HMAC secret.
+func TestMountIngestRouter_EnabledEmptyHMACSecret_ReturnsError(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mux := http.NewServeMux()
+	cfg := config.Defaults()
+	cfg.EnableExternalIngestWebhook = true
+	cfg.WebhookHMACSecret = "" // hand-built misconfiguration
+	cfg.WebhookSigningKeyID = "key-test-01"
+
+	err = mountIngestRouter(mux, cfg, db, nil)
+	if err == nil {
+		t.Fatalf("mountIngestRouter: want non-nil error for empty HMAC secret, got nil")
+	}
+	if !strings.Contains(err.Error(), config.EnvWebhookHMACSecret) {
+		t.Errorf("error message: want substring %q for operator triage, got %v", config.EnvWebhookHMACSecret, err)
+	}
+}
+
+// TestMountIngestRouter_Enabled_MountsRouterAtCanonicalPath
+// (iter-3 evaluator item #3) pins the happy-path wiring:
+// with all three operator pins set and a non-nil *sql.DB,
+// mountIngestRouter MUST mount the Router at the canonical
+// /v1/ingest/ prefix so a POST to /v1/ingest/{verb} is
+// handled by the new Router (we observe a non-404 response
+// -- the exact 401 status proves we hit the HMAC verifier).
+func TestMountIngestRouter_Enabled_MountsRouterAtCanonicalPath(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mux := http.NewServeMux()
+	cfg := config.Defaults()
+	cfg.EnableExternalIngestWebhook = true
+	cfg.WebhookHMACSecret = strings.Repeat("k", 32)
+	cfg.WebhookSigningKeyID = "key-test-01"
+
+	if err := mountIngestRouter(mux, cfg, db, nil); err != nil {
+		t.Fatalf("mountIngestRouter: %v", err)
+	}
+
+	// Hit the canonical path WITHOUT a valid signature so we
+	// never reach the PG store. The Router MUST be present
+	// (non-404). The exact 401 status proves the HMAC
+	// verifier sits in front of the DB roundtrip.
+	req := httptest.NewRequest(http.MethodPost, "/v1/ingest/churn", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusNotFound {
+		t.Errorf("status: got 404, want non-404 (Router MUST be mounted at /v1/ingest/)")
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status: got %d, want 401 (unsigned request MUST be rejected by HMAC verifier before any handler runs); body=%s",
+			rec.Code, rec.Body.String())
+	}
+}
+
+// TestMountIngestRouter_Disabled_RouterNotReachableEvenWithSecrets
+// pins the inverse: even when secrets ARE supplied, the
+// enable flag governs mounting. This protects against the
+// "secrets pre-staged for rollout but flag still off" case.
+func TestMountIngestRouter_Disabled_RouterNotReachableEvenWithSecrets(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mux := http.NewServeMux()
+	cfg := config.Defaults()
+	cfg.EnableExternalIngestWebhook = false
+	cfg.WebhookHMACSecret = strings.Repeat("k", 32)
+	cfg.WebhookSigningKeyID = "key-test-01"
+
+	if err := mountIngestRouter(mux, cfg, db, nil); err != nil {
+		t.Fatalf("mountIngestRouter (disabled with secrets present): %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/ingest/churn", strings.NewReader(`{}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404 (enable flag governs mounting; secrets alone MUST NOT mount)", rec.Code)
+	}
+}

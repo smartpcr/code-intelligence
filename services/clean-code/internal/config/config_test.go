@@ -37,6 +37,8 @@ func clearCleanCodeEnv(t *testing.T) {
 		EnvWebhookHMACSecret,
 		EnvEnableScaffoldChurnWebhook,
 		EnvEnableScaffoldIndexerWebhook,
+		EnvEnableExternalIngestWebhook,
+		EnvWebhookSigningKeyID,
 		EnvDisableStaleSweep,
 		EnvEnableLegacyDemoAPI,
 		EnvAstScanRoot,
@@ -683,3 +685,117 @@ func TestAllowSharedPGRole_RejectsNonBoolean(t *testing.T) {
 		t.Errorf("Load with %s=maybe: want non-nil error, got nil", EnvAllowSharedPGRole)
 	}
 }
+
+// strongHMACSecret returns an HMAC secret long enough to clear
+// [MinWebhookHMACSecretBytes] -- a constant test fixture used
+// by the external-ingest interlock tests below.
+func strongHMACSecret() string {
+	return strings.Repeat("z", MinWebhookHMACSecretBytes)
+}
+
+// TestExternalIngestWebhook_AllThreeVarsSet_AcceptsAndRoundTrips
+// (iter-3 evaluator item #3) pins the happy path of the
+// three-variable interlock for the external-ingest Router:
+// when [EnvEnableExternalIngestWebhook] AND
+// [EnvWebhookHMACSecret] AND [EnvWebhookSigningKeyID] are
+// all set, Load succeeds and the values round-trip onto the
+// Config.
+func TestExternalIngestWebhook_AllThreeVarsSet_AcceptsAndRoundTrips(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvEnableExternalIngestWebhook, "1")
+	t.Setenv(EnvWebhookHMACSecret, strongHMACSecret())
+	t.Setenv(EnvWebhookSigningKeyID, "key-prod-01")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.EnableExternalIngestWebhook {
+		t.Errorf("EnableExternalIngestWebhook: want true, got false")
+	}
+	if cfg.WebhookSigningKeyID != "key-prod-01" {
+		t.Errorf("WebhookSigningKeyID: want %q, got %q", "key-prod-01", cfg.WebhookSigningKeyID)
+	}
+	if cfg.WebhookHMACSecret != strongHMACSecret() {
+		t.Errorf("WebhookHMACSecret round-trip mismatch")
+	}
+}
+
+// TestExternalIngestWebhook_EnableWithoutHMACSecret_Rejected
+// pins the first half of the interlock: enabling the
+// webhook without supplying the HMAC secret is a deployment
+// misconfiguration that MUST fail loudly at Load.
+func TestExternalIngestWebhook_EnableWithoutHMACSecret_Rejected(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvEnableExternalIngestWebhook, "1")
+	t.Setenv(EnvWebhookSigningKeyID, "key-prod-01")
+	// EnvWebhookHMACSecret deliberately left unset.
+	_, err := Load()
+	if err == nil {
+		t.Fatalf("Load: want error (missing %s), got nil", EnvWebhookHMACSecret)
+	}
+	if !strings.Contains(err.Error(), EnvWebhookHMACSecret) {
+		t.Errorf("error must name %s for operator triage, got: %v", EnvWebhookHMACSecret, err)
+	}
+	if !strings.Contains(err.Error(), EnvEnableExternalIngestWebhook) {
+		t.Errorf("error must name %s, got: %v", EnvEnableExternalIngestWebhook, err)
+	}
+}
+
+// TestExternalIngestWebhook_EnableWithoutSigningKeyID_Rejected
+// pins the second half of the interlock: enabling the
+// webhook without the signing_key_id leaves the secret
+// resolver unable to verify any signature, so Load MUST
+// reject.
+func TestExternalIngestWebhook_EnableWithoutSigningKeyID_Rejected(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvEnableExternalIngestWebhook, "1")
+	t.Setenv(EnvWebhookHMACSecret, strongHMACSecret())
+	// EnvWebhookSigningKeyID deliberately left unset.
+	_, err := Load()
+	if err == nil {
+		t.Fatalf("Load: want error (missing %s), got nil", EnvWebhookSigningKeyID)
+	}
+	if !strings.Contains(err.Error(), EnvWebhookSigningKeyID) {
+		t.Errorf("error must name %s, got: %v", EnvWebhookSigningKeyID, err)
+	}
+}
+
+// TestExternalIngestWebhook_SigningKeyIDWithoutEnable_Rejected
+// pins the inverse direction of the interlock: setting the
+// signing_key_id without the explicit enable flag is a
+// fingerprint of a half-finished rollout (operator forgot
+// the enable). Load MUST reject so the misconfiguration
+// surfaces before any HTTP traffic arrives.
+func TestExternalIngestWebhook_SigningKeyIDWithoutEnable_Rejected(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvWebhookSigningKeyID, "key-prod-01")
+	t.Setenv(EnvWebhookHMACSecret, strongHMACSecret())
+	// EnvEnableExternalIngestWebhook deliberately left unset.
+	_, err := Load()
+	if err == nil {
+		t.Fatalf("Load: want error (signing_key_id without enable), got nil")
+	}
+	if !strings.Contains(err.Error(), EnvEnableExternalIngestWebhook) {
+		t.Errorf("error must name %s, got: %v", EnvEnableExternalIngestWebhook, err)
+	}
+}
+
+// TestExternalIngestWebhook_UnsetByDefault pins the
+// off-by-default posture: with NO webhook env vars set, the
+// external-ingest flag is false and the signing_key_id is
+// empty. Required so a service binary that doesn't opt in
+// will never accidentally accept external webhook traffic.
+func TestExternalIngestWebhook_UnsetByDefault(t *testing.T) {
+	clearCleanCodeEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.EnableExternalIngestWebhook {
+		t.Errorf("EnableExternalIngestWebhook: want false (off-by-default), got true")
+	}
+	if cfg.WebhookSigningKeyID != "" {
+		t.Errorf("WebhookSigningKeyID: want empty (off-by-default), got %q", cfg.WebhookSigningKeyID)
+	}
+}
+

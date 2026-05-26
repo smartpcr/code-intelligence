@@ -1691,3 +1691,412 @@ hydrator is gated.
 - [ ] You have set `CLEAN_CODE_ENABLE_SCAFFOLD_CHURN_WEBHOOK=true` AND `CLEAN_CODE_WEBHOOK_HMAC_SECRET=<value>`.
 - [ ] Restart `clean-coded`. The startup log line `ingest.churn webhook mounted in SCAFFOLD MODE -- writer is in-memory and rows are LOST on restart` confirms the mount.
 - [ ] You have a plan to upgrade to Phase 3.2 BEFORE the in-memory loss becomes operationally painful (e.g. a backfill job that re-POSTs the last N hours of churn on every restart).
+
+## Stage 4.1 -- `/v1/ingest/{verb}` Router and HMAC verification
+
+The Stage 4.1 webhook lives at `internal/ingest/webhook/router.go`
+and serves the **generic** `/v1/ingest/{verb}` path that all four
+`ingest.*` verbs (`coverage`, `test_balance`, `churn`, `defects`)
+will mount on. The legacy `/v1/ingest/churn` mount (above) stays
+for backwards compatibility; the Router is the canonical
+production surface going forward.
+
+### Wire shape
+
+```
+POST /v1/ingest/{verb} HTTP/1.1
+Content-Type: <per-verb media type, e.g. application/json>
+X-Signing-Key-Id: <opaque ASCII id agreed out-of-band>
+X-Hub-Signature-256: sha256=<lowercase-hex HMAC-SHA256(body, secret)>
+
+<verb-specific body>
+```
+
+The Router resolves the per-deployment HMAC secret via
+`SecretResolver.Resolve(X-Signing-Key-Id)`. v1 is
+**single-tenant** per tech-spec Sec 4.14 (one logical org per
+deployment); there is NO `tenant_id` field on the resolver,
+the response envelope, or the idempotency record. Multi-tenant
+v2 will use per-schema isolation (tech-spec Sec 10A lines
+1690-1696), NOT row-level tenant columns -- the Router's
+seam-shape survives that migration without API change.
+
+### Order of operations (security-critical)
+
+1. **Method check**: non-`POST` -> `405 / METHOD_NOT_ALLOWED`.
+2. **Body size cap**: 16 MiB -> `413 / PAYLOAD_TOO_LARGE`.
+3. **HMAC verification** (BEFORE any per-verb inspection):
+   - `ValidateSigningKeyID(X-Signing-Key-Id)` rejects missing /
+     malformed headers (`HMAC_MISSING_KEY_ID`,
+     `HMAC_MALFORMED_KEY_ID`).
+   - `SecretResolver.Resolve(...)` rejects unknown ids
+     (`HMAC_UNKNOWN_KEY_ID`).
+   - `VerifyHMAC(body, X-Hub-Signature-256, secret)` rejects
+     missing / malformed / mismatched signatures
+     (`HMAC_MISSING_SIGNATURE`, `HMAC_MALFORMED_SIGNATURE`,
+     `HMAC_SIGNATURE_MISMATCH`).
+   - Every failure returns `401`. The HMAC step runs BEFORE
+     verb / content-type inspection so an unauthenticated
+     caller cannot probe the per-verb contract via 401-vs-415
+     differentials.
+4. **Verb lookup**: unregistered verb -> `404 / VERB_NOT_FOUND`.
+5. **Content-Type pin** (per-verb): a mismatch ->
+   `415 / UNSUPPORTED_MEDIA_TYPE`.
+6. **Idempotency claim**: `payload_hash = sha256(body)`. A
+   prior commit for the same `(verb, payload_hash)` returns
+   the cached `scan_run_id` with `replayed=true` and does NOT
+   re-execute the verb handler. Atomic claim/commit/abort
+   guarantees exactly one execution under concurrent retries.
+
+### Success envelope
+
+```json
+{
+  "scan_run_id": "<uuidv7>",
+  "verb": "<churn|coverage|test_balance|defects>",
+  "scan_run_kind": "<external_per_row|external_single>",
+  "payload_hash": "<sha256 lowercase hex>",
+  "foundation_dispatched": false,
+  "replayed": false,
+  "detail": { /* verb-specific counters */ }
+}
+```
+
+A replay returns the SAME `scan_run_id` with `replayed=true`.
+
+### Operator rotation (signing key)
+
+`StaticSecretResolver` supports the tech-spec Sec 8.2 24-hour
+overlap:
+
+1. Publish a new `(signing_key_id, secret)` pair via
+   `resolver.Add(newID, newSecret)`. Both old and new keys
+   verify during the overlap window.
+2. Update CI publishers to use the new id.
+3. After the 24-hour overlap, `resolver.Remove(oldID)`. The
+   old id now returns `HMAC_UNKNOWN_KEY_ID`.
+
+A Phase 3.2 PG-backed resolver will source rows from a
+secret-rotation table; the rotation flow stays the same.
+
+### Iter 2 -- Durable `scan_run(payload_hash)` idempotency + Router mount
+
+> **Superseded by iter 3.** Iter 2 keyed the partial
+> unique index on `(kind, payload_hash)`. Iter 3 rekeyed
+> it on `(verb, payload_hash)` (index name
+> `scan_run_payload_hash_verb_uniq`) -- see the iter-3
+> section below for the canonical migration shape and
+> operator playbook. The iter-2 prose is preserved as
+> historical record only; do NOT use the SQL snippets in
+> this section directly.
+
+Iter 1 used the in-process `IdempotencyStore` as the source of
+truth for replay. Iter 2 inverts that: the durable
+`scan_run(kind, payload_hash)` row is now the authority; the
+in-process store is a fast same-process replay cache.
+
+#### Required migration -- 0009 (apply BEFORE enabling the webhook)
+
+`migrations/0009_scan_run_payload_hash_unique.up.sql` creates a
+partial unique index:
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS
+    scan_run_payload_hash_kind_uniq
+    ON scan_run (kind, payload_hash)
+    WHERE payload_hash IS NOT NULL;
+```
+
+Operational rules:
+
+- `CREATE INDEX CONCURRENTLY` cannot run inside a transaction.
+  Apply via `psql -f` (autocommit), NOT through the migration
+  runner if that runner wraps each file in `BEGIN/COMMIT`.
+- The `WHERE payload_hash IS NOT NULL` clause restricts the
+  constraint to external-ingest rows; foundation-tier rows
+  (`atomic`, `aggregated_repo`, etc.) keep
+  `payload_hash NULL` and remain unaffected.
+- Rollback is `0009_scan_run_payload_hash_unique.down.sql`:
+  `DROP INDEX CONCURRENTLY IF EXISTS`. Safe to roll back, but
+  retries across replicas/restarts will degrade to "duplicate
+  scan_run rows on race" -- the Router still works, just not
+  durably-idempotent.
+
+#### Two-tier idempotency
+
+| Tier | Backend | Scope | What it catches |
+|------|---------|-------|------------------|
+| In-process | `webhook.InMemoryIdempotencyStore` | one replica | concurrent retries on the SAME process |
+| Durable | `webhook.PGScanRunRepository` | cluster-wide, survives restart | retries across replicas + after restart |
+
+On each request the Router consults BOTH:
+
+1. Compute `payload_hash = sha256(body)`.
+2. **In-process claim** -- `IdempotencyStore.Claim` returns a
+   prior committed envelope verbatim (single round-trip; no
+   DB cost on the hot replay path).
+3. **Metadata extract** -- `VerbHandler.ExtractMetadata(body)`
+   pulls the verb-specific `(RepoID, SHA)` out of the canonical
+   body (required for the durable INSERT shape). Decode errors
+   here surface as `400 / BAD_REQUEST` or `422 / UNPROCESSABLE_ENTITY`
+   WITHOUT burning a `scan_run` row.
+4. **Durable open** -- `ScanRunRepository.OpenExternal(...)`
+   performs an `INSERT ... ON CONFLICT DO NOTHING RETURNING
+   scan_run_id` against the partial unique index. On conflict
+   the store transparently re-`SELECT`s the prior row. The
+   result carries `AlreadyExisted` + `ExistingStatus`.
+5. **Replay branch** -- if `AlreadyExisted=true`, the Router
+   emits the durable replay envelope (`scan_run_id` =
+   the prior row, `replayed=true`) WITHOUT calling the verb
+   handler. The in-process cache is also populated so further
+   replays on the same process collapse to step (2).
+6. **Fresh execution** -- the verb handler runs against the
+   fresh `scan_run_id`, then the Router calls
+   `ScanRunRepository.Finalize(succeeded|failed)` and commits
+   the in-process cache.
+
+#### Replay semantics
+
+- A second POST with the same canonical body returns the
+  ORIGINAL `scan_run_id` and `replayed=true`. The verb handler
+  is NOT re-executed; no new `scan_run` row is inserted.
+- This holds across **process restarts** AND across
+  **replicas** -- the durable INSERT-ON-CONFLICT is the
+  source of truth.
+- Pinned by:
+  - `TestRouter_DurableReplay_AcrossSimulatedRestart` (two
+    Router instances sharing one `ScanRunRepository`).
+  - `TestRouter_ReplayReturnsCachedScanRun_NoReExecution`
+    (in-process happy path).
+  - `TestRouter_VerbFailure_FinalizesScanRunAsFailed`
+    (failure path; durable row finalizes as `failed`).
+
+#### Sticky-failed replay (publisher contract)
+
+When a verb handler returns an error, the Router finalizes
+the durable `scan_run` row as `failed`. A subsequent POST
+with the **same canonical body** resolves through the partial
+unique index and returns the failed row's `scan_run_id` with
+`replayed=true`. **The handler is NOT retried.** Publishers
+MUST change the canonical body to retry (e.g. bump a request
+nonce or correlation id inside the body). This matches GitHub
+webhook conventions and preserves the audit chain. A future
+iter MAY add a retry-window-controlled
+`ON CONFLICT DO UPDATE` recycle path for failed rows -- not
+in v1.
+
+#### Running-status replay (sibling-replica race)
+
+When the durable row is found in `running` state (a sibling
+replica is mid-execution), the Router currently returns the
+running `scan_run_id` with `replayed=true`. The publisher's
+poll-until-terminal loop on `GET /v1/scan_runs/{id}` is the
+canonical way to wait for the verdict. A future iter MAY add
+a Router-side poll-or-409 surface.
+
+#### Composition-root wiring (operator-visible env vars)
+
+`cmd/clean-code-metric-ingestor/main.go` mounts the Router
+behind two new env vars in addition to the existing
+`CLEAN_CODE_WEBHOOK_HMAC_SECRET`:
+
+| Variable | Required | Default | Notes |
+|----------|----------|---------|-------|
+| `CLEAN_CODE_ENABLE_EXTERNAL_INGEST_WEBHOOK` | yes (for mount) | `false` | When unset the Router is NOT mounted; the legacy `/v1/ingest/churn` path remains. |
+| `CLEAN_CODE_WEBHOOK_SIGNING_KEY_ID` | yes (when enabled) | -- | Opaque ASCII key id paired with `CLEAN_CODE_WEBHOOK_HMAC_SECRET`. Publishers send this in the `X-Signing-Key-Id` header. |
+| `CLEAN_CODE_WEBHOOK_HMAC_SECRET` | yes (when enabled) | -- | Per-deployment secret. |
+
+Startup-time interlocks reject:
+
+- `EnableExternalIngestWebhook=true` with either of the
+  other two unset.
+- `WebhookSigningKeyID` set with
+  `EnableExternalIngestWebhook=false` (wiring drift -- the
+  id would never be consulted).
+
+To enable in production:
+
+1. Apply migration 0009 via `psql -f` (see above).
+2. Set the three env vars in the operator's deployment
+   secret store.
+3. Restart `clean-code-metric-ingestor` -- the startup log
+   line `mounted external-ingest webhook router` (emitted by
+   `cmd/clean-code-metric-ingestor/main.go: mountIngestRouter`
+   at INFO level) with structured fields `path`,
+   `signing_key_id`, and `verbs` confirms the mount. Sample
+   field shape (slog text encoder, secret values redacted):
+   `path=/v1/ingest/ signing_key_id=<id> verbs=[churn]`.
+
+#### Observability
+
+Stage 4.1 emits five structured-log lines from the Router
+itself (`internal/ingest/webhook/router.go`) plus one
+startup line from the composition root
+(`cmd/clean-code-metric-ingestor/main.go`); the underlying
+durable-claim primitives (`metric_ingestor.PGExternalScanRunStore`,
+`webhook.PGScanRunRepository`) do NOT carry an `slog`
+seam in v1 -- their behaviour surfaces through the
+Router's lines plus the catalog `scan_run` table itself.
+
+| Event | Level | slog message (verbatim) | Fields (verbatim) | Emitter (file:func) |
+|-------|-------|-------------------------|-------------------|---------------------|
+| Mount confirmation (startup) | INFO | `mounted external-ingest webhook router` | `path`, `signing_key_id`, `verbs` | `cmd/clean-code-metric-ingestor/main.go: mountIngestRouter` |
+| Fresh successful POST | INFO | `ingest webhook: success` | `verb`, `scan_run_id`, `payload_hash`, `scan_run_kind` | `router.go: Router.ServeHTTP` (after Commit) |
+| In-process replay (same-replica cache hit, fast path) | INFO | `ingest webhook: replay (cached scan_run_id, in-process)` | `verb`, `scan_run_id`, `payload_hash` | `router.go: Router.replayResponse` |
+| Durable replay (cross-process / cross-replica) | INFO | `ingest webhook: replay (durable scan_run_id, cross-process)` | `verb`, `scan_run_id`, `existing_status`, `payload_hash` | `router.go: Router.emitDurableReplay` |
+| HMAC short-circuit (any 401 path) | WARN | `ingest webhook: HMAC verification failed` | `verb`, `code` (one of the `HMAC_*` codes below), `err`, `remote_addr` | `router.go: Router.logHMACFailure` |
+| Internal failure (resolver, scan_run-open, verb-handler, idempotency-commit, marshal, etc.) | WARN | `ingest webhook: internal failure` | `verb`, `kind` (stage tag), `err`, `remote_addr` | `router.go: Router.logInternal` |
+
+The `code` field on `HMAC verification failed` and the
+`code` field on the 401 JSON error envelope (`ErrorBody.Code`)
+draw from the SAME closed set:
+
+| Code | Trigger | Source |
+|------|---------|--------|
+| `HMAC_MISSING_KEY_ID` | `X-Signing-Key-Id` header absent | `router.go: classifyKeyIDError` |
+| `HMAC_MALFORMED_KEY_ID` | header fails [ValidateSigningKeyID] | `router.go: classifyKeyIDError` |
+| `HMAC_UNKNOWN_KEY_ID` | header valid but resolver has no entry | `router.go: Router.ServeHTTP` ([ErrUnknownSigningKeyID] branch) |
+| `HMAC_MISSING_SIGNATURE` | `X-Hub-Signature-256` header absent | `handler.go: classifyHMACError` ([ErrHMACMissingHeader]) |
+| `HMAC_MALFORMED_SIGNATURE` | header not `sha256=<64 hex>` | `handler.go: classifyHMACError` ([ErrHMACMalformedHeader]) |
+| `HMAC_SIGNATURE_MISMATCH` | digest != recomputed body digest | `handler.go: classifyHMACError` ([ErrHMACSignatureMismatch]) |
+| `HMAC_EMPTY_SECRET` | resolver returned an empty secret (server-side misconfig) | `handler.go: classifyHMACError` ([ErrHMACEmptySecret]) |
+| `HMAC_INVALID` | any other HMAC-layer error (catch-all default) | `handler.go: classifyHMACError` (default arm) |
+
+Operator notes:
+
+- `grep -F "ingest webhook: HMAC verification failed"` against
+  the service log returns every 401 from the Router; the
+  `code` field on the same line names the failure mode.
+  `grep -F "HMAC_SIGNATURE_MISMATCH"` is the canonical query
+  for "publisher signed the wrong body".
+- `grep -F "ingest webhook: internal failure"` against the
+  service log returns every Router-internal 500. The `kind`
+  field is the stage tag (e.g. `resolver-internal-failure`,
+  `scan-run-open-failure`, `idempotency-commit-failure`,
+  `extract-metadata-failure`) so operators can disambiguate
+  which Router stage failed without re-reading the
+  pipeline code.
+- The `existing_status` field on a durable replay names
+  the prior terminal state of the `scan_run` row
+  (`succeeded` / `failed` / `running`). A
+  `running` value means a sibling replica is still
+  mid-execution -- publishers should poll
+  `GET /v1/scan_runs/{id}` for the terminal verdict.
+- The Router NEVER logs the `signing_key_id` value, the
+  HMAC secret, the supplied signature, or the computed
+  digest -- those would all leak side-channel information
+  useful for brute-force or replay attacks. The 401 JSON
+  envelope is similarly safe (it carries only the
+  `HMAC_*` code, no secret material).
+- DB-tier observability for the durable seam is the
+  `scan_run` catalog itself: a `SELECT verb,
+  payload_hash, status, started_at, ended_at FROM
+  clean_code.scan_run WHERE payload_hash IS NOT NULL
+  ORDER BY started_at DESC LIMIT 50` returns the same
+  view that operators ran against `scan_run` for
+  foundation-tier rows in Stage 3. A future iter MAY
+  add INFO logs at the `PGExternalScanRunStore` layer
+  if operator feedback shows the catalog query is
+  insufficient; until then the catalog table IS the
+  authoritative observability surface.
+
+
+### Iter 3 -- Per-verb idempotency key + Finalize same-terminal contract
+
+Iter 2 keyed the durable partial unique index on
+(kind, payload_hash). That key is too coarse: `churn`
+and `defects` are both `kind = external_per_row`, and
+`coverage` and `test_balance` are both
+`kind = external_single`. A publisher posting the same
+canonical body to two different verbs would have collapsed
+onto a single `scan_run` row -- corrupting the per-verb
+audit chain. Iter 3 keys the durable uniqueness on
+`(verb, payload_hash)` instead.
+
+#### Migration 0009 -- rewritten shape
+
+The iter-3 `migrations/0009_scan_run_payload_hash_unique.up.sql`:
+
+1. `DROP INDEX CONCURRENTLY IF EXISTS clean_code.scan_run_payload_hash_kind_uniq` --
+   removes the iter-2 index if any dev DB applied it.
+2. `ALTER TABLE clean_code.scan_run ADD COLUMN IF NOT EXISTS verb text` --
+   nullable; metadata-only on PG 11+.
+3. Defensive backfill:
+   `UPDATE clean_code.scan_run SET verb = '__legacy_' || kind WHERE payload_hash IS NOT NULL AND verb IS NULL` --
+   ensures any iter-2 dev rows satisfy the new CHECK
+   constraint without operator intervention. Production has
+   zero external `scan_run` rows yet.
+4. `ALTER TABLE clean_code.scan_run ADD CONSTRAINT scan_run_verb_payload_hash_consistent CHECK ((verb IS NULL) = (payload_hash IS NULL))` --
+   pins the invariant that `verb` and `payload_hash`
+   are always set together for external rows and always
+   null together for foundation-tier rows.
+5. `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS scan_run_payload_hash_verb_uniq ON clean_code.scan_run (verb, payload_hash) WHERE payload_hash IS NOT NULL` --
+   the new per-verb idempotency key.
+
+Operational rules unchanged: `CREATE INDEX CONCURRENTLY`
+cannot run inside a transaction; apply via `psql -f`
+(autocommit). The rollback file
+`0009_scan_run_payload_hash_unique.down.sql` is updated
+to drop the new index, the CHECK constraint, and the
+`verb` column (in that order).
+
+#### Per-verb closed set + verb-kind matrix
+
+`PGExternalScanRunStore` (`internal/metric_ingestor`)
+validates the verb closed-set BEFORE any DB roundtrip:
+
+| Verb            | Kind                 |
+|-----------------|----------------------|
+| `coverage`    | `external_single`  |
+| `test_balance`| `external_single`  |
+| `churn`       | `external_per_row` |
+| `defects`     | `external_per_row` |
+
+An unknown verb returns `ErrExternalScanRunUnsupportedVerb`;
+a verb-kind mismatch (e.g. `Verb: "churn", Kind: "external_single"`)
+returns a validation error naming both fields. These
+guards close a wiring-bug class where a caller could
+silently write a verb row under the wrong kind enum.
+
+#### `ScanRunRepository.Finalize` same-terminal contract
+
+The interface contract: a double-finalize where the row
+is ALREADY in the requested terminal status MUST return
+nil (this is the benign sibling-replica double-finalize).
+Only a finalize that observes a DIFFERENT terminal
+status (or a missing row) returns an error.
+
+The PG adapter (`webhook.PGScanRunRepository.Finalize`)
+implements this by, on `ErrConcurrentFinalize`:
+
+1. Calling `LookupExternalScanRunStatusByID(scan_run_id)`.
+2. If the existing status == requested status -> nil.
+3. If the existing status != requested status -> wrapped
+   `ErrConcurrentFinalize` naming the mismatch (the
+   operator log line tells the SRE which two terminal
+   statuses raced).
+4. If the row is unexpectedly missing (stale-sweep DELETE
+   between FinalizeExternalScanRun and the lookup) ->
+   wrapped error naming the missing row.
+
+Pinned by three adapter-layer tests
+(`TestPGScanRunRepository_Finalize_ConcurrentSameTerminal_ReturnsNil`,
+`_DifferentTerminal_ReturnsError`,
+`_RowMissing_ReturnsError`) and two in-memory tests
+(`TestInMemoryScanRunRepository_Finalize_SameTerminal_ReturnsNil`,
+`_DifferentTerminal_ReturnsError`).
+
+#### Composition root + config interlock tests
+
+Iter 3 adds direct test coverage for the iter-2 wiring:
+
+- `internal/config/config_test.go` -- 5 tests pin the
+  three-variable interlock (all-set OK, partial-set
+  rejected each way, off-by-default).
+- `cmd/clean-code-metric-ingestor/main_test.go` -- 6
+  tests pin the mount: disabled-no-mount, enabled-nil-DB,
+  enabled-empty-signing-key-id, enabled-empty-hmac-secret,
+  enabled-canonical-path (asserts a POST without a valid
+  signature returns 401 NOT 404, proving the Router is
+  mounted AND the HMAC verifier runs in front of the DB
+  roundtrip), and disabled-with-secrets-still-not-mounted.

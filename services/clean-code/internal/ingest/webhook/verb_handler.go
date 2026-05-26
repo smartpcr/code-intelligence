@@ -14,10 +14,11 @@ import (
 // tech-spec Sec 8.5 -- `coverage`, `test_balance`, `churn`,
 // `defects` -- registers one implementation.
 //
-// Stage 4.1 ships ONE implementation: [ChurnVerbHandler]. The
-// remaining three verbs land in Stages 4.2-4.5 and plug into
-// the same interface; the Router does NOT change to add a
-// verb.
+// Stages 4.1 - 4.2 ship TWO implementations: [ChurnVerbHandler]
+// (Stage 4.1) and [CoverageVerbHandler] (Stage 4.2). The
+// remaining two verbs (`test_balance`, `defects`) land in
+// Stages 4.3 - 4.5 and plug into the same interface; the
+// Router does NOT change to add a verb.
 //
 // # Contract
 //
@@ -255,4 +256,3 @@ func canonicalSHABindingForKind(kind string) (string, bool) {
 		return "", false
 	}
 }
-

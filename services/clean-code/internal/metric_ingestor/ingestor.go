@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/gofrs/uuid"
+
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/churn"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/coverage"
 )
 
 // ErrMissingChurnPayloadForExternalPerRow is returned when
@@ -16,6 +19,23 @@ import (
 // kind is to deliver churn data; refusing here keeps the
 // scan-run state machine honest.
 var ErrMissingChurnPayloadForExternalPerRow = errors.New("metric_ingestor: ScanRunKindExternalPerRow requires a non-nil churn.Payload")
+
+// ErrMissingCoveragePayloadForExternalSingle is returned
+// when [Ingestor.Run] is invoked with
+// `kind='external_single'` and no [coverage.Payload]. An
+// external-single run is the coverage / test_balance
+// upload path (tech-spec Sec 4.11) and MUST carry the
+// single-SHA payload for the writer to do anything; a nil
+// here is a caller bug.
+var ErrMissingCoveragePayloadForExternalSingle = errors.New("metric_ingestor: ScanRunKindExternalSingle requires a non-nil coverage.Payload")
+
+// ErrCoverageSweepUnwired is returned by [Ingestor.Run]
+// when a `kind='external_single'` request arrives but the
+// composition root did NOT call [Ingestor.WithCoverageSweep].
+// Surfaced as a 500/INTERNAL_ERROR by the verb handler's
+// classifier so the operator immediately sees the wiring
+// gap rather than getting a misleading 4xx.
+var ErrCoverageSweepUnwired = errors.New("metric_ingestor: ScanRunKindExternalSingle reached Ingestor.Run but no CoverageSweep is wired (composition-root must call WithCoverageSweep)")
 
 // FoundationInput is the payload the
 // [FoundationRecipeDispatcher] consumes when a foundation
@@ -159,6 +179,17 @@ type RunRequest struct {
 	//   foundation dispatch only and reports
 	//   [IngestorResult.ChurnSkipped] = true.
 	Churn *churn.Payload
+	// Coverage is the Cobertura coverage payload to
+	// hydrate + persist.
+	//
+	// - REQUIRED when [ScanRunContext.Kind] is
+	//   `external_single` (the coverage / test_balance
+	//   upload path -- tech-spec Sec 4.11). A nil payload
+	//   returns [ErrMissingCoveragePayloadForExternalSingle].
+	// - IGNORED for `full` / `delta` / `external_per_row`
+	//   kinds (those run foundation / churn dispatch, not
+	//   coverage).
+	Coverage *coverage.Payload
 }
 
 // IngestorResult summarises the outcome of one
@@ -167,8 +198,8 @@ type RunRequest struct {
 type IngestorResult struct {
 	// FoundationDispatched is true iff
 	// [FoundationRecipeDispatcher.Dispatch] was invoked AND
-	// returned nil. Always false for `external_per_row`
-	// runs.
+	// returned nil. Always false for `external_per_row` /
+	// `external_single` runs.
 	FoundationDispatched bool
 	// ChurnSkipped is true iff the run kind permitted a nil
 	// churn payload (`full` / `delta`) and the caller did
@@ -178,6 +209,13 @@ type IngestorResult struct {
 	// [SweepResult]. Both zero when ChurnSkipped is true.
 	ChurnSamplesWritten int
 	ChurnRowsHydrated   int
+	// CoverageSamplesWritten / CoverageRowsHydrated /
+	// CoverageSkippedUnboundScope mirror
+	// [CoverageSweepResult]. All zero for non-coverage
+	// runs (`full`, `delta`, `external_per_row`).
+	CoverageSamplesWritten      int
+	CoverageRowsHydrated        int
+	CoverageSkippedUnboundScope int
 }
 
 // Ingestor is the production coordinator that owns
@@ -214,14 +252,23 @@ type IngestorResult struct {
 // it. Callers MUST NOT assume the [Ingestor] gives them an
 // all-or-nothing guarantee across the two sweeps yet.
 type Ingestor struct {
-	dispatcher FoundationRecipeDispatcher
-	churnSweep *ChurnSweep
+	dispatcher    FoundationRecipeDispatcher
+	churnSweep    *ChurnSweep
+	coverageSweep *CoverageSweep
 }
 
 // NewIngestor returns an [Ingestor] wired with `dispatcher`
-// and `churnSweep`. PANICS on any nil argument -- both
-// dependencies are non-optional. To run in scaffold mode
-// (Phase 3.2 not yet wired), pass
+// and `churnSweep`. PANICS on nil `dispatcher` or
+// `churnSweep` -- both are non-optional for the
+// foundation + churn pipeline. The [CoverageSweep]
+// (`external_single` -> coverage uploads) is OPTIONAL and
+// MUST be attached with [Ingestor.WithCoverageSweep] when
+// the service is configured to accept the `coverage` verb;
+// a `kind='external_single'` request that reaches an
+// Ingestor with no CoverageSweep returns
+// [ErrCoverageSweepUnwired].
+//
+// To run in scaffold mode (Phase 3.2 not yet wired), pass
 // [NoopFoundationRecipeDispatcher]{Logger: log} so
 // `full`/`delta` runs succeed with zero foundation recipes
 // executed and the [ChurnSweep] still gets to write its
@@ -237,6 +284,38 @@ func NewIngestor(dispatcher FoundationRecipeDispatcher, churnSweep *ChurnSweep) 
 		dispatcher: dispatcher,
 		churnSweep: churnSweep,
 	}
+}
+
+// WithCoverageSweep attaches `coverageSweep` to the
+// receiver and returns it for chaining. A nil argument is
+// a no-op. The Ingestor exposes the setter (not a required
+// constructor argument) so the composition root can roll
+// out the coverage verb independently of the existing
+// churn-only deployments -- a service built before Stage
+// 4.2 lands keeps working until the operator opts in.
+//
+// Calling this twice with different sweeps REPLACES the
+// prior sweep (last-writer-wins). The composition root is
+// expected to call it exactly once.
+func (i *Ingestor) WithCoverageSweep(coverageSweep *CoverageSweep) *Ingestor {
+	if coverageSweep != nil {
+		i.coverageSweep = coverageSweep
+	}
+	return i
+}
+
+// HasCoverageSweep reports whether [WithCoverageSweep] has
+// been called with a non-nil sweep. The webhook layer
+// consults this at construction time so a verb handler that
+// requires the coverage write-path can fail FAST at process
+// start rather than at first request (iter-3 evaluator item
+// 5). A `kind='external_single'` request that reaches the
+// Ingestor with no sweep wired still returns
+// [ErrCoverageSweepUnwired] as a defensive runtime guard;
+// the composition-root probe is the load-bearing fail-fast
+// path.
+func (i *Ingestor) HasCoverageSweep() bool {
+	return i != nil && i.coverageSweep != nil
 }
 
 // Run drives one ScanRun through the writer pipeline. The
@@ -271,8 +350,18 @@ func NewIngestor(dispatcher FoundationRecipeDispatcher, churnSweep *ChurnSweep) 
 // etc.) so callers can `errors.Is` to map to structured
 // responses.
 func (i *Ingestor) Run(ctx context.Context, req RunRequest) (IngestorResult, error) {
-	if err := req.ScanRun.Validate(); err != nil {
-		return IngestorResult{}, err
+	// Cheap structural guards first. The per-sweep
+	// kind-allow-list checks (allowedScanRunKinds for the
+	// ChurnSweep, coverageAllowedScanRunKinds for the
+	// CoverageSweep) run BELOW the dispatch switch so the
+	// Ingestor itself can accept the FULL closed set of
+	// kinds without the per-sweep allow-lists drifting into
+	// the Ingestor surface.
+	if req.ScanRun.ID == uuid.Nil {
+		return IngestorResult{}, ErrZeroScanRunID
+	}
+	if req.ScanRun.RepoID == uuid.Nil {
+		return IngestorResult{}, ErrZeroRepoID
 	}
 
 	switch req.ScanRun.Kind {
@@ -307,6 +396,23 @@ func (i *Ingestor) Run(ctx context.Context, req RunRequest) (IngestorResult, err
 		return IngestorResult{
 			ChurnSamplesWritten: sweepResult.SamplesWritten,
 			ChurnRowsHydrated:   sweepResult.RowsHydrated,
+		}, nil
+
+	case ScanRunKindExternalSingle:
+		if req.Coverage == nil {
+			return IngestorResult{}, ErrMissingCoveragePayloadForExternalSingle
+		}
+		if i.coverageSweep == nil {
+			return IngestorResult{}, ErrCoverageSweepUnwired
+		}
+		covResult, err := i.coverageSweep.Run(ctx, req.ScanRun, req.Coverage)
+		if err != nil {
+			return IngestorResult{}, err
+		}
+		return IngestorResult{
+			CoverageSamplesWritten:      covResult.SamplesWritten,
+			CoverageRowsHydrated:        covResult.RowsHydrated,
+			CoverageSkippedUnboundScope: covResult.SkippedUnboundScopeCount,
 		}, nil
 
 	default:

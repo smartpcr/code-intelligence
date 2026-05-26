@@ -50,6 +50,7 @@ import (
 
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/config"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/churn"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/coverage"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/webhook"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/management"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
@@ -450,9 +451,17 @@ func mountMgmtRoutes(mux *http.ServeMux, ingestorDB, mgmtDB *sql.DB) error {
 //     bytes verbatim).
 //   - [webhook.NewStaticSecretResolver] maps the configured
 //     signing_key_id -> HMAC secret.
-//   - [webhook.NewChurnVerbHandler] is Stage 4.1's only
-//     mounted verb; later stages register more verbs via the
-//     same RouterConfig.Verbs slice.
+//   - [webhook.NewChurnVerbHandler] is Stage 4.1's first
+//     mounted verb (`/v1/ingest/churn`).
+//   - [webhook.NewCoverageVerbHandler] is Stage 4.2's
+//     second mounted verb (`/v1/ingest/coverage`); it shares
+//     the same Ingestor instance as the churn handler so
+//     stamps + scan_run lifecycle compose against one PG
+//     handle. The coverage hydrator is backed by a
+//     READ-ONLY [coverage.PGScopeResolver] against
+//     `clean_code.scope_binding` -- missing rows are
+//     skipped and counted via
+//     `coverage_skipped_unbound_scope`, NEVER auto-minted.
 //
 // The Router is mounted at [webhook.RouterPath]
 // (`/v1/ingest/`) on the supplied mux; the verb is parsed
@@ -503,25 +512,48 @@ func mountIngestRouter(mux *http.ServeMux, cfg config.Config, ingestorDB *sql.DB
 		cfg.WebhookSigningKeyID: []byte(cfg.WebhookHMACSecret),
 	})
 
-	// Churn verb: re-uses the same Ingestor + ChurnSweep
-	// chain the Stage 3.2 PG-backed metric-sample writer
-	// composes. The metric-sample writer is PG-backed when
-	// CLEAN_CODE_PG_URL is set (production).
+	// Churn + coverage verbs share one Ingestor + one
+	// PG-backed MetricSampleWriter so all external ingest
+	// rows flow through the same `metric_sample` INSERT
+	// path. The Ingestor's per-kind switch (churn ->
+	// ChurnSweep; coverage -> CoverageSweep) dispatches by
+	// scan_run.kind.
 	mat := materialisers.NewMaterialiser(materialisers.DefaultWindowDays)
 	hyd := churn.NewHydrator(churn.NewAutoMapScopeResolver())
 	sampleWriter, err := metric_ingestor.NewPGMetricSampleWriter(ingestorDB)
 	if err != nil {
 		return fmt.Errorf("NewPGMetricSampleWriter: %w", err)
 	}
-	sweep := metric_ingestor.NewChurnSweep(mat, hyd, sampleWriter)
-	ing := metric_ingestor.NewIngestor(metric_ingestor.NoopFoundationRecipeDispatcher{}, sweep)
+	churnSweep := metric_ingestor.NewChurnSweep(mat, hyd, sampleWriter)
+
+	// Coverage hydrator + sweep. The PG-backed resolver is
+	// READ-ONLY against `scope_binding`; missing rows are
+	// reported as `(found=false, err=nil)` so the
+	// hydrator's skip-and-count path runs (NOT
+	// auto-minted -- a publisher MUST NOT race the
+	// foundation pipeline that owns scope identity).
+	repoURLLookup, err := metric_ingestor.NewPGRepoURLLookup(ingestorDB)
+	if err != nil {
+		return fmt.Errorf("NewPGRepoURLLookup: %w", err)
+	}
+	covResolver, err := coverage.NewPGScopeResolver(ingestorDB, repoURLLookup.LookupRepoURL)
+	if err != nil {
+		return fmt.Errorf("coverage.NewPGScopeResolver: %w", err)
+	}
+	covHydrator := coverage.NewHydrator(covResolver).WithSkipLogger(logger)
+	covSweep := metric_ingestor.NewCoverageSweep(covHydrator, sampleWriter).
+		EnsureCoverageSkipLoggerAttached(logger)
+
+	ing := metric_ingestor.NewIngestor(metric_ingestor.NoopFoundationRecipeDispatcher{}, churnSweep).
+		WithCoverageSweep(covSweep)
 	churnHandler := webhook.NewChurnVerbHandler(ing)
+	coverageHandler := webhook.NewCoverageVerbHandler(ing)
 
 	router := webhook.NewRouter(webhook.RouterConfig{
 		Resolver:    resolver,
 		Store:       idempotencyStore,
 		ScanRunRepo: scanRunRepo,
-		Verbs:       []webhook.VerbHandler{churnHandler},
+		Verbs:       []webhook.VerbHandler{churnHandler, coverageHandler},
 		Logger:      logger,
 	})
 	mux.Handle(webhook.RouterPath, router)
@@ -529,7 +561,7 @@ func mountIngestRouter(mux *http.ServeMux, cfg config.Config, ingestorDB *sql.DB
 		logger.Info("mounted external-ingest webhook router",
 			"path", webhook.RouterPath,
 			"signing_key_id", cfg.WebhookSigningKeyID,
-			"verbs", []string{churnHandler.Verb()},
+			"verbs", []string{churnHandler.Verb(), coverageHandler.Verb()},
 		)
 	}
 	return nil
@@ -624,11 +656,11 @@ type scanRunRequest struct {
 // validScanRunKinds enumerates the canonical clean_code.scan_run_kind
 // enum (architecture Sec 5.7 line 1273 / migration 0001 line 344).
 var validScanRunKinds = map[string]struct{}{
-	"full":              {},
-	"delta":             {},
-	"external_single":   {},
-	"external_per_row":  {},
-	"retract":           {},
+	"full":             {},
+	"delta":            {},
+	"external_single":  {},
+	"external_per_row": {},
+	"retract":          {},
 }
 
 // scanRunShaBindingForKind is the canonical kind → sha_binding map.

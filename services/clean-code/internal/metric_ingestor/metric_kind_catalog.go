@@ -9,6 +9,7 @@ import (
 
 	"github.com/lib/pq"
 
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/coverage"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/materialisers"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
@@ -78,12 +79,12 @@ const (
 // requires both PK natural-key columns to be populated for
 // the seeder's output to satisfy the downstream INSERT.
 type MetricKindCatalogRow struct {
-	MetricKind     string
-	MetricVersion  int
-	Tier           MetricKindTier
-	Pack           recipes.Pack
-	Unit           string
-	DescriptionMD  string
+	MetricKind    string
+	MetricVersion int
+	Tier          MetricKindTier
+	Pack          recipes.Pack
+	Unit          string
+	DescriptionMD string
 }
 
 // foundationCatalogMetadata is the hand-curated per-kind
@@ -135,6 +136,14 @@ var foundationCatalogMetadata = map[string]struct {
 	"modification_count_in_window": {
 		Unit:          "count",
 		DescriptionMD: "Number of file modifications observed within the configured window_days for a given scope (architecture Sec 1.4.1 row 12; tech-spec Sec 8.2).",
+	},
+	"coverage_line_ratio": {
+		Unit:          "ratio",
+		DescriptionMD: "Per-file line-coverage ratio (lines_covered / lines_valid) ingested from an external coverage publisher (architecture Sec 1.4.1 row 16; tech-spec Sec 4.1.1 -- the ONLY canonical line-coverage metric_kind, with `coverage_line` and `coverage_lines_covered_ratio` aliases removed per iter-1 evaluator item 4).",
+	},
+	"coverage_branch_ratio": {
+		Unit:          "ratio",
+		DescriptionMD: "Per-file branch-coverage ratio (branches_covered / branches_valid) ingested from an external coverage publisher (architecture Sec 1.4.1 row 16; tech-spec Sec 4.1.1 -- the ONLY canonical branch-coverage metric_kind, with `coverage_branch` and `coverage_branches_covered_ratio` aliases removed per iter-1 evaluator item 4).",
 	},
 }
 
@@ -224,6 +233,31 @@ func MetricKindCatalogRowsForRegistry(reg *recipes.Registry) ([]MetricKindCatalo
 		Unit:          matMeta.Unit,
 		DescriptionMD: matMeta.DescriptionMD,
 	})
+
+	// External-ingest foundation rows (Stage 4.2) -- coverage
+	// kinds are NOT in the recipe registry by design (the AST
+	// adapter is NOT a producer; rows arrive via the
+	// `/v1/ingest/coverage` webhook). They share the same
+	// PGMetricSampleWriter and therefore the same composite
+	// FK on `metric_sample.(metric_kind, metric_version)`, so
+	// they MUST be seeded alongside the recipe-emitted kinds.
+	for _, kind := range []string{
+		coverage.MetricKindCoverageLineRatio,
+		coverage.MetricKindCoverageBranchRatio,
+	} {
+		meta, ok := foundationCatalogMetadata[kind]
+		if !ok {
+			return nil, fmt.Errorf("%w: metric_kind=%q (external-ingest metadata missing)", ErrMetricKindCatalogMissingMetadata, kind)
+		}
+		out = append(out, MetricKindCatalogRow{
+			MetricKind:    kind,
+			MetricVersion: coverage.MetricVersion,
+			Tier:          MetricKindTierFoundation,
+			Pack:          recipes.PackIngested,
+			Unit:          meta.Unit,
+			DescriptionMD: meta.DescriptionMD,
+		})
+	}
 
 	// Deterministic ordering for log reproducibility (G2).
 	sort.Slice(out, func(i, j int) bool { return out[i].MetricKind < out[j].MetricKind })

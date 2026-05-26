@@ -15,8 +15,59 @@ env:
   COMPOSE_FILE: tests/e2e/phase-04-webhook/docker-compose.yml
 
 jobs:
-  e2e-ingest-churn-verb-feeds-materialiser:
-    name: "E2E – Ingest Churn Verb Feeds Materialiser"
+  e2e-ingest-defects-verb-store-only:
+    name: "E2E – Ingest Defects Verb Store Only"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: services/clean-code/go.sum
+
+      - name: Verify compose file exists
+        run: |
+          if [ ! -f "${{ env.COMPOSE_FILE }}" ]; then
+            echo "::error::Compose file not found: ${{ env.COMPOSE_FILE }}"
+            exit 1
+          fi
+
+      - name: Start compose services
+        run: docker compose -f ${{ env.COMPOSE_FILE }} up -d --build
+
+      - name: Export compose-provided env vars
+        run: |
+          set -euo pipefail
+          # Generate HMAC secret FIRST so compose can inject it.
+          export CLEAN_CODE_WEBHOOK_HMAC_SECRET="$(openssl rand -hex 32)"
+          # Start compose — secret is already exported.
+          docker compose -f ${{ env.COMPOSE_FILE }} up -d --build
+          # Discover dynamic ports.
+          PG_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port postgres 5432 | cut -d: -f2)
+          WEBHOOK_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port webhook 8080 | cut -d: -f2)
+          OTEL_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port otel-collector 4317 | cut -d: -f2)
+          export CLEAN_CODE_PG_URL="postgres://postgres:postgres@localhost:${PG_PORT}/clean_code?sslmode=disable"
+          export CLEAN_CODE_WEBHOOK_URL="http://localhost:${WEBHOOK_PORT}"
+          export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:${OTEL_PORT}"
+          # Bootstrap.
+          make migrate-up
+          make seed-repo-d
+          # Run tests.
+          cd services/clean-code
+          go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
+            -run TestE2E_external_metric_ingest_webhook_ingest_defects_verb_store_only
+
+      - name: Tear down compose services
+        if: always()
+        run: docker compose -f ${{ env.COMPOSE_FILE }} down -v --remove-orphans
+
+  e2e-ingest-coverage-verb-cobertura-parser:
+    name: "E2E – Ingest Coverage Verb Cobertura Parser"
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -57,7 +108,58 @@ jobs:
           # Run tests.
           cd services/clean-code
           go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
-            -run TestE2E_external_metric_ingest_webhook_ingest_churn_verb_feeds_materialiser
+            -run TestE2E_external_metric_ingest_webhook_ingest_coverage_verb_cobertura_parser
+
+      - name: Tear down compose services
+        if: always()
+        run: docker compose -f ${{ env.COMPOSE_FILE }} down -v --remove-orphans
+
+  e2e-ingest-test-balance-verb:
+    name: "E2E – Ingest test_balance Verb"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: services/clean-code/go.sum
+
+      - name: Verify compose file exists
+        run: |
+          if [ ! -f "${{ env.COMPOSE_FILE }}" ]; then
+            echo "::error::Compose file not found: ${{ env.COMPOSE_FILE }}"
+            exit 1
+          fi
+
+      - name: Start compose services
+        run: docker compose -f ${{ env.COMPOSE_FILE }} up -d --build
+
+      - name: Export compose-provided env vars
+        run: |
+          set -euo pipefail
+          # Generate HMAC secret FIRST so compose can inject it.
+          export CLEAN_CODE_WEBHOOK_HMAC_SECRET="$(openssl rand -hex 32)"
+          # Start compose — secret is already exported.
+          docker compose -f ${{ env.COMPOSE_FILE }} up -d --build
+          # Discover dynamic ports.
+          PG_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port postgres 5432 | cut -d: -f2)
+          WEBHOOK_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port webhook 8080 | cut -d: -f2)
+          OTEL_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port otel-collector 4317 | cut -d: -f2)
+          export CLEAN_CODE_PG_URL="postgres://postgres:postgres@localhost:${PG_PORT}/clean_code?sslmode=disable"
+          export CLEAN_CODE_WEBHOOK_URL="http://localhost:${WEBHOOK_PORT}"
+          export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:${OTEL_PORT}"
+          # Bootstrap.
+          make migrate-up
+          make seed-repo-d
+          # Run tests.
+          cd services/clean-code
+          go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
+            -run TestE2E_external_metric_ingest_webhook_ingest_test_balance_verb
 
       - name: Tear down compose services
         if: always()

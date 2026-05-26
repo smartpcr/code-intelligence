@@ -180,8 +180,12 @@ func (s *defectsVerbState) doSignedPostDefects(body []byte) error {
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
 	s.lastStatusCode = resp.StatusCode
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("reading response body: %w", err)
+	}
 
 	var result struct {
 		ScanRunID string `json:"scan_run_id"`

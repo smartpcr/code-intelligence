@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -1052,6 +1053,15 @@ func (s *evalGateState) theResponseRejectsPercentileStaleAsInvalidEvalGateReason
 
 func InitializeScenario_evaluator_surface_and_management_surface_evaluator_gate_verb_and_synchronous_solid_delegation(ctx *godog.ScenarioContext) {
 	s := newEvalGateState()
+
+	// Close any DB connection opened during the scenario to avoid leaking
+	// Postgres connections across test runs.
+	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
+		if s.db != nil {
+			s.db.Close()
+		}
+		return ctx, nil
+	})
 
 	// Scenario: verdict-enum-only-canonical
 	ctx.Step(`^the production Verdict enum imported from the domain package$`, s.theProductionVerdictEnumImportedFromDomain)

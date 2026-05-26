@@ -65,6 +65,8 @@ import (
 	"time"
 
 	"github.com/gofrs/uuid"
+
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
 )
 
 // Canonical HTTP paths for the Stage 3.4 management write
@@ -547,22 +549,22 @@ func (w *MgmtWriter) Routes() *http.ServeMux {
 // writeRetractDispatchError maps a dispatcher-side error to
 // an HTTP status. Sentinel mapping:
 //
-//   - ErrMgmtUnknownSample (or any error wrapping a
-//     "sample_id not found" upstream)               -> 404
-//   - anything that errors.Is matches "unknown sample"
-//     in the upstream metric_ingestor package        -> 404
-//   - anything else                                  -> 500
+//   - errors.Is matches [ErrMgmtUnknownSample]          -> 404
+//     (a management-layer "this sample never existed" path)
+//   - errors.Is matches
+//     [metric_ingestor.ErrRetractUnknownSample]         -> 404
+//     (the dispatcher's sample-vanished-between-resolve-
+//     and-dispatch race; the dispatcher wraps the sentinel
+//     with `%w` per retract.go, so the chain walks cleanly)
+//   - anything else                                      -> 500
 //
-// Because the dispatcher's sentinel lives in the
-// metric_ingestor package and we don't import it here (to
-// keep the management package's dependency tree narrow),
-// the mapping inspects the wrapped error chain via
-// errors.Is against [ErrMgmtUnknownSample] AND a substring
-// fallback for the metric_ingestor variant. A future
-// refactor can collapse these by introducing a shared
-// package-level sentinel.
+// Both checks are sentinel-based (errors.Is), NOT substring,
+// so reworded error messages on either side do not silently
+// degrade the mapping to 500. The management package already
+// imports metric_ingestor (via mgmt_adapters.go) so referencing
+// the sentinel here costs no new package dependency.
 func writeRetractDispatchError(rw http.ResponseWriter, r *http.Request, err error, log *slog.Logger) {
-	if errors.Is(err, ErrMgmtUnknownSample) || strings.Contains(err.Error(), "sample_id not found") {
+	if errors.Is(err, ErrMgmtUnknownSample) || errors.Is(err, metric_ingestor.ErrRetractUnknownSample) {
 		http.Error(rw, err.Error(), http.StatusNotFound)
 		return
 	}

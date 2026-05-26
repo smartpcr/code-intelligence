@@ -5,6 +5,87 @@ production-tier environment. The instructions assume Postgres
 14+ is already running and the `clean_code_*` roles have been
 created via the `0004_roles.up.sql` migration.
 
+## Stage 6.1: `eval.gate` verb and synchronous SOLID delegation
+
+This subsection captures the rollout sequence for the
+Stage 6.1 verb `eval.gate(repo_id, sha, scope?)`. It does
+NOT introduce a new binary -- the `clean-code-eval-gate`
+binary delivered in Stage 5.7 iter 4 is reused, with two
+behavioural changes documented below.
+
+### Behavioural changes vs. Stage 5.7 iter 4
+
+1. **Active-policy resolution is now mandatory.** The
+   `/v1/eval/gate` route NO LONGER accepts a caller-supplied
+   `policy_version_id`. The gate resolves the active
+   `policy_version_id` itself via the latest
+   `clean_code.policy_activation` row. A caller-supplied
+   `policy_version_id` is REJECTED with HTTP 400 pointing
+   the caller at the new `/v1/eval/replay` route.
+2. **New admin route `/v1/eval/replay`.** Same JSON contract
+   as the prior Stage 5.7 `/v1/eval/gate` body
+   (`{repo_id, sha, policy_version_id, scope?}`). Provided
+   so batch tooling and reconciler replays can still pin
+   evaluations to a specific policy. MUST be exposed only
+   on an admin-only network path.
+3. **HTTP 409 on no active policy.** A `/v1/eval/gate` call
+   against a repo whose policy has never been activated
+   returns HTTP 409 (was 500 in Stage 5.7). No audit row is
+   written -- `evaluation_run.policy_version_id` is NOT NULL.
+
+### No new environment variables
+
+Stage 6.1 reuses the Stage 5.7 iter 4 env vars
+(`CLEAN_CODE_EVALUATOR_PG_URL`, `CLEAN_CODE_PG_URL`) without
+change.
+
+### Migration sequence
+
+1. Ensure `clean_code.policy_activation` has at least one
+   row per repo that should be gateable. Activation is the
+   canonical `policy.activate` write verb on the Policy
+   Steward (`POST /v1/policy/activate`); see the Stage 5.2
+   `policy.activate` runbook section for the body schema
+   and the `## Stage 5.2: Policy publish/activate/rulepack
+   verbs` rollout section below for the deploy sequence.
+2. Verify the persisted `policy_version.signature` is
+   correct for the active policy bytes; the
+   `policy_signature_invalid` degraded path is the gate's
+   own self-healing trap, not a happy-path expectation.
+3. Deploy the Stage 6.1 build of `clean-code-eval-gate`.
+4. **Cutover smoke test**: call
+   `POST /v1/eval/gate {repo_id, sha}` against a SHA whose
+   `scan_status='scanned'`. Expect HTTP 200 with
+   `degraded=false` and a non-empty `evaluation_run_id`.
+5. **Bypass-regression smoke test**: call
+   `POST /v1/eval/gate {repo_id, sha, policy_version_id: "<any uuid>"}`.
+   Expect HTTP 400 with the error pointing at
+   `/v1/eval/replay`. If you get HTTP 200, the bypass
+   rejection has regressed; roll back.
+
+### Rollback
+
+If Stage 6.1 misbehaves in production, roll back the
+`clean-code-eval-gate` binary to the Stage 5.7 iter 4 build.
+The audit-row schema is unchanged
+(`evaluation_run`/`evaluation_verdict`/`finding`), so no
+DB migration rollback is required. Reconcilers that depend
+on `/v1/eval/replay` will receive HTTP 404 against the
+Stage 5.7 binary -- pause those reconcilers until the
+Stage 6.1 binary is re-deployed.
+
+### Observability checklist
+
+- `clean_code_eval_gate_requests_total{route, status}` --
+  one counter per (route, HTTP status) pair. Expect
+  steady-state traffic on `/v1/eval/gate` with status
+  200; spikes on 400 indicate caller-side bypass attempts.
+- `clean_code_eval_gate_degraded_total{reason}` -- one
+  counter per `degraded_reason`. `samples_pending` should
+  trend down as the ingestor catches up;
+  `policy_signature_invalid` should be near zero -- any
+  non-zero rate indicates a steward signing-key issue.
+
 ## Stage 5.7 (iter 4): least-privilege Audit writes, durable catchup, and production gate wiring
 
 This subsection captures the operator-facing changes that

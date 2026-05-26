@@ -106,6 +106,41 @@ func (a *stewardSignatureAdapter) VerifyPolicyVersionSignature(ctx context.Conte
 	return a.steward.VerifyPolicyVersionSignature(ctx, pv)
 }
 
+// stewardActivationAdapter adapts the steward onto the
+// gate's [PolicyActivationReader] interface. The
+// production wiring resolves the active `policy_version_id`
+// via [steward.Steward.ActivePolicyVersion] -- which reads
+// the latest `clean_code.policy_activation` row and
+// dereferences to its policy_version. The Stage 6.1 brief
+// step (1) is for the `eval.gate(repo_id, sha, scope?)`
+// verb to perform this lookup itself.
+//
+// Defence in depth: a `(PolicyVersion, true, nil)` reply
+// from the steward whose `PolicyVersionID` is the zero
+// uuid is treated as an invariant violation (loud error
+// rather than silent ok=false). The same guard the
+// `rule_engine.StewardActivationReader` enforces.
+type stewardActivationAdapter struct {
+	steward *steward.Steward
+}
+
+func (a *stewardActivationAdapter) ActivePolicyVersionID(ctx context.Context) (uuid.UUID, bool, error) {
+	if a == nil || a.steward == nil {
+		return uuid.Nil, false, errors.New("evaluator: stewardActivationAdapter: steward is nil")
+	}
+	pv, ok, err := a.steward.ActivePolicyVersion(ctx)
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	if !ok {
+		return uuid.Nil, false, nil
+	}
+	if pv.PolicyVersionID == uuid.Nil {
+		return uuid.Nil, false, errors.New("evaluator: stewardActivationAdapter: steward returned ok=true with zero PolicyVersionID")
+	}
+	return pv.PolicyVersionID, true, nil
+}
+
 // NewProductionGate wires a [*Gate] whose [Gate.Evaluate]
 // path is fully production-ready. The caller still owns
 // the `*sql.DB` and `*steward.Steward` lifecycles -- this
@@ -113,7 +148,7 @@ func (a *stewardSignatureAdapter) VerifyPolicyVersionSignature(ctx context.Conte
 //
 // Returns an error if any required dependency is missing.
 //
-// Composition (Stage 5.7 evaluator feedback #2):
+// Composition (Stage 5.7 evaluator feedback #2 + Stage 6.1):
 //
 //   - [SQLSampleReadiness] -- backs [SampleReadinessReader]
 //     against `clean_code.commit.scan_status`.
@@ -126,6 +161,13 @@ func (a *stewardSignatureAdapter) VerifyPolicyVersionSignature(ctx context.Conte
 //   - [stewardSignatureAdapter] -- backs
 //     [PolicySignatureVerifier] against
 //     [steward.Steward.VerifyPolicyVersionSignature].
+//   - [stewardActivationAdapter] -- backs
+//     [PolicyActivationReader] against
+//     [steward.Steward.ActivePolicyVersion]; this is the
+//     Stage 6.1 step (1) "resolve active
+//     `policy_version_id` via latest `policy_activation`
+//     row" wiring that lets [Gate.Gate] satisfy the
+//     canonical verb signature.
 //   - [uuid.NewV4] / [time.Now] -- production defaults
 //     for the [IDMinter] / now hooks.
 func NewProductionGate(cfg ProductionGateConfig) (*Gate, error) {
@@ -156,6 +198,7 @@ func NewProductionGate(cfg ProductionGateConfig) (*Gate, error) {
 		PolicyReader:    &stewardPolicyAdapter{store: cfg.StewardStore},
 		SignatureVerify: &stewardSignatureAdapter{steward: cfg.Steward},
 		DegradedStore:   degraded,
+		Activation:      &stewardActivationAdapter{steward: cfg.Steward},
 		NewID:           uuid.NewV4,
 		Now:             func() int64 { return time.Now().UTC().UnixNano() },
 	})

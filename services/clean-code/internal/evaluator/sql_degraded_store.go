@@ -96,8 +96,28 @@ func (s *SQLDegradedRunStore) AppendDegradedRun(ctx context.Context, run Degrade
 	if verdict.Verdict == "" {
 		return errors.New("evaluator: AppendDegradedRun: verdict.Verdict is empty")
 	}
+	if !verdict.Verdict.IsValid() {
+		return fmt.Errorf("evaluator: AppendDegradedRun: verdict.Verdict=%q is not in the canonical {pass, warn, block} set", verdict.Verdict)
+	}
+	// Architecture Sec 3.7 lines 566-575 + operator pin
+	// `gate-degraded-policy=warn` (Sec 1.6): a degraded
+	// audit row MUST surface `warn`. The gate code path
+	// always passes [VerdictWarn], so this check defends
+	// against a future caller that mints a degraded row
+	// with `block` or `pass` and corrupts the audit trail.
+	if verdict.Degraded && verdict.Verdict != VerdictWarn {
+		return fmt.Errorf("evaluator: AppendDegradedRun: degraded=true requires verdict='warn' per architecture Sec 3.7; got %q", verdict.Verdict)
+	}
 	if verdict.DegradedReason == "" {
 		return errors.New("evaluator: AppendDegradedRun: verdict.DegradedReason is empty (degraded paths MUST carry a reason)")
+	}
+	// Stage 6.1 brief: `percentile_stale` is INSIGHTS-ONLY
+	// (tech-spec C17). The DB CHECK admits the value but
+	// eval.gate MUST reject it -- defence in depth so a
+	// programming mistake cannot conflate an Insights-
+	// surface staleness with a gate-surface degraded path.
+	if !verdict.DegradedReason.IsValidForGate() {
+		return fmt.Errorf("%w: %q", ErrInvalidGateDegradedReason, verdict.DegradedReason)
 	}
 
 	qual := func(t string) string { return pq.QuoteIdentifier(s.schema) + "." + pq.QuoteIdentifier(t) }
@@ -158,9 +178,9 @@ func (s *SQLDegradedRunStore) AppendDegradedRun(ctx context.Context, run Degrade
 	if _, err := tx.ExecContext(ctx, verdictStmt,
 		verdict.VerdictID.String(),
 		verdict.EvaluationRunID.String(),
-		verdict.Verdict,
+		string(verdict.Verdict),
 		verdict.Degraded,
-		verdict.DegradedReason,
+		string(verdict.DegradedReason),
 		verdictCreatedAt,
 	); err != nil {
 		return fmt.Errorf("evaluator: AppendDegradedRun: insert evaluation_verdict: %w", err)

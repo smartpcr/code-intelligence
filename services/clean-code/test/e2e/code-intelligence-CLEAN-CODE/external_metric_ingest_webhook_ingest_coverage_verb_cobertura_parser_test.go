@@ -248,6 +248,10 @@ func (s *coverageState) aCoberturaXMLCoverageReportIsUploadedForSHAWithFiles(sha
 	s.lastStatusCode = resp.StatusCode
 	s.lastResponseBody = respBody
 
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("upload failed: HTTP %d – %s", resp.StatusCode, string(respBody))
+	}
+
 	var result struct {
 		ScanRunID string `json:"scan_run_id"`
 	}

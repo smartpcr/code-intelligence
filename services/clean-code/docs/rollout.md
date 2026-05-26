@@ -1,9 +1,361 @@
-# `services/clean-code` rollout playbook
+## `services/clean-code` rollout playbook
 
 How to roll a new build of the clean-code service into a
 production-tier environment. The instructions assume Postgres
 14+ is already running and the `clean_code_*` roles have been
 created via the `0004_roles.up.sql` migration.
+
+## Stage 5.7 (iter 4): least-privilege Audit writes, durable catchup, and production gate wiring
+
+This subsection captures the operator-facing changes that
+shipped with Stage 5.7 iter 4. The base Stage 5.7 rollout
+narrative (worker composition, observability, rollback) is
+unchanged and remains canonical below.
+
+### New environment variables
+
+| Var | Default | Purpose |
+|---|---|---|
+| `CLEAN_CODE_SOLID_BATCH_PG_URL` | unset (FALLS BACK to `CLEAN_CODE_PG_URL` with WARN) | Separate DSN authenticated as `clean_code_solid_batch` for the rule-engine Audit writes (`INSERT INTO evaluation_run`, `evaluation_verdict`, `finding`). Required under production least-privilege; dev/test compose-as-superuser can omit it. |
+| `CLEAN_CODE_EVALUATOR_PG_URL` | unset (FALLS BACK to `CLEAN_CODE_PG_URL`) | DSN authenticated as `clean_code_evaluator` for the new `clean-code-eval-gate` binary. Used for the degraded-path Audit writes and for the `commit.scan_status` readiness reads. |
+
+### New cmd binary: `clean-code-eval-gate`
+
+The `evaluator.Gate.Evaluate` surface is now hosted by its own
+binary at `services/clean-code/cmd/clean-code-eval-gate`. It
+exposes:
+
+- `/healthz` -- standard liveness check.
+- `POST /v1/eval/gate` -- accepts `{repo_id, sha, policy_version_id, scope?}` and returns `{evaluation_run_id, evaluation_verdict_id, finding_ids[], verdict, degraded, degraded_reason?}`.
+
+The handler resolves the policy via the Steward, re-verifies
+the persisted signature against THAT policy version's
+canonical bytes, checks `commit.scan_status='scanned'`, and
+delegates to `rule_engine.Engine.RunSync` on the happy path.
+On the two degraded paths (`policy_signature_invalid`,
+`samples_pending`) the gate writes ONE `evaluation_run` +
+ONE `evaluation_verdict` (zero findings, `degraded=true`,
+`verdict='warn'`) under the `clean_code_evaluator` grant
+and returns HTTP 200 with `degraded=true`.
+
+The Verdict on BOTH degraded paths is `warn` (Stage 5.7
+evaluator feedback #1 / architecture Sec 3.7 lines 566-575
++ operator pin `gate-degraded-policy=warn` from Sec 1.6):
+the gate never blocks on a degraded path, but it also does
+not silently pass.
+
+### Durable catchup loop
+
+The post-scan dispatcher's buffered channel
+(`scanEvents`, capacity 64) is best-effort. Per Stage 5.7
+evaluator feedback #6, `cmd/clean-code-metric-ingestor`
+now:
+
+1. Bounds the emit by `scanEventEmitTimeout` (5s). A
+   saturated buffer surfaces as a latency spike + log line,
+   NOT a silent permanent drop.
+2. Runs `rule_engine.Worker.Catchup(...)` on startup AND
+   every 5 minutes against `SQLPendingScanReader` which
+   selects `commit` rows with `scan_status='scanned'` that
+   have NO matching `evaluation_run` row (caller=
+   `batch_refresh`, degraded=false) for the active policy
+   version (NOT EXISTS anti-join -- see Stage 5.7
+   evaluator iter-4 feedback #1). The reader orders by
+   `(committed_at, repo_id, sha)` (Stage 5.7 evaluator
+   iter-5 feedback #1: `clean_code.commit` has
+   `committed_at`, not `created_at`) and is paged via a
+   keyset cursor over the same tuple
+   (`(committed_at, repo_id, sha) > ($t, $r, $s)`) at
+   `LIMIT 100` per call to avoid an evaluation storm on
+   policy switch. Each invocation pins the active policy
+   version once at the TOP and routes the work through
+   `Worker.processWithPolicy` so a mid-run policy switch
+   cannot cause pages-for-P1 to be persisted-against-P2.
+3. `Worker.Catchup` advances the cursor by the LAST row of
+   every page regardless of per-event success or failure
+   (Stage 5.7 evaluator iter-5 feedback #2: cursor
+   advancement guarantees that a persistent poison row at
+   the head no longer starves later valid SHAs within the
+   same invocation). The loop terminates when the reader
+   returns an empty page OR a short page (`len < limit`);
+   any rows that errored within the invocation are logged
+   and retried fresh on the next 5-minute tick.
+
+Grep for these log lines:
+- `rule_engine: scan event channel saturated after 5s -- event WILL BE REPROCESSED BY CATCHUP` -- emit timeout tripped; catchup will pick the SHA up on its next tick.
+- `rule_engine.worker.Catchup (startup) processed=N events` -- backlog drained at boot.
+- `rule_engine.worker.Catchup (periodic) processed=N events` -- 5-minute tick drained N events.
+
+### Cross-replica run dedup (`Store.LookupRecentCanonicalRun`)
+
+Per Stage 5.7 evaluator iter-5 feedback #3 (and the iter-6
+feedback #2 closure), the engine performs an additional
+Store-level lookup BEFORE writing a fresh canonical
+`(evaluation_run, evaluation_verdict, findings)` triple.
+The lookup runs INSIDE the `pg_advisory_xact_lock`
+envelope, so a replica that just committed its canonical
+row is observed by the second replica's RC-isolated SELECT
+before that replica begins mutating Audit rows. The
+implementation joins `evaluation_verdict ON
+evaluation_run.evaluation_run_id =
+verdict.evaluation_run_id` and filters `verdict.degraded =
+false` so a degraded short-circuit is never returned as
+canonical.
+
+**Both callers are covered (iter-7).** Migration 0008
+adds a nullable `evaluation_run.scope_id uuid` column +
+composite index `evaluation_run_dedup_idx`. The lookup
+filters with the null-safe `IS NOT DISTINCT FROM`
+operator, so a scoped eval_gate row NEVER matches an
+unscoped eval_gate call (or vice versa); the engine
+consults the Store-level lookup for both
+`caller='batch_refresh'` and `caller='eval_gate'` with
+the call's `scopeID`, and parallel calls across replicas
+produce a single canonical run+verdict pair. The previous
+iter-6 limitation (eval_gate fell back to the in-process
+cache only) is closed.
+
+Operationally, the second replica that observed the
+first's row returns the SAME `(evaluation_run_id,
+evaluation_verdict_id, []finding_id)` to its caller, so
+HTTP responses from `eval.gate.Evaluate` are stable
+across replicas for the same `(repo_id, sha,
+policy_version_id, scope_id)` tuple within the run-dedup
+TTL.
+
+### Active-row reads for metric samples
+
+`SQLStore.ListMetricSamples` (used by both happy and
+synchronous paths) now JOINs through
+`clean_code.metric_sample_active` (the active-row pointer
+table) so retracted / inactive samples cannot trigger
+findings. The query also hydrates `pack`, `source`,
+`degraded`, and `degraded_reason` so DSL predicates over
+those canonical fields evaluate correctly under production
+data. See Stage 5.7 evaluator feedback #3 + #4.
+
+### Per-scope predicate evaluation (SOLID composites)
+
+The rule engine now evaluates predicates per SCOPE (not
+per sample) via the new `dsl.Predicate.EvalAtScope`
+contract. This is what enables SOLID composite recipes
+like SRP's `threshold(lcom4) AND threshold(interface_width)`
+to fire at a class scope when the class has BOTH a
+high-LCOM4 sample AND a wide-interface sample, even though
+no single sample carries both metric_kinds. Per-sample
+correlated predicates such as
+`metric_kind == 'lcom4' AND value > 5` still take the
+single-sample-witness path so they cannot cross witnesses
+across two unrelated samples. See Stage 5.7 evaluator
+feedback #7.
+
+## Stage 5.7: SOLID Rule Engine batch worker and synchronous mode
+
+### Pre-requisites
+
+- **Stage 5.2 active policy:** the Rule Engine consumes the
+  latest active `policy_version`. Confirm the
+  `clean_code.policy_activation` table has at least one row
+  (`SELECT activation_id, policy_version_id, created_at FROM
+  clean_code.policy_activation ORDER BY created_at DESC
+  LIMIT 1;`) before enabling the engine.
+- **Migration 0003 applied:** `evaluation_run`,
+  `evaluation_verdict`, `finding` tables and the Phase 1.5
+  grants on those tables to `clean_code_solid_batch`,
+  `clean_code_evaluator`, and `clean_code_wal_reconciler`
+  MUST exist. Verify with:
+
+  ```bash
+  psql -c "SELECT grantee, privilege_type
+           FROM information_schema.role_table_grants
+           WHERE table_name IN ('evaluation_run','evaluation_verdict','finding')
+             AND grantee LIKE 'clean_code_%'
+           ORDER BY table_name, grantee;"
+  ```
+
+  Expect THREE grantees (`clean_code_evaluator`,
+  `clean_code_solid_batch`, `clean_code_wal_reconciler`) per
+  table, each with `INSERT`.
+
+### One-time bootstrap (per environment)
+
+1. **Apply migration `0008_evaluation_run_scope_id`.** Stage
+   5.7 iter 7 introduces ONE schema change on top of the base
+   Audit schema from migration 0003: a nullable
+   `clean_code.evaluation_run.scope_id uuid` column plus the
+   composite index `evaluation_run_dedup_idx(repo_id, sha,
+   policy_version_id, caller, scope_id, created_at DESC)`. The
+   column is REQUIRED by the engine's Store-level cross-
+   replica dedup lookup (`Store.LookupRecentCanonicalRun`)
+   for both `caller='eval_gate'` and `caller='batch_refresh'`;
+   without it, parallel `eval.gate` calls landing on
+   different replicas can mint duplicate run+verdict rows.
+   The migration is forward-only and safe to apply against a
+   live database. Lock semantics (iter-8 evaluator feedback
+   #3):
+
+   - The `ADD COLUMN scope_id uuid NULL` is additive and
+     non-defaulting, so PostgreSQL completes it as a fast
+     `ACCESS EXCLUSIVE` catalogue update -- no table
+     rewrite, no data scan.
+   - The composite index is built with
+     `CREATE INDEX CONCURRENTLY IF NOT EXISTS
+     evaluation_run_dedup_idx ...`, which acquires
+     `SHARE UPDATE EXCLUSIVE` rather than `ACCESS EXCLUSIVE`
+     on `clean_code.evaluation_run`. The Rule Engine's
+     happy-path INSERTs and the eval-gate's degraded-path
+     INSERTs continue to run while the index materialises.
+   - CONCURRENTLY cannot run inside a transaction, so the
+     migration file deliberately omits any `BEGIN/COMMIT`
+     envelope. Apply via `psql -f
+     migrations/0008_evaluation_run_scope_id.up.sql`
+     (autocommit; the default for `psql -f` is already
+     `--single-transaction=off`). Wrapping the apply
+     command in `psql --single-transaction` will FAIL with
+     "CREATE INDEX CONCURRENTLY cannot run inside a
+     transaction block".
+   - **End-to-end idempotency** (iter-9 evaluator
+     feedback #1): both DDL statements in the up migration
+     carry `IF NOT EXISTS` (`ADD COLUMN IF NOT EXISTS
+     scope_id uuid NULL` on the table, `CREATE INDEX
+     CONCURRENTLY IF NOT EXISTS evaluation_run_dedup_idx`
+     on the index), so re-running the WHOLE file against
+     a partially-applied state never errors -- in
+     particular, if a previous attempt added the column
+     but the CONCURRENTLY index build was interrupted
+     (leaving the index in PostgreSQL's `INVALID` state),
+     the operator runs `DROP INDEX CONCURRENTLY IF EXISTS
+     clean_code.evaluation_run_dedup_idx` (no
+     `--single-transaction`) and re-runs `psql -f
+     migrations/0008_evaluation_run_scope_id.up.sql`;
+     the ALTER step is a no-op on the second pass, the
+     CREATE INDEX picks up cleanly, and the migration
+     completes. (`COMMENT ON COLUMN` is naturally
+     idempotent -- it overwrites the existing comment
+     with the same text.)
+
+   Verify after apply:
+
+   ```bash
+   psql -c "SELECT column_name, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema='clean_code'
+              AND table_name='evaluation_run'
+              AND column_name='scope_id';"
+   # expect: scope_id | YES
+
+   psql -c "SELECT indexname, indexdef FROM pg_indexes
+            WHERE schemaname='clean_code'
+              AND tablename='evaluation_run'
+              AND indexname='evaluation_run_dedup_idx';"
+   # expect: evaluation_run_dedup_idx
+
+   psql -c "SELECT indisvalid FROM pg_index
+            WHERE indexrelid='clean_code.evaluation_run_dedup_idx'::regclass;"
+   # expect: t  -- 'f' means the CONCURRENTLY build was
+   # interrupted; drop the INVALID index and re-run the
+   # migration before considering the bootstrap complete.
+   ```
+
+   Rollback path: `migrations/0008_evaluation_run_scope_id.down.sql`
+   drops the index (also CONCURRENTLY) then the column.
+   The engine treats a missing `scope_id` column as a hard
+   error at startup (the SQL lookup references `scope_id
+   IS NOT DISTINCT FROM $5::uuid`), so the rollback must
+   be paired with rolling Stage 5.7 iter 7 binaries back
+   to an iter-6 build that does not expect the column.
+
+2. **Verify the Rule Engine wires.** The composition root
+   for the batch path is the
+   `cmd/clean-code-metric-ingestor/main.go` entrypoint --
+   the same binary that serves `/v1/ingestor/process` and
+   manages the ScanRun state machine. Stage 5.7 adds an
+   in-process [rule_engine.Worker] driven by a
+   buffered post-scan dispatcher channel:
+
+   ```go
+   stewardStore, _ := steward.NewSQLStore(db)
+   stew, _        := steward.New(steward.Config{Store: stewardStore})
+
+   ruleStore, _ := rule_engine.NewSQLStore(rule_engine.SQLStoreConfig{
+       DB:      db,
+       Steward: stewardStore,
+   })
+   engine, _ := rule_engine.New(rule_engine.Config{Store: ruleStore})
+
+   events := make(chan rule_engine.ScanEvent, 64) // buffered
+   worker, _ := rule_engine.NewWorker(rule_engine.WorkerConfig{
+       Engine:     engine,
+       Activation: rule_engine.NewStewardActivation(stew),
+       Events:     events,
+       Logger:     slog.Default(),
+   })
+   go worker.Run(ctx)
+   ```
+
+   The composition is performed at process start by
+   `startRuleEngineWorker`; the HTTP handler
+   `handleProcess` emits a non-blocking `ScanEvent` on
+   every transition to `scan_status='scanned'`. A
+   `CLEAN_CODE_RULE_ENGINE_DISABLED=1` env var skips the
+   wiring entirely (no-op fallback) for environments that
+   want to defer the cut-over.
+
+   The engine is shared between the worker (`RunBatch`,
+   `caller='batch_refresh'`) and `eval.gate.Evaluate`
+   (`RunSync`, `caller='eval_gate'`); both paths are
+   concurrent-safe. The
+   `rule_engine.NewStewardActivation` adapter is the
+   canonical bridge between
+   `steward.Steward.ActivePolicyVersion(...)` and the
+   worker's `PolicyActivationReader` port -- passing
+   `stew` (a `*steward.Steward`) directly to
+   `WorkerConfig.Activation` will NOT compile.
+
+### Observability
+
+Grep the structured log stream for these lines per event:
+
+- `rule_engine.worker: RunBatch completed` -- one INFO per
+  successful batch run. Carries `evaluation_run_id`,
+  `verdict`, `findings_count`.
+- `rule_engine.worker: skip -- no active policy` -- INFO,
+  expected only during fresh-deploy steady state.
+- `rule_engine.worker: active policy lookup failed` -- ERROR
+  on activation reader failure; the worker proceeds to the
+  next event.
+- `rule_engine.worker: RunBatch failed` -- ERROR on engine
+  failure (broken predicate, missing rule, etc.). The worker
+  proceeds to the next event so one broken policy does not
+  bring down the post-scan pipeline.
+
+### Rollback
+
+The Rule Engine has no persisted state of its own beyond
+the canonical Audit rows. To roll back:
+
+1. Stop the service.
+2. Optionally clear the freshly-written audit rows for the
+   in-flight SHA via the `audit.purge_run` operator verb
+   (Stage 5.6 -- if shipped) or by issuing a manual
+   `DELETE FROM clean_code.finding WHERE evaluation_run_id
+   IN (...); DELETE FROM clean_code.evaluation_verdict WHERE
+   evaluation_run_id IN (...); DELETE FROM
+   clean_code.evaluation_run WHERE evaluation_run_id IN
+   (...)` against the offending IDs.
+3. Deploy the previous binary; the prior Stage's evaluator
+   (signature-verify-only) will resume as the canonical
+   verdict writer on the gate-degraded paths.
+
+### Feature flags
+
+None for Stage 5.7. The Rule Engine becomes the canonical
+writer of `evaluation_verdict` on the rule-pass paths as
+soon as the binary lands; there is no operator switch to
+defer the cut-over. The gate-degraded short-circuit paths
+(signature-invalid, samples_pending) continue to write
+their own zero-findings verdict pair via the
+`clean_code_evaluator` role.
 
 ## Stage 3.2: Metric Ingestor and ScanRun state machine
 

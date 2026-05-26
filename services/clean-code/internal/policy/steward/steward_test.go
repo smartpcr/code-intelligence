@@ -471,6 +471,47 @@ func TestSteward_PublishRefusesWhenSignerNil(t *testing.T) {
 	}
 }
 
+// TestSteward_VerifyPolicyVersionSignature_FailsWhenSignerNil
+// pins the iter-8 evaluator feedback #1 bug condition: a
+// Steward constructed with no Signer (i.e. with the
+// [noActiveSigner] null object) MUST refuse
+// [VerifyPolicyVersionSignature] -- it is incapable of
+// verifying anything because it has no active key.
+//
+// This is the contract the production eval-gate composition
+// root depends on: if the composition root forgets to wire a
+// keys.Manager into the Steward, EVERY Gate.Evaluate call
+// degrades as `policy_signature_invalid` and the synchronous
+// rule-pass happy path is unreachable. Pinning the failure
+// makes the wiring requirement explicit. The complementary
+// positive case -- a real keys.Manager-wired Steward verifies
+// successfully -- is already pinned by
+// [TestSteward_PublishHappyPath] and
+// [TestSteward_KeyRotation_DoesNotInvalidatePriorSignatures].
+func TestSteward_VerifyPolicyVersionSignature_FailsWhenSignerNil(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := NewInMemoryStore()
+	st, err := New(Config{Store: store}) // no Signer wired
+	if err != nil {
+		t.Fatalf("New(no Signer): %v", err)
+	}
+	// A PolicyVersion shape with a non-empty signature; the
+	// content does not matter because the null-object signer
+	// cannot dispatch verification to a key.
+	pv := PolicyVersion{
+		PolicyVersionID: uuid.Must(uuid.NewV4()),
+		Signature:       []byte("synthetic-signature-bytes"),
+	}
+	err = st.VerifyPolicyVersionSignature(ctx, pv)
+	if err == nil {
+		t.Fatal("VerifyPolicyVersionSignature on null-signer Steward: err=nil; want a verification error (noActiveSigner cannot verify -- the eval-gate composition root MUST wire a keys.Manager as Signer)")
+	}
+	if !errors.Is(err, keys.ErrUnknownKey) {
+		t.Errorf("VerifyPolicyVersionSignature on null-signer Steward: err=%v; want errors.Is(.., keys.ErrUnknownKey)", err)
+	}
+}
+
 // TestSteward_PublishHandlesUUIDGenError surfaces a generator
 // failure as a wrapped error rather than crashing.
 func TestSteward_PublishHandlesUUIDGenError(t *testing.T) {

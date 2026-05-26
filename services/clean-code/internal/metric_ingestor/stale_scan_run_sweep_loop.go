@@ -35,13 +35,20 @@ func WithStaleSweepLoopErrorBackoff(d time.Duration) StaleScanRunSweepLoopOption
 }
 
 // WithStaleSweepLoopSleep overrides the timer factory.
-// Tests inject a channel-driven clock so the loop is
-// deterministic; production uses [time.After] (the
-// default).
+// This injection point is for TESTS ONLY -- it lets a
+// deterministic channel-driven clock drive the loop. In
+// production the loop does NOT use this factory; it uses
+// [time.NewTimer] directly so that the timer can be
+// [time.Timer.Stop]ped on the cancel path (see
+// [StaleScanRunSweepLoop.wait]). Leaving this option
+// unset selects the production path.
 //
-// The factory MUST return a channel that fires after the
-// requested duration; the loop drains the channel before
-// the next call.
+// The injected factory MUST return a channel that fires
+// after the requested duration. The injected channel is
+// NOT stopped by the loop on cancellation -- tests are
+// responsible for cleaning up their own mock clocks. (For
+// the in-tree tests this is trivially safe: the mock
+// channel is GC'd when the test goroutine returns.)
 func WithStaleSweepLoopSleep(sleep func(d time.Duration) <-chan time.Time) StaleScanRunSweepLoopOption {
 	return func(l *StaleScanRunSweepLoop) { l.sleep = sleep }
 }
@@ -88,13 +95,28 @@ func WithStaleSweepLoopRunOnStart(b bool) StaleScanRunSweepLoopOption {
 // error is ctx.Err() (typically context.Canceled or
 // context.DeadlineExceeded). Tests that simulate a degraded
 // store assert the loop keeps ticking through the failures.
+//
+// # Timer hygiene
+//
+// The wait between ticks uses [time.NewTimer] + [time.Timer.Stop]
+// in the cancel path so an early cancel does NOT leak a
+// pending timer (relevant under a short [errorBackoff]
+// against a sustained-failure store). The
+// [WithStaleSweepLoopSleep] test-injection path is
+// channel-only and intentionally does NOT call Stop --
+// test mock clocks are GC'd with the test goroutine.
 type StaleScanRunSweepLoop struct {
 	sweep        *StaleScanRunSweep
 	cadence      time.Duration
 	errorBackoff time.Duration
-	sleep        func(d time.Duration) <-chan time.Time
-	log          *slog.Logger
-	runOnStart   bool
+	// sleep is the optional test-injection timer factory.
+	// nil (the default) selects the production path which
+	// uses [time.NewTimer] directly so the timer can be
+	// stopped on cancellation. Non-nil routes through the
+	// channel-based factory in [StaleScanRunSweepLoop.wait].
+	sleep      func(d time.Duration) <-chan time.Time
+	log        *slog.Logger
+	runOnStart bool
 }
 
 // ErrStaleSweepLoopNilSweep surfaces a nil sweep at
@@ -114,7 +136,10 @@ var ErrStaleSweepLoopNonPositiveCadence = errors.New("metric_ingestor: NewStaleS
 // Defaults:
 //   - cadence       = 5 min (tech-spec Sec 8.2)
 //   - errorBackoff  = cadence
-//   - sleep         = time.After
+//   - sleep         = nil (production path uses [time.NewTimer]
+//     directly so the timer is Stop()ped on ctx cancel;
+//     tests inject a channel-based factory via
+//     [WithStaleSweepLoopSleep])
 //   - log           = nil (silent)
 //   - runOnStart    = true
 func NewStaleScanRunSweepLoop(sweep *StaleScanRunSweep, opts ...StaleScanRunSweepLoopOption) *StaleScanRunSweepLoop {
@@ -128,7 +153,6 @@ func NewStaleScanRunSweepLoop(sweep *StaleScanRunSweep, opts ...StaleScanRunSwee
 	l := &StaleScanRunSweepLoop{
 		sweep:      sweep,
 		cadence:    config.DefaultPeriodicSweepCadence,
-		sleep:      time.After,
 		runOnStart: true,
 	}
 	for _, opt := range opts {
@@ -140,9 +164,10 @@ func NewStaleScanRunSweepLoop(sweep *StaleScanRunSweep, opts ...StaleScanRunSwee
 	if l.errorBackoff <= 0 {
 		l.errorBackoff = l.cadence
 	}
-	if l.sleep == nil {
-		l.sleep = time.After
-	}
+	// NOTE: l.sleep is intentionally left nil when no
+	// [WithStaleSweepLoopSleep] is provided -- the wait()
+	// method takes the production [time.NewTimer] branch in
+	// that case so the timer is Stop()ped on ctx cancel.
 	return l
 }
 
@@ -254,17 +279,65 @@ func (l *StaleScanRunSweepLoop) runOnce(ctx context.Context) time.Duration {
 }
 
 // wait sleeps for `d` or returns ctx.Err() on cancellation.
-// Goes through the injected [WithStaleSweepLoopSleep]
-// factory so tests can drive the loop deterministically.
+//
+// # Production path (l.sleep == nil)
+//
+// Uses [time.NewTimer] directly. When ctx.Done() wins the
+// select race, the timer is [time.Timer.Stop]ped and its
+// channel drained non-blockingly so the underlying
+// [time.Timer] is released immediately rather than held
+// until it fires. This matters under a short
+// [WithStaleSweepLoopErrorBackoff] against a
+// sustained-failure store, where the previous
+// `time.After`-based implementation would accumulate
+// pending timers on every cancel race (negligible at the
+// 5-min cadence default but observable under aggressive
+// backoff).
+//
+// Note: Go 1.23 changed the runtime so unreferenced
+// [time.After] timers are GC'd promptly, blunting the
+// leak. The explicit Stop+drain here is still preferred:
+// it makes the resource lifetime obvious to readers, is
+// portable to older toolchains, and matches the
+// well-known cancellable-timer idiom.
+//
+// # Test path (l.sleep != nil)
+//
+// Routes through the injected channel-based factory so
+// test clocks remain deterministic. The injected channel
+// is NOT stopped/drained on cancel -- tests own their
+// mock clock's lifecycle and the in-tree mocks are GC'd
+// when the test goroutine returns.
 func (l *StaleScanRunSweepLoop) wait(ctx context.Context, d time.Duration) error {
 	if d <= 0 {
 		return nil
 	}
-	timer := l.sleep(d)
+	if l.sleep != nil {
+		ch := l.sleep(d)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ch:
+			return nil
+		}
+	}
+	timer := time.NewTimer(d)
 	select {
 	case <-ctx.Done():
+		if !timer.Stop() {
+			// Stop returned false: the timer either already
+			// fired or was already stopped. Drain its
+			// channel non-blockingly so a buffered fire
+			// doesn't outlive this function. (No-op in Go
+			// 1.23+ where the runtime handles drain on
+			// Stop, but safe and self-documenting.)
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
 		return ctx.Err()
-	case <-timer:
+	case <-timer.C:
 		return nil
 	}
 }

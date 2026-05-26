@@ -45,6 +45,30 @@ import (
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/rule_engine"
 )
 
+// maxRequestBodyBytes caps the JSON body size on both
+// `/v1/eval/gate` and `/v1/eval/replay`. The canonical
+// payload is a handful of UUIDs + strings (well under
+// 1 KiB in practice); 1 MiB is two orders of magnitude
+// of headroom and keeps a malicious client from
+// streaming an unbounded body and OOM'ing the gate
+// process.
+//
+// The cap is enforced with [http.MaxBytesReader] (not a
+// plain [io.LimitReader]) so the excess bytes are NEVER
+// buffered into memory: the reader returns a
+// *[http.MaxBytesError] synchronously the moment the
+// limit is crossed, the connection's read side is
+// closed, and the handler responds with 413 Request
+// Entity Too Large. Both handlers share the same
+// reader-wrap + [writeBodyReadError] pair so the two
+// surfaces have IDENTICAL body-size protection -- iter-N
+// review caught that [makeEvalHandler] used
+// `io.ReadAll(r.Body)` without a limit AND that
+// [makeReplayHandler] used `json.NewDecoder(r.Body)`
+// without one either, so the two routes were
+// inconsistently exposed.
+const maxRequestBodyBytes = 1 << 20
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -343,6 +367,33 @@ func rejectExtraPolicyVersionField(raw []byte) error {
 	return nil
 }
 
+// writeBodyReadError maps a request-body read/decode
+// error to the canonical HTTP status. A
+// *[http.MaxBytesError] -- the sentinel
+// [http.MaxBytesReader] returns when a client tries to
+// stream more than [maxRequestBodyBytes] -- surfaces as
+// 413 Request Entity Too Large so the caller can tell
+// "your body is too big" apart from "your body is
+// malformed JSON". Every other read/decode error
+// surfaces as 400 Bad Request.
+//
+// Both handlers share this helper so the two routes
+// have IDENTICAL body-size protection and uniform error
+// shapes, closing the iter-N review gap where
+// `/v1/eval/gate` used `io.ReadAll(r.Body)` and
+// `/v1/eval/replay` used `json.NewDecoder(r.Body)`
+// without either applying a cap.
+func writeBodyReadError(w http.ResponseWriter, err error) {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		http.Error(w,
+			fmt.Sprintf("bad request: body exceeds %d bytes", maxErr.Limit),
+			http.StatusRequestEntityTooLarge)
+		return
+	}
+	http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+}
+
 // makeEvalHandler binds the CANONICAL `/v1/eval/gate`
 // handler to the supplied [evaluator.Gate]. The handler
 // invokes [evaluator.Gate.Gate] -- the verb method that
@@ -357,15 +408,22 @@ func rejectExtraPolicyVersionField(raw []byte) error {
 // conflated with a 500 internal failure. Only true error
 // conditions (invalid input, DB outage, ...) surface as
 // 500.
+//
+// The request body is wrapped in [http.MaxBytesReader]
+// before [io.ReadAll] so a malicious client cannot
+// stream an unbounded body and OOM the gate process;
+// the cap is [maxRequestBodyBytes] and is enforced
+// identically on `/v1/eval/replay`.
 func makeEvalHandler(gate *evaluator.Gate) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		raw, err := io.ReadAll(r.Body)
 		if err != nil {
-			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			writeBodyReadError(w, err)
 			return
 		}
 		if rerr := rejectExtraPolicyVersionField(raw); rerr != nil {
@@ -407,15 +465,21 @@ func makeEvalHandler(gate *evaluator.Gate) http.HandlerFunc {
 // [evaluator.Gate.Evaluate] directly. It is intentionally
 // a distinct route so the canonical verb's audit trail
 // remains uniform.
+//
+// The request body is wrapped in [http.MaxBytesReader]
+// before the [json.Decoder] runs so the admin surface
+// has the same OOM protection as the canonical verb;
+// the cap is [maxRequestBodyBytes].
 func makeReplayHandler(gate *evaluator.Gate) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		var req replayRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			writeBodyReadError(w, err)
 			return
 		}
 		repoID, err := uuid.FromString(req.RepoID)

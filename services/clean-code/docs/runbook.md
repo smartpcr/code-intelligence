@@ -4,6 +4,359 @@ Operational guide for the clean-code service. Add a new
 section here as each subsystem ships against the production
 composition root (`cmd/clean-coded/main.go`).
 
+## Stage 5.7 iter 4 -- production wiring updates
+
+This subsection captures the operator-facing changes that
+shipped with Stage 5.7 iter 4. The base Stage 5.7 section
+below remains canonical for the engine and worker behaviour.
+
+### Two new environment variables
+
+- `CLEAN_CODE_SOLID_BATCH_PG_URL`: DSN authenticated as
+  `clean_code_solid_batch` for rule-engine Audit writes.
+  When unset the composition root falls back to the main
+  `CLEAN_CODE_PG_URL` handle with a WARN log. Required under
+  production least-privilege.
+- `CLEAN_CODE_EVALUATOR_PG_URL`: DSN authenticated as
+  `clean_code_evaluator` for the new `clean-code-eval-gate`
+  binary. Used for the degraded-path Audit writes and for
+  the `commit.scan_status` readiness reads. Falls back to
+  `CLEAN_CODE_PG_URL` when unset.
+
+### New binary: `clean-code-eval-gate`
+
+The production gate composition root now lives under
+`cmd/clean-code-eval-gate`. It exposes `POST /v1/eval/gate`
+and returns the canonical
+`{evaluation_run_id, evaluation_verdict_id, finding_ids[], verdict, degraded, degraded_reason?}`
+shape. The Verdict on BOTH degraded paths
+(`policy_signature_invalid`, `samples_pending`) is `warn`
+per architecture Sec 3.7 + operator pin
+`gate-degraded-policy=warn`.
+
+### Durable catchup loop
+
+`cmd/clean-code-metric-ingestor` now:
+
+1. Bounds the `scanEvents` channel emit by 5s. Saturation
+   surfaces as a latency spike + log line, NOT a silent
+   permanent drop.
+2. Runs `rule_engine.Worker.Catchup` on startup AND every
+   5 minutes against `SQLPendingScanReader`. The reader
+   selects `commit.scan_status='scanned'` rows missing an
+   `evaluation_run` for the active policy and pages at
+   100 rows per call.
+
+### Active-row metric_sample reads
+
+`SQLStore.ListMetricSamples` now JOINs through
+`clean_code.metric_sample_active` so retracted / inactive
+samples cannot trigger findings. The query also hydrates
+`pack`, `source`, `degraded`, and `degraded_reason` so DSL
+predicates over those canonical fields evaluate correctly.
+
+### Per-scope predicate evaluation
+
+The rule engine evaluates predicates per SCOPE via the new
+`dsl.Predicate.EvalAtScope` contract. This enables SOLID
+composite recipes such as SRP's
+`threshold(lcom4) AND threshold(interface_width)` to fire
+at a class scope when the class has BOTH a high-LCOM4
+sample AND a wide-interface sample, even though no single
+sample carries both metric_kinds.
+
+## SOLID Rule Engine batch worker and synchronous mode (Stage 5.7)
+
+### What
+
+The Rule Engine subsystem is a small stack of types in
+`internal/rule_engine/`:
+
+- `Engine` (`engine.go`) -- the in-process actor that
+  consumes the active `policy_version`, compiles each rule's
+  predicate via `dsl.Cache`, evaluates the predicate over
+  `metric_sample` rows for the target SHA, computes the
+  `new`/`newly_failing`/`unchanged`/`resolved` delta for
+  every emitted finding, and writes ONE `evaluation_run` +
+  ONE `evaluation_verdict` + N `finding` rows in a single
+  `Store.AppendEvaluation` transaction.
+- `Worker` (`worker.go`) -- the long-running batch-refresh
+  driver consuming `ScanEvent{RepoID, SHA}` from a channel
+  (the post-scan dispatcher). The worker resolves the active
+  `policy_version_id` via the `PolicyActivationReader` port,
+  then calls `Engine.RunBatch(ctx, repo, sha,
+  policy_version_id)` for each event.
+- `Store` (`store.go`) -- the atomic-write boundary. The
+  production implementation will issue
+  `BEGIN; INSERT evaluation_run; INSERT evaluation_verdict;
+  INSERT findings...; COMMIT;` as one Postgres transaction.
+  Tests use the `InMemoryStore` (`inmem_store.go`) drop-in.
+
+### Two callable modes (canonical signatures)
+
+**Synchronous mode -- `eval.gate` invokes the engine in the
+same call:**
+
+```go
+result, err := engine.RunSync(ctx, repoID, sha, scopeID, policyVersionID)
+// returns: result.EvaluationRunID, result.EvaluationVerdictID, result.FindingIDs
+```
+
+`caller='eval_gate'`. The gate uses the three returned IDs
+to attach its HTTP response to the canonical audit rows.
+
+**Batch-refresh mode -- the post-scan dispatcher invokes
+the engine after a SHA's metric samples land:**
+
+```go
+result, err := engine.RunBatch(ctx, repoID, sha, policyVersionID)
+```
+
+`caller='batch_refresh'`. The dispatcher emits one
+`ScanEvent` per newly-scanned SHA; `Worker.Run` drains the
+channel and calls `RunBatch` per event.
+
+Both modes write the SAME row set in the SAME transaction.
+The engine -- not eval.gate -- is the canonical writer of
+`evaluation_verdict` whenever the rule pass is invoked.
+
+### Writer-ownership grid (Phase 1.5 grants)
+
+| Path                      | Run + Verdict writer       | Finding writer            |
+|---------------------------|----------------------------|---------------------------|
+| Synchronous rule pass     | Rule Engine (`eval_gate`)  | Rule Engine               |
+| Batch refresh             | Rule Engine (`batch_refresh`) | Rule Engine            |
+| Gate degraded (sig-invalid, samples_pending) | `clean_code_evaluator` | (none -- 0 findings) |
+| WAL replay                | `clean_code_wal_reconciler` | `clean_code_wal_reconciler` |
+
+The three Audit tables (`evaluation_run`,
+`evaluation_verdict`, `finding`) are granted INSERT in
+parallel to `clean_code_solid_batch` (the engine's batch
+worker), `clean_code_evaluator` (the gate degraded paths),
+and `clean_code_wal_reconciler` (replay only) per tech-spec
+Sec 7.2 lines 1256-1261.
+
+### Operating the batch worker
+
+- One worker per service instance is sufficient. The
+  engine's per-`(repo, sha)` `sync.Mutex` serialises
+  read-modify-write windows across concurrent gate calls;
+  multiple workers competing for the same event stream
+  would only add coordination overhead.
+- The worker logs at INFO on every successful
+  `Engine.RunBatch` with the freshly-written
+  `evaluation_run_id`, the rollup `verdict`, and the
+  `findings_count`. Grep for `rule_engine.worker:` to surface
+  per-event lines.
+- On a transient activation-lookup error the worker logs at
+  ERROR and proceeds to the next event. Repeated
+  ERROR-level lines from one operator typically point at a
+  stale `policy_activation` table; resolve by reactivating
+  the latest published `policy_version` via
+  `policy.activate`.
+- On a missing active policy (no `policy_activation` row
+  yet) the worker logs at INFO and skips the event. This is
+  the expected fresh-deploy steady state.
+
+### Manually invoking `RunSync` for diagnosis
+
+When a developer wants to reproduce a gate decision
+offline (e.g. to debug a "why did this SHA block?"
+incident), they can shell into the service and call
+`RunSync` directly via the wired `Engine`. The engine
+**deduplicates** invocations within the configured TTL
+window (default **30 seconds**, exported as
+`rule_engine.DefaultRunDedupTTL` and overridable via
+`Config.RunDedupTTL`; see the public `Engine.RunSync`
++ `Store.LookupRecentCanonicalRun` -- the cache uses
+the private `Engine.runDedupTTL` field threaded
+through to the Store lookup). A diagnostic call with
+the same `(repo_id, sha, policy_version_id, scope_id,
+caller)` tuple as a recent run returns the existing
+canonical run+verdict IDs rather than mint a fresh
+audit row. This is the production cross-replica
+dedup contract from migration 0008 +
+architecture §5.4.2; the runbook MUST NOT contradict it.
+
+To force a fresh diagnostic row when the operator wants
+one (e.g. to see findings against an updated rule set or
+to reproduce after fixing a sample-ingestion bug),
+choose ONE of the following:
+
+- **Vary `policy_version_id`** -- publish a new
+  `policy_version` (or activate a different existing
+  one) and pass its ID; this is the canonical way to
+  evaluate a SHA against a different rule set.
+- **Vary `scope_id`** -- a per-scope diagnostic
+  evaluation against the same SHA writes a distinct
+  audit row because the dedup tuple includes
+  `scope_id` (null-safe via `IS NOT DISTINCT FROM`).
+- **Wait out the TTL** -- after `runDedupTTL` has
+  elapsed since the most recent canonical row, the
+  next `RunSync` call mints a new run.
+
+Diagnostic rows are written under the canonical
+`clean_code_solid_batch` grant (the Rule Engine's own
+writer ownership), with `caller='eval_gate'` or
+`caller='batch_refresh'` matching whichever entry path
+the developer triggered. If the diagnostic finds new
+findings worth muting from regression counts, use the
+overrides UI to mark the resulting `evaluation_run_id`
+as a "manual repro" so the Insights surface excludes it
+from rollups.
+
+### Mute semantics
+
+An active `override` row with `mute=true` whose
+`scope_filter` matches a candidate scope causes the engine
+to **emit no finding row** for that scope+rule pairing on
+the current SHA (per Stage 5.7 brief scenario
+`muted-scope-skipped`). This deviates from architecture
+Sec 5.3.6's "preserve as info" wording; the chosen
+behaviour is documented in `engine.go`.
+
+If `mute=false` (the unmute case), the engine emits the
+finding row as normal -- the override has no effect on a
+non-muted scope.
+
+### Resolved findings
+
+When a prior SHA's `(scope, rule)` tuple produced a
+`severity=block` finding and the current SHA's predicate
+does NOT fire (sample absent, value below threshold, or
+the engine returns no row), the engine emits a
+`delta=resolved`, `severity=info` row at the current SHA.
+Resolved rows are EXCLUDED from the verdict severity
+rollup so a clean SHA receives `verdict=pass` even though
+a resolved-finding row was written.
+
+The engine emits AT MOST one resolved row per tuple per
+SHA; subsequent SHAs where the tuple remains absent do
+NOT emit a duplicate resolved row (the engine consults
+`LatestPriorFinding` and short-circuits when the latest
+prior row already has `delta=resolved` or a non-block
+severity).
+
+### Severity rollup
+
+The verdict for a run is `MAX(severity)` over the firing
+findings, with `pass < warn < block`:
+
+| Findings                          | Verdict |
+|-----------------------------------|---------|
+| none                              | pass    |
+| only `info`                       | pass    |
+| at least one `warn`, no `block`   | warn    |
+| at least one `block`              | block   |
+
+`delta=resolved` rows are excluded from the rollup.
+
+### Production composition root
+
+The Rule Engine is wired by
+`cmd/clean-code-metric-ingestor/main.go` at process start
+(function `startRuleEngineWorker`). The wiring fans
+together:
+
+| Layer                          | Type                              | Role                                                                  |
+|--------------------------------|-----------------------------------|-----------------------------------------------------------------------|
+| `*sql.DB` (libpq)              | `database/sql`                    | The canonical Postgres handle (env `CLEAN_CODE_PG_URL`).              |
+| `*steward.SQLStore`            | `internal/policy/steward`         | Reader for `policy_version`, override matcher.                        |
+| `*steward.Steward`             | `internal/policy/steward`         | Exposes `ActivePolicyVersion(ctx)` -- the single source of truth.     |
+| `*rule_engine.SQLStore`        | `internal/rule_engine`            | Audit-table writer + metric_sample / commit reader.                   |
+| `*rule_engine.Engine`          | `internal/rule_engine`            | In-process actor for `RunSync` + `RunBatch`.                          |
+| `chan rule_engine.ScanEvent`   | std chan (buffered, cap=64)       | Post-scan dispatcher channel; emit is non-blocking on the HTTP path.  |
+| `*rule_engine.Worker`          | `internal/rule_engine`            | Consumes ScanEvent + drives `Engine.RunBatch`.                        |
+| `NewStewardActivation(stew)`   | `internal/rule_engine`            | Adapter projecting `ActivePolicyVersion` → `ActivePolicyVersionID`.    |
+
+The `handleProcess` HTTP handler emits exactly one
+`ScanEvent` on every successful transition to
+`scan_status='scanned'`. The emit uses a `select` with
+a 5-second bounded `time.After` branch
+(`scanEventEmitTimeout`): if the worker is stalled and
+the channel remains full for the full 5 seconds, the emit
+logs the line
+`rule_engine: scan event channel saturated after 5s -- event WILL BE REPROCESSED BY CATCHUP repo_id=<id> sha=<sha> ...`
+and returns. The HTTP request still succeeds because the
+durable catchup loop (next paragraph) replays any
+`scan_status='scanned'` SHA that lacks a
+`(caller='batch_refresh', degraded=false)` evaluation_run
+within ~5 minutes -- saturation surfaces as a latency
+spike + log line, NOT silent permanent loss. Operators
+can tune channel capacity by recompiling with a different
+`scanEventCapacity` constant (v1 ships with 64); the
+catchup loop is the durability backstop and SHOULD NOT
+be tuned away.
+
+The composition root also runs
+`rule_engine.Worker.Catchup` at startup and on a
+5-minute ticker. Catchup pages over commits where
+`scan_status='scanned'` AND no canonical batch-refresh
+evaluation_run exists yet under the active policy
+(`NOT EXISTS` anti-join on
+`caller='batch_refresh' AND degraded=false`); each page
+processes through the same `Engine.RunBatch` path as the
+live channel. The reader orders by
+`(committed_at, repo_id, sha)` (Stage 5.7 evaluator iter-5
+feedback #1: `clean_code.commit.committed_at` is the
+canonical timestamp column -- earlier iters incorrectly
+used `created_at`, which does not exist) and pages via a
+keyset cursor over the same tuple
+(`(committed_at, repo_id, sha) > ($t, $r, $s)`). Catchup
+pins the active policy version at the TOP of each
+invocation so a policy switch mid-run does not deadlock
+the anti-join, and advances the cursor by the LAST row of
+every page regardless of per-event success or failure --
+a persistent poison row at the head no longer starves
+later valid SHAs within the same invocation (Stage 5.7
+evaluator iter-5 feedback #2). The loop terminates when a
+page comes back empty or short (`len < limit`); per-event
+errors are logged and retried fresh on the next tick.
+
+### Cross-replica canonical-run dedup
+
+The engine performs an additional Store-level lookup
+(`Store.LookupRecentCanonicalRun`) before writing a fresh
+canonical `(evaluation_run, evaluation_verdict, findings)`
+triple. The lookup runs INSIDE the
+`pg_advisory_xact_lock` envelope, so when two replicas
+race for the same `(repo, sha, policy_version)` the second
+replica's RC-isolated SELECT observes the first replica's
+just-committed canonical row and returns the SAME IDs
+without minting a duplicate audit row (Stage 5.7 evaluator
+iter-5 feedback #3 + iter-6 feedback #2).
+
+**Both callers are covered (iter-7).** Migration 0008
+(`evaluation_run_scope_id`) adds a nullable
+`evaluation_run.scope_id uuid` column plus the
+`evaluation_run_dedup_idx` composite index on
+`(repo_id, sha, policy_version_id, caller, scope_id,
+created_at DESC)`. The lookup filters with the null-safe
+`IS NOT DISTINCT FROM` operator so a scoped eval_gate row
+NEVER matches an unscoped call (or vice versa); the engine
+now consults the Store-level lookup for both
+`caller='batch_refresh'` and `caller='eval_gate'` with the
+call's `scopeID`. The previous iter-6 limitation (eval_gate
+fell back to in-process cache only) is closed.
+
+**PendingScanCursor visibility caveat (open question
+resolution).** The 5-minute catchup ticker uses a keyset
+cursor over `(committed_at, repo_id, sha)`. A SHA inserted
+into `commit` AFTER the catchup loop's current invocation
+started but BEFORE the cursor reached its
+`committed_at` may not be visible to THAT invocation; the
+NEXT tick (default 5 minutes) re-issues `PendingScans`
+from cursor=nil and will pick it up. This is acceptable
+under the durability contract: the live event channel
+emits the SHA immediately, so the catchup loop is
+strictly a safety net.
+
+The wiring is opt-out via
+`CLEAN_CODE_RULE_ENGINE_DISABLED=1`. When the env var is
+set the worker is NOT composed and the post-scan emit is
+a no-op (`scanEvents == nil`), so the binary continues
+serving `/v1/ingestor/process` unchanged.
+
 ## Metric Ingestor and ScanRun state machine (Stage 3.2)
 
 ### What

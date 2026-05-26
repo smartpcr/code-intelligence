@@ -48,6 +48,16 @@ type PolicySignature struct {
 // invoked by every consumer that receives a policy bundle.
 type Gate struct {
 	keys *keys.Manager
+
+	// Evaluate-path dependencies. All nil on a gate built
+	// via [NewGate]; populated by [NewGateWithEngine].
+	engine        RuleEngine
+	readiness     SampleReadinessReader
+	policyReader  PolicyVersionReader
+	sigVerify     PolicySignatureVerifier
+	degradedStore DegradedRunStore
+	newID         IDMinter
+	now           func() int64
 }
 
 // NewGate wires the gate to a [keys.Manager]. mgr MAY be nil

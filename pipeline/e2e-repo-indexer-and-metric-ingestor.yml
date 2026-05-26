@@ -1,0 +1,93 @@
+name: "E2E — repo-indexer-and-metric-ingestor"
+
+on:
+  pull_request:
+    branches:
+      - feature/clean-code
+      - "ws/code-intelligence-CLEAN-CODE/**"
+    paths:
+      - "services/clean-code/**"
+      - "tests/e2e/phase-03-indexer-ingestor/**"
+      - ".github/workflows/e2e-repo-indexer-and-metric-ingestor.yml"
+  push:
+    branches:
+      - feature/clean-code
+      - "ws/code-intelligence-CLEAN-CODE/**"
+    paths:
+      - "services/clean-code/**"
+      - "tests/e2e/phase-03-indexer-ingestor/**"
+      - ".github/workflows/e2e-repo-indexer-and-metric-ingestor.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-repo-indexer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stale-scanrun-sweep-loop:
+    name: "stale-scanrun-sweep-loop"
+    runs-on: ubuntu-latest
+    env:
+      COMPOSE_FILE: tests/e2e/phase-03-indexer-ingestor/docker-compose.yml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/clean-code/go.mod
+          cache: true
+
+      - name: Start compose stack
+        run: docker compose -f $COMPOSE_FILE up -d --build
+
+      - name: Wait for services
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 90 ))
+          while :; do
+            healthy=true
+            for svc in postgres otel-collector indexer ingestor; do
+              status=$(docker compose -f $COMPOSE_FILE ps --format json \
+                | jq -r "select(.Service==\"$svc\") | .Health // .State" 2>/dev/null || echo "unknown")
+              echo "  $svc -> $status"
+              if [ "$status" != "healthy" ] && [ "$status" != "running" ]; then
+                healthy=false
+              fi
+            done
+            if $healthy; then echo "All services ready"; break; fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Services did not become healthy within 90s"
+              docker compose -f $COMPOSE_FILE logs --tail=100
+              exit 1
+            fi
+            sleep 3
+          done
+
+      - name: Run migrations
+        run: make migrate-up
+        env:
+          CLEAN_CODE_PG_URL: postgres://cleancode:cleancode@localhost:5432/cleancode?sslmode=disable
+
+      - name: Seed fixture data
+        run: make seed-fixtures-phase-03
+        env:
+          CLEAN_CODE_PG_URL: postgres://cleancode:cleancode@localhost:5432/cleancode?sslmode=disable
+
+      - name: Run E2E tests
+        working-directory: services/clean-code
+        run: |
+          go test -tags e2e -v -count=1 -timeout 120s \
+            -run TestE2E_repo_indexer_and_metric_ingestor_stale_scanrun_sweep_loop \
+            ./test/e2e/code-intelligence-CLEAN-CODE/...
+        env:
+          CLEAN_CODE_PG_URL: postgres://cleancode:cleancode@localhost:5432/cleancode?sslmode=disable
+          CLEAN_CODE_OTEL_ENDPOINT: localhost:4317
+
+      - name: Tear down compose stack
+        if: always()
+        run: docker compose -f $COMPOSE_FILE down -v

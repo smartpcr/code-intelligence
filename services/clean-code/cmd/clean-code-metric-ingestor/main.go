@@ -525,10 +525,14 @@ func mountMgmtRoutes(mux *http.ServeMux, ingestorDB, mgmtDB *sql.DB) error {
 //     bytes verbatim).
 //   - [webhook.NewStaticSecretResolver] maps the configured
 //     signing_key_id -> HMAC secret.
-//   - [webhook.NewChurnVerbHandler] and
-//     [webhook.NewTestBalanceVerbHandler] are the verbs
-//     mounted at this stage; later stages register more verbs
-//     via the same RouterConfig.Verbs slice.
+//   - [webhook.NewChurnVerbHandler] is the `churn` verb
+//     mount; [webhook.NewTestBalanceVerbHandler] is the
+//     `test_balance` verb mount (Stage 4.3, architecture
+//     Sec 1.4.2 / tech-spec Sec 4.1.1, `external_single`);
+//     [webhook.NewDefectsVerbHandler] is the `defects` verb
+//     mount (Stage 4.5, store-only v1 -- no writer
+//     dependency); later stages register more verbs via the
+//     same RouterConfig.Verbs slice.
 //
 // The Router is mounted at [webhook.RouterPath]
 // (`/v1/ingest/`) on the supplied mux; the verb is parsed
@@ -619,11 +623,20 @@ func mountIngestRouter(mux *http.ServeMux, cfg config.Config, ingestorDB *sql.DB
 	testBalanceWriter := test_balance.NewWriter(sampleWriter, testBalanceScopeResolver)
 	testBalanceHandler := webhook.NewTestBalanceVerbHandler(testBalanceWriter)
 
+	// Defects verb (Stage 4.5): v1 store-only at the scan_run
+	// boundary -- no writer dependency. The verb parses the
+	// JIRA-export-shaped body, validates its shape, records
+	// the parent scan_run's payload_hash via the same
+	// scanRunRepo seam the churn verb uses, and DISCARDS the
+	// body. No metric_sample row is written by this verb in
+	// v1 (tech-spec Sec 4.11 row 4 + Sec 10A pin).
+	defectsHandler := webhook.NewDefectsVerbHandler()
+
 	router := webhook.NewRouter(webhook.RouterConfig{
 		Resolver:    resolver,
 		Store:       idempotencyStore,
 		ScanRunRepo: scanRunRepo,
-		Verbs:       []webhook.VerbHandler{churnHandler, testBalanceHandler},
+		Verbs:       []webhook.VerbHandler{churnHandler, testBalanceHandler, defectsHandler},
 		Logger:      logger,
 	})
 	mux.Handle(webhook.RouterPath, router)
@@ -631,7 +644,7 @@ func mountIngestRouter(mux *http.ServeMux, cfg config.Config, ingestorDB *sql.DB
 		logger.Info("mounted external-ingest webhook router",
 			"path", webhook.RouterPath,
 			"signing_key_id", cfg.WebhookSigningKeyID,
-			"verbs", []string{churnHandler.Verb(), testBalanceHandler.Verb()},
+			"verbs", []string{churnHandler.Verb(), testBalanceHandler.Verb(), defectsHandler.Verb()},
 		)
 	}
 	return nil

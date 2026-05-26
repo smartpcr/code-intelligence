@@ -370,16 +370,20 @@ func (s *solidRuleEngineState) noFindingRowIsAppendedForThatScopeAndRule() error
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	// Scope the count to this run's SHA. The feature file hardcodes the
+	// scope string ("repo-a/src/BigClass.cs"), so without the sha filter
+	// stale finding rows from a prior run against the same DB would cause
+	// a false failure here. mutedSHA is generated per-run via uniqueSHA().
 	var count int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM finding WHERE scope_id = $1 AND rule_id = $2`,
-		s.mutedScope, s.mutedRuleID).Scan(&count)
+		`SELECT COUNT(*) FROM finding WHERE scope_id = $1 AND rule_id = $2 AND sha = $3`,
+		s.mutedScope, s.mutedRuleID, s.mutedSHA).Scan(&count)
 	if err != nil {
 		return fmt.Errorf("querying findings for muted scope: %w", err)
 	}
 	if count != 0 {
-		return fmt.Errorf("expected 0 findings for muted scope %s/%s, got %d",
-			s.mutedScope, s.mutedRuleID, count)
+		return fmt.Errorf("expected 0 findings for muted scope %s/%s at sha %s, got %d",
+			s.mutedScope, s.mutedRuleID, s.mutedSHA, count)
 	}
 	return nil
 }

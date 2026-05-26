@@ -450,9 +450,11 @@ func mountMgmtRoutes(mux *http.ServeMux, ingestorDB, mgmtDB *sql.DB) error {
 //     bytes verbatim).
 //   - [webhook.NewStaticSecretResolver] maps the configured
 //     signing_key_id -> HMAC secret.
-//   - [webhook.NewChurnVerbHandler] is Stage 4.1's only
-//     mounted verb; later stages register more verbs via the
-//     same RouterConfig.Verbs slice.
+//   - [webhook.NewChurnVerbHandler] is the `churn` verb
+//     mount (Stage 4.4); [webhook.NewDefectsVerbHandler]
+//     is the `defects` verb mount (Stage 4.5, store-only
+//     v1 -- no writer dependency); later stages register
+//     more verbs via the same RouterConfig.Verbs slice.
 //
 // The Router is mounted at [webhook.RouterPath]
 // (`/v1/ingest/`) on the supplied mux; the verb is parsed
@@ -517,11 +519,20 @@ func mountIngestRouter(mux *http.ServeMux, cfg config.Config, ingestorDB *sql.DB
 	ing := metric_ingestor.NewIngestor(metric_ingestor.NoopFoundationRecipeDispatcher{}, sweep)
 	churnHandler := webhook.NewChurnVerbHandler(ing)
 
+	// Defects verb (Stage 4.5): v1 store-only at the scan_run
+	// boundary -- no writer dependency. The verb parses the
+	// JIRA-export-shaped body, validates its shape, records
+	// the parent scan_run's payload_hash via the same
+	// scanRunRepo seam the churn verb uses, and DISCARDS the
+	// body. No metric_sample row is written by this verb in
+	// v1 (tech-spec Sec 4.11 row 4 + Sec 10A pin).
+	defectsHandler := webhook.NewDefectsVerbHandler()
+
 	router := webhook.NewRouter(webhook.RouterConfig{
 		Resolver:    resolver,
 		Store:       idempotencyStore,
 		ScanRunRepo: scanRunRepo,
-		Verbs:       []webhook.VerbHandler{churnHandler},
+		Verbs:       []webhook.VerbHandler{churnHandler, defectsHandler},
 		Logger:      logger,
 	})
 	mux.Handle(webhook.RouterPath, router)
@@ -529,7 +540,7 @@ func mountIngestRouter(mux *http.ServeMux, cfg config.Config, ingestorDB *sql.DB
 		logger.Info("mounted external-ingest webhook router",
 			"path", webhook.RouterPath,
 			"signing_key_id", cfg.WebhookSigningKeyID,
-			"verbs", []string{churnHandler.Verb()},
+			"verbs", []string{churnHandler.Verb(), defectsHandler.Verb()},
 		)
 	}
 	return nil

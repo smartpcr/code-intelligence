@@ -149,17 +149,35 @@ func (s *sweepState) aCommitRowWithScanStatusLinkedToAScanRunThatWasJustMarked(s
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// First, insert a scan_run already in the target runStatus (e.g. "failed").
+	// The feature wording "scan_run that was just marked '<runStatus>'" describes
+	// the *post-sweep* status of the scan_run, not its pre-sweep status.  Per the
+	// feature file, the sweep only targets scan_runs stuck in "running"; a row
+	// already inserted in a terminal status (e.g. "failed") would never be
+	// revisited and the commit cascade would never fire, causing
+	// theSweepFinalises to hang for 30 s before timing out.
+	//
+	// We therefore set up a stale "running" scan_run and rely on the sweep to
+	// (1) transition the run "running" -> runStatus and (2) cascade the linked
+	// commit's "scanning" scan_status in the same pass.  runStatus is preserved
+	// as a parameter so the step expression still binds the feature wording,
+	// and is validated below to keep that contract explicit.
+	if runStatus == "running" {
+		return fmt.Errorf(
+			"feature must specify a terminal post-sweep run status, got %q", runStatus)
+	}
+
 	staleTime := time.Now().UTC().Add(-31 * time.Minute)
 	err := s.db.QueryRowContext(ctx,
 		`INSERT INTO scan_runs (status, created_at, updated_at)
-		 VALUES ($1, $2, $2)
-		 RETURNING id`, runStatus, staleTime).Scan(&s.scanRunID)
+		 VALUES ('running', $1, $1)
+		 RETURNING id`, staleTime).Scan(&s.scanRunID)
 	if err != nil {
-		return fmt.Errorf("inserting scan_run with status %q: %w", runStatus, err)
+		return fmt.Errorf("inserting stale running scan_run: %w", err)
 	}
 
-	// Then insert a commit linked to that scan_run still in "scanning".
+	// Insert a commit linked to that scan_run still in scanStatus ("scanning").
+	// When the sweep runs, the run transitions to runStatus and the commit
+	// scan_status is cascaded.
 	err = s.db.QueryRowContext(ctx,
 		`INSERT INTO commits (scan_run_id, scan_status, created_at, updated_at)
 		 VALUES ($1, $2, now(), now())

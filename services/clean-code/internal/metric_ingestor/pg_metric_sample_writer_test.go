@@ -39,6 +39,51 @@ func expectScanRunGuardError(t *testing.T, mock sqlmock.Sqlmock, producerRunID u
 		WillReturnError(err)
 }
 
+// expectMetricSampleInsertPrepare registers the INSERT INTO
+// `metric_sample` prepared statement and returns its
+// [sqlmock.ExpectedPrepare] so per-record EXECs can be
+// chained. Pinned in one helper so the Stage 3.3 active-row
+// UPSERT flow (`expectMetricSampleActiveUpsertPrepare`) is
+// the symmetric next prepare in the same transaction.
+func expectMetricSampleInsertPrepare(t *testing.T, mock sqlmock.Sqlmock) *sqlmock.ExpectedPrepare {
+	t.Helper()
+	return mock.ExpectPrepare(`INSERT\s+INTO\s+"` + pgMetricSampleTestSchema + `"\."metric_sample"`)
+}
+
+// expectMetricSampleActiveUpsertPrepare registers the
+// Stage 3.3 INSERT ... ON CONFLICT DO UPDATE prepared
+// statement against `metric_sample_active`. It is the
+// canonical active-row UPSERT (tech-spec Sec 7.1.b lines
+// 1070-1119 / architecture Sec 5.2.1 G2): no `swap_active`
+// verb, trigger, or stored function exists in the canonical
+// model.
+//
+// The regex pins:
+//   - the qualified relation name (`<schema>.metric_sample_active`);
+//   - the exact six-column INSERT list
+//     `(repo_id, sha, scope_id, metric_kind, metric_version, sample_id)`;
+//   - the exact six-placeholder VALUES list `($1, ..., $6)`;
+//   - the exact ON CONFLICT quintuple target
+//     `(repo_id, sha, scope_id, metric_kind, metric_version)`;
+//   - the exact `DO UPDATE SET sample_id = EXCLUDED.sample_id`
+//     clause.
+//
+// Any deviation -- an extra column, a wrong placeholder
+// count, a different conflict target, a different SET clause
+// (e.g. setting `created_at` or `degraded_reason`) -- fails
+// the prepare-expectation match and surfaces as an unmet
+// expectation in cleanup.
+func expectMetricSampleActiveUpsertPrepare(t *testing.T, mock sqlmock.Sqlmock) *sqlmock.ExpectedPrepare {
+	t.Helper()
+	return mock.ExpectPrepare(
+		`INSERT\s+INTO\s+"` + pgMetricSampleTestSchema + `"\."metric_sample_active"` +
+			`\s+\(repo_id,\s+sha,\s+scope_id,\s+metric_kind,\s+metric_version,\s+sample_id\)` +
+			`\s+VALUES\s+\(\$1,\s+\$2,\s+\$3,\s+\$4,\s+\$5,\s+\$6\)` +
+			`\s+ON\s+CONFLICT\s+\(repo_id,\s+sha,\s+scope_id,\s+metric_kind,\s+metric_version\)` +
+			`\s+DO\s+UPDATE\s+SET\s+sample_id\s+=\s+EXCLUDED\.sample_id\s*\z`,
+	)
+}
+
 func newSQLMockMetricSampleWriter(t *testing.T) (*metric_ingestor.PGMetricSampleWriter, sqlmock.Sqlmock, func()) {
 	t.Helper()
 	db, mock, err := sqlmock.New(
@@ -125,6 +170,14 @@ func TestPGMetricSampleWriter_WriteBatch_HappyPath(t *testing.T) {
 			`{"file":"pkg/foo.go"}`,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectMetricSampleActiveUpsertPrepare(t, mock).
+		ExpectExec().
+		WithArgs(
+			rec.RepoID, rec.SHA, rec.ScopeID,
+			rec.MetricKind, rec.MetricVersion,
+			rec.SampleID,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
 	if err := w.WriteBatch(context.Background(), []metric_ingestor.MetricSampleRecord{rec}); err != nil {
@@ -157,9 +210,13 @@ func TestPGMetricSampleWriter_WriteBatch_MultiRowIsOneTx(t *testing.T) {
 
 	mock.ExpectBegin()
 	expectScanRunGuard(t, mock, recs[0].ProducerRunID, "running")
-	prep := mock.ExpectPrepare(`INSERT\s+INTO\s+"` + pgMetricSampleTestSchema + `"\."metric_sample"`)
+	prep := expectMetricSampleInsertPrepare(t, mock)
 	for range recs {
 		prep.ExpectExec().WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+	prepActive := expectMetricSampleActiveUpsertPrepare(t, mock)
+	for range recs {
+		prepActive.ExpectExec().WillReturnResult(sqlmock.NewResult(0, 1))
 	}
 	mock.ExpectCommit()
 

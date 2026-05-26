@@ -295,8 +295,10 @@ func (s *churnState) selectCountFromMetricSampleReturns0ForTheProducerRun() erro
 		return nil
 	}
 
-	// If neither column exists, the table may not yet have data – pass vacuously.
-	return nil
+	// Neither column exists: this is a schema mismatch, not a satisfied
+	// invariant. Fail loudly so the schema drift is surfaced instead of
+	// silently passing the zero-row check.
+	return fmt.Errorf("metric_sample table has neither producer_run_id nor scan_run_id column; cannot verify zero-row invariant")
 }
 
 func (s *churnState) churnEventRowsAreAppendedForEveryUploadedFile() error {

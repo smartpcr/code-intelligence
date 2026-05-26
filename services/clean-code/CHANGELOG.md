@@ -4,6 +4,247 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 3.4 -- Retraction and rescan flow
+
+### Iter 3 (evaluator-driven role-wiring + cmd test gate)
+
+Iter 2 (score 86) left three concrete items the evaluator
+flagged. Iter 3 addresses each one structurally:
+
+- **`cmd/clean-code-metric-ingestor/main.go`** (REWRITE):
+  Iter 2's `mountMgmtRoutes` took a single `*sql.DB` for all
+  four PG stores, which violated the role grants documented
+  in `migrations/0004_roles.up.sql` (line 313 grants
+  `repo_event` INSERT to `clean_code_management`; lines 348
+  / 374 grant `scan_run` + `metric_retraction` to
+  `clean_code_metric_ingestor`). Iter 3 splits the
+  composition root:
+  - `openMgmtDB(cfg, ingestorDB)` opens a SECOND `*sql.DB`
+    from the new `CLEAN_CODE_MGMT_PG_URL` env var (the
+    canonical Go field is `config.Config.ManagementPostgresURL`).
+  - `mountMgmtRoutes(mux, ingestorDB, mgmtDB)` now accepts
+    two handles and routes `PGRepoEventAppender` through
+    `mgmtDB` while keeping `PGRetractScanRunStore`,
+    `PGRetractionStore`, and `PGRescanScanRunStore` on
+    `ingestorDB`.
+  - When `CLEAN_CODE_MGMT_PG_URL` is unset AND
+    `CLEAN_CODE_ALLOW_SHARED_PG_ROLE=true` is not set, the
+    binary FAILS FAST at startup with an error that names
+    both env vars AND `migrations/0004_roles.up.sql` so an
+    operator scanning logs lands directly on the ACL rows.
+  - Also implemented the four helpers
+    (`buildSweepLoop`, `buildMux`, `newMetricsHandler`,
+    `handleScanRun`) plus the `scanRunShaBindingForKind`
+    map that the orphaned cmd tests reference. This was
+    iter-3 evaluator item #2: `go test ./...` was red on
+    `cmd/clean-code-metric-ingestor` since iter 1 due to
+    these undefined symbols. It is now GREEN.
+- **`internal/config/config.go`**: Added `EnvMgmtPGURL`
+  (`CLEAN_CODE_MGMT_PG_URL`) and `EnvAllowSharedPGRole`
+  (`CLEAN_CODE_ALLOW_SHARED_PG_ROLE`) constants;
+  added `ManagementPostgresURL` and `AllowSharedPGRole`
+  fields on `Config`; taught `readEnvOverrides` +
+  `applyOverrides` about both. The fail-fast-on-bogus-value
+  contract matches the other `CLEAN_CODE_*_ENABLE_*` flags.
+- **`internal/config/config_test.go`**: Added the two new
+  env vars to `clearCleanCodeEnv`; added
+  `TestMgmtPGURL_DefaultsAreEmpty`,
+  `TestMgmtPGURL_RoundTripsThroughLoad`,
+  `TestAllowSharedPGRole_RoundTripsBooleans`,
+  `TestAllowSharedPGRole_RejectsNonBoolean`.
+- **`cmd/clean-code-metric-ingestor/role_wiring_test.go`** (NEW):
+  Six tests pinning the role-wiring contract:
+  - `TestOpenMgmtDB_FailsFastWhenUnsetAndNotOptedIn` pins
+    the production fail-fast guard.
+  - `TestOpenMgmtDB_ReusesIngestorHandleWhenSharedOptIn`
+    pins the dev/E2E shared-role opt-in via pointer
+    equality (caller MUST NOT double-close).
+  - `TestMgmtRoleHandleSource_LabelsBranchClearly` pins
+    the startup-log label for each branch.
+  - `TestMountMgmtRoutes_RejectsNilMgmtDB` and
+    `TestMountMgmtRoutes_RejectsNilIngestorDB` pin the
+    composition-time fail-fast guards.
+  - `TestMountMgmtRoutes_DistinctHandlesMountsBothVerbs`
+    pins the happy path: both verbs reachable on the mux
+    when both handles are wired.
+- **`cmd/clean-code-metric-ingestor/test_helpers_test.go`**
+  (NEW): Two small helpers (`mustGET`, `newRecorder`)
+  shared by the new role-wiring tests.
+- **`docs/runbook.md`** -- rewrote the Stage 3.4
+  "Composition root wiring" section to document the role
+  boundary, the `mountMgmtRoutes(mux, ingestorDB, mgmtDB)`
+  signature, and the new operator env vars. Added an
+  "Operator env var reference (Stage 3.4)" table.
+
+### Iter 2 (evaluator-driven bugfix + production wiring)
+
+Iter 1 added implementation + tests but left FOUR concrete
+gaps the evaluator flagged. Iter 2 addresses each one:
+
+- **`internal/metric_ingestor/retract.go`**: fixed
+  idempotency bug. The dispatcher now consults
+  `RetractionStore.Lookup(sample_id)` BEFORE opening a
+  fresh `scan_run(kind='retract')`. Sequential retract of
+  the same sample returns
+  `{ScanRunID=uuid.Nil, Inserted=false, Retraction=existing}`
+  -- NO scan_run row is opened. Race-loser path (Lookup
+  said no, Append says yes) returns the actual scan_run_id
+  with `Inserted=false` -- audit trail stays honest.
+  Added `RetractionStore.Lookup(ctx, sample_id)` to the
+  interface and to `InMemoryRetractStore`.
+- **`internal/metric_ingestor/retract_test.go`**:
+  strengthened `TestRetractDispatcher_Idempotent` to
+  assert `ScanRunID == uuid.Nil` and `CountScanRuns() == 1`
+  after the second call. Added
+  `TestRetractDispatcher_RaceLoserReturnsActualScanRunID`
+  that drives the race-loser path with a custom
+  `raceLoserStore` wrapper.
+- **`internal/rule_engine/sql_store.go`**: added the
+  required `metric_retraction` anti-join to the
+  `eval.gate` reader path. The brief says "SHA-pinned
+  readers (mgmt.read.metric_sample, mgmt.read.metric_samples,
+  eval.gate) filter the retracted sample out via a
+  `metric_retraction` join". Pre-iter-2 the SQLStore's
+  `listMetricSamplesQuery` joined only
+  `metric_sample_active x metric_sample x scope_binding`,
+  so a retract WITHOUT a follow-up rescan left the active
+  pointer in place and the rule engine still evaluated
+  the retracted sample (DELETE on `metric_sample_active`
+  is REVOKEd per tech-spec Sec 7.2 line 1248). The fix
+  adds `LEFT JOIN clean_code.metric_retraction mr ON
+  mr.sample_id = msa.sample_id` with
+  `WHERE mr.sample_id IS NULL`.
+- **`internal/rule_engine/sql_store_test.go`**: added
+  `metric_retraction` table to `ruleEngineSchemaPrep`
+  test schema DDL and a new live PG test
+  `TestSQLStore_ListMetricSamples_FiltersRetracted` that
+  seeds (metric_sample, metric_sample_active,
+  metric_retraction), asserts the retracted sample is
+  filtered, AND asserts the active pointer is STILL in
+  place (proving the filter is the only thing hiding the
+  sample).
+- **`internal/metric_ingestor/pg_retract_store.go`**
+  (NEW): production-PG `PGRetractScanRunStore` and
+  `PGRetractionStore` implementing the `RetractScanRunStore`,
+  `RetractionStore`, and `SampleResolver` contracts.
+  `PGRetractionStore.Append` uses
+  `INSERT ... ON CONFLICT (sample_id) DO NOTHING RETURNING`
+  + fallback `Lookup` so the PG path preserves the
+  in-memory store's idempotency contract bit-for-bit.
+- **`internal/metric_ingestor/pg_rescan_store.go`**
+  (NEW): production-PG `PGRescanScanRunStore` that opens
+  `scan_run(kind='full', sha_binding='single',
+  status='running')`.
+- **`internal/metric_ingestor/pg_retract_store_test.go`**
+  (NEW): sqlmock-driven tests pinning the exact SQL
+  shape each store emits (table identifiers, ON CONFLICT
+  clause, RETURNING columns).
+- **`internal/management/pg_repo_event_appender.go`**
+  (NEW): production-PG `PGRepoEventAppender` that
+  INSERTs `repo_event(repo_id, kind, payload_json)` with
+  `kind` cast to the canonical
+  `clean_code.repo_event_kind` enum and `payload_json`
+  cast to `jsonb`. Empty payload defaults to `{}`.
+- **`internal/management/pg_repo_event_appender_test.go`**
+  (NEW): sqlmock tests for the canonical INSERT shape,
+  nil-payload-bind-as-empty-object, and validation
+  rejects (zero repoID, empty kind, nil DB, empty
+  schema).
+- **`internal/management/verbs.go`**: extended `Handler`
+  with an optional `writer *MgmtWriter` field via a new
+  `NewHandlerWithWriter(reader, writer)` constructor.
+  `Routes()` now mounts `/v1/mgmt/retract_sample` and
+  `/v1/mgmt/rescan` when the writer is non-nil. The
+  scaffold-mode `NewHandler(reader)` path is unchanged
+  (no mgmt routes mounted -- 404).
+- **`internal/management/verbs_test.go`**: added
+  `TestHandler_RoutesIncludesMgmtVerbPaths_WhenWriterWired`
+  and `TestHandler_RoutesOmitsMgmtVerbPaths_WhenWriterNil`.
+- **`internal/management/mgmt_verbs_real_dispatcher_test.go`**
+  (NEW): the "real-dispatcher" integration tests that
+  drive HTTP through `metric_ingestor.NewRetractDispatcher`
+  + `InMemoryRetractStore` (the exact production wiring
+  shape). Pins the iter 2 idempotency fix at the wire:
+  a second POST with the same `sample_id` MUST return
+  `scan_run_id == uuid.Nil`, `inserted == false`, AND
+  the underlying store MUST record only ONE scan_run row.
+  Iter 1's hand-rolled `fakeRetractDispatcher` would have
+  passed even with the broken dispatcher; this test
+  would not.
+- **`cmd/clean-code-metric-ingestor/main.go`**: added
+  `mountMgmtRoutes(mux, db)` that wires
+  `PGRetractionStore` (as `RetractionStore` AND
+  `SampleResolver`), `PGRetractScanRunStore`,
+  `PGRescanScanRunStore`, `PGRepoEventAppender`,
+  `RetractDispatcher`, `RescanEnqueuer`, and `MgmtWriter`
+  against the existing `*sql.DB`. Mounts both verb paths
+  on the parent mux at startup. Fails fast if any seam
+  cannot be constructed.
+
+### Iter 1 additions (workstream bring-up)
+
+- **`services/clean-code/internal/management/mgmt_verbs_test.go`**
+  (NEW). HTTP-level coverage for the `mgmt.retract_sample`
+  and `mgmt.rescan` handlers. The pre-existing
+  `mgmt_verbs.go` already implements both verbs, but the
+  test file was missing -- this iteration adds it so the
+  wire layer's behavior is now pinned end-to-end. Coverage:
+  - **`mgmt.retract_sample` happy path**: 200 response;
+    `repo_event(kind='retract_intent', payload={sample_id, reason})`
+    appended; canonical wire fields populated;
+    `appended_by` stamped `operator:<X-OIDC-Subject>`.
+  - **`mgmt.retract_sample` idempotency**: a second
+    dispatch for the same `sample_id` returns the EXISTING
+    `retraction_id` with `inserted=false` and a zero
+    `scan_run_id`. The `repo_event` intent log accepts
+    retry duplicates (append-only at the audit layer).
+  - **`mgmt.retract_sample` error mapping**: 400 for
+    malformed JSON / unknown body fields / zero UUID /
+    blank reason; 401 for missing or blank
+    `X-OIDC-Subject`; 404 when the resolver does not know
+    the sample (NO `repo_event` row is appended on the
+    404 path); 405 for non-POST; 500 when the resolver or
+    dispatcher fails (opaque body, no driver-error leak);
+    503 when resolver / dispatcher / appender is not
+    wired.
+  - **`mgmt.rescan` happy path**: 200 response; a single
+    canonical `scan_run` is enqueued via the in-memory
+    enqueuer; canonical wire fields populated;
+    `requested_by` stamped `operator:<X-OIDC-Subject>`.
+  - **`mgmt.rescan` emits NO `repo_event`**: a focused
+    regression guard for the architecture Sec 5.1.4
+    invariant that the canonical `RepoEvent.kind` enum has
+    no `rescan_intent` value; even three repeated rescans
+    leave the `repo_event` log empty.
+  - **`mgmt.rescan` is NOT idempotent**: three rescans for
+    the same `(repo_id, sha)` produce three distinct
+    `scan_run_id`s -- an operator who clicks rescan twice
+    expects the recipe loop to run twice.
+  - **`mgmt.rescan` error mapping**: 400 / 401 / 405 / 500
+    / 503 same as retract minus the 404 path (no canonical
+    not-found mapping at the enqueuer layer for v1).
+  - **`InMemoryRepoEventAppender`**: defensive-copy
+    contract (caller mutation of the payload map does NOT
+    bleed through to the persisted row); zero `repoID` /
+    empty `kind` rejection; `EventsForRepo` filter
+    correctness.
+  - **`RepoEventKindRetractIntent` constant**: pinned to
+    the literal `"retract_intent"` so a refactor that
+    renames the symbol surfaces immediately.
+- **`services/clean-code/docs/runbook.md`** -- new top-level
+  section "`mgmt.retract_sample` and `mgmt.rescan` (Stage 3.4)"
+  documenting the operator-facing surface: HTTP paths, body
+  shapes, the full retract sequencing (validate -> resolve
+  -> append `retract_intent` repo_event -> dispatch -> return
+  retraction row), idempotency semantics, the
+  "`metric_sample_active` is NOT deleted" invariant + the
+  SHA-pinned reader join shape, the rescan flow's
+  intentional non-idempotency and the
+  "no `rescan_intent` RepoEvent.kind" rule, the 200 / 400 /
+  401 / 404 / 405 / 500 / 503 status-code matrix, the
+  `X-OIDC-Subject` trust boundary, and the composition-root
+  wiring example for `cmd/clean-coded/main.go`.
+
 ## Stage 5.7 -- SOLID Rule Engine batch worker and synchronous mode
 
 ### Iter 10 additions (evaluator iter-9 feedback #1, #2)

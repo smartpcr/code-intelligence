@@ -102,6 +102,23 @@ CREATE TABLE %[1]s.metric_sample_active (
     PRIMARY KEY (repo_id, sha, scope_id, metric_kind, metric_version)
 );
 
+-- Retraction tombstone table per migrations/0002_measurement.up.sql
+-- lines 448-475. The Stage 3.4 SHA-pinned readers
+-- (mgmt.read.metric_sample, mgmt.read.metric_samples, eval.gate)
+-- LEFT JOIN through this table and filter WHERE mr.sample_id IS
+-- NULL so a retracted sample never feeds the rule engine even
+-- when metric_sample_active still points at it (DELETE on
+-- metric_sample_active is REVOKEd per tech-spec Sec 7.2 line
+-- 1248). The UNIQUE on sample_id mirrors the architecture's
+-- "double-retract is a no-op" invariant.
+CREATE TABLE %[1]s.metric_retraction (
+    retraction_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    sample_id     uuid NOT NULL UNIQUE REFERENCES %[1]s.metric_sample(sample_id),
+    reason        text NOT NULL,
+    appended_by   text NOT NULL,
+    created_at    timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE %[1]s.rule (
     rule_id          text                       NOT NULL,
     version          integer                    NOT NULL,
@@ -361,6 +378,114 @@ func TestSQLStore_LiveRoundTrip(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("worker.Run: %v", err)
+	}
+}
+
+// TestSQLStore_ListMetricSamples_FiltersRetracted pins
+// iter 2 fix #2 (workstream brief Stage 3.4 verbatim):
+// SHA-pinned readers (mgmt.read.metric_sample,
+// mgmt.read.metric_samples, eval.gate) MUST filter the
+// retracted sample out via a `metric_retraction` join.
+//
+// Before iter 2 the SQLStore.ListMetricSamples query
+// joined only `metric_sample_active x metric_sample x
+// scope_binding`. The DELETE on `metric_sample_active`
+// is REVOKEd per tech-spec Sec 7.2 line 1248, so a retract
+// without a follow-up rescan leaves the active pointer
+// in place -- the rule_engine would evaluate the retracted
+// sample. The fix adds a LEFT JOIN to `metric_retraction`
+// with `WHERE mr.sample_id IS NULL` so retracted samples
+// are filtered.
+//
+// The test:
+//
+//  1. Seeds a `metric_sample` row and an active pointer.
+//  2. Asserts ListMetricSamples returns the sample.
+//  3. INSERTs a `metric_retraction` row referencing the
+//     sample.
+//  4. Asserts ListMetricSamples NOW returns ZERO rows --
+//     the active pointer is STILL in place, but the
+//     retraction filter excludes the row.
+func TestSQLStore_ListMetricSamples_FiltersRetracted(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode; skipping live PG test")
+	}
+	db := openLiveDB(t)
+	schema := ruleEngineTestSchemaName
+	ctx := context.Background()
+
+	repoID := uuid.Must(uuid.NewV4())
+	sha := "0000000000000000000000000000000000000042"
+	scopeID := uuid.Must(uuid.NewV4())
+	sampleID := uuid.Must(uuid.NewV4())
+
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(q, schema), args...); err != nil {
+			t.Fatalf("seed (%q): %v", q, err)
+		}
+	}
+
+	exec(`INSERT INTO %s.commit (repo_id, sha) VALUES ($1, $2)`, repoID.String(), sha)
+	exec(`INSERT INTO %s.scope_binding (scope_id, scope_kind, canonical_signature)
+	      VALUES ($1, $2, $3)`, scopeID.String(), "class", "src/Foo.cs::Foo")
+	exec(`INSERT INTO %s.metric_sample (sample_id, repo_id, sha, scope_id, metric_kind, metric_version, value)
+	      VALUES ($1, $2, $3, $4, 'lcom4', 1, 9.0)`,
+		sampleID.String(), repoID.String(), sha, scopeID.String())
+	// Active pointer -- per the schema's PK over the
+	// quintuple, only one active row per (repo, sha,
+	// scope_id, metric_kind, metric_version).
+	exec(`INSERT INTO %s.metric_sample_active (repo_id, sha, scope_id, metric_kind, metric_version, sample_id)
+	      VALUES ($1, $2, $3, 'lcom4', 1, $4)`,
+		repoID.String(), sha, scopeID.String(), sampleID.String())
+
+	stewardStore, err := steward.NewSQLStoreWithSchema(db, schema)
+	if err != nil {
+		t.Fatalf("steward.NewSQLStoreWithSchema: %v", err)
+	}
+	store, err := NewSQLStore(SQLStoreConfig{DB: db, Schema: schema, Steward: stewardStore})
+	if err != nil {
+		t.Fatalf("NewSQLStore: %v", err)
+	}
+
+	// --- pre-retraction: the sample is visible -------------
+	samples, err := store.ListMetricSamples(ctx, repoID, sha, nil)
+	if err != nil {
+		t.Fatalf("pre-retract ListMetricSamples: %v", err)
+	}
+	if len(samples) != 1 {
+		t.Fatalf("pre-retract: got %d samples, want 1", len(samples))
+	}
+	if samples[0].SampleID != sampleID {
+		t.Fatalf("pre-retract sample_id: got %s, want %s", samples[0].SampleID, sampleID)
+	}
+
+	// --- append a retraction row --------------------------
+	// The active pointer stays in place -- DELETE on
+	// metric_sample_active is REVOKEd per tech-spec Sec 7.2
+	// line 1248.
+	exec(`INSERT INTO %s.metric_retraction (sample_id, reason, appended_by)
+	      VALUES ($1, $2, $3)`, sampleID.String(), "vendored file", "operator:alice")
+
+	// --- post-retraction: ListMetricSamples filters it ----
+	samples, err = store.ListMetricSamples(ctx, repoID, sha, nil)
+	if err != nil {
+		t.Fatalf("post-retract ListMetricSamples: %v", err)
+	}
+	if len(samples) != 0 {
+		t.Fatalf("post-retract: got %d samples, want 0 (retracted sample MUST be filtered via metric_retraction anti-join)", len(samples))
+	}
+
+	// Verify the active pointer is STILL present -- the
+	// retraction does not delete it.
+	var activeCount int
+	if err := db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT count(*) FROM %s.metric_sample_active WHERE sample_id = $1`, schema),
+		sampleID.String()).Scan(&activeCount); err != nil {
+		t.Fatalf("count metric_sample_active: %v", err)
+	}
+	if activeCount != 1 {
+		t.Errorf("metric_sample_active count: got %d, want 1 (DELETE is REVOKEd; the retraction filter is the ONLY thing hiding the sample)", activeCount)
 	}
 }
 

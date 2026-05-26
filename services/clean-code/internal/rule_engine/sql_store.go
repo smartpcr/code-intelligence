@@ -123,20 +123,31 @@ func (s *SQLStore) LatestMatchingOverride(ctx context.Context, ruleID string, ca
 }
 
 // ListMetricSamples implements [Store]. Joins
-// `metric_sample_active x metric_sample x scope_binding` so
-// the engine receives the denormalised, active-row-only
-// view it expects (architecture Sec 5.2.1 lines 991-1003 +
-// Sec 5.2.3 line 1046).
+// `metric_sample_active x metric_sample x scope_binding` +
+// LEFT-ANTI-JOIN `metric_retraction` so the engine
+// receives the denormalised, active-row-only,
+// non-retracted view it expects (architecture
+// Sec 5.2.1 lines 991-1003 + Sec 5.2.3 line 1046 +
+// Sec 5.2.2 retraction filter -- workstream brief Stage
+// 3.4 verbatim: "SHA-pinned readers (mgmt.read.metric_sample,
+// mgmt.read.metric_samples, eval.gate) filter the retracted
+// sample out via a metric_retraction join").
 //
-// Reading through `metric_sample_active` is mandatory: the
-// raw `metric_sample` table is append-only and includes
-// retracted rows. The pointer table tracks the active row
-// per (repo, sha, scope_id, metric_kind, metric_version)
-// quintuple (G2), so a retract-then-reinsert sequence
-// re-points the active row without ever deleting a sample.
-// Evaluating rules against raw `metric_sample` would let
-// retracted (stale) rows trigger findings, violating C2 /
-// architecture Sec 5.2.2 lines 1023-1042.
+// Reading through `metric_sample_active` is NECESSARY
+// but NOT SUFFICIENT. The active-row pointer is mutable,
+// but the architecture REVOKEs DELETE on
+// `metric_sample_active` (tech-spec Sec 7.2 line 1248),
+// so a retract that has NOT yet been followed by a
+// rescan-with-supersede leaves the active pointer in
+// place: `msa.sample_id` still names the retracted
+// sample. Without the anti-join, eval.gate would
+// evaluate the retracted sample's value -- violating
+// the workstream invariant.
+//
+// The anti-join is the canonical "filter retracted
+// samples" idiom: LEFT JOIN to `metric_retraction` on
+// `sample_id`, then WHERE the joined `mr.sample_id` IS
+// NULL -- only rows with no matching retraction survive.
 //
 // All four DSL-exposed fields are hydrated:
 //   - `pack` (`base|solid|system|ingested`),
@@ -154,10 +165,11 @@ func (s *SQLStore) ListMetricSamples(ctx context.Context, repoID uuid.UUID, sha 
 // [SQLStore.ListMetricSamples] (auto-committing reads) and
 // [txStore.ListMetricSamples] (tx-scoped reads inside
 // `WithEvaluationLock`). Keeping it in one place ensures the
-// active-row JOIN + the four extra-field hydration stays in
-// sync across the two call sites (rubber-duck #2: a fix that
-// landed only in SQLStore would not flow through the engine
-// hot path because RunSync/RunBatch route via txStore).
+// active-row JOIN + the metric_retraction anti-join + the
+// four extra-field hydration stays in sync across the two
+// call sites (rubber-duck #2: a fix that landed only in
+// SQLStore would not flow through the engine hot path
+// because RunSync/RunBatch route via txStore).
 //
 // The querier interface is satisfied by both `*sql.DB` and
 // `*sql.Tx`.
@@ -172,11 +184,14 @@ func listMetricSamplesQuery(ctx context.Context, q sampleQuerier, schema string,
 		 FROM %s msa
 		 JOIN %s ms ON ms.sample_id = msa.sample_id
 		 JOIN %s sb ON sb.scope_id = msa.scope_id
+		 LEFT JOIN %s mr ON mr.sample_id = msa.sample_id
 		 WHERE msa.repo_id = $1
-		   AND msa.sha = $2`,
+		   AND msa.sha = $2
+		   AND mr.sample_id IS NULL`,
 		qual("metric_sample_active"),
 		qual("metric_sample"),
 		qual("scope_binding"),
+		qual("metric_retraction"),
 	)
 	args := []any{repoID.String(), sha}
 	if scopeID != nil {

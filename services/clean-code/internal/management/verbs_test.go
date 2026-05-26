@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofrs/uuid"
+
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/keys"
 )
 
@@ -189,4 +191,91 @@ func TestHandler_ListActiveResponseTimestampsAreRFC3339(t *testing.T) {
 			t.Fatalf("valid_from=%q not RFC3339(Nano): %v / %v", vfStr, err, err2)
 		}
 	}
+}
+
+// TestHandler_RoutesIncludesMgmtVerbPaths_WhenWriterWired
+// pins iter 2 evaluator item #4: when the composition
+// root wires a non-nil [MgmtWriter] via
+// [NewHandlerWithWriter], the Stage 3.4 verb paths
+// `/v1/mgmt/retract_sample` and `/v1/mgmt/rescan` are
+// mounted on the SAME `Handler.Routes()` mux that the
+// service exposes -- i.e. they are reachable from
+// production HTTP, not only from package-local tests.
+//
+// The test does NOT assert response shape (those
+// invariants live in mgmt_verbs_test.go); it only
+// asserts the routes EXIST -- a GET against either
+// path must return 405 (method not allowed), NOT 404
+// (no such route). A nil-writer Handler must still
+// return 404 (the route is genuinely not mounted).
+func TestHandler_RoutesIncludesMgmtVerbPaths_WhenWriterWired(t *testing.T) {
+	t.Parallel()
+	m := buildManagerWithMintedKey(t)
+	appender := NewInMemoryRepoEventAppender()
+	writer := NewMgmtWriter(
+		stubSampleResolver{},
+		stubRetractDispatcher{},
+		stubRescanEnqueuer{},
+		appender,
+	)
+	h := NewHandlerWithWriter(NewReader(m), writer)
+	mux := h.Routes()
+
+	// GET against either mgmt path must hit the handler
+	// (which then 405s on non-POST). If the path were not
+	// mounted the default ServeMux would 404.
+	for _, path := range []string{VerbMgmtRetractSamplePath, VerbMgmtRescanPath} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+		if rr.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("path=%s status=%d, want 405 (route is mounted; GET is rejected by the handler's method guard)", path, rr.Code)
+		}
+	}
+}
+
+// TestHandler_RoutesOmitsMgmtVerbPaths_WhenWriterNil
+// pins the inverse: a Handler built via the legacy
+// [NewHandler] constructor (no writer) MUST NOT mount
+// the mgmt verb paths -- the default ServeMux returns
+// 404. This keeps the scaffold-mode bring-up path
+// honest: a service started without a Postgres-backed
+// writer does NOT advertise endpoints it cannot serve.
+func TestHandler_RoutesOmitsMgmtVerbPaths_WhenWriterNil(t *testing.T) {
+	t.Parallel()
+	m := buildManagerWithMintedKey(t)
+	h := NewHandler(NewReader(m))
+	mux := h.Routes()
+
+	for _, path := range []string{VerbMgmtRetractSamplePath, VerbMgmtRescanPath} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("path=%s status=%d, want 404 (route MUST NOT be mounted when writer is nil)", path, rr.Code)
+		}
+	}
+}
+
+// Local stubs for the route-mount tests. We only need
+// the routes to be reachable; the per-verb method guard
+// (405 on non-POST) fires before any of these stubs is
+// invoked, so the return values can be zero-valued.
+
+type stubSampleResolver struct{}
+
+func (stubSampleResolver) ResolveSample(context.Context, uuid.UUID) (uuid.UUID, string, bool, error) {
+	return uuid.Nil, "", false, nil
+}
+
+type stubRetractDispatcher struct{}
+
+func (stubRetractDispatcher) Dispatch(context.Context, uuid.UUID, string, string) (RetractResult, error) {
+	return RetractResult{}, nil
+}
+
+type stubRescanEnqueuer struct{}
+
+func (stubRescanEnqueuer) Enqueue(context.Context, uuid.UUID, string, string) (RescanResult, error) {
+	return RescanResult{}, nil
 }

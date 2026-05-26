@@ -786,6 +786,18 @@ func InitializeScenario_policy_steward_and_solid_rule_engine_solid_rule_engine_b
 		s.allRowsWereCommittedInTheSameTransaction)
 	ctx.Step(`^the verdict column matches the severity rollup of unmuted findings$`,
 		s.theVerdictColumnMatchesSeverityRollupOfUnmutedFindings)
+
+	// FIX (review): close db after every scenario so connections don't leak
+	// until process exit. Without this, each scenario's lazy ensureDB opens
+	// a fresh pool that is never released, leaking ~4 pools across this
+	// suite's scenarios.
+	ctx.After(func(ctx context.Context, _ *godog.Scenario, _ error) (context.Context, error) {
+		if s.db != nil {
+			_ = s.db.Close()
+			s.db = nil
+		}
+		return ctx, nil
+	})
 }
 
 func TestE2E_policy_steward_and_solid_rule_engine_solid_rule_engine_batch_worker_and_synchronous_mode(t *testing.T) {

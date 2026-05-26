@@ -55,7 +55,6 @@ type churnState struct {
 	lastStatusCode   int
 	lastResponseBody []byte
 	uploadedFiles    []churnFileRow
-	boundFiles       []string
 }
 
 type churnFileRow struct {
@@ -118,12 +117,10 @@ func (s *churnState) theDatabaseIsMigratedAndRepoDIsSeeded() error {
 }
 
 func (s *churnState) scopeBindingsExistForChurnFiles(table *godog.Table) error {
-	s.boundFiles = nil
 	ctx := context.Background()
 
 	for _, row := range table.Rows[1:] {
 		filePath := row.Cells[0].Value
-		s.boundFiles = append(s.boundFiles, filePath)
 
 		_, err := s.db.ExecContext(ctx, `
 			INSERT INTO clean_code.scope_binding (repo_id, file_path, scope_kind)
@@ -146,17 +143,10 @@ func (s *churnState) aChurnUploadIsSubmittedForSHAWithFiles(sha string, table *g
 	s.uploadedFiles = nil
 
 	for _, row := range table.Rows[1:] {
-		filePath := row.Cells[0].Value
-		add, err := strconv.Atoi(row.Cells[1].Value)
-		if err != nil {
-			return fmt.Errorf("invalid additions value %q for file %q: %w", row.Cells[1].Value, filePath, err)
-		}
-		del, err := strconv.Atoi(row.Cells[2].Value)
-		if err != nil {
-			return fmt.Errorf("invalid deletions value %q for file %q: %w", row.Cells[2].Value, filePath, err)
-		}
+		add, _ := strconv.Atoi(row.Cells[1].Value)
+		del, _ := strconv.Atoi(row.Cells[2].Value)
 		s.uploadedFiles = append(s.uploadedFiles, churnFileRow{
-			FilePath: filePath, Additions: add, Deletions: del,
+			FilePath: row.Cells[0].Value, Additions: add, Deletions: del,
 		})
 	}
 
@@ -466,19 +456,6 @@ func (s *churnState) itEmitsAMetricSampleWithMetricKindAndPackAndSource(metricKi
 		time.Sleep(1 * time.Second)
 	}
 	return lastErr
-}
-
-// ---------------------------------------------------------------------------
-// internal helpers
-// ---------------------------------------------------------------------------
-
-func (s *churnState) isBoundChurn(filePath string) bool {
-	for _, b := range s.boundFiles {
-		if b == filePath {
-			return true
-		}
-	}
-	return false
 }
 
 // ---------------------------------------------------------------------------

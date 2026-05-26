@@ -29,9 +29,16 @@ stages:
             displayName: "Install Go $(GO_VERSION)"
 
           - script: |
+              SECRET=$(openssl rand -hex 32)
+              echo "##vso[task.setvariable variable=CLEAN_CODE_WEBHOOK_HMAC_SECRET;issecret=true]$SECRET"
+            displayName: "Generate ephemeral HMAC secret"
+
+          - script: |
               docker compose -f $(COMPOSE_FILE) up -d --build
             displayName: "Start compose services"
             workingDirectory: $(Build.SourcesDirectory)
+            env:
+              CLEAN_CODE_WEBHOOK_HMAC_SECRET: $(CLEAN_CODE_WEBHOOK_HMAC_SECRET)
 
           - script: |
               PG_PORT=$(docker compose -f $(COMPOSE_FILE) port postgres 5432 | cut -d: -f2)
@@ -40,7 +47,6 @@ stages:
               export CLEAN_CODE_PG_URL="postgres://postgres:postgres@localhost:${PG_PORT}/clean_code?sslmode=disable"
               export CLEAN_CODE_WEBHOOK_URL="http://localhost:${WEBHOOK_PORT}"
               export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:${OTEL_PORT}"
-              export CLEAN_CODE_WEBHOOK_HMAC_SECRET=$(openssl rand -hex 32)
               make migrate-up
               make seed-repo-d
               cd services/clean-code
@@ -48,6 +54,8 @@ stages:
                 -run TestE2E_external_metric_ingest_webhook_webhook_transport_and_hmac_verification
             displayName: "Export compose URLs, bootstrap, and run E2E tests"
             workingDirectory: $(Build.SourcesDirectory)
+            env:
+              CLEAN_CODE_WEBHOOK_HMAC_SECRET: $(CLEAN_CODE_WEBHOOK_HMAC_SECRET)
 
           - script: |
               docker compose -f $(COMPOSE_FILE) down -v --remove-orphans

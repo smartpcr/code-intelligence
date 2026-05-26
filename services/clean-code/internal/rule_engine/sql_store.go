@@ -433,10 +433,56 @@ func evaluationLockKey(repoID uuid.UUID, sha string) int64 {
 	return int64(h.Sum64())
 }
 
-// AppendEvaluation implements [Store] for the non-locked
-// path -- the engine routes here via WithEvaluationLock,
-// but tests / replay code may call it directly when no
-// cross-process serialisation is required.
+// AppendEvaluation implements [Store] and opens its OWN
+// `BEGIN; ...; COMMIT;` transaction WITHOUT acquiring the
+// per-(repo, sha) `pg_advisory_xact_lock` that
+// [SQLStore.WithEvaluationLock] holds on the engine's
+// happy path.
+//
+// The rule engine NEVER lands here directly: every
+// production call site (the batch worker, the synchronous
+// gate, [Engine.run] -> [Engine.runLocked]) routes through
+// [SQLStore.WithEvaluationLock], which hands its callback
+// a [txStore]-wrapped [Store] whose `AppendEvaluation`
+// inserts the run+verdict+findings triple inside the
+// already-locked transaction (see store.go:146-165 + the
+// [Store] interface contract). This concrete-receiver
+// variant exists ONLY because [Store] requires the method
+// on the SQLStore type so non-engine callers -- unit
+// tests, replay tooling, manual fixups -- can still reach
+// the writer when they don't need the cross-process lock.
+//
+// WARNING -- DIRECT CALLERS MUST SERIALISE EXTERNALLY.
+// Because this method skips `pg_advisory_xact_lock`, two
+// concurrent direct callers for the same (repo, sha) will
+// run their `BEGIN` blocks under default (Read Committed)
+// isolation with NO mutual exclusion in the path. Their
+// read-modify-write windows against `finding`,
+// `evaluation_run`, and `evaluation_verdict` can interleave
+// -- the exact race the engine relies on the advisory lock
+// to close (rationale at store.go:177-184: a sibling
+// instance could overlap our prior-finding snapshot read
+// with its own append and emit `delta=new` against a stale
+// view of the prior set). Acceptable serialisation
+// strategies for callers that need this entry point:
+//
+//   - Preferred: route through [SQLStore.WithEvaluationLock]
+//     and invoke `AppendEvaluation` on the callback's
+//     Store (the engine pattern). The callback's Store is
+//     the locked [txStore] variant, so the call lands
+//     inside the advisory-lock envelope.
+//   - Single-writer deployment: run the caller as a
+//     one-instance batch job or replay CLI where no peer
+//     can contend for the same (repo, sha) tuple.
+//   - In-process tests: ensure the test suite never fires
+//     two `AppendEvaluation` calls for the same (repo,
+//     sha) in parallel goroutines (the existing
+//     `engine_test.go` / `engine_priorsha_test.go` /
+//     `synchronous_test.go` fixtures all satisfy this).
+//
+// Direct callers that do NOT satisfy one of the above are
+// a concurrency bug, regardless of whether the race has
+// been observed under current load.
 func (s *SQLStore) AppendEvaluation(ctx context.Context, run EvaluationRun, verdict EvaluationVerdict, findings []Finding) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

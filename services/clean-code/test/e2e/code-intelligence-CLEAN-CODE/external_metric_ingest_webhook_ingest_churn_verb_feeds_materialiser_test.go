@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -147,10 +146,17 @@ func (s *churnState) aChurnUploadIsSubmittedForSHAWithFiles(sha string, table *g
 	s.uploadedFiles = nil
 
 	for _, row := range table.Rows[1:] {
-		add, _ := strconv.Atoi(row.Cells[1].Value)
-		del, _ := strconv.Atoi(row.Cells[2].Value)
+		filePath := row.Cells[0].Value
+		add, err := strconv.Atoi(row.Cells[1].Value)
+		if err != nil {
+			return fmt.Errorf("invalid additions value %q for file %q: %w", row.Cells[1].Value, filePath, err)
+		}
+		del, err := strconv.Atoi(row.Cells[2].Value)
+		if err != nil {
+			return fmt.Errorf("invalid deletions value %q for file %q: %w", row.Cells[2].Value, filePath, err)
+		}
 		s.uploadedFiles = append(s.uploadedFiles, churnFileRow{
-			FilePath: row.Cells[0].Value, Additions: add, Deletions: del,
+			FilePath: filePath, Additions: add, Deletions: del,
 		})
 	}
 
@@ -219,19 +225,13 @@ func (s *churnState) aChurnUploadIsSubmittedForSHAWithFiles(sha string, table *g
 func (s *churnState) theModificationCountMaterialiserRunsNext() error {
 	// The materialiser may run automatically after churn ingest. We try to
 	// trigger it explicitly if there is an endpoint, otherwise wait for it.
-	//
-	// All failure paths below are best-effort (we still return nil so the
-	// downstream metric_sample poll can run), but we log diagnostics so a
-	// broken trigger surfaces here rather than as a misleading 45s timeout in
-	// `itEmitsAMetricSampleWithMetricKindAndPackAndSource`.
 	triggerURL := s.webhookURL + "/v1/materialiser/trigger"
 	payload, _ := json.Marshal(map[string]string{"kind": "modification_count"})
 	sig := computeHMACSHA256ForChurn([]byte(s.hmacSecret), payload)
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, triggerURL, bytes.NewReader(payload))
 	if err != nil {
-		log.Printf("[materialiser-trigger] failed to build request for %s: %v (continuing; materialiser may auto-run)", triggerURL, err)
-		return nil
+		return nil // best-effort; materialiser may auto-run
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Hub-Signature-256", "sha256="+sig)
@@ -239,18 +239,11 @@ func (s *churnState) theModificationCountMaterialiserRunsNext() error {
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("[materialiser-trigger] POST %s failed: %v (continuing; materialiser may auto-run)", triggerURL, err)
+		// Materialiser may be auto-triggered; continue and poll later.
 		return nil
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-
-	// Surface non-2xx responses so they show up in the test output and the
-	// downstream metric_sample assertion isn't the first sign of trouble.
-	if resp.StatusCode >= 400 {
-		log.Printf("[materialiser-trigger] POST %s returned HTTP %d; body: %s",
-			triggerURL, resp.StatusCode, string(respBody))
-	}
+	io.ReadAll(resp.Body)
 
 	// Give the materialiser time to process.
 	time.Sleep(3 * time.Second)

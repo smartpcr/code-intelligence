@@ -1,0 +1,56 @@
+# Docker Compose for Phase 04 – External Metric Ingest Webhook E2E tests.
+# The CLEAN_CODE_WEBHOOK_HMAC_SECRET env-var MUST be exported before
+# running `docker compose up` so the webhook container receives the secret.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: clean_code
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  webhook:
+    build:
+      context: ../../../
+      dockerfile: services/clean-code/Dockerfile.webhook
+    environment:
+      CLEAN_CODE_PG_URL: "postgres://postgres:postgres@postgres:5432/clean_code?sslmode=disable"
+      CLEAN_CODE_WEBHOOK_HMAC_SECRET: "${CLEAN_CODE_WEBHOOK_HMAC_SECRET}"
+      CLEAN_CODE_OTEL_ENDPOINT: "otel-collector:4317"
+    ports:
+      - "8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+
+  ingestor:
+    build:
+      context: ../../../
+      dockerfile: services/clean-code/Dockerfile.ingestor
+    environment:
+      CLEAN_CODE_PG_URL: "postgres://postgres:postgres@postgres:5432/clean_code?sslmode=disable"
+      CLEAN_CODE_OTEL_ENDPOINT: "otel-collector:4317"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.100.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317"
+      - "8889"

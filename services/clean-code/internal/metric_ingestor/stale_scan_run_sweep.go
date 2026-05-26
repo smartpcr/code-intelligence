@@ -562,8 +562,16 @@ func (s *StaleScanRunSweep) Sweep(ctx context.Context) (SweepReport, error) {
 	if err := ctx.Err(); err != nil {
 		return SweepReport{}, err
 	}
-	cutoff := s.now().Add(-s.scanTimeout)
-	endedAt := s.now()
+	// Capture `now` ONCE so cutoff and endedAt come from
+	// the same instant. Under real wall-clock the two
+	// separate s.now() calls drift by ns/us (usually
+	// harmless but logically incoherent -- endedAt should
+	// be >= cutoff); under a test clock that advances on
+	// each call, the drift is observable and makes the
+	// sweep non-deterministic.
+	now := s.now()
+	cutoff := now.Add(-s.scanTimeout)
+	endedAt := now
 
 	var report SweepReport
 	maxBatches := s.maxBatches

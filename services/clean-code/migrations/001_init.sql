@@ -47,3 +47,28 @@ CREATE TABLE IF NOT EXISTS clean_code.scan_run (
     started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at  TIMESTAMPTZ
 );
+
+-- metric_sample: one row per computed metric snapshot for a commit.
+CREATE TABLE IF NOT EXISTS clean_code.metric_sample (
+    sample_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    commit_sha   TEXT NOT NULL REFERENCES clean_code.commit(sha),
+    payload      JSONB NOT NULL DEFAULT '{}',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- metric_sample_active: pointer table — one row per commit, pointing to
+-- the currently-active metric_sample.  UPSERT keeps exactly one row.
+CREATE TABLE IF NOT EXISTS clean_code.metric_sample_active (
+    commit_sha   TEXT PRIMARY KEY REFERENCES clean_code.commit(sha),
+    sample_id    UUID NOT NULL REFERENCES clean_code.metric_sample(sample_id),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- metric_retraction: tombstone table for retracted samples (tech-spec §7.2).
+-- The row in metric_sample_active is NOT deleted (REVOKE DELETE); readers
+-- LEFT JOIN metric_retraction and filter WHERE mr.sample_id IS NULL.
+CREATE TABLE IF NOT EXISTS clean_code.metric_retraction (
+    sample_id    UUID PRIMARY KEY REFERENCES clean_code.metric_sample(sample_id),
+    reason       TEXT NOT NULL DEFAULT '',
+    retracted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

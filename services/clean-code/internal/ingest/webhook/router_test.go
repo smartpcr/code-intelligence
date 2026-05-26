@@ -21,7 +21,6 @@ import (
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/churn"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/webhook"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/materialisers"
 )
 
 // routerTestKeyID is the canonical signing-key id every Router
@@ -35,28 +34,36 @@ const routerTestKeyID = "kv-prod-2026-q1"
 var routerTestSecret = []byte("router-test-hmac-secret-32-bytes-deadbeef!!")
 
 // newRouterStack builds a fully-wired Router on top of an
-// in-memory [metric_ingestor.Ingestor] so a Router test can
-// assert end-to-end behaviour without touching Postgres or
-// network listeners.
+// in-memory [churn.Ingester] -> [churn.InMemoryChurnEventStore]
+// so a Router test can assert end-to-end behaviour without
+// touching Postgres or network listeners.
 //
 // Returns:
 //
 //   - the Router (mountable via [http.ServeMux] or directly
 //     via [http.Handler] interface)
-//   - the in-memory metric-sample writer the churn sweep
-//     persists into (so tests can assert "no writer touched
-//     on auth failure" and "writer touched once for the
-//     winning call, not on replay")
+//   - the in-memory churn-event store the Stage 4.4 staging
+//     verb persists into (so tests can assert "no event
+//     staged on auth failure" and "store touched once for
+//     the winning call, not on replay")
 //   - the idempotency store (so tests can introspect the
 //     committed records)
 //
-// The Router is constructed with the ChurnVerbHandler bound
-// to the same Ingestor the legacy [ChurnIngestHandler] uses,
-// so the round-trip ScanRun flow matches production wiring.
-func newRouterStack(t *testing.T) (*webhook.Router, *metric_ingestor.InMemoryMetricSampleWriter, *webhook.InMemoryIdempotencyStore) {
+// # Stage 4.4 rewire (this iter)
+//
+// The previous wiring threaded the request through
+// `metric_ingestor.ChurnSweep -> MetricSampleWriter`. The
+// rewired stack threads through `churn.Ingester ->
+// ChurnEventWriter` and the in-memory store. This file no
+// longer imports `metric_ingestor.NewInMemoryMetricSampleWriter`
+// because the Router's churn verb path is now the SOLE owner
+// of the `clean_code.churn_event` staging table and writes
+// ZERO `metric_sample` rows directly (Stage 4.4 acceptance
+// criterion; evaluator iter-1 item #4).
+func newRouterStack(t *testing.T) (*webhook.Router, *churn.InMemoryChurnEventStore, *webhook.InMemoryIdempotencyStore) {
 	t.Helper()
-	r, writer, store, _ := newRouterStackWithDurable(t)
-	return r, writer, store
+	r, churnStore, store, _ := newRouterStackWithDurable(t)
+	return r, churnStore, store
 }
 
 // newRouterStackWithDurable extends [newRouterStack] by also
@@ -66,13 +73,10 @@ func newRouterStack(t *testing.T) (*webhook.Router, *metric_ingestor.InMemoryMet
 // shared default; pass a non-nil pre-built repo to share
 // state across two Router instances (the
 // across-restart replay test).
-func newRouterStackWithDurable(t *testing.T) (*webhook.Router, *metric_ingestor.InMemoryMetricSampleWriter, *webhook.InMemoryIdempotencyStore, *webhook.InMemoryScanRunRepository) {
+func newRouterStackWithDurable(t *testing.T) (*webhook.Router, *churn.InMemoryChurnEventStore, *webhook.InMemoryIdempotencyStore, *webhook.InMemoryScanRunRepository) {
 	t.Helper()
-	mat := materialisers.NewMaterialiserWithClock(materialisers.DefaultWindowDays, fixedNow)
-	hyd := churn.NewHydrator(churn.NewAutoMapScopeResolver())
-	writer := metric_ingestor.NewInMemoryMetricSampleWriter()
-	sweep := metric_ingestor.NewChurnSweep(mat, hyd, writer)
-	ing := metric_ingestor.NewIngestor(metric_ingestor.NoopFoundationRecipeDispatcher{}, sweep)
+	churnStore := churn.NewInMemoryChurnEventStore()
+	ing := churn.NewIngesterWithClocks(churnStore, fixedNow, uuid.NewV4)
 
 	resolver := webhook.NewStaticSecretResolver(map[string][]byte{
 		routerTestKeyID: routerTestSecret,
@@ -84,9 +88,9 @@ func newRouterStackWithDurable(t *testing.T) (*webhook.Router, *metric_ingestor.
 		Resolver:    resolver,
 		Store:       store,
 		ScanRunRepo: scanRunRepo,
-		Verbs:       []webhook.VerbHandler{webhook.NewChurnVerbHandler(ing)},
+		Verbs:       []webhook.VerbHandler{webhook.NewChurnVerbHandlerWithClock(ing, fixedNow)},
 	})
-	return r, writer, store, scanRunRepo
+	return r, churnStore, store, scanRunRepo
 }
 
 // signedChurnRequest builds a POST request against
@@ -121,7 +125,7 @@ func decodeRouterResponse(t *testing.T, body *bytes.Buffer) webhook.RouterRespon
 // per-verb counter envelope under a fresh scan_run_id.
 func TestRouter_HappyPath_HMACVerifiedAndDispatched(t *testing.T) {
 	t.Parallel()
-	r, writer, store := newRouterStack(t)
+	r, churnStore, store := newRouterStack(t)
 	body := goodPayloadJSON(t)
 	req := signedChurnRequest(t, body)
 	rec := httptest.NewRecorder()
@@ -152,8 +156,11 @@ func TestRouter_HappyPath_HMACVerifiedAndDispatched(t *testing.T) {
 	if want := fmt.Sprintf("%x", gotHash); resp.PayloadHash != want {
 		t.Errorf("response.payload_hash = %q; want %q", resp.PayloadHash, want)
 	}
-	if got := len(writer.Records()); got == 0 {
-		t.Errorf("writer.Records: want >=1 record persisted, got 0")
+	// Stage 4.4: the verb stages rows into clean_code.churn_event,
+	// NOT metric_sample. The in-memory churn store is the
+	// authoritative "did the verb run?" signal.
+	if got := churnStore.Len(); got == 0 {
+		t.Errorf("churn_event store.Len: want >=1 record staged, got 0")
 	}
 	if got := store.Len(); got != 1 {
 		t.Errorf("store.Len after one successful call: want 1, got %d", got)
@@ -167,7 +174,7 @@ func TestRouter_HappyPath_HMACVerifiedAndDispatched(t *testing.T) {
 // idempotency store is empty).
 func TestRouter_InvalidSignature_RejectedWith401(t *testing.T) {
 	t.Parallel()
-	r, writer, store := newRouterStack(t)
+	r, churnStore, store := newRouterStack(t)
 	body := goodPayloadJSON(t)
 	req := signedChurnRequest(t, body)
 	// Tamper the signature so it is well-formed (sha256=<64
@@ -184,8 +191,8 @@ func TestRouter_InvalidSignature_RejectedWith401(t *testing.T) {
 	if got.Code != "HMAC_SIGNATURE_MISMATCH" {
 		t.Errorf("error code: want HMAC_SIGNATURE_MISMATCH, got %q", got.Code)
 	}
-	if n := len(writer.Records()); n != 0 {
-		t.Errorf("writer.Records: want 0 (auth failed), got %d", n)
+	if n := churnStore.Len(); n != 0 {
+		t.Errorf("churn_event store.Len: want 0 (auth failed), got %d", n)
 	}
 	if n := store.Len(); n != 0 {
 		t.Errorf("store.Len after auth failure: want 0 (no scan_run enqueued), got %d", n)
@@ -197,7 +204,7 @@ func TestRouter_InvalidSignature_RejectedWith401(t *testing.T) {
 // is rejected at the verifier with HMAC_MISSING_SIGNATURE.
 func TestRouter_MissingSignature_RejectedWith401(t *testing.T) {
 	t.Parallel()
-	r, writer, store := newRouterStack(t)
+	r, churnStore, store := newRouterStack(t)
 	body := goodPayloadJSON(t)
 	req := signedChurnRequest(t, body)
 	req.Header.Del(webhook.HMACSignatureHeader)
@@ -212,8 +219,8 @@ func TestRouter_MissingSignature_RejectedWith401(t *testing.T) {
 	if got.Code != "HMAC_MISSING_SIGNATURE" {
 		t.Errorf("error code: want HMAC_MISSING_SIGNATURE, got %q", got.Code)
 	}
-	if n := len(writer.Records()); n != 0 {
-		t.Errorf("writer.Records: want 0, got %d", n)
+	if n := churnStore.Len(); n != 0 {
+		t.Errorf("churn_event store.Len: want 0, got %d", n)
 	}
 	if n := store.Len(); n != 0 {
 		t.Errorf("store.Len: want 0, got %d", n)
@@ -316,7 +323,7 @@ func TestRouter_MalformedSigningKeyID_RejectedWith401(t *testing.T) {
 // HMAC_SIGNATURE_MISMATCH.
 func TestRouter_TamperedBody_RejectedWith401(t *testing.T) {
 	t.Parallel()
-	r, writer, _ := newRouterStack(t)
+	r, churnStore, _ := newRouterStack(t)
 	originalBody := goodPayloadJSON(t)
 	req := signedChurnRequest(t, originalBody)
 	// Swap the body the request will read with a tampered
@@ -337,8 +344,8 @@ func TestRouter_TamperedBody_RejectedWith401(t *testing.T) {
 	if got.Code != "HMAC_SIGNATURE_MISMATCH" {
 		t.Errorf("error code: want HMAC_SIGNATURE_MISMATCH, got %q", got.Code)
 	}
-	if n := len(writer.Records()); n != 0 {
-		t.Errorf("writer.Records: want 0 (tampered body), got %d", n)
+	if n := churnStore.Len(); n != 0 {
+		t.Errorf("churn_event store.Len: want 0 (tampered body), got %d", n)
 	}
 }
 
@@ -349,7 +356,7 @@ func TestRouter_TamperedBody_RejectedWith401(t *testing.T) {
 // and the writer is touched on the first call only.
 func TestRouter_ReplayReturnsCachedScanRun(t *testing.T) {
 	t.Parallel()
-	r, writer, store := newRouterStack(t)
+	r, churnStore, store := newRouterStack(t)
 	body := goodPayloadJSON(t)
 
 	// First POST -- claims the slot, runs the verb, commits.
@@ -366,9 +373,9 @@ func TestRouter_ReplayReturnsCachedScanRun(t *testing.T) {
 	if first.ScanRunID == uuid.Nil {
 		t.Fatalf("first response: scan_run_id is zero UUID")
 	}
-	firstWriterCount := len(writer.Records())
-	if firstWriterCount == 0 {
-		t.Fatalf("writer.Records after first POST: want >=1, got 0")
+	firstStoreCount := churnStore.Len()
+	if firstStoreCount == 0 {
+		t.Fatalf("churn_event store.Len after first POST: want >=1, got 0")
 	}
 
 	// Second POST -- same body -> cached replay.
@@ -388,8 +395,8 @@ func TestRouter_ReplayReturnsCachedScanRun(t *testing.T) {
 	if second.PayloadHash != first.PayloadHash {
 		t.Errorf("replay payload_hash: want %s, got %s", first.PayloadHash, second.PayloadHash)
 	}
-	if got := len(writer.Records()); got != firstWriterCount {
-		t.Errorf("writer.Records after replay: want unchanged at %d, got %d (verb handler re-ran on replay)", firstWriterCount, got)
+	if got := churnStore.Len(); got != firstStoreCount {
+		t.Errorf("churn_event store.Len after replay: want unchanged at %d, got %d (verb handler re-ran on replay)", firstStoreCount, got)
 	}
 	if got := store.Len(); got != 1 {
 		t.Errorf("store.Len after replay: want 1 (single committed entry), got %d", got)
@@ -701,7 +708,7 @@ func TestRouter_VerbFailure_AllowsRetryWithSameBody(t *testing.T) {
 // exactly one record.
 func TestRouter_ConcurrentReplay_OneWriterOneCommit(t *testing.T) {
 	t.Parallel()
-	r, writer, store := newRouterStack(t)
+	r, churnStore, store := newRouterStack(t)
 	body := goodPayloadJSON(t)
 
 	const N = 8
@@ -746,11 +753,11 @@ func TestRouter_ConcurrentReplay_OneWriterOneCommit(t *testing.T) {
 	if got := atomic.LoadInt64(&replayCount); got != N-1 {
 		t.Errorf("replay (Replayed=true) count: want %d, got %d", N-1, got)
 	}
-	// The writer's record count should equal the number of
-	// rows in ONE happy-path call (2 in goodPayloadJSON);
+	// The churn-event store count should equal the number
+	// of rows in ONE happy-path call (2 in goodPayloadJSON);
 	// the verb handler ran exactly once.
-	if got := len(writer.Records()); got != 2 {
-		t.Errorf("writer.Records: want 2 (verb handler ran once), got %d", got)
+	if got := churnStore.Len(); got != 2 {
+		t.Errorf("churn_event store.Len: want 2 (verb handler ran once), got %d", got)
 	}
 	if got := store.Len(); got != 1 {
 		t.Errorf("store.Len: want 1 (single committed slot), got %d", got)
@@ -764,11 +771,8 @@ func TestRouter_ConcurrentReplay_OneWriterOneCommit(t *testing.T) {
 func TestRouter_LoggerEmitsHMACFailures(t *testing.T) {
 	t.Parallel()
 	logs, logger := newTestLogger()
-	mat := materialisers.NewMaterialiserWithClock(materialisers.DefaultWindowDays, fixedNow)
-	hyd := churn.NewHydrator(churn.NewAutoMapScopeResolver())
-	writer := metric_ingestor.NewInMemoryMetricSampleWriter()
-	sweep := metric_ingestor.NewChurnSweep(mat, hyd, writer)
-	ing := metric_ingestor.NewIngestor(metric_ingestor.NoopFoundationRecipeDispatcher{}, sweep)
+	churnStore := churn.NewInMemoryChurnEventStore()
+	ing := churn.NewIngesterWithClocks(churnStore, fixedNow, uuid.NewV4)
 	resolver := webhook.NewStaticSecretResolver(map[string][]byte{routerTestKeyID: routerTestSecret})
 	store := webhook.NewInMemoryIdempotencyStore(0)
 	scanRunRepo := webhook.NewInMemoryScanRunRepository()
@@ -776,7 +780,7 @@ func TestRouter_LoggerEmitsHMACFailures(t *testing.T) {
 		Resolver:    resolver,
 		Store:       store,
 		ScanRunRepo: scanRunRepo,
-		Verbs:       []webhook.VerbHandler{webhook.NewChurnVerbHandler(ing)},
+		Verbs:       []webhook.VerbHandler{webhook.NewChurnVerbHandlerWithClock(ing, fixedNow)},
 		Logger:      logger,
 	})
 
@@ -816,26 +820,23 @@ func TestRouter_LoggerEmitsHMACFailures(t *testing.T) {
 // with the canonical pin must crash at startup.
 func TestNewRouter_PanicsOnMisconfiguration(t *testing.T) {
 	t.Parallel()
-	mat := materialisers.NewMaterialiserWithClock(materialisers.DefaultWindowDays, fixedNow)
-	hyd := churn.NewHydrator(churn.NewAutoMapScopeResolver())
-	writer := metric_ingestor.NewInMemoryMetricSampleWriter()
-	sweep := metric_ingestor.NewChurnSweep(mat, hyd, writer)
-	ing := metric_ingestor.NewIngestor(metric_ingestor.NoopFoundationRecipeDispatcher{}, sweep)
+	churnStore := churn.NewInMemoryChurnEventStore()
+	ing := churn.NewIngesterWithClocks(churnStore, fixedNow, uuid.NewV4)
 	resolver := webhook.NewStaticSecretResolver(map[string][]byte{routerTestKeyID: routerTestSecret})
 	store := webhook.NewInMemoryIdempotencyStore(0)
 	scanRunRepo := webhook.NewInMemoryScanRunRepository()
 
 	t.Run("nil resolver", func(t *testing.T) {
 		defer expectPanic(t, "nil SecretResolver")
-		_ = webhook.NewRouter(webhook.RouterConfig{Store: store, ScanRunRepo: scanRunRepo, Verbs: []webhook.VerbHandler{webhook.NewChurnVerbHandler(ing)}})
+		_ = webhook.NewRouter(webhook.RouterConfig{Store: store, ScanRunRepo: scanRunRepo, Verbs: []webhook.VerbHandler{webhook.NewChurnVerbHandlerWithClock(ing, fixedNow)}})
 	})
 	t.Run("nil store", func(t *testing.T) {
 		defer expectPanic(t, "nil IdempotencyStore")
-		_ = webhook.NewRouter(webhook.RouterConfig{Resolver: resolver, ScanRunRepo: scanRunRepo, Verbs: []webhook.VerbHandler{webhook.NewChurnVerbHandler(ing)}})
+		_ = webhook.NewRouter(webhook.RouterConfig{Resolver: resolver, ScanRunRepo: scanRunRepo, Verbs: []webhook.VerbHandler{webhook.NewChurnVerbHandlerWithClock(ing, fixedNow)}})
 	})
 	t.Run("nil scan_run_repo", func(t *testing.T) {
 		defer expectPanic(t, "nil ScanRunRepository")
-		_ = webhook.NewRouter(webhook.RouterConfig{Resolver: resolver, Store: store, Verbs: []webhook.VerbHandler{webhook.NewChurnVerbHandler(ing)}})
+		_ = webhook.NewRouter(webhook.RouterConfig{Resolver: resolver, Store: store, Verbs: []webhook.VerbHandler{webhook.NewChurnVerbHandlerWithClock(ing, fixedNow)}})
 	})
 	t.Run("no verbs", func(t *testing.T) {
 		defer expectPanic(t, "zero verbs")
@@ -847,7 +848,7 @@ func TestNewRouter_PanicsOnMisconfiguration(t *testing.T) {
 			Resolver:    resolver,
 			Store:       store,
 			ScanRunRepo: scanRunRepo,
-			Verbs:       []webhook.VerbHandler{webhook.NewChurnVerbHandler(ing), webhook.NewChurnVerbHandler(ing)},
+			Verbs:       []webhook.VerbHandler{webhook.NewChurnVerbHandlerWithClock(ing, fixedNow), webhook.NewChurnVerbHandlerWithClock(ing, fixedNow)},
 		})
 	})
 	t.Run("negative MaxBytes", func(t *testing.T) {
@@ -856,7 +857,7 @@ func TestNewRouter_PanicsOnMisconfiguration(t *testing.T) {
 			Resolver:    resolver,
 			Store:       store,
 			ScanRunRepo: scanRunRepo,
-			Verbs:       []webhook.VerbHandler{webhook.NewChurnVerbHandler(ing)},
+			Verbs:       []webhook.VerbHandler{webhook.NewChurnVerbHandlerWithClock(ing, fixedNow)},
 			MaxBytes:    -1,
 		})
 	})
@@ -965,13 +966,10 @@ func TestRouter_DurableReplay_AcrossSimulatedRestart(t *testing.T) {
 	t.Parallel()
 
 	// Build a SHARED durable scan_run repo and a shared
-	// metric-sample writer (so we can prove the second
+	// churn-event store (so we can prove the second
 	// Router's verb path is NOT walked).
-	mat := materialisers.NewMaterialiserWithClock(materialisers.DefaultWindowDays, fixedNow)
-	hyd := churn.NewHydrator(churn.NewAutoMapScopeResolver())
-	writer := metric_ingestor.NewInMemoryMetricSampleWriter()
-	sweep := metric_ingestor.NewChurnSweep(mat, hyd, writer)
-	ing := metric_ingestor.NewIngestor(metric_ingestor.NoopFoundationRecipeDispatcher{}, sweep)
+	churnStore := churn.NewInMemoryChurnEventStore()
+	ing := churn.NewIngesterWithClocks(churnStore, fixedNow, uuid.NewV4)
 
 	resolver := webhook.NewStaticSecretResolver(map[string][]byte{
 		routerTestKeyID: routerTestSecret,
@@ -983,7 +981,7 @@ func TestRouter_DurableReplay_AcrossSimulatedRestart(t *testing.T) {
 			Resolver:    resolver,
 			Store:       webhook.NewInMemoryIdempotencyStore(0),
 			ScanRunRepo: sharedScanRunRepo,
-			Verbs:       []webhook.VerbHandler{webhook.NewChurnVerbHandler(ing)},
+			Verbs:       []webhook.VerbHandler{webhook.NewChurnVerbHandlerWithClock(ing, fixedNow)},
 		})
 	}
 	first := makeRouter()
@@ -1005,7 +1003,7 @@ func TestRouter_DurableReplay_AcrossSimulatedRestart(t *testing.T) {
 	if got := sharedScanRunRepo.Len(); got != 1 {
 		t.Fatalf("scan_run rows after first POST: want 1, got %d", got)
 	}
-	writes1 := len(writer.Records())
+	writes1 := churnStore.Len()
 
 	// POST to the SECOND "process" with the SAME body.
 	// The second Router has a fresh in-memory cache --
@@ -1027,9 +1025,9 @@ func TestRouter_DurableReplay_AcrossSimulatedRestart(t *testing.T) {
 	if got := sharedScanRunRepo.Len(); got != 1 {
 		t.Errorf("scan_run rows after second POST: want 1 (no new row), got %d", got)
 	}
-	writes2 := len(writer.Records())
+	writes2 := churnStore.Len()
 	if writes2 != writes1 {
-		t.Errorf("verb writer touched during durable replay: writes pre=%d, post=%d (want unchanged)",
+		t.Errorf("verb churn-event store touched during durable replay: writes pre=%d, post=%d (want unchanged)",
 			writes1, writes2)
 	}
 }

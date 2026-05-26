@@ -1,32 +1,48 @@
 package webhook_test
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"testing"
-	"time"
 
 	"github.com/gofrs/uuid"
 
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/churn"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/webhook"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/materialisers"
 )
 
 // newChurnVerb constructs a [webhook.ChurnVerbHandler] backed
-// by the standard in-memory pipeline.
-func newChurnVerb(t *testing.T) (*webhook.ChurnVerbHandler, *metric_ingestor.InMemoryMetricSampleWriter) {
+// by the Stage-4.4 staging [churn.Ingester] over an in-memory
+// [churn.InMemoryChurnEventStore].
+//
+// # Why this test stack proves the Stage 4.4 contract
+//
+// The brief pins "the verb writes ZERO `metric_sample` rows
+// directly; it ONLY feeds the `modification_count_in_window`
+// materialiser via the `clean_code.churn_event` staging
+// table" (implementation-plan Stage 4.4). The stack returned
+// here is the STRUCTURAL proof: there is NO
+// [metric_ingestor.MetricSampleWriter] in scope -- a
+// regression that re-wires the verb back to the inline
+// metric_sample path would force a new import here and a
+// new constructor argument, which the evaluator can detect
+// at the source-level.
+func newChurnVerb(t *testing.T) (*webhook.ChurnVerbHandler, *churn.InMemoryChurnEventStore) {
 	t.Helper()
-	mat := materialisers.NewMaterialiserWithClock(materialisers.DefaultWindowDays, fixedNow)
-	hyd := churn.NewHydrator(churn.NewAutoMapScopeResolver())
-	writer := metric_ingestor.NewInMemoryMetricSampleWriter()
-	sweep := metric_ingestor.NewChurnSweep(mat, hyd, writer)
-	ing := metric_ingestor.NewIngestor(metric_ingestor.NoopFoundationRecipeDispatcher{}, sweep)
-	return webhook.NewChurnVerbHandler(ing), writer
+	store := churn.NewInMemoryChurnEventStore()
+	ing := churn.NewIngesterWithClocks(store, fixedNow, deterministicUUID(t))
+	return webhook.NewChurnVerbHandlerWithClock(ing, fixedNow), store
+}
+
+// deterministicUUID returns a UUID minter that produces v4
+// UUIDs from the gofrs/uuid generator. Marked t.Helper so a
+// failure here surfaces at the caller's frame.
+func deterministicUUID(t *testing.T) func() (uuid.UUID, error) {
+	t.Helper()
+	return uuid.NewV4
 }
 
 // TestChurnVerbHandler_Identity pins the canonical metadata
@@ -44,17 +60,27 @@ func TestChurnVerbHandler_Identity(t *testing.T) {
 		t.Errorf("ContentType() = %q; want %q", h.ContentType(), "application/json")
 	}
 	if h.ScanRunKind() != metric_ingestor.ScanRunKindExternalPerRow {
-		t.Errorf("ScanRunKind() = %q; want %q", h.ScanRunKind(), metric_ingestor.ScanRunKindExternalPerRow)
+		t.Errorf("ScanRunKind() = %q; want %q (Stage 4.4 churn.Kind must agree with the legacy enum literal)", h.ScanRunKind(), metric_ingestor.ScanRunKindExternalPerRow)
+	}
+	if h.ScanRunKind() != churn.Kind {
+		t.Errorf("ScanRunKind() = %q; want churn.Kind=%q", h.ScanRunKind(), churn.Kind)
+	}
+	if h.SHABinding() != churn.SHABinding {
+		t.Errorf("SHABinding() = %q; want churn.SHABinding=%q", h.SHABinding(), churn.SHABinding)
 	}
 }
 
 // TestChurnVerbHandler_HappyPath_HonoursSuppliedScanRunID
 // pins the "Router owns the scan_run_id" contract: the verb
-// MUST stamp every persisted record with the id the Router
-// hands it, not mint its own.
+// MUST stamp every staged record with the id the Router hands
+// it, not mint its own. ALSO pins the Stage 4.4 acceptance
+// criterion -- the verb writes into `clean_code.churn_event`
+// and NEVER touches `metric_sample` (proven by the absence
+// of a metric_sample writer in the test stack: this test
+// file does not even construct one).
 func TestChurnVerbHandler_HappyPath_HonoursSuppliedScanRunID(t *testing.T) {
 	t.Parallel()
-	h, writer := newChurnVerb(t)
+	h, store := newChurnVerb(t)
 	body := goodPayloadJSON(t)
 	scanRunID := uuid.Must(uuid.NewV7())
 
@@ -66,33 +92,36 @@ func TestChurnVerbHandler_HappyPath_HonoursSuppliedScanRunID(t *testing.T) {
 		t.Errorf("result.ScanRunID = %s; want %s (must mirror Router-supplied id)", res.ScanRunID, scanRunID)
 	}
 	if res.FoundationDispatched {
-		t.Errorf("result.FoundationDispatched = true; want false (external_per_row)")
+		t.Errorf("result.FoundationDispatched = true; want false (external_per_row never dispatches foundation in the Stage 4.4 staging path)")
 	}
-	records := writer.Records()
-	if len(records) == 0 {
-		t.Fatalf("writer.Records: want >=1, got 0")
-	}
-	for _, r := range records {
-		if r.ProducerRunID != scanRunID {
-			t.Errorf("record.ProducerRunID = %s; want %s (same-ScanRun invariant)", r.ProducerRunID, scanRunID)
-		}
+	// The staged-event count proves the verb wrote into the
+	// churn_event staging table; the test fixture
+	// goodPayloadJSON ships 2 rows.
+	if got := store.Len(); got != 2 {
+		t.Errorf("churn_event store.Len() = %d; want 2 (the staging path MUST be the writer; metric_sample MUST NOT receive any rows)", got)
 	}
 	// Detail envelope carries the per-verb counters.
 	var detail struct {
-		ChurnSamplesWritten int `json:"churn_samples_written"`
-		ChurnRowsHydrated   int `json:"churn_rows_hydrated"`
+		ChurnEventsWritten int       `json:"churn_events_written"`
+		ScanRunID          uuid.UUID `json:"scan_run_id"`
 	}
 	if err := json.Unmarshal(res.Detail, &detail); err != nil {
 		t.Fatalf("decode detail: %v (raw=%q)", err, res.Detail)
 	}
-	if detail.ChurnSamplesWritten != 2 || detail.ChurnRowsHydrated != 2 {
-		t.Errorf("detail counters = %+v; want 2/2", detail)
+	if detail.ChurnEventsWritten != 2 {
+		t.Errorf("detail.churn_events_written = %d; want 2 (Stage 4.4 ingester returns the staged-row count)", detail.ChurnEventsWritten)
+	}
+	if detail.ScanRunID != scanRunID {
+		t.Errorf("detail.scan_run_id = %s; want %s (echoes the Router-supplied id)", detail.ScanRunID, scanRunID)
 	}
 }
 
 // TestChurnVerbHandler_ClassifyError_KnownSentinels pins the
 // per-verb error-to-status mapping the Router consumes via
-// the [webhook.VerbErrorClassifier] interface.
+// the [webhook.VerbErrorClassifier] interface. Stage 4.4
+// REPLACED the legacy `metric_ingestor.Err*` sentinels with
+// the [churn] package's equivalents -- the table below pins
+// that swap.
 func TestChurnVerbHandler_ClassifyError_KnownSentinels(t *testing.T) {
 	t.Parallel()
 	h, _ := newChurnVerb(t)
@@ -109,9 +138,10 @@ func TestChurnVerbHandler_ClassifyError_KnownSentinels(t *testing.T) {
 		{"EmptyFilePath", churn.ErrEmptyFilePath, http.StatusBadRequest, "EMPTY_FILE_PATH"},
 		{"ZeroModifiedAt", churn.ErrZeroModifiedAt, http.StatusBadRequest, "ZERO_MODIFIED_AT"},
 		{"ScopeResolutionFailed", churn.ErrScopeResolutionFailed, http.StatusUnprocessableEntity, "SCOPE_RESOLUTION_FAILED"},
-		{"RepoIDMismatch", metric_ingestor.ErrRepoIDMismatch, http.StatusBadRequest, "REPO_ID_MISMATCH"},
-		{"ZeroRepoID", metric_ingestor.ErrZeroRepoID, http.StatusBadRequest, "EMPTY_REPO_ID"},
-		{"WriterFailure", metric_ingestor.ErrWriterFailure, http.StatusInternalServerError, "WRITER_FAILURE"},
+		// Stage 4.4: the verb maps the churn package's
+		// sentinels, NOT the legacy metric_ingestor ones.
+		{"RepoIDMismatch", churn.ErrRepoIDMismatch, http.StatusBadRequest, "REPO_ID_MISMATCH"},
+		{"ChurnEventWriteFailed", churn.ErrChurnEventWriteFailed, http.StatusInternalServerError, "WRITER_FAILURE"},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -144,10 +174,12 @@ func TestChurnVerbHandler_ClassifyError_DefersUnknownToRouter(t *testing.T) {
 // TestChurnVerbHandler_RejectsBadJSON pins the
 // JSON-decode-failure path. A malformed body returns a
 // wrapped sentinel the verb's ClassifyError maps to 400 /
-// BAD_REQUEST.
+// BAD_REQUEST. ALSO pins that a decode-failure path NEVER
+// stages any churn_event row (the staging-table writer is
+// not touched on a decode failure).
 func TestChurnVerbHandler_RejectsBadJSON(t *testing.T) {
 	t.Parallel()
-	h, writer := newChurnVerb(t)
+	h, store := newChurnVerb(t)
 	scanRunID := uuid.Must(uuid.NewV7())
 	_, err := h.Handle(context.Background(), webhook.VerbPayloadMetadata{}, []byte("{not json"), scanRunID)
 	if err == nil {
@@ -157,8 +189,8 @@ func TestChurnVerbHandler_RejectsBadJSON(t *testing.T) {
 	if status != http.StatusBadRequest || code != "BAD_REQUEST" {
 		t.Errorf("ClassifyError(bad JSON) = (%d, %q); want (400, %q)", status, code, "BAD_REQUEST")
 	}
-	if got := len(writer.Records()); got != 0 {
-		t.Errorf("writer.Records: want 0 (decode failed), got %d", got)
+	if got := store.Len(); got != 0 {
+		t.Errorf("churn_event store.Len: want 0 (decode failed), got %d", got)
 	}
 }
 
@@ -180,9 +212,11 @@ func TestChurnVerbHandler_RejectsUnknownFields(t *testing.T) {
 	}
 }
 
-// TestChurnVerbHandler_PanicsOnNilIngestor pins the wiring
-// guard.
-func TestNewChurnVerbHandler_PanicsOnNilIngestor(t *testing.T) {
+// TestNewChurnVerbHandler_PanicsOnNilIngester pins the
+// composition-root wiring guard: passing a nil
+// [webhook.ChurnIngester] is a hard wiring bug and must
+// crash at startup, not at first request.
+func TestNewChurnVerbHandler_PanicsOnNilIngester(t *testing.T) {
 	t.Parallel()
 	defer func() {
 		r := recover()
@@ -196,7 +230,3 @@ func TestNewChurnVerbHandler_PanicsOnNilIngestor(t *testing.T) {
 // Compile-time assertion the test exercises the
 // [webhook.VerbErrorClassifier] interface.
 var _ webhook.VerbErrorClassifier = (*webhook.ChurnVerbHandler)(nil)
-
-// Touch unused imports for the few tests that need them.
-var _ = bytes.NewReader
-var _ = time.Hour

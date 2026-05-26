@@ -144,7 +144,45 @@ const (
 	// `CLEAN_CODE_PG_URL` -- DO NOT rename the env var without
 	// also updating e2e-scenarios.md.
 	EnvPGURL                       = "CLEAN_CODE_PG_URL"
-	EnvLogLevel                    = "CLEAN_CODE_LOG_LEVEL"
+	// EnvMgmtPGURL is the OPTIONAL libpq DSN the metric-ingestor
+	// binary connects to under the `clean_code_management` role
+	// for `repo_event` INSERTs (Stage 3.4 retract intent /
+	// rescan-related events). The Metric Ingestor's own role
+	// (`clean_code_metric_ingestor`) is granted INSERT on
+	// `scan_run` and `metric_retraction` ONLY -- repo_event
+	// INSERT belongs to the management role per
+	// migrations/0004_roles.up.sql lines 313 / 348 / 374.
+	//
+	// When set, the binary opens a SECOND `*sql.DB` against this
+	// DSN and routes `PGRepoEventAppender` writes through it
+	// while keeping `PGRetractScanRunStore`, `PGRetractionStore`,
+	// and `PGRescanScanRunStore` on the metric-ingestor handle
+	// (CLEAN_CODE_PG_URL).
+	//
+	// When UNSET, the binary refuses to mount the `mgmt.*` write
+	// verbs unless [EnvAllowSharedPGRole] is truthy
+	// (dev/E2E-only opt-in that re-uses a single DSN across both
+	// roles). Production deployments MUST set role-distinct
+	// credentials.
+	EnvMgmtPGURL = "CLEAN_CODE_MGMT_PG_URL"
+	// EnvAllowSharedPGRole is the explicit dev/E2E-mode opt-in
+	// for sharing a single DSN across the
+	// `clean_code_metric_ingestor` and `clean_code_management`
+	// roles. Accepts any boolean literal
+	// (1|true|yes|on / 0|false|no|off). Default false.
+	//
+	// When false (production default), the metric-ingestor
+	// binary REFUSES to mount the Stage 3.4 management write
+	// verbs unless [EnvMgmtPGURL] is set -- the operator MUST
+	// supply role-distinct credentials so a future role-grant
+	// audit reflects the documented Sec 7.2 ACL boundary.
+	//
+	// When true, the binary uses CLEAN_CODE_PG_URL for BOTH
+	// roles and logs a WARN at startup. Intended ONLY for local
+	// `docker compose` E2E runs where the test fixture uses a
+	// single superuser DSN.
+	EnvAllowSharedPGRole = "CLEAN_CODE_ALLOW_SHARED_PG_ROLE"
+	EnvLogLevel          = "CLEAN_CODE_LOG_LEVEL"
 	EnvScanTimeout                 = "CLEAN_CODE_SCAN_TIMEOUT"
 	EnvPeriodicSweepCadence        = "CLEAN_CODE_PERIODIC_SWEEP_CADENCE"
 	EnvWindowDays                  = "CLEAN_CODE_WINDOW_DAYS"
@@ -315,6 +353,21 @@ type Config struct {
 	// /readyz probe stays 503 until a PG pool registers a
 	// readiness check.
 	PostgresURL string
+
+	// ManagementPostgresURL is the OPTIONAL libpq DSN the
+	// metric-ingestor binary uses under the
+	// `clean_code_management` role for `repo_event` INSERTs.
+	// See [EnvMgmtPGURL] for the role-boundary rationale and
+	// [AllowSharedPGRole] for the dev-mode opt-out. Empty in
+	// scaffold mode.
+	ManagementPostgresURL string
+
+	// AllowSharedPGRole is the dev/E2E opt-in that lets the
+	// metric-ingestor binary mount the Stage 3.4 management
+	// verbs against [PostgresURL] alone (i.e. use the same DSN
+	// for both the ingestor and management roles). Default
+	// false. See [EnvAllowSharedPGRole].
+	AllowSharedPGRole bool
 
 	// --- Observability ---
 
@@ -581,6 +634,8 @@ func readEnvOverrides() map[string]string {
 		EnvPrometheusAddr,
 		EnvOTelEndpoint,
 		EnvPGURL,
+		EnvMgmtPGURL,
+		EnvAllowSharedPGRole,
 		EnvLogLevel,
 		EnvScanTimeout,
 		EnvPeriodicSweepCadence,
@@ -629,6 +684,17 @@ func applyOverrides(cfg *Config, overrides map[string]string) error {
 			cfg.OTelEndpoint = v
 		case EnvPGURL:
 			cfg.PostgresURL = v
+		case EnvMgmtPGURL:
+			cfg.ManagementPostgresURL = v
+		case EnvAllowSharedPGRole:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "1", "true", "yes", "on":
+				cfg.AllowSharedPGRole = true
+			case "0", "false", "no", "off":
+				cfg.AllowSharedPGRole = false
+			default:
+				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
+			}
 		case EnvLogLevel:
 			cfg.LogLevel = v
 		case EnvScanTimeout:

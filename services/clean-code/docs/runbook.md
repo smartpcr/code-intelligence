@@ -1119,6 +1119,263 @@ a body identifying the rename so operators scripting against an
 older draft contract learn of the change without getting a
 404.
 
+## `mgmt.retract_sample` and `mgmt.rescan` (Stage 3.4)
+
+### What
+
+Two operator-facing HTTP verbs that drive the
+Measurement-sub-store retraction and rescan flows. Both are
+mounted on the Management surface (`internal/management/mgmt_verbs.go`)
+and delegate the actual sub-store writes to the Metric
+Ingestor -- the Management surface NEVER writes Measurement
+rows directly per architecture Sec 6.3.
+
+- `POST /v1/mgmt/retract_sample` -- canonical name
+  `mgmt.retract_sample`. Body: `{"sample_id":"<uuid>","reason":"<free-form>"}`.
+  Actor is sourced from the `X-OIDC-Subject` header (NOT the
+  body -- a caller cannot spoof attribution).
+- `POST /v1/mgmt/rescan` -- canonical name `mgmt.rescan`.
+  Body: `{"repo_id":"<uuid>","sha":"<commit-sha>"}`. Actor is
+  sourced from `X-OIDC-Subject`.
+
+### Retract flow
+
+The handler executes the architecture-pinned sequence:
+
+1. **Validate body shape.** `DisallowUnknownFields` rejects
+   any caller attempt to include `actor` in the body
+   (status 400). The trust boundary is the auth gateway, not
+   the JSON.
+2. **Resolve `sample_id` -> `(repo_id, sha)`.** A missing
+   sample returns 404 BEFORE any `repo_event` row is
+   appended -- an intent log entry for a non-existent sample
+   would be misleading audit noise.
+3. **Append `repo_event(kind='retract_intent', payload={sample_id, reason})`.**
+   `retract_intent` is the canonical RepoEvent.kind value per
+   architecture Sec 5.1.4 line 883 (the canonical enum is
+   `registered | retired | retract_intent | mode_changed`).
+   This is the operator-intent audit row -- it lands BEFORE
+   the Measurement-sub-store writes so the operator's intent
+   survives even if the dispatcher fails.
+4. **Dispatch to `metric_ingestor.RetractDispatcher`.** The
+   dispatcher opens a `scan_run(kind='retract', sha_binding='single',
+   status='running', to_sha=<sample.sha>)`, appends a
+   `metric_retraction(retraction_id, sample_id, reason, appended_by, created_at)`
+   row in the Measurement sub-store, and transitions the
+   scan_run to `succeeded` (or `failed`).
+5. **Return** the persisted retraction row + the scan_run_id.
+
+`appended_by` is stamped `operator:<X-OIDC-Subject>` per
+architecture Sec 5.2.2 line 1033.
+
+### Retract idempotency
+
+A second `mgmt.retract_sample` call for the
+already-retracted sample is a no-op:
+
+- The dispatcher (`metric_ingestor.RetractDispatcher.Dispatch`)
+  consults `RetractionStore.Lookup(sample_id)` BEFORE
+  opening a fresh `scan_run(kind='retract')`. If the
+  lookup finds an existing retraction the dispatcher
+  short-circuits and returns
+  `{Retraction=existing, ScanRunID=uuid.Nil, Inserted=false}`
+  -- NO scan_run row is opened (iter 2 fix; prior to iter 2
+  the dispatcher opened a duplicate scan_run row that
+  immediately transitioned to `succeeded`).
+- The dispatcher's `RetractionStore.Append` is also
+  idempotent at the storage layer on `sample_id`
+  (the schema's `UNIQUE` on `metric_retraction.sample_id`
+  enforces this at the DB layer; the in-memory store
+  mirrors it; the `PGRetractionStore` uses
+  `INSERT ... ON CONFLICT (sample_id) DO NOTHING
+  RETURNING ...` with a fallback `Lookup` so the PG
+  contract matches the in-memory contract bit-for-bit).
+  This belt-and-braces second guard catches the rare
+  race where TWO concurrent dispatches Lookup-miss and
+  both call Append.
+- **Race-loser path**: When the Lookup-first probe finds
+  no existing row but the Append fails on the UNIQUE
+  collision (a concurrent retract raced ahead), the
+  dispatcher finalises its already-opened scan_run as
+  `succeeded` (preserving an honest audit trail of the
+  attempt) and returns
+  `{Retraction=existing, ScanRunID=<real-id>, Inserted=false}`
+  -- NOT `uuid.Nil`. The race-loser scan_run row IS
+  visible in the table because the operator's intent
+  did reach the dispatcher; only the
+  `metric_retraction` write was suppressed.
+- The wire response on the sequential idempotent path
+  carries the EXISTING `retraction_id`,
+  `inserted=false`, and `scan_run_id == uuid.Nil` -- no
+  new scan_run was opened, so there is none to point at.
+- The `repo_event` intent log is APPEND-ONLY -- a retry
+  appends a second `retract_intent` row even though only
+  one `metric_retraction` exists. The Sec 5.1.4 intent log
+  is the operator-intent record, not the applied-state
+  record.
+
+### `metric_sample_active` is NOT deleted
+
+Per tech-spec Sec 7.2 line 1248 the `DELETE` privilege on
+`metric_sample_active` is REVOKEd from every writer role.
+The retract flow does NOT delete the pointer row; SHA-pinned
+readers (`mgmt.read.metric_sample`, `mgmt.read.metric_samples`,
+`eval.gate`) filter the retracted sample out by joining
+through `metric_retraction`:
+
+```sql
+SELECT msa.sample_id
+FROM clean_code.metric_sample_active msa
+LEFT JOIN clean_code.metric_retraction mr ON mr.sample_id = msa.sample_id
+WHERE msa.repo_id = $1
+  AND msa.sha     = $2
+  AND mr.sample_id IS NULL  -- exclude tombstoned samples
+```
+
+The production implementation of this anti-join for the
+`eval.gate` rule-engine reader lives in
+`internal/rule_engine/sql_store.go` --
+`listMetricSamplesQuery`. The live PG test
+`TestSQLStore_ListMetricSamples_FiltersRetracted` in
+`internal/rule_engine/sql_store_test.go` pins the
+behaviour against an isolated PG schema: a retracted
+sample is filtered out even when the active pointer
+remains in place.
+
+### Rescan flow
+
+The rescan verb is intentionally NOT idempotent: an
+operator who clicks "rescan" twice expects TWO `scan_run`
+rows because they want the recipe loop to run twice. The
+handler executes:
+
+1. **Validate body shape.** Same `DisallowUnknownFields`
+   rule as retract.
+2. **NO `repo_event` row is appended.** The canonical
+   `RepoEvent.kind` enum at architecture Sec 5.1.4 has only
+   four values (`registered`, `retired`, `retract_intent`,
+   `mode_changed`) -- no `rescan_intent`. The rescan verb is
+   a service-internal request; its audit trail lives in the
+   structured log line plus the `scan_run` row itself.
+3. **Delegate to `metric_ingestor.RescanEnqueuer`.** The
+   enqueuer opens a `scan_run(kind='full', sha_binding='single',
+   status='running', to_sha=<sha>)` row and returns the
+   freshly-minted `scan_run_id`. The foundation-tier state
+   machine drains the row via its standard claim path and
+   finalises it once the recipe loop completes.
+
+### Status codes (both verbs)
+
+- **200** -- happy path. Body is the canonical wire-response
+  shape (`retract_sample`: `retraction_id`, `sample_id`,
+  `reason`, `appended_by`, `created_at`, `scan_run_id`,
+  `inserted`; `rescan`: `scan_run_id`, `repo_id`, `sha`,
+  `requested_by`, `opened_at`).
+- **400** -- malformed JSON, unknown body field, missing
+  required field, zero UUID, blank `reason` / `sha`.
+- **401** -- missing or blank `X-OIDC-Subject` header.
+- **404** (retract only) -- `sample_id` does not exist in
+  `metric_sample`.
+- **405** -- any method other than POST.
+- **500** -- internal error; opaque body (`internal error`).
+  The underlying driver / chain is logged server-side under
+  `management write verb failed`.
+- **503** -- one of the verb's backing subsystems
+  (resolver / dispatcher / repo_event appender / enqueuer)
+  is not wired. Mirrors the "verb exists, backing subsystem
+  is down" contract pinned by Stage 5.1.
+
+### Trust boundary
+
+The body's `sample_id` / `reason` / `repo_id` / `sha` are
+caller-supplied. The actor stamped on
+`metric_retraction.appended_by` and the rescan structured
+log line comes from `X-OIDC-Subject` (set by the auth
+gateway). A body containing `actor` is REJECTED with 400 --
+`DisallowUnknownFields` is the enforcement mechanism.
+
+### Composition root wiring (Stage 3.4 iter 3 — role boundary)
+
+Production wiring lives in
+`cmd/clean-code-metric-ingestor/main.go`
+(`mountMgmtRoutes`). The function takes **two** `*sql.DB`
+handles so the binary honours the role grants from
+`migrations/0004_roles.up.sql`:
+
+| Handle       | Role                            | Tables (writes)                                            | Migration line |
+| ------------ | ------------------------------- | ---------------------------------------------------------- | -------------- |
+| `ingestorDB` | `clean_code_metric_ingestor`    | `scan_run` (INSERT/UPDATE), `metric_retraction` (INSERT)   | 348, 374       |
+| `mgmtDB`     | `clean_code_management`         | `repo_event` (INSERT)                                      | 313            |
+
+The `mgmtDB` handle is opened from the new
+`CLEAN_CODE_MGMT_PG_URL` env var (the canonical Go field is
+`config.Config.ManagementPostgresURL`). When that env var is
+unset, the binary refuses to mount the `mgmt.*` write verbs
+**unless** the operator has opted into shared-role mode via
+`CLEAN_CODE_ALLOW_SHARED_PG_ROLE=true` (dev / `docker compose`
+E2E only — production deployments **MUST** set role-distinct
+DSNs).
+
+```go
+ingestorDB, _ := openAndPingDB(cfg.PostgresURL, "ingestor")
+mgmtDB, _, _  := openMgmtDB(cfg, ingestorDB)
+// mgmtDB is either:
+//   - a SECOND *sql.DB opened from CLEAN_CODE_MGMT_PG_URL, OR
+//   - the SAME pointer as ingestorDB if
+//     CLEAN_CODE_ALLOW_SHARED_PG_ROLE=true (dev/E2E only).
+// If CLEAN_CODE_MGMT_PG_URL is unset AND the shared-role
+// opt-in is false, openMgmtDB FAILS FAST -- the binary
+// will not boot.
+
+retractStore, _        := metric_ingestor.NewPGRetractionStore(ingestorDB)
+retractScanRunStore, _ := metric_ingestor.NewPGRetractScanRunStore(ingestorDB)
+rescanStore, _         := metric_ingestor.NewPGRescanScanRunStore(ingestorDB)
+repoEventAppender, _   := management.NewPGRepoEventAppender(mgmtDB) // mgmt role
+
+dispatcher := metric_ingestor.NewRetractDispatcher(retractScanRunStore, retractStore, retractStore)
+enqueuer   := metric_ingestor.NewRescanEnqueuer(rescanStore)
+
+writer := management.NewMgmtWriter(
+    retractStore, // PGRetractionStore satisfies SampleResolver
+    management.AdaptMetricIngestorRetractDispatcher(dispatcher),
+    management.AdaptMetricIngestorRescanEnqueuer(enqueuer),
+    repoEventAppender,
+)
+mux.HandleFunc(management.VerbMgmtRetractSamplePath, writer.RetractSample)
+mux.HandleFunc(management.VerbMgmtRescanPath, writer.Rescan)
+```
+
+### Operator env var reference (Stage 3.4)
+
+| Env var                              | Default     | Required when                                        | Effect                                                                                       |
+| ------------------------------------ | ----------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `CLEAN_CODE_PG_URL`                  | unset       | Always (the binary refuses to boot without it)       | libpq DSN with `clean_code_metric_ingestor` credentials                                      |
+| `CLEAN_CODE_MGMT_PG_URL`             | unset       | When `CLEAN_CODE_ALLOW_SHARED_PG_ROLE` is NOT truthy | libpq DSN with `clean_code_management` credentials (used for `PGRepoEventAppender` ONLY)     |
+| `CLEAN_CODE_ALLOW_SHARED_PG_ROLE`    | `false`     | NEVER in production                                  | Dev/E2E opt-in to re-use `CLEAN_CODE_PG_URL` for both roles. Logs a startup WARN.            |
+| `CLEAN_CODE_DISABLE_STALE_SWEEP`     | `false`     | Legacy `001_init.sql` environments only              | Skips the Stage 3.5 stale-sweep goroutine                                                    |
+| `CLEAN_CODE_ENABLE_LEGACY_DEMO_API`  | `false`     | Legacy E2E only                                      | Mounts `/v1/ingestor/process` + `/v1/ingestor/scan-run`                                      |
+
+When BOTH the keys-reader and the mgmt-writer are wired,
+prefer the combined constructor that mounts both
+surfaces on a single `http.ServeMux`:
+
+```go
+handler := management.NewHandlerWithWriter(reader, writer)
+srv := &http.Server{Handler: handler.Routes()}
+```
+
+The `NewHandler(reader)` overload (no writer) is the
+scaffold-mode bring-up posture: `policy.keys.list_active`
+is mounted, the mgmt verb paths are NOT mounted (parent
+mux returns 404 -- the service does NOT advertise an
+endpoint it cannot serve).
+
+Any nil dependency passed to `NewMgmtWriter` disables
+ONLY the verb that depends on it (the affected verb
+returns 503); the other verb keeps serving. This is the
+same scaffold-mode posture Stage 5.1 established for
+`policy.keys.list_active`.
+
 ## SOLID rule packs (Stage 5.5)
 
 ### What

@@ -24,6 +24,8 @@ func clearCleanCodeEnv(t *testing.T) {
 		EnvPrometheusAddr,
 		EnvOTelEndpoint,
 		EnvPGURL,
+		EnvMgmtPGURL,
+		EnvAllowSharedPGRole,
 		EnvLogLevel,
 		EnvScanTimeout,
 		EnvPeriodicSweepCadence,
@@ -607,5 +609,77 @@ func TestStaleSweep_EnvFields_RejectsNonBoolean(t *testing.T) {
 				t.Errorf("Load with %s=bogus: want non-nil error, got nil", env)
 			}
 		})
+	}
+}
+
+// TestMgmtPGURL_DefaultsAreEmpty pins iter-3 evaluator item #1
+// production-default semantics: when no operator env var is set,
+// the management-role DSN is empty and the shared-role opt-in is
+// false -- production main() will then refuse to mount the mgmt.*
+// write verbs and fail fast at startup.
+func TestMgmtPGURL_DefaultsAreEmpty(t *testing.T) {
+	clearCleanCodeEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ManagementPostgresURL != "" {
+		t.Errorf("ManagementPostgresURL default: got %q, want empty (operators MUST set CLEAN_CODE_MGMT_PG_URL)", cfg.ManagementPostgresURL)
+	}
+	if cfg.AllowSharedPGRole {
+		t.Errorf("AllowSharedPGRole default: got true, want false (shared-role mode is opt-in)")
+	}
+}
+
+// TestMgmtPGURL_RoundTripsThroughLoad pins the env var → Config
+// field plumbing for the new Stage 3.4 iter-3 management-role
+// fields. Without this assertion a future refactor of
+// applyOverrides could silently strip the case branch.
+func TestMgmtPGURL_RoundTripsThroughLoad(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvMgmtPGURL, "postgres://mgmt-role@host:5432/db")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got, want := cfg.ManagementPostgresURL, "postgres://mgmt-role@host:5432/db"; got != want {
+		t.Errorf("ManagementPostgresURL: got %q, want %q", got, want)
+	}
+}
+
+// TestAllowSharedPGRole_RoundTripsBooleans verifies the boolean
+// literal parsing for the dev/E2E opt-in flag mirrors the other
+// CLEAN_CODE_*_ENABLE_* flags.
+func TestAllowSharedPGRole_RoundTripsBooleans(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want bool
+	}{
+		{"1", true}, {"true", true}, {"yes", true}, {"on", true},
+		{"0", false}, {"false", false}, {"no", false}, {"off", false},
+	}
+	for _, c := range cases {
+		t.Run(c.raw, func(t *testing.T) {
+			clearCleanCodeEnv(t)
+			t.Setenv(EnvAllowSharedPGRole, c.raw)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.AllowSharedPGRole != c.want {
+				t.Errorf("AllowSharedPGRole(%q): got %v, want %v", c.raw, cfg.AllowSharedPGRole, c.want)
+			}
+		})
+	}
+}
+
+// TestAllowSharedPGRole_RejectsNonBoolean pins fail-fast on a
+// malformed value so an operator typo cannot silently disable the
+// role-distinct fail-fast guard.
+func TestAllowSharedPGRole_RejectsNonBoolean(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvAllowSharedPGRole, "maybe")
+	if _, err := Load(); err == nil {
+		t.Errorf("Load with %s=maybe: want non-nil error, got nil", EnvAllowSharedPGRole)
 	}
 }

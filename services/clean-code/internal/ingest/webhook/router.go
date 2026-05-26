@@ -65,14 +65,39 @@ type RouterResponse struct {
 //
 //  1. Method check (POST only -- 405 otherwise).
 //  2. Body size-limited read (16 MiB cap -- 413 otherwise).
-//  3. HMAC-SHA256 verification: resolve the per-deployment
+//  3. Verb lookup. The Router resolves the handler for the
+//     URL path BEFORE HMAC verification so step 4 can ask
+//     the handler for its [VerbHandler.CanonicalRequest]
+//     bytes -- the per-verb canonical form the publisher
+//     signs over. For an unknown verb the Router falls back
+//     to `body` verbatim as the canonical bytes; this
+//     preserves the pre-Stage-4.3 invariant that an
+//     unauthenticated POST to `/v1/ingest/typo` returns 401
+//     (HMAC fails) rather than 404 (verb taxonomy leaked).
+//  4. HMAC-SHA256 verification: resolve the per-deployment
 //     secret via [SecretResolver.Resolve] keyed on
-//     [SigningKeyIDHeader], verify [HMACSignatureHeader] over
-//     the raw body. 401 on any failure.
-//  4. Verb lookup + Content-Type check (404 / 415).
-//  5. Idempotency claim against [IdempotencyStore]:
-//     `payload_hash = sha256(body)`. On replay: return the
-//     cached response. On claim: dispatch the
+//     [SigningKeyIDHeader], verify [HMACSignatureHeader]
+//     over the per-verb canonical bytes from step 3. 401 on
+//     any failure. The canonical bytes MUST include any
+//     header-borne target metadata so an attacker cannot
+//     retarget a signed body to a different (repo, sha) by
+//     swapping headers (Stage 4.3 evaluator iter-2 #2 fix).
+//  5. Authenticated 404 for unknown verbs. Now that the
+//     caller has proven they hold a valid signing key the
+//     Router can safely surface the verb-not-registered
+//     response.
+//  6. Content-Type check (415).
+//  7. Metadata extraction via [VerbHandler.ExtractMetadata]
+//     (consults headers AND body, see verb docs). Surfaces
+//     400 / 422 for malformed metadata; runs AFTER auth so
+//     classifier sentinels only reach authenticated callers.
+//  8. Idempotency claim against [IdempotencyStore]:
+//     `payload_hash = sha256(canonical bytes from step 3)`.
+//     For header-borne verbs the canonical bytes include
+//     the (repo, sha) target so two requests with the same
+//     body but different headers do NOT collide on the
+//     claim (Stage 4.3 evaluator iter-2 #1 fix). On replay:
+//     return the cached response. On claim: dispatch the
 //     [VerbHandler.Handle] and commit (or abort on failure).
 //
 // # Why HMAC before content-type
@@ -305,6 +330,29 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Verb lookup BEFORE HMAC so we can ask the handler for
+	// its canonical signed material in the next step. The
+	// Router does NOT surface the 404 yet: an unauthenticated
+	// probe to `/v1/ingest/typo` MUST return 401 (HMAC
+	// fails), not 404 (verb taxonomy leaked).
+	handler, registered := r.verbs[verb]
+
+	// Per-verb canonical bytes for HMAC AND payload_hash.
+	// For header-borne verbs (test_balance) the canonical
+	// bytes include the (repo, sha) target -- so a publisher
+	// who swaps headers after signing fails HMAC. For
+	// body-borne verbs (churn) the canonical bytes ARE the
+	// body verbatim. For unknown verbs we fall back to the
+	// body so the publisher's HMAC over body still fails
+	// uniformly (the Router never has to canonicalise
+	// against a missing handler).
+	var canonical []byte
+	if registered {
+		canonical = handler.CanonicalRequest(req.Header, body)
+	} else {
+		canonical = body
+	}
+
 	// HMAC verification BEFORE any verb / content-type
 	// inspection. The signing_key_id header is the FIRST
 	// header the verifier reads; a missing/malformed value
@@ -340,7 +388,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	sig := req.Header.Get(HMACSignatureHeader)
-	if vErr := VerifyHMAC(body, sig, secret); vErr != nil {
+	if vErr := VerifyHMAC(canonical, sig, secret); vErr != nil {
 		code := classifyHMACError(vErr)
 		r.logHMACFailure(req, verb, code, vErr)
 		r.writeError(w, http.StatusUnauthorized,
@@ -348,11 +396,12 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Verb lookup. The Router rejects any verb the
-	// composition root did not register (404) -- a publisher
-	// hitting `/v1/ingest/typo` should not be able to probe
-	// the registration surface via response-shape diff.
-	handler, registered := r.verbs[verb]
+	// Verb-registration surface is observable ONLY after
+	// HMAC has authenticated the caller. An unauthenticated
+	// caller hitting `/v1/ingest/typo` got 401 above; an
+	// authenticated caller hitting the same URL gets 404
+	// with the registered-verbs list (the operator can use
+	// the list to diagnose a typo'd publisher).
 	if !registered {
 		r.writeError(w, http.StatusNotFound,
 			fmt.Sprintf("verb %q not registered (registered: %v)", verb, r.registeredVerbs()),
@@ -373,13 +422,42 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Compute payload_hash AFTER auth + media-type pass so
-	// the hash is computed against an already-validated body
-	// shape. (The hash itself is over the raw bytes; the
-	// validation is only on the SHAPE of the request, not
-	// the hash inputs.)
-	hash := sha256.Sum256(body)
-	payloadHash := PayloadHash(hash)
+	// Compute payload_hash from the SAME canonical bytes
+	// HMAC verified against. For header-borne verbs the
+	// canonical bytes include the (repo, sha) target so
+	// `payload_hash` is unique per logical target -- two
+	// requests with byte-identical bodies but different
+	// header SHAs hash to DIFFERENT payload_hashes and DO
+	// NOT collide on the in-process idempotency claim or
+	// the durable `(verb, payload_hash)` index (Stage 4.3
+	// evaluator iter-2 #1 fix).
+	canonicalHash := sha256.Sum256(canonical)
+	payloadHash := PayloadHash(canonicalHash)
+
+	// Extract the per-verb metadata (RepoID, SHA) required
+	// to open the durable scan_run row. ExtractMetadata
+	// runs AFTER HMAC has already authenticated the caller
+	// so 400/422 classifier codes (malformed UUID,
+	// non-canonical SHA, etc.) ONLY surface to a caller
+	// who already proved they hold a valid signing key.
+	// Validation here doesn't burn an idempotency slot --
+	// the durable scan_run claim happens later.
+	//
+	// 4xx classifications keep the verb-handler's message
+	// (it tells the caller WHAT in their request is wrong);
+	// 5xx classifications are masked to the generic
+	// message so internal failure detail stays in the log.
+	metadata, mdErr := handler.ExtractMetadata(req.Context(), req.Header, body)
+	if mdErr != nil {
+		status, code := r.classifyVerbError(handler, mdErr)
+		msg := mdErr.Error()
+		if status >= 500 {
+			r.logInternal(req, verb, "extract-metadata-failure", mdErr)
+			msg = internalErrorClientMessage
+		}
+		r.writeError(w, status, msg, code, verb)
+		return
+	}
 
 	// In-process claim. Two SAME-process retries collapse
 	// onto one verb execution; cross-restart retries are
@@ -410,28 +488,6 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			}
 		}
 	}()
-
-	// Extract the per-verb metadata (RepoID, SHA) required
-	// to open the durable scan_run row. ExtractMetadata
-	// runs BEFORE the scan_run claim so a malformed body
-	// surfaces as 400/422 WITHOUT burning a durable
-	// scan_run row.
-	//
-	// 4xx classifications keep the verb-handler's message
-	// (it tells the caller WHAT in their payload is wrong);
-	// 5xx classifications are masked to the generic
-	// message so internal failure detail stays in the log.
-	metadata, mdErr := handler.ExtractMetadata(req.Context(), body)
-	if mdErr != nil {
-		status, code := r.classifyVerbError(handler, mdErr)
-		msg := mdErr.Error()
-		if status >= 500 {
-			r.logInternal(req, verb, "extract-metadata-failure", mdErr)
-			msg = internalErrorClientMessage
-		}
-		r.writeError(w, status, msg, code, verb)
-		return
-	}
 
 	// Open the DURABLE scan_run row keyed on (verb,
 	// payload_hash) -- see migration 0009's partial unique
@@ -482,7 +538,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	result, hErr := handler.Handle(req.Context(), body, scanRunID)
+	result, hErr := handler.Handle(req.Context(), metadata, body, scanRunID)
 	if hErr != nil {
 		// Finalize the durable scan_run as 'failed' so a
 		// retry of the SAME payload short-circuits to

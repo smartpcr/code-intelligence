@@ -34,7 +34,7 @@
 -- `internal/metric_ingestor.VerifyMetricKindCatalog` is the
 -- runtime SELECT-only fence that surfaces version drift
 -- between this seed and the in-process recipe versions
--- (cmd/clean-coded/main.go).
+-- (cmd/clean-code-metric-ingestor/main.go: verifyMetricKindCatalog).
 --
 -- Source-of-truth metadata table:
 --   `internal/metric_ingestor/metric_kind_catalog.go`

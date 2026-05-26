@@ -83,6 +83,12 @@ func (h *ChurnVerbHandler) SHABinding() string {
 // because each emitted row carries its own SHA, and the
 // scan_run row leaves `to_sha` NULL.
 //
+// `headers` is ignored: the churn body envelope already
+// carries `repo_id` so there is no need to consult HTTP
+// headers for metadata. Other verbs (e.g. test_balance)
+// take their `(repo_id, sha)` from [RepoIDHeader] +
+// [SHAHeader] instead.
+//
 // Validation surface mirrors the legacy
 // [churn.Payload.Validate] check at the
 // repo_id-only level; full per-row validation runs inside
@@ -93,7 +99,7 @@ func (h *ChurnVerbHandler) SHABinding() string {
 // is preferable to leaking the parsed payload through
 // the [VerbHandler] interface (which would couple the
 // Router to per-verb body shapes).
-func (h *ChurnVerbHandler) ExtractMetadata(ctx context.Context, body []byte) (VerbPayloadMetadata, error) {
+func (h *ChurnVerbHandler) ExtractMetadata(_ context.Context, _ http.Header, body []byte) (VerbPayloadMetadata, error) {
 	var payload churn.Payload
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
@@ -110,11 +116,29 @@ func (h *ChurnVerbHandler) ExtractMetadata(ctx context.Context, body []byte) (Ve
 	}, nil
 }
 
+// CanonicalRequest implements [VerbHandler]. Churn's body
+// envelope already carries `(repo_id, per-row sha)` so the
+// canonical signed material IS the raw body bytes -- no
+// header folding is required. This preserves backward
+// compatibility with the pre-Stage-4.3 publisher contract
+// (`HMAC(body, secret)`) and the existing
+// [TestRouter_PayloadHashMatchesSpec] which pins
+// `payload_hash = sha256(body)` for churn.
+func (h *ChurnVerbHandler) CanonicalRequest(_ http.Header, body []byte) []byte {
+	return body
+}
+
 // Handle implements [VerbHandler]. Decodes `body` as a
 // [churn.Payload] (with DisallowUnknownFields), builds a
 // [metric_ingestor.ScanRunContext] stamped with
 // `scanRunID`, and dispatches to the underlying Ingestor.
-func (h *ChurnVerbHandler) Handle(ctx context.Context, body []byte, scanRunID uuid.UUID) (VerbHandleResult, error) {
+//
+// `metadata` is unused: the churn body already carries the
+// RepoID and is the authoritative source for the Ingestor's
+// ScanRunContext (the Router-supplied metadata was derived
+// from the SAME body bytes in [ExtractMetadata], so the two
+// are byte-equivalent).
+func (h *ChurnVerbHandler) Handle(ctx context.Context, _ VerbPayloadMetadata, body []byte, scanRunID uuid.UUID) (VerbHandleResult, error) {
 	var payload churn.Payload
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()

@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +18,7 @@ import (
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/config"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/webhook"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
 
 // TestBuildSweepLoop_DisableStaleSweep_ReturnsNil verifies the
@@ -440,6 +443,123 @@ func TestMountIngestRouter_Enabled_MountsRouterAtCanonicalPath(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("status: got %d, want 401 (unsigned request MUST be rejected by HMAC verifier before any handler runs); body=%s",
 			rec.Code, rec.Body.String())
+	}
+}
+
+// TestVerifyMetricKindCatalog_NilDB pins the wiring guard:
+// the composition-root startup probe MUST refuse a nil
+// `*sql.DB` rather than panic on it (the only path that
+// reaches this helper in production is `main()` immediately
+// after `openAndPingDB`, but exposing the helper for unit
+// testing means nil-handling has to be defensive too).
+func TestVerifyMetricKindCatalog_NilDB(t *testing.T) {
+	t.Parallel()
+	err := verifyMetricKindCatalog(context.Background(), nil, "clean_code")
+	if err == nil {
+		t.Fatalf("verifyMetricKindCatalog(nil db): err=nil, want guard error")
+	}
+	if !strings.Contains(err.Error(), "db is nil") {
+		t.Errorf("verifyMetricKindCatalog(nil db): err=%q, want substring %q", err.Error(), "db is nil")
+	}
+}
+
+// TestVerifyMetricKindCatalog_EmptySchema pins the second
+// wiring guard: empty schema must error out, never silently
+// fall through to a SELECT against `"".metric_kind`.
+func TestVerifyMetricKindCatalog_EmptySchema(t *testing.T) {
+	t.Parallel()
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	gotErr := verifyMetricKindCatalog(context.Background(), db, "")
+	if gotErr == nil {
+		t.Fatalf("verifyMetricKindCatalog(empty schema): err=nil, want guard error")
+	}
+	if !strings.Contains(gotErr.Error(), "schema is empty") {
+		t.Errorf("verifyMetricKindCatalog(empty schema): err=%q, want substring %q", gotErr.Error(), "schema is empty")
+	}
+}
+
+// TestVerifyMetricKindCatalog_HappyPath_AllRowsPresent pins
+// the success path: when EVERY row produced by
+// `MetricKindCatalogRowsForRegistry(recipes.DefaultRegistry())`
+// has a matching entry in the on-disk `metric_kind` table at
+// the expected version, the helper returns nil. The test
+// also independently asserts the helper queries for
+// `pass_first_try_ratio` (Stage 4.3 ingested kind) so a
+// future regression that drops the ingested row from the
+// canonical set is caught here AND in the
+// metric_ingestor package.
+func TestVerifyMetricKindCatalog_HappyPath_AllRowsPresent(t *testing.T) {
+	t.Parallel()
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectedRows, err := metric_ingestor.MetricKindCatalogRowsForRegistry(recipes.DefaultRegistry())
+	if err != nil {
+		t.Fatalf("MetricKindCatalogRowsForRegistry: %v", err)
+	}
+	prep := mock.ExpectPrepare(`SELECT\s+metric_version\s+FROM\s+"clean_code"\."metric_kind"`)
+	for _, row := range expectedRows {
+		prep.ExpectQuery().WithArgs(row.MetricKind).
+			WillReturnRows(sqlmock.NewRows([]string{"metric_version"}).AddRow(row.MetricVersion))
+	}
+
+	if err := verifyMetricKindCatalog(context.Background(), db, metricKindCatalogSchema); err != nil {
+		t.Errorf("verifyMetricKindCatalog: err=%v, want nil", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+
+	// Belt-and-braces: assert the canonical row set INCLUDES
+	// the ingested pass_first_try_ratio kind. Without this
+	// the test could regress silently if a future refactor
+	// drops ingested kinds from the row builder.
+	var sawPassFirstTryRatio bool
+	for _, r := range expectedRows {
+		if r.MetricKind == "pass_first_try_ratio" {
+			sawPassFirstTryRatio = true
+			break
+		}
+	}
+	if !sawPassFirstTryRatio {
+		t.Errorf("verifyMetricKindCatalog: canonical row set did NOT include `pass_first_try_ratio` -- the Stage 4.3 ingested kind was dropped from MetricKindCatalogRowsForRegistry")
+	}
+}
+
+// TestVerifyMetricKindCatalog_MissingRow_FailsFast pins the
+// production fail-fast contract: when the catalog is missing
+// a row the producer registry would emit (e.g. the operator
+// forgot to apply migration 0010 before the binary boots),
+// the helper returns an error wrapping
+// `ErrMetricKindCatalogRowMissing` so the `main`
+// `log.Fatalf` surfaces the missing kind in the boot log
+// rather than serving a listener that 500s on the first
+// `metric_sample` INSERT.
+func TestVerifyMetricKindCatalog_MissingRow_FailsFast(t *testing.T) {
+	t.Parallel()
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectPrepare(`SELECT\s+metric_version\s+FROM\s+"clean_code"\."metric_kind"`).
+		ExpectQuery().WillReturnError(sql.ErrNoRows)
+
+	gotErr := verifyMetricKindCatalog(context.Background(), db, metricKindCatalogSchema)
+	if gotErr == nil {
+		t.Fatalf("verifyMetricKindCatalog (missing row): err=nil, want errors.Is ErrMetricKindCatalogRowMissing")
+	}
+	if !errors.Is(gotErr, metric_ingestor.ErrMetricKindCatalogRowMissing) {
+		t.Errorf("verifyMetricKindCatalog (missing row): err=%v, want errors.Is ErrMetricKindCatalogRowMissing", gotErr)
 	}
 }
 

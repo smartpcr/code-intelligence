@@ -50,10 +50,12 @@ import (
 
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/config"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/churn"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/test_balance"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/webhook"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/management"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/materialisers"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
 
 // db is the metric-ingestor-role PG handle used by the legacy demo
@@ -83,6 +85,28 @@ func main() {
 	}
 	defer ingestorDB.Close()
 	db = ingestorDB
+
+	// Stage 4.3 iter-4 evaluator follow-up: startup-time
+	// catalog fence. Build the canonical set of (metric_kind,
+	// metric_version) tuples this binary's emitters WILL
+	// produce -- recipes from the default registry, the
+	// modification_count materialiser, and the ingested
+	// kinds (e.g. `pass_first_try_ratio`) -- then assert
+	// EVERY tuple has a matching row in
+	// `clean_code.metric_kind`. A missing row or version
+	// drift fails fast at boot so the process does not serve
+	// a listener that would FK-reject the first
+	// `metric_sample` INSERT downstream.
+	//
+	// SELECT-only -- the ingestor role has SELECT on
+	// `clean_code.metric_kind` per
+	// `migrations/0004_roles.up.sql:227-260` but NOT INSERT;
+	// the actual seeding is done by the schema-owner
+	// migrations (`0007_seed_foundation_metric_kinds.up.sql`
+	// + `0010_seed_ingested_metric_kind_pass_first_try_ratio.up.sql`).
+	if err := verifyMetricKindCatalog(context.Background(), ingestorDB, metricKindCatalogSchema); err != nil {
+		log.Fatalf("verifyMetricKindCatalog: %v", err)
+	}
 
 	mgmtDB, mgmtClose, err := openMgmtDB(cfg, ingestorDB)
 	if err != nil {
@@ -158,6 +182,57 @@ func main() {
 		"management_role_handle", mgmtRoleHandleSource(cfg),
 	)
 	log.Fatal(http.ListenAndServe(":"+port, rootMux))
+}
+
+// metricKindCatalogSchema is the Postgres schema the
+// composition-root startup probe checks for `metric_kind`
+// catalog rows. Mirrors `internal/metric_ingestor/
+// pg_scan_run_store.go:pgScanRunDefaultSchema` and the
+// `clean_code.metric_kind` references in the migrations
+// (`migrations/0001_catalog_lifecycle.up.sql:258`,
+// `0007_seed_foundation_metric_kinds.up.sql`,
+// `0010_seed_ingested_metric_kind_pass_first_try_ratio.up.sql`).
+// The constant lives here (rather than imported from
+// metric_ingestor) so the wiring file does not depend on
+// internals not part of the package's exported surface.
+const metricKindCatalogSchema = "clean_code"
+
+// verifyMetricKindCatalog is the composition-root startup
+// fence the doc-comment on
+// [metric_ingestor.VerifyMetricKindCatalog] promises: derive
+// the canonical (metric_kind, metric_version) tuple set the
+// running process WILL emit from the recipe registry +
+// materialiser + ingested-kind table, then SELECT each
+// tuple from `<schema>.metric_kind`. Returns nil iff every
+// expected row exists at the matching version.
+//
+// Wiring contract: called BEFORE buildSweepLoop / buildMux /
+// mountMgmtRoutes / mountIngestRouter so a fresh process
+// refuses to come up against a catalog missing rows the
+// downstream INSERTs would FK-reject.
+//
+// Errors surface via
+// [metric_ingestor.ErrMetricKindCatalogRowMissing] (no row
+// for kind) or
+// [metric_ingestor.ErrMetricKindCatalogVersionDrift] (row
+// exists at a different version). `main` calls `log.Fatalf`
+// on any non-nil return, so the operator sees the failing
+// metric_kind in the boot log.
+func verifyMetricKindCatalog(ctx context.Context, db *sql.DB, schema string) error {
+	if db == nil {
+		return fmt.Errorf("verifyMetricKindCatalog: db is nil")
+	}
+	if schema == "" {
+		return fmt.Errorf("verifyMetricKindCatalog: schema is empty")
+	}
+	rows, err := metric_ingestor.MetricKindCatalogRowsForRegistry(recipes.DefaultRegistry())
+	if err != nil {
+		return fmt.Errorf("verifyMetricKindCatalog: build catalog rows: %w", err)
+	}
+	if err := metric_ingestor.VerifyMetricKindCatalog(ctx, db, schema, rows); err != nil {
+		return fmt.Errorf("verifyMetricKindCatalog: %w", err)
+	}
+	return nil
 }
 
 // openAndPingDB opens a libpq handle against dsn and pings it with a
@@ -451,10 +526,13 @@ func mountMgmtRoutes(mux *http.ServeMux, ingestorDB, mgmtDB *sql.DB) error {
 //   - [webhook.NewStaticSecretResolver] maps the configured
 //     signing_key_id -> HMAC secret.
 //   - [webhook.NewChurnVerbHandler] is the `churn` verb
-//     mount (Stage 4.4); [webhook.NewDefectsVerbHandler]
-//     is the `defects` verb mount (Stage 4.5, store-only
-//     v1 -- no writer dependency); later stages register
-//     more verbs via the same RouterConfig.Verbs slice.
+//     mount; [webhook.NewTestBalanceVerbHandler] is the
+//     `test_balance` verb mount (Stage 4.3, architecture
+//     Sec 1.4.2 / tech-spec Sec 4.1.1, `external_single`);
+//     [webhook.NewDefectsVerbHandler] is the `defects` verb
+//     mount (Stage 4.5, store-only v1 -- no writer
+//     dependency); later stages register more verbs via the
+//     same RouterConfig.Verbs slice.
 //
 // The Router is mounted at [webhook.RouterPath]
 // (`/v1/ingest/`) on the supplied mux; the verb is parsed
@@ -518,6 +596,32 @@ func mountIngestRouter(mux *http.ServeMux, cfg config.Config, ingestorDB *sql.DB
 	sweep := metric_ingestor.NewChurnSweep(mat, hyd, sampleWriter)
 	ing := metric_ingestor.NewIngestor(metric_ingestor.NoopFoundationRecipeDispatcher{}, sweep)
 	churnHandler := webhook.NewChurnVerbHandler(ing)
+	// Stage 4.3 (architecture Sec 1.4.2 / Sec 6.4 lines
+	// 1367-1368, tech-spec Sec 4.1.1): the test_balance verb
+	// shares the PG-backed [metric_ingestor.MetricSampleWriter]
+	// already built for churn -- both verbs persist into
+	// `clean_code.metric_sample` and the writer's transactional
+	// guard is reused. The verb's [test_balance.Writer] does NOT
+	// route through [metric_ingestor.Ingestor] because the
+	// Ingestor's churn-sweep coordinator only accepts
+	// `external_per_row` (the test_balance verb is
+	// `external_single`).
+	//
+	// Stage 4.3 iter-2 evaluator item 3: the writer ALSO
+	// upserts a `scope_binding` row per emitted record via
+	// [metric_ingestor.PGScopeBindingResolver] so the
+	// `metric_sample.scope_id REFERENCES scope_binding(scope_id)`
+	// FK (migration `0002_measurement.up.sql:266-268`) is
+	// satisfied at insert time for publisher-supplied opaque
+	// scope_ids. The resolver shares the SAME `*sql.DB` as the
+	// metric_sample writer so both writes commit against the
+	// same connection pool / role grants.
+	testBalanceScopeResolver, err := metric_ingestor.NewPGScopeBindingResolver(ingestorDB)
+	if err != nil {
+		return fmt.Errorf("NewPGScopeBindingResolver(test_balance): %w", err)
+	}
+	testBalanceWriter := test_balance.NewWriter(sampleWriter, testBalanceScopeResolver)
+	testBalanceHandler := webhook.NewTestBalanceVerbHandler(testBalanceWriter)
 
 	// Defects verb (Stage 4.5): v1 store-only at the scan_run
 	// boundary -- no writer dependency. The verb parses the
@@ -532,7 +636,7 @@ func mountIngestRouter(mux *http.ServeMux, cfg config.Config, ingestorDB *sql.DB
 		Resolver:    resolver,
 		Store:       idempotencyStore,
 		ScanRunRepo: scanRunRepo,
-		Verbs:       []webhook.VerbHandler{churnHandler, defectsHandler},
+		Verbs:       []webhook.VerbHandler{churnHandler, testBalanceHandler, defectsHandler},
 		Logger:      logger,
 	})
 	mux.Handle(webhook.RouterPath, router)
@@ -540,7 +644,7 @@ func mountIngestRouter(mux *http.ServeMux, cfg config.Config, ingestorDB *sql.DB
 		logger.Info("mounted external-ingest webhook router",
 			"path", webhook.RouterPath,
 			"signing_key_id", cfg.WebhookSigningKeyID,
-			"verbs", []string{churnHandler.Verb(), defectsHandler.Verb()},
+			"verbs", []string{churnHandler.Verb(), testBalanceHandler.Verb(), defectsHandler.Verb()},
 		)
 	}
 	return nil

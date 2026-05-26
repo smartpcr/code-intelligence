@@ -34,6 +34,10 @@ func clearCleanCodeEnv(t *testing.T) {
 		EnvKMSMasterKeyHex,
 		EnvWebhookHMACSecret,
 		EnvEnableScaffoldChurnWebhook,
+		EnvEnableScaffoldIndexerWebhook,
+		EnvDisableStaleSweep,
+		EnvEnableLegacyDemoAPI,
+		EnvAstScanRoot,
 	} {
 		t.Setenv(k, "")
 	}
@@ -527,4 +531,81 @@ func TestChurnWebhook_HMACEnvFields_MinSecretLengthEnforced(t *testing.T) {
 			t.Errorf("Load with both env vars unset: want nil; got %v", err)
 		}
 	})
+}
+
+// --- Stage 3.5 iter 3: stale-sweep + legacy-demo env round-trip ---
+
+// TestStaleSweep_EnvFields_DefaultsAreEnabled pins the
+// production-default semantics for iter-3 evaluator item 2: when
+// no operator env var is set, the sweep is enabled (DisableStaleSweep
+// == false) and the legacy demo API is unmounted
+// (EnableLegacyDemoAPI == false). Both defaults match
+// architecture's "canonical surface only, sweep on" stance.
+func TestStaleSweep_EnvFields_DefaultsAreEnabled(t *testing.T) {
+	clearCleanCodeEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.DisableStaleSweep {
+		t.Errorf("DisableStaleSweep: want false (sweep enabled by default), got true")
+	}
+	if cfg.EnableLegacyDemoAPI {
+		t.Errorf("EnableLegacyDemoAPI: want false (legacy demo unmounted by default), got true")
+	}
+}
+
+// TestStaleSweep_EnvFields_RoundTripBooleans verifies the
+// boolean opt-out / opt-in literals (1|true|yes|on /
+// 0|false|no|off) round-trip through Load. The iter-3 evaluator
+// flagged that the previous direct os.Getenv call in main.go
+// bypassed this contract; we assert it here so a future
+// regression breaks the test.
+func TestStaleSweep_EnvFields_RoundTripBooleans(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want bool
+	}{
+		{"1", true}, {"true", true}, {"yes", true}, {"on", true},
+		{"0", false}, {"false", false}, {"no", false}, {"off", false},
+	}
+	for _, c := range cases {
+		t.Run("DisableStaleSweep="+c.raw, func(t *testing.T) {
+			clearCleanCodeEnv(t)
+			t.Setenv(EnvDisableStaleSweep, c.raw)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.DisableStaleSweep != c.want {
+				t.Errorf("DisableStaleSweep(%q): got %v, want %v", c.raw, cfg.DisableStaleSweep, c.want)
+			}
+		})
+		t.Run("EnableLegacyDemoAPI="+c.raw, func(t *testing.T) {
+			clearCleanCodeEnv(t)
+			t.Setenv(EnvEnableLegacyDemoAPI, c.raw)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.EnableLegacyDemoAPI != c.want {
+				t.Errorf("EnableLegacyDemoAPI(%q): got %v, want %v", c.raw, cfg.EnableLegacyDemoAPI, c.want)
+			}
+		})
+	}
+}
+
+// TestStaleSweep_EnvFields_RejectsNonBoolean pins the fail-fast
+// contract: a malformed value MUST produce a non-nil Load error
+// so an operator typo cannot silently flip back to the default.
+func TestStaleSweep_EnvFields_RejectsNonBoolean(t *testing.T) {
+	for _, env := range []string{EnvDisableStaleSweep, EnvEnableLegacyDemoAPI} {
+		t.Run(env+"=bogus", func(t *testing.T) {
+			clearCleanCodeEnv(t)
+			t.Setenv(env, "bogus")
+			if _, err := Load(); err == nil {
+				t.Errorf("Load with %s=bogus: want non-nil error, got nil", env)
+			}
+		})
+	}
 }

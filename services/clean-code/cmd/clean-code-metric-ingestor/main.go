@@ -5,6 +5,52 @@
 // The dispatcher drives the in-process [rule_engine.Worker] which re-runs
 // the active [steward.PolicyVersion] under `caller='batch_refresh'`,
 // writing the canonical (run, verdict, findings) triple in one transaction.
+//
+// # Composition root layout
+//
+// Stage 3.5 wiring runs the production
+// [metric_ingestor.StaleScanRunSweepLoop] as a background goroutine. The
+// loop reads `scan_timeout` and `periodic_sweep_cadence` from the canonical
+// [config.Config] (tech-spec Sec 8.2) and runs against the live
+// [metric_ingestor.PGScanRunStore], so stale `scan_run(status='running')`
+// rows past `scan_timeout` transition to `status='failed'` without operator
+// intervention. The metrics emitted by the sweep
+// (`cleancode_sweep_stale_scans_total`,
+// `cleancode_sweep_failed_commits_total`) surface via `/metrics` in
+// Prometheus text-exposition format.
+//
+// Stage 5.7 wiring layers the SOLID Rule Engine batch worker on top: a
+// bounded post-scan dispatcher channel fans [rule_engine.ScanEvent]s from
+// the legacy demo `/v1/ingestor/process` path (and any future canonical
+// scan-completion path it stands in for) to the in-process
+// [rule_engine.Worker]. The worker writes
+// `evaluation_run`/`evaluation_verdict`/`finding` rows under
+// `caller='batch_refresh'` against a dedicated Audit-writer DB handle.
+//
+// # Production vs legacy demo
+//
+// The production composition root mounts ONLY the canonical surface:
+// `/healthz`, `/metrics`, the in-process sweep goroutine, and the
+// Stage 5.7 rule_engine worker goroutine. Both `/v1/ingestor/process`
+// and `/v1/ingestor/scan-run` are LEGACY DEMO handlers that write the
+// older `001_init.sql` `scan_run(commit_sha,kind,status,finished_at)`
+// shape and are mounted iff [config.Config.EnableLegacyDemoAPI] is true
+// (env `CLEAN_CODE_ENABLE_LEGACY_DEMO_API`). The Stage 1.2 canonical
+// schema (`0001_catalog_lifecycle`) does not expose those columns;
+// running the legacy demo against the canonical schema is a wiring
+// error.
+//
+// # Config contract
+//
+// All `CLEAN_CODE_*` env vars are read EXCLUSIVELY by `internal/config`
+// (per the package doc lines 15-16). This binary reads only
+// [config.Config] fields; an invalid env value is a HARD ERROR at
+// startup (no silent fallback to defaults). The Stage 5.7 wiring reads
+// two additional env vars directly (`CLEAN_CODE_RULE_ENGINE_DISABLED`
+// and `CLEAN_CODE_SOLID_BATCH_PG_URL`) because they govern an optional
+// per-composition-root knob (worker enable + dedicated audit handle)
+// rather than per-request behaviour; both default to safe values when
+// unset.
 package main
 
 import (
@@ -17,12 +63,17 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gofrs/uuid"
 	_ "github.com/lib/pq"
 
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/config"
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/steward"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/rule_engine"
 )
@@ -35,7 +86,10 @@ import (
 // declared a stale set `{ast_metrics, lint, complexity, dependency}` that
 // does NOT match the canonical schema. This guard is now aligned with the
 // canonical 5-value enum so a `kind` POSTed by upstream services is
-// accepted iff it would be accepted by Postgres.
+// accepted iff it would be accepted by Postgres. The guard remains scoped
+// to the legacy demo `/v1/ingestor/scan-run` handler; the canonical Stage
+// 1.2 schema enforces the same enum at the database layer via the
+// enum-typed `kind` column.
 var validScanRunKinds = map[string]bool{
 	"full":              true,
 	"delta":             true,
@@ -44,6 +98,11 @@ var validScanRunKinds = map[string]bool{
 	"retract":           true,
 }
 
+// db is the shared *sql.DB instance the legacy demo handlers use.
+// Production wiring SHOULD prefer injecting a dependency at the
+// `runService` boundary rather than reading this package var, but
+// the legacy handlers predate the refactor and remain in place
+// for legacy E2E parity. New code MUST take *sql.DB as a parameter.
 var db *sql.DB
 
 // scanEventCapacity is the buffer size of the post-scan
@@ -88,18 +147,33 @@ const catchupInterval = 5 * time.Minute
 // behave exactly as before this stage.
 var scanEvents chan<- rule_engine.ScanEvent
 
+// staleSweepLoop is the package-level handle to the running
+// sweep loop. Exposed so the `/metrics` handler can scrape the
+// counters without re-allocating the metrics holder. Nil when
+// [config.Config.DisableStaleSweep] is true or PGScanRunStore
+// construction failed.
+var staleSweepLoop *metric_ingestor.StaleScanRunSweepLoop
+
 func main() {
+	// Stage 3.5 fail-fast contract: an invalid env value (bad
+	// duration, unknown literal, etc.) MUST surface as a startup
+	// crash so the operator sees the misconfiguration immediately
+	// instead of the service silently falling back to defaults.
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("config.Load: %v", err)
+	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	pgURL := os.Getenv("CLEAN_CODE_PG_URL")
+	pgURL := cfg.PostgresURL
 	if pgURL == "" {
 		log.Fatal("CLEAN_CODE_PG_URL is required")
 	}
 
-	var err error
 	db, err = sql.Open("postgres", pgURL)
 	if err != nil {
 		log.Fatalf("opening postgres: %v", err)
@@ -114,13 +188,18 @@ func main() {
 		time.Sleep(time.Second)
 	}
 
-	rootCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
-	// Wire the SOLID Rule Engine batch worker. Failures here
-	// are LOGGED -- the ingest service must keep serving
-	// /v1/ingestor/process even when the engine cannot be
-	// composed (e.g. migrations not yet applied).
+	// Unified root context: both the Stage 3.5 sweep loop and
+	// the Stage 5.7 rule_engine worker shut down cleanly when
+	// this is cancelled by the SIGINT/SIGTERM handler below.
+	rootCtx, cancelRoot := context.WithCancel(context.Background())
+	defer cancelRoot()
+
+	// Stage 5.7 wiring: SOLID Rule Engine batch worker.
+	// Failures here are LOGGED -- the ingest service must keep
+	// serving /v1/ingestor/process even when the engine cannot
+	// be composed (e.g. migrations not yet applied).
 	if disabled := strings.EqualFold(os.Getenv("CLEAN_CODE_RULE_ENGINE_DISABLED"), "1"); disabled {
 		log.Print("rule_engine: disabled via CLEAN_CODE_RULE_ENGINE_DISABLED=1")
 	} else if events, werr := startRuleEngineWorker(rootCtx, db); werr != nil {
@@ -130,13 +209,187 @@ func main() {
 		log.Print("rule_engine: worker wired (caller=batch_refresh on post-scan events)")
 	}
 
+	// Stage 3.5 wiring: stale ScanRun sweep loop.
+	var sweepLoopWG sync.WaitGroup
+	loop, sweepErr := buildSweepLoop(cfg, db, logger)
+	if sweepErr != nil {
+		// Construction errors are surfaced but non-fatal: the
+		// legacy demo path may still want to serve while an
+		// operator triages the PG store wiring.
+		log.Printf("stale sweep: build failed (sweep disabled): %v", sweepErr)
+	}
+	staleSweepLoop = loop
+	loopStarted := false
+	if staleSweepLoop != nil {
+		sweepLoopWG.Add(1)
+		loopStarted = true
+		go func() {
+			defer sweepLoopWG.Done()
+			if rerr := staleSweepLoop.Run(rootCtx); rerr != nil &&
+				!errors.Is(rerr, context.Canceled) &&
+				!errors.Is(rerr, context.DeadlineExceeded) {
+				log.Printf("stale sweep loop exited: %v", rerr)
+			}
+		}()
+		log.Printf("stale sweep loop wired: scan_timeout=%s cadence=%s",
+			cfg.ScanTimeout, cfg.PeriodicSweepCadence)
+	} else if cfg.DisableStaleSweep {
+		log.Printf("stale sweep loop DISABLED via %s", config.EnvDisableStaleSweep)
+	}
+
+	mux := buildMux(cfg, staleSweepLoop)
+
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	// SIGINT / SIGTERM trigger graceful shutdown: cancel the root
+	// ctx (which stops the sweep loop AND the rule_engine worker /
+	// catchup goroutines together), give the HTTP server up to 10s
+	// to drain in-flight requests, then exit.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		log.Print("clean-code-metric-ingestor: shutdown signal received")
+		cancelRoot()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+
+	log.Printf("clean-code-metric-ingestor listening on :%s (stale_sweep=%v legacy_demo=%v rule_engine=%v)",
+		port, loopStarted, cfg.EnableLegacyDemoAPI, scanEvents != nil)
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("http server: %v", err)
+	}
+	cancelRoot()
+	sweepLoopWG.Wait()
+}
+
+// buildSweepLoop constructs the Stage 3.5 stale ScanRun sweep
+// loop or returns (nil, nil) when the operator has explicitly
+// disabled it via [config.Config.DisableStaleSweep].
+//
+// Splitting this out of main() lets the unit tests assert the
+// disable-path (returns nil) without spinning up a Postgres pool
+// and the wire-path (returns non-nil with the operator-pinned
+// scan_timeout / cadence) without needing a long-running goroutine.
+//
+// A non-nil error means the operator wanted the sweep enabled
+// but the underlying store could not be constructed -- callers
+// should log and continue rather than crash, so an unrelated
+// legacy-demo deploy is not blocked by a sweep wiring bug.
+//
+// # Knobs deliberately NOT wired
+//
+// [metric_ingestor.WithStaleSweepLoopErrorBackoff] is not wired
+// here. The loop's constructor defaults errorBackoff to cadence,
+// which is the Stage 3.5 production stance (see the inline NOTE
+// at the option-list call site for rationale and the migration
+// path if an operator-tunable backoff is later required).
+func buildSweepLoop(cfg config.Config, sqlDB *sql.DB, logger *slog.Logger) (*metric_ingestor.StaleScanRunSweepLoop, error) {
+	if cfg.DisableStaleSweep {
+		return nil, nil
+	}
+	if sqlDB == nil {
+		return nil, fmt.Errorf("buildSweepLoop: nil *sql.DB (cannot wire PGScanRunStore)")
+	}
+	store, sErr := metric_ingestor.NewPGScanRunStore(sqlDB)
+	if sErr != nil {
+		return nil, fmt.Errorf("NewPGScanRunStore: %w", sErr)
+	}
+	sweep := metric_ingestor.NewStaleScanRunSweep(
+		store,
+		metric_ingestor.WithStaleSweepScanTimeout(cfg.ScanTimeout),
+		metric_ingestor.WithStaleSweepLogger(logger),
+	)
+	loop := metric_ingestor.NewStaleScanRunSweepLoop(
+		sweep,
+		metric_ingestor.WithStaleSweepLoopCadence(cfg.PeriodicSweepCadence),
+		// errorBackoff is intentionally left to default to cadence.
+		// [metric_ingestor.NewStaleScanRunSweepLoop] folds an
+		// unset value to cadence (`if l.errorBackoff <= 0 {
+		// l.errorBackoff = l.cadence }`), which is the chosen
+		// Stage 3.5 production stance: a degraded DB MUST NOT be
+		// retried more aggressively than the healthy 5-min
+		// cadence (tech-spec Sec 8.2 `periodic_sweep_cadence`) --
+		// faster retries on Sweep failure would compound
+		// back-pressure on an already-struggling store, and the
+		// failure modes we expect here (transient PG unavailability,
+		// connection-pool saturation) recover on minute scales,
+		// not sub-second ones. The
+		// [metric_ingestor.WithStaleSweepLoopErrorBackoff] option
+		// is kept in the library surface for (1) deterministic
+		// sub-second backoffs in the loop's unit tests, where
+		// real-cadence waits would balloon suite runtime, and
+		// (2) the future operator-tunable knob hinted at in
+		// loop.go. Exposing that knob to operators is a
+		// deliberate follow-up because no current SLO calls for
+		// it; when it is wanted, the migration path is (a) add
+		// `config.Config.SweepErrorBackoff` backed by
+		// `CLEAN_CODE_PERIODIC_SWEEP_ERROR_BACKOFF` (honouring
+		// the tech-spec Sec 8.2 single-source-of-truth contract
+		// already established for ScanTimeout / PeriodicSweepCadence),
+		// then (b) thread it here with
+		// `metric_ingestor.WithStaleSweepLoopErrorBackoff(cfg.SweepErrorBackoff)`.
+		metric_ingestor.WithStaleSweepLoopLogger(logger),
+	)
+	return loop, nil
+}
+
+// buildMux assembles the HTTP routes the metric-ingestor binary
+// exposes, gated on [config.Config.EnableLegacyDemoAPI]. The
+// production composition root mounts only `/healthz` and
+// `/metrics`; the legacy `001_init.sql`-shaped `/v1/ingestor/*`
+// handlers mount iff EnableLegacyDemoAPI is true.
+//
+// Extracted from main() so the test suite can assert the route
+// table directly (no network listener required).
+func buildMux(cfg config.Config, loop *metric_ingestor.StaleScanRunSweepLoop) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
-	mux.HandleFunc("/v1/ingestor/process", handleProcess)
-	mux.HandleFunc("/v1/ingestor/scan-run", handleScanRun)
+	mux.Handle("/metrics", newMetricsHandler(loop))
+	if cfg.EnableLegacyDemoAPI {
+		mux.HandleFunc("/v1/ingestor/process", handleProcess)
+		mux.HandleFunc("/v1/ingestor/scan-run", handleScanRun)
+	}
+	return mux
+}
 
-	log.Printf("clean-code-metric-ingestor listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+// newMetricsHandler returns an http.HandlerFunc that emits the
+// Stage 3.5 sweep counters in Prometheus text-exposition format.
+// When loop is nil (sweep disabled or wiring failed), the handler
+// returns an empty body with a 200 status -- Prometheus tolerates
+// this as a zero-sample scrape.
+//
+// Taking the loop as a function parameter lets the test suite
+// stub it without touching the package-level [staleSweepLoop]
+// (which the production main() owns).
+func newMetricsHandler(loop *metric_ingestor.StaleScanRunSweepLoop) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		if loop != nil {
+			if _, err := loop.Sweep().Metrics().WriteText(w); err != nil {
+				log.Printf("metrics: WriteText failed: %v", err)
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+// handleMetrics is preserved for production /metrics wiring and
+// reads the package-level [staleSweepLoop] that main() populated.
+// New callers should prefer [newMetricsHandler] which takes the
+// loop as a parameter -- this wrapper exists so the legacy
+// hand-rolled `mux.HandleFunc("/metrics", handleMetrics)` form
+// keeps compiling for any external test that imports the package
+// for its handler.
+func handleMetrics(w http.ResponseWriter, r *http.Request) {
+	newMetricsHandler(staleSweepLoop)(w, r)
 }
 
 // startRuleEngineWorker composes the SOLID Rule Engine

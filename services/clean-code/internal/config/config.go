@@ -227,6 +227,36 @@ const (
 	// bodies against the same secret). One without the other
 	// is a configuration error that fails fast at startup.
 	EnvEnableScaffoldIndexerWebhook = "CLEAN_CODE_ENABLE_SCAFFOLD_INDEXER_WEBHOOK"
+
+	// EnvDisableStaleSweep is the operator-facing opt-out for
+	// the Stage 3.5 stale ScanRun sweep loop. It accepts any
+	// boolean literal (1|true|yes|on / 0|false|no|off). Default
+	// unset = sweep enabled. Set this to a truthy value in
+	// environments that still run the legacy `001_init.sql`
+	// `scan_run(commit_sha,kind,status,finished_at)` schema --
+	// the sweep targets the canonical
+	// `0001_catalog_lifecycle` shape and produces repeated
+	// UPDATE errors at every cadence tick when pointed at the
+	// legacy table. Operators MUST leave the sweep enabled in
+	// production (canonical schema).
+	//
+	// Centralised here per the config-package contract
+	// (architecture Sec 1.6 / package doc lines 15-16): no
+	// other package reads `CLEAN_CODE_*` env vars directly.
+	EnvDisableStaleSweep = "CLEAN_CODE_DISABLE_STALE_SWEEP"
+
+	// EnvEnableLegacyDemoAPI is the operator-facing opt-in for
+	// the legacy `001_init.sql`-shaped HTTP surface on the
+	// metric-ingestor binary (`/v1/ingestor/process` and
+	// `/v1/ingestor/scan-run`). Default unset = NOT MOUNTED;
+	// the production composition root exposes only the
+	// canonical health/metrics endpoints + the Stage 3.5 sweep
+	// loop. Set this in legacy E2E environments that still
+	// drive the older `commit_sha`/`finished_at` shape;
+	// production deployments MUST leave this unset (the
+	// canonical Stage 1.2 `0001_catalog_lifecycle` schema does
+	// not have the columns these handlers write).
+	EnvEnableLegacyDemoAPI = "CLEAN_CODE_ENABLE_LEGACY_DEMO_API"
 )
 
 // MinWebhookHMACSecretBytes is the minimum length (in bytes,
@@ -349,6 +379,31 @@ type Config struct {
 	// rationale. The indexer reuses [WebhookHMACSecret] (the
 	// SHARED external-ingest HMAC secret).
 	EnableScaffoldIndexerWebhook bool
+
+	// --- Stage 3.5 stale-ScanRun sweep loop ---
+
+	// DisableStaleSweep is the explicit operator opt-out for
+	// the Stage 3.5 stale ScanRun sweep loop. Default false
+	// (sweep enabled). When true, the metric-ingestor binary
+	// SKIPS construction of the sweep goroutine entirely --
+	// no PGScanRunStore is instantiated, no loop ticks fire,
+	// and `/metrics` returns no sweep counters. Intended for
+	// legacy E2E environments running the older
+	// `001_init.sql` `scan_run` shape; production MUST keep
+	// this false. See [EnvDisableStaleSweep].
+	DisableStaleSweep bool
+
+	// EnableLegacyDemoAPI is the operator opt-in for the
+	// legacy `001_init.sql`-shaped HTTP routes
+	// (`/v1/ingestor/process`, `/v1/ingestor/scan-run`).
+	// Default false: production composition root mounts only
+	// health/metrics. Setting this true in legacy E2E
+	// environments mounts the older handlers that write the
+	// `commit_sha`/`finished_at` columns. The Stage 1.2
+	// canonical schema does not expose those columns; mixing
+	// canonical migrations with this flag set is a wiring
+	// error. See [EnvEnableLegacyDemoAPI].
+	EnableLegacyDemoAPI bool
 
 	// --- Stage 3.2 Metric Ingestor scan-source ---
 
@@ -537,6 +592,8 @@ func readEnvOverrides() map[string]string {
 		EnvWebhookHMACSecret,
 		EnvEnableScaffoldChurnWebhook,
 		EnvEnableScaffoldIndexerWebhook,
+		EnvDisableStaleSweep,
+		EnvEnableLegacyDemoAPI,
 		EnvAstScanRoot,
 	}
 	out := make(map[string]string, len(keys))
@@ -625,6 +682,24 @@ func applyOverrides(cfg *Config, overrides map[string]string) error {
 				cfg.EnableScaffoldIndexerWebhook = true
 			case "0", "false", "no", "off":
 				cfg.EnableScaffoldIndexerWebhook = false
+			default:
+				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
+			}
+		case EnvDisableStaleSweep:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "1", "true", "yes", "on":
+				cfg.DisableStaleSweep = true
+			case "0", "false", "no", "off":
+				cfg.DisableStaleSweep = false
+			default:
+				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
+			}
+		case EnvEnableLegacyDemoAPI:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "1", "true", "yes", "on":
+				cfg.EnableLegacyDemoAPI = true
+			case "0", "false", "no", "off":
+				cfg.EnableLegacyDemoAPI = false
 			default:
 				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
 			}

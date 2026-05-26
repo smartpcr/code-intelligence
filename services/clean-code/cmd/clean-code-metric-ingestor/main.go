@@ -193,6 +193,14 @@ func main() {
 // but the underlying store could not be constructed -- callers
 // should log and continue rather than crash, so an unrelated
 // legacy-demo deploy is not blocked by a sweep wiring bug.
+//
+// # Knobs deliberately NOT wired
+//
+// [metric_ingestor.WithStaleSweepLoopErrorBackoff] is not wired
+// here. The loop's constructor defaults errorBackoff to cadence,
+// which is the Stage 3.5 production stance (see the inline NOTE
+// at the option-list call site for rationale and the migration
+// path if an operator-tunable backoff is later required).
 func buildSweepLoop(cfg config.Config, sqlDB *sql.DB, logger *slog.Logger) (*metric_ingestor.StaleScanRunSweepLoop, error) {
 	if cfg.DisableStaleSweep {
 		return nil, nil
@@ -212,6 +220,32 @@ func buildSweepLoop(cfg config.Config, sqlDB *sql.DB, logger *slog.Logger) (*met
 	loop := metric_ingestor.NewStaleScanRunSweepLoop(
 		sweep,
 		metric_ingestor.WithStaleSweepLoopCadence(cfg.PeriodicSweepCadence),
+		// errorBackoff is intentionally left to default to cadence.
+		// [metric_ingestor.NewStaleScanRunSweepLoop] folds an
+		// unset value to cadence (`if l.errorBackoff <= 0 {
+		// l.errorBackoff = l.cadence }`), which is the chosen
+		// Stage 3.5 production stance: a degraded DB MUST NOT be
+		// retried more aggressively than the healthy 5-min
+		// cadence (tech-spec Sec 8.2 `periodic_sweep_cadence`) --
+		// faster retries on Sweep failure would compound
+		// back-pressure on an already-struggling store, and the
+		// failure modes we expect here (transient PG unavailability,
+		// connection-pool saturation) recover on minute scales,
+		// not sub-second ones. The
+		// [metric_ingestor.WithStaleSweepLoopErrorBackoff] option
+		// is kept in the library surface for (1) deterministic
+		// sub-second backoffs in the loop's unit tests, where
+		// real-cadence waits would balloon suite runtime, and
+		// (2) the future operator-tunable knob hinted at in
+		// loop.go. Exposing that knob to operators is a
+		// deliberate follow-up because no current SLO calls for
+		// it; when it is wanted, the migration path is (a) add
+		// `config.Config.SweepErrorBackoff` backed by
+		// `CLEAN_CODE_PERIODIC_SWEEP_ERROR_BACKOFF` (honouring
+		// the tech-spec Sec 8.2 single-source-of-truth contract
+		// already established for ScanTimeout / PeriodicSweepCadence),
+		// then (b) thread it here with
+		// `metric_ingestor.WithStaleSweepLoopErrorBackoff(cfg.SweepErrorBackoff)`.
 		metric_ingestor.WithStaleSweepLoopLogger(logger),
 	)
 	return loop, nil

@@ -162,9 +162,10 @@ func TestMetricKindCatalogRowsForRegistry_CoversDefaultRegistry(t *testing.T) {
 	}
 	// 6 registered recipes (cyclo, cognitive_complexity, loc,
 	// lcom4, fan_in, fan_out) + 1 materialiser
-	// (modification_count_in_window) + 1 ingested kind
-	// (pass_first_try_ratio, Stage 4.3) = 8 catalog rows.
-	const want = 8
+	// (modification_count_in_window) + 3 ingested kinds
+	// (pass_first_try_ratio, coverage_line_ratio,
+	// coverage_branch_ratio) = 10 catalog rows.
+	const want = 10
 	if got := len(rows); got != want {
 		t.Errorf("rows=%d, want %d (foundation registry + materialiser + ingested); got=%v", got, want, kindsOf(rows))
 	}
@@ -172,6 +173,8 @@ func TestMetricKindCatalogRowsForRegistry_CoversDefaultRegistry(t *testing.T) {
 		"cyclo": false, "cognitive_complexity": false, "loc": false,
 		"lcom4": false, "fan_in": false, "fan_out": false,
 		"modification_count_in_window": false,
+		"coverage_line_ratio":          false,
+		"coverage_branch_ratio":        false,
 		"pass_first_try_ratio":         false,
 	}
 	for _, r := range rows {

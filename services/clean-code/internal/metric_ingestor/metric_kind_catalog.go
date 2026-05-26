@@ -9,6 +9,7 @@ import (
 
 	"github.com/lib/pq"
 
+	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/coverage"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/materialisers"
 	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
@@ -78,12 +79,12 @@ const (
 // requires both PK natural-key columns to be populated for
 // the seeder's output to satisfy the downstream INSERT.
 type MetricKindCatalogRow struct {
-	MetricKind     string
-	MetricVersion  int
-	Tier           MetricKindTier
-	Pack           recipes.Pack
-	Unit           string
-	DescriptionMD  string
+	MetricKind    string
+	MetricVersion int
+	Tier          MetricKindTier
+	Pack          recipes.Pack
+	Unit          string
+	DescriptionMD string
 }
 
 // foundationCatalogMetadata is the hand-curated per-kind
@@ -135,6 +136,14 @@ var foundationCatalogMetadata = map[string]struct {
 	"modification_count_in_window": {
 		Unit:          "count",
 		DescriptionMD: "Number of file modifications observed within the configured window_days for a given scope (architecture Sec 1.4.1 row 12; tech-spec Sec 8.2).",
+	},
+	"coverage_line_ratio": {
+		Unit:          "ratio",
+		DescriptionMD: "Per-file line-coverage ratio (lines_covered / lines_valid) ingested from an external coverage publisher (architecture Sec 1.4.1 row 16; tech-spec Sec 4.1.1 -- the ONLY canonical line-coverage metric_kind, with `coverage_line` and `coverage_lines_covered_ratio` aliases removed per iter-1 evaluator item 4).",
+	},
+	"coverage_branch_ratio": {
+		Unit:          "ratio",
+		DescriptionMD: "Per-file branch-coverage ratio (branches_covered / branches_valid) ingested from an external coverage publisher (architecture Sec 1.4.1 row 16; tech-spec Sec 4.1.1 -- the ONLY canonical branch-coverage metric_kind, with `coverage_branch` and `coverage_branches_covered_ratio` aliases removed per iter-1 evaluator item 4).",
 	},
 	"pass_first_try_ratio": {
 		Unit:          "ratio",
@@ -204,6 +213,16 @@ var ingestedMetricKinds = []struct {
 	// MUST track `test_balance.MetricKind` /
 	// `test_balance.MetricVersion`.
 	{Kind: "pass_first_try_ratio", Version: 1},
+	// Coverage kinds (Stage 4.2) -- produced by the Cobertura
+	// parser in `internal/ingest/coverage` and uploaded via
+	// the `/v1/ingest/coverage` webhook. The coverage package
+	// does NOT import `metric_ingestor`, so referencing the
+	// producer constants here does NOT introduce an import
+	// cycle (the hand-curated string-literal rule above
+	// applies to producers that depend on
+	// [PGMetricSampleWriter]).
+	{Kind: coverage.MetricKindCoverageLineRatio, Version: coverage.MetricVersion},
+	{Kind: coverage.MetricKindCoverageBranchRatio, Version: coverage.MetricVersion},
 }
 
 // MetricKindCatalogRowsForRegistry returns the canonical
@@ -278,9 +297,10 @@ func MetricKindCatalogRowsForRegistry(reg *recipes.Registry) ([]MetricKindCatalo
 		DescriptionMD: matMeta.DescriptionMD,
 	})
 
-	// Foundation-tier INGESTED kinds (Stage 4.3+). NOT in the
-	// recipe registry (no AST adapter produces them) and not
-	// a materialiser (no recipe-emitted foundation row to
+	// Foundation-tier INGESTED kinds (Stage 4.2 coverage,
+	// Stage 4.3 test_balance, ...). NOT in the recipe
+	// registry (no AST adapter produces them) and not a
+	// materialiser (no recipe-emitted foundation row to
 	// derive from); they are publisher-uploaded through the
 	// `internal/ingest/...` HTTP verbs. The verb writers go
 	// through the same PGMetricSampleWriter so the FK must be

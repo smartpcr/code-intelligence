@@ -281,6 +281,10 @@ func TestIngestor_ExternalPerRow_NilChurnPayload_Rejected(t *testing.T) {
 // TestIngestor_RejectsInvalidScanRunKind asserts the
 // pre-dispatch validation path: an unsupported kind is
 // rejected BEFORE any dispatcher or sweep is touched.
+// (Stage 4.2 added `external_single` as a valid kind for
+// the coverage path; this test now uses `retract` -- still
+// outside the Ingestor's closed set -- to exercise the
+// rejection branch.)
 func TestIngestor_RejectsInvalidScanRunKind(t *testing.T) {
 	t.Parallel()
 	ing, disp, writer := newIngestorWithRecordingDispatcher(t, nil)
@@ -288,7 +292,7 @@ func TestIngestor_RejectsInvalidScanRunKind(t *testing.T) {
 	_, err := ing.Run(context.Background(), metric_ingestor.RunRequest{
 		ScanRun: metric_ingestor.ScanRunContext{
 			ID:     fixedScanRunID,
-			Kind:   "external_single",
+			Kind:   metric_ingestor.ScanRunKindRetract,
 			RepoID: fixedRepoID,
 		},
 	})

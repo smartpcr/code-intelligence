@@ -1,10 +1,10 @@
 -- 0007_seed_foundation_metric_kinds.down.sql
 --
 -- Reverse of 0007_seed_foundation_metric_kinds.up.sql.
--- Deletes the seven foundation-tier catalog rows seeded by
+-- Deletes the nine foundation-tier catalog rows seeded by
 -- the UP half, scoped to the EXACT
 -- `(metric_kind, metric_version)` tuples the UP inserts
--- (all seven kinds at `metric_version = 1`). Any
+-- (all nine kinds at `metric_version = 1`). Any
 -- Steward-curated row at a DIFFERENT `metric_version`
 -- survives the DELETE.
 --
@@ -43,7 +43,9 @@ DELETE FROM clean_code.metric_kind
      ('lcom4',                        1),
      ('fan_in',                       1),
      ('fan_out',                      1),
-     ('modification_count_in_window', 1)
+     ('modification_count_in_window', 1),
+     ('coverage_line_ratio',          1),
+     ('coverage_branch_ratio',        1)
  );
 
 COMMIT;

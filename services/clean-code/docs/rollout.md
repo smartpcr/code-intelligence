@@ -5,6 +5,250 @@ production-tier environment. The instructions assume Postgres
 14+ is already running and the `clean_code_*` roles have been
 created via the `0004_roles.up.sql` migration.
 
+## Stage 4.1 iter 3: per-verb durable idempotency key + Finalize same-terminal contract
+
+Iter 2 shipped the durable seam with a `(kind, payload_hash)`
+partial unique index. Iter 3 keys the durable uniqueness
+on `(verb, payload_hash)` instead. Two distinct verbs that
+share the same kind (e.g. `churn` + `defects` -- both
+`external_per_row`) MUST receive independent scan_run rows
+even when their canonical bodies hash identically.
+Migration 0009 is rewritten end-to-end.
+
+### Pre-roll checklist (iter 3 -- in order)
+
+- [ ] **If iter 2's migration was applied on a dev DB**, the
+      iter-3 up migration DROPs the iter-2
+      `scan_run_payload_hash_kind_uniq` index automatically.
+      No operator action required other than running the
+      iter-3 file via `psql -f` (autocommit). Production has
+      not applied iter 2 because Stage 4.1 has not gone live;
+      this branch is the iter-3 shape from day one for prod.
+
+- [ ] Apply migration 0009 (iter-3 shape) BEFORE deploying
+      the new binary. The file is
+      `services/clean-code/migrations/0009_scan_run_payload_hash_unique.up.sql`.
+      It uses `DROP / CREATE INDEX CONCURRENTLY` and
+      `ALTER TABLE ADD COLUMN`, which CANNOT all run inside
+      a single transaction:
+
+      ```bash
+      psql "$CLEAN_CODE_PG_URL" \
+          -v ON_ERROR_STOP=1 \
+          -f services/clean-code/migrations/0009_scan_run_payload_hash_unique.up.sql
+      ```
+
+      Do NOT route this migration through a wrapper that
+      opens a transaction. Verify the new index is
+      `valid=true` post-apply:
+
+      ```sql
+      SELECT indexname, indisvalid
+      FROM   pg_indexes ix JOIN pg_class c ON c.relname = ix.indexname
+                            JOIN pg_index i ON i.indexrelid = c.oid
+      WHERE  ix.indexname = 'scan_run_payload_hash_verb_uniq';
+      ```
+
+      An `invalid` index means the concurrent build failed
+      (likely a pre-existing duplicate on the new `(verb,
+      payload_hash)` shape); `DROP INDEX CONCURRENTLY` and
+      investigate before retrying. Also verify the new CHECK
+      constraint is present:
+
+      ```sql
+      SELECT conname FROM pg_constraint
+      WHERE  conname = 'scan_run_verb_payload_hash_consistent';
+      ```
+
+- [ ] Confirm there are NO duplicate
+      `(verb, payload_hash) WHERE payload_hash IS NOT NULL`
+      rows in `scan_run` BEFORE migration 0009 -- otherwise
+      the CONCURRENTLY build will mark the new index
+      `invalid`:
+
+      ```sql
+      SELECT verb, payload_hash, count(*)
+      FROM   scan_run
+      WHERE  payload_hash IS NOT NULL
+      GROUP  BY verb, payload_hash
+      HAVING count(*) > 1;
+      ```
+
+      Zero rows is the expected state on a fresh
+      external-ingest rollout. If a dev DB has rows from
+      iter-2's `(kind, payload_hash)` shape, the iter-3
+      backfill UPDATE assigns them `verb = '__legacy_' ||
+      kind`, which avoids violating the new CHECK
+      constraint but does NOT auto-resolve duplicates --
+      operators with rows from a prior dev environment must
+      manually deduplicate before applying 0009.
+
+### Iter-3 verification
+
+After the new binary is live, verify the
+per-verb idempotency:
+
+```bash
+# Same body, two verbs -- both MUST succeed (200) with
+# DIFFERENT scan_run_ids:
+RESP_A=$(curl -s -X POST .../v1/ingest/churn  --data @body.json -H "X-Hub-Signature-256: sha256=...")
+RESP_B=$(curl -s -X POST .../v1/ingest/defects --data @body.json -H "X-Hub-Signature-256: sha256=...")
+[[ "$(jq -r .scan_run_id <<< "$RESP_A")" != "$(jq -r .scan_run_id <<< "$RESP_B")" ]] || echo "FAIL: per-verb idempotency regressed"
+```
+
+### Rollback (iter 3)
+
+`migrations/0009_scan_run_payload_hash_unique.down.sql`:
+
+```sql
+DROP INDEX CONCURRENTLY IF EXISTS clean_code.scan_run_payload_hash_verb_uniq;
+ALTER TABLE clean_code.scan_run DROP CONSTRAINT IF EXISTS scan_run_verb_payload_hash_consistent;
+ALTER TABLE clean_code.scan_run DROP COLUMN IF EXISTS verb;
+```
+
+Apply via `psql -f` (autocommit). Rolling back leaves the
+external-ingest Router functional but NOT
+durably-idempotent across replicas / restarts.
+
+## Stage 4.1 iter 2: durable `scan_run(payload_hash)` idempotency + Router mount
+
+*Note: iter-2's `(kind, payload_hash)` uniqueness shape
+has been superseded by iter-3's `(verb, payload_hash)`
+shape. The iter-2 checklist below is preserved as
+historical record; the iter-3 checklist above is the
+canonical playbook for the migration step.*
+
+Iter 1 shipped the transport / HMAC / in-process idempotency
+layers. Iter 2 closes the durability gap: a second POST with
+the same canonical body now resolves through the database
+even across replica or restart boundaries, and the Router is
+wired into the running service.
+
+### Pre-roll checklist (iter 2 -- in order)
+
+- [ ] Apply migration 0009 BEFORE deploying the new binary.
+      The file is
+      `services/clean-code/migrations/0009_scan_run_payload_hash_unique.up.sql`.
+      It uses `CREATE UNIQUE INDEX CONCURRENTLY`, which CANNOT
+      run inside a transaction:
+
+      ```bash
+      psql "$CLEAN_CODE_PG_URL" \
+          -v ON_ERROR_STOP=1 \
+          -f services/clean-code/migrations/0009_scan_run_payload_hash_unique.up.sql
+      ```
+
+      Do NOT route this migration through a wrapper that opens
+      a transaction. Verify the index is `valid=true` post-apply:
+
+      ```sql
+      SELECT indexname, indisvalid
+      FROM   pg_indexes ix JOIN pg_class c ON c.relname = ix.indexname
+                            JOIN pg_index i ON i.indexrelid = c.oid
+      WHERE  ix.indexname = 'scan_run_payload_hash_kind_uniq';
+      ```
+
+      An `invalid` index means the concurrent build failed (likely
+      a pre-existing duplicate); `DROP INDEX CONCURRENTLY` and
+      investigate before retrying.
+
+- [ ] Confirm there are NO duplicate
+      `(kind, payload_hash) WHERE payload_hash IS NOT NULL`
+      rows in `scan_run` BEFORE migration 0009 -- otherwise the
+      CONCURRENTLY build will mark the index `invalid`:
+
+      ```sql
+      SELECT kind, payload_hash, count(*)
+      FROM   scan_run
+      WHERE  payload_hash IS NOT NULL
+      GROUP  BY kind, payload_hash
+      HAVING count(*) > 1;
+      ```
+
+      Zero rows is the expected state on a fresh
+      external-ingest rollout.
+
+- [ ] Set the three env vars in the deployment secret store:
+
+      ```
+      CLEAN_CODE_ENABLE_EXTERNAL_INGEST_WEBHOOK=true
+      CLEAN_CODE_WEBHOOK_SIGNING_KEY_ID=<opaque ASCII id>
+      CLEAN_CODE_WEBHOOK_HMAC_SECRET=<32+ random bytes, base64 or hex>
+      ```
+
+      Each is required when the flag is `true`; startup-time
+      interlocks reject partial wiring.
+
+- [ ] Roll the new `clean-code-metric-ingestor` binary.
+      Confirm the startup log line
+      `webhook.router mounted at /v1/ingest/ signing_key_id=...`
+      and the existing
+      `clean-code-metric-ingestor http listening`.
+
+- [ ] Smoke-test the durable replay using
+      `scripts/smoke/ingest-replay.sh` (or curl): POST the
+      same canonical body twice and confirm the second
+      response carries `replayed=true` AND the same
+      `scan_run_id` as the first.
+
+### Rollback (iter 2)
+
+If the Router misbehaves and the legacy `/v1/ingest/churn`
+path is sufficient:
+
+1. Set `CLEAN_CODE_ENABLE_EXTERNAL_INGEST_WEBHOOK=false` and
+   restart. The Router unmounts; the legacy churn handler
+   continues serving.
+2. (Optional) Drop the partial unique index if it's blocking
+   an unrelated `scan_run` insertion path:
+
+   ```bash
+   psql "$CLEAN_CODE_PG_URL" -v ON_ERROR_STOP=1 \
+       -f services/clean-code/migrations/0009_scan_run_payload_hash_unique.down.sql
+   ```
+
+   This is safe: the constraint is the ONLY thing depending
+   on the index, and re-applying 0009 later is idempotent
+   (`IF NOT EXISTS`). After the drop, retries across replicas
+   degrade to "may insert duplicate `scan_run` rows on race"
+   -- the Router still works, just not durably-idempotent.
+
+## Stage 4.1: external ingest webhook Router + HMAC
+
+The generic `/v1/ingest/{verb}` Router lands in
+`internal/ingest/webhook/router.go` and is the production
+surface for all four `ingest.*` verbs. Stage 4.1 ships the
+transport, HMAC, and idempotency layers; per-verb dispatch
+(coverage / test_balance / churn / defects) is wired
+incrementally in Stages 4.2-4.5.
+
+### Pre-roll checklist
+
+- [ ] Generate ONE signing key id (e.g. UUID, or
+  `kv-prod-2026-q1`) and ONE 32-byte secret. Distribute the
+  secret to publishers via the deployment's secret manager,
+  NOT source control.
+- [ ] Seed `webhook.StaticSecretResolver` with the `(id,
+  secret)` pair at composition-root startup. The Router
+  panics on a nil resolver or a registration with an empty
+  secret -- a misconfigured deployment fails LOUDLY rather
+  than serving unauthenticated traffic.
+- [ ] CI publishers MUST compute and send BOTH headers per
+  request:
+  - `X-Signing-Key-Id: <the id agreed above>`
+  - `X-Hub-Signature-256: sha256=<lowercase-hex HMAC-SHA256(body, secret)>`
+- [ ] CI publishers SHOULD treat any `replayed=true` in the
+  200 envelope as success (no-op retry); retries against
+  network errors are safe and idempotent.
+
+### Operator key rotation (24h overlap)
+
+1. `resolver.Add(newID, newSecret)` -- both ids verify.
+2. Update publishers in waves.
+3. After 24h: `resolver.Remove(oldID)`. The old id now
+   yields `HMAC_UNKNOWN_KEY_ID` -- monitor the
+   `HMAC verification failed` warning logs for stragglers.
+
 ## Stage 5.7 (iter 4): least-privilege Audit writes, durable catchup, and production gate wiring
 
 This subsection captures the operator-facing changes that

@@ -60,9 +60,17 @@ var ErrUUIDMintFailed = errors.New("churn: minting churn_event_id failed")
 // staged rows without a follow-up SELECT.
 type ChurnEvent struct {
 	// ChurnEventID is the per-row PK. Minted by the
-	// caller-supplied UUID generator at hydrate time; the
-	// production path uses [uuid.NewV7] (time-ordered, so the
-	// PK index is correlated with insert order).
+	// caller-supplied UUID generator at hydrate time. The
+	// default minter wired by [NewIngester] is
+	// [uuid.NewV4] (random) -- consequently `churn_event_id`
+	// is NOT correlated with insert order. Callers that need
+	// insert-time ordering MUST sort on `created_at` (or
+	// `payload_row_index` within a single scan_run), NOT on
+	// `churn_event_id`. Tests and the materialiser's read
+	// path already follow this rule; see
+	// [InMemoryChurnEventStore.ListChurnEventsForRepo] and
+	// [PGChurnEventStore.ListChurnEventsForRepo] for the
+	// canonical ordering tuple.
 	ChurnEventID uuid.UUID
 	// ScanRunID is the parent ScanRun the Router opened with
 	// (verb='churn', kind='external_per_row',

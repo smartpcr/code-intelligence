@@ -23,6 +23,22 @@ import (
 	"github.com/lib/pq"
 )
 
+// Sentinel errors emitted by the PG-backed rescan store at
+// composition-root wiring time. These mirror the retract
+// store's sentinels but name the rescan seam explicitly so
+// an operator debugging a rescan wiring failure sees an
+// error that points at the rescan store rather than the
+// retract store.
+var (
+	// ErrPGRescanStoreNilDB surfaces a nil *sql.DB at
+	// wiring time so the operator log names the missing
+	// seam.
+	ErrPGRescanStoreNilDB = errors.New("metric_ingestor: NewPGRescanScanRunStore: *sql.DB is nil")
+	// ErrPGRescanStoreEmptySchema surfaces an empty
+	// schema name at wiring time.
+	ErrPGRescanStoreEmptySchema = errors.New("metric_ingestor: NewPGRescanScanRunStoreWithSchema: schema is empty")
+)
+
 // PGRescanScanRunStore is the production
 // PostgreSQL-backed [RescanScanRunStore]. It exposes ONLY
 // `OpenRescanRun`; the row's eventual terminal transition
@@ -49,10 +65,10 @@ func NewPGRescanScanRunStore(db *sql.DB) (*PGRescanScanRunStore, error) {
 // schema-isolated constructor.
 func NewPGRescanScanRunStoreWithSchema(db *sql.DB, schema string) (*PGRescanScanRunStore, error) {
 	if db == nil {
-		return nil, ErrPGRetractStoreNilDB
+		return nil, ErrPGRescanStoreNilDB
 	}
 	if strings.TrimSpace(schema) == "" {
-		return nil, ErrPGRetractStoreEmptySchema
+		return nil, ErrPGRescanStoreEmptySchema
 	}
 	return &PGRescanScanRunStore{db: db, schema: schema}, nil
 }

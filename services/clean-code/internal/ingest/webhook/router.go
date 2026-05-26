@@ -16,6 +16,16 @@ import (
 	"github.com/gofrs/uuid"
 )
 
+// internalErrorClientMessage is the generic, opaque message
+// the Router emits in the `error` field of every 5xx response
+// body. The detailed error (which may carry PG connection
+// strings, internal DSNs, or other server-side state) is
+// recorded via [Router.logInternal] into the structured log
+// only -- the HMAC-authenticated caller sees nothing past this
+// constant. Pinned here so the message is consistent across
+// every 5xx path and easy to grep for.
+const internalErrorClientMessage = "internal error (see server logs)"
+
 // RouterPath is the canonical HTTP path the Router is mounted
 // at. The trailing slash is significant: Go's [http.ServeMux]
 // matches the prefix and exposes the remaining `{verb}` path
@@ -114,14 +124,14 @@ type RouterResponse struct {
 // [ScanRunRepository], whose own claim semantics serialise
 // access per (verb, payload_hash).
 type Router struct {
-	resolver  SecretResolver
-	store     IdempotencyStore
+	resolver    SecretResolver
+	store       IdempotencyStore
 	scanRunRepo ScanRunRepository
-	verbs     map[string]VerbHandler
-	logger    *slog.Logger
-	newUUID   func() (uuid.UUID, error)
-	maxBytes  int64
-	now       func() time.Time
+	verbs       map[string]VerbHandler
+	logger      *slog.Logger
+	newUUID     func() (uuid.UUID, error)
+	maxBytes    int64
+	now         func() time.Time
 }
 
 // RouterConfig bundles the Router's wiring. Every field
@@ -319,10 +329,14 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		// Resolver-internal failure (e.g. a future PG-backed
 		// resolver lost its connection). Surface as 500 --
-		// the caller is not at fault.
+		// the caller is not at fault. The detailed error is
+		// logged server-side; the response body carries only
+		// the generic message so resolver-internal state
+		// (DSNs, connection strings) cannot leak to the
+		// HMAC-authenticated caller.
 		r.logInternal(req, verb, "resolver-internal-failure", rErr)
 		r.writeError(w, http.StatusInternalServerError,
-			fmt.Sprintf("resolver error: %v", rErr), "INTERNAL_ERROR", verb)
+			internalErrorClientMessage, "INTERNAL_ERROR", verb)
 		return
 	}
 	sig := req.Header.Get(HMACSignatureHeader)
@@ -375,7 +389,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if claimErr != nil {
 		r.logInternal(req, verb, "idempotency-claim-failure", claimErr)
 		r.writeError(w, http.StatusInternalServerError,
-			fmt.Sprintf("idempotency claim failed: %v", claimErr),
+			internalErrorClientMessage,
 			"INTERNAL_ERROR", verb)
 		return
 	}
@@ -402,13 +416,20 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// runs BEFORE the scan_run claim so a malformed body
 	// surfaces as 400/422 WITHOUT burning a durable
 	// scan_run row.
+	//
+	// 4xx classifications keep the verb-handler's message
+	// (it tells the caller WHAT in their payload is wrong);
+	// 5xx classifications are masked to the generic
+	// message so internal failure detail stays in the log.
 	metadata, mdErr := handler.ExtractMetadata(req.Context(), body)
 	if mdErr != nil {
 		status, code := r.classifyVerbError(handler, mdErr)
+		msg := mdErr.Error()
 		if status >= 500 {
 			r.logInternal(req, verb, "extract-metadata-failure", mdErr)
+			msg = internalErrorClientMessage
 		}
-		r.writeError(w, status, mdErr.Error(), code, verb)
+		r.writeError(w, status, msg, code, verb)
 		return
 	}
 
@@ -432,9 +453,13 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		OpenedAt:    repoOpenedAt,
 	})
 	if repoErr != nil {
+		// scan-run-open failures may carry a PG error chain
+		// (sqlstate, dsn fragments, connection details);
+		// keep the detail in the log and respond with the
+		// generic 5xx message only.
 		r.logInternal(req, verb, "scan-run-open-failure", repoErr)
 		r.writeError(w, http.StatusInternalServerError,
-			fmt.Sprintf("opening scan_run: %v", repoErr),
+			internalErrorClientMessage,
 			"INTERNAL_ERROR", verb)
 		return
 	}
@@ -466,11 +491,17 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		if fErr := r.scanRunRepo.Finalize(req.Context(), scanRunID, ScanRunStatusFailed, r.now()); fErr != nil {
 			r.logInternal(req, verb, "scan-run-finalize-failed-on-handler-error", fErr)
 		}
+		// As for ExtractMetadata: keep the verb-handler's
+		// 4xx message (it diagnoses the caller's payload)
+		// but mask 5xx detail behind the generic constant
+		// to keep PG/writer internals out of the response.
 		status, code := r.classifyVerbError(handler, hErr)
+		msg := hErr.Error()
 		if status >= 500 {
 			r.logInternal(req, verb, "verb-handle-failure", hErr)
+			msg = internalErrorClientMessage
 		}
-		r.writeError(w, status, hErr.Error(), code, verb)
+		r.writeError(w, status, msg, code, verb)
 		return
 	}
 	// Defensive: the verb handler MUST honour the supplied
@@ -485,7 +516,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		r.logInternal(req, verb, "verb-scan-run-id-mismatch", err)
 		r.writeError(w, http.StatusInternalServerError,
-			err.Error(), "INTERNAL_ERROR", verb)
+			internalErrorClientMessage, "INTERNAL_ERROR", verb)
 		return
 	}
 
@@ -505,7 +536,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			r.logInternal(req, verb, "scan-run-finalize-failed-on-marshal-error", fErr)
 		}
 		r.writeError(w, http.StatusInternalServerError,
-			fmt.Sprintf("marshalling response: %v", marshalErr),
+			internalErrorClientMessage,
 			"INTERNAL_ERROR", verb)
 		return
 	}
@@ -519,7 +550,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if fErr := r.scanRunRepo.Finalize(req.Context(), scanRunID, ScanRunStatusSucceeded, r.now()); fErr != nil {
 		r.logInternal(req, verb, "scan-run-finalize-succeeded-failure", fErr)
 		r.writeError(w, http.StatusInternalServerError,
-			fmt.Sprintf("finalize scan_run: %v", fErr),
+			internalErrorClientMessage,
 			"INTERNAL_ERROR", verb)
 		return
 	}
@@ -537,7 +568,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if cErr := r.store.Commit(req.Context(), record); cErr != nil {
 		r.logInternal(req, verb, "idempotency-commit-failure", cErr)
 		r.writeError(w, http.StatusInternalServerError,
-			fmt.Sprintf("idempotency commit failed: %v", cErr),
+			internalErrorClientMessage,
 			"INTERNAL_ERROR", verb)
 		return
 	}
@@ -613,7 +644,7 @@ func (r *Router) replayResponse(w http.ResponseWriter, req *http.Request, verb s
 	if marshalErr != nil {
 		r.logInternal(req, verb, "replay-envelope-marshal-failure", marshalErr)
 		r.writeError(w, http.StatusInternalServerError,
-			fmt.Sprintf("re-marshalling replay envelope: %v", marshalErr),
+			internalErrorClientMessage,
 			"INTERNAL_ERROR", verb)
 		return
 	}
@@ -655,7 +686,7 @@ func (r *Router) emitDurableReplay(w http.ResponseWriter, req *http.Request, ver
 	if marshalErr != nil {
 		r.logInternal(req, verb, "durable-replay-envelope-marshal-failure", marshalErr)
 		r.writeError(w, http.StatusInternalServerError,
-			fmt.Sprintf("marshalling durable replay envelope: %v", marshalErr),
+			internalErrorClientMessage,
 			"INTERNAL_ERROR", verb)
 		return
 	}

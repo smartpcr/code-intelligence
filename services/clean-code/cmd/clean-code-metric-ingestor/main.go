@@ -481,7 +481,20 @@ func mountIngestRouter(mux *http.ServeMux, cfg config.Config, ingestorDB *sql.DB
 
 	// In-process response_body cache (fast same-process
 	// replay; the durable seam handles cross-process).
-	idempotencyStore := webhook.NewInMemoryIdempotencyStore(0)
+	//
+	// The cap is MANDATORY in production per the doc on
+	// idempotency.go lines 220-226: a zero cap (unbounded)
+	// would let an authenticated-but-malicious publisher
+	// OOM the process by replaying with rotating fresh
+	// payloads. 65 536 is the doc-recommended cap; eviction
+	// is LRU by arrival-of-commit and in-flight claims are
+	// NEVER evicted (which would violate the Commit
+	// contract). At v1 scale (1-2 popular slots in a retry
+	// storm; cache entry ≈ response_body size + key) this
+	// caps the cache at well under 100 MiB of resident
+	// memory even with maximum-size payloads.
+	const idempotencyCacheMaxEntries = 65536
+	idempotencyStore := webhook.NewInMemoryIdempotencyStore(idempotencyCacheMaxEntries)
 
 	// Single-key resolver: v1 is single-tenant per
 	// tech-spec Sec 4.14, so one (key_id, secret) pair is

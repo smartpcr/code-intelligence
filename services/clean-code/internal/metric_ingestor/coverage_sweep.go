@@ -25,6 +25,33 @@ import (
 // writer-side seam.
 var ErrCoverageSHAMismatch = errors.New("metric_ingestor: ScanRunContext.SHA does not match coverage.Payload.SHA (single-SHA binding violated)")
 
+// ErrEmptyScanRunSHA is returned by [CoverageSweep.Run]
+// when [ScanRunContext.SHA] is the empty string. The
+// `external_single` scan_run is opened with the body's SHA
+// stamped on `scan_run.to_sha` BEFORE this sweep runs; an
+// empty value here means the webhook's ExtractMetadata
+// step never persisted a SHA on the parent scan_run.
+//
+// This is a DEDICATED sentinel (rather than letting the
+// emptiness fall through into the
+// [ErrCoverageSHAMismatch] branch on line 209) so an
+// operator can distinguish "publisher stamped two
+// disagreeing SHAs" -- a wire-protocol violation that
+// points at the upstream publisher -- from "the scan_run
+// was opened without a SHA at all" -- a webhook /
+// scan-run-store bug that points at our own ingress path.
+// The mismatch error's format string would otherwise read
+// `scan_run.sha= payload.sha=<40 hex>`, which buries the
+// root cause behind the misleading "the two channels
+// disagree" framing.
+//
+// The payload-side SHA is enforced non-empty AND 40-char
+// hex by `coverage.ParseXML` (`shaRegex.MatchString`)
+// before this sweep ever sees it, so a dedicated
+// `ErrEmptyPayloadSHA` is unnecessary -- the parser
+// rejects that case at the ingress boundary.
+var ErrEmptyScanRunSHA = errors.New("metric_ingestor: ScanRunContext.SHA is empty (external_single scan_run was opened without a to_sha)")
+
 // `scan_run.kind` literals the [CoverageSweep] accepts. A
 // coverage upload carries ONE `sha` per call (tech-spec Sec
 // 4.11 line 429-431, architecture Sec 6.4 lines 1364-1366),
@@ -140,12 +167,25 @@ func newCoverageSweepWithUUID(
 // [ScanRunContext.Validate] (which accepts the ChurnSweep's
 // allow-list) so the structural-coupling of churn and
 // coverage at the kind level is explicit.
+//
+// The SHA non-empty guard is INTENTIONALLY at this layer
+// (not on the shared [ScanRunContext.Validate]): only the
+// single-SHA-binding pipelines (`external_single`) require
+// a non-empty `to_sha` on the scan_run -- the
+// foundation-recipe `full` / `delta` scans do NOT, so
+// pushing the check up would over-constrain ChurnSweep.
+// Running BEFORE the [ErrCoverageSHAMismatch] check in
+// Run keeps the "missing SHA" and "disagreeing SHA"
+// failure modes distinguishable.
 func validateCoverageScanRun(c ScanRunContext) error {
 	if c.ID == uuid.Nil {
 		return ErrZeroScanRunID
 	}
 	if c.RepoID == uuid.Nil {
 		return ErrZeroRepoID
+	}
+	if c.SHA == "" {
+		return ErrEmptyScanRunSHA
 	}
 	for _, k := range coverageAllowedScanRunKinds {
 		if c.Kind == k {
@@ -160,7 +200,8 @@ func validateCoverageScanRun(c ScanRunContext) error {
 // pipeline:
 //
 //  1. Validate [ScanRunContext]: non-zero
-//     [ScanRunContext.ID] / [ScanRunContext.RepoID] AND
+//     [ScanRunContext.ID] / [ScanRunContext.RepoID],
+//     non-empty [ScanRunContext.SHA], AND
 //     [ScanRunContext.Kind] == `external_single` (the
 //     only kind compatible with the single-SHA coverage
 //     semantics).
@@ -206,6 +247,12 @@ func (s *CoverageSweep) Run(ctx context.Context, scanRun ScanRunContext, payload
 	// paths violate the single-SHA invariant the row keys
 	// are stamped against, so fail-closed before the
 	// writer call.
+	//
+	// NOTE: scanRun.SHA is guaranteed non-empty here --
+	// validateCoverageScanRun above returns
+	// [ErrEmptyScanRunSHA] for the empty case so the
+	// "missing SHA" vs "disagreeing SHAs" failure modes
+	// surface as DISTINCT sentinels to the operator.
 	if scanRun.SHA != payload.SHA {
 		return CoverageSweepResult{}, fmt.Errorf("%w: scan_run.sha=%s payload.sha=%s",
 			ErrCoverageSHAMismatch, scanRun.SHA, payload.SHA)

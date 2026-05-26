@@ -80,6 +80,9 @@ type evalGateState struct {
 	// Samples-pending in double-write
 	samplesDoubleWriteSHA string
 
+	// KMS policy signature for eval.gate calls
+	policySignature string
+
 	// HTTP response tracking
 	lastHTTPStatus int
 	lastHTTPBody   string
@@ -351,8 +354,7 @@ func (s *evalGateState) aUniqueCleanSHAWithSamplesPresentAndAValidPolicySignatur
 		return fmt.Errorf("signing policy for clean-pass SHA: %w", err)
 	}
 	if sig != "" {
-		// Store signature for use in the eval.gate call
-		s.lastHTTPBody = sig // reuse field temporarily
+		s.policySignature = sig
 	}
 
 	return nil
@@ -370,8 +372,8 @@ func (s *evalGateState) theRuleEngineHTTPInvocationCountIsSnapshottedViaMetrics(
 func (s *evalGateState) evalGateIsCalledForTheCleanPassPath() error {
 	extras := map[string]interface{}{}
 	// Include valid policy signature if one was obtained from KMS mock
-	if s.lastHTTPBody != "" {
-		extras["signature"] = s.lastHTTPBody
+	if s.policySignature != "" {
+		extras["signature"] = s.policySignature
 	}
 	status, body, err := callEvalGate(s.evaluatorURL, s.sha, s.repoID, s.policyVersionID, extras)
 	if err != nil {

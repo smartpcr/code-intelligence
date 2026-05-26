@@ -256,6 +256,12 @@ func (s *testBalanceState) noMetricSampleRowsExistWithMetricKindOr(kind1, kind2 
 		return fmt.Errorf("no scan_run_id captured from upload response")
 	}
 
+	// Brief pause to ensure async processing had time to complete. This makes
+	// the negative assertion robust in isolation (e.g. if scenario step order
+	// changes) instead of relying on a preceding polling Then step to absorb
+	// the webhook's async work. Mirrors noMetricSampleRowIsWrittenForScopeID.
+	time.Sleep(2 * time.Second)
+
 	var count int
 	err := s.db.QueryRowContext(context.Background(), `
 		SELECT COUNT(*) FROM clean_code.metric_sample

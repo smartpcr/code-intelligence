@@ -10,7 +10,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/repo_indexer"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/repo_indexer"
 )
 
 // fixedRepoID is a stable repo_id literal used across tests.

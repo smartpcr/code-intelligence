@@ -9,9 +9,9 @@ import (
 
 	"github.com/lib/pq"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/coverage"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/materialisers"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/coverage"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/materialisers"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
 
 // pgMetricKindTable is the unqualified `metric_kind` catalog

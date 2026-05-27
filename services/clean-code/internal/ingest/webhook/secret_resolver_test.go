@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/webhook"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook"
 )
 
 // TestStaticSecretResolver_RoundTrip pins the happy-path

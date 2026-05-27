@@ -47,8 +47,8 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/config"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/repo_indexer"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/config"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/repo_indexer"
 )
 
 // Sentinel errors emitted by the stale-sweep layer.

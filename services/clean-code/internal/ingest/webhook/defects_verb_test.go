@@ -10,8 +10,8 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/defects"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/webhook"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/defects"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook"
 )
 
 // goodDefectsPayloadJSON returns a serialised defects payload

@@ -7,7 +7,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/config"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/config"
 )
 
 // TestOpenMgmtDB_FailsFastWhenUnsetAndNotOptedIn pins Stage 3.4 iter

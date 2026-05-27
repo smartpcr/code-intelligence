@@ -7,7 +7,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/keys"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
 )
 
 // newSamplePolicyVersion mints a typical [PolicyVersion]

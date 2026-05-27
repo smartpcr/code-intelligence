@@ -5,9 +5,9 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/dsl"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/keys"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/steward"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/dsl"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 )
 
 // newWiredSteward constructs a fully-wired [steward.Steward]

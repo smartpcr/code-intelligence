@@ -5,9 +5,9 @@ import (
 	"math"
 	"testing"
 
-	astv1 "github.com/microsoft/code-intelligence/services/clean-code/internal/ast/v1"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/scope"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
+	astv1 "github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/v1"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
 
 // makeDupFile builds an AstFile with the given path, package

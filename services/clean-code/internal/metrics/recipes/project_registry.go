@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/parser"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
 )
 
 // ProjectRecipe is the contract every metric_kind whose value

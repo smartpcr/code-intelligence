@@ -51,7 +51,7 @@ CLEAN_CODE_MAIN_PKG ?= ./cmd/clean-coded
 # `--go_opt=module=$(PROTO_GO_MODULE)` so generated files land at
 # the import path the source-tree expects -- specifically
 # `internal/ast/v1/ast.pb.go` for the AST v1 proto.
-PROTO_GO_MODULE     ?= github.com/microsoft/code-intelligence/services/clean-code
+PROTO_GO_MODULE     ?= github.com/smartpcr/code-intelligence/services/clean-code
 PROTO_DIR           ?= proto
 PROTO_OUT_DIR       ?= .
 PROTO_FILES         ?= ast/v1/ast.proto

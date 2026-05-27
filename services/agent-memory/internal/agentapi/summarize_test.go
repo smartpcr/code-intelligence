@@ -26,8 +26,12 @@ package agentapi
 //   * Summariser error returning partial-but-non-empty
 //       SummaryMD: partial output MUST be discarded.
 //   * Reranker freshness 8 days old → `reranker_model_stale`.
-//   * Reranker freshness 1 hour old → `summariser_unavailable`.
-//   * Reranker freshness lookup error → `summariser_unavailable`.
+//   * Reranker freshness 1 hour old → internal classifier
+//       `summariser_unavailable`, translated on the wire to
+//       `embedding_index_unavailable` by Stage 8.1.
+//   * Reranker freshness lookup error → internal classifier
+//       `summariser_unavailable`, translated on the wire to
+//       `embedding_index_unavailable` by Stage 8.1.
 //   * Parent ctx cancellation propagates as hard error (no
 //       degraded envelope).
 //   * Context log append soft failure → response with empty
@@ -52,6 +56,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/degraded"
 )
 
 // fakeSummariser is the deterministic counterpart to the
@@ -778,8 +784,12 @@ func TestSummarize_node_graphUnavailable_emptyRepoID_stillAppends(t *testing.T) 
 // the Stage 5.4 acceptance scenario "timeout returns degraded
 // summary". The summariser sleeps past the 1 ms budget; the
 // verb must (a) abandon the LLM call, (b) render the
-// deterministic template, (c) mark degraded=true with
-// `summariser_unavailable` (no freshness source wired).
+// deterministic template, (c) mark degraded=true. The
+// internal classifier picks `summariser_unavailable` (no
+// freshness source wired); Stage 8.1's
+// applySummarizeDegradedContract then translates it to the
+// closed-set wire reason `embedding_index_unavailable`
+// before Enforce.
 func TestSummarize_summariserTimeout_returnsDegradedTemplate(t *testing.T) {
 	nb := sampleNodeNeighborhood()
 	resolver := &fakeResolver{
@@ -806,9 +816,17 @@ func TestSummarize_summariserTimeout_returnsDegradedTemplate(t *testing.T) {
 	if !resp.Degraded {
 		t.Fatalf("Degraded = false; want true on timeout")
 	}
-	if resp.DegradedReason != DegradedReasonSummariserUnavailable {
-		t.Fatalf("DegradedReason = %q; want %q",
-			resp.DegradedReason, DegradedReasonSummariserUnavailable)
+	// Stage 8.1: applySummarizeDegradedContract translates the
+	// rich classifier value `summariser_unavailable` to the
+	// closed-set wire reason `embedding_index_unavailable`
+	// (both are model-serving infrastructure outages and share
+	// the operator triage path). The original classifier is
+	// emitted via the `degraded_reason_raw` structured-log
+	// field, not the wire envelope.
+	if resp.DegradedReason != degraded.ReasonEmbeddingIndexUnavailable {
+		t.Fatalf("DegradedReason = %q; want %q (translated from %q)",
+			resp.DegradedReason, degraded.ReasonEmbeddingIndexUnavailable,
+			DegradedReasonSummariserUnavailable)
 	}
 	// CRITICAL: partial output MUST NOT leak into the
 	// response. Even though the fake's `output` field is
@@ -910,9 +928,10 @@ func TestSummarize_rerankerFresh_surfacesSummariserUnavailable(t *testing.T) {
 	resp, _ := svc.Summarize(context.Background(), SummarizeRequest{
 		NodeID: nb.Node.NodeID,
 	})
-	if resp.DegradedReason != DegradedReasonSummariserUnavailable {
-		t.Fatalf("DegradedReason = %q; want %q",
-			resp.DegradedReason, DegradedReasonSummariserUnavailable)
+	if resp.DegradedReason != degraded.ReasonEmbeddingIndexUnavailable {
+		t.Fatalf("DegradedReason = %q; want %q (Stage 8.1 wire translation of %q)",
+			resp.DegradedReason, degraded.ReasonEmbeddingIndexUnavailable,
+			DegradedReasonSummariserUnavailable)
 	}
 }
 
@@ -934,9 +953,9 @@ func TestSummarize_freshnessSourceError_fallsBackToSummariserUnavailable(t *test
 	if err != nil {
 		t.Fatalf("Summarize: %v", err)
 	}
-	if resp.DegradedReason != DegradedReasonSummariserUnavailable {
-		t.Fatalf("DegradedReason = %q; want %q (freshness lookup err → conservative)",
-			resp.DegradedReason, DegradedReasonSummariserUnavailable)
+	if resp.DegradedReason != degraded.ReasonEmbeddingIndexUnavailable {
+		t.Fatalf("DegradedReason = %q; want %q (freshness lookup err → conservative summariser_unavailable, wire-translated)",
+			resp.DegradedReason, degraded.ReasonEmbeddingIndexUnavailable)
 	}
 }
 
@@ -955,9 +974,9 @@ func TestSummarize_freshnessSourceNoRow_fallsBackToSummariserUnavailable(t *test
 	resp, _ := svc.Summarize(context.Background(), SummarizeRequest{
 		NodeID: nb.Node.NodeID,
 	})
-	if resp.DegradedReason != DegradedReasonSummariserUnavailable {
-		t.Fatalf("DegradedReason = %q; want %q (cold-start: no row)",
-			resp.DegradedReason, DegradedReasonSummariserUnavailable)
+	if resp.DegradedReason != degraded.ReasonEmbeddingIndexUnavailable {
+		t.Fatalf("DegradedReason = %q; want %q (cold-start: no row → wire-translated)",
+			resp.DegradedReason, degraded.ReasonEmbeddingIndexUnavailable)
 	}
 }
 

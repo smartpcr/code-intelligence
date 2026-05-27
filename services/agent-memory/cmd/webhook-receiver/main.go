@@ -69,6 +69,7 @@ import (
 
 	_ "github.com/lib/pq"
 
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/obs"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/webhookreceiver"
 )
 
@@ -86,6 +87,22 @@ func main() {
 		os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Stage 8.3 step 2 — OTel trace export. Best-effort
+	// noop when no endpoint configured.
+	tracerSetup, err := obs.SetupTracer(ctx, obs.ServiceNameWebhookReceiver, logger)
+	if err != nil {
+		logger.Error("webhook-receiver.otel.setup_failed", slog.String("error", err.Error()))
+		os.Exit(2)
+	}
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tracerSetup.Shutdown(shutCtx)
+	}()
+	logger.Info("webhook-receiver.otel.ready",
+		slog.Bool("exporting", tracerSetup.Exporting),
+		slog.String("endpoint", tracerSetup.EndpointResolved))
+
 	db, err := openPG(ctx, cfg, logger)
 	if err != nil {
 		logger.Error("webhook-receiver.pg", slog.String("error", err.Error()))
@@ -97,6 +114,10 @@ func main() {
 		Logger:          logger,
 		SignatureHeader: cfg.SignatureHeader,
 		MaxBodyBytes:    cfg.MaxBodyBytes,
+		// Stage 8.3 step 2 -- wire the OTel tracer so each
+		// inbound webhook produces a
+		// `webhookreceiver.receive` span.
+		Tracer: tracerSetup.Tracer,
 	})
 
 	mux := http.NewServeMux()
@@ -104,6 +125,28 @@ func main() {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+	// Stage 8.3 step 1 — /metrics surface. The receiver now
+	// exposes a per-status request counter on top of the
+	// up-gauge so `sum by (status) (rate(...))` queries on the
+	// dashboard render real data without a manual log scrape.
+	// Iter-3 evaluator fix #2 added the counter to close the
+	// "every binary emits counters" gap.
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		if r.Method == http.MethodHead {
+			return
+		}
+		fmt.Fprintf(w, "# HELP webhook_receiver_up Always 1 -- presence indicates the binary is reachable for Prometheus scrape (Stage 8.3 step 1).\n")
+		fmt.Fprintf(w, "# TYPE webhook_receiver_up gauge\n")
+		fmt.Fprintf(w, "webhook_receiver_up 1\n")
+		handler.WriteMetrics(w)
 	})
 
 	srv := &http.Server{

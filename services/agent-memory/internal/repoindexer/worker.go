@@ -13,7 +13,10 @@ import (
 	"github.com/lib/pq"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/obs"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Mode is the ingest_jobs.mode discriminator. The values are
@@ -181,6 +184,12 @@ type WorkerOptions struct {
 	// `NewRetirementAdapter` for production wiring; tests
 	// supply a fake satisfying the `Retirer` interface.
 	Retirer Retirer
+
+	// Tracer wraps each job-claim cycle in a
+	// `repoindexer.process_job` OTel span (Stage 8.3 step 2).
+	// Nil is tolerated and falls back to a noop tracer at
+	// call time so the unit tests don't need a tracer.
+	Tracer trace.Tracer
 }
 
 // DefaultMaxAttempts is the operator default for
@@ -224,6 +233,10 @@ type Worker struct {
 
 	logger *slog.Logger
 	now    func() time.Time
+
+	// tracer wraps each ProcessOnce call in a
+	// `repoindexer.process_job` OTel span (Stage 8.3 step 2).
+	tracer trace.Tracer
 }
 
 // NewWorker constructs a Worker over `db` (an `agent_memory_app`
@@ -289,6 +302,7 @@ func NewWorker(db *sql.DB, writer *graphwriter.Writer, opts WorkerOptions) *Work
 		maxAttempts:  maxAttempts,
 		logger:       logger,
 		now:          now,
+		tracer:       opts.Tracer,
 	}
 }
 
@@ -358,10 +372,21 @@ func (w *Worker) ProcessOnce(ctx context.Context) (processed bool, err error) {
 		return false, err
 	}
 	// Beyond this point we have ownership of the row.
+	// Stage 8.3 step 2 -- open a `repoindexer.process_job`
+	// span around the handler dispatch. The span carries
+	// low-cardinality attributes (repo_id + mode) so trace
+	// UIs can facet by repo without exploding cardinality.
 	// Any handler failure is recorded against the row; we
 	// always return processed=true so the polling loop knows
 	// it executed work this tick.
-	w.processClaimed(ctx, job)
+	_ = obs.TickSpan(ctx, w.tracer, "repoindexer.process_job", []attribute.KeyValue{
+		attribute.String("repo_id", job.RepoID.String()),
+		attribute.String("mode", string(job.Mode)),
+		attribute.String("worker_id", w.workerID),
+	}, func(ctx context.Context) error {
+		w.processClaimed(ctx, job)
+		return nil
+	})
 	return true, nil
 }
 

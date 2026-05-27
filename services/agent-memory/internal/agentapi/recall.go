@@ -44,8 +44,21 @@ import (
 	"strings"
 	"time"
 
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/degraded"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/embedding"
+	"go.opentelemetry.io/otel/trace"
 )
+
+// VerbRecall / VerbExpand are the §6.3 verb identifiers the
+// Stage 8.1 wiring stamps on degraded-metric counters and
+// `FaultInjector` lookups.  They are package-level constants
+// so a test (or operator-facing rule editor) cannot drift
+// from the on-the-wire spelling.
+const (
+	VerbRecall = "agent.recall"
+	VerbExpand = "agent.expand"
+)
+
 
 // QueryEmbedder is the narrow read-side view of
 // `embedding.Embedder`.  The recall service ONLY needs the
@@ -228,6 +241,36 @@ type Service struct {
 	expandMaxEdges    int
 	expandSnapshot    ExpandSnapshotSource
 	expandEdgeKinds   []string
+
+	// Stage 8.1 degraded-mode contract wiring. Both fields are
+	// optional; a nil value is a no-op. The verbs apply
+	// `degraded.Enforce` regardless so a closed-set violation
+	// always trips, even when no test seam is wired.
+	degradedMetric degraded.Metric
+	faultInjector  degraded.FaultInjector
+
+	// Stage 8.3 — per-verb latency observers wired by
+	// `WithRecallLatencyObserver` / `WithObserveLatencyObserver`
+	// / `WithExpandLatencyObserver` /
+	// `WithSummarizeLatencyObserver`. See `latency.go` for the
+	// callback contract. Each verb dispatches its elapsed
+	// wall-clock seconds via `recordLatency` in a deferred
+	// block; the binary at `cmd/agent-api/main.go` binds these
+	// to `obs.Histogram.Observe` for Prometheus exposition. A
+	// nil observer is a no-op (the verbs call `observerOrNoop`).
+	recallLatency    LatencyObserver
+	observeLatency   LatencyObserver
+	expandLatency    LatencyObserver
+	summarizeLatency LatencyObserver
+
+	// Stage 8.3 step 2 (iter-2 evaluator fix #1) — per-verb
+	// OpenTelemetry tracer. Each verb opens a single span at
+	// its entry point and threads the returned context into
+	// every downstream call so the span tree captures the
+	// real operation. A nil tracer is a no-op; the per-verb
+	// wrapper helpers in `tracing.go` substitute a package
+	// noop tracer at call time.
+	tracer trace.Tracer
 }
 
 // Option configures a `Service`.
@@ -280,6 +323,31 @@ func WithOverFetchMultiplier(n int) Option {
 func WithHealthSource(h HealthSource) Option {
 	return func(s *Service) {
 		s.health = h
+	}
+}
+
+// WithDegradedMetric plumbs the per-verb degraded counter.
+// The Stage 8.1 contract calls `IncDegraded(verb, reason)`
+// every time the recall / expand handler returns a degraded
+// response with a closed-set reason. A nil metric is a no-op.
+// Wire `degraded.NewCounter()` in the production binary so the
+// admin `mgmt.metrics` endpoint can surface per-verb gauges.
+func WithDegradedMetric(m degraded.Metric) Option {
+	return func(s *Service) {
+		s.degradedMetric = m
+	}
+}
+
+// WithFaultInjector plumbs the Stage 8.1 test seam that flips
+// recall / expand into a synthetic degraded state. Production
+// binaries leave this nil; only contract tests and the
+// `mgmt.fault.inject` admin command wire a real value.  The
+// handler always runs `degraded.Enforce` against the final
+// response so a non-closed reason produced by injection is
+// caught — see `applyDegradedContract` in `recall.go`.
+func WithFaultInjector(f degraded.FaultInjector) Option {
+	return func(s *Service) {
+		s.faultInjector = f
 	}
 }
 
@@ -635,7 +703,39 @@ const maxK = 256
 // still carries `OverFetched` and `Filtered` so the
 // operator can distinguish "no vectors matched the query"
 // from "all matching vectors are still queued/failed".
-func (s *Service) Recall(ctx context.Context, req RecallRequest) (RecallResponse, error) {
+func (s *Service) Recall(ctx context.Context, req RecallRequest) (resp RecallResponse, err error) {
+	// Stage 8.3 — record `agent_recall_duration_seconds`
+	// for every call (happy path AND degraded), so the
+	// dashboard's p95/p99 panels include the slow tail
+	// caused by degraded fallbacks. The defer fires
+	// AFTER the Stage 8.1 contract wrap below.
+	recallStart := time.Now()
+	defer func() { recordLatency(s.recallLatency, recallStart) }()
+
+	// Stage 8.3 step 2 — open the `agent.recall` operational
+	// span and thread the returned context into every
+	// downstream call. The defer below records the terminal
+	// status (error vs. degraded-but-served) AFTER the named-
+	// return wrap fires, so the span captures the final
+	// caller-visible outcome.
+	var span trace.Span
+	ctx, span = startVerbSpan(ctx, s.tracer, VerbRecall, req.RepoID)
+	defer func() { endVerbSpan(span, err, resp.DegradedReason) }()
+
+	// Stage 8.1 — every successful exit of Recall funnels
+	// through the closed-set contract helper. Named returns
+	// + deferred wrap keep every existing `return resp, nil`
+	// site untouched, which avoids the "fixed one branch,
+	// missed the other" regression class flagged on prior
+	// iters. On error we skip the helper (no metric / no
+	// overlay on a 500).
+	defer func() {
+		if err != nil {
+			return
+		}
+		resp, err = s.applyRecallDegradedContract(req.RepoID, resp)
+	}()
+
 	if strings.TrimSpace(req.Query) == "" {
 		return RecallResponse{}, ErrEmptyQuery
 	}
@@ -868,7 +968,7 @@ func (s *Service) Recall(ctx context.Context, req RecallRequest) (RecallResponse
 		taken++
 	}
 
-	resp := RecallResponse{
+	resp = RecallResponse{
 		Hits:                 hits,
 		Nodes:                nodes,
 		Edges:                expansion.Edges,
@@ -1125,6 +1225,136 @@ func appendFrontierCandidates(
 	}
 	_ = allowSet // kept on signature for future per-frontier filtering
 	return out
+}
+
+// applyRecallDegradedContract is the Stage 8.1 contract wiring
+// helper Recall funnels every successful exit through. Mirrors
+// the `applyDegradedContract` helper on ObserveService:
+//
+//  1. Overlay the fault-injection reason ONLY when its closed-
+//     set priority strictly exceeds the in-flight reason (or
+//     the response is not currently degraded). Real outages
+//     win over injection so a test rule cannot mask a live
+//     `embedding_index_unavailable` / `graph_store_unavailable`
+//     fallback the recall path just produced.
+//  2. Enforce the §8.2 closed set on the final pair. A non-
+//     closed reason fails the call so the gRPC adapter
+//     surfaces `codes.Internal` per the §13 scenario "closed
+//     degraded_reason enforced".
+//  3. Increment the per-verb degraded counter on a valid
+//     degraded response. No increment on `degraded=false`
+//     (the healthy path).
+func (s *Service) applyRecallDegradedContract(repoID string, resp RecallResponse) (RecallResponse, error) {
+	if s.faultInjector != nil {
+		injDeg, injReason := s.faultInjector.Inject(VerbRecall, repoID)
+		if injDeg && injReason != "" {
+			if !resp.Degraded || degraded.Priority(injReason) > degraded.Priority(resp.DegradedReason) {
+				s.logger.Warn("agentapi.recall.fault_injected",
+					slog.String("repo_id", repoID),
+					slog.String("reason", injReason))
+				resp.Degraded = true
+				resp.DegradedReason = injReason
+			}
+		}
+	}
+	if err := degraded.Enforce(resp.Degraded, resp.DegradedReason); err != nil {
+		s.logger.Error("agentapi.recall.closed_set_violation",
+			slog.String("repo_id", repoID),
+			slog.String("attempted_reason", resp.DegradedReason),
+			slog.String("err", err.Error()))
+		return RecallResponse{}, fmt.Errorf("agentapi: recall: %w", err)
+	}
+	if resp.Degraded && s.degradedMetric != nil {
+		s.degradedMetric.IncDegraded(VerbRecall, resp.DegradedReason)
+	}
+	return resp, nil
+}
+
+// applyExpandDegradedContract is the §6.3 / §8.1 sibling of
+// `applyRecallDegradedContract` applied to ExpandResponse.
+// Same three-step flow (injection-overlay -> Enforce ->
+// metric); only the verb constant and response shape differ.
+// See `applyRecallDegradedContract` for the per-step rationale.
+func (s *Service) applyExpandDegradedContract(repoID string, resp ExpandResponse) (ExpandResponse, error) {
+	if s.faultInjector != nil {
+		injDeg, injReason := s.faultInjector.Inject(VerbExpand, repoID)
+		if injDeg && injReason != "" {
+			if !resp.Degraded || degraded.Priority(injReason) > degraded.Priority(resp.DegradedReason) {
+				s.logger.Warn("agentapi.expand.fault_injected",
+					slog.String("repo_id", repoID),
+					slog.String("reason", injReason))
+				resp.Degraded = true
+				resp.DegradedReason = injReason
+			}
+		}
+	}
+	if err := degraded.Enforce(resp.Degraded, resp.DegradedReason); err != nil {
+		s.logger.Error("agentapi.expand.closed_set_violation",
+			slog.String("repo_id", repoID),
+			slog.String("attempted_reason", resp.DegradedReason),
+			slog.String("err", err.Error()))
+		return ExpandResponse{}, fmt.Errorf("agentapi: expand: %w", err)
+	}
+	if resp.Degraded && s.degradedMetric != nil {
+		s.degradedMetric.IncDegraded(VerbExpand, resp.DegradedReason)
+	}
+	return resp, nil
+}
+
+// applySummarizeDegradedContract is the §6.3 / §8.1 sibling
+// of `applyRecallDegradedContract` and
+// `applyExpandDegradedContract` applied to SummarizeResponse.
+// Same three-step flow (injection-overlay -> Enforce ->
+// metric); only the verb constant and response shape differ.
+// See `applyRecallDegradedContract` for the per-step
+// rationale.
+//
+// `summariser_unavailable` is NOT in the §8.2 closed set
+// (architecture.md §8.2 pins six reasons). summarize.go's
+// `classifySummariserFailure` emits the rich classifier value
+// `summariser_unavailable` so the verb's slog audit trail and
+// the row-level `Episode.degraded_reason` audit field keep
+// the LLM-outage vs graph-outage distinction. This chokepoint
+// translates the rich value to `embedding_index_unavailable`
+// (both are "model-serving infrastructure unavailable" outages
+// and share the operator triage path) BEFORE Enforce so the
+// closed wire contract still holds. The original classifier
+// string is emitted via the structured log field
+// `degraded_reason_raw` so operators can still grep audit
+// logs for `summariser_unavailable` even though it never
+// reaches the wire envelope. See architecture.md §8.2 note
+// and iter-3 evaluator finding #1.
+func (s *Service) applySummarizeDegradedContract(repoID string, resp SummarizeResponse) (SummarizeResponse, error) {
+	if resp.Degraded && resp.DegradedReason == DegradedReasonSummariserUnavailable {
+		s.logger.Info("agentapi.summarize.degraded_reason_translated",
+			slog.String("repo_id", repoID),
+			slog.String("degraded_reason_raw", resp.DegradedReason),
+			slog.String("degraded_reason_wire", degraded.ReasonEmbeddingIndexUnavailable))
+		resp.DegradedReason = degraded.ReasonEmbeddingIndexUnavailable
+	}
+	if s.faultInjector != nil {
+		injDeg, injReason := s.faultInjector.Inject(VerbSummarize, repoID)
+		if injDeg && injReason != "" {
+			if !resp.Degraded || degraded.Priority(injReason) > degraded.Priority(resp.DegradedReason) {
+				s.logger.Warn("agentapi.summarize.fault_injected",
+					slog.String("repo_id", repoID),
+					slog.String("reason", injReason))
+				resp.Degraded = true
+				resp.DegradedReason = injReason
+			}
+		}
+	}
+	if err := degraded.Enforce(resp.Degraded, resp.DegradedReason); err != nil {
+		s.logger.Error("agentapi.summarize.closed_set_violation",
+			slog.String("repo_id", repoID),
+			slog.String("attempted_reason", resp.DegradedReason),
+			slog.String("err", err.Error()))
+		return SummarizeResponse{}, fmt.Errorf("agentapi: summarize: %w", err)
+	}
+	if resp.Degraded && s.degradedMetric != nil {
+		s.degradedMetric.IncDegraded(VerbSummarize, resp.DegradedReason)
+	}
+	return resp, nil
 }
 
 // degradedFallback projects the most recent valid snapshot

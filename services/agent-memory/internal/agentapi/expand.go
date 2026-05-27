@@ -70,8 +70,10 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"time"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphreader"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Direction constants close the {callees, callers} set for
@@ -517,7 +519,33 @@ func WithExpandEdgeKinds(kinds []string) Option {
 // emits an empty Edges/Nodes envelope with `Degraded=true`
 // (the "envelope-but-empty" cold-start case pinned by
 // `TestExpand_degradedEnvelopeWhenSnapshotMissing`).
-func (s *Service) Expand(ctx context.Context, req ExpandRequest) (ExpandResponse, error) {
+func (s *Service) Expand(ctx context.Context, req ExpandRequest) (resp ExpandResponse, err error) {
+	// Stage 8.3 — record `agent_expand_duration_seconds`
+	// for every call (happy path AND degraded). The defer
+	// fires AFTER the Stage 8.1 contract wrap below.
+	expandStart := time.Now()
+	defer func() { recordLatency(s.expandLatency, expandStart) }()
+
+	// Stage 8.3 step 2 — open the `agent.expand` operational
+	// span. Returned ctx propagates to the graph_store and
+	// snapshot calls below so their child spans (when those
+	// dependencies are themselves traced) hang under the
+	// verb span.
+	var span trace.Span
+	ctx, span = startVerbSpan(ctx, s.tracer, VerbExpand, req.RepoID)
+	defer func() { endVerbSpan(span, err, resp.DegradedReason) }()
+
+	// Stage 8.1 — named returns + deferred wrap funnel every
+	// successful exit through the closed-set contract helper.
+	// On error we skip the helper (no metric / no overlay on
+	// a 500).
+	defer func() {
+		if err != nil {
+			return
+		}
+		resp, err = s.applyExpandDegradedContract(req.RepoID, resp)
+	}()
+
 	if req.NodeID == "" {
 		return ExpandResponse{}, ErrInvalidExpandNodeID
 	}
@@ -666,7 +694,7 @@ func (s *Service) Expand(ctx context.Context, req ExpandRequest) (ExpandResponse
 	sortExpandEdges(walkResult.edges, walkResult.edgeHops)
 
 	// Build the final response shape.
-	resp := ExpandResponse{
+	resp = ExpandResponse{
 		RootNodeID: rootNode.NodeID,
 		Edges:      walkResult.edges,
 		Nodes:      walkResult.nodes,

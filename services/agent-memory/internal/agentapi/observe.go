@@ -89,7 +89,17 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/degraded"
+	"go.opentelemetry.io/otel/trace"
 )
+
+// VerbObserve is the canonical verb name passed to
+// [degraded.Metric] and [degraded.FaultInjector] for this
+// handler. Mirrors the proto method name so the operator
+// dashboard's `agent_observe_degraded_total{reason=}` label
+// matches the dashboard's RPC labels.
+const VerbObserve = "agent.observe"
 
 // allowedOutcomes is the SUBSET of the `outcome` ENUM that
 // `agent.observe` accepts (architecture.md §6.1.2). The
@@ -390,6 +400,40 @@ type ObserveMetrics interface {
 	RecordWALDepth(depth int64)
 }
 
+// ConsolidatorBackpressureSource is the cross-process /
+// cross-component signal the Stage 8.1 wiring consults to
+// decide whether to stamp
+// `degraded_reason=consolidator_backpressure` on the Episode
+// row + response.
+//
+// architecture.md §8.3 + C24 invariant: "An `agent.observe`
+// call NEVER fails because the Consolidator is backpressured;
+// the Episode is queued and `degraded_reason` set."  The
+// Observe handler's "queue" is the existing synchronous
+// EpisodicLog append (the Episode row IS the queue entry the
+// Consolidator processes on its next tick).  Backpressure is
+// therefore a RESPONSE DECORATION + a persisted Episode flag,
+// not a new queue.
+//
+// Backpressured is called once per Observe invocation, BEFORE
+// the EpisodeAppender.Append.  An error MUST NOT fail the
+// observe call — the handler logs at warn level and treats
+// the source as "healthy" so a flaky probe never blocks the
+// agent caller.
+type ConsolidatorBackpressureSource interface {
+	Backpressured(ctx context.Context, repoID string) (bool, error)
+}
+
+// ConsolidatorBackpressureSourceFunc adapts a plain function
+// into a ConsolidatorBackpressureSource. Used by tests and by
+// the binary composition root.
+type ConsolidatorBackpressureSourceFunc func(ctx context.Context, repoID string) (bool, error)
+
+// Backpressured implements ConsolidatorBackpressureSource.
+func (f ConsolidatorBackpressureSourceFunc) Backpressured(ctx context.Context, repoID string) (bool, error) {
+	return f(ctx, repoID)
+}
+
 // -- Observe service -------------------------------------------------
 
 // ObserveService is the in-process Stage 5.2 implementation.
@@ -407,6 +451,42 @@ type ObserveService struct {
 	logger    *slog.Logger
 	now       func() time.Time
 	uuidFunc  func() (string, error)
+
+	// Stage 8.1 — Degraded-mode contract wiring
+	// (architecture.md §6.3, §8.2; C22, C24).
+	//
+	// degradedMetric is the per-verb, per-reason counter the
+	// operator dashboard graphs. Nil means "no metric wired"
+	// (the production composition root may leave it nil
+	// while the unit tests pin a *degraded.Counter).
+	degradedMetric degraded.Metric
+	// faultInjector is the optional test-only seam that
+	// overlays a degraded reason on the response. The
+	// production composition root MUST NOT wire one.
+	faultInjector degraded.FaultInjector
+	// consolidatorBackpressure is the cross-component
+	// backpressure source the §8.3 / C24 invariant consults
+	// before stamping the Episode row. Nil means the source
+	// is not wired (legacy / partial-deploy behaviour);
+	// production wires either a PG-row health source or the
+	// in-process consolidator gauge.
+	consolidatorBackpressure ConsolidatorBackpressureSource
+
+	// Stage 8.3 — `agent_observe_duration_seconds` observer
+	// wired by `WithObserveLatencyObserver`. A nil observer
+	// is a no-op; production wiring at `cmd/agent-api/main.go`
+	// binds it to an `*obs.Histogram` so the binary's
+	// `/metrics` body exposes the histogram.
+	latency LatencyObserver
+
+	// Stage 8.3 step 2 (iter-2 evaluator fix #1) — per-verb
+	// OpenTelemetry tracer wired by `WithObserveTracer`. The
+	// Observe verb opens an `agent.observe` span and threads
+	// the returned context into every downstream call (DB
+	// writer, WAL, context resolver). A nil tracer is a
+	// no-op (the helpers in `tracing.go` substitute a
+	// package noop tracer at call time).
+	tracer trace.Tracer
 }
 
 // ObserveOption configures an ObserveService.
@@ -462,6 +542,55 @@ func WithObserveUUID(fn func() (string, error)) ObserveOption {
 	}
 }
 
+// WithObserveDegradedMetric plumbs the per-verb degraded
+// counter (implementation-plan §8.1 step 4). A nil metric is
+// a no-op; tests pin a `*degraded.Counter` so they can assert
+// per-reason counts.
+func WithObserveDegradedMetric(m degraded.Metric) ObserveOption {
+	return func(s *ObserveService) {
+		if m != nil {
+			s.degradedMetric = m
+		}
+	}
+}
+
+// WithObserveFaultInjector plumbs the §8.1 test-only fault
+// injector. Production wiring leaves it nil; the e2e
+// "closed degraded_reason enforced" scenario wires a
+// `*degraded.MapFaultInjector` and asserts the wire response
+// either gets rewritten to a closed value OR fails with
+// Internal.
+func WithObserveFaultInjector(fi degraded.FaultInjector) ObserveOption {
+	return func(s *ObserveService) {
+		s.faultInjector = fi
+	}
+}
+
+// WithObserveConsolidatorBackpressure plumbs the §8.3 / C24
+// signal so the handler stamps
+// `degraded_reason=consolidator_backpressure` on the Episode
+// row when the Consolidator queue depth exceeds threshold.
+// A nil source disables the check (no-op overlay); production
+// wires the consolidator health gauge.
+func WithObserveConsolidatorBackpressure(b ConsolidatorBackpressureSource) ObserveOption {
+	return func(s *ObserveService) {
+		s.consolidatorBackpressure = b
+	}
+}
+
+// WithObserveLatency plumbs the §8.3
+// `agent_observe_duration_seconds` histogram observer. Mirrors
+// `WithObserveLatencyObserver` (which is the `Service`-level
+// helper exported from `latency.go`); both names exist because
+// the recall/expand/summarize verbs hang off `Service` while
+// `Observe` hangs off `ObserveService`, and a single option
+// type cannot configure both. A nil observer is a no-op.
+func WithObserveLatency(o LatencyObserver) ObserveOption {
+	return func(s *ObserveService) {
+		s.latency = o
+	}
+}
+
 // NewObserveService constructs an Observe handler. The two
 // required dependencies panic on nil — a wiring bug surfacing
 // at process start is cheaper than the same bug surfacing on
@@ -510,7 +639,23 @@ func NewObserveService(writer EpisodeAppender, resolver ContextResolver, opts ..
 //     refuse to return success when the row is not durable.
 //  6. Any other writer error propagates verbatim — schema /
 //     constraint failures must surface loudly.
-func (s *ObserveService) Observe(ctx context.Context, req ObserveRequest) (ObserveResponse, error) {
+func (s *ObserveService) Observe(ctx context.Context, req ObserveRequest) (resp ObserveResponse, err error) {
+	// Stage 8.3 — record `agent_observe_duration_seconds`
+	// for every call (happy path AND degraded). The defer
+	// fires AFTER the function returns regardless of which
+	// branch handled the request.
+	observeStart := time.Now()
+	defer func() { recordLatency(s.latency, observeStart) }()
+
+	// Stage 8.3 step 2 — open the `agent.observe` operational
+	// span and thread the returned context into every
+	// downstream call. The deferred `endVerbSpan` runs AFTER
+	// the function returns so the span records the final
+	// caller-visible status (error or degraded reason).
+	var span trace.Span
+	ctx, span = startVerbSpan(ctx, s.tracer, VerbObserve, req.RepoID)
+	defer func() { endVerbSpan(span, err, resp.DegradedReason) }()
+
 	if err := validateObserveRequest(req); err != nil {
 		return ObserveResponse{}, err
 	}
@@ -589,6 +734,26 @@ func (s *ObserveService) Observe(ctx context.Context, req ObserveRequest) (Obser
 			slog.String("episode_id", episodeID))
 	}
 
+	// Stage 8.1 / C24 — consult the Consolidator backpressure
+	// source BEFORE Append so the durable Episode row carries
+	// the flag (mgmt.read.episodes later surfaces the same
+	// degraded_reason the agent saw on the response).  A
+	// HealthSource probe error MUST NOT fail the observe call:
+	// the §8.3 invariant promises agent.observe never fails on
+	// downstream queue pressure, and a flaky probe is treated
+	// as "healthy" (we log + carry on).
+	consolidatorDegraded := false
+	if s.consolidatorBackpressure != nil {
+		bp, bpErr := s.consolidatorBackpressure.Backpressured(ctx, req.RepoID)
+		if bpErr != nil {
+			s.logger.Warn("agentapi.observe.consolidator_backpressure_probe_failed",
+				slog.String("repo_id", req.RepoID),
+				slog.String("err", bpErr.Error()))
+		} else {
+			consolidatorDegraded = bp
+		}
+	}
+
 	in := EpisodeAppendInput{
 		EpisodeID:      episodeID,
 		EpisodeGroupID: episodeGroupID,
@@ -604,17 +769,40 @@ func (s *ObserveService) Observe(ctx context.Context, req ObserveRequest) (Obser
 		Observations:   observations,
 	}
 
+	// When the Consolidator is backpressured we MUST persist
+	// the degraded flag onto the Episode row itself so
+	// `mgmt.read.episodes` can later report
+	// `degraded_reason='consolidator_backpressure'` for this
+	// row (architecture.md §6.3 row "agent.observe": the
+	// Episode is still appended AND carries the reason).  The
+	// row-level flag is set BEFORE Append so a successful
+	// Append also commits the reason.
+	if consolidatorDegraded {
+		in.Degraded = true
+		in.DegradedReason = degradedReasonConsolidatorBackpressure
+	}
+
 	// Step 4 — single-tx INSERT.
 	writeErr := s.writer.Append(ctx, in)
 	if writeErr == nil {
 		s.logger.Debug("agentapi.observe.appended",
 			slog.String("episode_id", episodeID),
 			slog.Int("observations", len(observations)),
-			slog.Bool("served_under_degraded", servedDegraded))
-		return ObserveResponse{
+			slog.Bool("served_under_degraded", servedDegraded),
+			slog.Bool("consolidator_backpressure", consolidatorDegraded))
+		resp := ObserveResponse{
 			EpisodeID:      episodeID,
 			EpisodeGroupID: episodeGroupID,
-		}, nil
+		}
+		if consolidatorDegraded {
+			// §8.3 / C24: the Episode is queued (durably
+			// appended) and the response carries the flag.
+			// Use the constant from the package so the wire
+			// string matches the §8.2 closed set verbatim.
+			resp.Degraded = true
+			resp.DegradedReason = degradedReasonConsolidatorBackpressure
+		}
+		return s.applyDegradedContract(req.RepoID, resp)
 	}
 
 	// Step 5 — partition outage triggers WAL fallback (when
@@ -644,12 +832,71 @@ func (s *ObserveService) Observe(ctx context.Context, req ObserveRequest) (Obser
 		slog.String("episode_id", episodeID),
 		slog.String("reason", degradedReasonEpisodicLogUnavailable),
 		slog.String("writer_error", writeErr.Error()))
-	return ObserveResponse{
+	// Stage 8.1 priority: episodic_log_unavailable dominates
+	// over consolidator_backpressure (the WAL outage is the
+	// more severe signal — the row has not yet reached the
+	// EpisodicLog, so the Consolidator queue position is moot).
+	return s.applyDegradedContract(req.RepoID, ObserveResponse{
 		EpisodeID:      episodeID,
 		EpisodeGroupID: episodeGroupID,
 		Degraded:       true,
 		DegradedReason: degradedReasonEpisodicLogUnavailable,
-	}, nil
+	})
+}
+
+// applyDegradedContract is the Stage 8.1 wiring helper every
+// successful Observe response funnels through. It runs in
+// this order:
+//
+//  1. Apply fault-injection overlay when the injector is
+//     wired AND a real degraded signal of equal-or-lower
+//     priority is in place. Real outages dominate over
+//     injected reasons so the test seam cannot mask a live
+//     fallback.
+//  2. Run `degraded.Enforce` on the final pair. A non-closed
+//     reason fails the call so the gRPC adapter returns
+//     codes.Internal — matching the §13 contract scenario
+//     "closed degraded_reason enforced".
+//  3. Increment the per-verb degraded metric on a valid
+//     degraded response. The counter never increments on
+//     `degraded=false` (the healthy path), nor on a 500
+//     response (because Enforce returned an error first).
+func (s *ObserveService) applyDegradedContract(repoID string, resp ObserveResponse) (ObserveResponse, error) {
+	if s.faultInjector != nil {
+		injDeg, injReason := s.faultInjector.Inject(VerbObserve, repoID)
+		if injDeg && injReason != "" {
+			// Priority overlay: only overwrite when the
+			// injected reason has strictly higher priority,
+			// or no real reason is currently set.  This
+			// prevents a fault-injection test rule from
+			// erasing a real episodic_log_unavailable signal
+			// the WAL path just produced.
+			if !resp.Degraded || degraded.Priority(injReason) > degraded.Priority(resp.DegradedReason) {
+				s.logger.Warn("agentapi.observe.fault_injected",
+					slog.String("repo_id", repoID),
+					slog.String("reason", injReason))
+				resp.Degraded = true
+				resp.DegradedReason = injReason
+			}
+		}
+	}
+	if err := degraded.Enforce(resp.Degraded, resp.DegradedReason); err != nil {
+		// Hard-fail.  The §13 scenario requires the wire to
+		// either carry a closed reason OR fail; we choose
+		// failure so the call is observable as Internal at the
+		// gRPC adapter.
+		s.logger.Error("agentapi.observe.closed_set_violation",
+			slog.String("repo_id", repoID),
+			slog.String("attempted_reason", resp.DegradedReason),
+			slog.String("err", err.Error()))
+		return ObserveResponse{}, fmt.Errorf("agentapi: observe: %w", err)
+	}
+	if resp.Degraded {
+		if s.degradedMetric != nil {
+			s.degradedMetric.IncDegraded(VerbObserve, resp.DegradedReason)
+		}
+	}
+	return resp, nil
 }
 
 // walPayloadForDegraded stamps the §7.5 degraded fields onto

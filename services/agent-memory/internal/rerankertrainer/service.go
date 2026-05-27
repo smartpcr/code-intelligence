@@ -7,6 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/obs"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Default parameter values surfaced both as package constants
@@ -151,6 +155,37 @@ type Service struct {
 	// the success path. Protected by the advisory lock
 	// (the Tick that updates it holds the lock).
 	growthBaseline int64
+
+	// tracer wraps each Tick in a `rerankertrainer.tick`
+	// OTel span (Stage 8.3 step 2 -- OTel-trace export from
+	// every binary on its own operational verbs). Nil
+	// falls back to a noop tracer at call time.
+	tracer trace.Tracer
+}
+
+// Option is the functional-options shape used to install
+// post-construction hooks like the OTel tracer.
+type Option func(*Service)
+
+// WithTracer installs the OTel tracer used to wrap each Tick
+// in a `rerankertrainer.tick` span. Nil tolerates and falls
+// back to the noop tracer.
+func WithTracer(tracer trace.Tracer) Option {
+	return func(s *Service) {
+		if tracer != nil {
+			s.tracer = tracer
+		}
+	}
+}
+
+// ApplyOptions applies the supplied opts after the Service
+// has been constructed. Allows the binary's main() to wire
+// the tracer without bloating the New() positional
+// arguments (which integration tests already exercise).
+func (s *Service) ApplyOptions(opts ...Option) {
+	for _, opt := range opts {
+		opt(s)
+	}
 }
 
 // New constructs a Service. Panics on a nil *sql.DB OR a nil
@@ -287,6 +322,22 @@ type PublishedModel struct {
 // The advisory lock is released by the deferred unlock
 // regardless of error path.
 func (s *Service) Tick(ctx context.Context) (TickResult, error) {
+	// Stage 8.3 step 2 -- wrap the tick body in a
+	// `rerankertrainer.tick` OTel span. A noop tracer is
+	// substituted when none was configured via WithTracer.
+	var result TickResult
+	err := obs.TickSpan(ctx, s.tracer, "rerankertrainer.tick", []attribute.KeyValue{
+		attribute.Int64("advisory_lock_key", s.cfg.AdvisoryLockKey),
+	}, func(ctx context.Context) error {
+		var innerErr error
+		result, innerErr = s.tickOnce(ctx)
+		return innerErr
+	})
+	return result, err
+}
+
+// tickOnce is the un-instrumented body of one trainer tick.
+func (s *Service) tickOnce(ctx context.Context) (TickResult, error) {
 	s.metrics.IncRuns()
 
 	tickCtx, cancel := context.WithTimeout(ctx, s.cfg.TickTimeout)

@@ -1,0 +1,73 @@
+# promtool test fixture for the Stage 8.2 PartitionProvisionLagHigh
+# alert. Runs as part of `promtool test rules
+# partition_rotation.rules_test.yml`; the matching `rule_files`
+# entry points back to the production rule file in this same
+# directory.
+#
+# Two acceptance scenarios per implementation-plan §8.2:
+#
+#   1. "Lag alert fires" -- the partition_provision_lag gauge
+#      stays at 90000s (i.e. > 86400s = 1 day) for >10 minutes,
+#      so the alert MUST be firing at the 25h mark (the §8.2
+#      scenario's stated outage duration).
+#
+#   2. "No false positive at the threshold edge" -- the gauge
+#      stays at 86400s exactly for 25h. Because the rule uses
+#      strict `> 86400`, the alert MUST NOT fire.
+#
+#   3. "No false positive in healthy steady-state" -- the gauge
+#      stays at 0 for 25h. The alert MUST NOT fire.
+
+rule_files:
+  - partition_rotation.rules.yml
+
+# Evaluate the rule once per minute so the `for: 10m` window
+# has enough resolution to trigger.
+evaluation_interval: 1m
+
+tests:
+  # Scenario 1: alert fires after sustained breach.
+  - interval: 1m
+    input_series:
+      - series: 'partition_provision_lag{instance="partition-maintainer:8087"}'
+        # 25 hours of 90000s -- comfortably above 86400 for the
+        # entire window.
+        values: '90000+0x1500'
+    alert_rule_test:
+      - eval_time: 25h
+        alertname: PartitionProvisionLagHigh
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: agent_memory
+              subsystem: partition_rotation
+            # `exp_annotations` must EXACTLY mirror every annotation
+            # the rule emits (promtool does a full-set comparison).
+            # Keep this block 1:1 with the rule's `annotations:` --
+            # the rule file's CONTRACT comment links back here.
+            exp_annotations:
+              summary: "pg_partman forward partitions lagging > 1 day"
+              description: "partition_provision_lag=90000s exceeds 1d threshold (86400s); see runbook for triage."
+              runbook_url: "docs/runbooks/agent-memory-partition-rotation.md"
+              gauge_value: "90000s"
+
+  # Scenario 2: gauge exactly at the threshold -- strict `>`
+  # means no alert.
+  - interval: 1m
+    input_series:
+      - series: 'partition_provision_lag{instance="partition-maintainer:8087"}'
+        values: '86400+0x1500'
+    alert_rule_test:
+      - eval_time: 25h
+        alertname: PartitionProvisionLagHigh
+        exp_alerts: []
+
+  # Scenario 3: healthy steady-state -- gauge at 0.
+  - interval: 1m
+    input_series:
+      - series: 'partition_provision_lag{instance="partition-maintainer:8087"}'
+        values: '0+0x1500'
+    alert_rule_test:
+      - eval_time: 25h
+        alertname: PartitionProvisionLagHigh
+        exp_alerts: []

@@ -61,12 +61,18 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/obs"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -173,6 +179,20 @@ type Bootstrapper struct {
 	HTTPClient *http.Client
 	APIKey     string
 	DryRun     bool
+	// Collections optionally narrows the bootstrap to a
+	// caller-supplied list rather than the package-level
+	// defaultCollections var. When nil or empty,
+	// defaultCollections wins. The integration test at
+	// TestBootstrap_againstLiveQdrant uses this to inject a
+	// per-run-unique list so two devs can run the live test
+	// against the same Qdrant without colliding; the unit
+	// test at TestBootstrap_collectionsOverrideTakesPrecedence
+	// regression-guards the no-leakage contract.
+	//
+	// Iter-3 evaluator fix #1: the test code referenced this
+	// field at main_test.go:662, :712 but the struct lacked
+	// it, leaving the package un-buildable. Added explicitly.
+	Collections []string
 	// Snapshot, when true, asks Bootstrap() to take a one-off
 	// baseline snapshot of every collection after the
 	// provisioning step. Independent of SnapshotInterval.
@@ -187,6 +207,28 @@ type Bootstrapper struct {
 	// REST API does not expose a recurring-snapshot endpoint.
 	SnapshotInterval time.Duration
 	Logger           *log.Logger
+	// Tracer — Stage 8.3 step 2 OTel tracer used by Bootstrap
+	// and the scheduled snapshot tick to open per-run spans.
+	// Nil-safe: a noop tracer is substituted at run time.
+	Tracer trace.Tracer
+	// Metrics — Stage 8.3 step 1 Prometheus metric ledger.
+	// Nil-safe: observe() / Inc() calls degrade to no-ops
+	// when the field is nil (kept for the unit-test fixtures
+	// that don't wire one).
+	Metrics *bootstrapMetrics
+}
+
+// collectionsToProvision returns Bootstrapper.Collections when
+// the caller supplied a non-empty list; falls back to
+// defaultCollections otherwise. Centralising the selection in
+// one helper keeps the override semantics consistent across
+// Bootstrap and SnapshotLoop and makes it easy to grep for
+// every site that reads the effective collection list.
+func (b *Bootstrapper) collectionsToProvision() []string {
+	if len(b.Collections) > 0 {
+		return b.Collections
+	}
+	return defaultCollections
 }
 
 // NewBootstrapper wires up sensible defaults. Callers may
@@ -211,7 +253,7 @@ func NewBootstrapper(baseURL string, vectorSize int) *Bootstrapper {
 // Bootstrap is the single entrypoint exercised by the
 // integration test and by main(); we keep main() trivial so
 // the test can drive the same code path the CLI does.
-func (b *Bootstrapper) Bootstrap(ctx context.Context) error {
+func (b *Bootstrapper) Bootstrap(ctx context.Context) (rerr error) {
 	if b.BaseURL == "" {
 		return errors.New("qdrant base URL is required")
 	}
@@ -228,7 +270,39 @@ func (b *Bootstrapper) Bootstrap(ctx context.Context) error {
 		b.Logger = log.New(io.Discard, "", 0)
 	}
 
-	for _, name := range defaultCollections {
+	// Stage 8.3 step 2 — open the `qdrant.bootstrap` span.
+	// Threaded ctx propagates into the HTTP doRaw calls so
+	// any future HTTP-client instrumentation chains under
+	// this span automatically.
+	start := time.Now()
+	tracer := b.Tracer
+	if tracer == nil {
+		// SetupTracer always installs at least a noop global
+		// tracer; pulling it via the noop import would also
+		// work but using otel.Tracer keeps the dep surface
+		// inside trace/noop already imported by main.go.
+		tracer = traceNoopTracer()
+	}
+	var span trace.Span
+	ctx, span = tracer.Start(ctx, "qdrant.bootstrap", trace.WithAttributes(
+		attribute.String("qdrant.base_url", b.BaseURL),
+		attribute.Int("qdrant.vector_size", b.VectorSize),
+		attribute.Bool("qdrant.dry_run", b.DryRun),
+		attribute.Bool("qdrant.snapshot_requested", b.Snapshot),
+	))
+	defer func() {
+		elapsed := time.Since(start)
+		if rerr != nil {
+			span.RecordError(rerr)
+			span.SetStatus(codes.Error, "bootstrap_failed")
+		}
+		span.End()
+		if b.Metrics != nil {
+			b.Metrics.observe(elapsed, rerr == nil, time.Now())
+		}
+	}()
+
+	for _, name := range b.collectionsToProvision() {
 		if err := b.EnsureCollection(ctx, name); err != nil {
 			return fmt.Errorf("ensure collection %s: %w", name, err)
 		}
@@ -447,18 +521,47 @@ func (b *Bootstrapper) SnapshotLoop(
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	cols := b.collectionsToProvision()
 	b.Logger.Printf("snapshot scheduler running every %s for %d collections",
-		interval, len(defaultCollections))
+		interval, len(cols))
+	tracer := b.Tracer
+	if tracer == nil {
+		tracer = traceNoopTracer()
+	}
 	for {
-		for _, name := range defaultCollections {
-			if err := b.CreateBaselineSnapshot(ctx, name); err != nil {
-				// Transient failure; log and keep the schedule alive.
+		// Stage 8.3 step 2 — open ONE span per scheduler
+		// tick (not per whole loop), so the span lifetime
+		// mirrors a single scheduler activation.
+		tickStart := time.Now()
+		tickCtx, tickSpan := tracer.Start(ctx, "qdrant.snapshot_tick", trace.WithAttributes(
+			attribute.Int("qdrant.collection_count", len(cols)),
+		))
+		var tickErr error
+		for _, name := range cols {
+			if err := b.CreateBaselineSnapshot(tickCtx, name); err != nil {
 				b.Logger.Printf("WARN scheduled snapshot %s failed: %v",
 					name, err)
+				tickErr = err
 			}
 			if ctx.Err() != nil {
+				if tickErr != nil {
+					tickSpan.RecordError(tickErr)
+					tickSpan.SetStatus(codes.Error, "snapshot_tick_failed")
+				}
+				tickSpan.End()
+				if b.Metrics != nil {
+					b.Metrics.observe(time.Since(tickStart), tickErr == nil, time.Now())
+				}
 				return ctx.Err()
 			}
+		}
+		if tickErr != nil {
+			tickSpan.RecordError(tickErr)
+			tickSpan.SetStatus(codes.Error, "snapshot_tick_failed")
+		}
+		tickSpan.End()
+		if b.Metrics != nil {
+			b.Metrics.observe(time.Since(tickStart), tickErr == nil, time.Now())
 		}
 		select {
 		case <-ctx.Done():
@@ -615,7 +718,41 @@ func main() {
 		context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	err := b.RunWithSchedule(ctx)
+	// Stage 8.3 step 1+2 (iter-2 evaluator fix #2) — bring
+	// up the OTel tracer + Prometheus /metrics surface BEFORE
+	// the bootstrap call so even a one-shot invocation
+	// produces observability data. SetupTracer is a no-op
+	// when OTEL_EXPORTER_OTLP_ENDPOINT is unset, so the
+	// historical "qdrant-bootstrap is a CLI tool" use case
+	// still works.
+	slogLogger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	tracerSetup, err := obs.SetupTracer(ctx, obs.ServiceNameQdrantBootstrap, slogLogger)
+	if err != nil {
+		// Non-fatal: tracing failure must not block the
+		// bootstrap from running. Log and continue with
+		// the noop tracer SetupTracer left installed.
+		slogLogger.Error("qdrant-bootstrap.otel.setup_failed",
+			slog.String("error", err.Error()))
+	}
+	defer func() {
+		shutCtx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer scancel()
+		_ = tracerSetup.Shutdown(shutCtx)
+	}()
+	b.Tracer = tracerSetup.Tracer
+
+	metrics := newBootstrapMetrics()
+	b.Metrics = metrics
+	metricsShutdown := startMetricsServer(ctx,
+		resolveHealthAddr(os.Getenv("AGENT_MEMORY_HEALTH_ADDR")),
+		metrics, slogLogger)
+	defer func() {
+		shutCtx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer scancel()
+		_ = metricsShutdown(shutCtx)
+	}()
+
+	err = b.RunWithSchedule(ctx)
 	// SnapshotLoop returns ctx.Err() (Canceled / DeadlineExceeded)
 	// on a clean SIGINT/SIGTERM; that is success, not failure.
 	if err != nil && !errors.Is(err, context.Canceled) &&
@@ -624,5 +761,5 @@ func main() {
 		os.Exit(1)
 	}
 	b.Logger.Printf("done: %d collections conformant",
-		len(defaultCollections))
+		len(b.collectionsToProvision()))
 }

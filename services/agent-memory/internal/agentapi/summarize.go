@@ -23,12 +23,19 @@
 //     'summarize')` row id the handler appended exactly once
 //     per call (soft-failure on append → empty `context_id`,
 //     mirroring the recall path).
-//   * `degraded` / `degraded_reason` use the §C22 closed-set
-//     reasons augmented with `summariser_unavailable` (Stage
-//     5.4) and the existing `reranker_model_stale`. The
-//     latter is preferred when the reranker run is older
-//     than 7 days per risk §9.10; the former covers a
-//     fresh-reranker-but-timed-out summariser.
+//   * `degraded` / `degraded_reason` use the six-value §C22
+//     closed set pinned by Stage 8.1 (no augmentation). A
+//     summariser/LLM outage is classified internally as
+//     `summariser_unavailable` (see classifySummariserFailure
+//     below) and the wire envelope is normalised to
+//     `embedding_index_unavailable` by
+//     applySummarizeDegradedContract in recall.go before
+//     Enforce; the original classifier value is preserved in
+//     the structured log `degraded_reason_raw` field for
+//     audit. The `reranker_model_stale` reason is preferred
+//     when the reranker run is older than 7 days per risk
+//     §9.10; the wire normalisation is bypassed for that
+//     reason since it is already a §C22 closed-set value.
 //
 // Why everything is an interface
 // ------------------------------
@@ -82,7 +89,16 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel/trace"
 )
+
+// VerbSummarize is the §6.3 verb identifier the Stage 8.1
+// wiring stamps on degraded-metric counters and
+// `FaultInjector` lookups. Package-level constant so a test
+// (or operator-facing rule editor) cannot drift from the
+// on-the-wire spelling.
+const VerbSummarize = "agent.summarize"
 
 // Summariser is the pluggable LLM client the summarize verb
 // invokes to render `summary_md`. Vendor pin for v1 is any
@@ -423,19 +439,28 @@ var (
 	ErrSummarizeUnconfigured = errors.New("agentapi: summarize: no NeighborhoodResolver wired")
 )
 
-// Degraded-reason constants surfaced on SummarizeResponse.
+// Degraded-reason constants surfaced from SummarizeResponse.
 // Centralised so the gRPC adapter, the unit tests, and
-// future downstream consumers can pattern-match against
-// the exact wire string.
+// internal log/audit consumers can pattern-match against
+// the exact value. `DegradedReasonSummariserUnavailable` is
+// an INTERNAL classifier value: Stage 8.1 normalises it to
+// the §C22 closed-set wire reason
+// `embedding_index_unavailable` via
+// `applySummarizeDegradedContract` in recall.go before
+// Enforce. The original classifier is preserved on the
+// `degraded_reason_raw` slog field for audit. The wire
+// envelope itself only ever carries §C22 closed-set values.
 const (
-	// DegradedReasonSummariserUnavailable is the §C22-aligned
-	// reason emitted when the configured Summariser returns
-	// an error (including the internal 5 s timeout) AND the
-	// reranker freshness signal does NOT indicate staleness.
-	// Architecture §6.3 + the Stage 5.4 brief introduce this
-	// reason; it is NOT a `recall_context_log.degraded_reason`
-	// ENUM value (that ENUM applies to a different column),
-	// it lives only on the SummarizeResponse wire envelope.
+	// DegradedReasonSummariserUnavailable is the §6.3 +
+	// Stage 5.4 internal classifier emitted when the
+	// configured Summariser returns an error (including the
+	// internal 5 s timeout) AND the reranker freshness signal
+	// does NOT indicate staleness. It is NOT a
+	// `recall_context_log.degraded_reason` ENUM value (that
+	// ENUM applies to a different column) and Stage 8.1
+	// confirms it is NOT a §C22 closed-set wire reason: the
+	// SummarizeResponse envelope normalises it to
+	// `embedding_index_unavailable` before Enforce.
 	DegradedReasonSummariserUnavailable = "summariser_unavailable"
 
 	// DegradedReasonRerankerModelStale is the §C22 ENUM
@@ -546,9 +571,12 @@ const (
 
 // WithSummariser plumbs the LLM client. A nil summariser is
 // equivalent to "no summariser configured" — every summarize
-// call degrades to the template fallback with
-// `degraded_reason=summariser_unavailable` (unless the
-// freshness source signals staleness). Production wiring
+// call degrades to the template fallback with the internal
+// classifier `summariser_unavailable` (Stage 8.1 normalises
+// the wire reason to `embedding_index_unavailable` via
+// applySummarizeDegradedContract in recall.go before
+// Enforce; the original classifier is preserved in the
+// `degraded_reason_raw` slog field). Production wiring
 // supplies `OpenAICompatibleSummariser`.
 func WithSummariser(s Summariser) Option {
 	return func(svc *Service) {
@@ -578,9 +606,11 @@ func WithNeighborhoodResolver(r NeighborhoodResolver) Option {
 
 // WithRerankerFreshness plumbs the reranker freshness
 // signal. OPTIONAL; nil means "no staleness signal", which
-// pins every degraded summarize to
-// `DegradedReasonSummariserUnavailable`. Production wiring
-// runs a one-line `SELECT max(trained_at) FROM
+// pins every degraded summarize to the internal classifier
+// `DegradedReasonSummariserUnavailable` (Stage 8.1 then
+// normalises the wire reason to
+// `embedding_index_unavailable` before Enforce). Production
+// wiring runs a one-line `SELECT max(trained_at) FROM
 // reranker_model WHERE status='published'` adapter.
 func WithRerankerFreshness(r RerankerFreshnessSource) Option {
 	return func(svc *Service) {
@@ -614,7 +644,34 @@ func WithSummariserTimeout(d time.Duration) Option {
 // timed-out summariser, a graph_store outage, or a busted
 // freshness lookup — surfaces as a degraded envelope with
 // `degraded=true` so the agent loop stays alive.
-func (s *Service) Summarize(ctx context.Context, req SummarizeRequest) (SummarizeResponse, error) {
+func (s *Service) Summarize(ctx context.Context, req SummarizeRequest) (resp SummarizeResponse, err error) {
+	// Stage 8.3 — record `agent_summarize_duration_seconds`
+	// for every call (happy path AND degraded). The defer
+	// fires AFTER the Stage 8.1 contract wrap below.
+	summarizeStart := time.Now()
+	defer func() { recordLatency(s.summarizeLatency, summarizeStart) }()
+
+	// Stage 8.3 step 2 — open the `agent.summarize` span and
+	// thread the returned context into every downstream call
+	// (graph_store snapshot, summariser POST, context-log
+	// append). Recorded with the final caller-visible status.
+	var span trace.Span
+	ctx, span = startVerbSpan(ctx, s.tracer, VerbSummarize, req.RepoID)
+	defer func() { endVerbSpan(span, err, resp.DegradedReason) }()
+
+	// Stage 8.1 — named returns + deferred wrap funnel every
+	// successful exit through the closed-set contract helper.
+	// On error we skip the helper (no metric / no overlay on
+	// a 500). The helper shares the Recall/Expand Service's
+	// `degradedMetric` + `faultInjector` fields wired via
+	// `WithDegradedMetric` / `WithFaultInjector`.
+	defer func() {
+		if err != nil {
+			return
+		}
+		resp, err = s.applySummarizeDegradedContract(req.RepoID, resp)
+	}()
+
 	// Validation runs FIRST so a malformed request against
 	// a binary that hasn't wired the resolver (e.g. a stage
 	// rollback) still surfaces as `InvalidArgument` (the

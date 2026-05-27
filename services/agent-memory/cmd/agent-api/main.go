@@ -115,8 +115,15 @@
 //	                                    summarize verb is wired but
 //	                                    the LLM is disabled; every
 //	                                    call surfaces the templated
-//	                                    fallback with
-//	                                    `degraded_reason=summariser_unavailable`.
+//	                                    fallback. Stage 8.1 closed
+//	                                    the wire reason to
+//	                                    `embedding_index_unavailable`
+//	                                    (the internal
+//	                                    `summariser_unavailable`
+//	                                    classifier is preserved in
+//	                                    the structured log
+//	                                    `degraded_reason_raw` field
+//	                                    for audit).
 //	AGENT_MEMORY_SUMMARISER_MODEL       (optional) Vendor model id
 //	                                    (e.g. `gpt-4o-mini`). Required
 //	                                    when AGENT_MEMORY_SUMMARISER_ENDPOINT
@@ -160,8 +167,10 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/agentapi"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/degraded"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/embedding"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphreader"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/obs"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/recallcontext"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/rerankertrainer"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/spaningestor"
@@ -225,6 +234,81 @@ func main() {
 			return agentapi.HealthState{}, err
 		}
 		return agentapi.HealthState{Degraded: st.Degraded, Reason: st.Reason, Source: st.Source}, nil
+	})
+
+	// Stage 8.1 — Degraded-mode contract wiring (architecture
+	// §6.3 / §8.2 closed set / C22).  All four agent verbs
+	// (observe, recall, expand, summarize) share a single
+	// per-verb degraded counter — the operator dashboard
+	// aggregates by the `verb` + `reason` labels.  The fault
+	// injector is intentionally nil in production: it is a
+	// test-only seam wired by the §13 contract tests; leaving
+	// it nil here is what guarantees the production binary
+	// cannot be coerced into emitting an injected reason.
+	degradedCounter := degraded.NewCounter()
+
+	// Stage 8.3 step 2 — OTel trace export. Best-effort:
+	// SetupTracer is a noop when neither
+	// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` nor
+	// `OTEL_EXPORTER_OTLP_ENDPOINT` is set, so the binary
+	// boots cleanly on developer laptops without a Collector.
+	// When an endpoint IS configured and unreachable
+	// (DNS/parse error) we crash early — operators must know
+	// trace export is broken before traffic arrives.
+	tracerSetup, err := obs.SetupTracer(ctx, obs.ServiceNameAgentAPI, logger)
+	if err != nil {
+		logger.Error("agent-api.otel.setup_failed", slog.String("error", err.Error()))
+		os.Exit(2)
+	}
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tracerSetup.Shutdown(shutCtx); err != nil {
+			logger.Warn("agent-api.otel.shutdown_failed", slog.String("error", err.Error()))
+		}
+	}()
+	logger.Info("agent-api.otel.ready",
+		slog.Bool("exporting", tracerSetup.Exporting),
+		slog.String("endpoint", tracerSetup.EndpointResolved))
+
+	// Stage 8.3 step 1 — verb-latency histograms. One per
+	// agent verb so the dashboard can compute p95/p99 via
+	// `histogram_quantile()` independently. Bucket
+	// boundaries align with §8.3 SLO lines (0.4, 1.5, 2, 4,
+	// 5, 10) so `histogram_quantile()`'s linear
+	// interpolation lands exactly on the SLO threshold —
+	// avoids the off-by-bucket oscillation that plagues
+	// default Prometheus bucket sets.
+	recallLatency := obs.NewHistogram(obs.MetricAgentRecallDurationSeconds,
+		"agent.recall verb wall-clock latency (seconds) -- §8.3 SLO p95≤1.5s, p99≤4s.",
+		obs.DefaultDurationBuckets)
+	observeLatency := obs.NewHistogram(obs.MetricAgentObserveDurationSeconds,
+		"agent.observe verb wall-clock latency (seconds) -- §8.3 SLO p95≤0.4s, p99≤1.5s.",
+		obs.DefaultDurationBuckets)
+	expandLatency := obs.NewHistogram(obs.MetricAgentExpandDurationSeconds,
+		"agent.expand verb wall-clock latency (seconds) -- §8.3 SLO p95≤1.5s, p99≤4s.",
+		obs.DefaultDurationBuckets)
+	summarizeLatency := obs.NewHistogram(obs.MetricAgentSummarizeDurationSeconds,
+		"agent.summarize verb wall-clock latency (seconds) -- §8.3 SLO p95≤4s, p99≤10s.",
+		obs.DefaultDurationBuckets)
+
+	// Stage 8.1 — `consolidator_backpressure` source.  The
+	// `repo_health` table is the same per-repo health blob
+	// the recall path already consults via `NewPGHealthSource`
+	// above (see `healthSource` builder).  When that row
+	// surfaces `consolidator_backpressure`, the agent.observe
+	// path must STAMP the row before append AND still
+	// succeed (architecture §7.5 C24 invariant: observe never
+	// fails on consolidator pressure).  Reusing the same
+	// PG-backed health source keeps the lookup cheap (one
+	// indexed read per call) and avoids a second flag-store
+	// implementation.
+	consolidatorSource := agentapi.ConsolidatorBackpressureSourceFunc(func(ctx context.Context, repoID string) (bool, error) {
+		st, err := spaningestor.NewPGHealthSource(db).HealthForRepo(ctx, repoID)
+		if err != nil {
+			return false, err
+		}
+		return st.Degraded && st.Reason == degraded.ReasonConsolidatorBackpressure, nil
 	})
 
 	// Stage 5.1 + Stage 6.4 reranker wiring.
@@ -361,6 +445,24 @@ func main() {
 	opts := []agentapi.Option{
 		agentapi.WithLogger(logger),
 		agentapi.WithHealthSource(healthSource),
+		// Stage 8.1 — per-verb degraded counter shared across
+		// recall / expand / summarize.  Observe wires the
+		// same counter via WithObserveDegradedMetric below.
+		agentapi.WithDegradedMetric(degradedCounter),
+		// Stage 8.3 step 1 — verb-latency observers. Each
+		// histogram's `Observe` method is plumbed as a
+		// `LatencyObserver` callback so the verb code stays
+		// decoupled from the obs package (avoids an import
+		// cycle).
+		agentapi.WithRecallLatencyObserver(recallLatency.Observe),
+		agentapi.WithExpandLatencyObserver(expandLatency.Observe),
+		agentapi.WithSummarizeLatencyObserver(summarizeLatency.Observe),
+		// Stage 8.3 step 2 (iter-2 evaluator fix #1) — wire
+		// the OTel tracer so the recall/expand/summarize verbs
+		// each open a real operational span. The tracer name
+		// is "agent-api" via the resource attribute the
+		// SetupTracer call attached above.
+		agentapi.WithTracer(tracerSetup.Tracer),
 		agentapi.WithReranker(reranker),
 		agentapi.WithSeedExpander(expander),
 		agentapi.WithExpansionDepth(1),
@@ -440,6 +542,23 @@ func main() {
 		contextResolver := newContextResolverFromDB(db)
 		observeOpts := []agentapi.ObserveOption{
 			agentapi.WithObserveLogger(logger.With(slog.String("comp", "observe"))),
+			// Stage 8.1 — observe wires the shared per-verb
+			// counter AND the consolidator_backpressure
+			// probe so a sustained backpressure window is
+			// stamped on every Episode row + counted on the
+			// `agent.observe`/`consolidator_backpressure`
+			// metric series.  See architecture §7.5 C24.
+			agentapi.WithObserveDegradedMetric(degradedCounter),
+			agentapi.WithObserveConsolidatorBackpressure(consolidatorSource),
+			// Stage 8.3 step 1 — observe verb latency
+			// histogram. ObserveService carries its own
+			// latency observer (its handler is separate
+			// from Service's Recall/Expand/Summarize).
+			agentapi.WithObserveLatency(observeLatency.Observe),
+			// Stage 8.3 step 2 (iter-2 evaluator fix #1) —
+			// wire the OTel tracer onto the observe verb
+			// so it opens an `agent.observe` span per call.
+			agentapi.WithObserveTracer(tracerSetup.Tracer),
 		}
 		var observeMetrics *agentapi.Metrics
 		if cfg.WALDir != "" {
@@ -499,28 +618,49 @@ func main() {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok"))
 		})
-		// `/metrics` exposes the Prometheus text-format
+		// `/metrics` exposes BOTH the Prometheus text-format
 		// `observe_wal_buffer_depth` gauge mandated by the
-		// implementation plan §5.2. We hand-roll the
-		// text format instead of pulling in
-		// prometheus/client_golang because this binary
-		// exports exactly one metric and the Prometheus
-		// text format is intentionally trivial. The
-		// handler ALWAYS responds — depth reports 0 when
-		// no WAL is wired — so an operator's `curl
-		// /metrics | grep observe_wal_buffer_depth`
-		// works regardless of whether the WAL is
-		// configured (resolves evaluator iter-1 item #3).
-		mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		// implementation plan §5.2 AND the Stage 8.1 per-verb
+		// `agent_memory_degraded_total` counter that operators
+		// scrape into the §8.1 degraded dashboard (evaluator
+		// iter-3 finding #3). We hand-roll both bodies into a
+		// single response rather than pulling in
+		// prometheus/client_golang because this binary exports
+		// a tightly-bounded metric set and the Prometheus text
+		// format is intentionally trivial. The handler ALWAYS
+		// responds — depth reports 0 when no WAL is wired and
+		// the degraded counter pre-registers every closed-set
+		// (verb × reason) pair at zero so a `curl /metrics
+		// | grep agent_memory_degraded_total` works on a fresh
+		// binary that has never gone degraded.
+		degradedHandler := degraded.NewPrometheusHandler(degradedCounter)
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				w.Header().Set("Allow", "GET, HEAD")
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
 			var depth int64
 			if observeWAL != nil {
 				depth = observeWAL.Depth()
 			}
 			w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
+			if r.Method == http.MethodHead {
+				return
+			}
 			fmt.Fprintf(w, "# HELP observe_wal_buffer_depth Number of EpisodeAppendInput payloads buffered in the agent.observe WAL awaiting replay.\n")
 			fmt.Fprintf(w, "# TYPE observe_wal_buffer_depth gauge\n")
 			fmt.Fprintf(w, "observe_wal_buffer_depth %d\n", depth)
+			degradedHandler.Write(w)
+			// Stage 8.3 step 1 — verb-latency histograms.
+			// Each Write emits a self-contained
+			// HELP/TYPE/series envelope so the body parses
+			// even when no samples have been observed yet.
+			recallLatency.Write(w)
+			observeLatency.Write(w)
+			expandLatency.Write(w)
+			summarizeLatency.Write(w)
 		})
 		srv := &http.Server{
 			Addr:              cfg.HealthAddr,
@@ -726,6 +866,20 @@ func loadConfig() (config, error) {
 			return c, fmt.Errorf("AGENT_MEMORY_RERANKER_INFERENCE_TIMEOUT must be > 0 (got %s)", v)
 		}
 		c.RerankerInferenceTimeout = d
+	}
+	// Stage 8.3 (iter-2 evaluator fix #3): the /metrics
+	// + /healthz HTTP surface MUST be on by default so
+	// Prometheus can scrape every binary without operator
+	// opt-in. Empty AGENT_MEMORY_HEALTH_ADDR defaults to
+	// :9464 (the OpenMetrics-conventional "second app"
+	// port; agent-api's gRPC owns :9460). Operators can
+	// still disable by setting AGENT_MEMORY_HEALTH_ADDR=off
+	// (compared case-insensitive after trim).
+	if c.HealthAddr == "" {
+		c.HealthAddr = ":9464"
+	} else if strings.EqualFold(strings.TrimSpace(c.HealthAddr), "off") ||
+		strings.EqualFold(strings.TrimSpace(c.HealthAddr), "disabled") {
+		c.HealthAddr = ""
 	}
 	return c, nil
 }

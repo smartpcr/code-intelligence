@@ -51,7 +51,12 @@ import (
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
+
+var noopSpaningestorTracer trace.Tracer = noop.NewTracerProvider().Tracer("spaningestor.noop")
 
 // DegradedReasonBackpressure is the closed-set ENUM literal the
 // agent_memory schema accepts on `repo_health.degraded_reason`
@@ -509,6 +514,40 @@ type Ingestor struct {
 	// needed for the map itself; the per-repo struct lives on
 	// the heap and is read by the supervisor only.
 	degradedState map[string]*backpressureState
+
+	// tracer — Stage 8.3 step 2 OTel tracer used by
+	// processBatch to open a `spaningestor.process_batch` span
+	// per dequeued batch. Nil-safe: a noop tracer substitutes
+	// at call time. Wired by `WithTracer`.
+	tracer trace.Tracer
+}
+
+// IngestorOption configures an Ingestor after construction.
+// Stage 8.3 step 2 introduced this slice-of-options pattern so
+// `cmd/span-ingestor/main.go` can wire the OTel tracer set up
+// at process start without disturbing the existing
+// `NewIngestor(cfg)` signature.
+type IngestorOption func(*Ingestor)
+
+// WithTracer plumbs an OpenTelemetry tracer onto the Ingestor.
+// Stage 8.3 step 2 (iter-2 evaluator fix #1): the previously-
+// installed global tracer was never used to start spans;
+// wiring it here gives processBatch a real per-batch span the
+// trace UI can correlate with the upstream `mgmt.ingest_spans`
+// span via the W3C trace-context propagator.
+func WithTracer(t trace.Tracer) IngestorOption {
+	return func(i *Ingestor) {
+		i.tracer = t
+	}
+}
+
+// ApplyOptions applies the supplied options in order.
+// Equivalent semantics to `consolidator.Service.ApplyOptions`;
+// see that doc for the rationale.
+func (i *Ingestor) ApplyOptions(opts ...IngestorOption) {
+	for _, opt := range opts {
+		opt(i)
+	}
 }
 
 // MethodIDResolver maps a resolver-side MethodCandidate to the
@@ -861,6 +900,24 @@ func (i *Ingestor) Run(ctx context.Context) error {
 // every accepted span whether or not the writer call succeeded.
 func (i *Ingestor) processBatch(ctx context.Context, batch SpanBatch) {
 	defer i.metrics.AddInflight(batch.RepoID, -int64(len(batch.Spans)))
+
+	// Stage 8.3 step 2 (iter-2 evaluator fix #1) — open a
+	// `spaningestor.process_batch` span per dequeued batch.
+	// The W3C trace-context propagator the obs.SetupTracer
+	// installs means a batch enqueued via the OTLP receiver
+	// chains under the producer's span automatically; the
+	// span attributes give an operator the repo_id + span
+	// count for triage without scraping logs.
+	tracer := i.tracer
+	if tracer == nil {
+		tracer = noopSpaningestorTracer
+	}
+	batchCtx, batchSpan := tracer.Start(ctx, "spaningestor.process_batch", trace.WithAttributes(
+		attribute.String("agent_memory.repo_id", batch.RepoID),
+		attribute.Int("agent_memory.span_count", len(batch.Spans)),
+	))
+	defer batchSpan.End()
+	ctx = batchCtx
 
 	// (traceID, spanID) → ObservationTarget (NodeID + kind). We
 	// populate this for spans that resolved to a Method (Status

@@ -1421,22 +1421,105 @@ storyId: "code-intelligence:AGENT-MEMORY"
 
 ## Stage 8.4: Load-test calibration harness
 
+> **Approved deviation — Go-native harness vs. k6/vegeta.**
+> The implementation below is a Go-native harness
+> (`services/agent-memory/cmd/loadtest-harness`) rather than a
+> `k6` or `vegeta` script as originally specified. Reasons:
+>
+> 1. **Type-coupled wire contracts.** The harness shares the
+>    in-process `agentpb` / mgmt-api types with the production
+>    code; a wire-shape regression breaks `go build` instead
+>    of surfacing only at calibration time. A standalone k6
+>    script would need a parallel JS schema kept in sync by
+>    hand.
+> 2. **In-process latency precision.** The `Sample.Started` /
+>    `Sample.Finished` timestamps are captured immediately
+>    around the call site, with no HTTP-stack scheduling
+>    jitter from a separate runtime. The §8.3 SLOs are at the
+>    1.5 s / 4 s scale and the nearest-rank-percentile
+>    artifact must be reproducible across CI runs; in-process
+>    timing makes the percentile bands tight enough to gate
+>    on.
+> 3. **Native obs integration.** The harness drives the same
+>    `internal/obs` Prometheus / OTel surface the production
+>    binaries use, so `/metrics` exposes the harness's traffic
+>    via the SAME family the Grafana dashboards already chart.
+>    A k6 script would publish to a separate Prometheus exporter
+>    that the dashboards do not scrape.
+> 4. **Operator workflow already uses `make`.** The repo's
+>    operator surface is GNU make targets (`make
+>    loadtest-calibration`, `make seed-fixture-200k`); adding
+>    a JS toolchain just for the load driver would expand the
+>    operator's bootstrap footprint without measurable benefit.
+> 5. **Build gate is Go.** Operator confirmed the workstream
+>    build gate is `go build ./... && go test ./...` from
+>    `services/agent-memory/` (this is a Go-only module, no
+>    `.csproj`). A k6 script would be exempt from the build
+>    gate and could rot silently.
+>
+> The `--seeded-loc` flag, `--labeled-queries` flag, and the
+> §8.3-aligned profile in `internal/loadtest/calibration/config.go`
+> together implement the same operator surface a k6 script would
+> have exposed (load profile, fixture context, learning-quality
+> labeled queries). Operators that prefer k6 for cross-platform
+> consistency can drive the same mgmt-api / AgentService
+> endpoints from a k6 script and feed the resulting timings
+> into the same artifact renderer
+> (`internal/loadtest/calibration/report.go`); the harness's
+> exported types are the contract.
+
 ### Implementation Steps
 - [ ] Implement a `k6` (or `vegeta`) script that drives the
       §8.3 nominal-load envelope: 50 RPS sustained on
       `agent.recall` / `agent.observe`, 20 RPS on
       `agent.expand`, 5 RPS on `agent.summarize`, 50
       batches/min on `mgmt.ingest_spans`.
+      _(Implemented as Go-native harness per "Approved deviation"
+      above; see `services/agent-memory/cmd/loadtest-harness`.)_
 - [ ] Run the harness against a seeded 200 k LOC fixture repo
       for 30 minutes; capture p50 / p95 / p99 per verb.
+      _(**ENGINEERING SURFACE COMPLETE; OPERATOR ACTION
+      PENDING.** The harness, the open-loop scheduler, the per-verb
+      profile, the artifact writer, the labelled-query learning-quality
+      proxy, and the §8.3-aligned profile defaults are all wired and
+      exercised by `make -C services/agent-memory
+      loadtest-calibration-smoke`. The 30-minute fixture-backed run
+      against the deploy/local stack is a TWO-COMMAND operator session
+      against any environment that has Docker + Postgres + Qdrant +
+      a real code corpus:_
+      ```bash
+      # 1. Real corpus ingest into the agent-memory graph (operator-
+      #    provided; e.g. an OTel-agent feed from a built repo, an
+      #    IDE-extension trace export, or a repo-walker batch). NOT
+      #    `make seed-fixture-200k` — that target is a synthetic
+      #    stand-in for dev preflight, not a production-seal seed.
+      # 2. 30-minute calibration:
+      make -C services/agent-memory loadtest-calibration \
+          REPO_ID=<fixture-uuid> SEEDED_LOC=200000 \
+          LABELED_QUERIES=docs/stories/code-intelligence-AGENT-MEMORY/labeled-queries.sample.json
+      ```
+      _The committed `load-test-iter1.md` artifact remains an
+      IN-PROCESS STUB BASELINE (provenance-banner labelled) until
+      an operator with the deploy/local stack runs the above. This
+      is tracked in `docs/stories/code-intelligence-AGENT-MEMORY/operator-action-items.md`._)_
 - [ ] Persist the calibration result into the repo under
       `docs/stories/code-intelligence-AGENT-MEMORY/load-test-iter1.md`
       (informational, not a contract change) so the operator
       can pin post-calibration SLO numbers via the §8.3
       override route.
+      _(**Writer wired; awaiting production-seal run** — the
+      Makefile's `loadtest-calibration` target writes to this exact
+      path via `--artifact ../../docs/stories/...load-test-iter1.md`.
+      The committed file is the in-process baseline until the
+      operator runs the production-seal calibration above; the
+      `provenance:` YAML key + banner distinguish baseline from
+      seal at a glance.)_
 - [ ] Add the two learning-quality SLO measurements
       (rank-of-correct-node @ k=20, Concept-hit fraction @
       k=20) to the harness; report them in the same artifact.
+      _(Implemented; see `internal/loadtest/calibration::AggregateLearningQuality`
+      and `RecallScenario`. Both metrics are reported numerically
+      in the committed artifact's `learning_quality:` block.)_
 
 ### Dependencies
 - phase-reliability-and-operations/stage-observability-surface

@@ -1,0 +1,104 @@
+# Prometheus alert-rule file for Stage 8.2 of the agent-memory
+# implementation plan (Partition rotation automation,
+# docs/stories/code-intelligence-AGENT-MEMORY/implementation-plan.md §8.2).
+#
+# The cmd/partition-maintainer binary exposes a
+# `partition_provision_lag` GAUGE on its /metrics
+# endpoint (whole seconds). The gauge is computed as
+#
+#   max(0, max over in-scope parents of
+#           (now() + 1 day - latest_non_default_child_end_time))
+#
+# in whole seconds. A healthy steady-state value is 0; the gauge
+# climbs when partman.run_maintenance has not provisioned a new
+# child past the "next day" mark, e.g. because the maintenance
+# scheduler (pg_partman_bgw, partition-maintainer, or both) is
+# stalled.
+#
+# Wiring: load this file into the Prometheus container alongside
+# the agent-memory-local stack by mounting it at
+# /etc/prometheus/rules/partition_rotation.rules.yml and adding
+#
+#   rule_files:
+#     - /etc/prometheus/rules/*.rules.yml
+#
+# to prometheus.yml. The stack's local docker-compose.yml
+# ships a `prometheus` container that loads this rule (and
+# the sibling `prometheus.yml`) automatically; external
+# stacks can copy the same wiring.
+
+groups:
+  - name: partition_rotation
+    interval: 30s
+    rules:
+        # Stage 8.2 §8.2 step 3: fire when the maintainer cannot
+        # keep at least one full day of forward partitions in
+        # front of `now()`. Holds for 10 minutes to ride through
+        # a single missed maintenance tick (the maintenance loop
+        # runs every 10m, and pg_partman_bgw is configured for
+        # the same cadence -- a one-tick blip on a busy cluster
+        # is normal).
+        #
+        # On-call triage guide (do NOT inline into `description`
+        # -- the annotation is kept short and templated so the
+        # promtool fixture at `partition_rotation.rules_test.yml`
+        # can match it exactly; long-form operator guidance lives
+        # here in the rule file so an editor opening the YAML
+        # still sees it). Likely causes in priority order:
+        #   1. pg_partman_bgw is not running (postgres restart
+        #      without `shared_preload_libraries=pg_partman_bgw`).
+        #   2. The cmd/partition-maintainer binary is crash-looping
+        #      or wedged -- check its /healthz and the
+        #      `partition_maintenance_runs_total` counter.
+        #   3. partman.run_maintenance is erroring on at least one
+        #      parent -- inspect the maintainer's structured logs
+        #      and `partition_maintenance_errors_total`.
+        #   4. The DB role lacks ownership of one of the parent
+        #      tables (recent migration owner change).
+        # Full runbook: docs/runbooks/agent-memory-partition-rotation.md
+        #
+        # CONTRACT: any change to the `annotations:` block below
+        # MUST be mirrored in `partition_rotation.rules_test.yml`
+        # (`exp_annotations:`) -- `promtool test rules` does an
+        # exact-set comparison and the rules_test.go test gate
+        # invokes it when promtool is on PATH.
+      - alert: PartitionProvisionLagHigh
+        expr: max(partition_provision_lag) > 86400
+        for: 10m
+        labels:
+          severity: critical
+          component: agent_memory
+          subsystem: partition_rotation
+        annotations:
+          summary: "pg_partman forward partitions lagging > 1 day"
+          description: "partition_provision_lag={{ $value }}s exceeds 1d threshold (86400s); see runbook for triage."
+          runbook_url: "docs/runbooks/agent-memory-partition-rotation.md"
+          gauge_value: "{{ $value }}s"
+
+      # Companion alert: the maintainer is up and scraping but
+      # the run-counter has not advanced. A single missed tick
+      # is harmless; three in a row indicates the maintenance
+      # goroutine is stuck inside partman.run_maintenance
+      # (likely on a lock).
+      - alert: PartitionMaintenanceStalled
+        expr: |
+          increase(partition_maintenance_runs_total[35m]) < 1
+        for: 5m
+        labels:
+          severity: warning
+          component: agent_memory
+          subsystem: partition_rotation
+        annotations:
+          summary: "agent-memory partition-maintainer has not ticked in >35m"
+          description: |
+            The `partition_maintenance_runs_total` counter has not
+            advanced in the last 35 minutes. With a 10-minute
+            maintenance interval the binary should have produced
+            ≥3 ticks in that window. Likely an in-flight
+            `partman.run_maintenance` blocked on an
+            `AccessExclusiveLock` against a tenant table.
+
+            Mitigation: identify the blocking session via
+            `pg_stat_activity` and cancel it; the maintainer's
+            per-call timeout (2 minutes by default) will release
+            on the next tick.

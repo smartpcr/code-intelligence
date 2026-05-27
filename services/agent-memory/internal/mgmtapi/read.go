@@ -140,6 +140,8 @@ import (
 	"time"
 
 	"github.com/lib/pq"
+
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/degraded"
 )
 
 // ---------------------------------------------------------------
@@ -671,13 +673,99 @@ func extractTrailingPathID(prefix, path string) (string, bool) {
 	return rest, true
 }
 
-// writeReadResponse wraps `payload` in a DegradedEnvelope with
-// the §6.3 / C22 degraded fields stamped to false and emits
-// the JSON. Stage 7.5 always serves `degraded=false`; Stage
-// 8.1 will introduce a probe that flips the flag based on
-// `repo_health` and per-verb fault-injection.
-func writeReadResponse[T any](w http.ResponseWriter, payload T) {
-	writeJSONResponse(w, http.StatusOK, DegradedEnvelope[T]{Payload: payload})
+// Mgmt verb identifiers used by the Stage 8.1 degraded-mode
+// contract chokepoint. The constants are package-level so a
+// test (or operator-facing rule editor) cannot drift from the
+// on-the-wire spelling. The §6.3 routing table names every
+// verb; this list mirrors it exactly.
+const (
+	VerbReadRepos             = "mgmt.read.repos"
+	VerbReadCommits           = "mgmt.read.commits"
+	VerbReadEpisodes          = "mgmt.read.episodes"
+	VerbReadObservations      = "mgmt.read.observations"
+	VerbReadContext           = "mgmt.read.context"
+	VerbReadConcepts          = "mgmt.read.concepts"
+	VerbReadConceptSupports   = "mgmt.read.concept_supports"
+	VerbReadGraphNode         = "mgmt.read.graph_node"
+	VerbReadTraceObservation  = "mgmt.read.trace_observation"
+)
+
+// writeReadResponse wraps `payload` in a DegradedEnvelope and
+// applies the §8.1 audit chokepoint. The pipeline is:
+//
+//  1. Consult `h.degradedHealthSource` for a closed-set
+//     reason. A probe error is treated as healthy (logged at
+//     Warn) so a flaky `repo_health` row never blocks the
+//     read.
+//  2. Apply the `h.degradedFaultInjector` overlay; injection
+//     never erases a higher-priority real signal.
+//  3. Run `degraded.Enforce` on the final pair. A non-closed
+//     reason produced by injection fails the call with 500.
+//  4. Increment the per-verb degraded counter when the
+//     envelope is non-empty.
+//
+// Stage 7.5's default path (every nil source) reduces to a
+// healthy `degraded=false` envelope, preserving baseline
+// behaviour.
+func writeReadResponse[T any](w http.ResponseWriter, r *http.Request, h *Handler, verb, repoID string, payload T) {
+	env := DegradedEnvelope[T]{Payload: payload}
+
+	if h != nil && h.degradedHealthSource != nil {
+		reason, probeErr := h.degradedHealthSource.DegradedReason(r.Context(), verb, repoID)
+		if probeErr != nil {
+			// §8.3-style invariant: a flaky probe MUST NOT
+			// fail the read.  Treat as healthy + log.
+			h.logger.Warn("mgmtapi.read.degraded_probe_failed",
+				slog.String("verb", verb),
+				slog.String("repo_id", repoID),
+				slog.String("err", probeErr.Error()))
+		} else if reason != "" {
+			env.Degraded = true
+			env.DegradedReason = reason
+		}
+	}
+
+	if h != nil && h.degradedFaultInjector != nil {
+		injDeg, injReason := h.degradedFaultInjector.Inject(verb, repoID)
+		if injDeg && injReason != "" {
+			// Priority overlay: a real outage dominates over
+			// a lower-priority injection rule so a test rule
+			// cannot mask a live probe signal.
+			if !env.Degraded || degraded.Priority(injReason) > degraded.Priority(env.DegradedReason) {
+				if h.logger != nil {
+					h.logger.Warn("mgmtapi.read.fault_injected",
+						slog.String("verb", verb),
+						slog.String("repo_id", repoID),
+						slog.String("reason", injReason))
+				}
+				env.Degraded = true
+				env.DegradedReason = injReason
+			}
+		}
+	}
+
+	if err := degraded.Enforce(env.Degraded, env.DegradedReason); err != nil {
+		// A non-closed reason reached the chokepoint — either
+		// the HealthSource returned an out-of-set string
+		// (operator bug) or the fault injector did.  Hard
+		// fail so the UI / operator sees the violation
+		// immediately.
+		if h != nil && h.logger != nil {
+			h.logger.Error("mgmtapi.read.closed_set_violation",
+				slog.String("verb", verb),
+				slog.String("repo_id", repoID),
+				slog.String("attempted_reason", env.DegradedReason),
+				slog.String("err", err.Error()))
+		}
+		writeJSONError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+
+	if env.Degraded && h != nil && h.degradedMetric != nil {
+		h.degradedMetric.IncDegraded(verb, env.DegradedReason)
+	}
+
+	writeJSONResponse(w, http.StatusOK, env)
 }
 
 // logReadError emits a structured ERROR-level log for a
@@ -774,7 +862,7 @@ func (h *Handler) handleListRepos(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "internal_error", "internal error")
 		return
 	}
-	writeReadResponse(w, ListReposResponse{Repos: out})
+	writeReadResponse(w, r, h, VerbReadRepos, repoID, ListReposResponse{Repos: out})
 }
 
 // ---------------------------------------------------------------
@@ -832,7 +920,7 @@ func (h *Handler) handleListCommits(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "internal_error", "internal error")
 		return
 	}
-	writeReadResponse(w, ListCommitsResponse{RepoID: repoID, Commits: out})
+	writeReadResponse(w, r, h, VerbReadCommits, repoID, ListCommitsResponse{RepoID: repoID, Commits: out})
 }
 
 // ---------------------------------------------------------------
@@ -938,7 +1026,7 @@ func (h *Handler) handleListEpisodes(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "internal_error", "internal error")
 		return
 	}
-	writeReadResponse(w, ListEpisodesResponse{Episodes: out})
+	writeReadResponse(w, r, h, VerbReadEpisodes, repoID, ListEpisodesResponse{Episodes: out})
 }
 
 // ---------------------------------------------------------------
@@ -1020,7 +1108,7 @@ func (h *Handler) handleListObservations(w http.ResponseWriter, r *http.Request)
 		writeJSONError(w, http.StatusInternalServerError, "internal_error", "internal error")
 		return
 	}
-	writeReadResponse(w, ListObservationsResponse{
+	writeReadResponse(w, r, h, VerbReadObservations, "", ListObservationsResponse{
 		EpisodeID:    episodeID,
 		Observations: out,
 	})
@@ -1136,7 +1224,7 @@ func (h *Handler) handleReadContext(w http.ResponseWriter, r *http.Request, rawC
 	resp.Nodes = nodes
 	resp.Edges = edges
 	resp.Concepts = concepts
-	writeReadResponse(w, resp)
+	writeReadResponse(w, r, h, VerbReadContext, resp.RepoID, resp)
 }
 
 // fetchContextNodes dereferences `node_ids[]` from a
@@ -1323,7 +1411,7 @@ func (h *Handler) handleListConcepts(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "internal_error", "internal error")
 		return
 	}
-	writeReadResponse(w, ListConceptsResponse{Concepts: out})
+	writeReadResponse(w, r, h, VerbReadConcepts, "", ListConceptsResponse{Concepts: out})
 }
 
 // ---------------------------------------------------------------
@@ -1389,7 +1477,7 @@ func (h *Handler) handleListConceptSupports(w http.ResponseWriter, r *http.Reque
 		writeJSONError(w, http.StatusInternalServerError, "internal_error", "internal error")
 		return
 	}
-	writeReadResponse(w, ListConceptSupportsResponse{
+	writeReadResponse(w, r, h, VerbReadConceptSupports, repoID, ListConceptSupportsResponse{
 		ConceptID: conceptID,
 		Supports:  out,
 	})
@@ -1510,7 +1598,7 @@ func (h *Handler) handleReadGraphNode(w http.ResponseWriter, r *http.Request, ra
 	}
 	resp.OutgoingEdges = out
 	resp.IncomingEdges = in
-	writeReadResponse(w, resp)
+	writeReadResponse(w, r, h, VerbReadGraphNode, resp.RepoID, resp)
 }
 
 // graphNodeShaState captures the booleans needed to decide a
@@ -1831,5 +1919,5 @@ func (h *Handler) handleReadTraceObservation(w http.ResponseWriter, r *http.Requ
 		resp.NextOffset = offset + limit
 	}
 	resp.Tail = tail
-	writeReadResponse(w, resp)
+	writeReadResponse(w, r, h, VerbReadTraceObservation, "", resp)
 }

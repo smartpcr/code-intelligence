@@ -42,6 +42,8 @@ func clearCleanCodeEnv(t *testing.T) {
 		EnvDisableStaleSweep,
 		EnvEnableLegacyDemoAPI,
 		EnvAstScanRoot,
+		EnvAggregatorCadence,
+		EnvDisableAggregator,
 	} {
 		t.Setenv(k, "")
 	}
@@ -123,6 +125,67 @@ func TestLoad_NumericDefaults(t *testing.T) {
 	}
 	if cfg.PolicyPublishOverlapSeconds != 86400 {
 		t.Errorf("PolicyPublishOverlapSeconds = %d; want 86400", cfg.PolicyPublishOverlapSeconds)
+	}
+	// Stage 7.1 knobs: tech-spec Sec 8.2 default
+	// `aggregator_cadence=15m`; aggregator loop enabled by
+	// default.
+	if cfg.AggregatorCadence != 15*time.Minute {
+		t.Errorf("AggregatorCadence = %s; want 15m", cfg.AggregatorCadence)
+	}
+	if cfg.AggregatorCadence != DefaultAggregatorCadence {
+		t.Errorf("AggregatorCadence = %s; want DefaultAggregatorCadence (%s)", cfg.AggregatorCadence, DefaultAggregatorCadence)
+	}
+	if cfg.DisableAggregator {
+		t.Errorf("DisableAggregator = true; want false (loop enabled by default)")
+	}
+}
+
+// TestLoad_AggregatorEnvOverrides verifies the Stage 7.1
+// `CLEAN_CODE_AGGREGATOR_CADENCE` + `CLEAN_CODE_DISABLE_AGGREGATOR`
+// knobs round-trip through Load and override the
+// `DefaultAggregatorCadence` / disabled=false defaults.
+func TestLoad_AggregatorEnvOverrides(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvAggregatorCadence, "7m30s")
+	t.Setenv(EnvDisableAggregator, "true")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: unexpected error: %v", err)
+	}
+	if cfg.AggregatorCadence != 7*time.Minute+30*time.Second {
+		t.Errorf("AggregatorCadence = %s; want 7m30s", cfg.AggregatorCadence)
+	}
+	if !cfg.DisableAggregator {
+		t.Errorf("DisableAggregator = false; want true")
+	}
+}
+
+// TestLoad_AggregatorCadenceMalformedRejected verifies a malformed
+// cadence value surfaces an error that names the env key (so the
+// operator can identify which knob to fix). The fail-fast contract
+// is the same as every other duration-typed knob.
+func TestLoad_AggregatorCadenceMalformedRejected(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvAggregatorCadence, "fifteen-minutes")
+	if _, err := Load(); err == nil {
+		t.Errorf("Load: want non-nil error for bogus AggregatorCadence, got nil")
+	} else if !strings.Contains(err.Error(), EnvAggregatorCadence) {
+		t.Errorf("Load: error %q must name %s for operator triage", err, EnvAggregatorCadence)
+	}
+}
+
+// TestLoad_AggregatorCadenceNonPositiveRejected verifies the
+// `> 0` validation in Config.Validate -- a zero or negative
+// cadence would loop tightly and is rejected at load time.
+func TestLoad_AggregatorCadenceNonPositiveRejected(t *testing.T) {
+	for _, raw := range []string{"0s", "-5m"} {
+		t.Run(raw, func(t *testing.T) {
+			clearCleanCodeEnv(t)
+			t.Setenv(EnvAggregatorCadence, raw)
+			if _, err := Load(); err == nil {
+				t.Errorf("Load: want non-nil error for AggregatorCadence=%s, got nil", raw)
+			}
+		})
 	}
 }
 

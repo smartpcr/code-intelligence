@@ -15,10 +15,10 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gofrs/uuid"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/config"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/webhook"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/config"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
 
 // TestBuildSweepLoop_DisableStaleSweep_ReturnsNil verifies the

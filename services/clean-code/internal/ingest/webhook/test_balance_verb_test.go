@@ -15,10 +15,10 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/test_balance"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/webhook"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/test_balance"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
 
 // testBalanceScopeResolver is a deterministic in-memory

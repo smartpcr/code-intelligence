@@ -10,7 +10,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/steward"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 )
 
 // InMemoryStore is the canonical test fake [Store]. Holds

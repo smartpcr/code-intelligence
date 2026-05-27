@@ -13,7 +13,7 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/lib/pq"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/scope"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
 )
 
 // scopeBindingTable is the unqualified table name the writer

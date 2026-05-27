@@ -20,7 +20,7 @@ import (
 	"github.com/cucumber/godog"
 	_ "github.com/lib/pq"
 
-	"forge/services/clean-code/internal/domain"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/domain"
 )
 
 // requireEnv returns the value of the named environment variable or skips the

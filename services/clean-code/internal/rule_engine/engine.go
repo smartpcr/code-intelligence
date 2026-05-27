@@ -10,8 +10,8 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/dsl"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/steward"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/dsl"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 )
 
 // Config wires the engine's dependencies. Required field:

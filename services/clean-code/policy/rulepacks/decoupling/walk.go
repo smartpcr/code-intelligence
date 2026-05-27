@@ -3,7 +3,7 @@ package decoupling
 import (
 	"github.com/gofrs/uuid"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/dsl"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/dsl"
 )
 
 // collectMetricKindLiterals walks a parsed DSL AST and

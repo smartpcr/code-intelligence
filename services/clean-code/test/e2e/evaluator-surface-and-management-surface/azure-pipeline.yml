@@ -16,8 +16,8 @@ variables:
   COMPOSE_FILE: tests/e2e/phase-06-evaluator-mgmt/docker-compose.yml
 
 stages:
-  - stage: e2e_evaluator_gate_verb_and_synchronous_solid_delegation
-    displayName: "E2E – Evaluator Gate Verb and Synchronous SOLID Delegation"
+  - stage: e2e_management_read_verbs_and_insights_projections
+    displayName: "E2E – Management Read Verbs and Insights Projections"
     jobs:
       - job: run_e2e
         displayName: "Run godog E2E tests"
@@ -62,7 +62,7 @@ stages:
               export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:${OTEL_PORT}"
               cd services/clean-code
               go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
-                -run TestE2E_evaluator_surface_and_management_surface_evaluator_gate_verb_and_synchronous_solid_delegation
+                -run TestE2E_evaluator_surface_and_management_surface_management_read_verbs_and_insights_projections
             displayName: "Export compose URLs and run E2E tests"
             workingDirectory: $(Build.SourcesDirectory)
 

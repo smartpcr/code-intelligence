@@ -7,7 +7,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/scope"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
 )
 
 // mustRepoID is a test-only helper turning a literal canonical
@@ -24,7 +24,7 @@ func mustRepoID(t *testing.T, s string) uuid.UUID {
 
 // pinnedNamespaceUUID is the LITERAL expected value of
 // [scope.Namespace]. Hand-computed once via
-// `uuid.NewV5(uuid.NamespaceURL, "https://github.com/microsoft/code-intelligence/clean-code/scope#v1").String()`
+// `uuid.NewV5(uuid.NamespaceURL, "https://github.com/smartpcr/code-intelligence/clean-code/scope#v1").String()`
 // and PASTED here as a string literal so the golden assertion
 // in [TestNamespace_Pinned] does not silently track the
 // in-source NamespaceURL. Iter-2 stored `want` as

@@ -48,15 +48,15 @@ import (
 
 	_ "github.com/lib/pq"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/config"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/churn"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/coverage"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/test_balance"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/webhook"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/management"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/materialisers"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/config"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/churn"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/coverage"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/test_balance"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/materialisers"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
 
 // db is the metric-ingestor-role PG handle used by the legacy demo

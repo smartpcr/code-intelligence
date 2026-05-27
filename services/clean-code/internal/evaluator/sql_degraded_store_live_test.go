@@ -13,7 +13,7 @@ import (
 	"github.com/gofrs/uuid"
 	_ "github.com/lib/pq"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/steward"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 )
 
 // envEvaluatorLiveURL is the libpq DSN consumed by the

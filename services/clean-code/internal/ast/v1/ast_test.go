@@ -3,7 +3,7 @@ package astv1_test
 import (
 	"testing"
 
-	astv1 "github.com/microsoft/code-intelligence/services/clean-code/internal/ast/v1"
+	astv1 "github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/v1"
 	"google.golang.org/protobuf/proto"
 )
 

@@ -22,7 +22,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gofrs/uuid"
 
-	metric_ingestor "github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
+	metric_ingestor "github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
 )
 
 const pgRetractTestSchema = "clean_code_retract_test"

@@ -54,7 +54,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/steward"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 )
 
 // BootstrapResult summarises what [Bootstrap] persisted on

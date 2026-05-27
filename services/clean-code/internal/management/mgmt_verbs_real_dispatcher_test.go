@@ -43,7 +43,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
 )
 
 // realDispatcherFixture stitches together the production

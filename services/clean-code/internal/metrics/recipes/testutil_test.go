@@ -1,7 +1,7 @@
 package recipes_test
 
 import (
-	astv1 "github.com/microsoft/code-intelligence/services/clean-code/internal/ast/v1"
+	astv1 "github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/v1"
 )
 
 // astBuilder is a tiny helper used by the recipe tests to

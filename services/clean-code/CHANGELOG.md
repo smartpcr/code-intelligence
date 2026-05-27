@@ -2775,7 +2775,7 @@ Mirroring every numbered item from iter-21's
 
 - `go-mod-module-path-fix = keep-the-fix`:
   `services/clean-code/go.mod` carries
-  `module github.com/microsoft/code-intelligence/services/clean-code`
+  `module github.com/smartpcr/code-intelligence/services/clean-code`
   (restored from commit `6cf1199`); every source file's
   import prefix matches. Confirmed by the full-package
   build passing at HEAD this iter.
@@ -2940,7 +2940,7 @@ from iter-20 is unchanged.
 
 - **`services/clean-code/go.mod`** -- module declaration
   corrected from `forge/services/clean-code` to
-  `github.com/microsoft/code-intelligence/services/clean-code`
+  `github.com/smartpcr/code-intelligence/services/clean-code`
   (matches every existing import in the repo). Direct
   requires added for `cucumber/godog`, `gofrs/uuid v4.3.1+incompatible`,
   `lib/pq v1.10.9`; `go mod tidy` populated indirect
@@ -3952,7 +3952,7 @@ foundation recipes and the Stage 2.6 materialiser.
     firstSeenSHA)` with NUL framing between fields, derived
     under a pinned package-level `Namespace` UUID (itself a
     UUIDv5 of `NamespaceURL` constant
-    `https://github.com/microsoft/code-intelligence/clean-code/scope#v1`).
+    `https://github.com/smartpcr/code-intelligence/clean-code/scope#v1`).
     SHA is NOT part of identity (G2): callers reuse the
     persisted `first_seen_sha` across SHAs so the same
     logical scope keeps the same `scope_id`. The
@@ -4039,7 +4039,7 @@ foundation recipes and the Stage 2.6 materialiser.
 ### Changed
 
 - `go.mod`: module path corrected from `forge/services/clean-code`
-  back to `github.com/microsoft/code-intelligence/services/clean-code`.
+  back to `github.com/smartpcr/code-intelligence/services/clean-code`.
   Every existing internal package (`internal/policy/keys`,
   `internal/policy/steward`, `internal/management`,
   `internal/evaluator`, `cmd/clean-coded`, etc.) imports from
@@ -4388,7 +4388,7 @@ foundation recipes and the Stage 2.6 materialiser.
 ### Changed
 
 - `cmd/clean-coded/main.go` import paths corrected to the
-  module path `github.com/microsoft/code-intelligence/services/clean-code/...`.
+  module path `github.com/smartpcr/code-intelligence/services/clean-code/...`.
   Pre-existing `forge/services/...` import paths were broken.
 
 ### Operational notes

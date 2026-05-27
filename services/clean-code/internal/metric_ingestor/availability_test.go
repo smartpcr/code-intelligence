@@ -20,8 +20,8 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/repo_indexer"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/repo_indexer"
 )
 
 // fakeProbe is a programmable [AstSourceAvailability]

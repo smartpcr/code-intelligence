@@ -9,8 +9,8 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/coverage"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/coverage"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
 )
 
 // CoverageVerbHandler is the [VerbHandler] implementation

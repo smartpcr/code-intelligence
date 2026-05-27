@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/scope"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
 )
 
 // TestNormalizeSignature_AgentMemoryParity asserts our

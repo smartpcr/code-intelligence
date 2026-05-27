@@ -15,7 +15,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gofrs/uuid"
 
-	management "github.com/microsoft/code-intelligence/services/clean-code/internal/management"
+	management "github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
 )
 
 const pgRepoEventTestSchema = "clean_code_mgmt_test"

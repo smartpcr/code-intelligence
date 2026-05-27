@@ -38,25 +38,33 @@ stages:
               docker compose -f $(COMPOSE_FILE) up -d --build
             displayName: "Start compose services"
             workingDirectory: $(Build.SourcesDirectory)
-            env:
-              CLEAN_CODE_WEBHOOK_HMAC_SECRET: $(CLEAN_CODE_WEBHOOK_HMAC_SECRET)
 
           - script: |
-              PG_PORT=$(docker compose -f $(COMPOSE_FILE) port postgres 5432 | cut -d: -f2)
-              WEBHOOK_PORT=$(docker compose -f $(COMPOSE_FILE) port webhook 8080 | cut -d: -f2)
-              OTEL_PORT=$(docker compose -f $(COMPOSE_FILE) port otel-collector 4317 | cut -d: -f2)
-              export CLEAN_CODE_PG_URL="postgres://postgres:postgres@localhost:${PG_PORT}/clean_code?sslmode=disable"
-              export CLEAN_CODE_WEBHOOK_URL="http://localhost:${WEBHOOK_PORT}"
-              export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:${OTEL_PORT}"
+              set -euo pipefail
+              # Generate HMAC secret FIRST — use $$() so Azure does not
+              # macro-expand the shell command substitution.
+              CLEAN_CODE_WEBHOOK_HMAC_SECRET="$$(openssl rand -hex 32)"
+              export CLEAN_CODE_WEBHOOK_HMAC_SECRET
+              # Persist as a pipeline secret for downstream steps.
+              echo "##vso[task.setvariable variable=CLEAN_CODE_WEBHOOK_HMAC_SECRET;issecret=true]$$CLEAN_CODE_WEBHOOK_HMAC_SECRET"
+              # Now start compose — the secret is already in the environment.
+              docker compose -f $(COMPOSE_FILE) up -d --build
+              # Discover dynamic ports.
+              PG_PORT=$$(docker compose -f $(COMPOSE_FILE) port postgres 5432 | cut -d: -f2)
+              WEBHOOK_PORT=$$(docker compose -f $(COMPOSE_FILE) port webhook 8080 | cut -d: -f2)
+              OTEL_PORT=$$(docker compose -f $(COMPOSE_FILE) port otel-collector 4317 | cut -d: -f2)
+              export CLEAN_CODE_PG_URL="postgres://postgres:postgres@localhost:$${PG_PORT}/clean_code?sslmode=disable"
+              export CLEAN_CODE_WEBHOOK_URL="http://localhost:$${WEBHOOK_PORT}"
+              export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:$${OTEL_PORT}"
+              # Bootstrap.
               make migrate-up
               make seed-repo-d
+              # Run tests.
               cd services/clean-code
               go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
                 -run TestE2E_external_metric_ingest_webhook_ingest_defects_verb_store_only
             displayName: "Export compose URLs, bootstrap, and run E2E tests"
             workingDirectory: $(Build.SourcesDirectory)
-            env:
-              CLEAN_CODE_WEBHOOK_HMAC_SECRET: $(CLEAN_CODE_WEBHOOK_HMAC_SECRET)
 
           - script: |
               docker compose -f $(COMPOSE_FILE) down -v --remove-orphans

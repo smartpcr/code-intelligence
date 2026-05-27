@@ -16,7 +16,7 @@
 //  2. The [Hydrator] that turns a [Payload] into
 //     `[]HydratedChurnRow` -- the writer-ready records the
 //     `modification_count_in_window` materialiser
-//     ([github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/materialisers])
+//     ([github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/materialisers])
 //     consumes plus the durable `scope_id` UUID the Metric
 //     Ingestor stamps on the emitted `metric_sample` row.
 //
@@ -65,9 +65,9 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/scope"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/materialisers"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/materialisers"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
 
 // ScanRunKindExternalPerRow is the canonical `ScanRun.kind`
@@ -79,11 +79,11 @@ import (
 // # Accepted parent ScanRun kinds (post iter-3)
 //
 // The Metric Ingestor's churn-sweep validator
-// ([github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor.AllowedScanRunKinds])
+// ([github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor.AllowedScanRunKinds])
 // ACCEPTS THREE kinds (NOT just this one):
 //
 //   - `full`     -- a foundation-tier initial scan; the
-//     [github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor.Ingestor]
+//     [github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor.Ingestor]
 //     coordinator dispatches the AST recipes FIRST, then
 //     invokes the churn sweep INLINE inside the SAME
 //     ScanRun so the active-row uniqueness invariant (G2)

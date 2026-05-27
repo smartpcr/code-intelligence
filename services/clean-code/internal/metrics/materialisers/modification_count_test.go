@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/scope"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/config"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/materialisers"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/config"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/materialisers"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
 
 // fixedClock returns a closure that always reports `t`. The

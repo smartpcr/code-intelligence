@@ -486,15 +486,27 @@ func InitializeScenario_cross_repo_aggregator_aggregator_cadence_loop_and_snapsh
 		return writerState.aNonAggregatorDatabaseRole()
 	})
 	ctx.Step(`^it attempts INSERT into cross_repo_percentile$`, func() error {
+		if writerState == nil {
+			return fmt.Errorf("writerState is nil")
+		}
 		return writerState.itAttemptsINSERTIntoCrossRepoPercentile()
 	})
 	ctx.Step(`^PostgreSQL returns permission denied$`, func() error {
+		if writerState == nil {
+			return fmt.Errorf("writerState is nil")
+		}
 		return writerState.postgresqlReturnsPermissionDenied()
 	})
 	ctx.Step(`^the aggregator role attempts INSERT into cross_repo_percentile$`, func() error {
+		if writerState == nil {
+			return fmt.Errorf("writerState is nil")
+		}
 		return writerState.theAggregatorRoleAttemptsINSERT()
 	})
 	ctx.Step(`^the aggregator INSERT succeeds$`, func() error {
+		if writerState == nil {
+			return fmt.Errorf("writerState is nil")
+		}
 		return writerState.theAggregatorINSERTSucceeds()
 	})
 }

@@ -85,6 +85,13 @@ const (
 	// `policy_publish_overlap_min_seconds` row: minimum
 	// key-rotation overlap (C13 mitigation).
 	DefaultPolicyPublishOverlapSeconds = 86400
+	// DefaultAggregatorCadence is the tech-spec Sec 8.2
+	// `aggregator_cadence` row: the period between
+	// Cross-Repo Aggregator ticks. 15 min is shorter than
+	// `freshness_window_seconds` (3600) so the Insights
+	// surface's percentile freshness banner has 3-4x
+	// headroom under nominal load (architecture Sec 3.10).
+	DefaultAggregatorCadence = 15 * time.Minute
 	// DefaultKMSProvider is the canonical default for the
 	// Stage 5.1 `kms-provider` knob. The empty default
 	// preserves scaffold-mode startup -- the composition root
@@ -188,6 +195,20 @@ const (
 	EnvWindowDays                  = "CLEAN_CODE_WINDOW_DAYS"
 	EnvFreshnessWindowSeconds      = "CLEAN_CODE_FRESHNESS_WINDOW_SECONDS"
 	EnvPolicyPublishOverlapSeconds = "CLEAN_CODE_POLICY_PUBLISH_OVERLAP_SECONDS"
+	// EnvAggregatorCadence is the operator-facing knob for
+	// the Cross-Repo Aggregator tick period (Stage 7.1,
+	// tech-spec Sec 8.2 `aggregator_cadence`). Accepts any
+	// [time.ParseDuration] value (e.g. `15m`, `5m`, `1h`).
+	// Default: [DefaultAggregatorCadence] (15 min).
+	EnvAggregatorCadence = "CLEAN_CODE_AGGREGATOR_CADENCE"
+	// EnvDisableAggregator is the explicit operator opt-out
+	// for the Stage 7.1 Cross-Repo Aggregator loop. Default
+	// false (loop enabled). When true, the composition root
+	// SKIPS construction of the aggregator goroutine entirely.
+	// Production MUST keep this false; intended for legacy
+	// E2E environments that lack the Stage 1.3 snapshot
+	// tables.
+	EnvDisableAggregator = "CLEAN_CODE_DISABLE_AGGREGATOR"
 	// EnvKMSProvider names the operator-facing knob that picks
 	// the policy-signing KMS adapter. Closed set: `local` |
 	// `in-memory`. Unset leaves the service in scaffold mode
@@ -415,6 +436,15 @@ type Config struct {
 	// PolicyPublishOverlapSeconds is the tech-spec Sec 8.2
 	// `policy_publish_overlap_min_seconds` value.
 	PolicyPublishOverlapSeconds int
+	// AggregatorCadence is the tech-spec Sec 8.2
+	// `aggregator_cadence` value -- the period between
+	// Cross-Repo Aggregator ticks (Stage 7.1, architecture
+	// Sec 3.10).
+	AggregatorCadence time.Duration
+	// DisableAggregator is the explicit operator opt-out for
+	// the Stage 7.1 Cross-Repo Aggregator loop. Default
+	// false (loop enabled). See [EnvDisableAggregator].
+	DisableAggregator bool
 
 	// --- Policy signing (Stage 5.1) ---
 
@@ -532,6 +562,7 @@ func Defaults() Config {
 		WindowDays:                   DefaultWindowDays,
 		FreshnessWindowSeconds:       DefaultFreshnessWindowSeconds,
 		PolicyPublishOverlapSeconds:  DefaultPolicyPublishOverlapSeconds,
+		AggregatorCadence:            DefaultAggregatorCadence,
 		KMSProvider:                  DefaultKMSProvider,
 		KMSMasterKeyHex:              "",
 	}
@@ -611,6 +642,9 @@ func (c Config) Validate() error {
 	}
 	if c.PeriodicSweepCadence <= 0 {
 		return fmt.Errorf("config: periodic-sweep-cadence=%s must be > 0", c.PeriodicSweepCadence)
+	}
+	if c.AggregatorCadence <= 0 {
+		return fmt.Errorf("config: aggregator-cadence=%s must be > 0", c.AggregatorCadence)
 	}
 	// KMS provider closed-set + interlocks.
 	switch c.KMSProvider {
@@ -704,6 +738,8 @@ func readEnvOverrides() map[string]string {
 		EnvWindowDays,
 		EnvFreshnessWindowSeconds,
 		EnvPolicyPublishOverlapSeconds,
+		EnvAggregatorCadence,
+		EnvDisableAggregator,
 		EnvKMSProvider,
 		EnvKMSMasterKeyHex,
 		EnvWebhookHMACSecret,
@@ -791,6 +827,21 @@ func applyOverrides(cfg *Config, overrides map[string]string) error {
 				return fmt.Errorf("%s=%q: %w", k, v, err)
 			}
 			cfg.PolicyPublishOverlapSeconds = n
+		case EnvAggregatorCadence:
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return fmt.Errorf("%s=%q: %w", k, v, err)
+			}
+			cfg.AggregatorCadence = d
+		case EnvDisableAggregator:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "1", "true", "yes", "on":
+				cfg.DisableAggregator = true
+			case "0", "false", "no", "off":
+				cfg.DisableAggregator = false
+			default:
+				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
+			}
 		case EnvKMSProvider:
 			cfg.KMSProvider = v
 		case EnvKMSMasterKeyHex:

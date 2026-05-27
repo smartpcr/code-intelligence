@@ -5,6 +5,159 @@ production-tier environment. The instructions assume Postgres
 14+ is already running and the `clean_code_*` roles have been
 created via the `0004_roles.up.sql` migration.
 
+## Stage 7.1: Cross-Repo Aggregator cadence loop
+
+This subsection captures the rollout sequence for the
+`internal/aggregator/` package (architecture Sec 3.10 /
+Sec 5.2.4 - Sec 5.2.6, tech-spec Sec 8.2
+`aggregator_cadence=15min`). Stage 7.1 introduces ONE new
+binary path under `cmd/clean-code-aggregator/` and ONE new
+process per environment.
+
+### What's new
+
+1. **`internal/aggregator/` package** -- new package carrying
+   `Aggregator` (Tick logic), `Loop` (cadence driver),
+   `PGSampleSource` (read path), `PGSnapshotWriter` (write
+   path). All three snapshot tables are populated by a SINGLE
+   process per environment.
+2. **`CLEAN_CODE_AGGREGATOR_CADENCE`** (Go duration, default
+   `15m`) and **`CLEAN_CODE_DISABLE_AGGREGATOR`** (bool,
+   default `false`) -- new env knobs in
+   `internal/config/config.go`.
+
+### Pre-rollout: confirm role grants
+
+Run as a DB superuser BEFORE rolling out the binary. The
+filter on `privilege_type IN ('INSERT','UPDATE','DELETE')` is
+LOAD-BEARING -- migration `0004_roles.up.sql:227-260` grants
+broad `SELECT` on the snapshot tables to nearly every role
+(reader access for Insights / Evaluator / Refactor Planner /
+etc.), so an UNFILTERED query would return many roles and the
+STOP guidance below would be unactionable. Only INSERT /
+UPDATE / DELETE on the snapshot tables identifies the
+sole-writer surface this rollout depends on, and matches the
+post-rollout validation query in `runbook.md` "Snapshot table
+writer identity".
+
+```sql
+SELECT grantee, privilege_type
+  FROM information_schema.role_table_grants
+ WHERE table_schema = 'clean_code'
+   AND table_name IN ('repo_metric_snapshot',
+                      'cross_repo_percentile',
+                      'portfolio_snapshot')
+   AND privilege_type IN ('INSERT', 'UPDATE', 'DELETE')
+ ORDER BY table_name, grantee, privilege_type;
+```
+
+Expected output: EXACTLY three rows, one per snapshot table,
+all of the form
+`('clean_code_xrepo_aggregator', 'INSERT')`. No `UPDATE` or
+`DELETE` row should appear (migration `0004_roles.up.sql`
+lines 416-418 explicitly `REVOKE UPDATE, DELETE` on all three
+tables, per the G6 row-immutability invariant), and no other
+`grantee` should appear with INSERT/UPDATE/DELETE on these
+three tables. If ANY of those conditions are violated,
+**STOP** and consult Phase 1.5 sub-store grant policy
+(migration `0004_roles.up.sql`).
+
+### Wiring step (composition root)
+
+The `cmd/clean-code-aggregator/main.go` composition root constructs:
+
+```go
+src, _ := aggregator.NewPGSampleSource(db)
+w, _   := aggregator.NewPGSnapshotWriter(db)
+agg, _ := aggregator.NewAggregator(src, w)
+loop   := aggregator.NewLoop(agg,
+    aggregator.WithLoopCadence(cfg.AggregatorCadence),
+    aggregator.WithLoopLogger(log),
+)
+go func() { _ = loop.Run(ctx) }()
+```
+
+Connect to the database AS the `clean_code_xrepo_aggregator`
+role (NOT `clean_code_management` or `clean_code_ingestor`).
+Per migration `0004_roles.up.sql:392-418` the role's grant
+matrix is:
+
+| Table                    | Aggregator grants    | Notes                                                                |
+| ------------------------ | -------------------- | -------------------------------------------------------------------- |
+| `metric_sample`          | `INSERT, SELECT`     | System-tier carve-out (tech-spec Sec 7.2 lines 1348-1364): the       |
+|                          |                      | aggregator writes `pack='system' AND source='derived'` rows for      |
+|                          |                      | composed metrics (xrepo-dep-depth, arch-debt-ratio, etc.). The       |
+|                          |                      | `pack='system'` filter is enforced by the application-layer writer   |
+|                          |                      | (architecture Sec 3.10), NOT by table-level ACL.                     |
+| `metric_retraction`      | `INSERT, SELECT`     | Retraction writer for system-tier rows the aggregator emitted.       |
+| `metric_sample_active`   | `INSERT, SELECT, UPDATE` | Pointer-update for system-tier active rows; only the aggregator  |
+|                          |                      | and the metric_ingestor have `UPDATE` here.                          |
+| `repo_metric_snapshot`   | `INSERT, SELECT`     | **SOLE writer** -- no other role has `INSERT`. `UPDATE` and          |
+|                          |                      | `DELETE` are explicitly `REVOKE`d (G6 row-immutability invariant).   |
+| `cross_repo_percentile`  | `INSERT, SELECT`     | Same: SOLE writer, UPDATE/DELETE revoked.                            |
+| `portfolio_snapshot`     | `INSERT, SELECT`     | Same: SOLE writer, UPDATE/DELETE revoked.                            |
+
+What this means for code drift:
+
+  - An accidental `INSERT INTO metric_sample` from the aggregator
+    binary WILL succeed at the PG ACL layer; the application-layer
+    `pack='system'` filter is the gate that protects the
+    metric_ingestor's foundation-tier write surface
+    (`pack IN ('base','solid','ingested')`; `'foundation'` is the
+    TIER label that contains those three packs, not a pack value
+    itself -- see tech-spec Sec 7.2 lines 1212-1248). Code review
+    + the `aggregator-is-sole-writer` role isolation test
+    (`internal/storage/roles_test.go`) are the safety nets.
+  - An accidental `INSERT INTO repo_metric_snapshot` from ANY OTHER
+    role (`clean_code_management`, `clean_code_metric_ingestor`,
+    `clean_code_repo_indexer`, etc.) WILL fail at the PG ACL layer
+    -- the sole-writer invariant is enforced by the role grants,
+    not by an application-layer check. Same for
+    `cross_repo_percentile` and `portfolio_snapshot`.
+  - An accidental `UPDATE` or `DELETE` from the aggregator role
+    against any of the three snapshot tables WILL fail at the PG
+    ACL layer (G6 row immutability is grant-enforced).
+
+### Single-replica invariant
+
+Run EXACTLY ONE aggregator process per environment. A second
+replica producing snapshot rows at the same cadence would
+double the row count and confuse downstream readers that
+JOIN to `MAX(built_at)`. The architecture G1 sub-store grant
+ensures correctness at the role layer (only one role can
+write), but the single-replica invariant must be enforced at
+the orchestration layer (Kubernetes `Deployment.replicas=1`
+with `strategy.type: Recreate`, or equivalent).
+
+### Smoke validation
+
+After the first tick (within `aggregator_cadence`, default
+15 min):
+
+```sql
+-- Confirm at least one tick landed:
+SELECT COUNT(*), MAX(built_at)
+  FROM clean_code.repo_metric_snapshot;
+SELECT COUNT(*), MAX(built_at)
+  FROM clean_code.cross_repo_percentile;
+SELECT COUNT(*), MAX(built_at)
+  FROM clean_code.portfolio_snapshot;
+```
+
+All three `MAX(built_at)` values MUST be EQUAL (within the
+single-transaction write window of one tick). A divergence
+indicates either a manual write to one of the three tables
+(policy violation) or a partial-COMMIT bug in the writer
+(file a regression and roll back).
+
+### Rollback
+
+To roll back the aggregator without losing already-written
+snapshot rows: set `CLEAN_CODE_DISABLE_AGGREGATOR=true`,
+restart the binary, and confirm `loop: stopped` appears in
+the structured log. Snapshot rows already in the three
+tables remain (they are append-only history).
+
 ## Stage 6.2: management write verbs and repo onboarding
 
 This subsection captures the rollout sequence for the

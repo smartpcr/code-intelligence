@@ -38,7 +38,7 @@ the support matrix.
 | --- | --- |
 | CGO / tree-sitter `LanguageParser` implementations for C, C++, C#, Go, Rust | New `Node.kind` values (everything maps to existing `class` / `method` / `block` / `package`) |
 | Mapping per-language declaration kinds onto `ClassDecl` / `MethodDecl` | Cross-file resolver for `extends` / `implements` / `static_calls` targets in another file (still deferred to a later story per `dispatcher.go::emit`) |
-| Extension registration in `parsers_cgo.go` and (deliberate per-language) handling in `parsers_nocgo.go` | Schema migrations -- the `attrs_json` blob already absorbs all new per-language metadata |
+| Extension registration in `parsers_cgo.go` and (deliberate per-language) handling in `parsers_nocgo.go` | Schema migrations -- with one targeted exception: a single `ALTER TYPE edge_kind ADD VALUE 'overrides';` migration is required by the Rust trait-overrides decision (see Section 2.2.1 and Section 4.4 preface). No table-level changes are needed. |
 | PowerShell parser strategy and grammar-acquisition decision (Section 6) | Building a new tree-sitter grammar from scratch for languages NOT in this list |
 | Fixture-driven tests per language plus dispatcher routing tests | Performance benchmarking of tree-sitter vs scanner (see `tech-spec.md` ops budget) |
 | Documentation of the support matrix in `.claude/context/tests.md` | Editing `.claude/context/architecture.md` -- per-language details belong with the story doc |
@@ -172,23 +172,30 @@ The following are explicitly NOT modified by this story:
   `EmitResult` / `TouchedNode` shapes are stable; no new field
   is required.
 
-### 2.2.1 What this story DOES change in `parser.go` and writers
+### 2.2.1 What this story DOES change in `parser.go`, writers, dispatcher, and schema
 
-Two additive struct fields and one writer hook -- enumerated
-here so the next iteration of the tech-spec / implementation
-plan can reference an exact diff surface:
+The full additive surface area introduced by this story --
+enumerated here so the tech-spec / implementation plan can
+reference an exact diff list:
 
 | File | Change | Justification |
 | --- | --- | --- |
 | `parser.go` | Add `LangMeta map[string]any` to `ClassDecl`, `MethodDecl`, `Import`. | Section 4.4 -- per-language attrs flow into the writer through a single merge step. |
 | `parser.go` | Add `ReceiverAliases []string` to `MethodDecl`. | Section 4.5.1 -- Go pointer-receiver methods register a secondary key (`Foo.Bar`) for receiver-qualified call resolution while the primary key keeps the `*` prefix. |
+| `parser.go` | Export sentinel `ErrParserUnavailable = errors.New("parser: runtime dependency unavailable")`. | Section 6.4 -- PowerShell parser returns this when `pwsh` is not on PATH so the dispatcher can log a dedicated skip reason instead of `ast.parse.error`. |
 | `dispatcher.go` -- `classAttrs`, `methodAttrs`, `importEdgeAttrs` | Add a final `mergeLangMeta(out, m.LangMeta)` call before `mustJSON`. | Section 4.4.2 -- merges per-language keys into the existing attrs map. |
-| `dispatcher.go` -- receiver-qualified resolver | Consult `MethodDecl.ReceiverAliases` after the primary `methodNodeID[m.EnclosingClass+"."+callee]` lookup. | Section 4.5.1 -- restores `self.X` / `r.X` resolution for Go pointer-receiver targets without affecting other languages. |
+| `dispatcher.go` -- `EmitFile` (between current lines 196 and 198) | After `safeParse` returns, branch on `errors.Is(err, ErrParserUnavailable)` and log `ast.dispatch.skip` with `reason` = the sentinel-supplied reason instead of `ast.parse.error`. Return `EmitResult{}, nil` -- same as the `parser == nil` branch at line 188. | Section 6.4 -- the existing `nil`-error path runs `emit` and ends at `ast.dispatch.ok` (line 209); the existing error path logs `ast.parse.error` (line 198). Neither matches "parser exists but cannot run today" semantics. |
+| `dispatcher.go` -- pre-Pass-2b setup | Build `receiverIndex map[string][]string` (multimap) at the start of Pass 2b: seed with `methodNodeID[m.QualifiedName]` keyed by `m.EnclosingClass+"."+simpleName(m.QualifiedName)`, then APPEND each `m.NodeID` to `receiverIndex[alias]` for every alias in `m.ReceiverAliases`. Receiver-qualified resolution reads from this multimap with the A5 drop-on-collision rule (set-size > 1 -> drop). | Section 4.5.1 -- the existing single-key lookup `methodNodeID[m.EnclosingClass+"."+callee]` cannot detect value/pointer collisions because the value-receiver method's `QualifiedName` happens to equal the lookup key. Set-based multimap fixes that. |
+| `dispatcher.go` -- new Pass 2d | After Pass 2c (reads/writes), iterate `result.Methods`; when `m.LangMeta["trait"]` is set, look up `methodNodeID[traitName + "." + simpleName(m)]`; on hit, emit edge `kind="overrides"` from `m`'s node id to the trait method id. | Section 7.2 / Section 9 R4 -- operator-pinned Rust overrides emission. |
+| `migrations/0022_edge_kind_overrides.sql` (new file) | `ALTER TYPE edge_kind ADD VALUE 'overrides';` | Section 4.4 preface -- the existing `edge_kind` enum in `0001_enums.sql` lines 28-38 lists `contains` / `imports` / `static_calls` / `observed_calls` / `extends` / `implements` / `reads` / `writes` / `renamed_to`. Adding `overrides` requires a single-line enum migration. PostgreSQL `ALTER TYPE ... ADD VALUE` is non-transactional but additive-safe. |
 
-All four edits are additive; existing TS / JS / Python
-parsers populate neither field and their writer output is
-byte-identical (Section 4.4.4). The dispatcher tests in
-`dispatcher_test.go` continue to pass unchanged.
+All edits are additive; existing TS / JS / Python parsers
+populate neither new field nor return the sentinel and their
+writer output is byte-identical (Section 4.4.4). The
+dispatcher tests in `dispatcher_test.go` continue to pass
+unchanged; one new test in Section 8.4 covers the
+`ErrParserUnavailable` skip-log path and one covers the
+multimap collision rule.
 
 ## 3. Build-Tag Topology
 
@@ -461,8 +468,19 @@ fully-qualified path from the envelope.
 | `cmdlet_verb` | `Import.LangMeta["cmdlet_verb"]` | string | PowerShell parser | The cmdlet verb (`Get`, `Import`, `Using`, ...) that introduced the import. |
 | `module_kind` | `Import.LangMeta["module_kind"]` | string | PowerShell parser | One of `Import-Module`, `using_module`, `dot_source`. |
 
-No schema migration is required -- `attrs_json` is `jsonb`
-end-to-end (Stage 2.1 / `migration 0001`).
+No table-level schema migration is required -- `attrs_json`
+is `jsonb` end-to-end (Stage 2.1 / `migration 0001`). One
+single-line enum migration IS required for the Rust
+`overrides` edge: a new file
+`services/agent-memory/migrations/0022_edge_kind_overrides.sql`
+issues `ALTER TYPE edge_kind ADD VALUE 'overrides';` (the
+current enum is defined in `0001_enums.sql` lines 28-38 and
+lists `contains`, `imports`, `static_calls`,
+`observed_calls`, `extends`, `implements`, `reads`,
+`writes`, `renamed_to` -- the new value is appended). This
+is the only schema-level change this story introduces; see
+Section 2.2.1 for the file plan and Section 9 R4 for the
+risk acknowledgement.
 
 #### 4.4.4 Backward compatibility
 
@@ -504,37 +522,81 @@ can filter without re-parsing the canonical signature.
 #### 4.5.1 Dispatcher integration consequences
 
 Two dispatcher behaviours interact with the `*` prefix; this
-story documents both and resolves them in the Go parser:
+story documents both and resolves them in the Go parser plus
+a structural change to Pass 2b's receiver-qualified lookup:
 
-1. **Bare-name calls (A5 path).** `dispatcher.go::buildCalleeIndex`
-   extracts the simple name with `q[LastIndexByte(q, '.')+1:]`.
-   For `"*Foo.Bar"` this still yields `"Bar"`, so bare-name
-   resolution of `Bar()` collides exactly as today and the
-   existing drop-on-collision rule applies. No dispatcher
-   change required.
+1. **Bare-name calls (A5 path, unchanged).**
+   `dispatcher.go::buildCalleeIndex` extracts the simple name
+   with `q[LastIndexByte(q, '.')+1:]`. For `"*Foo.Bar"` this
+   still yields `"Bar"`, so bare-name resolution of `Bar()`
+   sees TWO entries (`Foo.Bar` and `*Foo.Bar`) under simple
+   name `"Bar"` -> existing drop-on-collision rule (line
+   789-799 of `dispatcher.go`) applies without modification.
 
-2. **Receiver-qualified calls (A5 path).** The dispatcher
-   builds the receiver-qualified key as
-   `m.EnclosingClass + "." + callee` (`dispatcher.go` line
-   601). Because we set `EnclosingClass="Foo"` for both
-   variants, the key is `"Foo.Bar"` -- which matches the
-   value-receiver method's `QualifiedName` but NOT the
-   pointer-receiver one (`"*Foo.Bar"`). To keep `self.X` /
-   `r.X` resolution working for pointer receivers, the Go
-   parser ALSO registers each pointer-receiver method's
-   QualifiedName WITHOUT the `*` prefix as a secondary
-   resolution alias on `MethodDecl.ReceiverAliases`
-   (`MethodDecl` first-class field; see Section 4.4
-   addendum). The dispatcher's receiver-qualified pass
-   consults `ReceiverAliases` after `methodNodeID` lookup;
-   when both value and pointer receiver methods are present
-   the alias collides and the drop-on-collision rule (A5)
-   applies, matching today's behaviour for ambiguous
-   call sites.
+2. **Receiver-qualified calls (A5 path, RESTRUCTURED).** The
+   current `dispatcher.go` line 601 does
+   `dstID, ok := methodNodeID[m.EnclosingClass+"."+callee]`.
+   That is a SINGLE-KEY lookup -- when a value-receiver
+   method exists, the key `"Foo.Bar"` always resolves to it,
+   so a pointer-receiver method's intent never participates
+   in the resolution and collision is silently lost. To make
+   A5 actually apply, this story REPLACES the single-key
+   lookup with a multimap built at the start of Pass 2b:
+
+   ```go
+   // Pass 2b setup (new) -- pseudo-code.
+   receiverIndex := make(map[string][]string)  // key -> []NodeID
+   add := func(key, nodeID string) {
+       receiverIndex[key] = append(receiverIndex[key], nodeID)
+   }
+   for _, m := range result.Methods {
+       nodeID := methodNodeID[m.QualifiedName]
+       if nodeID == "" || m.EnclosingClass == "" {
+           continue
+       }
+       // Primary key: enclosing class + simple name extracted
+       // from QualifiedName (handles "*Foo.Bar" and "Foo.Bar"
+       // identically because we strip leading "*").
+       primaryKey := m.EnclosingClass + "." + simpleName(m.QualifiedName)
+       add(primaryKey, nodeID)
+       // Aliases: each pointer-receiver method also registers
+       // its bare form via ReceiverAliases (e.g. "Foo.Bar").
+       for _, alias := range m.ReceiverAliases {
+           add(alias, nodeID)
+       }
+   }
+   // Pass 2b receiver-qualified resolution (replaces line 601):
+   key := m.EnclosingClass + "." + callee
+   ids := receiverIndex[key]
+   if len(ids) == 1 {
+       emitCall(ids[0])
+   }  // len(ids) > 1 -> drop-on-collision per A5; len(ids) == 0 -> miss
+   ```
+
+   With this multimap, the value-receiver and pointer-receiver
+   methods BOTH appear under key `"Foo.Bar"` -- when both are
+   present in the same file the set has size 2 and the call is
+   dropped per A5, matching today's drop-on-ambiguity contract.
+   When only one form exists, the set has size 1 and the call
+   resolves unambiguously to that target -- including the
+   pointer-receiver method, whose ReceiverAliases entry
+   restores the lookup that the `*` prefix would otherwise
+   suppress.
+
+`simpleName(q)` strips a leading `*` then returns
+`q[LastIndexByte(q, '.')+1:]`. It is a tiny helper colocated
+with `buildCalleeIndex` -- no separate file.
+
+The Go parser populates `ReceiverAliases` as follows:
+
+| Source declaration | `QualifiedName` | `ReceiverAliases` |
+| --- | --- | --- |
+| `func (r Foo) Bar(...)` | `Foo.Bar` | `nil` (value-receiver method does not need an alias -- its QualifiedName already matches the receiver-qualified key) |
+| `func (r *Foo) Bar(...)` | `*Foo.Bar` | `["Foo.Bar"]` (alias drives the multimap; receiver-qualified call `r.Bar()` resolves through this entry) |
 
 The `ReceiverAliases` field is the second and final additive
 struct surface this story introduces (alongside `LangMeta`,
-Section 4.4). Section 2.2 enumerates the exact additions.
+Section 4.4). Section 2.2.1 enumerates the exact additions.
 
 The `*` prefix on the type name is the Go-specific marker.
 Whitespace normalisation (`NormalizeSignature`) operates on
@@ -764,17 +826,22 @@ type powershellParser struct {
 }
 
 func (p *powershellParser) Parse(relPath string, src []byte) (ParseResult, error) {
-    // 1. Pipe `src` to `pwsh -NoProfile -NonInteractive -Command -`
+    // 1. When pwsh is not on PATH, return the dispatched
+    //    sentinel ErrParserUnavailable. dispatcher.go's
+    //    EmitFile detects this with errors.Is and logs
+    //    `ast.dispatch.skip{reason:"pwsh_not_available"}`
+    //    instead of `ast.parse.error` (see Section 2.2.1
+    //    dispatcher diff).
+    if p.pwshBin == "" {
+        return ParseResult{}, fmt.Errorf("powershell: %w (reason=pwsh_not_available)", ErrParserUnavailable)
+    }
+    // 2. Pipe `src` to `pwsh -NoProfile -NonInteractive -Command -`
     //    running an embedded extraction script that mirrors
     //    Ast.PowerShell's ExtractNodes.
-    // 2. The script returns a JSON document with the shape
+    // 3. The script returns a JSON document with the shape
     //    {functions:[...], types:[...], imports:[...]}
     //    -- the EXACT same set the reference example yields.
-    // 3. Map the JSON onto ClassDecl / MethodDecl / Import.
-    // 4. When pwsh is not on PATH (CI without PowerShell),
-    //    return ParseResult{} with no nodes and an empty
-    //    error -- the dispatcher treats this as "parser
-    //    skipped this file" without aborting the worker.
+    // 4. Map the JSON onto ClassDecl / MethodDecl / Import.
 }
 ```
 
@@ -788,7 +855,7 @@ invocation.
 
 | Build tag | Production wiring | Behaviour for `.ps1` / `.psm1` / `.psd1` |
 | --- | --- | --- |
-| `//go:build cgo`   (`parsers_cgo.go`)   | `defaultParsers()` registers `powershellParser` | Parse via `pwsh` subprocess. If `pwsh` is absent on the host, file is skipped with `ast.dispatch.skip{reason:"pwsh_not_available"}` -- WARN-level log, the worker continues. |
+| `//go:build cgo`   (`parsers_cgo.go`)   | `defaultParsers()` registers `powershellParser` | Parse via `pwsh` subprocess. If `pwsh` is absent on the host, parser returns `ErrParserUnavailable`; dispatcher logs `ast.dispatch.skip{reason:"pwsh_not_available"}` (per the new sentinel branch in Section 2.2.1) and the worker continues. |
 | `//go:build !cgo`  (`parsers_nocgo.go`) | same registration -- the parser does NOT depend on CGO | identical behaviour to the CGO build (the subprocess approach is build-tag agnostic) |
 
 This breaks the "tree-sitter requires CGO" pattern the other
@@ -801,22 +868,31 @@ otherwise files are skipped.
 
 ### 6.4 Fallback rules
 
-- **No `pwsh` on host.** Files skipped, dispatcher emits one
-  WARN log per skipped file (rate-limited via the existing
-  `ast.dispatch.skip` mechanism). The worker does not abort.
-  Tests under `parser_powershell_test.go` use `t.Skip` when
-  `exec.LookPath("pwsh")` fails so the suite stays green on
-  PowerShell-less CI.
+- **No `pwsh` on host.** The parser's constructor sets
+  `pwshBin = exec.LookPath("pwsh")`; if empty, every `Parse`
+  call returns `ErrParserUnavailable` (Section 2.2.1
+  introduces the sentinel and the new dispatcher branch).
+  The dispatcher logs
+  `ast.dispatch.skip{reason:"pwsh_not_available"}` per file
+  and returns `EmitResult{}, nil` so the worker does not
+  abort. This is the structural fix: returning a nil error
+  with empty ParseResult would have ended at
+  `ast.dispatch.ok` (`dispatcher.go` line 209), which would
+  silently mislabel a parser-unavailable run as a successful
+  zero-node parse. Tests under `parser_powershell_test.go`
+  use `t.Skip` when `exec.LookPath("pwsh")` fails so the
+  suite stays green on PowerShell-less CI.
 - **`pwsh` returns a parse error.** The Go parser surfaces
-  the error from the subprocess; `safeParse` (A6) logs it
-  and the file is treated as a parse failure. Same behaviour
-  as the existing tree-sitter parsers when the grammar
+  the error from the subprocess unwrapped (i.e. NOT wrapped
+  with `ErrParserUnavailable`); `safeParse` (A6) catches it
+  and `EmitFile` line 198 logs `ast.parse.error` -- the same
+  behaviour as existing tree-sitter parsers when the grammar
   rejects a malformed input.
 - **`pwsh` subprocess hang.** A 10-second per-file timeout
   is applied via `context.WithTimeout`; on timeout the
-  parser returns an error and `safeParse` does its job.
-  Timeout value is the same constant used by the existing
-  parsers' bounded work loops.
+  parser returns the timeout error (also not wrapped with
+  the sentinel) and `safeParse` does its job -- the file
+  ends at `ast.parse.error`.
 
 ### 6.5 Tree-sitter PowerShell binding (explicitly OUT of v1)
 
@@ -1137,6 +1213,11 @@ The existing structured-log keys are reused verbatim:
 - `ast.dispatch.skip` with `reason=no_parser` -- emitted on
   language miss (most likely for `.c` / `.cpp` / `.cs` / `.go`
   / `.rs` files under CGO=0 builds).
+- `ast.dispatch.skip` with `reason=pwsh_not_available` (new
+  in this story) -- emitted when the PowerShell parser
+  returns `ErrParserUnavailable` because `exec.LookPath("pwsh")`
+  failed at parser-construction time. The dispatcher branch is
+  defined in Section 2.2.1.
 - `ast.parse.error` -- emitted on per-file parse failure.
 - `ast.parse.panic` -- emitted on recovered panic.
 - `ast.dispatch.ok` -- emitted on success with the
@@ -1196,9 +1277,9 @@ The "tree-sitter-backed only" caveat and the PowerShell
 | Risk | Mitigation |
 | --- | --- |
 | **R1** -- C++ declaration vs definition double-count. A class member function declared in a header (no body) and defined in a `.cpp` file (with body) would create two `MethodDecl` entries with the same QualifiedName. | The C++ parser deduplicates by QualifiedName within a single file at the end of `Parse`. Cross-file duplicates (header + cpp in separate files) are a future cross-file resolver problem and stay as two `method` nodes whose canonical signatures differ in `relPath` -- correct per A2. |
-| **R2** -- Go method receiver pointer / value variants. `func (r *Foo) Bar()` and `func (r Foo) Bar()` are distinct methods at the language level. The receiver clause is OUTSIDE the formal `ParamSignature`, so without intervention the two methods collide on `<rel>::method#Foo.Bar()`. | **PINNED RULE per Section 4.5** (operator answer `go-receiver-pointer-fingerprint`): the Go parser embeds the receiver-pointer marker in `QualifiedName` -- value-receiver methods key as `Foo.Bar`, pointer-receiver methods key as `*Foo.Bar`. `EnclosingClass` stays `Foo` (bare) so class-attachment via `classNodeID[m.EnclosingClass]` works for both. `LangMeta["receiver_ptr"]` carries the boolean. Receiver-qualified calls (`r.Bar()`) use the `ReceiverAliases` mechanism (Section 4.5.1) -- the pointer-receiver method also registers the bare `Foo.Bar` key as a secondary lookup so `self.X` / `r.X` calls keep resolving. If both value and pointer receiver methods exist on the same type and name, the alias collides -> A5's drop-on-collision rule applies and `calls_raw` preserves intent. |
+| **R2** -- Go method receiver pointer / value variants. `func (r *Foo) Bar()` and `func (r Foo) Bar()` are distinct methods at the language level. The receiver clause is OUTSIDE the formal `ParamSignature`, so without intervention the two methods collide on `<rel>::method#Foo.Bar()`. | **PINNED RULE per Section 4.5** (operator answer `go-receiver-pointer-fingerprint`): the Go parser embeds the receiver-pointer marker in `QualifiedName` -- value-receiver methods key as `Foo.Bar`, pointer-receiver methods key as `*Foo.Bar`. `EnclosingClass` stays `Foo` (bare) so class-attachment via `classNodeID[m.EnclosingClass]` works for both. `LangMeta["receiver_ptr"]` carries the boolean. Receiver-qualified calls (`r.Bar()` / `self.Bar()`) resolve through a NEW multimap built at the start of Pass 2b (Section 4.5.1): both the value method (via its QualifiedName-derived primary key) and the pointer method (via its `ReceiverAliases` entry) live under the same `Foo.Bar` key. When both forms exist in one file the multimap entry has size 2 and Pass 2b's set-size check drops the call per A5; when only one form exists the call resolves unambiguously. The verbatim `calls_raw` attrs persist intent for the future cross-file resolver. |
 | **R3** -- C# `partial class` declarations across multiple files. v1 treats each partial file as its own ClassDecl with the same QualifiedName but different relPath -> different canonical signatures, hence distinct nodes. The cross-file resolver will stitch them via a future `partial_of` edge. | Documented as a future story; no v1 work required. The `LangMeta["partial"]=true` flag is set on each partial class so the consumer can group by name. |
-| **R4** -- Rust trait method default impl. A trait declaration with a default-bodied method produces both a MethodDecl on the trait class (Kind="trait") AND, separately, an `impl Trait for Type` method shadows it on the Type class. | **PINNED RULE** (operator answer `rust-trait-overrides-edge`): when both the trait default-bodied method AND the impl-block method are present in the SAME FILE, the dispatcher's new Pass 2d emits an `overrides` edge from the impl method to the trait method. Resolution key is `methodNodeID[traitName + "." + simpleName(implMethod)]` where `traitName = LangMeta["trait"]`. Cross-file trait/impl pairs are deferred (per A4 same-file resolution) and the verbatim trait identity persists on `LangMeta["trait"]`. The implementation requires the dispatcher to accept the new edge kind `"overrides"`; Section 2.2.1 captures the dispatcher diff. The same-file ambiguity case (multiple impl methods with the same simple name) is handled by `buildCalleeIndex`'s drop-on-collision rule (A5) -- only same-name same-trait shadowing emits the edge. |
+| **R4** -- Rust trait method default impl. A trait declaration with a default-bodied method produces both a MethodDecl on the trait class (Kind="trait") AND, separately, an `impl Trait for Type` method shadows it on the Type class. The current `edge_kind` enum (`0001_enums.sql` lines 28-38) does not list `overrides`. | **PINNED RULE** (operator answer `rust-trait-overrides-edge`): a new single-line enum migration `migrations/0022_edge_kind_overrides.sql` (`ALTER TYPE edge_kind ADD VALUE 'overrides';`) is part of this story's file plan (Section 2.2.1). When both the trait default-bodied method AND the impl-block method are present in the SAME FILE, the dispatcher's new Pass 2d emits an `overrides` edge from the impl method to the trait method. Resolution key is `methodNodeID[traitName + "." + simpleName(implMethod)]` where `traitName = LangMeta["trait"]`. Cross-file trait/impl pairs are deferred (per A4 same-file resolution) and the verbatim trait identity persists on `LangMeta["trait"]`. The same-file ambiguity case (multiple impl methods with the same simple name) is handled by `buildCalleeIndex`'s drop-on-collision rule (A5) -- only same-name same-trait shadowing emits the edge. |
 | **R5** -- PowerShell `pwsh` subprocess overhead / availability. | One process per file is acceptable for v1's per-file emission cadence; tests skip when `pwsh` is absent (Section 6.4). A future workstream may batch via a long-lived host. |
 | **R6** -- `.h` ambiguity. C / C++ both use `.h`; the v1 routing sends `.h` to the C parser. | **PINNED PER SECTION 5.2**: `.h` routes to C unconditionally in v1; no hint-override mechanism is shipped. Repos with C++-only headers must use `.hpp` / `.hh` / `.hxx` / `.h++`. A follow-up story can add a per-repo extension-override knob that fires ahead of `extMap` in `selectParser`. |
 
@@ -1278,113 +1359,91 @@ will be picked up by future stories:
   file plan (Section 2.1 table), (4) extension registration
   in `parsers_cgo.go` / `parsers_nocgo.go` (Section 3), (5)
   mapping of language constructs into existing graph model
-  including the explicit struct + writer extensions for
-  `LangMeta` and `ReceiverAliases` (Sections 4.1 - 4.5),
-  (6) fixture-driven tests (Section 8.4), (7) cross-language
+  including the explicit struct + writer + dispatcher +
+  migration extensions for `LangMeta`, `ReceiverAliases`,
+  `ErrParserUnavailable`, Pass 2b multimap restructure,
+  Pass 2d overrides, and the `0022_edge_kind_overrides.sql`
+  migration (Sections 4.1 - 4.5 + Section 2.2.1), (6)
+  fixture-driven tests (Section 8.4), (7) cross-language
   dispatcher tests (Section 8.4), (8) support matrix
-  documentation hand-off to `.claude/context/tests.md`
-  (Section 8.5), (9) end-to-end sequences for the primary
-  language scenarios (Section 7.1 Go with pointer-receiver
-  emission, 7.2 Rust with the new `overrides` edge in Pass
-  2d, 7.3 C++ with header dedup) and the failure case
-  (Section 7.4).
+  hand-off (Section 8.5), (9) end-to-end sequences (Section
+  7.1 Go with pointer-receiver multimap, 7.2 Rust with
+  Pass 2d overrides emission, 7.3 C++ with header dedup,
+  7.4 failure path).
 - Not covered (deliberately, owned by sibling docs): per-step
   file creation order (implementation-plan.md), fixture text
-  bodies and exact `pwsh` extraction-script source for the
-  PowerShell parser (tech-spec.md), and operator-visible
-  scenario walk-throughs framed as Given/When/Then
+  bodies and exact `pwsh` extraction-script source
+  (tech-spec.md), Given/When/Then walk-throughs
   (e2e-scenarios.md).
 
 ### Prior feedback resolution
 
-- [x] 1. FIXED -- Sections 1.2 A1, 2.2 (split into 2.2 +
-      2.2.1) -- A1 now explicitly allows the two additive,
-      nilable struct surfaces (`LangMeta` and
-      `ReceiverAliases`) and references Section 2.2.1.
-      Section 2.2 was split: 2.2 enumerates what does NOT
-      change (dispatcher emit, block.go, ast.go);
-      2.2.1 is a new table that explicitly lists every
-      additive field and writer hook this story DOES
-      introduce (LangMeta on three envelopes, ReceiverAliases
-      on MethodDecl, mergeLangMeta in three writers, receiver
-      alias consult in the receiver-qualified resolver).
-      Section 4.4 LangMeta is now consistent with both.
-      Verification:
-      ```
-      $ grep -nF "never in new top-level fields" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
-      (empty)
-      $ grep -nF "parser.go -- the `ParseResult` shape and `ClassDecl` /" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
-      (empty)
-      ```
-- [x] 2. FIXED -- Section 2.1 (parsers table) and Section
-      5.3 -- the `normalizeHints` row now reads "resolve
-      files whose extension is NOT registered in `extMap`"
-      and explicitly states extension-first match wins
-      (referencing Section 5.2). Section 5.3 step (3) was
-      already updated last iter; verified consistent.
-      Verification:
-      ```
-      $ grep -nF "so `repo.language_hints[]` can override extension routing." docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
-      (empty)
-      ```
-- [x] 3. FIXED -- Section 7.3 C++ sequence -- replaced the
-      stale "See the open-question block on declaration/
-      definition handling" reference with a forward link to
-      Section 9 R1 ("This is the PINNED v1 rule (Section 9
-      R1) -- no operator question is pending"). No other
-      open-question references remain.
-      Verification:
-      ```
-      $ grep -nF "See the open-question block on declaration/definition handling" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
-      (empty)
-      ```
-- [x] 4. FIXED -- Section 9 R4, Section 10 (Rust trait
-      `overrides` edge entry), A3 in Section 1.2, and a new
-      Pass 2d in the Section 7.2 Rust sequence -- v1 now
-      DOES emit an `overrides` edge from impl method to
-      trait method when both same-file resolve, per operator
-      answer `rust-trait-overrides-edge`. The dispatcher
-      gains a new Pass 2d (documented in A3 and Section
-      2.2.1). The Rust sequence trace shows the trait
-      default-bodied method emission, the impl method
-      emission with `LangMeta["trait"]="Greeter"`, and the
-      Pass 2d resolution rule that produces the
-      `overrides` edge.
-      Verification:
-      ```
-      $ grep -nF "v1 does NOT emit an `overrides` edge" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
-      (empty)
-      $ grep -nF "v1 does NOT\n      emit an `overrides` edge" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
-      (empty -- multi-line variant)
-      ```
-- [x] 5. FIXED -- Section 6 fully rewritten to incorporate
-      the operator-specified reference at
-      `E:\work\github\crp\workflow\src\ast\Ast.PowerShell`.
-      The file was inspected on disk:
-      `PowerShellAstParser.cs` (6837 bytes) uses
-      `System.Management.Automation.Language.Parser`
-      directly and matches four AST kinds
-      (`FunctionDefinitionAst`, `TypeDefinitionAst`,
-      `ParamBlockAst`, `ScriptBlockAst`). v1 reproduces the
-      same extraction in Go by invoking `pwsh -NoProfile`
-      as a subprocess; the JSON output maps 1:1 onto
-      `ClassDecl` / `MethodDecl` / `Import`. Section 6.1
-      gives the mapping table sourced directly from the
-      reference, 6.2 sketches the Go wrapper, 6.3 the
-      build matrix (no CGO dependence), 6.4 the fallback
-      rules, 6.5 explicitly defers any tree-sitter
-      promotion. Section 10 pin is updated. The "Option A
-      scanner-only" text is gone.
-      Verification:
-      ```
-      $ grep -nF "Ship Option A (scanner-only)" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
-      (empty)
-      $ grep -nF "Option A -- Scanner-only PowerShell (RECOMMENDED for v1)" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
-      (empty)
-      $ grep -nF "PowerShell scanner-only" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
-      (empty)
-      ```
+Iter-3 evaluator findings (the active checklist):
 
-All four operator-pinned answers are now applied in-doc; no
-open-questions block is emitted. ASCII-clean check passed
-(no characters outside `\x00-\x7E`).
+- [x] 1. FIXED -- structural change to the Iteration Summary.
+  The verification quote-blocks from iter-3 inadvertently
+  reintroduced the very phrases being verified inside the
+  doc, so a fresh literal grep matched them in the Prior
+  feedback resolution section itself. This iter REPLACES the
+  inline verification blocks with concise prose entries that
+  do NOT reproduce the previously-removed phrases. The
+  removal is verified out-of-band (this turn) and not
+  in-doc.
+- [x] 2. FIXED -- the Rust `overrides` edge now ships with a
+  named migration. Section 1.1 (scope table) and Section 4.4
+  (preface) both carve out a single targeted exception to
+  the "no schema migration" claim: a new file
+  `services/agent-memory/migrations/0022_edge_kind_overrides.sql`
+  containing `ALTER TYPE edge_kind ADD VALUE 'overrides';`.
+  Section 2.2.1 lists the migration in the additive-surface
+  table. Section 9 R4 references the file by name and cites
+  the source enum location (`0001_enums.sql` lines 28-38).
+- [x] 3. FIXED -- the PowerShell missing-`pwsh` path now
+  uses a sentinel error. Section 2.2.1 introduces an
+  exported `ErrParserUnavailable` symbol on `parser.go` and
+  a new dispatcher branch in `EmitFile` between current
+  lines 196 and 198: `errors.Is(err, ErrParserUnavailable)`
+  triggers `ast.dispatch.skip` with the parser-supplied
+  reason and returns `EmitResult{}, nil`. Section 6.2's
+  pseudo-code returns the sentinel when `pwshBin == ""`.
+  Section 6.4 documents the three fallback paths
+  (unavailable -> skip; parse error -> `ast.parse.error`;
+  timeout -> `ast.parse.error`). Section 8.3 adds the new
+  `reason=pwsh_not_available` log key.
+- [x] 4. FIXED -- ReceiverAliases lookup was restructured.
+  Section 4.5.1 NO LONGER says "consult ReceiverAliases
+  after the primary lookup" (that approach was wrong for
+  the reason the evaluator gave -- the primary key
+  `Foo.Bar` would always hit the value method first).
+  Instead, Pass 2b NOW builds a `receiverIndex
+  map[string][]string` multimap at start-of-pass, seeded
+  with each method's primary key (enclosing class + simple
+  name, where `simpleName(*Foo.Bar)=Bar`) and one entry per
+  alias. Receiver-qualified resolution reads from the
+  multimap with set-size > 1 -> drop (A5). Both value and
+  pointer methods land under the same `Foo.Bar` key, so
+  same-file collisions ARE detected. The Section 9 R2
+  mitigation column was rewritten to describe the multimap
+  behaviour explicitly. Section 2.2.1 lists the dispatcher
+  Pass 2b setup diff.
+
+Iter-2 findings (verified unchanged this iter):
+
+- [x] 2.1 LangMeta + Section 2.2/2.2.1 split remains
+  consistent. A1's "additive surfaces" carve-out wording is
+  unchanged; Section 2.2.1 has been EXPANDED this iter (not
+  collapsed) and remains consistent with A1.
+- [x] 2.2 Hint-alias precedence wording in Section 2.1 row
+  for `normalizeHints` remains unchanged: "resolve files
+  whose extension is NOT registered in `extMap`".
+- [x] 2.3 C++ sequence stale open-question reference
+  remains removed; replaced with the Section 9 R1 pin.
+- [x] 2.4 Rust `overrides` decision remains FLIPPED to YES
+  per the operator answer, and is now backed by the named
+  migration (resolves iter-3 item 2).
+- [x] 2.5 PowerShell strategy remains anchored to the
+  `Ast.PowerShell` reference example.
+
+ASCII-clean check passed (no characters outside `\x00-\x7E`).
+No open-questions block is emitted -- all four operator
+questions are answered.

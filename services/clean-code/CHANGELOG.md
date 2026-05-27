@@ -4,6 +4,77 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 7.2 -- System tier metric composer
+
+### Iter 1 -- composer + in-memory writer + closed-set tests
+
+New file: `internal/aggregator/system_tier.go` introduces the
+`SystemTierComposer` that emits exactly the SEVEN canonical
+system-tier `metric_kind` rows per architecture Sec 1.4.2:
+`xrepo_dep_depth`, `arch_debt_ratio`, `velocity_trend`,
+`arch_fitness`, `blast_radius`, `xservice_test_reliability`,
+`knowledge_index`. The composer is the sole producer of
+`pack='system', source='derived'` rows (Phase 1.5 grants;
+migration `0004_roles.up.sql:382-397`). No invented
+`p50.system` / `p90.system` / `p95.system` / `p99.system`
+metric_kinds are written (iter 1 evaluator item 7) --
+percentile vectors continue to live in
+`cross_repo_percentile` columns, not as fake metric_kind rows.
+
+The composer honours the architecture Sec 3.10 step 4
+fail-safe contract: when an input prerequisite is missing
+(cross-repo edges in embedded mode for `xrepo_dep_depth` /
+`xservice_test_reliability` / `blast_radius`; the cycle_member
+foundation row for `arch_debt_ratio`; <2 velocity windows for
+`velocity_trend`; an empty author list for `knowledge_index`),
+the row is STILL emitted, with `degraded=true` and the
+matching `degraded_reason` from the architecture Sec 8.2
+closed list. The composer's permitted reasons are restricted
+to `xrepo_edges_unavailable` and `samples_pending`;
+`policy_signature_invalid` and `percentile_stale` are NOT
+composer-emitted (they belong to the evaluator gate / Insights
+surface respectively).
+
+Companion test file: `internal/aggregator/system_tier_test.go`
+covers (i) closed-set membership (exactly 7 names, none of the
+banned percentile-style strings); (ii) embedded-mode degraded
+contracts for `xrepo_dep_depth` and `blast_radius` per arch
+Sec 1.4.2; (iii) `samples_pending` degraded contracts for
+`velocity_trend` and `arch_debt_ratio`; (iv) the inverse case
+(`arch_debt_ratio` is non-degraded in embedded mode when
+`cycle_member` is present, per arch Sec 1.4.2 row 2 which
+names cycle_member as the only required input); (v) every
+emitted sample carries `pack='system'` AND `source='derived'`
+AND `metric_version=1`; (vi) every non-degraded row carries a
+finite float value (mirrors migration check
+`metric_sample_value_present_unless_degraded`); (vii) the
+deterministic-output ordering invariant (G6); (viii) input
+validation (empty RepoID / SHA / ProducerRunID rejected with
+`ErrSystemTierComposerInvalidInput`); (ix) ctx-cancel
+propagation; (x) the in-memory writer's centralised
+sample-shape validation (rejects a manufactured row whose
+metric_kind is `p50.system` or whose pack / source drifts off
+the canonical literals); (xi) writer round-trip and
+fault-injection (`SetFailError`).
+
+Out of scope -- explicitly deferred per workstream brief, to
+be handled by Stage 7.3+ workstreams:
+
+  - PostgreSQL writer implementation
+    (`PGSystemTierWriter`). The brief is composer-only; this
+    iter ships the `SystemTierWriter` interface and an
+    `InMemorySystemTierWriter` for tests. The doc comment on
+    `SystemTierWriter` itemises the PG-writer requirements
+    (txn-scoped batches, `ON CONFLICT DO NOTHING` for the
+    active-row unique constraint, `degraded` /
+    `degraded_reason` column mapping).
+  - System-tier metric_kind seed migration. The PG writer
+    cannot insert without the `metric_kind` lookup rows;
+    Stage 7.3 will own the seed.
+  - Aggregator.Tick integration. `Aggregator.Tick` keeps its
+    Stage 7.1 shape; the composer is callable in isolation
+    so Stage 7.3 can wire it without re-test churn.
+
 ## Stage 7.1 -- Cross-Repo Aggregator cadence loop and snapshot writers
 
 ### Iter 5 -- evaluator iter-4 feedback resolution

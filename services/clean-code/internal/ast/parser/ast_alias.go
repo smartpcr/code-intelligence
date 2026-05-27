@@ -1,7 +1,7 @@
 package parser
 
 import (
-	astv1 "github.com/microsoft/code-intelligence/services/clean-code/internal/ast/v1"
+	astv1 "github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/v1"
 )
 
 // AstFile is the canonical AST file message, re-exported from the

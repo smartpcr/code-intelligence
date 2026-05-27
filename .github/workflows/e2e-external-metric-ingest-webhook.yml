@@ -37,10 +37,7 @@ jobs:
             exit 1
           fi
 
-      - name: Start compose services
-        run: docker compose -f ${{ env.COMPOSE_FILE }} up -d --build
-
-      - name: Export compose-provided env vars
+      - name: Generate HMAC secret, start compose, and run e2e
         run: |
           set -euo pipefail
           # Generate HMAC secret FIRST so compose can inject it.

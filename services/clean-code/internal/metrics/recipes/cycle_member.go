@@ -5,8 +5,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/parser"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/scope"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
 )
 
 // cycleMemberMetricKind is the canonical metric_kind string

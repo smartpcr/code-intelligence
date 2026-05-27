@@ -3,8 +3,8 @@ package recipes
 import (
 	"fmt"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/parser"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/scope"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
 )
 
 // Pack is the closed enum of `MetricSample.pack` values

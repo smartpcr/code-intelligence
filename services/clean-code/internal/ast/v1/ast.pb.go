@@ -866,7 +866,7 @@ const file_ast_v1_ast_proto_rawDesc = "" +
 	"AstRefKind\x12\x1c\n" +
 	"\x18AST_REF_KIND_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12AST_REF_KIND_SCOPE\x10\x01\x12\x17\n" +
-	"\x13AST_REF_KIND_SYMBOL\x10\x02BRZPgithub.com/microsoft/code-intelligence/services/clean-code/internal/ast/v1;astv1b\x06proto3"
+	"\x13AST_REF_KIND_SYMBOL\x10\x02BQZOgithub.com/smartpcr/code-intelligence/services/clean-code/internal/ast/v1;astv1b\x06proto3"
 
 var (
 	file_ast_v1_ast_proto_rawDescOnce sync.Once

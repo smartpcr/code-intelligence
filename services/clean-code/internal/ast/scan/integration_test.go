@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/parser"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/scan"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scan"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
 
 // writeFile is a tiny test helper that creates parent

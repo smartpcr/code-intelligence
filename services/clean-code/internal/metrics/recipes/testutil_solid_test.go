@@ -1,8 +1,8 @@
 package recipes_test
 
 import (
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/parser"
-	astv1 "github.com/microsoft/code-intelligence/services/clean-code/internal/ast/v1"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
+	astv1 "github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/v1"
 )
 
 // This file augments [testutil_test.go] with helpers that the

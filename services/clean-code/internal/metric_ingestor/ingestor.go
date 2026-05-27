@@ -8,8 +8,8 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/churn"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/coverage"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/churn"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/coverage"
 )
 
 // ErrMissingChurnPayloadForExternalPerRow is returned when

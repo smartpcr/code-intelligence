@@ -52,7 +52,7 @@
 //
 //  2. The shape validator [Payload.Validate] that surfaces
 //     each malformed-field case as a sentinel error so the
-//     HTTP handler layer ([github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/webhook.DefectsVerbHandler])
+//     HTTP handler layer ([github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook.DefectsVerbHandler])
 //     can map them to structured 400 / 422 responses
 //     without parsing free-form error text.
 //
@@ -144,7 +144,7 @@ var (
 // CI-side publisher contract pinned in tech-spec Sec 8.5
 // row 4.
 //
-// JSON tags are populated so the [github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/webhook.DefectsVerbHandler]
+// JSON tags are populated so the [github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook.DefectsVerbHandler]
 // can `json.Decoder.Decode(...DisallowUnknownFields())`
 // straight into this struct without an intermediate DTO.
 type Payload struct {

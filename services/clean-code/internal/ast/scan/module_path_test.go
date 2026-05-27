@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/parser"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
 )
 
 // writeGoMod is a tiny test helper that writes `<dir>/go.mod`

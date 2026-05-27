@@ -12,8 +12,8 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ingest/test_balance"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metric_ingestor"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/test_balance"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
 )
 
 // TestBalanceVerbHandler is the [VerbHandler] implementation

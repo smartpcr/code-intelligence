@@ -39,10 +39,10 @@ import (
 	"github.com/gofrs/uuid"
 	_ "github.com/lib/pq"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/evaluator"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/keys"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/steward"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/rule_engine"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/evaluator"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
 )
 
 // maxRequestBodyBytes caps the JSON body size on both

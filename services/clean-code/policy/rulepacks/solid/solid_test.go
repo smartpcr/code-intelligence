@@ -19,8 +19,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/dsl"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/policy/steward"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/dsl"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 )
 
 // canonicalSeverities mirrors the closed set declared in

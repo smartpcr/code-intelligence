@@ -16,7 +16,7 @@ import (
 // The string deliberately includes both a URL anchor and a `#v1`
 // suffix so a future schema bump can mint a NEW namespace
 // (`...scope#v2`) without trampling existing identities.
-const NamespaceURL = "https://github.com/microsoft/code-intelligence/clean-code/scope#v1"
+const NamespaceURL = "https://github.com/smartpcr/code-intelligence/clean-code/scope#v1"
 
 // Namespace is the UUIDv5 namespace every `scope_id` is derived
 // from. It is itself a UUIDv5 of the URL namespace

@@ -6,7 +6,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/evaluator"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/evaluator"
 )
 
 // EvaluatorAdapter wraps an [Engine] in the shape the

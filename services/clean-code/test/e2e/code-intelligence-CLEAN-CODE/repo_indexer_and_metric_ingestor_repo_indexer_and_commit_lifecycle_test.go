@@ -21,7 +21,7 @@ import (
 	"github.com/cucumber/godog"
 	_ "github.com/lib/pq"
 
-	repo_indexer "github.com/microsoft/code-intelligence/services/clean-code/internal/repo_indexer"
+	repo_indexer "github.com/smartpcr/code-intelligence/services/clean-code/internal/repo_indexer"
 )
 
 // ---------------------------------------------------------------------------

@@ -24,7 +24,7 @@ syntax = "proto3";
 
 package clean_code.ast.v1;
 
-option go_package = "github.com/microsoft/code-intelligence/services/clean-code/internal/ast/v1;astv1";
+option go_package = "github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/v1;astv1";
 
 // ScopeKind is the canonical scope discriminator pinned by
 // architecture Sec 5.2.3 lines 1039-1050. Recipes MUST cite a

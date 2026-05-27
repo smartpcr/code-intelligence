@@ -9,8 +9,8 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/lib/pq"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/ast/scope"
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/metrics/recipes"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
 
 // ErrPGScopeResolverNilDB is returned by [NewPGScopeResolver]

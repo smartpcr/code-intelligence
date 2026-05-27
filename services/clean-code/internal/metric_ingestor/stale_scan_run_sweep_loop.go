@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/microsoft/code-intelligence/services/clean-code/internal/config"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/config"
 )
 
 // StaleScanRunSweepLoopOption configures a

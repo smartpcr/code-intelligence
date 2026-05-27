@@ -6,6 +6,141 @@ composition root (`cmd/clean-code-metric-ingestor/main.go`,
 which hosts the management + ingest HTTP surfaces; future
 binaries under `cmd/clean-code-*` ship their own routes).
 
+## Stage 7.1 -- Cross-Repo Aggregator cadence loop
+
+This section captures the operator-facing contract of the
+`internal/aggregator/` package -- the cadence-driven worker
+that materialises `repo_metric_snapshot`,
+`cross_repo_percentile`, and `portfolio_snapshot` from the
+active `metric_sample` rows (architecture Sec 3.10 /
+Sec 5.2.4 - Sec 5.2.6, tech-spec Sec 8.2
+`aggregator_cadence`).
+
+### Process layout
+
+The aggregator runs in its own loop (`internal/aggregator/Loop`)
+inside the `cmd/clean-code-aggregator/main.go` binary, separate
+from the metric_ingestor and management binaries. Exactly
+ONE aggregator process should run per environment -- the
+INSERT-only writes are not coordinated across replicas (a
+second writer would produce duplicate snapshot rows sharing
+the same `built_at`). The PG role `clean_code_xrepo_aggregator`
+is the only role with `INSERT, SELECT` on the three snapshot
+tables; `UPDATE` and `DELETE` are explicitly `REVOKE`d
+(migration `0004_roles.up.sql` lines 395-397 / 416-418).
+On the read side the same role ALSO has `INSERT, SELECT`
+on `metric_sample` and `metric_retraction` plus
+`INSERT, SELECT, UPDATE` on `metric_sample_active` per the
+system-tier MetricSample writer carve-out (tech-spec Sec 7.2
+lines 1348-1364); the `pack='system' AND source='derived'`
+discriminator that keeps the aggregator off the
+metric_ingestor's pack='ingested' surface is enforced at the
+application layer, NOT at the PG ACL layer.
+
+### Knobs (`internal/config/config.go`)
+
+- **`CLEAN_CODE_AGGREGATOR_CADENCE`** (Go duration; default
+  `15m` per tech-spec Sec 8.2). Period between aggregator
+  ticks. Must be `> 0`.
+- **`CLEAN_CODE_DISABLE_AGGREGATOR`** (bool; default `false`).
+  Skips composition-root wiring of the aggregator loop. Used
+  during the Stage 7 rollout when the binary ships but
+  operators want to gate the worker until snapshot reader
+  consumers exist.
+
+### What it writes per tick
+
+On every tick the aggregator:
+
+1. Captures a single `built_at = clock.Now().UTC()` value.
+2. Reads ACTIVE samples via the canonical join
+   `metric_sample_active msa JOIN metric_sample ms JOIN
+   scope_binding sb LEFT JOIN metric_retraction mr
+   WHERE mr.sample_id IS NULL AND ms.value IS NOT NULL`.
+   Degraded `value IS NULL` rows are filtered at the SQL
+   layer; NaN / +-Inf are filtered in Go.
+3. Buckets observations by `(repo_id, metric_kind,
+   scope_kind)` -> writes ONE `repo_metric_snapshot` row per
+   bucket carrying `count`, `mean`, `p50`, `p90`, `p99`.
+4. Groups observations by `(metric_kind, scope_kind)` -> writes
+   ONE `cross_repo_percentile` row per cohort with cross-repo
+   `p50`/`p90`/`p99` computed over the FLAT observation-value
+   set across ALL contributing repos (architecture Sec 3.10
+   line 644: "the full per-metric percentile vector across all
+   repos" -- large repos with more observations therefore carry
+   proportionally more weight in the cohort percentile by
+   design) + `histogram_json = {"entries":[{repo_id,count,mean,
+   p50,p90,p99}, ...]}` sorted by `repo_id`. The unweighted
+   per-repo view (size-equal weighting per repo) is what the
+   `histogram_json` entries + the sibling
+   `portfolio_snapshot.aggregate_json.unweighted_mean` field
+   surface for the operator portfolio UI.
+5. Writes ONE `portfolio_snapshot` row per `(metric_kind,
+   scope_kind)` with `aggregate_json = {total_observations,
+   repo_count, weighted_mean, unweighted_mean, p50, p90,
+   p99, per_repo[{repo_id,count,mean}, ...]}`.
+6. INSERTs all rows in a SINGLE transaction so a tick either
+   lands completely or not at all. Snapshot rows are
+   append-only: readers always JOIN to `MAX(built_at) BY
+   (metric_kind, scope_kind)` or analogous.
+
+### Operator-visible counters
+
+`aggregator.Report` (returned from `Loop.runOnce`'s
+structured log) carries:
+
+- `built_at` -- the timestamp shared by every row this tick
+- `observations_read` -- active rows pulled this tick
+- `cohorts_aggregated` -- distinct `(metric_kind, scope_kind)`
+  cohorts seen
+- `repo_metric_snapshot_rows`, `cross_repo_percentile_rows`,
+  `portfolio_snapshot_rows` -- INSERT counts per table
+
+A healthy tick log line at INFO level looks like:
+
+```
+level=INFO msg="aggregator loop: Tick succeeded"
+  built_at=2025-09-14T12:00:00Z observations_read=3712
+  cohorts_aggregated=12 repo_metric_snapshot_rows=180
+  cross_repo_percentile_rows=12 portfolio_snapshot_rows=12
+```
+
+### Failure handling
+
+A Tick error does NOT terminate the loop. The error is
+logged at WARN and the loop sleeps `errorBackoff` (default:
+equal to cadence) before the next attempt. The only way the
+loop exits is ctx cancellation (SIGTERM). Operators should
+alert on:
+
+- `observations_read=0` for > 2 ticks in a row when the
+  ingester is known healthy (suggests a JOIN regression or
+  `metric_sample_active` pointer-swap bug)
+- repeated WARN "Tick failed" lines -- inspect the wrapped
+  `err` for the PG error code
+
+### Snapshot table writer identity
+
+Per architecture G1 / Phase 1.5 sub-store grants, the
+aggregator is the SOLE writer for `repo_metric_snapshot`,
+`cross_repo_percentile`, `portfolio_snapshot`. Any other
+process writing to those tables is a policy violation.
+Validate by running:
+
+```sql
+SELECT grantee, privilege_type
+  FROM information_schema.role_table_grants
+ WHERE table_schema = 'clean_code'
+   AND table_name IN ('repo_metric_snapshot',
+                      'cross_repo_percentile',
+                      'portfolio_snapshot')
+   AND privilege_type IN ('INSERT', 'UPDATE', 'DELETE')
+ ORDER BY table_name, grantee, privilege_type;
+```
+
+Expected: `clean_code_xrepo_aggregator` has INSERT only;
+no other role has INSERT/UPDATE/DELETE.
+
 ## Stage 6.2 -- `mgmt.register_repo` and `mgmt.set_mode`
 
 This section captures the operator-facing contract of the

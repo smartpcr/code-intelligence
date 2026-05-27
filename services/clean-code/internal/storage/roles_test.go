@@ -703,6 +703,122 @@ COMMIT;
 	})
 
 	// ---------------------------------------------------------
+	// Cross-Repo Aggregator -- SOLE writer of the three
+	// snapshot tables (Stage 7.1, architecture G1 / Phase 1.5
+	// grants, migration 0004_roles.up.sql lines 392-418).
+	// ---------------------------------------------------------
+	//
+	// These cases pin the architecture's "Aggregator is the
+	// SOLE writer of repo_metric_snapshot / cross_repo_percentile
+	// / portfolio_snapshot" invariant against the live database.
+	// Three INSERT-allowed cases (one per snapshot table) prove
+	// the aggregator role can materialise a tick; three
+	// UPDATE/DELETE-denied cases prove the explicit
+	// `REVOKE UPDATE, DELETE` on those tables (migration 0004
+	// lines 416-418) is honoured by the live grant matrix so an
+	// application-layer regression cannot mutate or remove a
+	// snapshot row (architecture G6 row immutability); three
+	// DENIED-from-non-aggregator cases prove that
+	// non-aggregator writer roles (Management, Metric Ingestor,
+	// Repo Indexer) cannot INSERT into the snapshot tables --
+	// they do not appear in the `GRANT INSERT` list for any of
+	// the three tables in migration 0004. Together these nine
+	// subtests close the Stage 7.1 evaluator iter-1 finding #4
+	// gap (`aggregator-is-sole-writer` acceptance coverage).
+	//
+	// Each INSERT-allowed envelope satisfies the snapshot
+	// table's NOT NULL columns directly (no extra seed needed
+	// beyond what the suite already commits up front). The
+	// scope_kind enum value 'file' is used uniformly because it
+	// is a member of the canonical `scope_kind` enum
+	// (architecture Sec 5.2.3) and matches the seeded
+	// scope_binding row. metric_kind is the seeded SYSTEM-tier
+	// kind because the aggregator's application-layer filter
+	// pins it to `pack='system'` (the DB ACL allows any FK-valid
+	// metric_kind, but using the system-tier kind keeps the
+	// fixture aligned with the production write shape).
+
+	t.Run("xrepo_aggregator-insert-repo_metric_snapshot-allowed", func(t *testing.T) {
+		assertRoleAllowed(t, psql, url, "clean_code_xrepo_aggregator",
+			"INSERT INTO clean_code.repo_metric_snapshot "+
+				"(repo_id, metric_kind, scope_kind, count, mean, p50, p90, p99) "+
+				"VALUES ('"+roleSeedRepoID+"', "+
+				"'"+roleSeedSystemMetricKind+"', 'file', "+
+				"3, 12.0, 11.0, 13.0, 14.0)")
+	})
+
+	t.Run("xrepo_aggregator-insert-cross_repo_percentile-allowed", func(t *testing.T) {
+		assertRoleAllowed(t, psql, url, "clean_code_xrepo_aggregator",
+			"INSERT INTO clean_code.cross_repo_percentile "+
+				"(metric_kind, scope_kind, histogram_json, p50, p90, p99) "+
+				"VALUES ('"+roleSeedSystemMetricKind+"', 'file', "+
+				"'{\"buckets\":[]}'::jsonb, 11.0, 13.0, 14.0)")
+	})
+
+	t.Run("xrepo_aggregator-insert-portfolio_snapshot-allowed", func(t *testing.T) {
+		assertRoleAllowed(t, psql, url, "clean_code_xrepo_aggregator",
+			"INSERT INTO clean_code.portfolio_snapshot "+
+				"(metric_kind, scope_kind, repo_count, aggregate_json) "+
+				"VALUES ('"+roleSeedSystemMetricKind+"', 'file', 1, "+
+				"'{\"weighted_mean\":12.0}'::jsonb)")
+	})
+
+	// G6 immutability: even the SOLE writer cannot UPDATE or
+	// DELETE a snapshot row. The privilege check fires at plan
+	// time (the WHERE clause never has to match a row).
+
+	t.Run("xrepo_aggregator-update-repo_metric_snapshot-denied", func(t *testing.T) {
+		assertRoleDenied(t, psql, url, "clean_code_xrepo_aggregator",
+			"UPDATE clean_code.repo_metric_snapshot SET count = 0 WHERE FALSE")
+	})
+
+	t.Run("xrepo_aggregator-delete-cross_repo_percentile-denied", func(t *testing.T) {
+		assertRoleDenied(t, psql, url, "clean_code_xrepo_aggregator",
+			"DELETE FROM clean_code.cross_repo_percentile WHERE FALSE")
+	})
+
+	t.Run("xrepo_aggregator-update-portfolio_snapshot-denied", func(t *testing.T) {
+		assertRoleDenied(t, psql, url, "clean_code_xrepo_aggregator",
+			"UPDATE clean_code.portfolio_snapshot SET repo_count = 0 WHERE FALSE")
+	})
+
+	// Sole-writer rule: non-aggregator writer roles cannot
+	// INSERT into ANY of the three snapshot tables. We sample
+	// three different non-aggregator roles -- Management,
+	// Metric Ingestor, Repo Indexer -- one per snapshot table,
+	// so a future regression that accidentally adds `GRANT
+	// INSERT` for any of them is caught on at least one of the
+	// tables. The INSERT body still has to be valid SQL (PG
+	// rejects unparseable statements before checking
+	// privileges) but the privilege check fires regardless of
+	// whether the row would satisfy the NOT NULL constraints.
+
+	t.Run("metric_ingestor-insert-repo_metric_snapshot-denied", func(t *testing.T) {
+		assertRoleDenied(t, psql, url, "clean_code_metric_ingestor",
+			"INSERT INTO clean_code.repo_metric_snapshot "+
+				"(repo_id, metric_kind, scope_kind, count, mean, p50, p90, p99) "+
+				"VALUES ('"+roleSeedRepoID+"', "+
+				"'"+roleSeedSystemMetricKind+"', 'file', "+
+				"1, 0.0, 0.0, 0.0, 0.0)")
+	})
+
+	t.Run("management-insert-cross_repo_percentile-denied", func(t *testing.T) {
+		assertRoleDenied(t, psql, url, "clean_code_management",
+			"INSERT INTO clean_code.cross_repo_percentile "+
+				"(metric_kind, scope_kind, histogram_json, p50, p90, p99) "+
+				"VALUES ('"+roleSeedSystemMetricKind+"', 'file', "+
+				"'{}'::jsonb, 0.0, 0.0, 0.0)")
+	})
+
+	t.Run("repo_indexer-insert-portfolio_snapshot-denied", func(t *testing.T) {
+		assertRoleDenied(t, psql, url, "clean_code_repo_indexer",
+			"INSERT INTO clean_code.portfolio_snapshot "+
+				"(metric_kind, scope_kind, repo_count, aggregate_json) "+
+				"VALUES ('"+roleSeedSystemMetricKind+"', 'file', 1, "+
+				"'{}'::jsonb)")
+	})
+
+	// ---------------------------------------------------------
 	// Audit / verdict -- three writers in parallel OWNED writes
 	// ---------------------------------------------------------
 	//

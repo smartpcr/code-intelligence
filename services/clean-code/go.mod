@@ -1,4 +1,4 @@
-module github.com/microsoft/code-intelligence/services/clean-code
+module github.com/smartpcr/code-intelligence/services/clean-code
 
 go 1.25.1
 

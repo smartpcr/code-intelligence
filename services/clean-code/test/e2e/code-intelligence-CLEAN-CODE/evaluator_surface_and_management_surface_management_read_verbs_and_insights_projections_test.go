@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -351,11 +352,17 @@ func newMgmtReadStateFromEnv() *mgmtReadState {
 
 	if pgURL != "" {
 		db, err := sql.Open("postgres", pgURL)
-		if err == nil {
-			db.SetMaxOpenConns(5)
-			db.SetConnMaxLifetime(2 * time.Minute)
-			s.db = db
+		if err != nil {
+			panic(fmt.Sprintf("sql.Open failed for %s: %v", pgURL, err))
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if pingErr := db.PingContext(ctx); pingErr != nil {
+			panic(fmt.Sprintf("cannot reach PG at %s: %v", pgURL, pingErr))
+		}
+		db.SetMaxOpenConns(5)
+		db.SetConnMaxLifetime(2 * time.Minute)
+		s.db = db
 	}
 
 	return s

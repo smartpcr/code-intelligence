@@ -56,10 +56,6 @@ type mgmtReadState struct {
 	expectedP99          float64
 	expectedHistogramJSON string
 	crossRepoResponse    map[string]interface{}
-
-	// Query log tracking for recompute detection
-	queryCountBefore int64
-	queryCountAfter  int64
 }
 
 
@@ -184,14 +180,7 @@ func (s *mgmtReadState) populatedCrossRepoPercentileRowExists() error {
 	s.expectedP99 = 28.7
 	s.expectedHistogramJSON = `{"buckets":[0,5,10,15,20,25,30],"counts":[12,45,30,8,3,1,1]}`
 
-	// Snapshot query count before to detect recompute
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM pg_stat_activity WHERE state = 'active'`).Scan(&s.queryCountBefore)
-	if err != nil {
-		// Non-fatal: pg_stat_activity might not be available in all setups
-		s.queryCountBefore = -1
-	}
-
-	_, err = s.db.Exec(`
+	_, err := s.db.Exec(`
 		INSERT INTO cross_repo_percentile (id, metric_name, window_start, window_end, p50, p90, p99, histogram_json, created_at)
 		VALUES ($1, $2, NOW() - INTERVAL '7 days', NOW(), $3, $4, $5, $6, NOW())
 		ON CONFLICT (metric_name, window_start, window_end)
@@ -314,25 +303,26 @@ func (s *mgmtReadState) responseContainsHistogramJSON() error {
 	return nil
 }
 
-func (s *mgmtReadState) noOnTheFlyRecomputeQueryWasExecuted() error {
-	// Verify the response came directly from the materialised row.
-	// The mgmt.read.cross_repo endpoint should SELECT from cross_repo_percentile
-	// directly without computing percentiles on the fly. We verify by checking
-	// that the columns returned match the stored columns exactly — if a
-	// recompute had occurred the values would differ from what we seeded.
-	//
-	// Additionally, if pg_stat_statements is available we could check for
-	// absence of percentile_cont/percentile_disc queries, but that extension
-	// is not guaranteed. The value-match above is the primary assertion.
-
-	// Re-check p50 matches the seeded value exactly (not a recompute approximation)
-	v, ok := s.crossRepoResponse["p50"]
-	if !ok {
-		return fmt.Errorf("p50 missing — cannot verify no-recompute")
+func (s *mgmtReadState) responseValuesMatchSeededMaterialisedRow() error {
+	// Verify every returned percentile column matches the exact seeded value.
+	// This confirms the endpoint returned the materialised row as-is.
+	checks := map[string]float64{
+		"p50": s.expectedP50,
+		"p90": s.expectedP90,
+		"p99": s.expectedP99,
 	}
-	p50, _ := v.(float64)
-	if p50 != s.expectedP50 {
-		return fmt.Errorf("p50 value %f differs from seeded %f — possible on-the-fly recompute", p50, s.expectedP50)
+	for col, expected := range checks {
+		v, ok := s.crossRepoResponse[col]
+		if !ok {
+			return fmt.Errorf("response missing %s field", col)
+		}
+		actual, ok := v.(float64)
+		if !ok {
+			return fmt.Errorf("%s is not a number: %T", col, v)
+		}
+		if actual != expected {
+			return fmt.Errorf("%s mismatch: expected %f, got %f", col, expected, actual)
+		}
 	}
 	return nil
 }
@@ -389,7 +379,7 @@ func InitializeScenario_evaluator_surface_and_management_surface_management_read
 	ctx.Step(`^the response contains the p90 value from the materialised row$`, s.responseContainsP90)
 	ctx.Step(`^the response contains the p99 value from the materialised row$`, s.responseContainsP99)
 	ctx.Step(`^the response contains the histogram_json from the materialised row$`, s.responseContainsHistogramJSON)
-	ctx.Step(`^no on-the-fly recompute query was executed$`, s.noOnTheFlyRecomputeQueryWasExecuted)
+	ctx.Step(`^the response values match the seeded materialised row$`, s.responseValuesMatchSeededMaterialisedRow)
 }
 
 // ---------------------------------------------------------------------------

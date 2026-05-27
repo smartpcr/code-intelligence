@@ -438,6 +438,71 @@ if err0 != nil { t.Fatalf("NewSystemTierComposer: %v", err0) }
 	}
 }
 
+// TestAggregator_SystemTierWired_FalseWithoutOption pins the
+// negative half of the iter-5 observable-seam contract: an
+// aggregator constructed via the foundation-only
+// [aggregator.NewAggregator] path (no [aggregator.WithSystemTier]
+// option applied) MUST report SystemTierWired() == false. This
+// is the BLAST-SHIELD for the composition-root unit test in
+// `cmd/clean-code-aggregator/main_test.go` -- without this
+// pin a future refactor could make SystemTierWired() return
+// true unconditionally (e.g. "always wired" trivial impl) and
+// the cmd test would silently pass even after WithSystemTier
+// was dropped. Together with the positive case below the two
+// tests prove SystemTierWired() is a genuine TRUTH FUNCTION of
+// the WithSystemTier option being applied.
+func TestAggregator_SystemTierWired_FalseWithoutOption(t *testing.T) {
+	t.Parallel()
+	src := aggregator.NewInMemorySampleSource(nil)
+	w := aggregator.NewInMemorySnapshotWriter()
+	agg, err := aggregator.NewAggregator(src, w)
+	if err != nil {
+		t.Fatalf("NewAggregator: %v", err)
+	}
+	if agg.SystemTierWired() {
+		t.Error("agg.SystemTierWired() = true with no WithSystemTier option; want false (regression: SystemTierWired() no longer reflects whether WithSystemTier was applied -- the composition-root test in cmd/clean-code-aggregator becomes a tautology)")
+	}
+}
+
+// TestAggregator_SystemTierWired_TrueWithOption pins the
+// positive half: applying [aggregator.WithSystemTier] with all
+// three non-nil units flips SystemTierWired() to true. Paired
+// with the negative test above the two cases form the truth
+// table the composition-root cmd test relies on.
+func TestAggregator_SystemTierWired_TrueWithOption(t *testing.T) {
+	t.Parallel()
+	composer, err := aggregator.NewSystemTierComposer()
+	if err != nil {
+		t.Fatalf("NewSystemTierComposer: %v", err)
+	}
+	sysSrc := aggregator.NewInMemorySystemTierInputSource(nil)
+	sysW := aggregator.NewInMemorySystemTierWriter()
+	src := aggregator.NewInMemorySampleSource(nil)
+	w := aggregator.NewInMemorySnapshotWriter()
+	agg, err := aggregator.NewAggregator(src, w,
+		aggregator.WithSystemTier(composer, sysSrc, sysW),
+	)
+	if err != nil {
+		t.Fatalf("NewAggregator (with system tier): %v", err)
+	}
+	if !agg.SystemTierWired() {
+		t.Error("agg.SystemTierWired() = false after WithSystemTier(composer, source, writer); want true")
+	}
+}
+
+// TestAggregator_SystemTierWired_NilReceiver pins the defensive
+// nil-receiver branch: SystemTierWired() on a nil *Aggregator
+// must return false rather than panicking. Operators probing
+// `loop.Aggregator().SystemTierWired()` in a health surface
+// during partial-startup states must NOT crash the process.
+func TestAggregator_SystemTierWired_NilReceiver(t *testing.T) {
+	t.Parallel()
+	var agg *aggregator.Aggregator
+	if agg.SystemTierWired() {
+		t.Error("nil *Aggregator.SystemTierWired() = true; want false")
+	}
+}
+
 // TestInMemorySystemTierInputSource_ReturnsDeepCopy asserts
 // the source's COPY-OUT contract: a caller mutating the
 // returned slice locally MUST NOT mutate subsequent reads.

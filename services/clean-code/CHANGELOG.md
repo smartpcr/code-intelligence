@@ -6,6 +6,58 @@ Newest at the top. Stage references map to
 
 ## Stage 7.2 -- System tier metric composer
 
+### Iter 6 -- iter-5 evaluator polish: observable composition-root seam
+
+Iteration 5 (score 91, verdict: iterate) closed four of the iter-4
+polish items but the evaluator surfaced ONE remaining test-strength
+weakness: `TestBuildAggregatorLoop_WiresSystemTierPipeline` only
+asserted a non-nil `*aggregator.Loop`, which would still PASS if a
+future refactor dropped the `WithSystemTier(...)` option from
+`buildAggregatorLoop` (since the foundation-only constructor
+`aggregator.NewAggregator(source, writer)` still succeeds and the
+test never probed whether the system-tier pipeline was actually
+installed). This iter closes that gap with a structural fix: a
+public observable accessor on `*Aggregator` plus a true-positive,
+true-negative, and nil-receiver test suite that pins the accessor as
+a genuine truth function of `WithSystemTier` being applied.
+
+### Prior feedback resolution
+
+- 1. ADDRESSED -- added a public `(a *Aggregator) SystemTierWired() bool`
+  accessor in `services/clean-code/internal/aggregator/aggregator.go:121-148`
+  that returns true iff all three system-tier dependencies
+  (composer, sysSource, sysWriter) are non-nil. The accessor is
+  PRODUCTION API (mirrors the existing public `(*Loop).Cadence()`
+  / `(*Loop).Aggregator()` read-only accessors) so the composition-
+  root test in `cmd/clean-code-aggregator/main_test.go` (which lives
+  in a different Go package) can reach it -- a test-only
+  `export_test.go` accessor would be invisible to sibling packages
+  per Go's TestMain rules. The accessor is nil-safe (returns false
+  on nil receiver) so a `/healthz` probe during partial startup
+  doesn't crash the process. THREE new tests pin the truth table:
+  `TestAggregator_SystemTierWired_FalseWithoutOption`,
+  `TestAggregator_SystemTierWired_TrueWithOption`,
+  `TestAggregator_SystemTierWired_NilReceiver` in
+  `services/clean-code/internal/aggregator/system_tier_wiring_test.go:454-503`.
+  The negative test is the actual BLAST SHIELD: it would fail if a
+  future refactor made `SystemTierWired()` return `true`
+  unconditionally (which would re-introduce the iter-5 tautology
+  weakness from the other side). The cmd-package test
+  `TestBuildAggregatorLoop_WiresSystemTierPipeline`
+  (`services/clean-code/cmd/clean-code-aggregator/main_test.go:47-95`)
+  now calls `loop.Aggregator().SystemTierWired()` and fails on
+  false -- a regression that drops `aggregator.WithSystemTier(...)`
+  from `buildAggregatorLoop` is now caught deterministically by an
+  observable contract, NOT by happenstance non-nil-loop checks.
+  Bonus: also strengthened `TestBuildAggregatorLoop_PropagatesCadence`
+  to assert `loop.Cadence() == 23*time.Minute` (was previously the
+  same weak non-nil pattern). Verification:
+  ```
+  $ go test ./internal/aggregator/ ./cmd/clean-code-aggregator/ -count=1
+  ok  internal/aggregator   2.485s
+  ok  cmd/clean-code-aggregator 2.415s
+  ```
+
 ### Iter 5 -- iter-4 evaluator polish + explicit deferral docs
 
 Iteration 4 (score 88, verdict: iterate) closed the architecture-canonical

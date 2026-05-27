@@ -118,6 +118,35 @@ var ErrAggregatorNilSource = errors.New("aggregator: NewAggregator: source is ni
 // composition-root wiring time.
 var ErrAggregatorNilWriter = errors.New("aggregator: NewAggregator: writer is nil")
 
+// SystemTierWired reports whether the Stage 7.2 system-tier
+// pipeline (composer + source + writer) is installed on this
+// aggregator. Returns true iff all three system-tier
+// dependencies are non-nil; [WithSystemTier] is all-or-nothing
+// so this is the canonical observable seam for "is the
+// system-tier pass enabled?".
+//
+// Exposed publicly (not via export_test.go) for two reasons:
+//
+//  1. Composition-root unit tests in sibling packages (e.g.
+//     `cmd/clean-code-aggregator/main_test.go`) need to assert
+//     that `buildAggregatorLoop` actually applied
+//     [WithSystemTier] -- a non-nil [Loop] alone is insufficient
+//     evidence because [NewAggregator] succeeds with no
+//     system-tier option and `WithSystemTier` is the second
+//     opt-arg that a refactor could silently drop. The iter-5
+//     evaluator flagged this exact weakness (item #1).
+//  2. Operational `/healthz`-extended surfaces or Prometheus
+//     exporters can probe this so a deployment that lost its
+//     system-tier wiring (e.g. via a partial config rollback)
+//     surfaces as a visible health degradation rather than
+//     as silent missing system-tier rows.
+//
+// This is an O(1) field-tuple check; it touches no I/O and
+// makes no allocations. Safe to call from any goroutine.
+func (a *Aggregator) SystemTierWired() bool {
+	return a != nil && a.composer != nil && a.sysSource != nil && a.sysWriter != nil
+}
+
 // NewAggregator constructs an aggregator. Returns an error when
 // either dependency is nil so the wiring bug surfaces at startup
 // rather than at first tick.

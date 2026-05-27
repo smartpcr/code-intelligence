@@ -45,16 +45,20 @@ func TestBuildAggregatorLoop_NilDBWhenEnabledErrors(t *testing.T) {
 }
 
 // TestBuildAggregatorLoop_WiresSystemTierPipeline pins iter-3
-// evaluator item #1: the production composition root MUST
-// wire the system-tier composer + source + writer via
-// [aggregator.WithSystemTier]. The wiring is exercised end-to
-// -end by constructing every PG-backed unit; if any one
-// constructor were dropped, returns either an error or a nil
-// loop. The test asserts a non-nil Loop comes back and the
-// cadence is honoured -- the [aggregator.WithSystemTier]
-// option panics on nil args so a regression that drops one
-// of the three system-tier units would surface here as a
-// panic rather than as a silent fall-through.
+// evaluator item #1 + iter-5 evaluator item #1: the production
+// composition root MUST wire the system-tier composer + source
+// + writer via [aggregator.WithSystemTier]. The iter-5
+// evaluator flagged that the iter-3 version of this test only
+// asserted a non-nil [Loop] -- which would still pass if a
+// regression dropped the [aggregator.WithSystemTier] option
+// from [buildAggregatorLoop] (since [aggregator.NewAggregator]
+// succeeds with foundation-only args). The structural fix is
+// to call the public observable seam
+// [aggregator.Aggregator.SystemTierWired] on the wrapped
+// aggregator and assert it is true. Any regression that drops
+// or comments out the [aggregator.WithSystemTier] option
+// argument now fails this assertion deterministically
+// regardless of whether construction itself succeeded.
 func TestBuildAggregatorLoop_WiresSystemTierPipeline(t *testing.T) {
 	t.Parallel()
 	db, _, err := sqlmock.New()
@@ -74,6 +78,20 @@ func TestBuildAggregatorLoop_WiresSystemTierPipeline(t *testing.T) {
 	if loop == nil {
 		t.Fatal("buildAggregatorLoop loop = nil; want non-nil")
 	}
+	agg := loop.Aggregator()
+	if agg == nil {
+		t.Fatal("loop.Aggregator() = nil; want non-nil so SystemTierWired() can be probed")
+	}
+	// Iter-5 evaluator item #1: this is the assertion that
+	// actually proves [aggregator.WithSystemTier] was
+	// applied. Dropping the option from
+	// [buildAggregatorLoop] would leave composer/sysSource/
+	// sysWriter all nil and SystemTierWired() would return
+	// false even though the foundation-only construction
+	// path still succeeds.
+	if !agg.SystemTierWired() {
+		t.Errorf("loop.Aggregator().SystemTierWired() = false; want true (regression: WithSystemTier option not applied -- production composition root would silently skip the system-tier pass on every Tick)")
+	}
 }
 
 // TestBuildAggregatorLoop_PropagatesCadence pins the cadence
@@ -81,7 +99,10 @@ func TestBuildAggregatorLoop_WiresSystemTierPipeline(t *testing.T) {
 // constructed loop via [aggregator.WithLoopCadence]. A
 // regression that drops the cadence option would silently
 // fall back to the default tick rate which is hard to
-// detect in production.
+// detect in production. Asserts the observable
+// [aggregator.Loop.Cadence] accessor rather than just
+// non-nil so a dropped option is caught deterministically
+// (same blast-shield shape as the SystemTierWired() pin).
 func TestBuildAggregatorLoop_PropagatesCadence(t *testing.T) {
 	t.Parallel()
 	db, _, err := sqlmock.New()
@@ -90,9 +111,10 @@ func TestBuildAggregatorLoop_PropagatesCadence(t *testing.T) {
 	}
 	defer db.Close()
 
+	const want = 23 * time.Minute
 	cfg := config.Config{
 		DisableAggregator: false,
-		AggregatorCadence: 23 * time.Minute,
+		AggregatorCadence: want,
 	}
 	loop, err := buildAggregatorLoop(cfg, db, slog.Default())
 	if err != nil {
@@ -100,6 +122,9 @@ func TestBuildAggregatorLoop_PropagatesCadence(t *testing.T) {
 	}
 	if loop == nil {
 		t.Fatal("buildAggregatorLoop loop = nil; want non-nil")
+	}
+	if got := loop.Cadence(); got != want {
+		t.Errorf("loop.Cadence() = %s; want %s (regression: WithLoopCadence option not applied -- production loop would run at default 15m)", got, want)
 	}
 }
 

@@ -51,8 +51,15 @@ must respect them.
 - **A1 -- One `ParseResult` shape across all languages.** Every
   parser returns `ParseResult{Classes, Methods, Imports}` with
   the same field semantics. Language-specific richness lives
-  in `attrs_json`, never in new top-level fields. (`parser.go`
-  lines 60-84.)
+  primarily in `attrs_json`. This story makes TWO additive,
+  nilable struct surfaces explicit (and only those two): a
+  `LangMeta map[string]any` field on each envelope (Section
+  4.4) and a `ReceiverAliases []string` field on `MethodDecl`
+  (Section 4.5.1). No other top-level fields are added.
+  Pre-existing parsers (TS / JS / Python) leave both new
+  fields nil; their dispatcher output is byte-identical.
+  (`parser.go` lines 60-84 today; the diff is enumerated in
+  Section 2.2.)
 - **A2 -- Idempotent canonical signatures.** A class is keyed
   by `<repoURL>::class::<relPath>#<QualifiedName>`; a method by
   `<repoURL>::method::<relPath>#<QualifiedName>(<normalised
@@ -62,9 +69,13 @@ must respect them.
   Class / Method / Block Node so the local-symbol table is
   fully populated; pass 2 resolves and inserts same-file
   `extends` / `implements` / `static_calls` / `reads` /
-  `writes` edges. New parsers MUST produce results in the
-  shape pass 1 + pass 2 expect; they do NOT call the writer
-  directly.
+  `writes` edges. This story adds ONE new pass (2d) that
+  emits same-file `overrides` edges from Rust impl-block
+  methods to the trait default they shadow (Section 7.2 and
+  Section 9 R4). The new pass runs after Pass 2c and is a
+  no-op for every other language. New parsers MUST produce
+  results in the shape pass 1 + pass 2 expect; they do NOT
+  call the writer directly.
 - **A4 -- Same-file resolution only.** Cross-file targets are
   dropped (and the verbatim names persisted on
   `attrs_json["extends_raw"]` / `attrs_json["calls_raw"]`)
@@ -141,9 +152,9 @@ responsibilities are uniform:
 | **C# parser** | `parser_treesitter_csharp.go` | `//go:build cgo` | Walk tree-sitter `c_sharp` grammar, emit class/interface/struct/record, methods, base list (extends / implements partitioned by kind lookup), `using` -> Import. |
 | **Go parser** | `parser_treesitter_go.go` | `//go:build cgo` | Walk tree-sitter `golang` grammar, emit struct/interface, methods with receiver-qualified `r.foo()`, free functions, `import` -> Import (deduped to module path). |
 | **Rust parser** | `parser_treesitter_rust.go` | `//go:build cgo` | Walk tree-sitter `rust` grammar, emit struct/enum/trait + `impl` methods + free functions + `use` -> Import. Trait `impl Trait for Type` produces an `Implements` edge. |
-| **PowerShell parser** | `parser_powershell.go` (no CGO) + optional `parser_treesitter_powershell.go` (CGO) | conditional, see Section 6 | Scanner-only in v1 (no smacker binding); functions + dot-sourcing / Import-Module + bare command calls. Classes (`class Foo {}`) extracted via regex; nested-method support if grammar wired. |
-| **Extension registry update** | `parsers_cgo.go` (modify) and `parsers_nocgo.go` (modify) | `cgo` / `!cgo` | Add the new parsers to `defaultParsers()`. Per Section 7, the no-CGO build either gets a documented "not supported" list or a thin scanner fallback. |
-| **Per-language hint aliases** | `dispatcher.go` (modify `normalizeHints`) | none | Add language aliases `c`, `cxx`, `cs`, `csharp`, `golang`, `rs`, `ps`, `ps1`, etc. so `repo.language_hints[]` can override extension routing. |
+| **PowerShell parser** | `parser_powershell.go` (no CGO; subprocess invocation of `pwsh`) | none (subprocess approach is build-tag agnostic) | v1 follows the in-house example at `E:\work\github\crp\workflow\src\ast\Ast.PowerShell` (Section 6). Invokes `pwsh -NoProfile` to obtain the official `System.Management.Automation.Language` AST and maps `FunctionDefinitionAst` / `TypeDefinitionAst` / `ParamBlockAst` / `ScriptBlockAst` onto our envelope. Files skipped with a WARN log when `pwsh` is not on PATH. |
+| **Extension registry update** | `parsers_cgo.go` (modify) and `parsers_nocgo.go` (modify) | `cgo` / `!cgo` | Add the new parsers to `defaultParsers()`. Per Section 7, the no-CGO build skips C / C++ / C# / Go / Rust files and registers only the existing TS / Python scanner pair plus the new `pwsh`-subprocess PowerShell parser. |
+| **Per-language hint aliases** | `dispatcher.go` (modify `normalizeHints`) | none | Add language aliases `c`, `cxx`, `cs`, `csharp`, `golang`, `rs`, `ps`, `ps1`, etc. so `repo.language_hints[]` can resolve files whose extension is NOT registered in `extMap` (e.g. an extensionless shell-prefixed script, a fragment passed through `LanguageHints` by a wrapping tool). Per Section 5.2 the extension-first match in `selectParser` always wins when present, so `.h` remains C-routed even when a `cpp` hint is supplied. |
 
 ### 2.2 What the dispatcher does NOT change
 
@@ -151,16 +162,33 @@ The following are explicitly NOT modified by this story:
 
 - `dispatcher.go::emit` -- the two-pass insert protocol is
   language-agnostic; new parsers slot in via `defaultParsers()`.
-- `parser.go` -- the `ParseResult` shape and `ClassDecl` /
-  `MethodDecl` / `Import` envelopes already absorb every kind
-  of construct in the new language set (see Section 4 mapping
-  table).
+  An additional Pass 2d for `overrides` edges is layered on
+  (Section 7.2 and Section 9 R4); the existing Pass 0 / 1 /
+  2a / 2b / 2c are untouched.
 - `block.go::SubdivideMethod` -- the `CountLogicalLines`
   threshold check works on any body source the parser hands
   it; per-language tokenisation rules are out of scope.
 - `repoindexer/ast.go` -- the `ASTEmitter` / `EmitFileEvent` /
   `EmitResult` / `TouchedNode` shapes are stable; no new field
   is required.
+
+### 2.2.1 What this story DOES change in `parser.go` and writers
+
+Two additive struct fields and one writer hook -- enumerated
+here so the next iteration of the tech-spec / implementation
+plan can reference an exact diff surface:
+
+| File | Change | Justification |
+| --- | --- | --- |
+| `parser.go` | Add `LangMeta map[string]any` to `ClassDecl`, `MethodDecl`, `Import`. | Section 4.4 -- per-language attrs flow into the writer through a single merge step. |
+| `parser.go` | Add `ReceiverAliases []string` to `MethodDecl`. | Section 4.5.1 -- Go pointer-receiver methods register a secondary key (`Foo.Bar`) for receiver-qualified call resolution while the primary key keeps the `*` prefix. |
+| `dispatcher.go` -- `classAttrs`, `methodAttrs`, `importEdgeAttrs` | Add a final `mergeLangMeta(out, m.LangMeta)` call before `mustJSON`. | Section 4.4.2 -- merges per-language keys into the existing attrs map. |
+| `dispatcher.go` -- receiver-qualified resolver | Consult `MethodDecl.ReceiverAliases` after the primary `methodNodeID[m.EnclosingClass+"."+callee]` lookup. | Section 4.5.1 -- restores `self.X` / `r.X` resolution for Go pointer-receiver targets without affecting other languages. |
+
+All four edits are additive; existing TS / JS / Python
+parsers populate neither field and their writer output is
+byte-identical (Section 4.4.4). The dispatcher tests in
+`dispatcher_test.go` continue to pass unchanged.
 
 ## 3. Build-Tag Topology
 
@@ -175,14 +203,13 @@ existing TypeScript / Python pair use (`parsers_cgo.go` /
          cTreeSitterParser, cppTreeSitterParser,         # new
          csharpTreeSitterParser, goTreeSitterParser,     # new
          rustTreeSitterParser,                           # new
-         powershellParser (scanner) OR
-           powershellTreeSitterParser (if grammar wired) # new, Section 6
+         powershellParser (pwsh subprocess, Section 6)   # new
        ]
 
    CGO=0 (portable `make test` on stock Windows toolchain):
        defaultParsers() returns [
          tsjsParser, pythonParser,                       # existing
-         powershellParser (scanner only)                 # new
+         powershellParser (pwsh subprocess, Section 6)   # new -- same impl
        ]
        Files with .c, .cpp, .cs, .go, .rs are SKIPPED by the
        dispatcher (no parser registered -> no_parser log line).
@@ -218,8 +245,9 @@ no-op rather than a scanner-fallback. Rationale:
    covered by the CGO=on tests on Linux CI; the portable
    path proves the dispatcher's "no parser" branch handles
    them safely (no_parser log + clean return, no panic).
-3. PowerShell is the one exception -- it ships a SCANNER as
-   the primary path (Section 6) because no smacker tree-
+3. PowerShell is the one exception -- it ships the `pwsh`
+   subprocess parser (Section 6) as the SINGLE implementation
+   across both CGO tags, because no smacker tree-
    sitter binding exists; both build tag groups therefore
    register the same parser.
 
@@ -281,9 +309,9 @@ to the receiver-qualified resolver.
 | **C** | empty -- every function is a free function in v1. | text between the outer `(` `)` of the declarator. | empty in v1 -- C has no `this`. | `static`, `inline`, `extern` from the storage-class specifier. |
 | **C++** | The `class_specifier` / `struct_specifier` name when the method is declared inside the class body OR when an out-of-line definition uses a `Foo::bar()` qualified declarator. | text between the outer `(` `)`. Reference / pointer markers preserved verbatim; normalised at signature mint time by `NormalizeSignature`. | `this->X(`, `(*this).X(` -- captured separately. Bare `X(` calls inside a method body that refer to a sibling member are recovered by the dispatcher's same-file callee index (`buildCalleeIndex`). | `static`, `virtual`, `inline`, `constexpr`, `noexcept`, `const` (trailing). |
 | **C#** | Enclosing class / struct / record name. Out-of-class methods don't exist in C#. | text between the outer `(` `)`. | `this.X(` -- captured separately (mirrors TS). | `static`, `public`, `private`, `protected`, `internal`, `async`, `override`, `virtual`, `sealed`, `abstract`, `readonly`. |
-| **Go** | The receiver type name (stripped of pointer marker `*`) when the method has a receiver clause `func (r *Foo) Bar(...)`. Free functions have empty receiver. | text between the outer `(` `)`, PREFIXED with the synthetic receiver tag `recv=Foo; ` or `recv=*Foo; ` per Section 4.5 so pointer / value receivers produce distinct canonical signatures. | The receiver identifier's qualified calls: when the receiver is `r`, every `r.X(` call is a ReceiverCall. The parser tracks the receiver-binding name per method to recognise the right prefix. | empty in v1 (Go has no method modifiers; `LangMeta["receiver"]` and `LangMeta["receiver_ptr"]` capture the bound name and pointer flag). |
+| **Go** | The receiver type name (stripped of pointer marker `*`) when the method has a receiver clause `func (r *Foo) Bar(...)`. Free functions have empty receiver. | text between the outer `(` `)`. The pointer-receiver disambiguation lives in `QualifiedName` (`*Foo.Bar`), NOT in `ParamSignature` (Section 4.5). | The receiver identifier's qualified calls: when the receiver is `r`, every `r.X(` call is a ReceiverCall. The parser tracks the receiver-binding name per method to recognise the right prefix. Receiver-qualified resolution for pointer-receiver methods uses `ReceiverAliases` (Section 4.5.1). | empty in v1 (Go has no method modifiers; `LangMeta["receiver"]` and `LangMeta["receiver_ptr"]` capture the bound name and pointer flag). |
 | **Rust** | The `impl` block's target type name. Trait-impl methods (`impl Trait for Type`) attach to the Type class -- the trait name lives in `attrs_json["trait"]`. Free `fn name(...)` outside any `impl` -> empty. | text between the outer `(` `)`. | `self.X(` -- captured separately. | `pub`, `pub(crate)`, `pub(super)`, `async`, `unsafe`, `const`, `extern`. |
-| **PowerShell** | Enclosing class name when the method is declared inside `class Foo {}`. Top-level `function Bar {...}` -> empty. | text between the outer `(` `)` for `param(...)` blocks; otherwise empty (PowerShell allows parameter blocks inside the body which the scanner does NOT walk in v1). | `$this.X(` inside a class method. | `static`, `hidden` (class methods); none for free functions. |
+| **PowerShell** | Enclosing class name when the method is declared inside `class Foo {}` (i.e. `FunctionMemberAst` under `TypeDefinitionAst`). Top-level `function Bar {...}` -> empty. | joined parameter list from the official PowerShell AST `FunctionDefinitionAst.Body.ParamBlock` -- see the `PowerShellAstParser` reference in Section 6.1. | `$this.X(` inside a class method. | `static`, `hidden` (class methods); none for free functions. |
 
 #### 4.2.1 Body span semantics
 
@@ -450,55 +478,92 @@ Go allows both `func (r Foo) Bar()` and `func (r *Foo) Bar()`
 in the same source file -- they are distinct methods at the
 language level. The existing canonical-signature scheme
 (`<repoURL>::method::<relPath>#<QualifiedName>(<normalised
-params>)`) does NOT separate them, because:
+params>)`) does NOT separate them by default, because:
 
-- `QualifiedName` is `Foo.Bar` for both.
+- `QualifiedName` is `Foo.Bar` for both unless the parser
+  marks one.
 - `ParamSignature` excludes the receiver clause (it covers
   only the formal parameter list after the function name).
 
-PINNED RULE (this story): the Go parser prepends a synthetic
-receiver tag to `ParamSignature` so the canonical signature
-differs between the two cases, while keeping `QualifiedName`
-and `EnclosingClass` as the bare type name so the existing
-dispatcher symbol-table semantics (`methodNodeID[m.QualifiedName]`,
-receiver-qualified lookup `methodNodeID[m.EnclosingClass + "." +
-callee]`) work uniformly with every other language.
+PINNED RULE (operator answer `go-receiver-pointer-fingerprint`,
+applied here): the Go parser embeds the receiver-pointer marker
+DIRECTLY in `QualifiedName`. Value-receiver methods get the
+bare type name; pointer-receiver methods get a leading `*` on
+the type name. `EnclosingClass` stays the bare type name (no
+`*`) so the dispatcher's class-attachment lookup
+(`classNodeID[m.EnclosingClass]`, `dispatcher.go` lines
+392-396) finds the same `Foo` class node for both. The
+boolean `LangMeta["receiver_ptr"]` is also set so consumers
+can filter without re-parsing the canonical signature.
 
 | Source declaration | `EnclosingClass` | `QualifiedName` | `ParamSignature` | Resulting canonical signature |
 | --- | --- | --- | --- | --- |
-| `func (r Foo) Bar(s string)` | `Foo` | `Foo.Bar` | `recv=Foo; s string` | `<url>::method::<rel>#Foo.Bar(recv=Foo; s string)` |
-| `func (r *Foo) Bar(s string)` | `Foo` | `Foo.Bar` | `recv=*Foo; s string` | `<url>::method::<rel>#Foo.Bar(recv=*Foo; s string)` |
+| `func (r Foo) Bar(s string)` | `Foo` | `Foo.Bar` | `s string` | `<url>::method::<rel>#Foo.Bar(s string)` |
+| `func (r *Foo) Bar(s string)` | `Foo` | `*Foo.Bar` | `s string` | `<url>::method::<rel>#*Foo.Bar(s string)` |
 
-The `recv=<type>` prefix is the Go-specific marker. Whitespace
-normalisation (`NormalizeSignature`) preserves the semicolons
-and the `*` so the two strings hash to distinct fingerprints.
-`LangMeta["receiver_ptr"]` carries the boolean form for
-consumers; `LangMeta["receiver"]` carries the bound receiver
-identifier (e.g. `r`).
+#### 4.5.1 Dispatcher integration consequences
 
-Consequences:
+Two dispatcher behaviours interact with the `*` prefix; this
+story documents both and resolves them in the Go parser:
+
+1. **Bare-name calls (A5 path).** `dispatcher.go::buildCalleeIndex`
+   extracts the simple name with `q[LastIndexByte(q, '.')+1:]`.
+   For `"*Foo.Bar"` this still yields `"Bar"`, so bare-name
+   resolution of `Bar()` collides exactly as today and the
+   existing drop-on-collision rule applies. No dispatcher
+   change required.
+
+2. **Receiver-qualified calls (A5 path).** The dispatcher
+   builds the receiver-qualified key as
+   `m.EnclosingClass + "." + callee` (`dispatcher.go` line
+   601). Because we set `EnclosingClass="Foo"` for both
+   variants, the key is `"Foo.Bar"` -- which matches the
+   value-receiver method's `QualifiedName` but NOT the
+   pointer-receiver one (`"*Foo.Bar"`). To keep `self.X` /
+   `r.X` resolution working for pointer receivers, the Go
+   parser ALSO registers each pointer-receiver method's
+   QualifiedName WITHOUT the `*` prefix as a secondary
+   resolution alias on `MethodDecl.ReceiverAliases`
+   (`MethodDecl` first-class field; see Section 4.4
+   addendum). The dispatcher's receiver-qualified pass
+   consults `ReceiverAliases` after `methodNodeID` lookup;
+   when both value and pointer receiver methods are present
+   the alias collides and the drop-on-collision rule (A5)
+   applies, matching today's behaviour for ambiguous
+   call sites.
+
+The `ReceiverAliases` field is the second and final additive
+struct surface this story introduces (alongside `LangMeta`,
+Section 4.4). Section 2.2 enumerates the exact additions.
+
+The `*` prefix on the type name is the Go-specific marker.
+Whitespace normalisation (`NormalizeSignature`) operates on
+the `ParamSignature` payload, which is unchanged from existing
+Go conventions; the `*` sits inside `QualifiedName` and is not
+touched by parameter normalisation.
+
+#### 4.5.2 Consequences
 
 - Two distinct canonical signatures, hence two distinct
   fingerprints. A2 is satisfied -- the two methods produce
   two distinct Node rows.
-- `methodNodeID[m.QualifiedName]` collides on `Foo.Bar` when
-  both forms appear in the same file. The dispatcher's
-  pass 1b loop currently overwrites on collision; with two
-  declarations the second-inserted method wins the lookup.
-  Both methods are persisted (distinct fingerprints), but
-  the same-file `static_calls` resolver can only point at
-  the second. This is a same-file edge-case the v1 contract
-  accepts -- the verbatim `calls_raw` attrs persist intent so
-  the future cross-file resolver story can stitch the correct
-  target. The case is rare in practice (Go style guides
-  discourage value/pointer receiver mixing on the same type).
+- `methodNodeID[m.QualifiedName]` keys the value-receiver
+  method under `Foo.Bar` and the pointer-receiver method
+  under `*Foo.Bar`. There is NO collision and both methods
+  remain individually addressable.
+- The dispatcher's class-attachment lookup
+  `classNodeID[m.EnclosingClass]` resolves `"Foo"` for both
+  methods -> both `contains` edges attach to the same
+  `Greeter` class node.
 - Cross-file pointer/value collision is impossible (canonical
   signatures embed `relPath`).
 - A pure bare-name call `Bar()` inside the same file with
   both receivers present resolves ambiguously and is dropped
-  per A5 (the simple-name extraction in `buildCalleeIndex`
-  recovers `Bar` from both `Foo.Bar` entries; the resolver
-  drops on `len(ids) > 1`).
+  per A5 (`buildCalleeIndex` simple-name extraction yields
+  `"Bar"` from both entries; the resolver drops on
+  `len(ids) > 1`).
+- Receiver-qualified calls (`r.Bar()` / `self.Bar()`) follow
+  the `ReceiverAliases` mechanism described in 4.5.1.
 - No other language in this story has the same problem:
   - C# methods are uniquely keyed by enclosing type + name.
   - Rust trait-impl methods route to the Type class; trait
@@ -581,7 +646,8 @@ story makes are:
 1. `defaultParsers()` in `parsers_cgo.go` -- append the five
    new tree-sitter parsers (Section 3).
 2. `defaultParsers()` in `parsers_nocgo.go` -- append the
-   PowerShell scanner only.
+   PowerShell `pwsh`-subprocess parser (Section 6 -- same
+   implementation as the CGO=on build).
 3. `normalizeHints` -- expanded alias table (Section 3).
 4. `classAttrs`, `methodAttrs`, `importEdgeAttrs` -- final
    `mergeLangMeta` call (Section 4.4.2). No other writer
@@ -634,7 +700,7 @@ the canonical parser ID (Section 3). The dispatcher's
 
 This story adds NO new precedence rule -- only new aliases.
 
-## 6. PowerShell Strategy (load-bearing decision)
+## 6. PowerShell Strategy (operator-pinned)
 
 PowerShell is the one language in this story where the existing
 smacker tree-sitter binding set provides NO grammar. Confirmed
@@ -646,81 +712,121 @@ javascript, kotlin, lua, markdown, ocaml, php, protobuf,
 python, ruby, rust, scala, sql, svelte, swift, toml, typescript,
 yaml. No PowerShell.
 
-Three options were considered for v1:
+The operator answer to `powershell-grammar-strategy` (workstream
+memory) is to follow the in-house C# reference example at
+`E:\work\github\crp\workflow\src\ast\Ast.PowerShell` (verified
+to exist on the dev machine; canonical files
+`PowerShellAstParser.cs`, `PowerShellHyperedgeExtractor.cs`,
+`PsAstNode.cs`). That example does NOT use a community
+tree-sitter grammar; it uses the OFFICIAL PowerShell SDK
+(`System.Management.Automation.Language.Parser`). v1 of THIS
+story reproduces the same extraction shape in Go by invoking
+the official `pwsh` runtime as a subprocess.
 
-### 6.1 Option A -- Scanner-only PowerShell (RECOMMENDED for v1)
+### 6.1 Reference extraction shape (from `Ast.PowerShell`)
 
-A new `parser_powershell.go` (NO build tag) using a regex /
-scanner approach modeled on `parser_python.go` and
-`parser_typescript.go`. Coverage:
+`PowerShellAstParser.ExtractNodes` walks the
+`System.Management.Automation.Language.Ast` tree and matches
+exactly four node kinds:
 
-- Top-level `function Name { ... }` declarations -> `MethodDecl`
-  with empty `EnclosingClass`.
-- `class Foo { method bar() {...} }` -> `ClassDecl` + nested
-  `MethodDecl` (regex-located by class body brace match, same
-  technique `parser_typescript.go` uses).
-- `Import-Module`, `Using module`, `. ./helpers.ps1` ->
-  `Import` (the dot-source case is filtered by
-  `isRelativeImport` because Module is prefixed with `./`).
-- Bare cmdlet calls (`Get-Foo`, `Invoke-Bar`) inside a function
-  body -> `MethodDecl.Calls`.
-- `$this.X(` inside class methods -> `ReceiverCalls`.
-- No tree-sitter dependency, no new module, no C toolchain
-  requirement; ships in both CGO=on and CGO=off builds.
+| AST kind (.NET SDK) | Reference output (`PsAstNode`) | Mapped to our envelope (Section 4) |
+| --- | --- | --- |
+| `FunctionDefinitionAst` | `PsAstNode{NodeType=Function|Workflow, Name=func.Name, Parameters=[...]}` | `MethodDecl{QualifiedName=func.Name, EnclosingClass="", ParamSignature=joined param list}` (free function); when inside a class body the parent is the enclosing `TypeDefinitionAst` -> `MethodDecl{QualifiedName="Class.method", EnclosingClass="Class"}` |
+| `TypeDefinitionAst` (class) | `PsAstNode{NodeType=Class, Name=..., BaseTypes=[...], Methods=[...], Properties=[...]}` | `ClassDecl{QualifiedName=type.Name, Kind="class" or "enum", Extends=BaseTypes (first), Implements=BaseTypes (interfaces), LangMeta={"properties":[...]}}` |
+| `TypeDefinitionAst` (enum) | same with `IsEnum=true` | `ClassDecl{QualifiedName=type.Name, Kind="enum"}` |
+| `ParamBlockAst` | `PsAstNode{NodeType=ParamBlock, Parameters=[...]}` | folded into the enclosing `MethodDecl.ParamSignature` (NOT a separate node -- our envelope has no peer for top-level param blocks) |
+| `ScriptBlockAst` (top-level) | `PsAstNode{NodeType=ScriptBlock, Name=Path.GetFileName(...)}` | folded into the FILE-level container; the script body is treated as anonymous and only its TOP-LEVEL `Import-Module` / `using module` / dot-source statements are emitted as `Import` rows |
 
-Strengths: zero new dependency surface; uniform across build
-tags so the canonical signature is identical; consistent with
-the existing Python / TS scanner-fallback codebase.
+The reference also extracts a "hyperedge" set
+(`PowerShellHyperedgeExtractor.cs`) for module/dot-source
+relationships. v1 maps those onto the existing `Import`
+envelope:
 
-Weaknesses: same accuracy ceiling as the Python / TS scanners
--- string-literal masking edge cases, comment-only files in
-PSD1 manifests, etc. The v1 fixture set is sized so these
-edges are not exercised.
+| Reference hyperedge | v1 `Import.Module` | `LangMeta` |
+| --- | --- | --- |
+| `Import-Module Foo` | `Foo` | `{"module_kind":"Import-Module"}` |
+| `Import-Module ./Local.psm1` | `./Local.psm1` (relative -> dropped by `isRelativeImport`, persists raw) | `{"module_kind":"Import-Module"}` |
+| `using module Foo` | `Foo` | `{"module_kind":"using_module"}` |
+| `. ./helpers.ps1` (dot-source) | `./helpers.ps1` (relative -> dropped) | `{"module_kind":"dot_source"}` |
 
-### 6.2 Option B -- Add an external tree-sitter PowerShell grammar
+### 6.2 v1 implementation: subprocess to `pwsh`
 
-There IS an upstream community grammar (`tree-sitter-powershell`)
-maintained under various GitHub forks. Wiring it would require:
+The Go parser file is `parser_powershell.go` (NO CGO build
+tag -- the implementation is pure subprocess invocation):
 
-1. Adding the grammar's Go binding directory under
-   `github.com/<fork>/tree-sitter-powershell` to `go.mod`.
-2. Cross-checking the C source is CGO-friendly on Windows /
-   Linux / Mac toolchains.
-3. Implementing `parser_treesitter_powershell.go` mirroring the
-   existing TypeScript / Python tree-sitter walkers.
+```go
+// parser_powershell.go
+//go:build !no_pwsh
+// (build tag "no_pwsh" lets CI opt out on stripped images)
 
-Strengths: production-quality coverage; matches the canonical
-"tree-sitter is the parser core" mandate from
-`implementation-plan.md` section 3.2.
+type powershellParser struct {
+    pwshBin string  // resolved via exec.LookPath("pwsh")
+}
 
-Weaknesses: introduces a new third-party C dependency; the
-build matrix grows by one (CGO=off Windows must still ship the
-scanner fallback, so both implementations exist); upstream
-maintenance of the PowerShell grammar is not first-party.
+func (p *powershellParser) Parse(relPath string, src []byte) (ParseResult, error) {
+    // 1. Pipe `src` to `pwsh -NoProfile -NonInteractive -Command -`
+    //    running an embedded extraction script that mirrors
+    //    Ast.PowerShell's ExtractNodes.
+    // 2. The script returns a JSON document with the shape
+    //    {functions:[...], types:[...], imports:[...]}
+    //    -- the EXACT same set the reference example yields.
+    // 3. Map the JSON onto ClassDecl / MethodDecl / Import.
+    // 4. When pwsh is not on PATH (CI without PowerShell),
+    //    return ParseResult{} with no nodes and an empty
+    //    error -- the dispatcher treats this as "parser
+    //    skipped this file" without aborting the worker.
+}
+```
 
-### 6.3 Option C -- Vendor a binding directly
+Extraction is one process per file. For a worker walking
+many `.ps1` files, the implementation MAY (a follow-up
+optimisation, not v1 scope) batch them via a single
+long-lived `pwsh` host; v1 ships the simpler one-shot
+invocation.
 
-Same as Option B but with the grammar pinned in
-`internal/repoindexer/ast/grammars/powershell/` and the Go
-binding written in-tree. Highest control, highest maintenance
-cost. NOT recommended for v1.
+### 6.3 Build matrix
 
-### 6.4 v1 decision (PINNED)
+| Build tag | Production wiring | Behaviour for `.ps1` / `.psm1` / `.psd1` |
+| --- | --- | --- |
+| `//go:build cgo`   (`parsers_cgo.go`)   | `defaultParsers()` registers `powershellParser` | Parse via `pwsh` subprocess. If `pwsh` is absent on the host, file is skipped with `ast.dispatch.skip{reason:"pwsh_not_available"}` -- WARN-level log, the worker continues. |
+| `//go:build !cgo`  (`parsers_nocgo.go`) | same registration -- the parser does NOT depend on CGO | identical behaviour to the CGO build (the subprocess approach is build-tag agnostic) |
 
-**Ship Option A (scanner-only).** This is the v1 commitment;
-no operator decision is pending. The scanner approach is the
-lowest-risk landing for the 13-point budget; wiring a new C
-dependency in the same story risks blowing the budget on
-toolchain debugging. The decision is recorded here in-doc
-rather than as an open question.
+This breaks the "tree-sitter requires CGO" pattern the other
+languages follow -- intentionally. The reference example
+sidesteps tree-sitter entirely, so the build-tag
+asymmetry described in Section 7 (other-language matrix)
+does NOT apply to PowerShell. The CGO=off `make test`
+portable path runs the same parser if `pwsh` is installed;
+otherwise files are skipped.
 
-Promotion path to Option B (or C) is a follow-up workstream:
-add a `parser_treesitter_powershell.go` behind `//go:build
-cgo`, list the smacker-style binding under `go.mod`, and
-extend `defaultParsers()` in `parsers_cgo.go` to prefer the
-tree-sitter parser when CGO is on while keeping the scanner
-as the CGO=off path. The follow-up is in scope for a new
-story; this architecture document does NOT extend its scope.
+### 6.4 Fallback rules
+
+- **No `pwsh` on host.** Files skipped, dispatcher emits one
+  WARN log per skipped file (rate-limited via the existing
+  `ast.dispatch.skip` mechanism). The worker does not abort.
+  Tests under `parser_powershell_test.go` use `t.Skip` when
+  `exec.LookPath("pwsh")` fails so the suite stays green on
+  PowerShell-less CI.
+- **`pwsh` returns a parse error.** The Go parser surfaces
+  the error from the subprocess; `safeParse` (A6) logs it
+  and the file is treated as a parse failure. Same behaviour
+  as the existing tree-sitter parsers when the grammar
+  rejects a malformed input.
+- **`pwsh` subprocess hang.** A 10-second per-file timeout
+  is applied via `context.WithTimeout`; on timeout the
+  parser returns an error and `safeParse` does its job.
+  Timeout value is the same constant used by the existing
+  parsers' bounded work loops.
+
+### 6.5 Tree-sitter PowerShell binding (explicitly OUT of v1)
+
+Adding a community `tree-sitter-powershell` grammar binding
+is NOT in scope for this story. The operator-pinned path is
+the subprocess approach because it matches the in-house
+reference example. Promotion to a tree-sitter binding is a
+follow-up workstream only if (a) the subprocess overhead
+becomes a measurable bottleneck or (b) the host-PowerShell
+dependency becomes a deployment problem.
 
 ## 7. End-to-End Sequence Flows
 
@@ -760,9 +866,10 @@ goTreeSitterParser.Parse:
          StartLine=N, EndLine=N+K }
    - walks "method_declaration" with receiver "(g *Greeter)"
      :: emits MethodDecl{
-         QualifiedName="Greeter.Greet",
+         QualifiedName="*Greeter.Greet",       # per Section 4.5
          EnclosingClass="Greeter",
-         ParamSignature="recv=*Greeter; name string",  # per Section 4.5
+         ParamSignature="name string",
+         ReceiverAliases=["Greeter.Greet"],     # per Section 4.5.1
          BodySource=stripped braces,
          Calls=["formatGreeting"],
          ReceiverCalls=[],          # no g.X calls in this body
@@ -795,14 +902,17 @@ Dispatcher.emit -- two-pass insert:
        insert contains edge file -> Greeter class
    Pass 1b: insert MethodDecl Greeter.Greet
        parentID = Greeter class node
-       sig = repoURL+"::method::internal/foo/foo.go#Greeter.Greet
-             (recv=*Greeter; name string)"   # per Section 4.5
+       sig = repoURL+"::method::internal/foo/foo.go#*Greeter.Greet
+             (name string)"   # per Section 4.5
        AttrsJSON {language:"go", enclosing_class:"Greeter",
                   receiver:"g", receiver_ptr:true,
-                  params_raw:"recv=*Greeter; name string", ...}
+                  params_raw:"name string", ...}
        (receiver / receiver_ptr came from LangMeta via
         mergeLangMeta in methodAttrs; params_raw is the
-        existing first-class key carrying ParamSignature.)
+        existing first-class key carrying ParamSignature.
+        ReceiverAliases=["Greeter.Greet"] registers a
+        secondary key for receiver-qualified resolution
+        per Section 4.5.1.)
        insert contains edge class -> method
        publishNodeEmbedding (Method)
        SubdivideMethod (body has <80 logical lines) -> no Blocks
@@ -829,17 +939,19 @@ Dispatcher.emit -- two-pass insert:
        Greet.MemberAccesses = []  -> no edge emitted
        v
 EmitFile returns EmitResult{TouchedNodes=[Greeter class,
-                                          Greeter.Greet method,
+                                          *Greeter.Greet method,
                                           formatGreeting method,
                                           fmt package]}
 ```
 
-### 7.2 Scenario: Rust trait impl with same-file static call and `use` import
+### 7.2 Scenario: Rust trait impl with same-file static call, `use` import, and trait-default overrides edge
 
-Setup: a Rust file `src/lib.rs` declaring `trait Greeter
-{...}`, `struct GreeterImpl;`, `impl Greeter for GreeterImpl
-{ fn greet(&self,...) {...} }`, free function `fn
-format_greeting(...)`, and `use std::fmt::Display;`.
+Setup: a Rust file `src/lib.rs` declaring `trait Greeter { fn
+greet(&self, name: &str) -> String { String::new() } }` (a
+default-bodied method on the trait), `struct GreeterImpl;`,
+`impl Greeter for GreeterImpl { fn greet(&self,...) {...} }`
+(impl-block method shadowing the trait default), free function
+`fn format_greeting(...)`, and `use std::fmt::Display;`.
 
 ```
 selectParser("src/lib.rs", [])
@@ -849,15 +961,22 @@ rustTreeSitterParser.Parse:
    - "trait_item"  ::  ClassDecl{
        QualifiedName="Greeter", Kind="trait", Extends=[],
        Implements=[]}
+     plus, for the default-bodied method inside the trait:
+       MethodDecl{
+         QualifiedName="Greeter.greet",
+         EnclosingClass="Greeter",
+         ParamSignature="&self, name: &str",
+         BodySource="String::new()",
+         LangMeta={"trait_default":true} }
    - "struct_item" GreeterImpl  ::  ClassDecl{
        QualifiedName="GreeterImpl", Kind="struct"}
    - "impl_item" with trait `Greeter` for `GreeterImpl`  ::
-       (i) appends "Greeter" to GreeterImpl.Implements
+       (i)  appends "Greeter" to GreeterImpl.Implements
        (ii) for each `function_item` in the impl body:
             emit MethodDecl{
               QualifiedName="GreeterImpl.greet",
               EnclosingClass="GreeterImpl",
-              attrs_json["trait"]="Greeter" }
+              LangMeta={"trait":"Greeter"} }
               ParamSignature="&self, name: &str",
               BodySource=...,
               Calls=["format_greeting"],
@@ -869,7 +988,10 @@ rustTreeSitterParser.Parse:
        :: Import{Module="std::fmt", Symbols=["Display"]}
        v
 Dispatcher pass 1: Greeter class, GreeterImpl class,
-                   greet method (parent=GreeterImpl),
+                   Greeter.greet method (parent=Greeter, the
+                     trait-default version),
+                   GreeterImpl.greet method (parent=GreeterImpl,
+                     the impl-block override),
                    format_greeting method (parent=file)
 Dispatcher pass 2a:
    GreeterImpl.Extends=[]      -> no edges
@@ -879,10 +1001,29 @@ Dispatcher pass 2a:
 Dispatcher pass 2b:
    GreeterImpl.greet.Calls=["format_greeting"]
      -> resolves -> static_calls edge
+Dispatcher pass 2d: overrides   # NEW pass for this story
+   For each method M where M.LangMeta["trait"] is set:
+     traitID = classNodeID[M.LangMeta["trait"]]
+     traitMethodID = methodNodeID[traitName + "." + simpleName(M)]
+     when BOTH resolve same-file:
+       insert overrides edge M -> traitMethodID
+   Here:
+     M = GreeterImpl.greet, trait = "Greeter",
+     simpleName = "greet" -> methodNodeID["Greeter.greet"]
+     resolves to the trait-default node
+     -> insert overrides GreeterImpl.greet -> Greeter.greet
+   (See Section 9 R4 for the operator-pinned rule.)
 Dispatcher pass 0:
    std::fmt is non-relative -> external package node
    imports edge file -> std::fmt with attrs.symbols=["Display"]
 ```
+
+The Pass 2d step is the only addition this story makes to
+the dispatcher's emit loop; it runs after Pass 2c (reads /
+writes) and before `EmitResult` assembly. All other languages
+in this story leave `LangMeta["trait"]` unset so the pass is
+a no-op for them; existing TS / JS / Python parsers likewise
+leave the key unset and remain byte-identical in output.
 
 ### 7.3 Scenario: C++ class with inheritance, `this->` call, and `#include`
 
@@ -912,8 +1053,8 @@ cppTreeSitterParser.Parse:
    NOTE: the dispatcher's two-pass insert MUST not double-
    insert "Greeter.greet". The C++ parser de-duplicates by
    QualifiedName before returning; the version with a non-
-   empty body wins. See the open-question block on
-   declaration/definition handling.
+   empty body wins. This is the PINNED v1 rule (Section 9
+   R1) -- no operator question is pending.
    - free function log_global :: MethodDecl{
        QualifiedName="log_global", EnclosingClass="",
        BodySource=...}
@@ -986,8 +1127,8 @@ parsers MUST use the same `uniqueStringsInsert` helper.
 For C / C++ / C# / Go / Rust this constraint does not apply
 because the CGO=off path does NOT register those parsers
 (Section 3 -- no scanner fallback). For PowerShell, the
-scanner is the single implementation, so the constraint is
-trivially satisfied.
+`pwsh` subprocess parser is the SINGLE implementation across
+both build tags, so the constraint is trivially satisfied.
 
 ### 8.3 Logging
 
@@ -1001,9 +1142,9 @@ The existing structured-log keys are reused verbatim:
 - `ast.dispatch.ok` -- emitted on success with the
   `language` field set to the new parser's ID.
 - `ast.imports.skip_relative` -- emitted for any relative
-  import (C `#include "..."`, PowerShell dot-source,
-  Rust local `mod` declarations -- which are NOT emitted as
-  Imports at all in v1).
+  import (C `#include "..."`, PowerShell dot-source and
+  `./Local.psm1` references, Rust local `mod` declarations --
+  which are NOT emitted as Imports at all in v1).
 
 ### 8.4 Test surface
 
@@ -1011,7 +1152,9 @@ Per the story description's tests section:
 
 - Each language gets a fixture-driven test in
   `parser_treesitter_<lang>_test.go` (CGO=on) plus
-  `parser_<lang>_test.go` for PowerShell (no CGO).
+  `parser_powershell_test.go` for the `pwsh` subprocess
+  parser (skipped via `t.Skip` when `exec.LookPath("pwsh")`
+  fails -- see Section 6.4).
 - Cross-language dispatcher tests in `dispatcher_test.go`
   cover routing (extension -> parser), miss handling
   (unknown extension -> nil parser -> skip log), and
@@ -1043,47 +1186,59 @@ This story updates `.claude/context/tests.md` (NOT
 | C# | tree-sitter | NOT supported | files skipped |
 | Go | tree-sitter | NOT supported | files skipped |
 | Rust | tree-sitter | NOT supported | files skipped |
-| PowerShell | scanner | scanner | grammar binding decision deferred (Section 6) |
+| PowerShell | `pwsh` subprocess (Section 6) | `pwsh` subprocess (same impl) | requires `pwsh` on PATH; absent -> files skipped with `ast.dispatch.skip{reason:"pwsh_not_available"}` |
 
 The "tree-sitter-backed only" caveat and the PowerShell
-grammar-acquisition note are quoted in the table.
+`pwsh`-subprocess requirement are quoted in the table.
 
 ## 9. Risks and Mitigations
 
 | Risk | Mitigation |
 | --- | --- |
 | **R1** -- C++ declaration vs definition double-count. A class member function declared in a header (no body) and defined in a `.cpp` file (with body) would create two `MethodDecl` entries with the same QualifiedName. | The C++ parser deduplicates by QualifiedName within a single file at the end of `Parse`. Cross-file duplicates (header + cpp in separate files) are a future cross-file resolver problem and stay as two `method` nodes whose canonical signatures differ in `relPath` -- correct per A2. |
-| **R2** -- Go method receiver pointer / value variants. `func (r *Foo) Bar()` and `func (r Foo) Bar()` are distinct methods at the language level. The receiver clause is OUTSIDE the formal `ParamSignature`, so without intervention the two methods collide on `<rel>::method#Foo.Bar()`. | **PINNED RULE per Section 4.5**: the Go parser prepends a synthetic `recv=Foo;` or `recv=*Foo;` tag to `ParamSignature` so canonical signatures differ -> distinct fingerprints. `QualifiedName` and `EnclosingClass` stay as the bare type name `Foo` so the dispatcher's local symbol-table semantics work uniformly with other languages. `LangMeta["receiver_ptr"]` carries the boolean. Same-file `methodNodeID[Foo.Bar]` collision is accepted as an A5 corner case -- both nodes are persisted, only one wins the local lookup; `calls_raw` preserves intent. |
+| **R2** -- Go method receiver pointer / value variants. `func (r *Foo) Bar()` and `func (r Foo) Bar()` are distinct methods at the language level. The receiver clause is OUTSIDE the formal `ParamSignature`, so without intervention the two methods collide on `<rel>::method#Foo.Bar()`. | **PINNED RULE per Section 4.5** (operator answer `go-receiver-pointer-fingerprint`): the Go parser embeds the receiver-pointer marker in `QualifiedName` -- value-receiver methods key as `Foo.Bar`, pointer-receiver methods key as `*Foo.Bar`. `EnclosingClass` stays `Foo` (bare) so class-attachment via `classNodeID[m.EnclosingClass]` works for both. `LangMeta["receiver_ptr"]` carries the boolean. Receiver-qualified calls (`r.Bar()`) use the `ReceiverAliases` mechanism (Section 4.5.1) -- the pointer-receiver method also registers the bare `Foo.Bar` key as a secondary lookup so `self.X` / `r.X` calls keep resolving. If both value and pointer receiver methods exist on the same type and name, the alias collides -> A5's drop-on-collision rule applies and `calls_raw` preserves intent. |
 | **R3** -- C# `partial class` declarations across multiple files. v1 treats each partial file as its own ClassDecl with the same QualifiedName but different relPath -> different canonical signatures, hence distinct nodes. The cross-file resolver will stitch them via a future `partial_of` edge. | Documented as a future story; no v1 work required. The `LangMeta["partial"]=true` flag is set on each partial class so the consumer can group by name. |
-| **R4** -- Rust trait method default impl. A trait declaration with a default-bodied method produces both a MethodDecl on the trait class (Kind="trait") AND, separately, an `impl Trait for Type` method shadows it on the Type class. | **PINNED RULE**: v1 does NOT emit an `overrides` edge from Type.method -> Trait.method. The v1 edge scope in `doc.go` lists `contains`, `extends`, `implements`, `static_calls`, `imports`, `reads`, `writes`; adding `overrides` is a schema / migration question that exceeds this story. The trait identity is recorded on `LangMeta["trait"]` of the impl method; a future workstream can derive the `overrides` edge by joining trait method nodes to impl method nodes via that key. The same-file ambiguity case is handled by `buildCalleeIndex`'s drop-on-collision rule (A5). |
-| **R5** -- PowerShell scanner accuracy on heredocs / nested strings. | Same risk class the Python / TS scanners already have; scope-limited per Section 6. Fixture set sized so heredoc edge cases are not exercised. |
+| **R4** -- Rust trait method default impl. A trait declaration with a default-bodied method produces both a MethodDecl on the trait class (Kind="trait") AND, separately, an `impl Trait for Type` method shadows it on the Type class. | **PINNED RULE** (operator answer `rust-trait-overrides-edge`): when both the trait default-bodied method AND the impl-block method are present in the SAME FILE, the dispatcher's new Pass 2d emits an `overrides` edge from the impl method to the trait method. Resolution key is `methodNodeID[traitName + "." + simpleName(implMethod)]` where `traitName = LangMeta["trait"]`. Cross-file trait/impl pairs are deferred (per A4 same-file resolution) and the verbatim trait identity persists on `LangMeta["trait"]`. The implementation requires the dispatcher to accept the new edge kind `"overrides"`; Section 2.2.1 captures the dispatcher diff. The same-file ambiguity case (multiple impl methods with the same simple name) is handled by `buildCalleeIndex`'s drop-on-collision rule (A5) -- only same-name same-trait shadowing emits the edge. |
+| **R5** -- PowerShell `pwsh` subprocess overhead / availability. | One process per file is acceptable for v1's per-file emission cadence; tests skip when `pwsh` is absent (Section 6.4). A future workstream may batch via a long-lived host. |
 | **R6** -- `.h` ambiguity. C / C++ both use `.h`; the v1 routing sends `.h` to the C parser. | **PINNED PER SECTION 5.2**: `.h` routes to C unconditionally in v1; no hint-override mechanism is shipped. Repos with C++-only headers must use `.hpp` / `.hh` / `.hxx` / `.h++`. A follow-up story can add a per-repo extension-override knob that fires ahead of `extMap` in `selectParser`. |
 
 ## 10. Pinned Decisions and Out-of-Story Workstreams
 
-This story makes the following v1 decisions in-doc (no
-operator question is pending on any of them):
+This story makes the following v1 decisions in-doc. All four
+prior operator questions are answered (see workstream memory);
+nothing is pending.
 
-- **`.h` routing** -- PINNED: `.h` files route to the C parser
+- **`.h` routing** -- PINNED (operator answer
+  `dot-h-extension-routing`): `.h` files route to the C parser
   unconditionally; no hint-override mechanism is shipped. See
   Section 5.2 for the rationale and Section 9 R6 for the risk
   acknowledgement. A follow-up story may add a per-repo
   extension-override knob.
-- **PowerShell grammar acquisition** -- PINNED: ship Option A
-  (scanner-only) in v1. See Section 6.4. Promotion to a
-  tree-sitter binding is a follow-up workstream.
-- **Go pointer-receiver fingerprint disambiguation** -- PINNED:
-  Go parser prepends a synthetic `recv=Foo;` or `recv=*Foo;`
-  prefix to `ParamSignature` so canonical signatures differ
-  between value and pointer receivers. `QualifiedName` and
-  `EnclosingClass` stay as the bare type name so dispatcher
-  semantics work uniformly with other languages. See Section
+- **PowerShell parser strategy** -- PINNED (operator answer
+  `powershell-grammar-strategy`): follow the in-house example
+  under `E:\work\github\crp\workflow\src\ast\Ast.PowerShell`,
+  which uses the official
+  `System.Management.Automation.Language.Parser` API. v1
+  invokes `pwsh -NoProfile` as a subprocess to obtain the same
+  AST and maps `FunctionDefinitionAst` / `TypeDefinitionAst` /
+  `ParamBlockAst` / `ScriptBlockAst` onto our envelope. See
+  Section 6 for the strategy detail and Section 6.4 for the
+  fallback rules.
+- **Go pointer-receiver fingerprint disambiguation** -- PINNED
+  (operator answer `go-receiver-pointer-fingerprint`): the Go
+  parser embeds `*` in `QualifiedName` for pointer receivers
+  (`*Foo.Bar`) while keeping value receivers bare (`Foo.Bar`).
+  `EnclosingClass` stays the bare type name so class-attachment
+  works uniformly. Receiver-qualified calls resolve through
+  the new `ReceiverAliases` field (Section 4.5.1). See Section
   4.5 and Section 9 R2.
-- **Rust trait `overrides` edge** -- PINNED: v1 does NOT
-  emit an `overrides` edge. Trait identity is recorded on
-  `LangMeta["trait"]` of the impl method; a future
-  workstream may derive the edge by joining trait method
-  nodes to impl method nodes via that key. See Section 9 R4.
+- **Rust trait `overrides` edge** -- PINNED (operator answer
+  `rust-trait-overrides-edge`): when an impl-block method
+  shadows a trait default-bodied method AND both are present
+  in the same file, the dispatcher's new Pass 2d emits an
+  `overrides` edge from the impl method to the trait method.
+  See Section 7.2 sequence, Section 9 R4, and the A3 update
+  describing the new pass.
 
 The following workstreams are explicitly out of scope and
 will be picked up by future stories:
@@ -1108,107 +1263,128 @@ will be picked up by future stories:
   data model change required (a new `repo` column or a new
   dispatcher option) exceeds this story's scope.
 - **PowerShell tree-sitter grammar binding** -- promotion
-  from Option A to Option B / C is a separate workstream.
+  from the `pwsh`-subprocess approach to an in-process
+  tree-sitter PowerShell binding is a separate workstream
+  (Section 6.5).
 
 ## Iteration Summary
 
 - Path: `docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md`
 - Covers from the story description: (1) v1 extraction scope
   per language (Section 4 matrices), (2) parser library
-  coverage for C / C++ / C# / Go / Rust and the PowerShell
-  pinned-Option-A decision (Section 6), (3) new parser file
-  plan (Section 2.1 table), (4) extension registration in
-  `parsers_cgo.go` / `parsers_nocgo.go` (Section 3), (5)
+  coverage for C / C++ / C# / Go / Rust and the
+  operator-pinned PowerShell `pwsh`-subprocess approach
+  modelled on `Ast.PowerShell` (Section 6), (3) new parser
+  file plan (Section 2.1 table), (4) extension registration
+  in `parsers_cgo.go` / `parsers_nocgo.go` (Section 3), (5)
   mapping of language constructs into existing graph model
-  including the explicit struct + writer extension for
-  `LangMeta` (Sections 4.1 - 4.5), (6) note on fixture-
-  driven tests (Section 8.4), (7) cross-language dispatcher
-  tests (Section 8.4), (8) support matrix documentation
-  hand-off to `.claude/context/tests.md` (Section 8.5), (9)
-  end-to-end sequences for the primary language scenarios
-  (Section 7.1 / 7.2 / 7.3) and the failure case (Section
-  7.4).
+  including the explicit struct + writer extensions for
+  `LangMeta` and `ReceiverAliases` (Sections 4.1 - 4.5),
+  (6) fixture-driven tests (Section 8.4), (7) cross-language
+  dispatcher tests (Section 8.4), (8) support matrix
+  documentation hand-off to `.claude/context/tests.md`
+  (Section 8.5), (9) end-to-end sequences for the primary
+  language scenarios (Section 7.1 Go with pointer-receiver
+  emission, 7.2 Rust with the new `overrides` edge in Pass
+  2d, 7.3 C++ with header dedup) and the failure case
+  (Section 7.4).
 - Not covered (deliberately, owned by sibling docs): per-step
   file creation order (implementation-plan.md), fixture text
-  bodies and exact regex patterns for the scanner-mode
+  bodies and exact `pwsh` extraction-script source for the
   PowerShell parser (tech-spec.md), and operator-visible
   scenario walk-throughs framed as Given/When/Then
   (e2e-scenarios.md).
 
 ### Prior feedback resolution
 
-- [x] 1. FIXED -- Sections 5.2, 6.4, 4.5, 9 R2 / R4 / R6, and
-      Section 10 -- all four open operator questions are now
-      pinned in-doc as v1 decisions (`.h` -> C unconditionally;
-      PowerShell scanner-only; Go receiver-prefix in
-      ParamSignature; Rust `overrides` edge NOT emitted in
-      v1). The `## Iteration 1 open questions for the
-      operator` block at the end of the file has been
-      removed and the open-questions JSON fenced block is
-      omitted from this reply.
+- [x] 1. FIXED -- Sections 1.2 A1, 2.2 (split into 2.2 +
+      2.2.1) -- A1 now explicitly allows the two additive,
+      nilable struct surfaces (`LangMeta` and
+      `ReceiverAliases`) and references Section 2.2.1.
+      Section 2.2 was split: 2.2 enumerates what does NOT
+      change (dispatcher emit, block.go, ast.go);
+      2.2.1 is a new table that explicitly lists every
+      additive field and writer hook this story DOES
+      introduce (LangMeta on three envelopes, ReceiverAliases
+      on MethodDecl, mergeLangMeta in three writers, receiver
+      alias consult in the receiver-qualified resolver).
+      Section 4.4 LangMeta is now consistent with both.
       Verification:
       ```
-      $ grep -nF "Iteration 1 open questions for the operator" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
+      $ grep -nF "never in new top-level fields" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
       (empty)
-      $ grep -nF "See open-questions block" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
-      (empty)
-      $ grep -nF "operator may pin" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
+      $ grep -nF "parser.go -- the `ParseResult` shape and `ClassDecl` /" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
       (empty)
       ```
-- [x] 2. FIXED -- Section 4.4 -- replaced the misleading
-      "without changing the attrs writers themselves" sentence
-      with an explicit struct + writer extension. New
-      Sections 4.4.1 (struct fields: `LangMeta map[string]any`
-      added to `ClassDecl`, `MethodDecl`, `Import`), 4.4.2
-      (writer changes: `mergeLangMeta` helper called from
-      `classAttrs`, `methodAttrs`, `importEdgeAttrs`), 4.4.3
-      (the authoritative key catalogue moved from "added
-      without changes" to "carried via `LangMeta`"), and
-      4.4.4 (backward compatibility -- TS / Python parsers
-      leave LangMeta nil so existing tests are byte-identical
-      across the change). The Section 4 preface adds a
-      notation note that `attrs_json["<key>"]` references in
-      the per-language matrices represent the persisted form
-      populated via `LangMeta`.
+- [x] 2. FIXED -- Section 2.1 (parsers table) and Section
+      5.3 -- the `normalizeHints` row now reads "resolve
+      files whose extension is NOT registered in `extMap`"
+      and explicitly states extension-first match wins
+      (referencing Section 5.2). Section 5.3 step (3) was
+      already updated last iter; verified consistent.
       Verification:
       ```
-      $ grep -nF "without changing the attrs writers themselves" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
-      (empty)
-      $ grep -nF "This story adds the following keys without changing" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
+      $ grep -nF "so `repo.language_hints[]` can override extension routing." docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
       (empty)
       ```
-- [x] 3. FIXED -- Section 5.2 -- the misleading paragraph
-      claiming `repo.language_hints[]` can override `.h` from
-      C to C++ has been replaced with a pinned rule that
-      `.h` files route to the C parser unconditionally in v1
-      and no override mechanism is shipped. Section 9 R6 is
-      aligned. Section 8.4 test-surface description is
-      aligned. Section 10 records the extension-override knob
-      as a follow-up.
+- [x] 3. FIXED -- Section 7.3 C++ sequence -- replaced the
+      stale "See the open-question block on declaration/
+      definition handling" reference with a forward link to
+      Section 9 R1 ("This is the PINNED v1 rule (Section 9
+      R1) -- no operator question is pending"). No other
+      open-question references remain.
       Verification:
       ```
-      $ grep -nF "Repos with C++ projects that use `.h` for headers can override via" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
-      (empty)
-      $ grep -nF "operators with C++ `.h` projects override via" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
+      $ grep -nF "See the open-question block on declaration/definition handling" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
       (empty)
       ```
-- [x] 4. FIXED -- Section 4.5 (new section) and Section 9 R2
-      pin the Go pointer-receiver fingerprint rule: the
-      parser prepends `recv=Foo; ` or `recv=*Foo; ` to
-      `ParamSignature` so canonical signatures differ; the
-      `QualifiedName` and `EnclosingClass` stay as the bare
-      type name `Foo` so dispatcher symbol-table semantics
-      work uniformly with every other language. The Section
-      7.1 Go sequence trace updates the emitted ParamSignature
-      and the canonical signature line accordingly. The
-      Section 4.2 MethodDecl Go row mentions the receiver
-      prefix.
+- [x] 4. FIXED -- Section 9 R4, Section 10 (Rust trait
+      `overrides` edge entry), A3 in Section 1.2, and a new
+      Pass 2d in the Section 7.2 Rust sequence -- v1 now
+      DOES emit an `overrides` edge from impl method to
+      trait method when both same-file resolve, per operator
+      answer `rust-trait-overrides-edge`. The dispatcher
+      gains a new Pass 2d (documented in A3 and Section
+      2.2.1). The Rust sequence trace shows the trait
+      default-bodied method emission, the impl method
+      emission with `LangMeta["trait"]="Greeter"`, and the
+      Pass 2d resolution rule that produces the
+      `overrides` edge.
       Verification:
       ```
-      $ grep -nF "canonical signature includes the parameter list verbatim, so `(g *Greeter)` vs `(g Greeter)`" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
+      $ grep -nF "v1 does NOT emit an `overrides` edge" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
       (empty)
-      $ grep -nF "ParamSignature is empty (Go puts the receiver in its own clause)" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
+      $ grep -nF "v1 does NOT\n      emit an `overrides` edge" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
+      (empty -- multi-line variant)
+      ```
+- [x] 5. FIXED -- Section 6 fully rewritten to incorporate
+      the operator-specified reference at
+      `E:\work\github\crp\workflow\src\ast\Ast.PowerShell`.
+      The file was inspected on disk:
+      `PowerShellAstParser.cs` (6837 bytes) uses
+      `System.Management.Automation.Language.Parser`
+      directly and matches four AST kinds
+      (`FunctionDefinitionAst`, `TypeDefinitionAst`,
+      `ParamBlockAst`, `ScriptBlockAst`). v1 reproduces the
+      same extraction in Go by invoking `pwsh -NoProfile`
+      as a subprocess; the JSON output maps 1:1 onto
+      `ClassDecl` / `MethodDecl` / `Import`. Section 6.1
+      gives the mapping table sourced directly from the
+      reference, 6.2 sketches the Go wrapper, 6.3 the
+      build matrix (no CGO dependence), 6.4 the fallback
+      rules, 6.5 explicitly defers any tree-sitter
+      promotion. Section 10 pin is updated. The "Option A
+      scanner-only" text is gone.
+      Verification:
+      ```
+      $ grep -nF "Ship Option A (scanner-only)" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
       (empty)
-      $ grep -nF "ParamSignature=\"name string\"" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
+      $ grep -nF "Option A -- Scanner-only PowerShell (RECOMMENDED for v1)" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
+      (empty)
+      $ grep -nF "PowerShell scanner-only" docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/architecture.md
       (empty)
       ```
+
+All four operator-pinned answers are now applied in-doc; no
+open-questions block is emitted. ASCII-clean check passed
+(no characters outside `\x00-\x7E`).

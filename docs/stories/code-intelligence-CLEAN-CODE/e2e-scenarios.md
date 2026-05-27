@@ -413,12 +413,13 @@ Feature: cycle_member emitted only inside dependency cycles [arch Sec 1.4.1]
     Given the fixture `tests/fixtures/ast/go/cycle/{a,b,c}.go` forms an a->b->c->a cycle
     When the adapter computes foundation metrics for the package
     Then `cycle_member=1` rows exist for `a`, `b`, and `c`
-     And no `cycle_member` row exists for any acyclic package in the fixture set
+     And no `cycle_member=1` row exists for any acyclic package in the fixture set
 
-  Scenario: An acyclic graph emits no cycle_member rows
+  Scenario: An acyclic graph emits no value=1 cycle_member rows
     Given the fixture `tests/fixtures/ast/python/acyclic/` has no import cycles
     When the adapter computes foundation metrics
-    Then zero `metric_sample` rows exist with `metric_kind='cycle_member'`
+    Then zero `metric_sample` rows exist with `metric_kind='cycle_member'` and `value=1.0`
+     And every in-project file scope and package scope emits a `metric_kind='cycle_member'` row with `value=0.0` and empty `attrs_json` (the brief's universal `value=0 otherwise` contract; see implementation-plan Stage 2.5 "file D outside the cycle emits value=0")
 ```
 
 ```gherkin
@@ -436,7 +437,7 @@ Feature: Window default for `modification_count_in_window` materialiser is 90 da
   Scenario: Window default is 90 days and is read from the materialiser config (NOT from the AST adapter)
     Given the materialiser config has no `window_days` override
     When the `modification_count` materialiser runs over a synthetic churn stream
-    Then the count covers commits whose `committer_date` is within the last 90 days
+    Then the count covers commits whose `modified_at` is within the last 90 days
      And the emitted row's `attrs_json.window_days` field equals `90`
      And the AST adapter does NOT read or honour the `window_days` config (it is not a producer of this kind)
 ```

@@ -1,0 +1,83 @@
+# clean-code Stage 5.5 -- SOLID / Interface Segregation rule pack
+#
+# Architecture references:
+#   - Sec 1.3 "SOLID coding principles" (goal 2): the ISP
+#     smell is an interface so wide that callers depend on
+#     methods they do not need, dragging in irrelevant
+#     transitive coupling.
+#   - Sec 1.4.1 canonical metric_kind (line 101):
+#       * `interface_width` (class, interface scope,
+#         pack=solid): "Public method count. Drives ISP
+#         rule."
+#   - Sec 3.5.1.d SOLID input recipe for ISP: "Inputs:
+#     `interface_width` (class, interface), `fan_in`
+#     (interface). A wide interface consumed by a small
+#     subset of its methods is the smell."
+#   - tech-spec Sec 4.3 (line 350): "ISP joins on
+#     `interface_width`".
+#
+# # v1 scope choice
+#
+# The implementation-plan Stage 5.5 brief (line 515) names
+# `metric_kind='interface_width'` as the v1 ISP input. We
+# pin `scope_kind == 'interface'` to differentiate this rule
+# from the SRP companion rule on `class` scope:
+#
+#   - SRP.interface_width_high  fires on CLASS samples
+#     (high public surface = too many concerns).
+#   - ISP.interface_width_high  fires on INTERFACE samples
+#     (wide interface = clients depend on too much).
+#
+# Both rule_ids are distinct (`solid.srp.interface_width_high`
+# vs `solid.isp.interface_width_high`), so the Steward Rule
+# PK `(rule_id, version)` is satisfied. The semantic split
+# is captured in the scope binding, NOT in the rule_id
+# suffix.
+#
+# # Threshold rationale (v1 default)
+#
+#   - interface_width >= 20: an interface exposing 20+
+#     methods is wide enough that no single caller plausibly
+#     depends on the whole surface. The SRP variant uses a
+#     lower cut-off (15) on `class` scope; the ISP cut-off
+#     is higher because interfaces are expected to be wider
+#     than classes by design and the smell only fires once
+#     the width pushes past typical interface sizes.
+#
+# # Why fan_in is NOT in v1 ISP
+#
+# Architecture Sec 3.5.1.d names BOTH `interface_width` AND
+# `fan_in` (interface scope) as ISP inputs. The
+# implementation-plan Stage 5.5 brief (line 515) names only
+# `interface_width`. The v1 rulepack matches the
+# implementation-plan brief verbatim. A future v2 of this
+# pack can add an `solid.isp.fan_in_high` rule once the
+# Stage 2.4 SOLID recipes materialise `fan_in` samples at
+# `scope_kind='interface'` (v1 fan_in is method/class/file).
+#
+# # pack_id convention
+#
+# `<family>.<subname>` per migration
+# `0003_policy_audit_refactor.up.sql` line 200.
+pack_id: solid.isp
+version: 1
+display_name: SOLID -- Interface Segregation
+description_md: |-
+  One v1 rule firing on `interface`-scope samples whose
+  `interface_width` (public method count) exceeds the
+  threshold. Wide interfaces force every caller to depend on
+  the whole surface even when they only use a sliver of it.
+  The SRP rulepack uses the same metric_kind on `class`
+  scope with a lower cut-off; the two rules do not collide
+  because their scope_kind differs.
+rules:
+  - rule_id: solid.isp.interface_width_high
+    version: 1
+    predicate_dsl: "metric_kind == 'interface_width' AND scope_kind == 'interface' AND value >= 20"
+    severity_default: warn
+    description_md: |-
+      Interface `interface_width` >= 20 -- the interface
+      exposes 20+ methods. Suggested refactor: segregate
+      the interface into role-specific narrower contracts
+      so each caller depends only on the methods it
+      actually uses (the canonical ISP refactor).

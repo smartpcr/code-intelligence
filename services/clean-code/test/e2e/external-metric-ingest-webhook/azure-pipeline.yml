@@ -1,0 +1,248 @@
+trigger: none
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - services/clean-code/**
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  GO_VERSION: "1.25.1"
+  COMPOSE_FILE: tests/e2e/phase-04-webhook/docker-compose.yml
+
+stages:
+  - stage: e2e_ingest_defects_verb_store_only
+    displayName: "E2E – Ingest Defects Verb Store Only"
+    jobs:
+      - job: run_e2e
+        displayName: "Run godog E2E tests"
+        timeoutInMinutes: 20
+        steps:
+          - task: GoTool@0
+            inputs:
+              version: $(GO_VERSION)
+            displayName: "Install Go $(GO_VERSION)"
+
+          - script: |
+              SECRET=$(openssl rand -hex 32)
+              echo "##vso[task.setvariable variable=CLEAN_CODE_WEBHOOK_HMAC_SECRET;issecret=true]$SECRET"
+            displayName: "Generate ephemeral HMAC secret"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) up -d --build
+            displayName: "Start compose services"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
+              set -euo pipefail
+              # Generate HMAC secret FIRST — use $$() so Azure does not
+              # macro-expand the shell command substitution.
+              CLEAN_CODE_WEBHOOK_HMAC_SECRET="$$(openssl rand -hex 32)"
+              export CLEAN_CODE_WEBHOOK_HMAC_SECRET
+              # Persist as a pipeline secret for downstream steps.
+              echo "##vso[task.setvariable variable=CLEAN_CODE_WEBHOOK_HMAC_SECRET;issecret=true]$$CLEAN_CODE_WEBHOOK_HMAC_SECRET"
+              # Now start compose — the secret is already in the environment.
+              docker compose -f $(COMPOSE_FILE) up -d --build
+              # Discover dynamic ports.
+              PG_PORT=$$(docker compose -f $(COMPOSE_FILE) port postgres 5432 | cut -d: -f2)
+              WEBHOOK_PORT=$$(docker compose -f $(COMPOSE_FILE) port webhook 8080 | cut -d: -f2)
+              OTEL_PORT=$$(docker compose -f $(COMPOSE_FILE) port otel-collector 4317 | cut -d: -f2)
+              export CLEAN_CODE_PG_URL="postgres://postgres:postgres@localhost:$${PG_PORT}/clean_code?sslmode=disable"
+              export CLEAN_CODE_WEBHOOK_URL="http://localhost:$${WEBHOOK_PORT}"
+              export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:$${OTEL_PORT}"
+              # Bootstrap.
+              make migrate-up
+              make seed-repo-d
+              # Run tests.
+              cd services/clean-code
+              go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
+                -run TestE2E_external_metric_ingest_webhook_ingest_defects_verb_store_only
+            displayName: "Export compose URLs, bootstrap, and run E2E tests"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) down -v --remove-orphans
+            displayName: "Tear down compose services"
+            workingDirectory: $(Build.SourcesDirectory)
+            condition: always()
+
+  - stage: e2e_ingest_coverage_verb_cobertura_parser
+    displayName: "E2E – Ingest Coverage Verb Cobertura Parser"
+    dependsOn: []
+    jobs:
+      - job: run_e2e
+        displayName: "Run godog E2E tests"
+        timeoutInMinutes: 20
+        steps:
+          - task: GoTool@0
+            inputs:
+              version: $(GO_VERSION)
+            displayName: "Install Go $(GO_VERSION)"
+
+          - script: |
+              set -euo pipefail
+              if [ ! -f "$(COMPOSE_FILE)" ]; then
+                echo "##vso[task.logissue type=error]Compose file not found: $(COMPOSE_FILE)"
+                exit 1
+              fi
+            displayName: "Verify compose file exists"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
+              set -euo pipefail
+              # Generate HMAC secret FIRST — use $$() so Azure does not
+              # macro-expand the shell command substitution.
+              CLEAN_CODE_WEBHOOK_HMAC_SECRET="$$(openssl rand -hex 32)"
+              export CLEAN_CODE_WEBHOOK_HMAC_SECRET
+              # Persist as a pipeline secret for downstream steps.
+              echo "##vso[task.setvariable variable=CLEAN_CODE_WEBHOOK_HMAC_SECRET;issecret=true]$$CLEAN_CODE_WEBHOOK_HMAC_SECRET"
+              # Now start compose — the secret is already in the environment.
+              docker compose -f $(COMPOSE_FILE) up -d --build
+              # Discover dynamic ports.
+              PG_PORT=$$(docker compose -f $(COMPOSE_FILE) port postgres 5432 | cut -d: -f2)
+              WEBHOOK_PORT=$$(docker compose -f $(COMPOSE_FILE) port webhook 8080 | cut -d: -f2)
+              OTEL_PORT=$$(docker compose -f $(COMPOSE_FILE) port otel-collector 4317 | cut -d: -f2)
+              export CLEAN_CODE_PG_URL="postgres://postgres:postgres@localhost:$${PG_PORT}/clean_code?sslmode=disable"
+              export CLEAN_CODE_WEBHOOK_URL="http://localhost:$${WEBHOOK_PORT}"
+              export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:$${OTEL_PORT}"
+              # Bootstrap.
+              make migrate-up
+              make seed-repo-d
+              # Run tests.
+              cd services/clean-code
+              go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
+                -run TestE2E_external_metric_ingest_webhook_ingest_coverage_verb_cobertura_parser
+            displayName: "Generate HMAC, start compose, bootstrap, run E2E"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) down -v --remove-orphans
+            displayName: "Tear down compose services"
+            workingDirectory: $(Build.SourcesDirectory)
+            condition: always()
+
+  - stage: e2e_ingest_test_balance_verb
+    displayName: "E2E – Ingest test_balance Verb"
+    dependsOn: []
+    jobs:
+      - job: run_e2e
+        displayName: "Run godog E2E tests"
+        timeoutInMinutes: 20
+        steps:
+          - task: GoTool@0
+            inputs:
+              version: $(GO_VERSION)
+            displayName: "Install Go $(GO_VERSION)"
+
+          - script: |
+              SECRET=$(openssl rand -hex 32)
+              echo "##vso[task.setvariable variable=CLEAN_CODE_WEBHOOK_HMAC_SECRET;issecret=true]$SECRET"
+            displayName: "Generate ephemeral HMAC secret"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) up -d --build
+            displayName: "Start compose services"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
+              set -euo pipefail
+              # Generate HMAC secret FIRST — use $$() so Azure does not
+              # macro-expand the shell command substitution.
+              CLEAN_CODE_WEBHOOK_HMAC_SECRET="$$(openssl rand -hex 32)"
+              export CLEAN_CODE_WEBHOOK_HMAC_SECRET
+              # Persist as a pipeline secret for downstream steps.
+              echo "##vso[task.setvariable variable=CLEAN_CODE_WEBHOOK_HMAC_SECRET;issecret=true]$$CLEAN_CODE_WEBHOOK_HMAC_SECRET"
+              # Now start compose — the secret is already in the environment.
+              docker compose -f $(COMPOSE_FILE) up -d --build
+              # Discover dynamic ports.
+              PG_PORT=$$(docker compose -f $(COMPOSE_FILE) port postgres 5432 | cut -d: -f2)
+              WEBHOOK_PORT=$$(docker compose -f $(COMPOSE_FILE) port webhook 8080 | cut -d: -f2)
+              OTEL_PORT=$$(docker compose -f $(COMPOSE_FILE) port otel-collector 4317 | cut -d: -f2)
+              export CLEAN_CODE_PG_URL="postgres://postgres:postgres@localhost:$${PG_PORT}/clean_code?sslmode=disable"
+              export CLEAN_CODE_WEBHOOK_URL="http://localhost:$${WEBHOOK_PORT}"
+              export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:$${OTEL_PORT}"
+              # Bootstrap.
+              make migrate-up
+              make seed-repo-d
+              # Run tests.
+              cd services/clean-code
+              go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
+                -run TestE2E_external_metric_ingest_webhook_ingest_test_balance_verb
+            displayName: "Export compose URLs, bootstrap, and run E2E tests"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) down -v --remove-orphans
+            displayName: "Tear down compose services"
+            workingDirectory: $(Build.SourcesDirectory)
+            condition: always()
+
+  - stage: e2e_ingest_churn_verb_feeds_materialiser
+    displayName: "E2E – Ingest churn Verb feeds materialiser"
+    dependsOn: []
+    jobs:
+      - job: run_e2e
+        displayName: "Run godog E2E tests"
+        timeoutInMinutes: 20
+        steps:
+          - task: GoTool@0
+            inputs:
+              version: $(GO_VERSION)
+            displayName: "Install Go $(GO_VERSION)"
+
+          - script: |
+              set -euo pipefail
+              if [ ! -f "$(COMPOSE_FILE)" ]; then
+                echo "##vso[task.logissue type=error]Compose file not found: $(COMPOSE_FILE)"
+                exit 1
+              fi
+            displayName: "Verify compose file exists"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
+              set -euo pipefail
+              # Generate HMAC secret + signing key id FIRST — use $$() so
+              # Azure does not macro-expand the shell command substitution.
+              # The churn job exercises the PRODUCTION external-ingest
+              # Router (Stage-6 secret-resolver path), so both
+              # CLEAN_CODE_ENABLE_EXTERNAL_INGEST_WEBHOOK and
+              # CLEAN_CODE_WEBHOOK_SIGNING_KEY_ID MUST be set BEFORE compose
+              # boots the webhook container -- config.Load() enforces the
+              # interlock at startup (internal/config/config.go:660-672).
+              CLEAN_CODE_WEBHOOK_HMAC_SECRET="$$(openssl rand -hex 32)"
+              export CLEAN_CODE_WEBHOOK_HMAC_SECRET
+              export CLEAN_CODE_ENABLE_EXTERNAL_INGEST_WEBHOOK="true"
+              export CLEAN_CODE_WEBHOOK_SIGNING_KEY_ID="kv-ci-churn-2026-q2"
+              # Persist as a pipeline secret for downstream steps.
+              echo "##vso[task.setvariable variable=CLEAN_CODE_WEBHOOK_HMAC_SECRET;issecret=true]$$CLEAN_CODE_WEBHOOK_HMAC_SECRET"
+              # Now start compose — secret + key id are already in the environment.
+              docker compose -f $(COMPOSE_FILE) up -d --build
+              # Discover dynamic ports.
+              PG_PORT=$$(docker compose -f $(COMPOSE_FILE) port postgres 5432 | cut -d: -f2)
+              WEBHOOK_PORT=$$(docker compose -f $(COMPOSE_FILE) port webhook 8080 | cut -d: -f2)
+              OTEL_PORT=$$(docker compose -f $(COMPOSE_FILE) port otel-collector 4317 | cut -d: -f2)
+              export CLEAN_CODE_PG_URL="postgres://postgres:postgres@localhost:$${PG_PORT}/clean_code?sslmode=disable"
+              export CLEAN_CODE_WEBHOOK_URL="http://localhost:$${WEBHOOK_PORT}"
+              export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:$${OTEL_PORT}"
+              # Bootstrap.
+              make migrate-up
+              make seed-repo-d
+              # Run tests.
+              cd services/clean-code
+              go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
+                -run TestE2E_external_metric_ingest_webhook_ingest_churn_verb_feeds_materialiser
+            displayName: "Generate HMAC, start compose, bootstrap, run E2E"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) down -v --remove-orphans
+            displayName: "Tear down compose services"
+            workingDirectory: $(Build.SourcesDirectory)
+            condition: always()

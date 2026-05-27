@@ -1,0 +1,77 @@
+trigger: none
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - services/clean-code/**
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  GO_VERSION: "1.25.1"
+  COMPOSE_FILE: tests/e2e/phase-06-evaluator-mgmt/docker-compose.yml
+
+stages:
+  - stage: e2e_management_write_verbs_and_repo_onboarding
+    displayName: "E2E – Management Write Verbs and Repo Onboarding"
+    jobs:
+      - job: run_e2e
+        displayName: "Run godog E2E tests"
+        timeoutInMinutes: 20
+        steps:
+          - task: GoTool@0
+            inputs:
+              version: $(GO_VERSION)
+            displayName: "Install Go $(GO_VERSION)"
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) up -d --build
+            displayName: "Start compose services"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
+              make migrate-up
+              make seed-phase-06
+            displayName: "Bootstrap: migrate and seed"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
+              make tokens
+            displayName: "Mint OIDC bearer tokens"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
+              # No external secrets — compose exports all URLs via mapped ports.
+              PG_PORT=$(docker compose -f $(COMPOSE_FILE) port postgres 5432 | cut -d: -f2)
+              KMS_PORT=$(docker compose -f $(COMPOSE_FILE) port kms-mock 8080 | cut -d: -f2)
+              EVALUATOR_PORT=$(docker compose -f $(COMPOSE_FILE) port evaluator 8080 | cut -d: -f2)
+              MGMT_PORT=$(docker compose -f $(COMPOSE_FILE) port mgmt-surface 8080 | cut -d: -f2)
+              RULE_ENGINE_PORT=$(docker compose -f $(COMPOSE_FILE) port rule-engine 8080 | cut -d: -f2)
+              DEX_PORT=$(docker compose -f $(COMPOSE_FILE) port dex 5556 | cut -d: -f2)
+              OTEL_PORT=$(docker compose -f $(COMPOSE_FILE) port otel-collector 4317 | cut -d: -f2)
+              export CLEAN_CODE_PG_URL="postgres://postgres:postgres@localhost:${PG_PORT}/clean_code?sslmode=disable"
+              export CLEAN_CODE_KMS_URL="http://localhost:${KMS_PORT}"
+              export CLEAN_CODE_EVALUATOR_URL="http://localhost:${EVALUATOR_PORT}"
+              export CLEAN_CODE_MGMT_URL="http://localhost:${MGMT_PORT}"
+              export CLEAN_CODE_RULE_ENGINE_URL="http://localhost:${RULE_ENGINE_PORT}"
+              export CLEAN_CODE_OIDC_ISSUER="http://localhost:${DEX_PORT}"
+              export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:${OTEL_PORT}"
+              # OIDC bearer tokens minted by `make tokens`; read the dev-role token.
+              if [ -f tokens/dev.jwt ]; then
+                export CLEAN_CODE_OIDC_DEV_TOKEN="$(cat tokens/dev.jwt)"
+              fi
+              cd services/clean-code
+              go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
+                -run TestE2E_evaluator_surface_and_management_surface_management_write_verbs_and_repo_onboarding
+            displayName: "Export compose URLs and run E2E tests"
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) down -v --remove-orphans
+            displayName: "Tear down compose services"
+            workingDirectory: $(Build.SourcesDirectory)
+            condition: always()

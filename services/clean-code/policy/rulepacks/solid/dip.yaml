@@ -1,0 +1,115 @@
+# clean-code Stage 5.5 -- SOLID / Dependency Inversion rule pack
+#
+# Architecture references:
+#   - Sec 1.3 "SOLID coding principles" (goal 2): the DIP
+#     smell is a class that depends on concrete types
+#     (high fan_out / CBO) rather than abstractions.
+#   - Sec 1.4.1 canonical metric_kinds:
+#       * line 99 `fan_out` (method, class, file scope,
+#         pack=solid): "Number of outgoing call sites.
+#         Drives DIP rule."
+#       * line 102 `coupling_between_objects` (class scope,
+#         pack=solid): "CBO. Drives DIP / decoupling rule."
+#   - Sec 3.5.1.e SOLID input recipe for DIP: "Inputs:
+#     `coupling_between_objects`, `fan_out`. A class with
+#     high CBO and high fan-out into concrete types (rather
+#     than abstractions) is flagged."
+#   - tech-spec Sec 4.3 (line 351): "DIP joins on `fan_in` +
+#     `fan_out` + `coupling_between_objects`". The v1 rule
+#     here covers `fan_out` and `coupling_between_objects`;
+#     the `fan_in`-as-DIP-input is captured by the OCP rule
+#     already (per Sec 1.4.1 row 5 brief "Drives OCP / DIP
+#     rules") and is not re-emitted here to avoid duplicate
+#     finding rows on the same metric_sample.
+#
+# # Why two rules instead of one compound predicate
+#
+# The DSL evaluator operates on a single [dsl.Sample] at a
+# time. The DIP "AND" smell ("high CBO AND high fan_out")
+# is composed by the Stage 5.7 Rule Engine from the two
+# input signals defined here. Each rule fires at
+# severity=warn on its own.
+#
+# # Concrete-vs-abstract distinction (DEFERRED)
+#
+# Architecture Sec 3.5.1.e says the DIP smell is "high CBO
+# and high fan-out INTO CONCRETE TYPES". The v1 DSL does
+# NOT have a "concrete vs abstract" notion -- `fan_out` is
+# the total outgoing edge count regardless of the target's
+# concreteness. The v1 rule therefore approximates the
+# smell as "high fan_out" (any out-edges), which catches
+# the same hot-spots that a concrete-only count would. A
+# future v2 of this pack can add a more discriminating
+# `fan_out_concrete` metric_kind once the AST adapter
+# (Stage 2.2) materialises it.
+#
+# # Threshold rationale (v1 defaults)
+#
+#   - fan_out >= 20: a class with 20+ outgoing call sites is
+#     the canonical "shotgun surgery" / "high fan-out" band
+#     (matches the decoupling.fan_out_high threshold in
+#     `decoupling/thresholds.go`; intentional alignment so
+#     a finding here correlates with the decoupling fan_out
+#     warning).
+#   - coupling_between_objects >= 14: above the
+#     decoupling.cbo_high cut-off (12) by two so the DIP
+#     rule fires only at the higher-confidence band -- the
+#     v1 wider net "this class is entangled" smell at CBO
+#     >= 12 is captured by `decoupling.coupling.cbo_high`;
+#     this DIP rule fires only on the CBO >= 14 escalation
+#     band where dependency-inversion refactors are the
+#     primary remediation.
+#
+# # Why scope_kind == 'class'
+#
+# Both `fan_out` and `coupling_between_objects` are pinned
+# to class scope here. `coupling_between_objects` is
+# class-only per Sec 1.4.1 row 9; `fan_out` is
+# method/class/file but the DIP smell is at class scope
+# (the unit that "depends on too many concrete types").
+#
+# # pack_id convention
+#
+# `<family>.<subname>` per migration
+# `0003_policy_audit_refactor.up.sql` line 200.
+pack_id: solid.dip
+version: 1
+display_name: SOLID -- Dependency Inversion
+description_md: |-
+  Two input rules feeding the canonical DIP smell: a class
+  with high outgoing coupling (`fan_out` >= 20) and high
+  Chidamber-Kemerer CBO (>= 14). The rules fire
+  independently at severity=warn; the Stage 5.7 Rule Engine
+  composes the class-level smell from same-SHA hits on the
+  same scope.
+
+  The concrete-vs-abstract refinement
+  (architecture Sec 3.5.1.e "fan-out INTO CONCRETE TYPES")
+  is approximated as raw fan_out in v1 and deferred to a
+  v2 once the AST adapter materialises a discriminating
+  metric_kind.
+rules:
+  - rule_id: solid.dip.fan_out_high
+    version: 1
+    predicate_dsl: "metric_kind == 'fan_out' AND scope_kind == 'class' AND value >= 20"
+    severity_default: warn
+    description_md: |-
+      Class `fan_out` >= 20 -- the class depends on 20+
+      other entities directly. The DIP refactor: introduce
+      an abstraction (interface / abstract base / strategy)
+      so the class depends on a single abstract collaborator
+      rather than 20 concrete ones. Note: also surfaces as
+      `decoupling.coupling.fan_out_high` at the same
+      threshold; this rule is the DIP-specific framing.
+  - rule_id: solid.dip.coupling_between_objects_high
+    version: 1
+    predicate_dsl: "metric_kind == 'coupling_between_objects' AND scope_kind == 'class' AND value >= 14"
+    severity_default: warn
+    description_md: |-
+      Class `coupling_between_objects` (Chidamber-Kemerer
+      CBO) >= 14 -- the class is in a tight knot of
+      collaborators. Fires only at the high-confidence
+      escalation band (the decoupling family fires its
+      lower-tier warning at CBO >= 12). DIP refactor:
+      collapse the collaborator set through a shared
+      abstraction.

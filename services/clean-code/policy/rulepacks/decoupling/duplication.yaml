@@ -1,0 +1,50 @@
+# clean-code Stage 5.6 -- decoupling / duplication rule pack
+#
+# Architecture references:
+#   - Sec 1.3 "Decoupled functional areas" (CR1): duplicated
+#     blocks signal a missing shared abstraction.
+#   - Sec 1.4.1 canonical metric_kind `duplication_ratio`
+#     (file / package scope) -- the fraction of LoC inside
+#     duplicated blocks, materialised by Stage 2.5
+#     `internal/metrics/recipes/duplication_ratio.go`.
+#   - Sec 5.3.5 `threshold` row contract -- the numeric
+#     cut-off lives in `clean_code.threshold` so operators can
+#     re-tune without republishing the predicate text
+#     (implementation-plan Stage 5.6 line 534).
+#
+# The predicate is a single `threshold('<uuid>')` atom; the
+# canonical UUID is seeded by `decoupling.SeedThresholds`
+# (file `policy/rulepacks/decoupling/thresholds.go`) as a v5
+# UUID derived from `decoupling.Namespace` + the literal
+# "duplication_ratio".
+#
+# Canonical threshold UUID (pinned by
+# `TestCanonicalThresholdIDs_MatchYAML`):
+#   - 04d9f035-5183-5cb7-86bb-b582f85d3241 -- duplication_ratio (file, >0.20)
+#
+# pack_id convention: `<family>.<subname>` per the
+# `clean_code.rule_pack.pack_id` column comment in migration
+# `0003_policy_audit_refactor.up.sql` line 200.
+pack_id: decoupling.duplication
+version: 1
+display_name: Decoupling -- duplication ratio
+description_md: |-
+  Detects when a scope's `duplication_ratio` exceeds the
+  seeded threshold (v1 default: file scope, op=gt,
+  value=0.20). Materialised by the Stage 2.5
+  `duplication_ratio` recipe; consumed here as the trigger
+  for a Stage 6.4 `consolidate_duplication` refactor task
+  (Sec 5.5.3 `refactor_task.kind`).
+rules:
+  - rule_id: decoupling.duplication_ratio_high
+    version: 1
+    predicate_dsl: "threshold('04d9f035-5183-5cb7-86bb-b582f85d3241')"
+    severity_default: warn
+    description_md: |-
+      Scope's `duplication_ratio` exceeds the seeded
+      threshold (v1 default: file scope, op=gt, value=0.20 --
+      more than 20% of LoC sits inside duplicated blocks).
+      Suggested refactor: extract the duplicated text into a
+      single canonical implementation and depend on it from
+      each former duplicate; the Refactor Planner emits this
+      as a `kind='consolidate_duplication'` task.

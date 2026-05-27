@@ -1,0 +1,64 @@
+name: E2E – Policy Steward and SOLID Rule Engine
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "services/clean-code/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25.1"
+  COMPOSE_FILE: tests/e2e/phase-05-policy-engine/docker-compose.yml
+
+jobs:
+  e2e-solid-rule-engine-batch-worker-and-synchronous-mode:
+    name: "E2E – SOLID Rule Engine Batch Worker and Synchronous Mode"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: services/clean-code/go.sum
+
+      - name: Start compose services
+        run: docker compose -f ${{ env.COMPOSE_FILE }} up -d --build
+
+      - name: Bootstrap – migrate and seed
+        run: |
+          make migrate-up
+          make seed-phase-05
+
+      - name: Export compose-provided env vars
+        run: |
+          # No external secrets needed — compose exports all URLs.
+          # Extract the mapped host ports from the running compose services.
+          KMS_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port kms-mock 8080 | cut -d: -f2)
+          PG_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port postgres 5432 | cut -d: -f2)
+          STEWARD_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port policy-steward 8080 | cut -d: -f2)
+          RULE_ENGINE_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port rule-engine 8080 | cut -d: -f2)
+          OTEL_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port otel-collector 4317 | cut -d: -f2)
+          echo "CLEAN_CODE_KMS_URL=http://localhost:${KMS_PORT}" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_PG_URL=postgres://postgres:postgres@localhost:${PG_PORT}/clean_code?sslmode=disable" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_POLICY_STEWARD_URL=http://localhost:${STEWARD_PORT}" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_RULE_ENGINE_URL=http://localhost:${RULE_ENGINE_PORT}" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_OTEL_ENDPOINT=http://localhost:${OTEL_PORT}" >> "$GITHUB_ENV"
+
+      - name: Run E2E tests
+        working-directory: services/clean-code
+        run: |
+          go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
+            -run TestE2E_policy_steward_and_solid_rule_engine_solid_rule_engine_batch_worker_and_synchronous_mode
+
+      - name: Tear down compose services
+        if: always()
+        run: docker compose -f ${{ env.COMPOSE_FILE }} down -v --remove-orphans

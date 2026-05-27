@@ -85,6 +85,24 @@ const (
 	// `policy_publish_overlap_min_seconds` row: minimum
 	// key-rotation overlap (C13 mitigation).
 	DefaultPolicyPublishOverlapSeconds = 86400
+	// DefaultAggregatorCadence is the tech-spec Sec 8.2
+	// `aggregator_cadence` row: the period between
+	// Cross-Repo Aggregator ticks. 15 min is shorter than
+	// `freshness_window_seconds` (3600) so the Insights
+	// surface's percentile freshness banner has 3-4x
+	// headroom under nominal load (architecture Sec 3.10).
+	DefaultAggregatorCadence = 15 * time.Minute
+	// DefaultKMSProvider is the canonical default for the
+	// Stage 5.1 `kms-provider` knob. The empty default
+	// preserves scaffold-mode startup -- the composition root
+	// branches on this value to decide whether to wire the
+	// SQL-backed `internal/policy/keys` package against a
+	// LocalSealedKMS or stay in-memory. Setting it to
+	// `"in-memory"` would force every operator who omits the
+	// env var into scaffold mode silently; leaving it empty
+	// makes the operator's intent explicit at config-load
+	// time.
+	DefaultKMSProvider = ""
 )
 
 // Default network bind addresses for the empty scaffold. Operators
@@ -118,6 +136,14 @@ const (
 	EnvHTTPAddr                     = "CLEAN_CODE_HTTP_ADDR"
 	EnvPrometheusAddr               = "CLEAN_CODE_PROMETHEUS_ADDR"
 	EnvOTelEndpoint                 = "CLEAN_CODE_OTEL_ENDPOINT"
+	// EnvAstScanRoot points at the local on-disk root the
+	// Metric Ingestor's [DirectoryAstFileSource] walks.
+	// Layout convention is `<root>/<repo_id>/<sha>/...`.
+	// Empty leaves the source as the
+	// [EmptyAstFileSource] scaffold (Phase 4 supplies the
+	// PG-backed AST cache that replaces both).
+	EnvAstScanRoot = "CLEAN_CODE_AST_SCAN_ROOT"
+
 	// EnvPGURL is the canonical env var name for the PostgreSQL
 	// DSN (per docs/stories/code-intelligence-CLEAN-CODE/
 	// e2e-scenarios.md table at line 41-49). The Go field on
@@ -125,13 +151,204 @@ const (
 	// `CLEAN_CODE_PG_URL` -- DO NOT rename the env var without
 	// also updating e2e-scenarios.md.
 	EnvPGURL                       = "CLEAN_CODE_PG_URL"
-	EnvLogLevel                    = "CLEAN_CODE_LOG_LEVEL"
+	// EnvMgmtPGURL is the OPTIONAL libpq DSN the metric-ingestor
+	// binary connects to under the `clean_code_management` role
+	// for `repo_event` INSERTs (Stage 3.4 retract intent /
+	// rescan-related events). The Metric Ingestor's own role
+	// (`clean_code_metric_ingestor`) is granted INSERT on
+	// `scan_run` and `metric_retraction` ONLY -- repo_event
+	// INSERT belongs to the management role per
+	// migrations/0004_roles.up.sql lines 313 / 348 / 374.
+	//
+	// When set, the binary opens a SECOND `*sql.DB` against this
+	// DSN and routes `PGRepoEventAppender` writes through it
+	// while keeping `PGRetractScanRunStore`, `PGRetractionStore`,
+	// and `PGRescanScanRunStore` on the metric-ingestor handle
+	// (CLEAN_CODE_PG_URL).
+	//
+	// When UNSET, the binary refuses to mount the `mgmt.*` write
+	// verbs unless [EnvAllowSharedPGRole] is truthy
+	// (dev/E2E-only opt-in that re-uses a single DSN across both
+	// roles). Production deployments MUST set role-distinct
+	// credentials.
+	EnvMgmtPGURL = "CLEAN_CODE_MGMT_PG_URL"
+	// EnvAllowSharedPGRole is the explicit dev/E2E-mode opt-in
+	// for sharing a single DSN across the
+	// `clean_code_metric_ingestor` and `clean_code_management`
+	// roles. Accepts any boolean literal
+	// (1|true|yes|on / 0|false|no|off). Default false.
+	//
+	// When false (production default), the metric-ingestor
+	// binary REFUSES to mount the Stage 3.4 management write
+	// verbs unless [EnvMgmtPGURL] is set -- the operator MUST
+	// supply role-distinct credentials so a future role-grant
+	// audit reflects the documented Sec 7.2 ACL boundary.
+	//
+	// When true, the binary uses CLEAN_CODE_PG_URL for BOTH
+	// roles and logs a WARN at startup. Intended ONLY for local
+	// `docker compose` E2E runs where the test fixture uses a
+	// single superuser DSN.
+	EnvAllowSharedPGRole = "CLEAN_CODE_ALLOW_SHARED_PG_ROLE"
+	EnvLogLevel          = "CLEAN_CODE_LOG_LEVEL"
 	EnvScanTimeout                 = "CLEAN_CODE_SCAN_TIMEOUT"
 	EnvPeriodicSweepCadence        = "CLEAN_CODE_PERIODIC_SWEEP_CADENCE"
 	EnvWindowDays                  = "CLEAN_CODE_WINDOW_DAYS"
 	EnvFreshnessWindowSeconds      = "CLEAN_CODE_FRESHNESS_WINDOW_SECONDS"
 	EnvPolicyPublishOverlapSeconds = "CLEAN_CODE_POLICY_PUBLISH_OVERLAP_SECONDS"
+	// EnvAggregatorCadence is the operator-facing knob for
+	// the Cross-Repo Aggregator tick period (Stage 7.1,
+	// tech-spec Sec 8.2 `aggregator_cadence`). Accepts any
+	// [time.ParseDuration] value (e.g. `15m`, `5m`, `1h`).
+	// Default: [DefaultAggregatorCadence] (15 min).
+	EnvAggregatorCadence = "CLEAN_CODE_AGGREGATOR_CADENCE"
+	// EnvDisableAggregator is the explicit operator opt-out
+	// for the Stage 7.1 Cross-Repo Aggregator loop. Default
+	// false (loop enabled). When true, the composition root
+	// SKIPS construction of the aggregator goroutine entirely.
+	// Production MUST keep this false; intended for legacy
+	// E2E environments that lack the Stage 1.3 snapshot
+	// tables.
+	EnvDisableAggregator = "CLEAN_CODE_DISABLE_AGGREGATOR"
+	// EnvKMSProvider names the operator-facing knob that picks
+	// the policy-signing KMS adapter. Closed set: `local` |
+	// `in-memory`. Unset leaves the service in scaffold mode
+	// (no production key persistence). Per Stage 5.1
+	// tech-spec Sec 8.4.
+	EnvKMSProvider = "CLEAN_CODE_KMS_PROVIDER"
+	// EnvKMSMasterKeyHex is the 64-char lowercase hex
+	// encoding of the AES-256 master key the LocalSealedKMS
+	// uses to wrap Ed25519 seeds. The composition root
+	// reads this once at startup and the value MUST NOT be
+	// echoed into any log line. Operators are expected to
+	// inject this via their secret manager (env var, k8s
+	// Secret, etc.) and never check it into source.
+	EnvKMSMasterKeyHex = "CLEAN_CODE_KMS_MASTER_KEY_HEX"
+
+	// EnvWebhookHMACSecret is the shared HMAC-SHA256 secret
+	// every external `ingest.*` webhook verifies request
+	// bodies against via the `X-Hub-Signature-256` header
+	// (tech-spec Sec 8.5 "REST + HMAC-signed";
+	// e2e-scenarios.md lines 48/588/602/610 pin this exact
+	// env-var name as the SHARED external-ingest secret). The
+	// value is the raw secret string (NOT hex-encoded; the
+	// hex sits in the header). NEVER logged.
+	//
+	// # Minimum strength
+	//
+	// `Validate` rejects any non-empty value shorter than
+	// [MinWebhookHMACSecretBytes] (32 bytes -- matches the
+	// HMAC-SHA256 output width and the e2e-scenarios.md
+	// "32-byte HMAC secret" recommendation at line 588). A
+	// one-character secret would defeat the auth boundary;
+	// 32 bytes is a practical guard against operator typos
+	// and copy-paste truncation. Use a CSPRNG to generate it:
+	// `head -c 32 /dev/urandom | base64`.
+	//
+	// # When unset (default)
+	//
+	// The webhook is NOT MOUNTED at all in production wiring
+	// -- the route returns the standard 404 ("verb does not
+	// exist in this build"), keeping an unauthenticated
+	// `Ingestor.Run` driver out of production until either
+	// the HMAC layer or the Phase 3.12 production hardening
+	// lands.
+	EnvWebhookHMACSecret = "CLEAN_CODE_WEBHOOK_HMAC_SECRET" //nolint:gosec // env var name, not a credential
+
+	// EnvEnableScaffoldChurnWebhook is the explicit
+	// operator-facing opt-in for the Stage 2.6 scaffold-mode
+	// churn webhook. It accepts any non-empty value (the
+	// canonical form is `true`); setting it constitutes
+	// acknowledging the SCAFFOLD-MODE LIMITATION that the
+	// webhook persists into an in-memory writer and DATA IS
+	// LOST ON RESTART (the production-grade PG-backed writer
+	// lands in Phase 3.2). The webhook is mounted iff BOTH
+	// this flag AND [EnvWebhookHMACSecret] are set; one
+	// without the other is a configuration error that fails
+	// fast at startup.
+	EnvEnableScaffoldChurnWebhook = "CLEAN_CODE_ENABLE_SCAFFOLD_CHURN_WEBHOOK"
+
+	// EnvEnableScaffoldIndexerWebhook is the explicit
+	// operator-facing opt-in for the Stage 3.1 scaffold-mode
+	// Repo Indexer webhook + CLI rescan trigger. It accepts
+	// any non-empty boolean value (canonical form `true`).
+	// Setting it constitutes acknowledging the SCAFFOLD-MODE
+	// LIMITATION that when no `CLEAN_CODE_PG_URL` is wired the
+	// webhook persists commits + repo_events into an in-memory
+	// writer and DATA IS LOST ON RESTART (the production
+	// PG-backed [repo_indexer.PGCatalogWriter] is wired
+	// automatically when [EnvPGURL] is set).
+	//
+	// Both `/v1/indexer/webhook` and `/v1/indexer/rescan` are
+	// mounted iff this flag AND [EnvWebhookHMACSecret] are
+	// set; the indexer reuses the SHARED external-ingest HMAC
+	// secret (architecture Sec 8.5 -- every external
+	// `ingest.*` and `indexer.*` surface verifies request
+	// bodies against the same secret). One without the other
+	// is a configuration error that fails fast at startup.
+	EnvEnableScaffoldIndexerWebhook = "CLEAN_CODE_ENABLE_SCAFFOLD_INDEXER_WEBHOOK"
+
+	// EnvDisableStaleSweep is the operator-facing opt-out for
+	// the Stage 3.5 stale ScanRun sweep loop. It accepts any
+	// boolean literal (1|true|yes|on / 0|false|no|off). Default
+	// unset = sweep enabled. Set this to a truthy value in
+	// environments that still run the legacy `001_init.sql`
+	// `scan_run(commit_sha,kind,status,finished_at)` schema --
+	// the sweep targets the canonical
+	// `0001_catalog_lifecycle` shape and produces repeated
+	// UPDATE errors at every cadence tick when pointed at the
+	// legacy table. Operators MUST leave the sweep enabled in
+	// production (canonical schema).
+	//
+	// Centralised here per the config-package contract
+	// (architecture Sec 1.6 / package doc lines 15-16): no
+	// other package reads `CLEAN_CODE_*` env vars directly.
+	EnvDisableStaleSweep = "CLEAN_CODE_DISABLE_STALE_SWEEP"
+
+	// EnvEnableLegacyDemoAPI is the operator-facing opt-in for
+	// the legacy `001_init.sql`-shaped HTTP surface on the
+	// metric-ingestor binary (`/v1/ingestor/process` and
+	// `/v1/ingestor/scan-run`). Default unset = NOT MOUNTED;
+	// the production composition root exposes only the
+	// canonical health/metrics endpoints + the Stage 3.5 sweep
+	// loop. Set this in legacy E2E environments that still
+	// drive the older `commit_sha`/`finished_at` shape;
+	// production deployments MUST leave this unset (the
+	// canonical Stage 1.2 `0001_catalog_lifecycle` schema does
+	// not have the columns these handlers write).
+	EnvEnableLegacyDemoAPI = "CLEAN_CODE_ENABLE_LEGACY_DEMO_API"
+
+	// EnvEnableExternalIngestWebhook is the explicit
+	// operator-facing opt-in for the Stage 4.1
+	// production-grade `/v1/ingest/{verb}` Router on the
+	// metric-ingestor binary. Default unset = NOT MOUNTED
+	// (the route returns the standard 404 -- no
+	// unauthenticated path can reach Ingestor.Run). Set this
+	// to any truthy value to mount the Router; the Router
+	// requires BOTH this flag AND [EnvWebhookHMACSecret] AND
+	// [EnvWebhookSigningKeyID] to be set -- one without the
+	// others is a configuration error that fails fast at
+	// startup. The Router persists scan_run rows with
+	// `payload_hash` set (migration 0009's partial unique
+	// index) so retries across restarts and replicas
+	// short-circuit to the prior scan_run_id.
+	EnvEnableExternalIngestWebhook = "CLEAN_CODE_ENABLE_EXTERNAL_INGEST_WEBHOOK"
+
+	// EnvWebhookSigningKeyID is the operator-facing key-id
+	// the publishers MUST send in the `X-Signing-Key-Id`
+	// header. Pinned per deployment; the Router rejects
+	// any other key-id with 401 / HMAC_UNKNOWN_KEY_ID.
+	// Empty when [EnvEnableExternalIngestWebhook] is unset.
+	EnvWebhookSigningKeyID = "CLEAN_CODE_WEBHOOK_SIGNING_KEY_ID" //nolint:gosec // env var name, not a credential
 )
+
+// MinWebhookHMACSecretBytes is the minimum length (in bytes,
+// i.e. `len(string)`) the loader enforces on
+// [EnvWebhookHMACSecret] when it is set. Matches the
+// HMAC-SHA256 output width and the e2e-scenarios.md "32-byte
+// HMAC secret" guidance (line 588). Pinned as a const so a
+// future operator pin to a different floor is a one-line
+// change.
+const MinWebhookHMACSecretBytes = 32
 
 // Config is the in-memory shape of the service's runtime
 // configuration. Every field is exported so wired packages can
@@ -181,6 +398,21 @@ type Config struct {
 	// readiness check.
 	PostgresURL string
 
+	// ManagementPostgresURL is the OPTIONAL libpq DSN the
+	// metric-ingestor binary uses under the
+	// `clean_code_management` role for `repo_event` INSERTs.
+	// See [EnvMgmtPGURL] for the role-boundary rationale and
+	// [AllowSharedPGRole] for the dev-mode opt-out. Empty in
+	// scaffold mode.
+	ManagementPostgresURL string
+
+	// AllowSharedPGRole is the dev/E2E opt-in that lets the
+	// metric-ingestor binary mount the Stage 3.4 management
+	// verbs against [PostgresURL] alone (i.e. use the same DSN
+	// for both the ingestor and management roles). Default
+	// false. See [EnvAllowSharedPGRole].
+	AllowSharedPGRole bool
+
 	// --- Observability ---
 
 	// LogLevel is the slog level the JSON logger emits at.
@@ -204,6 +436,110 @@ type Config struct {
 	// PolicyPublishOverlapSeconds is the tech-spec Sec 8.2
 	// `policy_publish_overlap_min_seconds` value.
 	PolicyPublishOverlapSeconds int
+	// AggregatorCadence is the tech-spec Sec 8.2
+	// `aggregator_cadence` value -- the period between
+	// Cross-Repo Aggregator ticks (Stage 7.1, architecture
+	// Sec 3.10).
+	AggregatorCadence time.Duration
+	// DisableAggregator is the explicit operator opt-out for
+	// the Stage 7.1 Cross-Repo Aggregator loop. Default
+	// false (loop enabled). See [EnvDisableAggregator].
+	DisableAggregator bool
+
+	// --- Policy signing (Stage 5.1) ---
+
+	// KMSProvider selects the policy-signing KMS adapter.
+	// Closed set: `""` (scaffold; signing disabled), `"local"`
+	// (envelope-encrypted Ed25519 seeds under a master key),
+	// `"in-memory"` (test-only; private keys live in heap).
+	// Defaults to `""`. See tech-spec Sec 8.4.
+	KMSProvider string
+
+	// KMSMasterKeyHex is the 64-char lowercase hex encoding
+	// of the AES-256 master key the LocalSealedKMS uses.
+	// Required when `KMSProvider == "local"`. NEVER logged.
+	KMSMasterKeyHex string
+
+	// --- Stage 2.6 churn webhook (scaffold mode) ---
+
+	// WebhookHMACSecret is the shared HMAC-SHA256 secret used
+	// by every external `ingest.*` webhook to verify request
+	// bodies. See [EnvWebhookHMACSecret] for the operator-
+	// facing contract and [MinWebhookHMACSecretBytes] for the
+	// minimum-length guard. Empty in scaffold mode leaves the
+	// webhook UNMOUNTED. NEVER logged.
+	WebhookHMACSecret string
+
+	// EnableScaffoldChurnWebhook is the explicit
+	// operator-acknowledged opt-in for the Stage 2.6 scaffold
+	// churn webhook. See [EnvEnableScaffoldChurnWebhook] for
+	// the explicit "data lost on restart" rationale.
+	EnableScaffoldChurnWebhook bool
+
+	// --- Stage 3.1 Repo Indexer webhook (scaffold mode) ---
+
+	// EnableScaffoldIndexerWebhook is the explicit
+	// operator-acknowledged opt-in for the Stage 3.1
+	// scaffold-mode Repo Indexer webhook + CLI rescan
+	// trigger. See [EnvEnableScaffoldIndexerWebhook] for the
+	// rationale. The indexer reuses [WebhookHMACSecret] (the
+	// SHARED external-ingest HMAC secret).
+	EnableScaffoldIndexerWebhook bool
+
+	// --- Stage 3.5 stale-ScanRun sweep loop ---
+
+	// DisableStaleSweep is the explicit operator opt-out for
+	// the Stage 3.5 stale ScanRun sweep loop. Default false
+	// (sweep enabled). When true, the metric-ingestor binary
+	// SKIPS construction of the sweep goroutine entirely --
+	// no PGScanRunStore is instantiated, no loop ticks fire,
+	// and `/metrics` returns no sweep counters. Intended for
+	// legacy E2E environments running the older
+	// `001_init.sql` `scan_run` shape; production MUST keep
+	// this false. See [EnvDisableStaleSweep].
+	DisableStaleSweep bool
+
+	// EnableLegacyDemoAPI is the operator opt-in for the
+	// legacy `001_init.sql`-shaped HTTP routes
+	// (`/v1/ingestor/process`, `/v1/ingestor/scan-run`).
+	// Default false: production composition root mounts only
+	// health/metrics. Setting this true in legacy E2E
+	// environments mounts the older handlers that write the
+	// `commit_sha`/`finished_at` columns. The Stage 1.2
+	// canonical schema does not expose those columns; mixing
+	// canonical migrations with this flag set is a wiring
+	// error. See [EnvEnableLegacyDemoAPI].
+	EnableLegacyDemoAPI bool
+
+	// --- Stage 4.1 production-grade /v1/ingest/{verb}
+	//     Router ---
+
+	// EnableExternalIngestWebhook is the explicit operator
+	// opt-in for the Stage 4.1 production-grade
+	// `/v1/ingest/{verb}` Router. Default false (not
+	// mounted). Setting this true requires
+	// [WebhookHMACSecret] AND [WebhookSigningKeyID] to be
+	// set; one without the others fails fast at startup.
+	// See [EnvEnableExternalIngestWebhook].
+	EnableExternalIngestWebhook bool
+
+	// WebhookSigningKeyID is the canonical `signing_key_id`
+	// publishers MUST send in the `X-Signing-Key-Id` header.
+	// Empty when [EnableExternalIngestWebhook] is false.
+	// See [EnvWebhookSigningKeyID].
+	WebhookSigningKeyID string
+
+	// --- Stage 3.2 Metric Ingestor scan-source ---
+
+	// AstScanRoot points at the local on-disk root the
+	// Metric Ingestor's directory-backed [AstFileSource]
+	// walks. Layout convention is
+	// `<AstScanRoot>/<repo_id>/<sha>/...`. Empty in
+	// scaffold deploys -- the dispatcher falls back to the
+	// [EmptyAstFileSource], which yields no files and
+	// emits a `ast_files_seen=0` log line per dispatch.
+	// Phase 4 replaces both with the PG-backed AST cache.
+	AstScanRoot string
 }
 
 // Defaults returns a Config populated with the canonical
@@ -226,6 +562,9 @@ func Defaults() Config {
 		WindowDays:                   DefaultWindowDays,
 		FreshnessWindowSeconds:       DefaultFreshnessWindowSeconds,
 		PolicyPublishOverlapSeconds:  DefaultPolicyPublishOverlapSeconds,
+		AggregatorCadence:            DefaultAggregatorCadence,
+		KMSProvider:                  DefaultKMSProvider,
+		KMSMasterKeyHex:              "",
 	}
 }
 
@@ -304,6 +643,76 @@ func (c Config) Validate() error {
 	if c.PeriodicSweepCadence <= 0 {
 		return fmt.Errorf("config: periodic-sweep-cadence=%s must be > 0", c.PeriodicSweepCadence)
 	}
+	if c.AggregatorCadence <= 0 {
+		return fmt.Errorf("config: aggregator-cadence=%s must be > 0", c.AggregatorCadence)
+	}
+	// KMS provider closed-set + interlocks.
+	switch c.KMSProvider {
+	case "", "local", "in-memory":
+	default:
+		return fmt.Errorf("config: kms-provider=%q is not one of {\"\", local, in-memory}", c.KMSProvider)
+	}
+	if c.KMSProvider == "local" {
+		// Length check matches `keys.LocalKMSMasterKeyLen=32`
+		// (= 64 hex chars). The deeper hex-decode + AES key
+		// schedule construction happens at start-up inside
+		// `keys.NewLocalSealedKMS`; the config layer just
+		// pins the shape so an operator gets a clean error
+		// before reaching the policy/keys package.
+		hex := c.KMSMasterKeyHex
+		if len(hex) != 64 {
+			return fmt.Errorf("config: kms-provider=local requires kms-master-key-hex of exactly 64 hex chars; got %d chars", len(hex))
+		}
+	}
+	if c.KMSProvider != "local" && c.KMSMasterKeyHex != "" {
+		return fmt.Errorf("config: kms-master-key-hex is set but kms-provider=%q is not \"local\"", c.KMSProvider)
+	}
+	// Stage 2.6 scaffold-churn-webhook interlock: BOTH the
+	// HMAC secret AND the explicit opt-in flag must be set to
+	// enable the webhook; setting only one is always a
+	// misconfiguration (an opt-in with no HMAC = unauthenticated
+	// surface; HMAC without opt-in = unwanted surface). A
+	// non-empty secret must also clear the minimum-length
+	// guard ([MinWebhookHMACSecretBytes]) so an operator typo
+	// or copy-paste truncation cannot mount a trivially
+	// brute-forceable HMAC boundary (evaluator iter-6 #5).
+	if c.EnableScaffoldChurnWebhook && c.WebhookHMACSecret == "" {
+		return fmt.Errorf("config: %s=true requires %s to be set (HMAC verification is mandatory when the webhook is mounted)",
+			EnvEnableScaffoldChurnWebhook, EnvWebhookHMACSecret)
+	}
+	if !c.EnableScaffoldChurnWebhook && c.WebhookHMACSecret != "" && !c.EnableScaffoldIndexerWebhook && !c.EnableExternalIngestWebhook {
+		return fmt.Errorf("config: %s is set but none of %s / %s / %s is set; the webhooks stay UNMOUNTED until at least one opt-in flag is enabled (avoids an unintended public surface)",
+			EnvWebhookHMACSecret, EnvEnableScaffoldChurnWebhook, EnvEnableScaffoldIndexerWebhook, EnvEnableExternalIngestWebhook)
+	}
+	if c.EnableScaffoldIndexerWebhook && c.WebhookHMACSecret == "" {
+		return fmt.Errorf("config: %s=true requires %s to be set (HMAC verification is mandatory when the Repo Indexer webhook is mounted)",
+			EnvEnableScaffoldIndexerWebhook, EnvWebhookHMACSecret)
+	}
+	// Stage 4.1 production-grade /v1/ingest/{verb} Router
+	// interlock: enabling the Router requires BOTH a non-empty
+	// signing-key-id AND a non-empty HMAC secret. The Router
+	// rejects publishers that don't quote the configured
+	// signing_key_id, so a missing key-id would brick the
+	// surface; a missing secret would be an unauthenticated
+	// boundary.
+	if c.EnableExternalIngestWebhook {
+		if c.WebhookHMACSecret == "" {
+			return fmt.Errorf("config: %s=true requires %s to be set (HMAC verification is mandatory when the external-ingest Router is mounted)",
+				EnvEnableExternalIngestWebhook, EnvWebhookHMACSecret)
+		}
+		if c.WebhookSigningKeyID == "" {
+			return fmt.Errorf("config: %s=true requires %s to be set (the Router rejects any signing_key_id it does not recognise)",
+				EnvEnableExternalIngestWebhook, EnvWebhookSigningKeyID)
+		}
+	}
+	if c.WebhookSigningKeyID != "" && !c.EnableExternalIngestWebhook {
+		return fmt.Errorf("config: %s is set but %s is not; the signing key id is consumed only by the external-ingest Router",
+			EnvWebhookSigningKeyID, EnvEnableExternalIngestWebhook)
+	}
+	if c.WebhookHMACSecret != "" && len(c.WebhookHMACSecret) < MinWebhookHMACSecretBytes {
+		return fmt.Errorf("config: %s must be at least %d bytes long (got %d); use a CSPRNG-generated secret such as `head -c 32 /dev/urandom | base64`",
+			EnvWebhookHMACSecret, MinWebhookHMACSecretBytes, len(c.WebhookHMACSecret))
+	}
 	return nil
 }
 
@@ -321,12 +730,26 @@ func readEnvOverrides() map[string]string {
 		EnvPrometheusAddr,
 		EnvOTelEndpoint,
 		EnvPGURL,
+		EnvMgmtPGURL,
+		EnvAllowSharedPGRole,
 		EnvLogLevel,
 		EnvScanTimeout,
 		EnvPeriodicSweepCadence,
 		EnvWindowDays,
 		EnvFreshnessWindowSeconds,
 		EnvPolicyPublishOverlapSeconds,
+		EnvAggregatorCadence,
+		EnvDisableAggregator,
+		EnvKMSProvider,
+		EnvKMSMasterKeyHex,
+		EnvWebhookHMACSecret,
+		EnvEnableScaffoldChurnWebhook,
+		EnvEnableScaffoldIndexerWebhook,
+		EnvDisableStaleSweep,
+		EnvEnableLegacyDemoAPI,
+		EnvEnableExternalIngestWebhook,
+		EnvWebhookSigningKeyID,
+		EnvAstScanRoot,
 	}
 	out := make(map[string]string, len(keys))
 	for _, k := range keys {
@@ -361,6 +784,17 @@ func applyOverrides(cfg *Config, overrides map[string]string) error {
 			cfg.OTelEndpoint = v
 		case EnvPGURL:
 			cfg.PostgresURL = v
+		case EnvMgmtPGURL:
+			cfg.ManagementPostgresURL = v
+		case EnvAllowSharedPGRole:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "1", "true", "yes", "on":
+				cfg.AllowSharedPGRole = true
+			case "0", "false", "no", "off":
+				cfg.AllowSharedPGRole = false
+			default:
+				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
+			}
 		case EnvLogLevel:
 			cfg.LogLevel = v
 		case EnvScanTimeout:
@@ -393,6 +827,76 @@ func applyOverrides(cfg *Config, overrides map[string]string) error {
 				return fmt.Errorf("%s=%q: %w", k, v, err)
 			}
 			cfg.PolicyPublishOverlapSeconds = n
+		case EnvAggregatorCadence:
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return fmt.Errorf("%s=%q: %w", k, v, err)
+			}
+			cfg.AggregatorCadence = d
+		case EnvDisableAggregator:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "1", "true", "yes", "on":
+				cfg.DisableAggregator = true
+			case "0", "false", "no", "off":
+				cfg.DisableAggregator = false
+			default:
+				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
+			}
+		case EnvKMSProvider:
+			cfg.KMSProvider = v
+		case EnvKMSMasterKeyHex:
+			cfg.KMSMasterKeyHex = v
+		case EnvWebhookHMACSecret:
+			cfg.WebhookHMACSecret = v
+		case EnvEnableScaffoldChurnWebhook:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "1", "true", "yes", "on":
+				cfg.EnableScaffoldChurnWebhook = true
+			case "0", "false", "no", "off":
+				cfg.EnableScaffoldChurnWebhook = false
+			default:
+				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
+			}
+		case EnvEnableScaffoldIndexerWebhook:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "1", "true", "yes", "on":
+				cfg.EnableScaffoldIndexerWebhook = true
+			case "0", "false", "no", "off":
+				cfg.EnableScaffoldIndexerWebhook = false
+			default:
+				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
+			}
+		case EnvDisableStaleSweep:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "1", "true", "yes", "on":
+				cfg.DisableStaleSweep = true
+			case "0", "false", "no", "off":
+				cfg.DisableStaleSweep = false
+			default:
+				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
+			}
+		case EnvEnableLegacyDemoAPI:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "1", "true", "yes", "on":
+				cfg.EnableLegacyDemoAPI = true
+			case "0", "false", "no", "off":
+				cfg.EnableLegacyDemoAPI = false
+			default:
+				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
+			}
+		case EnvEnableExternalIngestWebhook:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "1", "true", "yes", "on":
+				cfg.EnableExternalIngestWebhook = true
+			case "0", "false", "no", "off":
+				cfg.EnableExternalIngestWebhook = false
+			default:
+				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
+			}
+		case EnvWebhookSigningKeyID:
+			cfg.WebhookSigningKeyID = v
+		case EnvAstScanRoot:
+			cfg.AstScanRoot = v
 		default:
 			return fmt.Errorf("unknown config key %q", k)
 		}

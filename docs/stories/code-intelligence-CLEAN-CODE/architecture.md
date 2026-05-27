@@ -103,6 +103,7 @@ metric_kind)`.
 | 10 | `cycle_member` | file, package | base | 1 iff the scope participates in a strongly-connected component in the import graph; cycle id in `attrs_json`. Drives decoupling rule. |
 | 11 | `duplication_ratio` | file, package | base | Fraction of tokens that recur as a clone of length >= 50. |
 | 12 | `modification_count_in_window` | file, method | base | Count of touching commits in the last `PolicyVersion.refactor_weights.window_days` window (Section 5.3.3); materialised by the Metric Ingestor on `ingest.churn` arrival (Section 3.1 case 3, Section 3.5.1.b). |
+| 13 | `lsp_violation` | method | solid | AST-level Liskov override-signature indicator. `value=1` iff an overriding method strengthens its parent's precondition or weakens its postcondition (Section 3.5.1.c); `value=0` otherwise. Drives the LSP override rule. Emitted by Stage 2.4 (Adapter, Section 3.2) as a first-class `MetricSample` row -- this is the DSL-expressible projection of the same boolean fact also recorded in `MetricSample.attrs_json.lsp_violation` (the latter retained for forensics). The dual encoding mirrors `cycle_member` (row 10), which is likewise a 0/1 AST-derived structural metric_kind whose detail (the cycle id) lives in `attrs_json`. |
 
 #### 1.4.2 System tier (`pack='system'`)
 
@@ -515,7 +516,16 @@ foundation-tier metric kinds; it composes the metrics in Section
   (class) plus an AST-level "overrides parent precondition / weakens
   postcondition" predicate from the Adapter (Section 3.2). Recorded
   as a single boolean `lsp_violation` attribute on the
-  `MetricSample.attrs_json`.
+  `MetricSample.attrs_json` AND projected as a first-class
+  `metric_kind='lsp_violation'` row (Section 1.4.1 row 13,
+  `scope_kind='method'`, `value=0|1`) so the Policy DSL --
+  which exposes only the columnar `{metric_kind, scope_kind, pack,
+  source, value, degraded}` fields and not `attrs_json` -- can
+  consume the indicator directly. The dual encoding (attrs_json
+  boolean for forensics + projected `metric_kind` row for DSL
+  consumption) mirrors `cycle_member` (Section 1.4.1 row 10), which
+  also surfaces the structural fact as a 0/1 metric_kind while
+  retaining detail (the cycle id) on `attrs_json`.
 - **d. ISP (Interface Segregation).** Inputs: `interface_width`
   (class, interface), `fan_in` (interface). A wide interface
   consumed by a small subset of its methods is the smell.
@@ -781,10 +791,25 @@ preserves the single-writer-per-sub-store rule.
    own SHA.
 2. Webhook enqueues a `ScanRun(kind='external_per_row',
    sha_binding='per_row', to_sha=NULL)` job for the Ingestor.
-3. Ingestor emits one `MetricSample` row per payload row, each
-   referencing its own SHA from the payload. Per G2 the
-   `(repo_id, sha, scope_id, metric_kind, metric_version)` key is
-   unique across rows.
+3. Per metric_kind, the Ingestor uses the appropriate writer:
+   - For raw per-row sample kinds (e.g. the future `velocity_trend`
+     / `knowledge_index` system-tier inputs, which need to retain
+     per-commit fidelity), the Ingestor emits **one `MetricSample`
+     row per payload row**, each referencing its own SHA from the
+     payload. Per G2 the
+     `(repo_id, sha, scope_id, metric_kind, metric_version)` key
+     remains unique across rows because the SHA differs.
+   - For **computed-window** kinds whose value is an aggregate
+     over the payload's rows (the canonical example is
+     `modification_count_in_window` -- arch Sec 1.4.1 row 12 -- a
+     COUNT of unique in-window SHAs per scope), the
+     `modification_count_materialiser` (a computing writer per
+     tech-spec Sec 4.1.1 lines 287-291 + Sec 4.11 lines 444-454)
+     emits **one `MetricSample` row per scope**, stamped with the
+     LATEST in-window SHA. The `(repo_id, sha, scope_id,
+     metric_kind, metric_version)` key is still unique because
+     only one row per scope is emitted for this metric_kind in
+     this ScanRun.
 4. Ingestor closes the `ScanRun`. Aggregator materialises
    `velocity_trend` / `knowledge_index` system-tier rows on its
    next tick.
@@ -849,6 +874,7 @@ against. Every table belongs to exactly one G1 sub-store
 | --- | --- | --- |
 | `repo_id` | uuid | Primary key. |
 | `display_name` | text | Free-form. |
+| `repo_url` | text? | Operator-supplied canonical repo URL (e.g. `https://github.com/org/repo`). Nullable for back-compat with rows inserted before migration `0006_repo_url.up.sql`; new rows inserted via `mgmt.register_repo` MUST supply a non-empty URL. **WRITE-ONCE post-registration** -- changing this value would break canonical-signature parity (Section 5.2.1) and the G2 guarantee, because every `scope_binding.canonical_signature` for the repo embeds this URL as the per-repo stamp. The Metric Ingestor's `PGRepoURLLookup` reads this column once per `ResolveScopeIDs` call (cached for the process lifetime); `display_name` was REJECTED as the URL source (iter-6 evaluator item 1) because it is free-form per this section's row 2 and covered by Management UPDATE grants (`mgmt.rename_repo`). |
 | `mode` | enum | `embedded` (default; operator pin `ast-mode-default`, Section 1.6) or `linked`. Determines AST Adapter mode (Section 3.2). |
 | `default_branch` | text | E.g. `main`. |
 | `default_branch_head` | text? | Head SHA of `default_branch`, cached by the Repo Indexer on push/merge webhooks so the Insights surface can answer "what's current?" with a single-row read instead of scanning `Commit`. Nullable until the first scan lands. The composite index `(repo_id, default_branch_head)` (implementation-plan Stage 1.2) backs the index-only-scan shape. The Repo Indexer (Section 3.3) is the only writer. |
@@ -1199,6 +1225,7 @@ against. Every table belongs to exactly one G1 sub-store
 | `sha` | text |  |
 | `policy_version_id` | uuid |  |
 | `caller` | enum | `eval_gate` or `batch_refresh`. |
+| `scope_id` | uuid? | NULLABLE. Records the `scope?` argument of `rule_engine.RunSync(repo_id, sha, scope?, policy_version_id)` so cross-replica Store-level run dedup distinguishes a scoped `eval_gate` evaluation from an unscoped one (and from a different scope's evaluation). `NULL` represents the whole-SHA evaluation: the canonical `eval.gate` happy path with no scope argument, AND every `batch_refresh` run by construction. Non-null represents a per-scope `eval.gate` call. The Store's cross-replica dedup lookup matches with the null-safe `IS NOT DISTINCT FROM` operator so parallel calls landing on different replicas for the same `(repo_id, sha, policy_version_id, caller, scope_id)` tuple produce a single canonical run+verdict. Materialised by migration `0008_evaluation_run_scope_id` and the composite index `evaluation_run_dedup_idx(repo_id, sha, policy_version_id, caller, scope_id, created_at DESC)`. Pre-migration rows and Audit WAL reconciler replay rows retain meaningful semantics under the legacy nullable shape. |
 | `created_at` | timestamp | Append-only. |
 
 #### 5.4.3 EvaluationVerdict

@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -323,6 +324,14 @@ func newMgmtWriteStateFromEnv() *mgmtWriteState {
 
 func InitializeScenario_evaluator_surface_and_management_surface_management_write_verbs_and_repo_onboarding(ctx *godog.ScenarioContext) {
 	s := newMgmtWriteStateFromEnv()
+
+	// Release the database connection pool after each scenario.
+	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
+		if s.db != nil {
+			s.db.Close()
+		}
+		return ctx, nil
+	})
 
 	// Scenario: register-repo-idempotent
 	ctx.Step(`^a repo is already registered with URL "([^"]*)"$`, s.aRepoIsAlreadyRegisteredWithURL)

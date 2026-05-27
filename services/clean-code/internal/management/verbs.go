@@ -173,7 +173,16 @@ func (h *Handler) ListActiveSigningKeys(w http.ResponseWriter, r *http.Request) 
 // directly into `http.Handle` or compose it under a parent
 // mux. Stage 5.1 ships one route; Stage 3.4 conditionally
 // mounts two more when the [Handler] was built with a
-// non-nil [MgmtWriter] (see [NewHandlerWithWriter]).
+// non-nil [MgmtWriter] (see [NewHandlerWithWriter]); Stage
+// 6.2 conditionally mounts `mgmt.register_repo` and
+// `mgmt.set_mode` when the writer was ALSO built with a
+// non-nil [RepoStore] (see [WithMgmtWriterRepoStore]).
+//
+// For a unified Management surface that ALSO mounts
+// `mgmt.override` (which lives on `PolicyWriter`), use
+// [MgmtSurfaceRoutes] -- this method covers the
+// reader-plus-mgmt-write subset and is kept for backward
+// compatibility with the Stage 5.1 / Stage 3.4 wiring shape.
 func (h *Handler) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc(VerbListActivePath, h.ListActiveSigningKeys)
@@ -187,6 +196,20 @@ func (h *Handler) Routes() *http.ServeMux {
 		// composing a sub-mux.
 		mux.HandleFunc(VerbMgmtRetractSamplePath, h.writer.RetractSample)
 		mux.HandleFunc(VerbMgmtRescanPath, h.writer.Rescan)
+		if h.writer.repoStore != nil {
+			// Stage 6.2: register_repo + set_mode mount
+			// only when the writer was built with a
+			// non-nil RepoStore via
+			// [WithMgmtWriterRepoStore]. We keep the
+			// wire surface honest by NOT mounting paths
+			// the handler cannot serve (the alternative
+			// -- mount + 503 -- is reserved for paths
+			// that may BECOME wired during the service
+			// lifecycle; the RepoStore is a
+			// composition-root-time choice).
+			mux.HandleFunc(VerbMgmtRegisterRepoPath, h.writer.RegisterRepo)
+			mux.HandleFunc(VerbMgmtSetModePath, h.writer.SetMode)
+		}
 	}
 	return mux
 }

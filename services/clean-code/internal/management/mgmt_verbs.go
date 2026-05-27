@@ -220,6 +220,12 @@ type RepoEventAppender interface {
 // management verbs. Wraps the four narrow dependencies and
 // serves `mgmt.retract_sample` + `mgmt.rescan`.
 //
+// Stage 6.2 adds the optional `repoStore RepoStore` seam used
+// by `mgmt.register_repo` and `mgmt.set_mode`. The seam is
+// optional so an existing scaffold-mode bring-up that only
+// wires retract / rescan keeps working unchanged; the new
+// verbs return 503 when the store is unset.
+//
 // Construct via [NewMgmtWriter]. Any dependency MAY be nil for
 // scaffold-mode bring-ups; the wire layer then returns 503 on
 // the affected verb (mirrors the
@@ -230,6 +236,7 @@ type MgmtWriter struct {
 	dispatcher RetractDispatcher
 	enqueuer   RescanEnqueuer
 	appender   RepoEventAppender
+	repoStore  RepoStore
 	clock      func() time.Time
 	logger     *slog.Logger
 }
@@ -249,6 +256,23 @@ func WithMgmtWriterLogger(log *slog.Logger) MgmtWriterOption {
 // clock injector). Default [time.Now].
 func WithMgmtWriterClock(now func() time.Time) MgmtWriterOption {
 	return func(w *MgmtWriter) { w.clock = now }
+}
+
+// WithMgmtWriterRepoStore wires the [RepoStore] dependency
+// used by the Stage 6.2 `mgmt.register_repo` and
+// `mgmt.set_mode` verbs. nil leaves the verbs unwired (they
+// return 503). Production wiring passes a real
+// [InMemoryRepoStore] (during early bring-up) or the
+// PG-backed implementation that lands in a follow-up stage.
+//
+// The option is defined here (not as a constructor argument)
+// so existing callers wiring only the Stage 3.4 retract /
+// rescan verbs continue to compile unchanged -- the
+// management package's public NewMgmtWriter signature is
+// load-bearing across the metric-ingestor and
+// composition-root callers.
+func WithMgmtWriterRepoStore(store RepoStore) MgmtWriterOption {
+	return func(w *MgmtWriter) { w.repoStore = store }
 }
 
 // NewMgmtWriter constructs an [MgmtWriter]. Any nil argument
@@ -535,12 +559,32 @@ func (w *MgmtWriter) Rescan(rw http.ResponseWriter, r *http.Request) {
 }
 
 // Routes returns an `http.ServeMux` ready to mount onto the
-// service's HTTP listener with the two Stage 3.4 verbs at
-// their canonical paths.
+// service's HTTP listener with the Stage 3.4 + Stage 6.2 verbs
+// at their canonical paths.
+//
+// Mounted unconditionally:
+//   - `mgmt.retract_sample` (Stage 3.4)
+//   - `mgmt.rescan`         (Stage 3.4)
+//
+// Mounted only when [WithMgmtWriterRepoStore] supplied a
+// non-nil store (otherwise the routes 503 anyway, so the
+// extra mount adds no value):
+//   - `mgmt.register_repo`  (Stage 6.2)
+//   - `mgmt.set_mode`       (Stage 6.2)
+//
+// For a UNIFIED management surface that ALSO mounts
+// `mgmt.override` (which lives on [PolicyWriter]), use
+// [MgmtSurfaceRoutes] -- this method is the writer-side
+// subset and intentionally does NOT mount override (a
+// PolicyWriter is not in scope here).
 func (w *MgmtWriter) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc(VerbMgmtRetractSamplePath, w.RetractSample)
 	mux.HandleFunc(VerbMgmtRescanPath, w.Rescan)
+	if w.repoStore != nil {
+		mux.HandleFunc(VerbMgmtRegisterRepoPath, w.RegisterRepo)
+		mux.HandleFunc(VerbMgmtSetModePath, w.SetMode)
+	}
 	return mux
 }
 

@@ -68,7 +68,7 @@ func TestDefectsVerbHandler_ExtractMetadata_HappyPath(t *testing.T) {
 	t.Parallel()
 	h := webhook.NewDefectsVerbHandler()
 	body := goodDefectsPayloadJSON(t)
-	md, err := h.ExtractMetadata(context.Background(), body)
+	md, err := h.ExtractMetadata(context.Background(), http.Header{}, body)
 	if err != nil {
 		t.Fatalf("ExtractMetadata: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestDefectsVerbHandler_ExtractMetadata_FullValidation(t *testing.T) {
 		},
 	}
 	body, _ := json.Marshal(p)
-	_, err := h.ExtractMetadata(context.Background(), body)
+	_, err := h.ExtractMetadata(context.Background(), http.Header{}, body)
 	if err == nil {
 		t.Fatalf("ExtractMetadata(invalid SHA): want error, got nil")
 	}
@@ -115,7 +115,7 @@ func TestDefectsVerbHandler_Handle_HappyPath_HonoursSuppliedScanRunID(t *testing
 	body := goodDefectsPayloadJSON(t)
 	scanRunID := uuid.Must(uuid.NewV7())
 
-	res, err := h.Handle(context.Background(), body, scanRunID)
+	res, err := h.Handle(context.Background(), webhook.VerbPayloadMetadata{}, body, scanRunID)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestDefectsVerbHandler_Handle_BadJSON_Rejected(t *testing.T) {
 	t.Parallel()
 	h := webhook.NewDefectsVerbHandler()
 	scanRunID := uuid.Must(uuid.NewV7())
-	_, err := h.Handle(context.Background(), []byte("{not json"), scanRunID)
+	_, err := h.Handle(context.Background(), webhook.VerbPayloadMetadata{}, []byte("{not json"), scanRunID)
 	if err == nil {
 		t.Fatalf("Handle bad JSON: want error, got nil")
 	}
@@ -158,7 +158,7 @@ func TestDefectsVerbHandler_Handle_UnknownFields_Rejected(t *testing.T) {
 	t.Parallel()
 	h := webhook.NewDefectsVerbHandler()
 	body := []byte(`{"repo_id":"11111111-2222-3333-4444-555555555555","rows":[],"unknown_field":42}`)
-	_, err := h.Handle(context.Background(), body, uuid.Must(uuid.NewV7()))
+	_, err := h.Handle(context.Background(), webhook.VerbPayloadMetadata{}, body, uuid.Must(uuid.NewV7()))
 	if err == nil {
 		t.Fatalf("Handle with unknown field: want error, got nil")
 	}
@@ -222,7 +222,7 @@ func TestDefectsVerbHandler_Handle_TrailingData_Rejected(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			_, err := h.Handle(context.Background(), tc.body, scanRunID)
+			_, err := h.Handle(context.Background(), webhook.VerbPayloadMetadata{}, tc.body, scanRunID)
 			if err == nil {
 				t.Fatalf("Handle(%s): want error, got nil", tc.name)
 			}
@@ -243,7 +243,7 @@ func TestDefectsVerbHandler_Handle_TrailingData_Rejected(t *testing.T) {
 	t.Run("trailing-whitespace-ok", func(t *testing.T) {
 		t.Parallel()
 		body := []byte(good + "\n\t  \r\n")
-		res, err := h.Handle(context.Background(), body, scanRunID)
+		res, err := h.Handle(context.Background(), webhook.VerbPayloadMetadata{}, body, scanRunID)
 		if err != nil {
 			t.Fatalf("Handle(trailing-whitespace): want nil error, got %v", err)
 		}
@@ -267,7 +267,7 @@ func TestDefectsVerbHandler_ExtractMetadata_TrailingData_Rejected(t *testing.T) 
 	t.Parallel()
 	h := webhook.NewDefectsVerbHandler()
 	body := []byte(string(goodDefectsPayloadJSON(t)) + `{"extra":"value"}`)
-	_, err := h.ExtractMetadata(context.Background(), body)
+	_, err := h.ExtractMetadata(context.Background(), http.Header{}, body)
 	if err == nil {
 		t.Fatalf("ExtractMetadata(trailing-data): want error, got nil")
 	}
@@ -287,7 +287,7 @@ func TestDefectsVerbHandler_Handle_ValidationFailure_Surfaces(t *testing.T) {
 	h := webhook.NewDefectsVerbHandler()
 	// Valid JSON shape but empty Rows -> ErrEmptyRows.
 	body := []byte(`{"repo_id":"11111111-2222-3333-4444-555555555555","rows":[]}`)
-	_, err := h.Handle(context.Background(), body, uuid.Must(uuid.NewV7()))
+	_, err := h.Handle(context.Background(), webhook.VerbPayloadMetadata{}, body, uuid.Must(uuid.NewV7()))
 	if err == nil {
 		t.Fatalf("Handle empty-rows: want error, got nil")
 	}

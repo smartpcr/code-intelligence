@@ -2,7 +2,170 @@
 
 Operational guide for the clean-code service. Add a new
 section here as each subsystem ships against the production
-composition root (`cmd/clean-coded/main.go`).
+composition root (`cmd/clean-code-metric-ingestor/main.go`,
+which hosts the management + ingest HTTP surfaces; future
+binaries under `cmd/clean-code-*` ship their own routes).
+
+## Stage 6.2 -- `mgmt.register_repo` and `mgmt.set_mode`
+
+This section captures the operator-facing contract of the
+Stage 6.2 management write verbs
+`mgmt.register_repo(repo_url, default_branch, mode?)` and
+`mgmt.set_mode(repo_id, mode)`. See
+`internal/management/register_repo_verb.go`,
+`internal/management/set_mode_verb.go`, and
+`internal/management/mgmt_surface.go` for the HTTP surface.
+
+### Canonical verb paths and mount
+
+The two Stage 6.2 verbs share the existing
+`clean-code-metric-ingestor` binary's HTTP server (the
+binary that already hosts the Stage 3.4 management verbs
+`mgmt.retract_sample` / `mgmt.rescan`). The unified
+canonical `mgmt.*` surface is composed by
+`MgmtSurfaceRoutes(mgmt *MgmtWriter, policy *PolicyWriter)`,
+which mounts every write verb in the canonical set
+(`mgmt.override, mgmt.register_repo, mgmt.set_mode,
+mgmt.retract_sample, mgmt.rescan`) onto a single
+`*http.ServeMux`. Each path is gated on its backing writer
+being non-nil so the wire surface NEVER advertises an
+endpoint it cannot serve. See
+`cmd/clean-code-metric-ingestor/main.go:mountMgmtRoutes`
+for the production composition root.
+
+- **`POST /v1/mgmt/register_repo`**. Body:
+  `{ "repo_url": "<https URL>", "default_branch": "<name>",
+     "mode": "embedded"|"linked", "modes": "embedded"|"linked",
+     "display_name": "<str?>" }`.
+  The wire accepts EITHER `mode` (the singular column name)
+  OR `modes` (the brief's plural-form parameter) as a JSON
+  string -- specifying both fields in the same request
+  returns HTTP 400. When BOTH are omitted, mode defaults to
+  the canonical `embedded` per architecture Sec 1.6
+  `ast-mode-default`. `display_name` defaults to the
+  path-tail of `repo_url` when omitted (e.g.
+  `https://github.com/org/repo` -> `repo`; `.git` suffix
+  stripped; SCP-style `git@github.com:org/repo.git` handled)
+  so the `repo.display_name NOT NULL` column always has a
+  value.
+- **`POST /v1/mgmt/set_mode`**. Body:
+  `{ "repo_id": "<uuid>", "mode": "embedded"|"linked" }`.
+
+### Authentication and actor attribution
+
+Both verbs REQUIRE `X-OIDC-Subject: <subject>` on every
+request. The subject is the OIDC-authenticated principal; it
+is stamped into the resulting `repo_event.payload.actor` as
+`"operator:<subject>"`. A missing or empty header returns
+HTTP 401 BEFORE any persistence happens.
+
+### Atomicity invariant (audit log integrity)
+
+Both verbs write BOTH the catalog row AND the matching
+`repo_event` atomically. The `RepoStore` implementation owns
+that boundary. In production the
+`management.NewPGRepoStore(mgmtDB)` implementation opens a
+single Postgres transaction per verb: `register_repo` takes
+a per-URL `pg_advisory_xact_lock(hashtext($repo_url::text))`
+so concurrent registrations of the same URL serialise on the
+write path (different URLs do not block each other); the
+SELECT-by-URL lookup then runs inside the lock, so the
+"check then INSERT" sequence is race-free even though the
+`clean_code.repo` table has no UNIQUE constraint on
+`repo_url`. `set_mode` takes `SELECT mode ... FOR UPDATE`
+on the `repo` row, computes the transition (no-op vs
+`embedded` <-> `linked`), and writes the matching
+`mode_changed` event in the same transaction. Either both
+the row mutation AND the event are durably committed, or
+neither is. Operators can rely on the invariant "every
+`repo_event` has a matching `repo`-row state and vice versa"
+for incident triage.
+
+### `mgmt.register_repo` semantics
+
+- **Happy path (200, `created:true`).** A new row is inserted
+  into `clean_code.repo` with the requested
+  `(repo_url, default_branch, mode, display_name)`. A
+  `repo_event(kind='registered',
+  payload={repo_url, default_branch, mode, display_name,
+  actor})` is appended. Response:
+  `{ "repo_id": "<uuid>", "created": true,
+     "mode": "embedded"|"linked" }`.
+
+- **Idempotent on `repo_url` (200, `created:false`).** A
+  second call with the same `repo_url` returns the existing
+  `repo_id` and sets `created:false`. NO second `registered`
+  event is appended. The existing row's `mode` is echoed back
+  even if the new request asked for a different mode --
+  callers MUST use `mgmt.set_mode` to change the mode of an
+  existing repo. This idempotency is required because the
+  `clean_code.repo` schema does NOT enforce a unique
+  constraint on `repo_url`; the store layer is the gate.
+
+### `mgmt.set_mode` semantics
+
+- **Transition (200, `changed:true`).** The row's `mode` is
+  updated and a `repo_event(kind='mode_changed',
+  payload={mode, previous_mode, actor})` is appended.
+  Response: `{ "repo_id": "<uuid>", "mode": "<new>",
+  "previous_mode": "<old>", "changed": true }`.
+- **No-op (200, `changed:false`).** A call that re-asserts
+  the existing mode (e.g. `mode:"embedded"` against a repo
+  already at `embedded`) returns 200 with `changed:false`
+  and appends NO `mode_changed` event. `mode_changed`
+  records a TRANSITION, not a re-assertion. This is a
+  deliberate audit-log hygiene rule: every `mode_changed`
+  row in the audit log implies a real transition.
+
+### Status code matrix
+
+| Code | When                                                            | Verbs affected         |
+| ---- | --------------------------------------------------------------- | ---------------------- |
+| 200  | Happy path (incl. idempotent register and no-op set_mode)       | register_repo, set_mode |
+| 400  | Empty / whitespace `repo_url`; empty `default_branch`; invalid `mode` / `modes` (anything outside `{embedded, linked}`); BOTH `mode` AND `modes` supplied in the same request (`ErrMgmtRegisterRepoBothModeAndModes`); malformed JSON; unknown body field; zero / malformed `repo_id` | both |
+| 401  | Missing or empty `X-OIDC-Subject`                               | both                   |
+| 404  | `set_mode` against an unknown `repo_id`                         | set_mode               |
+| 405  | Non-POST method                                                 | both                   |
+| 500  | Unexpected RepoStore error (NOT a known sentinel)               | both                   |
+| 503  | `repoStore` was not wired into the writer                       | both                   |
+
+### Operator triage
+
+- **HTTP 503 from either verb.** The composition root did
+  NOT wire a `RepoStore` into `MgmtWriter` via
+  `WithMgmtWriterRepoStore`. Inspect the binary's
+  composition (`cmd/clean-code-metric-ingestor/main.go`,
+  `mountMgmtRoutes`) and restart with the store wired.
+  Until then, the two paths return 503 and the rest of the
+  mgmt surface (retract_sample, rescan, override) is
+  UNAFFECTED.
+- **HTTP 400 with body mentioning BOTH `mode` and `modes`.**
+  A caller sent both wire fields in the same request --
+  this is rejected to prevent silent precedence ambiguity.
+  The caller MUST pick exactly one: the singular `mode`
+  (matches the `repo.mode` column and the `mgmt.set_mode`
+  verb) OR the plural `modes` (matches the brief signature
+  `register_repo(repo_url, default_branch, modes)`). Both
+  forms are accepted; the wire is forgiving so operators
+  who copy-paste from the brief and operators who copy-paste
+  from the column docs both work without a 400.
+- **HTTP 400 with `unknown field "actor"`.** A caller is
+  trying to forge the actor identity. Actor is sourced
+  ONLY from `X-OIDC-Subject` -- the body cannot override it.
+- **Mismatched `repo_event` and `repo` row.** This is a hard
+  invariant violation -- see the "Atomicity invariant"
+  section. If you observe one without the other in
+  Postgres, capture the rows, file a P1, and inspect the
+  store implementation; the in-memory implementation
+  rolls back on appender failure and the production
+  Postgres-backed implementation does the write in a
+  single transaction.
+- **Multiple `registered` events for the same `repo_id`.**
+  This is also a hard invariant violation -- the
+  `register_repo` verb is idempotent on `repo_url` and
+  appends `registered` only when `created:true`. Inspect
+  the audit log for non-canonical writers
+  (`repo_event.actor NOT LIKE 'operator:%'`).
 
 ## Stage 6.1 -- `eval.gate` verb and synchronous SOLID delegation
 

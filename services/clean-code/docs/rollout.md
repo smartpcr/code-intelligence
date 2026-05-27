@@ -5,6 +5,165 @@ production-tier environment. The instructions assume Postgres
 14+ is already running and the `clean_code_*` roles have been
 created via the `0004_roles.up.sql` migration.
 
+## Stage 6.2: management write verbs and repo onboarding
+
+This subsection captures the rollout sequence for the
+Stage 6.2 verbs `mgmt.register_repo(repo_url, default_branch,
+mode?)` and `mgmt.set_mode(repo_id, mode)`. It does NOT
+introduce a new binary -- the existing
+`clean-code-metric-ingestor` binary's HTTP server (the
+binary that already hosts the Stage 3.4 management verbs
+`mgmt.retract_sample` / `mgmt.rescan`) gains two new routes
+via the unified `MgmtSurfaceRoutes(mgmt, policy)` composition
+function. See `cmd/clean-code-metric-ingestor/main.go:mountMgmtRoutes`
+for the production wiring.
+
+### What's new at the HTTP layer
+
+1. **`POST /v1/mgmt/register_repo`** (new). Writes the
+   `clean_code.repo` row PLUS a
+   `repo_event(kind='registered')`. Idempotent on `repo_url`.
+2. **`POST /v1/mgmt/set_mode`** (new). Updates `repo.mode`
+   PLUS appends `repo_event(kind='mode_changed')`. No-op when
+   the new mode equals the existing mode.
+3. **`MgmtSurfaceRoutes(mgmt, policy)`** (new). A top-level
+   composition function that mounts all six canonical
+   `mgmt.*` write verbs (`mgmt.override, mgmt.register_repo,
+   mgmt.set_mode, mgmt.retract_sample, mgmt.rescan`) onto a
+   single `*http.ServeMux`. Each path is gated on its
+   backing writer being non-nil so the wire surface NEVER
+   advertises an endpoint it cannot serve. Existing Stage
+   3.4 callers that already mount `MgmtWriter.Routes()` and
+   `Handler.Routes()` continue to work unchanged -- the
+   new paths are conditionally mounted on those muxes too,
+   so existing composition roots pick up the new verbs
+   without re-routing.
+
+### Wiring step (composition root)
+
+The composition root (`cmd/clean-code-metric-ingestor/main.go`,
+`mountMgmtRoutes`) wires a Postgres-backed `RepoStore` into
+`MgmtWriter` via `WithMgmtWriterRepoStore`. The PG store
+runs against the SAME `*sql.DB` as the existing audit-log
+appender (both run under the `clean_code_management` Postgres
+role and therefore inherit the column-level grants enumerated
+in `migrations/0001_catalog_lifecycle.up.sql`).
+
+```go
+appender := management.NewPGRepoEventAppender(mgmtDB) // Stage 3.4
+repoStore := management.NewPGRepoStore(mgmtDB)        // Stage 6.2 iter 2
+writer := management.NewMgmtWriter(
+    sampleResolver,
+    retractDispatcher,
+    rescanEnqueuer,
+    appender,
+    management.WithMgmtWriterRepoStore(repoStore),
+)
+policyWriter := management.NewPolicyWriter(...) // Stage 5.3
+mux := management.MgmtSurfaceRoutes(writer, policyWriter)
+```
+
+A composition root that does NOT need overrides MAY pass
+`nil` for the `policy` argument; the function will omit
+`/v1/mgmt/override` from the mounted set. Likewise, omitting
+the `WithMgmtWriterRepoStore` option (as iter 1 did) causes
+`register_repo` / `set_mode` to be omitted from the mounted
+set entirely; this is the safety-net path for legacy
+composition roots that have not yet adopted Stage 6.2.
+
+### `NewPGRepoStore` transactional shape (operator detail)
+
+The `PGRepoStore` implementation in
+`internal/management/pg_repo_store.go` opens ONE Postgres
+transaction per write verb and commits BOTH the row mutation
+AND the matching `repo_event` in the same transaction. This
+is the production realisation of the Stage 6.2 atomicity
+invariant documented in the runbook.
+
+- `RegisterRepo` opens a transaction with
+  `BEGIN`, takes
+  `SELECT pg_advisory_xact_lock(hashtext($repo_url::text))`,
+  performs a `SELECT repo_id, mode FROM clean_code.repo
+  WHERE repo_url = $1` lookup INSIDE the lock, and either
+  returns the existing `repo_id` (idempotent path,
+  `created:false`, NO `registered` event written) or
+  INSERTs both the `clean_code.repo` row AND the
+  `repo_event(kind='registered')` payload before
+  COMMITting. The advisory lock is xact-scoped so it
+  auto-releases on COMMIT or ROLLBACK; different `repo_url`
+  hashes do not block each other.
+
+- `SetRepoMode` opens a transaction, takes
+  `SELECT mode FROM clean_code.repo WHERE repo_id = $1 FOR
+  UPDATE`, computes the transition, and either commits a
+  no-op (same mode -- NO `mode_changed` event appended)
+  or runs `UPDATE clean_code.repo SET mode=$2 WHERE
+  repo_id=$1` AND `INSERT INTO clean_code.repo_event`
+  before COMMITting. Unknown `repo_id` rolls back and
+  returns the `ErrRepoStoreUnknownRepo` sentinel which the
+  HTTP verb maps to HTTP 404.
+
+If the event-append step fails inside either transaction,
+the row mutation is rolled back. Operators can verify by
+SELECTing on the `clean_code.repo_event` audit log: every
+`registered`/`mode_changed` row implies a corresponding
+catalog state.
+
+### No new environment variables
+
+Stage 6.2 introduces no new env vars. The PG store reads from
+the same `*sql.DB` handle as Stage 3.4's appender (the
+`CLEAN_CODE_MGMT_PG_URL` connection string the binary already
+consumes).
+
+### Postgres impact
+
+No schema migration is required. Stage 6.2 reuses the
+existing tables introduced by earlier migrations:
+
+- `clean_code.repo` (Stage 1 migration `0001_catalog_lifecycle`,
+  with the `repo_url` column added by migration
+  `0006_repo_url`). The write-once `repo_url` invariant on the
+  column is honoured by `mgmt.register_repo` (which writes
+  the row exactly once) and respected by `mgmt.set_mode`
+  (which only updates `repo.mode`).
+- `clean_code.repo_event` (same migration). The
+  `repo_event_kind` enum already includes both `registered`
+  and `mode_changed` per Sec 5.1.4 lines 877-884.
+
+### Rollback
+
+Roll back by un-wiring the `RepoStore` from the composition
+root and redeploying. The two new paths return HTTP 503,
+existing mgmt verbs continue to serve, and no schema
+migration needs to be reverted. Already-written `repo` rows
+and `repo_event` rows remain in Postgres -- they are valid
+audit history under the existing schema, so there is no
+"data to clean up" before a partial rollback.
+
+### Smoke test sequence
+
+After deploying the new binary:
+
+1. `POST /v1/mgmt/register_repo` with a new `repo_url`. Assert
+   HTTP 200, `created:true`, and a `repo_id` in the
+   response body. Query Postgres for the new row and the
+   matching `repo_event(kind='registered')`.
+2. `POST /v1/mgmt/register_repo` with the SAME `repo_url`.
+   Assert HTTP 200, `created:false`, same `repo_id`. Query
+   Postgres: exactly ONE `repo_event(kind='registered')` for
+   that `repo_id` (idempotency invariant).
+3. `POST /v1/mgmt/set_mode` with the `repo_id` from step 1
+   and `mode:"linked"`. Assert HTTP 200, `changed:true`,
+   `previous_mode:"embedded"`, `mode:"linked"`. Query
+   Postgres: `repo.mode = 'linked'` AND one new
+   `repo_event(kind='mode_changed')`.
+4. Repeat step 3 with `mode:"linked"` (no-op). Assert HTTP
+   200, `changed:false`. Query Postgres: no new
+   `repo_event` row.
+5. `POST /v1/mgmt/set_mode` with a random UUID. Assert HTTP
+   404.
+
 ## Stage 6.1: `eval.gate` verb and synchronous SOLID delegation
 
 This subsection captures the rollout sequence for the

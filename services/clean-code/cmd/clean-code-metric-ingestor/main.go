@@ -434,10 +434,11 @@ func newMetricsHandler(loop *metric_ingestor.StaleScanRunSweepLoop) http.Handler
 	})
 }
 
-// mountMgmtRoutes wires the Stage 3.4 management write verbs
-// (`mgmt.retract_sample`, `mgmt.rescan`) against production PostgreSQL
-// stores and registers their HTTP handlers on `mux`. The role grants
-// from `migrations/0004_roles.up.sql` are honoured by accepting TWO
+// mountMgmtRoutes wires the management write verbs (Stage 3.4:
+// `mgmt.retract_sample`, `mgmt.rescan`; Stage 6.2: `mgmt.register_repo`,
+// `mgmt.set_mode`) against production PostgreSQL stores and registers
+// their HTTP handlers on `mux`. The role grants from
+// `migrations/0004_roles.up.sql` are honoured by accepting TWO
 // `*sql.DB` handles:
 //
 //   - ingestorDB carries `clean_code_metric_ingestor` credentials. Used
@@ -447,9 +448,11 @@ func newMetricsHandler(loop *metric_ingestor.StaleScanRunSweepLoop) http.Handler
 //     PGRetractionStore also reads `metric_sample` (granted SELECT to
 //     every clean_code role by line 282).
 //   - mgmtDB carries `clean_code_management` credentials. Used for
-//     `PGRepoEventAppender` (repo_event INSERT, line 313). A future
-//     production audit can grep this line and confirm the binary
-//     respects the documented ACL boundary.
+//     `PGRepoEventAppender` (repo_event INSERT, line 313) AND the
+//     Stage 6.2 `PGRepoStore` (repo INSERT/UPDATE per-column grants
+//     in 0004 lines 311-312 + 0006 lines 140-141; repo_event INSERT in
+//     the same transaction). A future production audit can grep these
+//     lines and confirm the binary respects the documented ACL boundary.
 //
 // Any failure surfaces with a wrapped error so the operator log
 // identifies the failing seam by name.
@@ -476,6 +479,20 @@ func mountMgmtRoutes(mux *http.ServeMux, ingestorDB, mgmtDB *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("NewPGRepoEventAppender: %w", err)
 	}
+	// Stage 6.2: the PG-backed RepoStore writes the
+	// `clean_code.repo` row AND the matching
+	// `repo_event(kind='registered'|'mode_changed')`
+	// audit row in ONE transaction. It uses the SAME
+	// `mgmtDB` handle as the appender so both writes
+	// run under the `clean_code_management` role's
+	// column-level INSERT/UPDATE grants on
+	// `clean_code.repo` (migrations/0004:311-312 +
+	// 0006:140-141) and INSERT on `clean_code.repo_event`
+	// (0004:313).
+	repoStore, err := management.NewPGRepoStore(mgmtDB)
+	if err != nil {
+		return fmt.Errorf("NewPGRepoStore: %w", err)
+	}
 	dispatcher := metric_ingestor.NewRetractDispatcher(retractScanRunStore, retractStore, retractStore)
 	enqueuer := metric_ingestor.NewRescanEnqueuer(rescanStore)
 	writer := management.NewMgmtWriter(
@@ -487,9 +504,18 @@ func mountMgmtRoutes(mux *http.ServeMux, ingestorDB, mgmtDB *sql.DB) error {
 		management.AdaptMetricIngestorRescanEnqueuer(enqueuer),
 		appender,
 		management.WithMgmtWriterLogger(slog.Default()),
+		// Stage 6.2 -- wire the PG-backed RepoStore so the
+		// new `mgmt.register_repo` / `mgmt.set_mode` routes
+		// (mounted below) can actually persist. Without
+		// this option the routes would return 503.
+		management.WithMgmtWriterRepoStore(repoStore),
 	)
+	// Stage 3.4 routes (retain).
 	mux.HandleFunc(management.VerbMgmtRetractSamplePath, writer.RetractSample)
 	mux.HandleFunc(management.VerbMgmtRescanPath, writer.Rescan)
+	// Stage 6.2 routes (NEW).
+	mux.HandleFunc(management.VerbMgmtRegisterRepoPath, writer.RegisterRepo)
+	mux.HandleFunc(management.VerbMgmtSetModePath, writer.SetMode)
 	return nil
 }
 

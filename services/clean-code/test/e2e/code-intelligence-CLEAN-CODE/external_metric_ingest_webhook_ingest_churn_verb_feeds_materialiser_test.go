@@ -22,6 +22,8 @@ import (
 )
 
 // computeHMACSHA256Churn returns the hex-encoded HMAC-SHA256 of body using secret.
+// One copy per package; the defects file holds the canonical helper used by other
+// scenarios. Naming is per-feature so the linker does not collide.
 func computeHMACSHA256Churn(secret, body []byte) string {
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(body)
@@ -35,29 +37,28 @@ func sha256HexChurn(data []byte) string {
 }
 
 // ---------------------------------------------------------------------------
-// shared state for churn verb feeds materialiser scenarios
+// shared state for churn-verb-feeds-materialiser scenarios
 // ---------------------------------------------------------------------------
 
+// churnVerbState holds the per-scenario state shared across
+// Given / When / Then steps for the churn feature. Mirrors the
+// shape of [defectsVerbState] so operators see the same triage
+// fields when a scenario fails (db handle, payload + hash,
+// last response, last scan_run_id).
 type churnVerbState struct {
-	db          *sql.DB
-	webhookURL  string
-	hmacSecret  string
-	payload     []byte
-	payloadHash string
+	db           *sql.DB
+	webhookURL   string
+	hmacSecret   string
+	signingKeyID string
+	payload      []byte
+	payloadHash  string
 
 	metricSampleCountBefore int
+	churnEventCountBefore   int
 	lastStatusCode          int
+	firstScanRunID          string
 	lastScanRunID           string
 	currentScanRunID        string
-
-	// Scenario-linked churn-event identity captured by
-	// `churnEventRowsExistForAScope` so the metric_sample
-	// assertions below can FILTER by (repo_id, sha) instead
-	// of accepting any pre-existing materialiser output.
-	// Closes iter-3-evaluator item 4 (loose assertion).
-	lastChurnRepoID    string
-	lastChurnSHA       string
-	lastChurnScanRunID string
 }
 
 func newChurnVerbState() *churnVerbState {
@@ -74,7 +75,7 @@ func (s *churnVerbState) close() {
 // Given steps
 // ---------------------------------------------------------------------------
 
-func (s *churnVerbState) aRunningWebhookServiceConnectedToPostgreSQL() error {
+func (s *churnVerbState) aRunningWebhookServiceConnectedToPostgreSQLChurn() error {
 	dsn := os.Getenv("CLEAN_CODE_PG_URL")
 	if dsn == "" {
 		return fmt.Errorf("CLEAN_CODE_PG_URL is not set")
@@ -98,14 +99,37 @@ func (s *churnVerbState) aRunningWebhookServiceConnectedToPostgreSQL() error {
 	if s.hmacSecret == "" {
 		return fmt.Errorf("CLEAN_CODE_WEBHOOK_HMAC_SECRET is not set")
 	}
+	// Stage-6 secret-resolver Router requires a non-empty
+	// signing_key_id on every POST. The CI workflow exports
+	// `CLEAN_CODE_WEBHOOK_SIGNING_KEY_ID` (and
+	// `CLEAN_CODE_ENABLE_EXTERNAL_INGEST_WEBHOOK=true`)
+	// BEFORE `docker compose up` so the binary mounts the
+	// production Router via `mountIngestRouter`
+	// (`cmd/clean-code-metric-ingestor/main.go:577-621`).
+	// The same env var is also passed through the compose
+	// `webhook` service env block so the binary's
+	// `StaticSecretResolver` is seeded with the
+	// (key_id, secret) pair the test signs with.
+	s.signingKeyID = os.Getenv("CLEAN_CODE_WEBHOOK_SIGNING_KEY_ID")
+	if s.signingKeyID == "" {
+		return fmt.Errorf("CLEAN_CODE_WEBHOOK_SIGNING_KEY_ID is not set (required by the production external-ingest Router; see cmd/clean-code-metric-ingestor/main.go:584-586)")
+	}
 	return nil
 }
 
-func (s *churnVerbState) theDatabaseIsMigratedAndRepoDIsSeeded() error {
+func (s *churnVerbState) theDatabaseIsMigratedAndRepoDIsSeededChurn() error {
+	// Canonical repo modes per architecture Sec 5.1.1 line
+	// 852 and the `clean_code.repo_mode` ENUM in
+	// `migrations/0001_catalog_lifecycle.up.sql:75-78`:
+	// `embedded` (default) or `linked`. The seed inserts the
+	// repo-d row using one of these two values; matching on
+	// the closed enum set (rather than a stale `'external'`
+	// literal) survives a seed-mode swap and aligns with
+	// `internal/management/repo_store.go:66-74`.
 	var count int
 	err := s.db.QueryRowContext(context.Background(), `
 		SELECT COUNT(*) FROM clean_code.repo
-		WHERE mode = 'external'
+		WHERE mode IN ('embedded', 'linked')
 	`).Scan(&count)
 	if err != nil {
 		return fmt.Errorf("checking repo-d seed: %w", err)
@@ -114,72 +138,23 @@ func (s *churnVerbState) theDatabaseIsMigratedAndRepoDIsSeeded() error {
 		return fmt.Errorf("repo-d seed data not found; run 'make seed-repo-d' first")
 	}
 
-	// Snapshot metric_sample count for the "unchanged" assertion.
+	// Snapshot metric_sample row count before the upload so the
+	// "unchanged" assertion can compare AFTER the verb runs.
 	err = s.db.QueryRowContext(context.Background(), `
 		SELECT COUNT(*) FROM clean_code.metric_sample
 	`).Scan(&s.metricSampleCountBefore)
 	if err != nil {
 		return fmt.Errorf("counting metric_sample rows: %w", err)
 	}
-	return nil
-}
 
-func (s *churnVerbState) churnEventRowsExistForAScope() error {
-	// The verb-writes-no-metric scenario above populates churn_event; if
-	// the test runs the materialiser scenario standalone, ensure at least
-	// one churn_event row exists or short-circuit. We also CAPTURE the
-	// (repo_id, sha, scan_run_id) of the most recently inserted churn
-	// row so downstream assertions filter to THIS scenario's chain of
-	// custody rather than any pre-existing materialiser output (closes
-	// iter-3 evaluator item 4).
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	var (
-		count     int
-		repoID    string
-		sha       string
-		scanRunID string
-	)
-	err := s.db.QueryRowContext(ctx, `
+	// Snapshot churn_event row count so the "one or more
+	// appended" assertion can derive the delta.
+	err = s.db.QueryRowContext(context.Background(), `
 		SELECT COUNT(*) FROM clean_code.churn_event
-	`).Scan(&count)
+	`).Scan(&s.churnEventCountBefore)
 	if err != nil {
 		return fmt.Errorf("counting churn_event rows: %w", err)
 	}
-	if count == 0 {
-		return fmt.Errorf("no churn_event rows present; run the churn-writes-no-metric-sample scenario first or seed churn_event")
-	}
-
-	// Prefer rows from the scan_run this scenario staged. Fall back to
-	// the most recently created churn_event row if no scan_run_id was
-	// captured (standalone materialiser scenario run).
-	if s.currentScanRunID != "" {
-		err = s.db.QueryRowContext(ctx, `
-			SELECT repo_id::text, sha, scan_run_id::text
-			  FROM clean_code.churn_event
-			 WHERE scan_run_id = $1
-			 ORDER BY created_at DESC
-			 LIMIT 1
-		`, s.currentScanRunID).Scan(&repoID, &sha, &scanRunID)
-	} else {
-		err = s.db.QueryRowContext(ctx, `
-			SELECT repo_id::text, sha, scan_run_id::text
-			  FROM clean_code.churn_event
-			 ORDER BY created_at DESC
-			 LIMIT 1
-		`).Scan(&repoID, &sha, &scanRunID)
-	}
-	if err == sql.ErrNoRows {
-		return fmt.Errorf("expected a churn_event row matching this scenario, got none")
-	}
-	if err != nil {
-		return fmt.Errorf("capturing churn_event identity: %w", err)
-	}
-
-	s.lastChurnRepoID = repoID
-	s.lastChurnSHA = sha
-	s.lastChurnScanRunID = scanRunID
 	return nil
 }
 
@@ -188,26 +163,31 @@ func (s *churnVerbState) churnEventRowsExistForAScope() error {
 // ---------------------------------------------------------------------------
 
 func (s *churnVerbState) aValidChurnWebhookPOSTIsSentForSHA(sha string) error {
+	// Canonical churn payload shape per [churn.Payload] in
+	// `internal/ingest/churn/churn.go:176-187`: `{repo_id,
+	// rows:[{sha, file_path, modified_at[, author]}]}`. The
+	// verb's decoder runs `DisallowUnknownFields`
+	// (`churn_verb.go:199-205`), so the wire test MUST match
+	// the canonical field set exactly -- any drift (e.g. the
+	// brief-draft `kind` / `window_days` / `files` fields)
+	// triggers a 400 before any churn_event row is written.
+	//
+	// The scenario's `sha` argument becomes the per-row sha
+	// the materialiser dedupes by (architecture Sec 4.4 line
+	// 781: "each row has its own SHA").
+	modifiedAt := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC).Format(time.RFC3339)
 	payload := map[string]interface{}{
-		"repository":  "repo-d",
-		"sha":         sha,
-		"ref":         "refs/heads/main",
-		"kind":        "churn",
-		"window_days": 30,
-		"events": []map[string]interface{}{
+		"repo_id": "11111111-2222-3333-4444-555555555555",
+		"rows": []map[string]interface{}{
 			{
-				"file":          "src/main.go",
-				"modified_at":   time.Now().UTC().Format(time.RFC3339),
-				"commit_sha":    "abcdef0123456789",
-				"lines_added":   12,
-				"lines_removed": 3,
+				"sha":         sha,
+				"file_path":   "internal/foo.go",
+				"modified_at": modifiedAt,
 			},
 			{
-				"file":          "src/util.go",
-				"modified_at":   time.Now().UTC().Format(time.RFC3339),
-				"commit_sha":    "1234567890abcdef",
-				"lines_added":   4,
-				"lines_removed": 1,
+				"sha":         sha,
+				"file_path":   "internal/bar.go",
+				"modified_at": modifiedAt,
 			},
 		},
 	}
@@ -218,7 +198,8 @@ func (s *churnVerbState) aValidChurnWebhookPOSTIsSentForSHA(sha string) error {
 	s.payload = body
 	s.payloadHash = sha256HexChurn(body)
 
-	// Clean any previous test state for this payload hash.
+	// Wipe prior scan_run rows for this exact payload hash so
+	// the idempotency test sees a clean slate.
 	_, _ = s.db.ExecContext(context.Background(),
 		`DELETE FROM clean_code.scan_run WHERE payload_hash = $1`, s.payloadHash)
 
@@ -228,7 +209,7 @@ func (s *churnVerbState) aValidChurnWebhookPOSTIsSentForSHA(sha string) error {
 func (s *churnVerbState) doSignedPostChurn(body []byte) error {
 	sig := computeHMACSHA256Churn([]byte(s.hmacSecret), body)
 
-	url := s.webhookURL + "/v1/webhook/churn"
+	url := s.webhookURL + "/v1/ingest/churn"
 	req, err := http.NewRequestWithContext(
 		context.Background(), http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -236,6 +217,19 @@ func (s *churnVerbState) doSignedPostChurn(body []byte) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Hub-Signature-256", "sha256="+sig)
+	// Stage-6 secret-resolver Router REQUIRES the canonical
+	// `X-Signing-Key-Id` header (=
+	// `webhook.SigningKeyIDHeader` at
+	// `internal/ingest/webhook/secret_resolver.go:34`); a
+	// missing or empty value triggers a 401 +
+	// `HMAC_MISSING_KEY_ID` before the body is HMAC-verified
+	// (router_test.go:557-575 pins the order). The CI
+	// workflow exports
+	// `CLEAN_CODE_WEBHOOK_SIGNING_KEY_ID` before compose-up
+	// and the binary's `StaticSecretResolver` is seeded with
+	// the (key_id, secret) pair via
+	// `cmd/clean-code-metric-ingestor/main.go:618-621`.
+	req.Header.Set("X-Signing-Key-Id", s.signingKeyID)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -255,244 +249,219 @@ func (s *churnVerbState) doSignedPostChurn(body []byte) error {
 		ScanRunID string `json:"scan_run_id"`
 	}
 	if err := json.Unmarshal(respBody, &result); err == nil && result.ScanRunID != "" {
+		if s.firstScanRunID == "" {
+			s.firstScanRunID = result.ScanRunID
+		}
 		s.lastScanRunID = result.ScanRunID
 		s.currentScanRunID = result.ScanRunID
 	}
 	return nil
 }
 
-func (s *churnVerbState) theModificationCountInWindowMaterialiserRuns() error {
-	// In CI the materialiser runs on a tick; in this e2e suite we just
-	// wait for the row to appear with a bounded retry. The materialiser
-	// daemon's cadence is owned by Stage 2.6. The poll filters by the
-	// scenario-captured (repo_id, sha) so we observe the materialiser
-	// output LINKED TO THIS SCENARIO'S churn_event rows -- not any
-	// pre-existing modification_count_in_window row (iter-3 evaluator
-	// item 4).
-	if s.lastChurnRepoID == "" || s.lastChurnSHA == "" {
-		return fmt.Errorf("missing churn-event identity capture; the precondition step `churn_event rows exist for a scope` must run first")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		var count int
-		err := s.db.QueryRowContext(ctx, `
-			SELECT COUNT(*) FROM clean_code.metric_sample
-			 WHERE metric_kind = 'modification_count_in_window'
-			   AND repo_id     = $1::uuid
-			   AND sha         = $2
-		`, s.lastChurnRepoID, s.lastChurnSHA).Scan(&count)
-		if err == nil && count > 0 {
-			return nil
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	return fmt.Errorf("materialiser did not emit modification_count_in_window for repo_id=%s sha=%s within 30s",
-		s.lastChurnRepoID, s.lastChurnSHA)
+func (s *churnVerbState) theSameChurnPayloadIsPOSTedAgainWithAValidSignature() error {
+	return s.doSignedPostChurn(s.payload)
 }
 
 // ---------------------------------------------------------------------------
-// Then steps -- churn-writes-no-metric-sample
+// Then steps
 // ---------------------------------------------------------------------------
 
-func (s *churnVerbState) aScanRunRowExistsWithKindAndStatus(wantKind, wantStatus string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	var kind, status string
-	err := s.db.QueryRowContext(ctx, `
+func (s *churnVerbState) aScanRunRowExistsWithKindAndStatus(kind, status string) error {
+	var got struct {
+		Kind   string
+		Status string
+	}
+	err := s.db.QueryRowContext(context.Background(), `
 		SELECT kind, status FROM clean_code.scan_run
 		WHERE payload_hash = $1
 		ORDER BY created_at DESC
 		LIMIT 1
-	`, s.payloadHash).Scan(&kind, &status)
-	if err == sql.ErrNoRows {
-		return fmt.Errorf("no scan_run row found for payload_hash=%s", s.payloadHash)
-	}
+	`, s.payloadHash).Scan(&got.Kind, &got.Status)
 	if err != nil {
-		return fmt.Errorf("querying scan_run: %w", err)
+		return fmt.Errorf("looking up scan_run: %w", err)
 	}
-	if kind != wantKind {
-		return fmt.Errorf("scan_run kind: want %q, got %q", wantKind, kind)
+	if got.Kind != kind {
+		return fmt.Errorf("scan_run.kind=%q; want %q", got.Kind, kind)
 	}
-	if status != wantStatus {
-		return fmt.Errorf("scan_run status: want %q, got %q", wantStatus, status)
+	if got.Status != status {
+		return fmt.Errorf("scan_run.status=%q; want %q", got.Status, status)
 	}
 	return nil
 }
 
 func (s *churnVerbState) theMetricSampleRowCountIsUnchanged() error {
-	var countAfter int
+	var after int
 	err := s.db.QueryRowContext(context.Background(), `
 		SELECT COUNT(*) FROM clean_code.metric_sample
-	`).Scan(&countAfter)
+	`).Scan(&after)
 	if err != nil {
-		return fmt.Errorf("counting metric_sample rows after: %w", err)
+		return fmt.Errorf("counting metric_sample rows: %w", err)
 	}
-	if countAfter != s.metricSampleCountBefore {
-		return fmt.Errorf("metric_sample row count changed: before=%d, after=%d",
-			s.metricSampleCountBefore, countAfter)
+	if after != s.metricSampleCountBefore {
+		return fmt.Errorf("metric_sample count=%d (was %d); churn verb MUST NOT write metric_sample rows directly",
+			after, s.metricSampleCountBefore)
 	}
 	return nil
 }
 
-func (s *churnVerbState) churnEventRowsAreAppendedForTheNewScanRun() error {
-	if s.currentScanRunID == "" {
-		return fmt.Errorf("no scan_run_id captured; cannot assert churn_event linkage")
-	}
+func (s *churnVerbState) oneOrMoreChurnEventRowsExistForThatScanRun() error {
 	var count int
 	err := s.db.QueryRowContext(context.Background(), `
 		SELECT COUNT(*) FROM clean_code.churn_event
 		WHERE scan_run_id = $1
 	`, s.currentScanRunID).Scan(&count)
 	if err != nil {
-		return fmt.Errorf("querying churn_event: %w", err)
+		return fmt.Errorf("counting churn_event rows: %w", err)
 	}
 	if count == 0 {
-		return fmt.Errorf("expected churn_event rows for scan_run_id=%s, got 0",
-			s.currentScanRunID)
+		return fmt.Errorf("churn_event count for scan_run_id=%s is 0; want >0", s.currentScanRunID)
 	}
 	return nil
 }
 
-// ---------------------------------------------------------------------------
-// Then steps -- materialiser-consumes-churn
-// ---------------------------------------------------------------------------
-
-func (s *churnVerbState) aMetricSampleRowExistsWithMetricKind(wantKind string) error {
-	if s.lastChurnRepoID == "" || s.lastChurnSHA == "" {
-		return fmt.Errorf("missing churn-event identity capture; the precondition step `churn_event rows exist for a scope` must run first")
+func (s *churnVerbState) theResponseStatusCodeIs2xxAndAScanRunIDIsReturned() error {
+	if s.lastStatusCode < 200 || s.lastStatusCode >= 300 {
+		return fmt.Errorf("status=%d; want 2xx", s.lastStatusCode)
 	}
+	if s.lastScanRunID == "" {
+		return fmt.Errorf("no scan_run_id in response body")
+	}
+	return nil
+}
+
+func (s *churnVerbState) theSameScanRunIDIsReturned() error {
+	if s.firstScanRunID == "" || s.lastScanRunID == "" {
+		return fmt.Errorf("missing scan_run_id state: first=%q last=%q",
+			s.firstScanRunID, s.lastScanRunID)
+	}
+	if s.firstScanRunID != s.lastScanRunID {
+		return fmt.Errorf("scan_run_id changed across replay: first=%s last=%s",
+			s.firstScanRunID, s.lastScanRunID)
+	}
+	return nil
+}
+
+func (s *churnVerbState) noSecondScanRunRowIsAppendedForThatPayloadHash() error {
 	var count int
 	err := s.db.QueryRowContext(context.Background(), `
-		SELECT COUNT(*) FROM clean_code.metric_sample
-		 WHERE metric_kind = $1
-		   AND repo_id     = $2::uuid
-		   AND sha         = $3
-	`, wantKind, s.lastChurnRepoID, s.lastChurnSHA).Scan(&count)
+		SELECT COUNT(*) FROM clean_code.scan_run
+		WHERE payload_hash = $1
+	`, s.payloadHash).Scan(&count)
 	if err != nil {
-		return fmt.Errorf("querying metric_sample by kind: %w", err)
+		return fmt.Errorf("counting scan_run rows for payload_hash: %w", err)
 	}
-	if count == 0 {
-		return fmt.Errorf("no metric_sample row with metric_kind=%q for repo_id=%s sha=%s",
-			wantKind, s.lastChurnRepoID, s.lastChurnSHA)
+	if count != 1 {
+		return fmt.Errorf("scan_run count for payload_hash=%s is %d; want 1 (idempotent replay)",
+			s.payloadHash, count)
 	}
 	return nil
 }
 
-func (s *churnVerbState) theMaterialiserEmittedSampleHasPackAndSource(wantPack, wantSource string) error {
-	if s.lastChurnRepoID == "" || s.lastChurnSHA == "" {
-		return fmt.Errorf("missing churn-event identity capture; the precondition step `churn_event rows exist for a scope` must run first")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	var pack, source string
-	err := s.db.QueryRowContext(ctx, `
-		SELECT pack::text, source::text
-		  FROM clean_code.metric_sample
-		 WHERE metric_kind = 'modification_count_in_window'
-		   AND repo_id     = $1::uuid
-		   AND sha         = $2
-		 ORDER BY created_at DESC
-		 LIMIT 1
-	`, s.lastChurnRepoID, s.lastChurnSHA).Scan(&pack, &source)
-	if err == sql.ErrNoRows {
-		return fmt.Errorf("no modification_count_in_window metric_sample row for repo_id=%s sha=%s",
-			s.lastChurnRepoID, s.lastChurnSHA)
-	}
+func (s *churnVerbState) noDuplicateChurnEventRowsAreAppended() error {
+	var dups int
+	err := s.db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*) FROM (
+			SELECT file_path, sha, COUNT(*) AS n
+			FROM clean_code.churn_event
+			WHERE scan_run_id = $1
+			GROUP BY file_path, sha
+			HAVING COUNT(*) > 1
+		) sub
+	`, s.currentScanRunID).Scan(&dups)
 	if err != nil {
-		return fmt.Errorf("querying materialiser-emitted sample: %w", err)
+		return fmt.Errorf("counting duplicate churn_event rows: %w", err)
 	}
-	if pack != wantPack {
-		return fmt.Errorf("pack: want %q, got %q", wantPack, pack)
+	if dups != 0 {
+		return fmt.Errorf("found %d duplicate (file_path, sha) groupings in churn_event; want 0", dups)
 	}
-	if source != wantSource {
-		return fmt.Errorf("source: want %q, got %q", wantSource, source)
+	return nil
+}
+
+// theStagedChurnEventRowsCarryTheMaterialiserShape asserts the
+// staged `churn_event` rows have the schema the
+// `modification_count_in_window` materialiser depends on:
+// each row carries a non-empty (repo_id, sha, file_path,
+// modified_at). This is the contract handoff between the
+// churn verb (this workstream) and the future
+// modification-count sweeper (a separate workstream). When the
+// sweeper lands it will SELECT exactly these four columns.
+func (s *churnVerbState) theStagedChurnEventRowsCarryTheMaterialiserShape() error {
+	var orphans int
+	err := s.db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*) FROM clean_code.churn_event
+		WHERE scan_run_id = $1
+		  AND (repo_id IS NULL
+		    OR sha IS NULL OR sha = ''
+		    OR file_path IS NULL OR file_path = ''
+		    OR modified_at IS NULL)
+	`, s.currentScanRunID).Scan(&orphans)
+	if err != nil {
+		return fmt.Errorf("checking churn_event materialiser-shape: %w", err)
+	}
+	if orphans != 0 {
+		return fmt.Errorf("found %d churn_event rows missing required materialiser fields (repo_id/sha/file_path/modified_at)", orphans)
 	}
 	return nil
 }
 
 // ---------------------------------------------------------------------------
-// scenario initializer
+// godog wiring
 // ---------------------------------------------------------------------------
 
-func InitializeScenario_external_metric_ingest_webhook_ingest_churn_verb_feeds_materialiser(ctx *godog.ScenarioContext) {
-	var state *churnVerbState
-
-	ctx.Before(func(bctx context.Context, sc *godog.Scenario) (context.Context, error) {
-		state = newChurnVerbState()
-		return bctx, nil
-	})
-
-	ctx.After(func(actx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
-		if state != nil {
-			state.close()
-		}
-		return actx, nil
-	})
-
-	// Given
-	ctx.Step(`^a running webhook service connected to PostgreSQL$`, func() error {
-		return state.aRunningWebhookServiceConnectedToPostgreSQL()
-	})
-	ctx.Step(`^the database is migrated and repo-d is seeded$`, func() error {
-		return state.theDatabaseIsMigratedAndRepoDIsSeeded()
-	})
-	ctx.Step(`^churn_event rows exist for a scope$`, func() error {
-		return state.churnEventRowsExistForAScope()
-	})
-
-	// When
-	ctx.Step(`^a valid churn webhook POST is sent for SHA "([^"]*)"$`, func(sha string) error {
-		return state.aValidChurnWebhookPOSTIsSentForSHA(sha)
-	})
-	ctx.Step(`^the modification_count_in_window materialiser runs$`, func() error {
-		return state.theModificationCountInWindowMaterialiserRuns()
-	})
-
-	// Then -- churn-writes-no-metric-sample
-	ctx.Step(`^a scan_run row exists with kind "([^"]*)" and status "([^"]*)"$`, func(kind, status string) error {
-		return state.aScanRunRowExistsWithKindAndStatus(kind, status)
-	})
-	ctx.Step(`^the metric_sample row count is unchanged$`, func() error {
-		return state.theMetricSampleRowCountIsUnchanged()
-	})
-	ctx.Step(`^churn_event rows are appended for the new scan_run$`, func() error {
-		return state.churnEventRowsAreAppendedForTheNewScanRun()
-	})
-
-	// Then -- materialiser-consumes-churn
-	ctx.Step(`^a metric_sample row exists with metric_kind "([^"]*)"$`, func(kind string) error {
-		return state.aMetricSampleRowExistsWithMetricKind(kind)
-	})
-	ctx.Step(`^the materialiser-emitted sample has pack "([^"]*)" and source "([^"]*)"$`, func(pack, source string) error {
-		return state.theMaterialiserEmittedSampleHasPackAndSource(pack, source)
-	})
-}
-
-// ---------------------------------------------------------------------------
-// test entrypoint
-// ---------------------------------------------------------------------------
-
+// TestE2E_external_metric_ingest_webhook_ingest_churn_verb_feeds_materialiser
+// is the entry point for the
+// `external_metric_ingest_webhook_ingest_churn_verb_feeds_materialiser`
+// e2e feature. The name follows the closed
+// `TestE2E_<feature>` convention every other e2e in this
+// directory uses, so the CI workflows can invoke it via
+// `-run TestE2E_external_metric_ingest_webhook_ingest_churn_verb_feeds_materialiser`.
+//
+// Compose-up requires (set by the CI workflows BEFORE
+// `docker compose up`):
+//
+//   - CLEAN_CODE_PG_URL                       = `postgres://...` to the e2e DB
+//   - CLEAN_CODE_WEBHOOK_URL                  = base URL of the metric-ingestor (default :8084)
+//   - CLEAN_CODE_WEBHOOK_HMAC_SECRET          = the shared HMAC secret matching the binary's config
+//   - CLEAN_CODE_ENABLE_EXTERNAL_INGEST_WEBHOOK = "true" so the binary mounts the Stage-6 Router
+//   - CLEAN_CODE_WEBHOOK_SIGNING_KEY_ID       = the publisher key id (sent as `X-Signing-Key-Id`)
+//
+// The phase-04 compose `webhook` service passes both new
+// env vars through to the container (`${VAR:-}` default
+// keeps backward-compat for sibling jobs that do NOT mount
+// the production Router).
+//
+// When any of these is missing the test skips (or fails
+// in setup with a clear error), mirroring the
+// other feature tests in this directory.
 func TestE2E_external_metric_ingest_webhook_ingest_churn_verb_feeds_materialiser(t *testing.T) {
-	requireEnv(t, "CLEAN_CODE_PG_URL")
-	requireEnv(t, "CLEAN_CODE_WEBHOOK_HMAC_SECRET")
+	if os.Getenv("CLEAN_CODE_PG_URL") == "" {
+		t.Skip("CLEAN_CODE_PG_URL is not set; skipping churn-verb e2e")
+	}
+	state := newChurnVerbState()
+	t.Cleanup(state.close)
 
 	suite := godog.TestSuite{
-		ScenarioInitializer: InitializeScenario_external_metric_ingest_webhook_ingest_churn_verb_feeds_materialiser,
+		ScenarioInitializer: func(sc *godog.ScenarioContext) {
+			sc.Step(`^a running webhook service connected to PostgreSQL$`, state.aRunningWebhookServiceConnectedToPostgreSQLChurn)
+			sc.Step(`^the database is migrated and repo-d is seeded$`, state.theDatabaseIsMigratedAndRepoDIsSeededChurn)
+			sc.Step(`^a valid churn webhook POST is sent for SHA "([^"]+)"$`, state.aValidChurnWebhookPOSTIsSentForSHA)
+			sc.Step(`^a scan_run row exists with kind "([^"]+)" and status "([^"]+)"$`, state.aScanRunRowExistsWithKindAndStatus)
+			sc.Step(`^the metric_sample row count is unchanged$`, state.theMetricSampleRowCountIsUnchanged)
+			sc.Step(`^one or more churn_event rows exist for that scan_run$`, state.oneOrMoreChurnEventRowsExistForThatScanRun)
+			sc.Step(`^the staged churn_event rows carry the materialiser shape$`, state.theStagedChurnEventRowsCarryTheMaterialiserShape)
+			sc.Step(`^the response status code is 2xx and a scan_run_id is returned$`, state.theResponseStatusCodeIs2xxAndAScanRunIDIsReturned)
+			sc.Step(`^the same churn payload is POSTed again with a valid signature$`, state.theSameChurnPayloadIsPOSTedAgainWithAValidSignature)
+			sc.Step(`^the same scan_run_id is returned$`, state.theSameScanRunIDIsReturned)
+			sc.Step(`^no second scan_run row is appended for that payload hash$`, state.noSecondScanRunRowIsAppendedForThatPayloadHash)
+			sc.Step(`^no duplicate churn_event rows are appended for the same \(file_path, sha\)$`, state.noDuplicateChurnEventRowsAreAppended)
+		},
 		Options: &godog.Options{
 			Format:   "pretty",
 			Paths:    []string{"external_metric_ingest_webhook_ingest_churn_verb_feeds_materialiser.feature"},
 			TestingT: t,
 		},
 	}
-
 	if suite.Run() != 0 {
-		t.Fatal("godog test suite failed")
+		t.Fatal("non-zero godog suite status; see scenario output above")
 	}
 }

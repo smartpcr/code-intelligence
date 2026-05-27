@@ -135,10 +135,15 @@ func (h *CoverageVerbHandler) SHABinding() string {
 // parsed payload between the two calls so the Router
 // stays per-verb-shape agnostic.
 //
+// The `headers` argument is unused: coverage's body is
+// the canonical source of `(repo_id, sha)` (they live in
+// the root `<coverage>` element's attributes), unlike
+// header-borne verbs such as test_balance.
+//
 // On any error returns a wrapped [coverage.Err*] sentinel
 // the [ClassifyError] mapping turns into the canonical
 // 400 / 422 response.
-func (h *CoverageVerbHandler) ExtractMetadata(ctx context.Context, body []byte) (VerbPayloadMetadata, error) {
+func (h *CoverageVerbHandler) ExtractMetadata(ctx context.Context, _ http.Header, body []byte) (VerbPayloadMetadata, error) {
 	repoID, sha, err := coverage.ExtractRootMetadata(body)
 	if err != nil {
 		return VerbPayloadMetadata{}, err
@@ -158,7 +163,15 @@ func (h *CoverageVerbHandler) ExtractMetadata(ctx context.Context, body []byte) 
 // `coverage_samples_written` / `coverage_rows_hydrated` /
 // `coverage_skipped_unbound_scope` counters the Router
 // lifts into the 200 response body.
-func (h *CoverageVerbHandler) Handle(ctx context.Context, body []byte, scanRunID uuid.UUID) (VerbHandleResult, error) {
+//
+// The `metadata` argument supplies the `(repo_id, sha)`
+// the Router already validated via [ExtractMetadata];
+// Handle re-derives the same values from the body for
+// defensive parity with the parser's required inputs
+// (the same trade-off the churn handler makes -- the
+// metadata-and-body bridge keeps the call site shape
+// uniform with the rest of the verb set).
+func (h *CoverageVerbHandler) Handle(ctx context.Context, _ VerbPayloadMetadata, body []byte, scanRunID uuid.UUID) (VerbHandleResult, error) {
 	// Re-extract repo_id / sha first so the same body is
 	// the source of truth for the parser's required
 	// (RepoID, SHA) inputs. ExtractRootMetadata already
@@ -314,6 +327,22 @@ func (h *CoverageVerbHandler) ClassifyError(err error) (int, string) {
 	default:
 		return 0, ""
 	}
+}
+
+// CanonicalRequest implements [VerbHandler]. Coverage's
+// body envelope carries `(repo_id, sha)` at the top level
+// so the canonical signed material IS the raw body bytes
+// -- no header folding is required. This mirrors the
+// churn handler's approach (see `churn_verb.go`) and
+// preserves backward compatibility with publishers that
+// HMAC the raw body.
+//
+// Pre-Stage-6.2 the compile-time guard at the bottom of
+// this file referenced [VerbHandler] but no concrete
+// implementation existed; iter 2 of Stage 6.2 added this
+// method to unblock the tree-wide build gate.
+func (h *CoverageVerbHandler) CanonicalRequest(_ http.Header, body []byte) []byte {
+	return body
 }
 
 // Compile-time interface assertions so a future signature

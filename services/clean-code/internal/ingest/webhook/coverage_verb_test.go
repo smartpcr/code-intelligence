@@ -126,7 +126,7 @@ func TestCoverageVerbHandler_Identity(t *testing.T) {
 func TestCoverageVerbHandler_ExtractMetadata_HappyPath(t *testing.T) {
 	t.Parallel()
 	h, _ := newCoverageVerb(t)
-	md, err := h.ExtractMetadata(context.Background(), goodCoverageBody())
+	md, err := h.ExtractMetadata(context.Background(), http.Header{}, goodCoverageBody())
 	if err != nil {
 		t.Fatalf("ExtractMetadata: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestCoverageVerbHandler_ExtractMetadata_MissingRepoID(t *testing.T) {
 	t.Parallel()
 	h, _ := newCoverageVerb(t)
 	body := []byte(`<?xml version="1.0"?><coverage sha="` + covTestSHA + `"/>`)
-	_, err := h.ExtractMetadata(context.Background(), body)
+	_, err := h.ExtractMetadata(context.Background(), http.Header{}, body)
 	if err == nil {
 		t.Fatalf("ExtractMetadata: want error, got nil")
 	}
@@ -171,7 +171,7 @@ func TestCoverageVerbHandler_HappyPath_HonoursSuppliedScanRunID(t *testing.T) {
 	scanRunID := uuid.Must(uuid.NewV7())
 	body := goodCoverageBody()
 
-	res, err := h.Handle(context.Background(), body, scanRunID)
+	res, err := h.Handle(context.Background(), webhook.VerbPayloadMetadata{}, body, scanRunID)
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestCoverageVerbHandler_DetailReportsSkippedUnboundScope(t *testing.T) {
 		WithCoverageSweep(sweep)
 	h := webhook.NewCoverageVerbHandler(ing)
 
-	res, err := h.Handle(context.Background(), goodCoverageBody(), uuid.Must(uuid.NewV7()))
+	res, err := h.Handle(context.Background(), webhook.VerbPayloadMetadata{}, goodCoverageBody(), uuid.Must(uuid.NewV7()))
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -277,7 +277,7 @@ func TestCoverageVerbHandler_RejectsBadXML(t *testing.T) {
 	t.Parallel()
 	h, writer := newCoverageVerb(t)
 	scanRunID := uuid.Must(uuid.NewV7())
-	_, err := h.Handle(context.Background(), []byte("<not xml"), scanRunID)
+	_, err := h.Handle(context.Background(), webhook.VerbPayloadMetadata{}, []byte("<not xml"), scanRunID)
 	if err == nil {
 		t.Fatalf("Handle bad XML: want error, got nil")
 	}
@@ -300,7 +300,7 @@ func TestCoverageVerbHandler_RejectsTrailingContent(t *testing.T) {
 	h, _ := newCoverageVerb(t)
 	body := append([]byte{}, goodCoverageBody()...)
 	body = append(body, []byte("<extra/>")...)
-	_, err := h.Handle(context.Background(), body, uuid.Must(uuid.NewV7()))
+	_, err := h.Handle(context.Background(), webhook.VerbPayloadMetadata{}, body, uuid.Must(uuid.NewV7()))
 	if err == nil {
 		t.Fatalf("Handle trailing content: want error, got nil")
 	}

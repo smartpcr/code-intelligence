@@ -140,13 +140,18 @@ func (h *DefectsVerbHandler) SHABinding() string {
 // validation here keeps the idempotency table clean: a
 // malformed body fails as 400 BEFORE the scan_run is opened.
 //
+// The `headers` argument is unused: defects' body is the
+// canonical source of `repo_id` (the per-row binding leaves
+// `scan_run.to_sha` NULL), unlike header-borne verbs such
+// as test_balance.
+//
 // The double-decode (here + in [Handle]) is a deliberate
 // trade-off: ExtractMetadata MUST run BEFORE the durable
 // scan_run claim, but decoding the body twice is preferable
 // to leaking the parsed payload through the [VerbHandler]
 // interface (which would couple the Router to per-verb body
 // shapes).
-func (h *DefectsVerbHandler) ExtractMetadata(ctx context.Context, body []byte) (VerbPayloadMetadata, error) {
+func (h *DefectsVerbHandler) ExtractMetadata(ctx context.Context, _ http.Header, body []byte) (VerbPayloadMetadata, error) {
 	payload, err := h.decode(body)
 	if err != nil {
 		return VerbPayloadMetadata{}, err
@@ -161,16 +166,18 @@ func (h *DefectsVerbHandler) ExtractMetadata(ctx context.Context, body []byte) (
 	}, nil
 }
 
-// Handle implements [VerbHandler]. Decodes + revalidates the
-// body defensively (the Router contract guarantees
-// ExtractMetadata ran first, but the parse is cheap and the
-// defensive layer protects against a future Router refactor
-// that elides the metadata step) and returns a success
-// envelope. The payload itself is then DISCARDED -- no
-// `metric_sample` row, no defect row, no other persisted
-// state. The parent scan_run's `payload_hash` (recorded by
-// the Router via [ScanRunRepository.OpenExternal]) is the
-// ONLY surviving side-effect.
+// envelope on the happy path. The payload itself is then
+// DISCARDED -- no `metric_sample` row, no defect row, no
+// other persisted state. The parent scan_run's
+// `payload_hash` (recorded by the Router via
+// [ScanRunRepository.OpenExternal]) is the ONLY surviving
+// side-effect.
+//
+// The `metadata` argument supplies the `(repo_id, sha)`
+// the Router already validated via [ExtractMetadata]; the
+// defects handler reuses ExtractMetadata's parser here
+// because the writer step needs the full row set, not just
+// the metadata tuple.
 //
 // # Detail envelope
 //
@@ -180,7 +187,7 @@ func (h *DefectsVerbHandler) ExtractMetadata(ctx context.Context, body []byte) (
 // verb-specific cache); emitting one on the happy path
 // would diverge from the replay envelope. Keeping it nil
 // makes the two paths shape-identical.
-func (h *DefectsVerbHandler) Handle(ctx context.Context, body []byte, scanRunID uuid.UUID) (VerbHandleResult, error) {
+func (h *DefectsVerbHandler) Handle(ctx context.Context, _ VerbPayloadMetadata, body []byte, scanRunID uuid.UUID) (VerbHandleResult, error) {
 	payload, err := h.decode(body)
 	if err != nil {
 		return VerbHandleResult{}, err
@@ -294,6 +301,20 @@ func (h *DefectsVerbHandler) ClassifyError(err error) (int, string) {
 		}
 		return 0, ""
 	}
+}
+
+// CanonicalRequest implements [VerbHandler]. Defects'
+// body envelope carries `(repo_id, sha)` at the top level
+// so the canonical signed material IS the raw body bytes
+// -- no header folding is required. Mirrors the churn /
+// coverage approach.
+//
+// Pre-Stage-6.2 the compile-time guard at the bottom of
+// this file referenced [VerbHandler] but no concrete
+// implementation existed; iter 2 of Stage 6.2 added this
+// method to unblock the tree-wide build gate.
+func (h *DefectsVerbHandler) CanonicalRequest(_ http.Header, body []byte) []byte {
+	return body
 }
 
 // Compile-time interface assertions so a future signature

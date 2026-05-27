@@ -122,3 +122,7 @@ services/agent-memory/deploy/local/data/
 services/agent-memory/deploy/local/**/_data/
 services/clean-code/deploy/local/data/
 services/clean-code/deploy/local/**/_data/
+
+# claude
+!.claude/
+!CLAUDE.md

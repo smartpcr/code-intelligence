@@ -693,12 +693,12 @@ func TestPayloadValidate(t *testing.T) {
 		p       Payload
 		wantErr string
 	}{
-		{"push ok", Payload{Kind: "push", ToSHA: "x"}, ""},
-		{"merge ok", Payload{Kind: "merge", ToSHA: "x"}, ""},
-		{"push without from_sha ok", Payload{Kind: "push", ToSHA: "x"}, ""},
-		{"empty kind", Payload{ToSHA: "x"}, "kind must be one of"},
-		{"register kind", Payload{Kind: "register", ToSHA: "x"}, "kind must be one of"},
-		{"manual kind", Payload{Kind: "manual", ToSHA: "x"}, "kind must be one of"},
+		{"push ok", Payload{Kind: "push", FromSHA: testFromSHA, ToSHA: testToSHA}, ""},
+		{"merge ok", Payload{Kind: "merge", FromSHA: testFromSHA, ToSHA: testToSHA}, ""},
+		{"push without from_sha ok", Payload{Kind: "push", ToSHA: testToSHA}, ""},
+		{"empty kind", Payload{ToSHA: testToSHA}, "kind must be one of"},
+		{"register kind", Payload{Kind: "register", ToSHA: testToSHA}, "kind must be one of"},
+		{"manual kind", Payload{Kind: "manual", ToSHA: testToSHA}, "kind must be one of"},
 		{"missing to_sha", Payload{Kind: "push"}, "to_sha is required"},
 	}
 	for _, tc := range cases {

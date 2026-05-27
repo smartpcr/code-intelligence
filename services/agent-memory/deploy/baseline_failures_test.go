@@ -46,26 +46,7 @@ import (
 // When the upstream owner fixes one of these tests, delete
 // the entry here AND the corresponding section in the .md
 // doc.
-var expectedBaselineFailures = map[string][]string{
-	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/webhookreceiver": {
-		// Pre-existing on feature/memory; fixture passes
-		// to_sha: "x" against an `isHexGitSHA` validator
-		// that requires 40/64 hex chars. Belongs to the
-		// Stage 3.4 webhook-receiver workstream.
-		"TestPayloadValidate",
-	},
-	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint": {
-		// Pre-existing on feature/memory; golden vectors
-		// pinned at commit 5058db7 do not match the
-		// current NodeFingerprint/EdgeFingerprint
-		// implementation. Belongs to the Stage 7.2
-		// GraphWriter library workstream.
-		"TestNodeFingerprint_goldenVector",
-		"TestEdgeFingerprint_goldenVector",
-		"TestNodeFingerprint_matchesHandRolledConcatenation",
-		"TestEdgeFingerprint_matchesHandRolledConcatenation",
-	},
-}
+var expectedBaselineFailures = map[string][]string{}
 
 // TestBaselineFailuresAreOnlyDocumentedOnes runs
 // `go test ./...` from the agent-memory module root and

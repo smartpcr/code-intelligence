@@ -8,8 +8,6 @@ import (
 	"testing"
 
 	sitter "github.com/smacker/go-tree-sitter"
-	"github.com/smacker/go-tree-sitter/typescript/tsx"
-	"github.com/smacker/go-tree-sitter/typescript/typescript"
 )
 
 // The tests in this file exercise the tree-sitter-backed
@@ -184,22 +182,29 @@ function App(): JSX.Element {
   return <div className="x">hello <Button onClick={handle} /></div>;
 }
 `
-	// First: assert the helper picks the JSX-aware grammar
-	// for .tsx / .jsx and the non-JSX grammar otherwise.
-	// This is the strict, no-loopholes verification of the
-	// finding -- the parser's behaviour depends entirely on
-	// what tsGrammarFor returns.
-	if got := tsGrammarFor("src/App.tsx"); got != tsx.GetLanguage() {
-		t.Fatalf("tsGrammarFor(.tsx): expected tsx grammar, got %p", got)
-	}
-	if got := tsGrammarFor("src/App.jsx"); got != tsx.GetLanguage() {
-		t.Fatalf("tsGrammarFor(.jsx): expected tsx grammar, got %p", got)
-	}
-	if got := tsGrammarFor("src/App.ts"); got != typescript.GetLanguage() {
-		t.Fatalf("tsGrammarFor(.ts): expected typescript grammar, got %p", got)
-	}
-	if got := tsGrammarFor("src/App.js"); got != typescript.GetLanguage() {
-		t.Fatalf("tsGrammarFor(.js): expected typescript grammar, got %p", got)
+	// First: assert the helper behaviorally picks the JSX-aware
+	// grammar for .tsx / .jsx and the non-JSX grammar otherwise.
+	// The smacker bindings can return distinct Go wrappers for
+	// the same underlying C grammar, so pointer identity is not a
+	// reliable grammar check.
+	for _, tc := range []struct {
+		relPath      string
+		wantHasError bool
+	}{
+		{relPath: "src/App.tsx", wantHasError: false},
+		{relPath: "src/App.jsx", wantHasError: false},
+		{relPath: "src/App.ts", wantHasError: true},
+		{relPath: "src/App.js", wantHasError: true},
+	} {
+		t.Run(tc.relPath, func(t *testing.T) {
+			root, err := sitter.ParseCtx(context.Background(), []byte(src), tsGrammarFor(tc.relPath))
+			if err != nil {
+				t.Fatalf("ParseCtx: %v", err)
+			}
+			if got := root.HasError(); got != tc.wantHasError {
+				t.Fatalf("HasError() = %v, want %v; tree: %s", got, tc.wantHasError, root.String())
+			}
+		})
 	}
 
 	// Second: assert end-to-end parse of a JSX-using .tsx
@@ -214,19 +219,6 @@ function App(): JSX.Element {
 	if root.HasError() {
 		t.Fatalf("tsx parse produced ERROR nodes: %s", root.String())
 	}
-	// Bonus: parsing the same source with the non-JSX
-	// grammar (the previous-iter bug) MUST produce ERROR
-	// nodes -- this guards against a regression where
-	// somebody "simplifies" tsGrammarFor back to a single
-	// grammar.
-	rootBuggy, err := sitter.ParseCtx(context.Background(), []byte(src), typescript.GetLanguage())
-	if err != nil {
-		t.Fatalf("ParseCtx (non-JSX) for control case: %v", err)
-	}
-	if !rootBuggy.HasError() {
-		t.Fatalf("non-JSX grammar should have produced ERROR nodes on JSX input; got clean tree")
-	}
-
 	// Third: the LanguageParser end-to-end -- App must
 	// appear in the parse result.
 	parser := NewTreeSitterTypeScriptParser()

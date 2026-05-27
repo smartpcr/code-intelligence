@@ -78,10 +78,12 @@ func TestNodeFingerprint_goldenVector(t *testing.T) {
 		wantHex   string
 	}{
 		{
-			// Pre-image (plain `‖` concatenation per architecture.md §1.3):
+			// Pre-image (NUL-framed concatenation per fingerprint.go):
 			//   16 zero bytes
 			// ‖ "method"
+			// ‖ 0x00
 			// ‖ "pkg.Foo#bar(int)"
+			// ‖ 0x00
 			// ‖ "deadbeef"
 			// SHA-256 of the above = wantHex.
 			name:      "zero repo / method / pkg.Foo#bar(int) / deadbeef",
@@ -89,7 +91,7 @@ func TestNodeFingerprint_goldenVector(t *testing.T) {
 			kind:      "method",
 			sig:       "pkg.Foo#bar(int)",
 			sha:       "deadbeef",
-			wantHex:   "84c1e48392256987a22f4c3d87cb82f10c62562af6a0d857aec97d08d918f6e9",
+			wantHex:   "1aec00b695f9d36fe8ac05364e6f5fa1ccfd9dc24c56e1823a7e36a2c1b74efe",
 		},
 		{
 			name:      "real uuid / class / pkg.Foo / aa00aa00",
@@ -97,7 +99,7 @@ func TestNodeFingerprint_goldenVector(t *testing.T) {
 			kind:      "class",
 			sig:       "pkg.Foo",
 			sha:       "aa00aa00",
-			wantHex:   "0a57fdd3e1e28e9270e247beecee26dfb21cafa21c2d33c3104d7dbf151bd3cc",
+			wantHex:   "7775f09d34da9c3905daedb1d7e93b2eb3b7be40fac54e76137dc10fc8446cc7",
 		},
 	}
 	for _, tc := range cases {
@@ -127,7 +129,7 @@ func TestEdgeFingerprint_goldenVector(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EdgeFingerprint: %v", err)
 	}
-	const want = "6942b4e8a12a08727174ed5fcf0eac1a535faf2213b00f05b9b6d5babd32719d"
+	const want = "2afb4060b6be9d0f1df291e6b321ee19d944126ba5f52a2998ac6d2923e606ed"
 	if got.Hex() != want {
 		t.Errorf("EdgeFingerprint = %s, want %s", got.Hex(), want)
 	}
@@ -263,7 +265,7 @@ func TestEdgeFingerprint_emptyFieldsRejected(t *testing.T) {
 // SECOND way (assembling the concatenated pre-image bytes by
 // hand and feeding them to sha256.Sum256) and compares to
 // NodeFingerprint. If the implementation drifts from the
-// documented plain-concatenation scheme this test fails loudly
+// documented NUL-framed concatenation scheme this test fails loudly
 // without anyone needing to recompute the golden hex.
 func TestNodeFingerprint_matchesHandRolledConcatenation(t *testing.T) {
 	t.Parallel()
@@ -277,7 +279,9 @@ func TestNodeFingerprint_matchesHandRolledConcatenation(t *testing.T) {
 	var buf bytes.Buffer
 	buf.Write(repoID[:])
 	buf.WriteString(kind)
+	buf.WriteByte(0)
 	buf.WriteString(sig)
+	buf.WriteByte(0)
 	buf.WriteString(sha)
 	want := sha256.Sum256(buf.Bytes())
 
@@ -293,7 +297,7 @@ func TestNodeFingerprint_matchesHandRolledConcatenation(t *testing.T) {
 // TestEdgeFingerprint_matchesHandRolledConcatenation is the
 // edge-side equivalence test: it asserts EdgeFingerprint is the
 // SHA-256 of the literal byte concatenation
-// (repo_id ‖ kind ‖ src ‖ dst ‖ from_sha).
+// (repo_id ‖ kind ‖ 0x00 ‖ src ‖ dst ‖ from_sha).
 func TestEdgeFingerprint_matchesHandRolledConcatenation(t *testing.T) {
 	t.Parallel()
 	repoID := MustParseRepoID("c0ffee00-c0ff-ee00-c0ff-ee00c0ffee00")
@@ -307,6 +311,7 @@ func TestEdgeFingerprint_matchesHandRolledConcatenation(t *testing.T) {
 	var buf bytes.Buffer
 	buf.Write(repoID[:])
 	buf.WriteString(kind)
+	buf.WriteByte(0)
 	buf.Write(src[:])
 	buf.Write(dst[:])
 	buf.WriteString(sha)

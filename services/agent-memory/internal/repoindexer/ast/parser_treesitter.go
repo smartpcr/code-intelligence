@@ -108,30 +108,31 @@ func tsGrammarFor(relPath string) *sitter.Language {
 }
 
 const (
-	tsNodeProgram           = "program"
-	tsNodeClassDecl         = "class_declaration"
-	tsNodeAbstractClass     = "abstract_class_declaration"
-	tsNodeInterfaceDecl     = "interface_declaration"
-	tsNodeFunctionDecl      = "function_declaration"
-	tsNodeMethodDef         = "method_definition"
-	tsNodeMethodSignature   = "method_signature"
-	tsNodeClassBody         = "class_body"
-	tsNodeInterfaceBody     = "interface_body"
-	tsNodeObjectType        = "object_type"
-	tsNodeImportStmt        = "import_statement"
-	tsNodeExtendsClause     = "class_heritage"
-	tsNodeImplementsClause  = "implements_clause"
-	tsNodeExtendsTypeClause = "extends_type_clause"
-	tsNodeStatementBlock    = "statement_block"
-	tsNodeIdentifier        = "identifier"
-	tsNodeTypeIdentifier    = "type_identifier"
-	tsNodeTypeArguments     = "type_arguments"
-	tsNodeTypeParameters    = "type_parameters"
-	tsNodeFormalParameters  = "formal_parameters"
-	tsNodeCallExpression    = "call_expression"
-	tsNodeMemberExpression  = "member_expression"
-	tsNodeAssignmentExpr    = "assignment_expression"
-	tsNodeThis              = "this"
+	tsNodeProgram            = "program"
+	tsNodeClassDecl          = "class_declaration"
+	tsNodeAbstractClass      = "abstract_class_declaration"
+	tsNodeInterfaceDecl      = "interface_declaration"
+	tsNodeFunctionDecl       = "function_declaration"
+	tsNodeMethodDef          = "method_definition"
+	tsNodeMethodSignature    = "method_signature"
+	tsNodeClassBody          = "class_body"
+	tsNodeInterfaceBody      = "interface_body"
+	tsNodeObjectType         = "object_type"
+	tsNodeImportStmt         = "import_statement"
+	tsNodeClassHeritage      = "class_heritage"
+	tsNodeClassExtendsClause = "extends_clause"
+	tsNodeImplementsClause   = "implements_clause"
+	tsNodeExtendsTypeClause  = "extends_type_clause"
+	tsNodeStatementBlock     = "statement_block"
+	tsNodeIdentifier         = "identifier"
+	tsNodeTypeIdentifier     = "type_identifier"
+	tsNodeTypeArguments      = "type_arguments"
+	tsNodeTypeParameters     = "type_parameters"
+	tsNodeFormalParameters   = "formal_parameters"
+	tsNodeCallExpression     = "call_expression"
+	tsNodeMemberExpression   = "member_expression"
+	tsNodeAssignmentExpr     = "assignment_expression"
+	tsNodeThis               = "this"
 )
 
 type tsWalker struct {
@@ -196,17 +197,17 @@ func (w *tsWalker) handleClass(n *sitter.Node, outer string) {
 	for i := uint32(0); i < n.NamedChildCount(); i++ {
 		child := n.NamedChild(int(i))
 		switch child.Type() {
-		case tsNodeExtendsClause:
+		case tsNodeClassHeritage:
 			for j := uint32(0); j < child.NamedChildCount(); j++ {
 				sub := child.NamedChild(int(j))
 				switch sub.Type() {
-				case tsNodeExtendsTypeClause:
+				case tsNodeClassExtendsClause, tsNodeExtendsTypeClause:
 					cls.Extends = append(cls.Extends, collectTSIdentifiers(sub, w.src)...)
 				case tsNodeImplementsClause:
 					cls.Implements = append(cls.Implements, collectTSIdentifiers(sub, w.src)...)
 				}
 			}
-		case tsNodeExtendsTypeClause:
+		case tsNodeClassExtendsClause, tsNodeExtendsTypeClause:
 			cls.Extends = append(cls.Extends, collectTSIdentifiers(child, w.src)...)
 		case tsNodeImplementsClause:
 			cls.Implements = append(cls.Implements, collectTSIdentifiers(child, w.src)...)

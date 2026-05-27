@@ -190,7 +190,7 @@ func (s *mgmtWriteState) aRepoRegisteredAtMode(mode string) error {
 	}
 	s.initialMode = mode
 	// Register a unique repo for this scenario
-	uniqueURL := fmt.Sprintf("https://github.com/acme/mode-test-%d", time.Now().UnixNano())
+	uniqueURL := "https://github.com/acme/" + s.generateUniqueID("mode-test")
 	repoID, err := s.registerRepo(uniqueURL)
 	if err != nil {
 		return fmt.Errorf("registering repo for mode test: %w", err)

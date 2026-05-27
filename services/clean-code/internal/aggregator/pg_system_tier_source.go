@@ -106,6 +106,59 @@ var ErrPGSystemTierInputSourceEmptySchema = errors.New("aggregator: NewPGSystemT
 // return identical bytes. The composer's downstream
 // determinism contract depends on this.
 //
+// # Deferred inputs (Stage 7.3 / Stage 8.x)
+//
+// Per iter-5 evaluator finding #1, the following composer
+// inputs are DELIBERATELY left zero-valued on every
+// [SystemTierInput] emitted by this Stage 7.2 source and
+// trigger the composer's `samples_pending` degraded path for
+// the affected metric_kinds. This is the architecture-correct
+// fail-safe behaviour, NOT a missing wiring:
+//
+//   - `SystemTierInput.VelocityWindows` -- left nil. Per the
+//     `velocity_trend` brief (architecture Sec 1.4.2 row 3:
+//     "trend slope across rolling
+//     `modification_count_in_window` samples"), velocity is a
+//     TIME-SERIES across multiple HEAD SHAs of the same repo,
+//     NOT multiple window sizes at a single SHA. Computing it
+//     correctly requires reading historical `metric_sample`
+//     rows by `(repo_id, scope_id, metric_kind)` across the
+//     last N retained SHAs and bucketing them by their
+//     producer scan's commit timestamp. That cross-SHA
+//     historic read is a Stage 7.3 deliverable (the
+//     implementation plan calls it out under "velocity-trend
+//     historical window scan"). Wiring a single-SHA
+//     proxy here would emit a semantically WRONG slope and
+//     defeat the composer's `samples_pending` fail-safe.
+//     Until Stage 7.3 lands, the composer correctly emits a
+//     degraded `velocity_trend` row with
+//     `degraded_reason='samples_pending'` per the architecture
+//     Sec 3.10 step 4 contract.
+//
+//   - `SystemTierInput.AuthorsByScope` -- left nil. Per the
+//     `knowledge_index` brief (architecture Sec 1.4.2 row 7:
+//     "bus-factor-style index over `modification_count_in_window`
+//     plus per-author churn data from `ingest.churn`"),
+//     populating this field requires reading the dedicated
+//     `churn_event` table (`ingest_pkg.churn_event(repo_id,
+//     sha, scope_id, author, commit_time, ...)`) which the
+//     `ingest.churn` verb populates per arch Sec 5.3.4. The
+//     `churn_event` reader belongs in a separate
+//     `PGChurnAuthorSource` shipped in Stage 7.3 alongside
+//     the velocity historic-window scan. Until Stage 7.3
+//     lands, the composer correctly emits degraded
+//     `knowledge_index` rows (per-file AND per-repo) with
+//     `degraded_reason='samples_pending'` per the architecture
+//     Sec 3.10 step 4 contract.
+//
+// The fail-safe contract is the canonical answer: the
+// composer NEVER silently drops a system-tier row -- it emits
+// a degraded one so downstream eval.gate + Insights envelope
+// surface the freshness state. Operators see the
+// `samples_pending` reason in `metric_sample.degraded_reason`
+// and trace it to the missing source via the Stage 7.3 work
+// item.
+//
 // # Concurrency
 //
 // Safe for concurrent invocation; each call opens its own
@@ -217,9 +270,14 @@ func (s *PGSystemTierInputSource) scopesQuery() string {
 // G3 invariant on foundation rows. The LEFT JOIN +
 // `mr.sample_id IS NULL` anti-join drops samples whose
 // active pointer references a retracted row.
+//
+// `ms.sample_id` is selected first so per-row error messages
+// can name the EXACT offending sample (operator triage:
+// `SELECT ... FROM metric_sample WHERE sample_id = $pasted`
+// is one click away).
 func (s *PGSystemTierInputSource) foundationSamplesQuery() string {
 	return fmt.Sprintf(
-		`SELECT sb.scope_id, sb.scope_kind::text, ms.metric_kind, ms.value, ms.attrs_json
+		`SELECT ms.sample_id, sb.scope_id, sb.scope_kind::text, ms.metric_kind, ms.value, ms.attrs_json
 		   FROM %s msa
 		   JOIN %s ms ON ms.sample_id = msa.sample_id
 		   JOIN %s sb ON sb.scope_id  = ms.scope_id
@@ -314,6 +372,34 @@ func (s *PGSystemTierInputSource) ReadSystemTierInputs(ctx context.Context) ([]S
 			Foundation:          foundation,
 			XRepoEdgesAvailable: false,
 			CallEdgesAvailable:  false,
+			// DEFERRED to Stage 7.3 per iter-5 evaluator
+			// item #1 (see the package-level "Deferred
+			// inputs" doc block above for the full
+			// architecture rationale): VelocityWindows
+			// requires a cross-SHA historic read of
+			// `modification_count_in_window` samples that
+			// the Stage 7.3 historic-window scanner will
+			// provide. Leaving nil here means the composer
+			// correctly emits a degraded `velocity_trend`
+			// row with `degraded_reason='samples_pending'`
+			// per arch Sec 3.10 step 4 -- the canonical
+			// fail-safe path.
+			VelocityWindows: nil,
+			// DEFERRED to Stage 7.3 per iter-5 evaluator
+			// item #1: AuthorsByScope requires a
+			// `churn_event` table reader
+			// (`PGChurnAuthorSource`) that Stage 7.3 ships
+			// alongside the historic-window scanner. The
+			// composer correctly emits degraded
+			// `knowledge_index` rows (per-file AND
+			// per-repo) with
+			// `degraded_reason='samples_pending'` per arch
+			// Sec 3.10 step 4 -- the canonical fail-safe
+			// path. NEVER fabricate authors here from the
+			// foundation samples we already have; the
+			// `modification_count_in_window` rows do not
+			// carry per-author granularity.
+			AuthorsByScope: nil,
 		})
 	}
 	// `pairs` is already sorted by (repo_id, sha) from the
@@ -416,13 +502,14 @@ func (s *PGSystemTierInputSource) readFoundationSamples(ctx context.Context, tx 
 	out := make([]FoundationSample, 0)
 	for rows.Next() {
 		var (
-			sidStr     string
-			scopeKind  string
-			metricKind string
-			value      sql.NullFloat64
-			attrsRaw   sql.NullString
+			sampleIDStr string
+			sidStr      string
+			scopeKind   string
+			metricKind  string
+			value       sql.NullFloat64
+			attrsRaw    sql.NullString
 		)
-		if err := rows.Scan(&sidStr, &scopeKind, &metricKind, &value, &attrsRaw); err != nil {
+		if err := rows.Scan(&sampleIDStr, &sidStr, &scopeKind, &metricKind, &value, &attrsRaw); err != nil {
 			return nil, fmt.Errorf("aggregator.PGSystemTierInputSource: scan foundation sample (repo_id=%s, sha=%s): %w", repoID, sha, err)
 		}
 		if !value.Valid {
@@ -436,7 +523,7 @@ func (s *PGSystemTierInputSource) readFoundationSamples(ctx context.Context, tx 
 		}
 		sid, err := uuid.FromString(sidStr)
 		if err != nil {
-			return nil, fmt.Errorf("aggregator.PGSystemTierInputSource: parse scope_id=%q: %w", sidStr, err)
+			return nil, fmt.Errorf("aggregator.PGSystemTierInputSource: parse scope_id=%q (sample_id=%s): %w", sidStr, sampleIDStr, err)
 		}
 		var attrs map[string]string
 		if attrsRaw.Valid && strings.TrimSpace(attrsRaw.String) != "" {
@@ -450,10 +537,16 @@ func (s *PGSystemTierInputSource) readFoundationSamples(ctx context.Context, tx 
 				// Surface the parse failure as a tick
 				// error so the operator can see it on
 				// /metrics and trace it back to the
-				// offending sample. Per iter-4 evaluator
+				// offending sample via the named
+				// sample_id. Per iter-4 evaluator
 				// finding #4: do NOT silently swallow
 				// corrupt input as if it were valid.
-				return nil, fmt.Errorf("aggregator.PGSystemTierInputSource: parse attrs_json (repo_id=%s, sha=%s, scope_id=%s, metric_kind=%s): %w", repoID, sha, sid, metricKind, err)
+				// Per iter-5 evaluator finding #4: name
+				// the sample_id explicitly so the error
+				// matches the CHANGELOG narrative AND
+				// gives operators a single-click triage
+				// point into `metric_sample`.
+				return nil, fmt.Errorf("aggregator.PGSystemTierInputSource: parse attrs_json (sample_id=%s, repo_id=%s, sha=%s, scope_id=%s, metric_kind=%s): %w", sampleIDStr, repoID, sha, sid, metricKind, err)
 			}
 		}
 		out = append(out, FoundationSample{

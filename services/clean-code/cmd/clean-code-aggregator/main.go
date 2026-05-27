@@ -273,9 +273,11 @@ func openAndPingDB(dsn, role string) (*sql.DB, error) {
 //     [aggregator.SystemTierInput] per active `(repo_id, sha)`
 //     pair.
 //  5. [aggregator.NewPGSystemTierWriter] -- single-tx writer
-//     that INSERTs into `metric_sample` and UPSERTs
-//     `metric_sample_active` per Phase 1.5 grants (sole writer
-//     of `pack='system'`).
+//     that runs the architecture-canonical SKIP-on-active
+//     check then INSERTs into `metric_sample` and
+//     `metric_sample_active` (bare INSERT, no ON CONFLICT)
+//     per Phase 1.5 grants and architecture Sec 5.2.1
+//     lines 1040-1048 (sole writer of `pack='system'`).
 //  6. [aggregator.NewAggregator] + [aggregator.NewLoop] -- the
 //     in-process per-cohort percentile math + the cadence loop.
 //     [aggregator.WithSystemTier] wires the system-tier composer

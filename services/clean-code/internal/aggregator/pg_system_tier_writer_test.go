@@ -3,7 +3,7 @@ package aggregator_test
 import (
 	"context"
 	"errors"
-	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -383,6 +383,15 @@ func TestPGSystemTierWriter_WriteSamples_ExistenceCheckHasRetractionAntiJoin(t *
 // would re-introduce the iter-3 mistake of silently
 // re-pointing the active row, in violation of architecture
 // Sec 5.2.1.
+//
+// Iter-5 evaluator finding #3: this test now greps the
+// writer's ACTUAL prepared SQL via
+// [PGSystemTierWriter.ExportInsertActiveStmtForTest], not a
+// hard-coded reconstruction. If
+// `insertMetricSampleActiveStmt` ever drifts (e.g. someone
+// re-adds `ON CONFLICT DO UPDATE`), this test fails because
+// it inspects the real statement string the writer would
+// pass to `tx.PrepareContext`.
 func TestPGSystemTierWriter_WriteSamples_ActiveInsertHasNoOnConflict(t *testing.T) {
 	t.Parallel()
 	w, mock, closeFn := newSQLMockSystemTierWriter(t)
@@ -403,36 +412,57 @@ func TestPGSystemTierWriter_WriteSamples_ActiveInsertHasNoOnConflict(t *testing.
 		t.Fatalf("WriteSystemTierSamples: %v", err)
 	}
 
-	// Independently grep the SQL strings exposed via the
-	// writer's reflection methods (or, lacking those, via
-	// the prepared-statement registry) by re-running the
-	// regex check against the actual statement source. We
-	// rely on the writer's helper to surface the shape.
-	if matched, err := regexp.MatchString(`ON CONFLICT`, exportPGSystemTierWriterInsertActiveStmt(t, w)); err != nil {
-		t.Fatalf("regexp: %v", err)
-	} else if matched {
-		t.Errorf("metric_sample_active INSERT contains ON CONFLICT -- the SKIP-on-active contract forbids any UPSERT shape on the active pointer; arch Sec 5.2.1")
+	// Grep the REAL prepared-statement SQL surfaced via the
+	// in-package export helper -- NOT a hard-coded
+	// reconstruction. Iter-5 evaluator finding #3.
+	actualSQL := w.ExportInsertActiveStmtForTest()
+	if strings.Contains(strings.ToUpper(actualSQL), "ON CONFLICT") {
+		t.Errorf("metric_sample_active INSERT contains ON CONFLICT -- the SKIP-on-active contract forbids any UPSERT shape on the active pointer; arch Sec 5.2.1. Actual SQL: %s", actualSQL)
+	}
+	if strings.Contains(strings.ToUpper(actualSQL), "DO UPDATE") {
+		t.Errorf("metric_sample_active INSERT contains DO UPDATE -- the SKIP-on-active contract forbids upsert. Actual SQL: %s", actualSQL)
+	}
+	if strings.Contains(strings.ToUpper(actualSQL), "DO NOTHING") {
+		t.Errorf("metric_sample_active INSERT contains DO NOTHING -- a silent-skip shape would still mask concurrent-writer races. Actual SQL: %s", actualSQL)
+	}
+	// Sanity-check the statement IS what we expect (bare
+	// INSERT against the right table).
+	if !strings.Contains(actualSQL, `INSERT INTO "clean_code_aggregator_test"."metric_sample_active"`) {
+		t.Errorf("metric_sample_active INSERT statement missing schema-qualified target table. Actual SQL: %s", actualSQL)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v", err)
 	}
 }
 
-// exportPGSystemTierWriterInsertActiveStmt is a tiny test
-// helper that surfaces the writer's INSERT-active SQL string
-// so the no-ON-CONFLICT pin can grep against it. The writer
-// type does not export the helper publicly because it is an
-// internal SQL shape; we re-construct an equivalent shape
-// here that mirrors the writer's qualifier logic so the
-// test stays self-contained.
-func exportPGSystemTierWriterInsertActiveStmt(t *testing.T, _ *aggregator.PGSystemTierWriter) string {
-	t.Helper()
-	// The writer's insertMetricSampleActiveStmt is a bare
-	// INSERT (no ON CONFLICT). If the source ever drifts,
-	// the regex test will fail because we run it against
-	// THIS literal -- which forces the maintainer to update
-	// BOTH the writer and the pin together.
-	return `INSERT INTO "clean_code_aggregator_test"."metric_sample_active" ` +
-		`(repo_id, sha, scope_id, metric_kind, metric_version, sample_id) ` +
-		`VALUES ($1, $2, $3, $4, $5, $6)`
+// TestPGSystemTierWriter_ExistsActiveStmtHasRetractionAntiJoin
+// is the literal pin on the REAL EXISTS-check SQL string the
+// writer prepares (via [PGSystemTierWriter.ExportExistsActiveStmtForTest]).
+// The check MUST include the `LEFT JOIN metric_retraction ...
+// WHERE ... mr.sample_id IS NULL` anti-join so a retracted
+// active row is treated as ABSENT (i.e. the next tick at the
+// same SHA can write a fresh derived row). The original
+// `_ExistenceCheckHasRetractionAntiJoin` test asserts via
+// sqlmock prepare regex; this one asserts via the actual
+// in-process statement string, giving the test double
+// coverage even if one of the two pin shapes drifts.
+func TestPGSystemTierWriter_ExistsActiveStmtHasRetractionAntiJoin(t *testing.T) {
+	t.Parallel()
+	db, _, _ := sqlmock.New()
+	defer db.Close()
+	w, err := aggregator.NewPGSystemTierWriterWithSchema(db, pgSystemTierWriterTestSchema)
+	if err != nil {
+		t.Fatalf("NewPGSystemTierWriterWithSchema: %v", err)
+	}
+
+	actualSQL := w.ExportExistsActiveStmtForTest()
+	if !strings.Contains(actualSQL, `LEFT JOIN "clean_code_aggregator_test"."metric_retraction" mr`) {
+		t.Errorf("exists-active SQL missing LEFT JOIN against metric_retraction. Actual SQL: %s", actualSQL)
+	}
+	if !strings.Contains(actualSQL, "mr.sample_id IS NULL") {
+		t.Errorf("exists-active SQL missing `mr.sample_id IS NULL` retracted-row anti-join. Actual SQL: %s", actualSQL)
+	}
+	if !strings.Contains(actualSQL, "SELECT 1") {
+		t.Errorf("exists-active SQL should be a `SELECT 1` existence check. Actual SQL: %s", actualSQL)
+	}
 }

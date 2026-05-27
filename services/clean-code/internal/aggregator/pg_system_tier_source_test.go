@@ -113,10 +113,10 @@ func TestPGSystemTierInputSource_ReadSystemTierInputs_HappyPath(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind"}).
 			AddRow(scopeID.String(), "file"))
 
-	mock.ExpectQuery(`SELECT sb\.scope_id, sb\.scope_kind::text, ms\.metric_kind, ms\.value, ms\.attrs_json`).
+	mock.ExpectQuery(`SELECT ms\.sample_id, sb\.scope_id, sb\.scope_kind::text, ms\.metric_kind, ms\.value, ms\.attrs_json`).
 		WithArgs(repoID, sha).
-		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}).
-			AddRow(scopeID.String(), "file", "cyclomatic_complexity", 12.5, `{"language":"go"}`))
+		WillReturnRows(sqlmock.NewRows([]string{"sample_id", "scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}).
+			AddRow(uuid.Must(uuid.NewV4()).String(), scopeID.String(), "file", "cyclomatic_complexity", 12.5, `{"language":"go"}`))
 	mock.ExpectRollback()
 
 	got, err := src.ReadSystemTierInputs(context.Background())
@@ -157,6 +157,24 @@ func TestPGSystemTierInputSource_ReadSystemTierInputs_HappyPath(t *testing.T) {
 	}
 	if fs.Attrs["language"] != "go" {
 		t.Errorf("foundation sample attrs = %+v; want language=go", fs.Attrs)
+	}
+	// Iter-5 evaluator item #1: VelocityWindows and
+	// AuthorsByScope are DELIBERATELY nil in the Stage 7.2
+	// PG source (see the source's "Deferred inputs"
+	// package-level doc block). If a future iter wires
+	// either field from foundation samples WITHOUT the
+	// Stage 7.3 cross-SHA historic-window reader or
+	// `churn_event` reader, the wired value would be
+	// semantically incorrect and this assertion is the
+	// blast-shield. To wire these correctly, ship the
+	// Stage 7.3 readers AND remove these assertions in the
+	// same iteration -- removing one without the other is
+	// either an evaluator regression or a deferral skew.
+	if in.VelocityWindows != nil {
+		t.Errorf("in.VelocityWindows = %v; Stage 7.2 PG source deliberately leaves this nil so the composer degrades velocity_trend with samples_pending until the Stage 7.3 historic-window reader lands (see package doc 'Deferred inputs')", in.VelocityWindows)
+	}
+	if in.AuthorsByScope != nil {
+		t.Errorf("in.AuthorsByScope = %v; Stage 7.2 PG source deliberately leaves this nil so the composer degrades knowledge_index with samples_pending until the Stage 7.3 churn_event reader lands (see package doc 'Deferred inputs')", in.AuthorsByScope)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
@@ -202,10 +220,10 @@ func TestPGSystemTierInputSource_SkipsPairsWithoutSucceededScanRun(t *testing.T)
 		WithArgs(repoB, shaB).
 		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind"}).
 			AddRow(scopeB.String(), "repo"))
-	mock.ExpectQuery(`SELECT sb\.scope_id, sb\.scope_kind::text, ms\.metric_kind`).
+	mock.ExpectQuery(`SELECT ms\.sample_id, sb\.scope_id, sb\.scope_kind::text, ms\.metric_kind`).
 		WithArgs(repoB, shaB).
-		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}).
-			AddRow(scopeB.String(), "repo", "loc", 1234.0, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"sample_id", "scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}).
+			AddRow(uuid.Must(uuid.NewV4()).String(), scopeB.String(), "repo", "loc", 1234.0, nil))
 	mock.ExpectRollback()
 
 	got, err := src.ReadSystemTierInputs(context.Background())
@@ -260,7 +278,7 @@ func TestPGSystemTierInputSource_FoundationQueryFiltersSystemPack(t *testing.T) 
 	}
 	mock.ExpectQuery(expr).
 		WithArgs(repoID, sha).
-		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}))
+		WillReturnRows(sqlmock.NewRows([]string{"sample_id", "scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}))
 	mock.ExpectRollback()
 
 	if _, err := src.ReadSystemTierInputs(context.Background()); err != nil {
@@ -319,9 +337,9 @@ func TestPGSystemTierInputSource_ScopesQueryHasRetractionAntiJoin(t *testing.T) 
 	mock.ExpectQuery(expr).
 		WithArgs(repoID, sha).
 		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind"}))
-	mock.ExpectQuery(`SELECT sb\.scope_id, sb\.scope_kind::text, ms\.metric_kind`).
+	mock.ExpectQuery(`SELECT ms\.sample_id, sb\.scope_id, sb\.scope_kind::text, ms\.metric_kind`).
 		WithArgs(repoID, sha).
-		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}))
+		WillReturnRows(sqlmock.NewRows([]string{"sample_id", "scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}))
 	mock.ExpectRollback()
 
 	if _, err := src.ReadSystemTierInputs(context.Background()); err != nil {
@@ -392,10 +410,14 @@ func TestPGSystemTierInputSource_PropagatesMalformedAttrsJSON(t *testing.T) {
 			AddRow(scopeID.String(), "file"))
 	// Deliberately corrupt attrs_json -- the parse failure
 	// MUST surface to the caller, not be silently dropped.
-	mock.ExpectQuery(`SELECT sb\.scope_id, sb\.scope_kind::text, ms\.metric_kind`).
+	// The error message MUST name the sample_id explicitly
+	// per iter-5 evaluator finding #4 (operator triage
+	// surface).
+	corruptSampleID := uuid.Must(uuid.NewV4())
+	mock.ExpectQuery(`SELECT ms\.sample_id, sb\.scope_id, sb\.scope_kind::text, ms\.metric_kind`).
 		WithArgs(repoID, sha).
-		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}).
-			AddRow(scopeID.String(), "file", "loc", 100.0, `{ malformed not-json`))
+		WillReturnRows(sqlmock.NewRows([]string{"sample_id", "scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}).
+			AddRow(corruptSampleID.String(), scopeID.String(), "file", "loc", 100.0, `{ malformed not-json`))
 	mock.ExpectRollback()
 
 	_, err := src.ReadSystemTierInputs(context.Background())
@@ -404,6 +426,13 @@ func TestPGSystemTierInputSource_PropagatesMalformedAttrsJSON(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "parse attrs_json") {
 		t.Errorf("err = %v; want substring 'parse attrs_json'", err)
+	}
+	// Iter-5 evaluator item #4: the error message MUST
+	// name the sample_id so the operator can triage with a
+	// single `SELECT * FROM metric_sample WHERE sample_id =
+	// ...` call.
+	if !strings.Contains(err.Error(), "sample_id="+corruptSampleID.String()) {
+		t.Errorf("err = %v; want substring 'sample_id=%s' (operator triage surface)", err, corruptSampleID)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
@@ -438,15 +467,15 @@ func TestPGSystemTierInputSource_DeterministicOrder(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"scan_run_id"}).AddRow(runLo.String()))
 	mock.ExpectQuery(`SELECT DISTINCT sb\.scope_id`).WithArgs(repoLo, shaLo).
 		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind"}))
-	mock.ExpectQuery(`SELECT sb\.scope_id, sb\.scope_kind::text, ms\.metric_kind`).WithArgs(repoLo, shaLo).
-		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}))
+	mock.ExpectQuery(`SELECT ms\.sample_id, sb\.scope_id, sb\.scope_kind::text, ms\.metric_kind`).WithArgs(repoLo, shaLo).
+		WillReturnRows(sqlmock.NewRows([]string{"sample_id", "scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}))
 
 	mock.ExpectQuery(`SELECT scan_run_id`).WithArgs(repoHi, shaHi).
 		WillReturnRows(sqlmock.NewRows([]string{"scan_run_id"}).AddRow(runHi.String()))
 	mock.ExpectQuery(`SELECT DISTINCT sb\.scope_id`).WithArgs(repoHi, shaHi).
 		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind"}))
-	mock.ExpectQuery(`SELECT sb\.scope_id, sb\.scope_kind::text, ms\.metric_kind`).WithArgs(repoHi, shaHi).
-		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}))
+	mock.ExpectQuery(`SELECT ms\.sample_id, sb\.scope_id, sb\.scope_kind::text, ms\.metric_kind`).WithArgs(repoHi, shaHi).
+		WillReturnRows(sqlmock.NewRows([]string{"sample_id", "scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}))
 	mock.ExpectRollback()
 
 	got, err := src.ReadSystemTierInputs(context.Background())

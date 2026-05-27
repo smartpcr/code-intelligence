@@ -6,6 +6,94 @@ Newest at the top. Stage references map to
 
 ## Stage 7.2 -- System tier metric composer
 
+### Iter 5 -- iter-4 evaluator polish + explicit deferral docs
+
+Iteration 4 (score 88, verdict: iterate) closed the architecture-canonical
+SKIP-on-active contract, the retraction anti-joins, the read transaction,
+and the malformed-attrs error surface, but the evaluator surfaced FOUR
+new polish findings: (1) `PGSystemTierInputSource` never populates
+`VelocityWindows` / `AuthorsByScope` and the deferral was undocumented at
+the source-code layer; (2) the production composition-root comment in
+`cmd/clean-code-aggregator/main.go` still said the writer "UPSERTs
+metric_sample_active" -- contradicting the iter-4 SKIP-on-active flip;
+(3) `_ActiveInsertHasNoOnConflict` grepped a hard-coded reconstructed
+SQL string rather than the writer's real prepared statement, so the
+regression guard could pass even if `insertMetricSampleActiveStmt`
+drifted; (4) the iter-4 CHANGELOG narrative claimed the malformed
+attrs error included `sample_id=...` but the actual source error
+named only `repo_id` / `sha` / `scope_id` / `metric_kind`. This iter
+closes all four.
+
+### Prior feedback resolution
+
+- 1. ADDRESSED -- the deferred-input behaviour of `VelocityWindows` /
+  `AuthorsByScope` is now EXPLICITLY documented at three layers:
+  (a) a new "Deferred inputs (Stage 7.3 / Stage 8.x)" section on the
+  `PGSystemTierInputSource` type-level doc (`pg_system_tier_source.go`
+  lines 109-160) explains the per-field architecture rationale --
+  `VelocityWindows` requires a cross-SHA historic read of
+  `modification_count_in_window` samples that the Stage 7.3
+  historic-window scanner will provide; `AuthorsByScope` requires a
+  `churn_event` table reader that ships in Stage 7.3 -- and explicitly
+  rejects the "wire a single-SHA proxy" alternative as semantically
+  WRONG; (b) the construction site at
+  `pg_system_tier_source.go:332-371` now sets `VelocityWindows: nil`
+  and `AuthorsByScope: nil` explicitly with inline `// DEFERRED to
+  Stage 7.3` comments pointing back to the type-level doc; (c) a new
+  blast-shield assertion in
+  `TestPGSystemTierInputSource_ReadSystemTierInputs_HappyPath` fails
+  if either field stops being nil so a future iter that silently
+  wires either field (without ALSO shipping the Stage 7.3 historic /
+  churn readers) hits a test regression and surfaces the deferral
+  skew. The fail-safe contract is unchanged: the composer correctly
+  emits degraded `velocity_trend` / `knowledge_index` rows with
+  `degraded_reason='samples_pending'` until Stage 7.3 lands.
+- 2. ADDRESSED -- `cmd/clean-code-aggregator/main.go` lines 275-279
+  (item 5 of the composition-root doc) now reads:
+  "[aggregator.NewPGSystemTierWriter] -- single-tx writer that runs
+  the architecture-canonical SKIP-on-active check then INSERTs into
+  `metric_sample` and `metric_sample_active` (bare INSERT, no ON
+  CONFLICT) per Phase 1.5 grants and architecture Sec 5.2.1 lines
+  1040-1048 (sole writer of `pack='system'`)". The stale "UPSERTs
+  metric_sample_active" text is gone. Grep verification:
+  ```
+  $ grep -rinF "UPSERTs metric_sample_active" services/clean-code/
+  (empty -- stale claim fully removed)
+  $ grep -rinF "upsert" services/clean-code/cmd/clean-code-aggregator/
+  (empty -- no upsert language survives in the binary)
+  ```
+- 3. ADDRESSED -- a new in-package `services/clean-code/internal/aggregator/export_test.go`
+  surfaces the writer's private SQL strings via test-only exported
+  wrappers: `(*PGSystemTierWriter).ExportInsertActiveStmtForTest()`,
+  `ExportInsertSampleStmtForTest()`, `ExportExistsActiveStmtForTest()`.
+  `TestPGSystemTierWriter_WriteSamples_ActiveInsertHasNoOnConflict`
+  (`pg_system_tier_writer_test.go:259-313`) now greps the REAL
+  prepared-statement string returned by
+  `ExportInsertActiveStmtForTest()` for `ON CONFLICT`, `DO UPDATE`,
+  and `DO NOTHING` (all three forbidden), AND asserts the schema-
+  qualified `INSERT INTO ... metric_sample_active` shape is present.
+  A new sibling test
+  `TestPGSystemTierWriter_ExistsActiveStmtHasRetractionAntiJoin`
+  (`pg_system_tier_writer_test.go:315-339`) pins the REAL exists-check
+  SQL string for `LEFT JOIN "<schema>"."metric_retraction" mr` +
+  `mr.sample_id IS NULL` + `SELECT 1`. The iter-4
+  `exportPGSystemTierWriterInsertActiveStmt` hard-coded literal
+  helper is DELETED -- it no longer reconstructs SQL; the export
+  wrappers return the actual writer-prepared string.
+- 4. ADDRESSED -- the `foundationSamplesQuery` SQL in
+  `pg_system_tier_source.go:213-249` now SELECTs `ms.sample_id` as
+  its FIRST column, and `readFoundationSamples`
+  (`pg_system_tier_source.go:421-489`) scans the new
+  `sampleIDStr` field and includes it FIRST in the wrapped
+  malformed-attrs error:
+  `"aggregator.PGSystemTierInputSource: parse attrs_json (sample_id=%s, repo_id=%s, sha=%s, scope_id=%s, metric_kind=%s): %w"`.
+  This both (a) matches the iter-4 CHANGELOG narrative AND (b) gives
+  operators a single-click triage point (`SELECT * FROM metric_sample
+  WHERE sample_id = <pasted>`). The
+  `TestPGSystemTierInputSource_PropagatesMalformedAttrsJSON` test
+  now asserts the error contains `sample_id=<actual UUID>` so the
+  narrative and impl can't diverge again.
+
 ### Iter 4 -- architecture-canonical SKIP-on-active + source-side correctness
 
 Iteration 3 (score 84, verdict: iterate, regressed from 86) shipped

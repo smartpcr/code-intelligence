@@ -165,6 +165,9 @@ func (s *mgmtWriteState) theExistingRepoIDIsReturned() error {
 }
 
 func (s *mgmtWriteState) noDuplicateRepoRowAppearsForURL(repoURL string) error {
+	if s.db == nil {
+		return fmt.Errorf("db not initialised; cannot verify duplicate repo rows")
+	}
 	var count int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM repo WHERE url = $1`, repoURL).Scan(&count)
 	if err != nil {
@@ -181,6 +184,9 @@ func (s *mgmtWriteState) noDuplicateRepoRowAppearsForURL(repoURL string) error {
 // ---------------------------------------------------------------------------
 
 func (s *mgmtWriteState) aRepoRegisteredAtMode(mode string) error {
+	if s.db == nil {
+		return fmt.Errorf("db not initialised; cannot snapshot repo_event count")
+	}
 	s.initialMode = mode
 	// Register a unique repo for this scenario
 	uniqueURL := fmt.Sprintf("https://github.com/acme/mode-test-%d", time.Now().UnixNano())
@@ -230,6 +236,9 @@ func (s *mgmtWriteState) mgmtSetModeIsCalledWithModeForThatRepo(newMode string) 
 }
 
 func (s *mgmtWriteState) aRepoEventWithKindIsAppended(expectedKind string) error {
+	if s.db == nil {
+		return fmt.Errorf("db not initialised; cannot verify repo_event")
+	}
 	var countAfter int64
 	err := s.db.QueryRow(
 		`SELECT COUNT(*) FROM repo_event WHERE repo_id = $1 AND kind = $2`,
@@ -296,7 +305,9 @@ func newMgmtWriteStateFromEnv() *mgmtWriteState {
 
 	if pgURL != "" {
 		db, err := sql.Open("postgres", pgURL)
-		if err == nil {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: sql.Open failed for CLEAN_CODE_PG_URL: %v\n", err)
+		} else {
 			db.SetMaxOpenConns(5)
 			db.SetConnMaxLifetime(2 * time.Minute)
 			s.db = db

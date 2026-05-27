@@ -15,6 +15,60 @@ env:
   COMPOSE_FILE: tests/e2e/phase-06-evaluator-mgmt/docker-compose.yml
 
 jobs:
+  e2e-evaluator-gate-verb-and-synchronous-solid-delegation:
+    name: "E2E – Evaluator Gate Verb and Synchronous SOLID Delegation"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: services/clean-code/go.sum
+
+      - name: Start compose services
+        run: docker compose -f ${{ env.COMPOSE_FILE }} up -d --build
+
+      - name: Bootstrap – migrate and seed
+        run: |
+          make migrate-up
+          make seed-phase-06
+
+      - name: Mint OIDC bearer tokens
+        run: make tokens
+
+      - name: Export compose-provided env vars
+        run: |
+          # No external secrets needed — compose exports all URLs.
+          PG_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port postgres 5432 | cut -d: -f2)
+          KMS_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port kms-mock 8080 | cut -d: -f2)
+          EVALUATOR_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port evaluator 8080 | cut -d: -f2)
+          MGMT_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port mgmt-surface 8080 | cut -d: -f2)
+          RULE_ENGINE_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port rule-engine 8080 | cut -d: -f2)
+          DEX_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port dex 5556 | cut -d: -f2)
+          OTEL_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port otel-collector 4317 | cut -d: -f2)
+          echo "CLEAN_CODE_PG_URL=postgres://postgres:postgres@localhost:${PG_PORT}/clean_code?sslmode=disable" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_KMS_URL=http://localhost:${KMS_PORT}" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_EVALUATOR_URL=http://localhost:${EVALUATOR_PORT}" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_MGMT_URL=http://localhost:${MGMT_PORT}" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_RULE_ENGINE_URL=http://localhost:${RULE_ENGINE_PORT}" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_OIDC_ISSUER=http://localhost:${DEX_PORT}" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_OTEL_ENDPOINT=http://localhost:${OTEL_PORT}" >> "$GITHUB_ENV"
+
+      - name: Run E2E tests
+        working-directory: services/clean-code
+        run: |
+          go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
+            -run TestE2E_evaluator_surface_and_management_surface_evaluator_gate_verb_and_synchronous_solid_delegation
+
+      - name: Tear down compose services
+        if: always()
+        run: docker compose -f ${{ env.COMPOSE_FILE }} down -v --remove-orphans
+
   e2e-management-read-verbs-and-insights-projections:
     name: "E2E – Management Read Verbs and Insights Projections"
     runs-on: ubuntu-latest

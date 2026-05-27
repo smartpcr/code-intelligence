@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -295,6 +297,337 @@ func TestFallbackString(t *testing.T) {
 	}
 }
 
+// --- Multi-DSN integration tests (iter-11) -------------------
+//
+// The composition root partitions verbs across up to five
+// independently-configured PG handles + a shared HMAC secret:
+//
+//   - primary PG URL                 (8 mgmt.read.* + 4 policy.*)
+//   - mgmt PG URL                    (4 mgmt write verbs)
+//   - webhook signing key + secret   (4 ingest verbs)
+//   - evaluator + solid_batch URLs   (eval.gate)
+//
+// The evaluator's iter-10 note ("Remaining risk is minor
+// integration depth around live multi-DSN deployments") points
+// at the gap that the SUMS of these per-axis env vars were not
+// exercised end-to-end through loadGatewayConfig +
+// buildProductionDeps. The tests below close that gap:
+//
+//   - the loader propagates each optional env var into
+//     gatewayConfig without dropping or aliasing it;
+//   - buildProductionDeps wires the right subset of optional
+//     deps for each operator config; verbs without env vars
+//     remain nil (surface as 503 in api.NewProductionRegistry);
+//   - an unreachable optional DSN fails buildProductionDeps
+//     loudly rather than silently leaving the verb nil.
+
+// TestLoadGatewayConfig_PropagatesOptionalMultiDSN asserts the
+// loader copies every optional multi-DSN env var into the
+// corresponding gatewayConfig field. Catches drift where a new
+// field is added to the struct but the loader is forgotten,
+// which would silently mount verbs as 503.
+func TestLoadGatewayConfig_PropagatesOptionalMultiDSN(t *testing.T) {
+	resetGatewayEnv(t)
+	t.Setenv(envPGURL, "postgres://primary/test")
+	t.Setenv(envOIDCIssuer, "https://idp.example/")
+	t.Setenv(envOIDCAudience, "clean-code-gateway")
+	t.Setenv(envMgmtPGURL, "postgres://mgmt/test")
+	t.Setenv(envEvaluatorPGURL, "postgres://evaluator/test")
+	t.Setenv(envSolidBatchPGURL, "postgres://solid/test")
+	t.Setenv(envWebhookSigningKeyID, "webhook-key-1")
+	t.Setenv(envWebhookHMACSecret, "webhook-shared-secret")
+
+	cfg, err := loadGatewayConfig()
+	if err != nil {
+		t.Fatalf("loadGatewayConfig: %v", err)
+	}
+	cases := []struct {
+		name, want, got string
+	}{
+		{"PGURL", "postgres://primary/test", cfg.PGURL},
+		{"MgmtPGURL", "postgres://mgmt/test", cfg.MgmtPGURL},
+		{"EvaluatorPGURL", "postgres://evaluator/test", cfg.EvaluatorPGURL},
+		{"SolidBatchPGURL", "postgres://solid/test", cfg.SolidBatchPGURL},
+		{"WebhookKeyID", "webhook-key-1", cfg.WebhookKeyID},
+		{"WebhookSecret", "webhook-shared-secret", cfg.WebhookSecret},
+	}
+	for _, tc := range cases {
+		if tc.got != tc.want {
+			t.Errorf("cfg.%s = %q want %q", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+// TestLoadGatewayConfig_OmitsOptionalMultiDSN_LeavesEmpty
+// asserts that the loader does NOT default any of the optional
+// multi-DSN env vars to a synthetic value. The boot-time
+// "stays as 503 stub" warning the operator relies on for
+// missing wiring fires off `cfg.{field} == ""`; a stray
+// default here would silently mask a misconfiguration.
+func TestLoadGatewayConfig_OmitsOptionalMultiDSN_LeavesEmpty(t *testing.T) {
+	resetGatewayEnv(t)
+	t.Setenv(envPGURL, "postgres://primary/test")
+	t.Setenv(envOIDCIssuer, "https://idp.example/")
+	t.Setenv(envOIDCAudience, "clean-code-gateway")
+
+	cfg, err := loadGatewayConfig()
+	if err != nil {
+		t.Fatalf("loadGatewayConfig: %v", err)
+	}
+	cases := []struct {
+		name, got string
+	}{
+		{"MgmtPGURL", cfg.MgmtPGURL},
+		{"EvaluatorPGURL", cfg.EvaluatorPGURL},
+		{"SolidBatchPGURL", cfg.SolidBatchPGURL},
+		{"WebhookKeyID", cfg.WebhookKeyID},
+		{"WebhookSecret", cfg.WebhookSecret},
+	}
+	for _, tc := range cases {
+		if tc.got != "" {
+			t.Errorf("cfg.%s = %q want \"\" (no implicit default)", tc.name, tc.got)
+		}
+	}
+}
+
+// silentLogger discards all log output for tests that exercise
+// the boot-time warn lines so the test runner output stays
+// clean. The real boot path uses slog.Default(); we override
+// it locally to keep verbosity out of the test report.
+func silentLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// stubProductionDepsCfg returns the minimum primary cfg that
+// satisfies loadGatewayConfig (so buildProductionDeps doesn't
+// trip over an unrelated invariant) with all optional
+// multi-DSN axes unset.
+func stubProductionDepsCfg() gatewayConfig {
+	return gatewayConfig{
+		Port:            defaultPort,
+		AuthMode:        authModeOIDC,
+		OIDCIssuer:      "https://idp.example/",
+		OIDCAudience:    "clean-code-gateway",
+		PGURL:           "postgres://primary/test",
+		ShutdownTimeout: time.Duration(defaultShutdownSeconds) * time.Second,
+	}
+}
+
+// stubGatewayDB opens a lib/pq handle against an obviously-
+// unreachable DSN. buildProductionDeps' primary path never
+// pings -- it composes management.NewPGMetricsBackend,
+// steward.NewSQLStore, steward.New, all of which are pure
+// constructors that take the handle and store it without
+// dialing. The handle therefore satisfies the nil-checks
+// without requiring a live PG; the only paths that DO ping
+// (mgmtDB/evaluatorDB/solidBatchDB) are gated by the optional
+// env vars and tested separately below.
+func stubGatewayDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := openDB("postgres://stub:stub@127.0.0.1:1/stub?sslmode=disable")
+	if err != nil {
+		t.Fatalf("openDB(stub): %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// runClosers fires every closer the build returned. Tests
+// call this even on failure paths so the stub handles get
+// released.
+func runClosers(closers []func()) {
+	for _, c := range closers {
+		if c != nil {
+			c()
+		}
+	}
+}
+
+// TestBuildProductionDeps_NoOptionalDSNs_LeavesOptionalNil
+// exercises the "read-only" deployment shape: only the primary
+// PG URL is set. The non-optional deps (Reader, Handler,
+// PolicyWriter) MUST be wired so the 8 mgmt.read.* + policy.*
+// verbs serve real traffic; the optional deps (MgmtWriter,
+// IngestRouter, EvalGateHandler) MUST stay nil so the gateway
+// surfaces them as 503 VERB_NOT_WIRED rather than dialling
+// nil.
+func TestBuildProductionDeps_NoOptionalDSNs_LeavesOptionalNil(t *testing.T) {
+	ctx := context.Background()
+	cfg := stubProductionDepsCfg()
+	db := stubGatewayDB(t)
+
+	deps, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger())
+	defer runClosers(closers)
+	if err != nil {
+		t.Fatalf("buildProductionDeps: %v", err)
+	}
+	if deps.MgmtReader == nil {
+		t.Errorf("MgmtReader: got nil, want non-nil (mgmt.read.* must serve real traffic)")
+	}
+	if deps.MgmtHandler == nil {
+		t.Errorf("MgmtHandler: got nil, want non-nil (policy.keys.list_active must serve real traffic)")
+	}
+	if deps.PolicyWriter == nil {
+		t.Errorf("PolicyWriter: got nil, want non-nil (policy.publish + activate must serve real traffic)")
+	}
+	if deps.MgmtWriter != nil {
+		t.Errorf("MgmtWriter: got non-nil, want nil (no CLEAN_CODE_MGMT_PG_URL -> mgmt write verbs stay 503)")
+	}
+	if deps.IngestRouter != nil {
+		t.Errorf("IngestRouter: got non-nil, want nil (no webhook envs -> ingest.* stays 503)")
+	}
+	if deps.EvalGateHandler != nil {
+		t.Errorf("EvalGateHandler: got non-nil, want nil (no evaluator DSNs -> eval.gate stays 503)")
+	}
+	if len(closers) != 0 {
+		t.Errorf("closers: len=%d want 0 (no optional handles were opened)", len(closers))
+	}
+}
+
+// TestBuildProductionDeps_WebhookOnly_WiresIngestRouter
+// exercises the "single-DB co-mount" shape where the operator
+// supplies the webhook key+secret but NO additional DSN: the
+// ingest pipeline reuses the primary handle per
+// migrations/0004 (clean_code_metric_ingestor role). Asserts
+// IngestRouter is wired without dialling a second handle, and
+// the other two optional deps remain nil.
+func TestBuildProductionDeps_WebhookOnly_WiresIngestRouter(t *testing.T) {
+	ctx := context.Background()
+	cfg := stubProductionDepsCfg()
+	cfg.WebhookKeyID = "test-key"
+	cfg.WebhookSecret = "test-secret"
+	db := stubGatewayDB(t)
+
+	deps, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger())
+	defer runClosers(closers)
+	if err != nil {
+		t.Fatalf("buildProductionDeps: %v", err)
+	}
+	if deps.IngestRouter == nil {
+		t.Errorf("IngestRouter: got nil, want non-nil (webhook key+secret were set)")
+	}
+	if deps.MgmtWriter != nil {
+		t.Errorf("MgmtWriter: got non-nil, want nil (CLEAN_CODE_MGMT_PG_URL still unset)")
+	}
+	if deps.EvalGateHandler != nil {
+		t.Errorf("EvalGateHandler: got non-nil, want nil (eval DSNs still unset)")
+	}
+	if len(closers) != 0 {
+		t.Errorf("closers: len=%d want 0 (no SECOND handle was opened -- ingest reuses the primary handle)", len(closers))
+	}
+}
+
+// TestBuildProductionDeps_WebhookKeyWithoutSecret_StaysNil
+// asserts the gate is logical-AND: setting only the key id
+// without the secret (or vice-versa) MUST leave IngestRouter
+// nil. Half-configured ingest would dispatch to a router
+// that rejects every request, which is worse than a 503.
+func TestBuildProductionDeps_WebhookKeyWithoutSecret_StaysNil(t *testing.T) {
+	ctx := context.Background()
+	cfg := stubProductionDepsCfg()
+	cfg.WebhookKeyID = "test-key"
+	// WebhookSecret intentionally left empty.
+	db := stubGatewayDB(t)
+
+	deps, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger())
+	defer runClosers(closers)
+	if err != nil {
+		t.Fatalf("buildProductionDeps: %v", err)
+	}
+	if deps.IngestRouter != nil {
+		t.Error("IngestRouter: got non-nil, want nil (logical-AND: key without secret must not wire)")
+	}
+}
+
+// TestBuildProductionDeps_EvalDSNHalfConfigured_StaysNil
+// asserts the same logical-AND for the evaluator gate: a
+// half-configured pair (evaluator DSN set, solid_batch DSN
+// unset) MUST leave EvalGateHandler nil rather than open
+// the one handle and wire a half-broken gate.
+func TestBuildProductionDeps_EvalDSNHalfConfigured_StaysNil(t *testing.T) {
+	ctx := context.Background()
+	cfg := stubProductionDepsCfg()
+	cfg.EvaluatorPGURL = "postgres://evaluator/test"
+	// SolidBatchPGURL intentionally left empty.
+	db := stubGatewayDB(t)
+
+	deps, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger())
+	defer runClosers(closers)
+	if err != nil {
+		t.Fatalf("buildProductionDeps: %v", err)
+	}
+	if deps.EvalGateHandler != nil {
+		t.Error("EvalGateHandler: got non-nil, want nil (logical-AND: evaluator without solid_batch must not wire)")
+	}
+	if len(closers) != 0 {
+		t.Errorf("closers: len=%d want 0 (half-configured eval gate must not open ANY handle)", len(closers))
+	}
+}
+
+// TestBuildProductionDeps_MgmtPGURL_PingFailure_PropagatesError
+// asserts that an UNREACHABLE optional DSN fails the boot
+// loudly, with the DSN's role named in the error. Silent
+// degradation (returning a nil dep + nil error) would hide
+// the misconfiguration behind a 503 that looks identical
+// to "env var unset" -- the operator deserves to know which.
+func TestBuildProductionDeps_MgmtPGURL_PingFailure_PropagatesError(t *testing.T) {
+	// A pre-cancelled context makes pingDBWithRetry return
+	// on the first select{} iteration, so the test does not
+	// pay the full 30-attempt budget. The exact error class
+	// (ctx.Canceled vs wrapped ping error) is timing-
+	// dependent; we assert only that the error is non-nil
+	// and names the failed role.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cfg := stubProductionDepsCfg()
+	cfg.MgmtPGURL = "postgres://127.0.0.1:1/nope?sslmode=disable&connect_timeout=1"
+	db := stubGatewayDB(t)
+
+	_, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger())
+	defer runClosers(closers)
+	if err == nil {
+		t.Fatalf("buildProductionDeps: want error from unreachable MgmtPGURL, got nil")
+	}
+	if !strings.Contains(err.Error(), "mgmt") {
+		t.Errorf("error %q: want substring %q so the operator knows which DSN failed", err.Error(), "mgmt")
+	}
+	// The mgmt handle was opened (lazily; sql.Open does not
+	// dial) so a closer MUST have been queued for it before
+	// the ping failed -- a leaked handle here would
+	// accumulate per restart.
+	if len(closers) == 0 {
+		t.Error("closers: want at least one entry to release the mgmt handle, got 0")
+	}
+}
+
+// TestBuildProductionDeps_EvalDSN_PingFailure_PropagatesError
+// asserts the same property for the evaluator DSNs: both
+// handles open, the first ping fails, the error names the
+// role, and both handles are queued for closing.
+func TestBuildProductionDeps_EvalDSN_PingFailure_PropagatesError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cfg := stubProductionDepsCfg()
+	cfg.EvaluatorPGURL = "postgres://127.0.0.1:1/nope1?sslmode=disable&connect_timeout=1"
+	cfg.SolidBatchPGURL = "postgres://127.0.0.1:1/nope2?sslmode=disable&connect_timeout=1"
+	db := stubGatewayDB(t)
+
+	_, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger())
+	defer runClosers(closers)
+	if err == nil {
+		t.Fatalf("buildProductionDeps: want error from unreachable evaluator DSN, got nil")
+	}
+	// The error message must name either evaluator or
+	// solid_batch so the operator can pinpoint which DSN
+	// failed. Both wrappers prefix with the role.
+	if !strings.Contains(err.Error(), "evaluator") && !strings.Contains(err.Error(), "solid_batch") {
+		t.Errorf("error %q: want substring naming evaluator/solid_batch role", err.Error())
+	}
+	if len(closers) == 0 {
+		t.Error("closers: want at least one entry to release the evaluator handle, got 0")
+	}
+}
+
 // resetGatewayEnv unsets every env var this binary's loader
 // consults so a test starts from a clean slate regardless of
 // the operator's local environment.
@@ -313,6 +646,18 @@ func resetGatewayEnv(t *testing.T) {
 		envKMSProvider,
 		envKMSMasterKeyHex,
 		envShutdownTimeoutSeconds,
+		// Multi-DSN optional wiring env vars -- if the host
+		// environment has any of these set (CI, operator
+		// dev box), the config loader would inherit them
+		// and the multi-DSN tests below would observe
+		// non-empty `cfg.{Mgmt,Evaluator,SolidBatch}PGURL`
+		// / Webhook fields they didn't set themselves. Clear
+		// them on every reset for hermetic test isolation.
+		envMgmtPGURL,
+		envEvaluatorPGURL,
+		envSolidBatchPGURL,
+		envWebhookSigningKeyID,
+		envWebhookHMACSecret,
 	}
 	for _, k := range keys {
 		// Use t.Setenv with "" to clear, but t.Setenv

@@ -39,6 +39,19 @@ type Aggregator struct {
 	source SampleSource
 	writer SnapshotWriter
 	now    func() time.Time
+
+	// System-tier pipeline (Stage 7.2 wiring). When all three
+	// are non-nil the aggregator runs a SECOND pass per tick
+	// reading [SystemTierInputSource], invoking
+	// [SystemTierComposer.Compose] per repo+SHA, and
+	// persisting the emitted samples through
+	// [SystemTierWriter]. The fields default to nil so the
+	// existing two-arg constructor + foundation-only tests
+	// keep their behaviour; wiring is opt-in via
+	// [WithSystemTier].
+	composer       *SystemTierComposer
+	sysSource      SystemTierInputSource
+	sysWriter      SystemTierWriter
 }
 
 // AggregatorOption configures an [Aggregator].
@@ -50,6 +63,51 @@ type AggregatorOption func(*Aggregator)
 // known timestamp.
 func WithClock(now func() time.Time) AggregatorOption {
 	return func(a *Aggregator) { a.now = now }
+}
+
+// WithSystemTier wires the Stage 7.2 system-tier composer
+// pipeline into the aggregator. When this option is applied
+// every [Tick] call ALSO:
+//
+//  1. Reads per-`(repo_id, sha)` inputs from `source`.
+//  2. Invokes `composer.Compose` per input.
+//  3. Persists the emitted samples through `writer` as
+//     `metric_sample(pack='system', source='derived')` rows.
+//
+// All three arguments MUST be non-nil; passing nil for any of
+// them is a wiring bug -- the option panics at startup rather
+// than at first tick so the misconfiguration surfaces in the
+// composition-root unit test.
+//
+// # Run-on-empty-foundation semantics
+//
+// The system-tier pipeline runs INDEPENDENTLY of the
+// foundation-snapshot pipeline. Even when the foundation
+// `ReadActive` call returns zero observations (e.g. a brand-new
+// deployment with no foundation samples yet), the system-tier
+// pass still executes -- the [SystemTierInputSource] is the
+// canonical reporter of which repo+SHA pairs need a system-tier
+// row this tick, and the composer's fail-safe contract
+// (architecture Sec 3.10 step 4 lines 637-657) REQUIRES a row
+// per input even when every input is missing -- it just emits a
+// degraded row carrying the reason. Coupling the system-tier
+// pass to foundation observation count would silently drop
+// rows the architecture explicitly mandates.
+func WithSystemTier(composer *SystemTierComposer, source SystemTierInputSource, writer SystemTierWriter) AggregatorOption {
+	if composer == nil {
+		panic("aggregator: WithSystemTier: composer is nil")
+	}
+	if source == nil {
+		panic("aggregator: WithSystemTier: source is nil")
+	}
+	if writer == nil {
+		panic("aggregator: WithSystemTier: writer is nil")
+	}
+	return func(a *Aggregator) {
+		a.composer = composer
+		a.sysSource = source
+		a.sysWriter = writer
+	}
 }
 
 // ErrAggregatorNilSource surfaces a nil [SampleSource] at
@@ -103,32 +161,56 @@ type cohortKey struct {
 //
 //  1. Captures `built_at` from the injected clock (single value
 //     shared by every row written this tick).
-//  2. Reads the active observation set from the source.
-//  3. Groups by `(repo_id, metric_kind, scope_kind)` and computes
-//     per-repo summaries (count, mean, p50, p90, p99).
-//  4. Groups by `(metric_kind, scope_kind)` and computes
-//     cross-repo percentile rows over the FLAT observation-value
-//     set across ALL contributing repos (architecture Sec 3.10
-//     line 644: "the full per-metric percentile vector across all
-//     repos"). Iter-3 evaluator finding #2: prior iterations
-//     computed percentiles over per-repo means, which silently
-//     drops within-repo variance and was a contract mismatch
-//     against the architecture doc.
-//  5. For each cohort, also produces the portfolio aggregate
-//     (weighted mean across all observations + per-repo entries).
-//  6. Calls WriteSnapshots once with all three slices so the
-//     PG-backed writer can persist them atomically.
+//  2. Runs the foundation-snapshot pass via [tickSnapshots]:
+//     reads the active observation set, computes per-repo +
+//     cross-repo + portfolio rows, and writes them.
+//  3. Runs the system-tier composer pass via [tickSystemTier]
+//     when wired (independent of foundation observations -- see
+//     [WithSystemTier]).
+//
+// Both passes execute in the SAME tick under the SAME BuiltAt
+// so downstream consumers (Insights, eval.gate) see a coherent
+// view across foundation snapshots + system-tier rows.
 //
 // Returns a [Report] summarising the tick. On read or write
-// failure, returns the underlying error; the Report value is
-// populated with whatever counters were captured up to the
-// failure point.
+// failure in either pass, returns the underlying error; the
+// Report value is populated with whatever counters were
+// captured up to the failure point.
+//
+// # Failure-handling order
+//
+// The snapshot pass runs first. When it fails, the system-tier
+// pass DOES NOT run -- the tick is rolled back in spirit (the
+// PG writer's transaction is the actual rollback boundary; the
+// in-memory writer drops the batch on its own error path).
+// When the snapshot pass succeeds and the system-tier pass
+// fails, the snapshot rows ARE persisted and the error
+// propagates with the system-tier failure context attached so
+// the operator can correlate via the Report counters.
 func (a *Aggregator) Tick(ctx context.Context) (Report, error) {
 	report := Report{BuiltAt: a.now().UTC()}
 
+	if err := a.tickSnapshots(ctx, &report); err != nil {
+		return report, err
+	}
+
+	if a.composer != nil && a.sysSource != nil && a.sysWriter != nil {
+		if err := a.tickSystemTier(ctx, &report); err != nil {
+			return report, err
+		}
+	}
+	return report, nil
+}
+
+// tickSnapshots is the foundation-snapshot pass extracted from
+// the prior monolithic Tick. It reads the active observation
+// set, computes per-repo + cross-repo + portfolio rows, and
+// writes them via [SnapshotWriter.WriteSnapshots]. Populates
+// the Report's snapshot counters in place.
+func (a *Aggregator) tickSnapshots(ctx context.Context, report *Report) error {
 	obs, err := a.source.ReadActive(ctx)
 	if err != nil {
-		return report, fmt.Errorf("aggregator: read active samples: %w", err)
+		return fmt.Errorf("aggregator: read active samples: %w", err)
 	}
 	report.ObservationsRead = len(obs)
 
@@ -138,9 +220,9 @@ func (a *Aggregator) Tick(ctx context.Context) (Report, error) {
 		// "fresh built_at, zero rows" tick (a degenerate but
 		// legitimate G6 state for a brand-new deployment).
 		if err := a.writer.WriteSnapshots(ctx, Snapshots{}); err != nil {
-			return report, fmt.Errorf("aggregator: write snapshots (empty tick): %w", err)
+			return fmt.Errorf("aggregator: write snapshots (empty tick): %w", err)
 		}
-		return report, nil
+		return nil
 	}
 
 	// Step 1: bucket observations by (repo_id, metric_kind, scope_kind).
@@ -248,7 +330,7 @@ func (a *Aggregator) Tick(ctx context.Context) (Report, error) {
 		// Serialise histogram_json with the envelope shape.
 		histBytes, err := json.Marshal(HistogramEnvelope{Entries: histEntries})
 		if err != nil {
-			return report, fmt.Errorf("aggregator: marshal histogram_json (metric_kind=%s, scope_kind=%s): %w", ck.metricKind, ck.scopeKind, err)
+			return fmt.Errorf("aggregator: marshal histogram_json (metric_kind=%s, scope_kind=%s): %w", ck.metricKind, ck.scopeKind, err)
 		}
 		crossRows = append(crossRows, CrossRepoPercentileRow{
 			MetricKind:    ck.metricKind,
@@ -271,7 +353,7 @@ func (a *Aggregator) Tick(ctx context.Context) (Report, error) {
 			PerRepo:           portfolioEntries,
 		})
 		if err != nil {
-			return report, fmt.Errorf("aggregator: marshal aggregate_json (metric_kind=%s, scope_kind=%s): %w", ck.metricKind, ck.scopeKind, err)
+			return fmt.Errorf("aggregator: marshal aggregate_json (metric_kind=%s, scope_kind=%s): %w", ck.metricKind, ck.scopeKind, err)
 		}
 		portfolioRows = append(portfolioRows, PortfolioSnapshotRow{
 			MetricKind:    ck.metricKind,
@@ -307,7 +389,67 @@ func (a *Aggregator) Tick(ctx context.Context) (Report, error) {
 		Portfolio:        portfolioRows,
 	}
 	if err := a.writer.WriteSnapshots(ctx, snap); err != nil {
-		return report, fmt.Errorf("aggregator: write snapshots: %w", err)
+		return fmt.Errorf("aggregator: write snapshots: %w", err)
 	}
-	return report, nil
+	return nil
+}
+
+// tickSystemTier is the Stage 7.2 system-tier pass. It runs
+// when the aggregator was constructed with [WithSystemTier].
+// Reads per-`(repo_id, sha)` inputs from the wired source,
+// invokes the composer per input, and persists ALL emitted
+// samples through the wired writer as ONE batch (so a partial
+// failure does not leave the active pointer in a torn state).
+//
+// # Counters
+//
+// Populates the Report's three system-tier counters
+// in place: SystemTierReposComposed (one per input), and
+// SystemTierSamplesWritten / SystemTierDegradedSamples
+// (totals across all inputs).
+//
+// # Empty input set
+//
+// When the source returns zero inputs (e.g. a fresh deployment
+// before any foundation rows have been ingested), the pass
+// records the zero counters and returns nil -- the writer is
+// NOT called with an empty slice (no transaction overhead).
+func (a *Aggregator) tickSystemTier(ctx context.Context, report *Report) error {
+	inputs, err := a.sysSource.ReadSystemTierInputs(ctx)
+	if err != nil {
+		return fmt.Errorf("aggregator: read system-tier inputs: %w", err)
+	}
+	if len(inputs) == 0 {
+		return nil
+	}
+
+	// Aggregate every input's samples into ONE writer batch so
+	// the PG writer's single transaction covers the whole tick
+	// (matches the snapshot pass's single-WriteSnapshots
+	// contract). Pre-size to the typical case (~10 samples per
+	// repo -- the seven canonical kinds plus per-scope blast
+	// radius / fan-in expansion bound).
+	allSamples := make([]SystemTierSample, 0, len(inputs)*10)
+	for i := range inputs {
+		out, err := a.composer.Compose(ctx, inputs[i])
+		if err != nil {
+			return fmt.Errorf("aggregator: compose system-tier (repo_id=%s, sha=%s): %w", inputs[i].RepoID, inputs[i].SHA, err)
+		}
+		allSamples = append(allSamples, out...)
+	}
+	report.SystemTierReposComposed = len(inputs)
+	report.SystemTierSamplesWritten = len(allSamples)
+	for i := range allSamples {
+		if allSamples[i].Degraded {
+			report.SystemTierDegradedSamples++
+		}
+	}
+
+	if len(allSamples) == 0 {
+		return nil
+	}
+	if err := a.sysWriter.WriteSystemTierSamples(ctx, allSamples); err != nil {
+		return fmt.Errorf("aggregator: write system-tier samples: %w", err)
+	}
+	return nil
 }

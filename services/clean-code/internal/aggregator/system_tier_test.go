@@ -805,9 +805,11 @@ func happyPathInput(t *testing.T) SystemTierInput {
 		XRepoEdges: []XRepoEdge{
 			{FromRepo: repoID, ToRepo: otherRepoID},
 		},
+		XRepoEdgesAvailable: true,
 		CallEdges: []CallEdge{
 			{FromScope: methodA, ToScope: classA},
 		},
+		CallEdgesAvailable: true,
 		VelocityWindows: []float64{1, 3, 5, 9},
 		AuthorsByScope: map[uuid.UUID][]string{
 			fileA: {"alice", "bob", "alice"},
@@ -818,3 +820,260 @@ func happyPathInput(t *testing.T) SystemTierInput {
 // float64Ptr returns a pointer to v -- composer rows use
 // *float64 for Value so a NULL is unambiguous.
 func float64Ptr(v float64) *float64 { return &v }
+
+// TestCompose_LinkedMode_AvailableButEmptyXRepoEdges_NonDegradedDepthZero
+// is the iter 1 evaluator item 2 fix: a linked-mode tick where
+// the agent-memory adapter returned successfully but with zero
+// cross-repo dependency edges is a VALID portfolio shape
+// (`xrepo_dep_depth = 0` -- "this repo has no cross-repo
+// dependencies"), NOT a degradation. Pre-fix the composer
+// conflated `len(in.XRepoEdges) == 0` with
+// `xrepo_edges_unavailable` and degraded the row; post-fix
+// the explicit [SystemTierInput.XRepoEdgesAvailable] flag
+// distinguishes the two cases.
+func TestCompose_LinkedMode_AvailableButEmptyXRepoEdges_NonDegradedDepthZero(t *testing.T) {
+	t.Parallel()
+	c := newTestComposer(t)
+	repoScopeID := mustNewUUID(t)
+	in := SystemTierInput{
+		Mode:                SystemTierModeLinked,
+		RepoID:              mustNewUUID(t),
+		SHA:                 "0e0e0e0e",
+		ProducerRunID:       mustNewUUID(t),
+		XRepoEdgesAvailable: true, // adapter responded -- with zero edges
+		XRepoEdges:          nil,
+		Scopes: []ScopeRef{
+			{ScopeID: repoScopeID, ScopeKind: "repo"},
+		},
+	}
+	out, err := c.Compose(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	var got *SystemTierSample
+	for i := range out {
+		if out[i].MetricKind == SystemMetricXRepoDepDepth {
+			got = &out[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("composer dropped xrepo_dep_depth on linked/empty-but-available input")
+	}
+	if got.Degraded {
+		t.Errorf("xrepo_dep_depth.Degraded=true on linked-mode AVAILABLE-but-empty edge set; want false (iter 1 evaluator item 2 fix). reason=%q", got.DegradedReason)
+	}
+	if got.Value == nil {
+		t.Fatal("xrepo_dep_depth.Value=nil on non-degraded row; want pointer to 0.0")
+	}
+	if *got.Value != 0 {
+		t.Errorf("xrepo_dep_depth.Value=%v on empty edge set, want 0.0 (no cross-repo dependencies = depth 0)", *got.Value)
+	}
+}
+
+// TestCompose_LinkedMode_AvailableButEmptyCallEdges_BlastRadiusNonDegradedZero
+// is the iter 1 evaluator item 2 fix applied to `blast_radius`:
+// a linked-mode tick with `CallEdgesAvailable=true` and an
+// empty call-graph is a valid `blast_radius = 0` shape for a
+// method with no inbound callers, NOT a degradation.
+func TestCompose_LinkedMode_AvailableButEmptyCallEdges_BlastRadiusNonDegradedZero(t *testing.T) {
+	t.Parallel()
+	c := newTestComposer(t)
+	methodScope := mustNewUUID(t)
+	in := SystemTierInput{
+		Mode:               SystemTierModeLinked,
+		RepoID:             mustNewUUID(t),
+		SHA:                "1f1f1f1f",
+		ProducerRunID:      mustNewUUID(t),
+		CallEdgesAvailable: true, // adapter responded -- with zero edges
+		CallEdges:          nil,
+		Scopes: []ScopeRef{
+			{ScopeID: methodScope, ScopeKind: "method"},
+		},
+	}
+	out, err := c.Compose(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	var got *SystemTierSample
+	for i := range out {
+		if out[i].MetricKind == SystemMetricBlastRadius {
+			got = &out[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("composer dropped blast_radius on linked/empty-but-available input")
+	}
+	if got.Degraded {
+		t.Errorf("blast_radius.Degraded=true on linked-mode AVAILABLE-but-empty call-graph; want false (iter 1 evaluator item 2 fix). reason=%q", got.DegradedReason)
+	}
+	if got.Value == nil {
+		t.Fatal("blast_radius.Value=nil on non-degraded row; want pointer to 0.0")
+	}
+	if *got.Value != 0 {
+		t.Errorf("blast_radius.Value=%v on empty call-graph, want 0.0", *got.Value)
+	}
+}
+
+// TestCompose_LegacyImplicitEdgesAvailable_BackwardCompat asserts
+// the backward-compat fallback in [xRepoEdgesAvailable] /
+// [callEdgesAvailable]: a pre-existing caller that passes a
+// non-empty `XRepoEdges` / `CallEdges` slice without setting the
+// new flag still gets the "available" answer (so iter-1 tests +
+// any external caller that pre-dated the flag are NOT broken
+// by the new field).
+func TestCompose_LegacyImplicitEdgesAvailable_BackwardCompat(t *testing.T) {
+	t.Parallel()
+	c := newTestComposer(t)
+	repoScopeID := mustNewUUID(t)
+	methodScope := mustNewUUID(t)
+	otherRepo := mustNewUUID(t)
+	repoID := mustNewUUID(t)
+	in := SystemTierInput{
+		Mode:          SystemTierModeLinked,
+		RepoID:        repoID,
+		SHA:           "2a2a2a2a",
+		ProducerRunID: mustNewUUID(t),
+		// Explicit flags left at zero-value (false) -- legacy caller shape.
+		XRepoEdges: []XRepoEdge{{FromRepo: repoID, ToRepo: otherRepo}},
+		CallEdges:  []CallEdge{{FromScope: methodScope, ToScope: mustNewUUID(t)}},
+		Scopes: []ScopeRef{
+			{ScopeID: repoScopeID, ScopeKind: "repo"},
+			{ScopeID: methodScope, ScopeKind: "method"},
+		},
+	}
+	out, err := c.Compose(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	for _, s := range out {
+		switch s.MetricKind {
+		case SystemMetricXRepoDepDepth, SystemMetricBlastRadius:
+			if s.Degraded {
+				t.Errorf("legacy implicit-availability shape: %s.Degraded=true (reason=%q); want false because non-empty edge slice implies available", s.MetricKind, s.DegradedReason)
+			}
+		}
+	}
+}
+
+// TestCompose_SamplesPending_XServiceTestReliability is the
+// iter 1 evaluator item 4 fix: a direct targeted assertion
+// that `xservice_test_reliability` emits a degraded row with
+// `degraded_reason='samples_pending'` when the foundation
+// `pass_first_try_ratio` row is absent. Architecture Sec 1.4.2
+// row 6 names `pass_first_try_ratio` as the metric's sole
+// input; missing input is `samples_pending` per the
+// composer's fail-safe contract. This kind does NOT degrade
+// on `xrepo_edges_unavailable` -- xrepo edges are not in its
+// requirement set (this is the bug the iter 1 CHANGELOG
+// narrative claimed; the CHANGELOG was wrong, the composer
+// was right).
+func TestCompose_SamplesPending_XServiceTestReliability(t *testing.T) {
+	t.Parallel()
+	c := newTestComposer(t)
+	repoScopeID := mustNewUUID(t)
+	in := SystemTierInput{
+		Mode:                SystemTierModeLinked,
+		RepoID:              mustNewUUID(t),
+		SHA:                 "3b3b3b3b",
+		ProducerRunID:       mustNewUUID(t),
+		XRepoEdgesAvailable: true,
+		CallEdgesAvailable:  true,
+		Scopes: []ScopeRef{
+			{ScopeID: repoScopeID, ScopeKind: "repo"},
+		},
+		// No foundation `pass_first_try_ratio` row -> samples_pending.
+	}
+	out, err := c.Compose(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	var got *SystemTierSample
+	for i := range out {
+		if out[i].MetricKind == SystemMetricXServiceTestReliability {
+			got = &out[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("composer dropped xservice_test_reliability; expected a degraded row (fail-safe contract -- architecture Sec 3.10 step 4)")
+	}
+	if !got.Degraded {
+		t.Errorf("xservice_test_reliability.Degraded=false, want true (no pass_first_try_ratio foundation row)")
+	}
+	if got.DegradedReason != DegradedReasonSamplesPending {
+		t.Errorf("xservice_test_reliability.DegradedReason=%q, want %q (architecture Sec 1.4.2 row 6 -- missing pass_first_try_ratio degrades as samples_pending, NOT xrepo_edges_unavailable)", got.DegradedReason, DegradedReasonSamplesPending)
+	}
+	if got.DegradedReason == DegradedReasonXRepoEdgesUnavailable {
+		t.Errorf("xservice_test_reliability incorrectly carries DegradedReason=xrepo_edges_unavailable; this kind does NOT consume cross-repo edges per architecture Sec 1.4.2 row 6 (iter 1 evaluator item 3 fix)")
+	}
+	if got.Value != nil {
+		t.Errorf("xservice_test_reliability.Value=%v, want nil (degraded -> NULL)", *got.Value)
+	}
+	if got.ScopeKind != "repo" {
+		t.Errorf("xservice_test_reliability.ScopeKind=%q, want %q (architecture Sec 1.4.2 row 6 -- repo scope)", got.ScopeKind, "repo")
+	}
+}
+
+// TestCompose_SamplesPending_KnowledgeIndex_FileAndRepo is the
+// iter 1 evaluator item 5 fix: a direct targeted assertion that
+// `knowledge_index` emits BOTH a file-scoped and a repo-scoped
+// degraded row with `degraded_reason='samples_pending'` when
+// the per-author churn data (`ingest.churn` adapter input) is
+// absent. Architecture Sec 1.4.2 row 7 explicitly names
+// `samples_pending` for this metric when churn has not yet
+// arrived; the e2e-scenarios "knowledge_index degrades when
+// churn lags" gherkin pins both scope_kinds.
+func TestCompose_SamplesPending_KnowledgeIndex_FileAndRepo(t *testing.T) {
+	t.Parallel()
+	c := newTestComposer(t)
+	repoScopeID := mustNewUUID(t)
+	fileScopeID := mustNewUUID(t)
+	in := SystemTierInput{
+		Mode:                SystemTierModeLinked,
+		RepoID:              mustNewUUID(t),
+		SHA:                 "4c4c4c4c",
+		ProducerRunID:       mustNewUUID(t),
+		XRepoEdgesAvailable: true,
+		CallEdgesAvailable:  true,
+		Scopes: []ScopeRef{
+			{ScopeID: repoScopeID, ScopeKind: "repo"},
+			{ScopeID: fileScopeID, ScopeKind: "file"},
+		},
+		// AuthorsByScope intentionally nil -> samples_pending.
+		// Note: knowledge_index ALSO needs
+		// `modification_count_in_window` foundation rows; we
+		// likewise leave those out, but the missing-author
+		// signal alone is sufficient to degrade per the
+		// composer's `missing := noMods || noAuthors` rule.
+	}
+	out, err := c.Compose(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	gotByScope := map[string]*SystemTierSample{}
+	for i := range out {
+		if out[i].MetricKind != SystemMetricKnowledgeIndex {
+			continue
+		}
+		gotByScope[out[i].ScopeKind] = &out[i]
+	}
+	if _, ok := gotByScope["file"]; !ok {
+		t.Errorf("composer dropped knowledge_index at file scope; want degraded row (architecture Sec 1.4.2 row 7)")
+	}
+	if _, ok := gotByScope["repo"]; !ok {
+		t.Errorf("composer dropped knowledge_index at repo scope; want degraded row")
+	}
+	for sk, s := range gotByScope {
+		if !s.Degraded {
+			t.Errorf("knowledge_index at scope_kind=%s.Degraded=false, want true (no AuthorsByScope -> samples_pending)", sk)
+		}
+		if s.DegradedReason != DegradedReasonSamplesPending {
+			t.Errorf("knowledge_index at scope_kind=%s.DegradedReason=%q, want %q (architecture Sec 1.4.2 row 7)", sk, s.DegradedReason, DegradedReasonSamplesPending)
+		}
+		if s.Value != nil {
+			t.Errorf("knowledge_index at scope_kind=%s.Value=%v, want nil (degraded -> NULL)", sk, *s.Value)
+		}
+	}
+}

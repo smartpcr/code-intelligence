@@ -6,6 +6,151 @@ Newest at the top. Stage references map to
 
 ## Stage 7.2 -- System tier metric composer
 
+### Iter 2 -- aggregator wiring + PG writer + edge-availability signal + degraded-path tests
+
+Iteration 1 (score 79, verdict: iterate) shipped the
+composer + in-memory writer but stopped short of making the
+running aggregator actually persist `metric_sample(pack='system',
+source='derived')` rows. This iter closes that gap and the four
+other findings.
+
+New files:
+- `internal/aggregator/system_tier_source.go` -- the
+  `SystemTierInputSource` interface (the read-side seam the
+  aggregator pulls per-tick per-`(repo_id, sha)` system-tier
+  inputs from) and `InMemorySystemTierInputSource` (the
+  test-side deep-copy-on-read implementation).
+- `internal/aggregator/pg_system_tier_writer.go` -- the
+  production `PGSystemTierWriter`. Persists composer-emitted
+  samples into `clean_code.metric_sample` and re-points
+  `clean_code.metric_sample_active` to the new sample inside
+  ONE PG transaction per `WriteSystemTierSamples` call. The
+  active-pointer upsert uses
+  `ON CONFLICT (repo_id, sha, scope_id, metric_kind,
+  metric_version) DO UPDATE SET sample_id = EXCLUDED.sample_id`
+  per architecture Sec 5.2.1's retract-then-reinsert semantics
+  -- a prior `DO NOTHING` shape would silently drop
+  re-composed rows.
+- `internal/aggregator/pg_system_tier_writer_test.go` --
+  sqlmock-driven contract pins: single-transaction shape,
+  empty-batch no-op, rollback on insert / upsert failure,
+  rejection of invented `metric_kind` values BEFORE the txn
+  opens, AND a literal regex pin on the
+  `DO UPDATE SET sample_id = EXCLUDED.sample_id` upsert
+  shape so a future refactor can't silently regress to
+  `DO NOTHING`.
+- `internal/aggregator/system_tier_wiring_test.go` -- proves
+  the aggregator path: `WithSystemTier` wires composer +
+  source + writer, the system-tier pass runs ALSO when the
+  foundation pipeline is empty (the foundation `ReadActive`
+  empty-observations early-return must NOT skip system-tier),
+  multi-repo inputs land in one writer batch, and source /
+  composer errors propagate with context.
+- `migrations/0011_seed_system_tier_metric_kinds.up.sql` and
+  `.down.sql` -- schema-owner seed for the seven canonical
+  system-tier `metric_kind` rows at `metric_version=1`,
+  `tier='system'`, `pack='system'`. Idempotent
+  (`ON CONFLICT (metric_kind) DO NOTHING`). The composer's
+  composite FK on `metric_sample.(metric_kind,
+  metric_version)` resolves at write time. The runtime
+  aggregator role has SELECT-only access to `metric_kind`
+  (`0004_roles.up.sql:350-355`); the schema-owner migration
+  is the canonical insert path (mirrors the iter-18 fix on
+  `0007_seed_foundation_metric_kinds`).
+
+Modified files:
+- `internal/aggregator/aggregator.go` -- added
+  `composer / sysSource / sysWriter` fields, new
+  `WithSystemTier(composer, source, writer)` option, and
+  restructured `Tick` into `tickSnapshots` +
+  `tickSystemTier` helpers. The system-tier pass runs
+  INDEPENDENTLY of foundation observation count -- the prior
+  monolithic `Tick`'s empty-observation early return would
+  have silently skipped system-tier rows the architecture's
+  fail-safe contract explicitly mandates be written.
+- `internal/aggregator/types.go` -- added three
+  `SystemTier*` counters to `Report`
+  (`SystemTierReposComposed`, `SystemTierSamplesWritten`,
+  `SystemTierDegradedSamples`).
+- `internal/aggregator/system_tier.go` -- added explicit
+  `XRepoEdgesAvailable bool` + `CallEdgesAvailable bool`
+  fields on `SystemTierInput` so a linked-mode source with
+  a valid-but-empty cross-repo graph can emit
+  `xrepo_dep_depth = 0` non-degraded (rather than the prior
+  shape that conflated empty edges with unavailable edges).
+  Backward-compat: when the flags are false AND the edge
+  slice is non-empty (legacy callers), the composer treats
+  edges as available. The composer's `composeXRepoDepDepth`
+  and `composeBlastRadius` dispatch now reads through the
+  helper functions `xRepoEdgesAvailable(in)` and
+  `callEdgesAvailable(in)`.
+- `internal/aggregator/system_tier_test.go` -- new direct
+  tests for the previously-missing degraded paths:
+  `xservice_test_reliability` `samples_pending` (item 4)
+  and `knowledge_index` `samples_pending` at file AND repo
+  scope (item 5); plus the new edge-availability cases:
+  linked-mode-available-but-empty xrepo edges produces
+  non-degraded depth 0, linked-mode-available-but-empty
+  call edges produces non-degraded blast_radius 0, and the
+  legacy-implicit-availability backward-compat path.
+
+#### Prior feedback resolution
+
+- [x] 1. **FIXED** -- `internal/aggregator/aggregator.go`
+  `WithSystemTier` option + restructured `Tick` (helpers
+  `tickSnapshots` / `tickSystemTier`) make the running
+  aggregator invoke the composer and persist
+  `metric_sample(pack='system', source='derived')` rows.
+  New `internal/aggregator/pg_system_tier_writer.go` is the
+  production writer (single-tx + DO UPDATE on active
+  pointer). New `internal/aggregator/system_tier_wiring_test.go`
+  asserts the captured batch carries the canonical
+  pack/source/kind shape AND that the system-tier pass runs
+  even when foundation `ReadActive` returns zero
+  observations (the prior monolithic Tick would have
+  early-returned). New migration
+  `migrations/0011_seed_system_tier_metric_kinds.up.sql`
+  seeds the seven `metric_kind` rows so the composite FK
+  resolves at write time.
+- [x] 2. **FIXED** -- `internal/aggregator/system_tier.go`
+  `SystemTierInput.XRepoEdgesAvailable` / `CallEdgesAvailable`
+  bool fields + `xRepoEdgesAvailable` /
+  `callEdgesAvailable` helpers separate "edges unavailable"
+  from "valid but empty edge corpus". `composeXRepoDepDepth`
+  / `composeBlastRadius` dispatch now reads
+  `embedded := in.Mode != SystemTierModeLinked ||
+  !xRepoEdgesAvailable(in)` so a linked-mode tick with an
+  empty graph emits non-degraded depth 0 / blast_radius 0.
+  New direct tests in
+  `internal/aggregator/system_tier_test.go`:
+  `TestCompose_LinkedMode_AvailableButEmptyXRepoEdges_NonDegradedDepthZero`,
+  `TestCompose_LinkedMode_AvailableButEmptyCallEdges_BlastRadiusNonDegradedZero`,
+  `TestCompose_LegacyImplicitEdgesAvailable_BackwardCompat`.
+- [x] 3. **FIXED** -- `services/clean-code/CHANGELOG.md`
+  iter-1 narrative paragraph rewritten: only
+  `xrepo_dep_depth` and `blast_radius` are listed as
+  embedded-mode xrepo-edges-degraded; the iter-2
+  correction sentence explicitly notes that
+  `xservice_test_reliability` is NOT an xrepo-edge-dependent
+  kind and degrades with `samples_pending` when the
+  foundation `pass_first_try_ratio` row is absent (matches
+  the code path at
+  `internal/aggregator/system_tier.go` --
+  `composeXServiceTestReliability`).
+- [x] 4. **FIXED** -- New direct test
+  `TestCompose_SamplesPending_XServiceTestReliability` in
+  `internal/aggregator/system_tier_test.go` asserts the
+  composer emits `degraded=true,
+  degraded_reason='samples_pending'` when
+  `pass_first_try_ratio` is absent from the foundation
+  input set.
+- [x] 5. **FIXED** -- New direct test
+  `TestCompose_SamplesPending_KnowledgeIndex_FileAndRepo`
+  in `internal/aggregator/system_tier_test.go` asserts
+  the composer emits `degraded=true,
+  degraded_reason='samples_pending'` at BOTH file and repo
+  scope when the `AuthorsByScope` churn input is absent.
+
 ### Iter 1 -- composer + in-memory writer + closed-set tests
 
 New file: `internal/aggregator/system_tier.go` introduces the
@@ -24,13 +169,20 @@ percentile vectors continue to live in
 The composer honours the architecture Sec 3.10 step 4
 fail-safe contract: when an input prerequisite is missing
 (cross-repo edges in embedded mode for `xrepo_dep_depth` /
-`xservice_test_reliability` / `blast_radius`; the cycle_member
-foundation row for `arch_debt_ratio`; <2 velocity windows for
+`blast_radius`; the cycle_member foundation row for
+`arch_debt_ratio`; the `pass_first_try_ratio` foundation row
+for `xservice_test_reliability`; <2 velocity windows for
 `velocity_trend`; an empty author list for `knowledge_index`),
 the row is STILL emitted, with `degraded=true` and the
 matching `degraded_reason` from the architecture Sec 8.2
-closed list. The composer's permitted reasons are restricted
-to `xrepo_edges_unavailable` and `samples_pending`;
+closed list. Per the iter-2 evaluator item 3 correction, ONLY
+`xrepo_dep_depth` and `blast_radius` depend on cross-repo
+edges and therefore degrade with `xrepo_edges_unavailable` in
+embedded mode -- `xservice_test_reliability` is NOT an
+xrepo-edge-dependent kind; it degrades with `samples_pending`
+when the foundation `pass_first_try_ratio` row is absent.
+The composer's permitted reasons are restricted to
+`xrepo_edges_unavailable` and `samples_pending`;
 `policy_signature_invalid` and `percentile_stale` are NOT
 composer-emitted (they belong to the evaluator gate / Insights
 surface respectively).

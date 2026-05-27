@@ -65,12 +65,19 @@ import (
 // from the architecture Sec 8.2 closed list:
 //
 //   - [DegradedReasonXRepoEdgesUnavailable] -- cross-repo
-//     edges required by `xrepo_dep_depth` or `blast_radius`
-//     are not present (embedded mode or agent-memory
-//     unavailable). Per architecture Sec 1.4.2 row 5,
-//     `blast_radius` is ALWAYS degraded with this reason in
+//     edges required by `xrepo_dep_depth` or call-graph
+//     edges required by `blast_radius` are not present
+//     (embedded mode, OR linked mode where the agent-memory
+//     adapter reports unavailable per
+//     [SystemTierInput.XRepoEdgesAvailable] /
+//     [SystemTierInput.CallEdgesAvailable] -- iter 1
+//     evaluator item 2 fix). Per architecture Sec 1.4.2 row
+//     5, `blast_radius` always degrades with this reason in
 //     embedded mode; the architecture treats local fan-in as
-//     a non-substitute for the call-graph signal.
+//     a non-substitute for the call-graph signal. A
+//     linked-mode tick with an explicitly AVAILABLE but
+//     empty edge set is a legitimate non-degraded `value=0`
+//     shape, NOT a degradation trigger.
 //   - [DegradedReasonSamplesPending] -- a required foundation
 //     or ingested input row has not yet arrived (e.g.
 //     `cycle_member` for `arch_debt_ratio`,
@@ -459,12 +466,44 @@ type SystemTierInput struct {
 	// `xrepo_dep_depth` composer reads in linked mode. Empty
 	// in embedded mode.
 	XRepoEdges []XRepoEdge
+	// XRepoEdgesAvailable signals whether the cross-repo edge
+	// SUBSYSTEM (architecture Sec 8.7 agent-memory adapter)
+	// responded with a real edge set this tick. The boolean is
+	// the canonical "are edges available?" answer that the
+	// composer reads when deciding whether `xrepo_dep_depth`
+	// should degrade. A nil/empty edge slice can legitimately
+	// mean "linked mode responded with zero edges -- this
+	// repository has no cross-repo dependencies" -- which is a
+	// valid `xrepo_dep_depth = 0` portfolio shape that MUST NOT
+	// degrade to `xrepo_edges_unavailable`. Iter 1 evaluator
+	// item 2 flagged the prior conflation of "len(edges)==0"
+	// with "edges unavailable" as a bug; this field is the
+	// fix.
+	//
+	// # Backward compatibility
+	//
+	// For callers that pre-date this field, the composer falls
+	// back to `XRepoEdgesAvailable = (len(XRepoEdges) > 0)` so
+	// the prior "non-empty edge slice = available" behaviour is
+	// preserved -- a caller that explicitly sets the flag wins
+	// over the implicit fallback. The explicit signal is the
+	// production wiring's contract; the fallback is the
+	// compat-with-old-tests escape hatch.
+	XRepoEdgesAvailable bool
 	// CallEdges is the downstream call-graph edge set the
 	// `blast_radius` composer reads in linked mode. Empty in
 	// embedded mode (`blast_radius` is unconditionally
 	// degraded regardless of this slice's content in embedded
 	// mode -- see architecture Sec 1.4.2 row 5).
 	CallEdges []CallEdge
+	// CallEdgesAvailable is the analogue of
+	// [SystemTierInput.XRepoEdgesAvailable] for the
+	// call-graph edge set the `blast_radius` composer reads.
+	// Same semantics: the flag wins; an empty `CallEdges`
+	// slice with `CallEdgesAvailable=true` is a legitimate
+	// `blast_radius = 0` shape for a method that no other
+	// scope calls. Same backward-compat fallback applies.
+	CallEdgesAvailable bool
 	// VelocityWindows carries per-window aggregate values for
 	// the rolling 4-window `velocity_trend` computation. A
 	// slice length < 2 degrades the row with samples_pending
@@ -701,6 +740,40 @@ func sortScopeRefs(refs []ScopeRef) {
 	})
 }
 
+// xRepoEdgesAvailable returns the canonical availability
+// answer for the cross-repo edge subsystem at this tick. Per
+// iter 1 evaluator item 2 (the "linked mode with empty graph
+// must not degrade to xrepo_edges_unavailable" finding), the
+// composer treats availability as a TWO-SIGNAL OR:
+//
+//   1. The explicit [SystemTierInput.XRepoEdgesAvailable] flag
+//      set true by the caller. This is the production wiring's
+//      contract: the agent-memory adapter (Stage 8.7) returns
+//      "available" iff the call to it succeeded -- a successful
+//      call that returned zero edges is still "available".
+//   2. The legacy implicit fallback `len(XRepoEdges) > 0`.
+//      Preserved so iter-1 tests that pre-date the explicit
+//      flag continue to pass without a coordinated rewrite.
+//
+// The disjunction is deliberate: a caller that sets the flag
+// true wins over an empty slice; a caller that leaves the flag
+// false but supplies a non-empty slice ALSO counts as
+// available. The only "unavailable" path is the all-false /
+// all-empty combination, which corresponds to embedded mode
+// or a linked-mode tick where the agent-memory adapter
+// returned a transport error.
+func xRepoEdgesAvailable(in SystemTierInput) bool {
+	return in.XRepoEdgesAvailable || len(in.XRepoEdges) > 0
+}
+
+// callEdgesAvailable is the analogue of
+// [xRepoEdgesAvailable] for the call-graph edge subsystem the
+// `blast_radius` composer reads. Same two-signal OR semantics
+// per iter 1 evaluator item 2.
+func callEdgesAvailable(in SystemTierInput) bool {
+	return in.CallEdgesAvailable || len(in.CallEdges) > 0
+}
+
 // buildXRepoAdjacency returns a `from -> []to` adjacency
 // list. The composer uses it for the longest-path traversal
 // in `xrepo_dep_depth`. A nil / empty edge slice yields an
@@ -758,7 +831,7 @@ func (c *SystemTierComposer) composeXRepoDepDepth(
 		return nil, nil
 	}
 
-	embedded := in.Mode != SystemTierModeLinked || len(in.XRepoEdges) == 0
+	embedded := in.Mode != SystemTierModeLinked || !xRepoEdgesAvailable(in)
 	out := make([]SystemTierSample, 0, len(repoScopes))
 	for _, s := range repoScopes {
 		if embedded {
@@ -1039,12 +1112,16 @@ func meanValues(xs []FoundationSample) float64 {
 
 // composeBlastRadius emits one row per `method`-kind scope
 // and one row per `class`-kind scope per architecture Sec
-// 1.4.2 row 5. In embedded mode the row is UNCONDITIONALLY
+// 1.4.2 row 5. In embedded mode (or linked mode where the
+// call-graph subsystem reports unavailable) the row is
 // degraded with [DegradedReasonXRepoEdgesUnavailable] per the
 // row 5 contract -- the architecture treats local fan_in as
 // a non-substitute for the call-graph signal in v1. Linked
-// mode counts downstream scopes reachable from each scope via
-// the call-graph adjacency list.
+// mode with call edges AVAILABLE (per
+// [SystemTierInput.CallEdgesAvailable] -- iter 1 evaluator
+// item 2) counts downstream scopes reachable from each scope
+// via the call-graph adjacency list; an empty-but-available
+// graph correctly emits `blast_radius = 0` non-degraded.
 func (c *SystemTierComposer) composeBlastRadius(
 	in SystemTierInput,
 	scopesByKind map[string][]ScopeRef,
@@ -1056,7 +1133,7 @@ func (c *SystemTierComposer) composeBlastRadius(
 	if total == 0 {
 		return nil, nil
 	}
-	embedded := in.Mode != SystemTierModeLinked
+	embedded := in.Mode != SystemTierModeLinked || !callEdgesAvailable(in)
 	out := make([]SystemTierSample, 0, total)
 	emit := func(s ScopeRef) error {
 		if embedded {

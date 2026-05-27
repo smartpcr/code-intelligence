@@ -151,12 +151,43 @@ var CanonicalVerbs = []CanonicalVerb{
 	},
 
 	// 6.3 mgmt.* read verbs (single repo_id query parameter).
+	//
+	// `read.metric_sample`: architecture (Sec 6.3 line 1356)
+	// expresses the contract as `metric_sample(sample_id)`, but
+	// the v1 Reader/adapter uses the NATURAL-KEY quintuple
+	// (repo_id, sha, scope_id, metric_kind) -- the
+	// `metric_sample_active` lookup is composite-keyed at the
+	// storage layer. The canonical verb therefore takes
+	// `repo_id` from the query string to MATCH the adapter
+	// (services/clean-code/internal/api/mgmt_read_adapter.go:144),
+	// so the gateway span's `repo_id` attribute is correctly
+	// populated. A future stage that introduces a true
+	// `sample_id`-keyed Reader method (architecture-aligned
+	// API) will revisit both this row AND the adapter.
+	// (Item #3 from iter-8 evaluator feedback.)
+	//
+	// `read.cross_repo`: architecture (Sec 6.3 line 1365) lists
+	// the verb's signature as `cross_repo(repo_id, metric_kind,
+	// scope_kind, sha?)`, but the v1 Reader
+	// (`ReadCrossRepo(ctx, metricKind, scopeKind)`) and the
+	// matching HTTP adapter (mgmt_read_adapter.go:275-293) are
+	// PORTFOLIO-WIDE: a single `cross_repo_percentile` snapshot
+	// row carries the full cross-repo distribution and the
+	// caller does NOT need to pin `repo_id` to read its rank.
+	// `RepoIDNone` here matches the adapter; the span attribute
+	// stays empty rather than being populated from a query
+	// parameter the adapter ignores (which would otherwise
+	// create a contract-vs-span drift). A future stage that
+	// introduces caller-repo rank computation will revisit
+	// both this row AND the adapter to thread `repo_id`
+	// through to the Reader.
+	// (Item #4 from iter-8 evaluator feedback.)
 	{Namespace: "mgmt", Name: "read.repo", RepoIDSource: RepoIDFromQuery, Description: "Read a repo by id."},
-	{Namespace: "mgmt", Name: "read.metric_sample", RepoIDSource: RepoIDNone, Description: "Read a metric sample by sample_id."},
+	{Namespace: "mgmt", Name: "read.metric_sample", RepoIDSource: RepoIDFromQuery, Description: "Read a metric sample by natural-key quintuple (repo_id, sha, scope_id, metric_kind)."},
 	{Namespace: "mgmt", Name: "read.metric_samples", RepoIDSource: RepoIDFromQuery, Description: "List metric samples for repo+sha."},
 	{Namespace: "mgmt", Name: "read.findings", RepoIDSource: RepoIDFromQuery, Description: "List findings for repo (optional sha, severity)."},
 	{Namespace: "mgmt", Name: "read.regressions", RepoIDSource: RepoIDFromQuery, Description: "List newly-failing rules for repo at sha vs prev."},
-	{Namespace: "mgmt", Name: "read.cross_repo", RepoIDSource: RepoIDFromQuery, Description: "Cross-repo percentile + histogram for metric/scope."},
+	{Namespace: "mgmt", Name: "read.cross_repo", RepoIDSource: RepoIDNone, Description: "Portfolio-wide percentile + histogram for metric_kind/scope_kind (no per-repo filter at v1)."},
 	{Namespace: "mgmt", Name: "read.portfolio", RepoIDSource: RepoIDNone, Description: "Portfolio snapshot for metric_kind+scope_kind."},
 	{Namespace: "mgmt", Name: "read.refactor_plan", RepoIDSource: RepoIDFromQuery, Description: "Read refactor plan for repo+sha."},
 

@@ -47,15 +47,16 @@ type errorEnvelope struct {
 // of its error responses. Pinned as exported constants so
 // integration tests can assert codes verbatim.
 const (
-	CodeMissingToken   = "MISSING_BEARER_TOKEN"
-	CodeMalformedToken = "MALFORMED_BEARER_TOKEN"
-	CodeInvalidToken   = "INVALID_BEARER_TOKEN"
-	CodeExpiredToken   = "EXPIRED_BEARER_TOKEN"
-	CodeBadAudience    = "BAD_AUDIENCE"
-	CodeBadIssuer      = "BAD_ISSUER"
-	CodeUnknownVerb    = "UNKNOWN_VERB"
-	CodeInternalError  = "INTERNAL_ERROR"
-	CodeAuthBackend    = "AUTH_BACKEND_UNAVAILABLE"
+	CodeMissingToken      = "MISSING_BEARER_TOKEN"
+	CodeMalformedToken    = "MALFORMED_BEARER_TOKEN"
+	CodeInvalidToken      = "INVALID_BEARER_TOKEN"
+	CodeExpiredToken      = "EXPIRED_BEARER_TOKEN"
+	CodeBadAudience       = "BAD_AUDIENCE"
+	CodeBadIssuer         = "BAD_ISSUER"
+	CodeUnknownVerb       = "UNKNOWN_VERB"
+	CodeInternalError     = "INTERNAL_ERROR"
+	CodeAuthBackend       = "AUTH_BACKEND_UNAVAILABLE"
+	CodeInsufficientGroup = "INSUFFICIENT_GROUP"
 )
 
 // GatewayHandler is the gateway's top-level [http.Handler]. It
@@ -67,6 +68,7 @@ const (
 // gateway under a prefix) can construct one directly.
 type GatewayHandler struct {
 	auth     Authenticator
+	authz    Authorizer
 	registry *VerbRegistry
 	tracer   Tracer
 	logger   *slog.Logger
@@ -75,9 +77,25 @@ type GatewayHandler struct {
 // NewGatewayHandler wires the gateway's dependencies. PANICS
 // when any required dependency is nil -- a misconfigured
 // gateway has no safe runtime behaviour.
+//
+// The Authorizer is OPTIONAL; passing nil installs
+// [NoopAuthorizer] which admits every authenticated caller.
+// Production composition roots SHOULD pass a real
+// Authorizer (e.g. [GroupClaimAuthorizer]) to honour the
+// tech-spec Sec 8.5 OIDC group-claim requirement.
 func NewGatewayHandler(auth Authenticator, registry *VerbRegistry, tracer Tracer, logger *slog.Logger) *GatewayHandler {
+	return NewGatewayHandlerWithAuthorizer(auth, NoopAuthorizer{}, registry, tracer, logger)
+}
+
+// NewGatewayHandlerWithAuthorizer is the full-config
+// constructor. PANICS on a nil Authenticator, nil Registry,
+// or nil Authorizer. The other arguments default safely.
+func NewGatewayHandlerWithAuthorizer(auth Authenticator, authz Authorizer, registry *VerbRegistry, tracer Tracer, logger *slog.Logger) *GatewayHandler {
 	if auth == nil {
 		panic("api: NewGatewayHandler received nil Authenticator")
+	}
+	if authz == nil {
+		panic("api: NewGatewayHandler received nil Authorizer (pass NoopAuthorizer{} explicitly to acknowledge no policy enforcement)")
 	}
 	if registry == nil {
 		panic("api: NewGatewayHandler received nil VerbRegistry")
@@ -90,6 +108,7 @@ func NewGatewayHandler(auth Authenticator, registry *VerbRegistry, tracer Tracer
 	}
 	return &GatewayHandler{
 		auth:     auth,
+		authz:    authz,
 		registry: registry,
 		tracer:   tracer,
 		logger:   logger,
@@ -171,6 +190,17 @@ func (g *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	identity, authErr := g.authenticate(r)
 	if authErr != nil {
 		g.handleAuthError(w, r, authErr, verb.DottedName())
+		return
+	}
+
+	// Step 3.5 -- group-claim authorisation (tech-spec
+	// Sec 8.5). Runs AFTER authn so the caller's
+	// Identity is verified before policy evaluation; runs
+	// BEFORE the span opens so a denied request does not
+	// pollute the verb-success metrics. A denial returns
+	// 403 with WWW-Authenticate insufficient_scope.
+	if authzErr := g.authz.Authorize(r.Context(), identity, verb.DottedName()); authzErr != nil {
+		g.handleAuthzError(w, r, authzErr, identity, verb.DottedName())
 		return
 	}
 
@@ -353,6 +383,57 @@ func (g *GatewayHandler) handleAuthError(w http.ResponseWriter, r *http.Request,
 		g.writeError(w, r, http.StatusInternalServerError, CodeInternalError,
 			"internal error", "", verb)
 	}
+}
+
+// handleAuthzError maps the [Authorizer.Authorize] return
+// onto the canonical HTTP shape. The deny path
+// ([ErrInsufficientGroup]) -> 403 with WWW-Authenticate
+// `insufficient_scope`; any other error -> 500 with the
+// opaque [CodeInternalError] body and a server-side log.
+//
+// The 403 body carries the canonical [CodeInsufficientGroup]
+// code so operator tooling can distinguish "audience
+// mismatch" (CodeBadAudience, also 403) from "group
+// policy" (CodeInsufficientGroup, also 403) without
+// parsing the human-readable error string.
+func (g *GatewayHandler) handleAuthzError(w http.ResponseWriter, r *http.Request, err error, identity *Identity, verb string) {
+	subject := ""
+	if identity != nil {
+		subject = identity.Subject
+	}
+	if errors.Is(err, ErrInsufficientGroup) {
+		// RFC 6750 Sec 3.1: `insufficient_scope` is the
+		// canonical OAuth 2.0 Bearer challenge for
+		// authenticated-but-unauthorised. The body
+		// surfaces the verb so the caller's tooling can
+		// log it for an audit trail; the underlying group
+		// mismatch is logged server-side only (the caller
+		// already knows their own group list, and a
+		// detailed diff would leak the per-verb policy to
+		// any caller probing the surface).
+		w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope", error_description="group policy denies verb"`)
+		g.logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"gateway: authz denied",
+			slog.String("verb", verb),
+			slog.String("caller_subject", subject),
+			slog.String("error", err.Error()),
+		)
+		g.writeError(w, r, http.StatusForbidden, CodeInsufficientGroup,
+			"caller groups do not satisfy verb policy", subject, verb)
+		return
+	}
+	// Any other authz error type is an INTERNAL failure
+	// (e.g. the Authorizer panicked decoding the claim,
+	// or a custom impl returned a non-sentinel error).
+	// Log the raw error; emit an opaque 500 on the wire
+	// so policy table contents do not leak.
+	g.logger.ErrorContext(r.Context(), "gateway: authorizer internal failure",
+		slog.String("verb", verb),
+		slog.String("caller_subject", subject),
+		slog.String("error", err.Error()),
+	)
+	g.writeError(w, r, http.StatusInternalServerError, CodeInternalError,
+		"internal error", subject, verb)
 }
 
 // writeError emits the canonical JSON error envelope and logs

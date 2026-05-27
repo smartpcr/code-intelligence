@@ -33,6 +33,16 @@ type ServerConfig struct {
 	// Authenticator verifies the bearer token. REQUIRED.
 	Authenticator Authenticator
 
+	// Authorizer enforces per-verb access policy AFTER
+	// the [Authenticator] succeeds. Optional -- nil
+	// installs [NoopAuthorizer] (every authenticated
+	// caller admitted) for scaffold / test deployments.
+	// Production composition roots MUST pass a real
+	// Authorizer (typically [NewGroupClaimAuthorizer])
+	// to honour the tech-spec Sec 8.5 OIDC-group-claim
+	// requirement.
+	Authorizer Authorizer
+
 	// Registry holds the verb table. When nil, [NewServer]
 	// installs [NewDefaultRegistry] so the gateway exposes
 	// every canonical verb (architecture Sec 6.2-6.5) as a
@@ -134,7 +144,11 @@ func NewServer(cfg ServerConfig) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	handler := NewGatewayHandler(cfg.Authenticator, registry, tracer, logger)
+	authz := cfg.Authorizer
+	if authz == nil {
+		authz = NoopAuthorizer{}
+	}
+	handler := NewGatewayHandlerWithAuthorizer(cfg.Authenticator, authz, registry, tracer, logger)
 	readHeaderTimeout := cfg.ReadHeaderTimeout
 	if readHeaderTimeout == 0 {
 		readHeaderTimeout = DefaultReadHeaderTimeout

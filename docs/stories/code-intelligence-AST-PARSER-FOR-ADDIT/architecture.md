@@ -102,10 +102,14 @@ must respect them.
 
 ## 2. Components and Responsibilities
 
-This story introduces no new packages. All new files live in
-`services/agent-memory/internal/repoindexer/ast/`. The component
-diagram below names existing pieces (unchanged) and the new
-pieces added by this story.
+This story introduces no new Go packages. New Go source files
+all live under
+`services/agent-memory/internal/repoindexer/ast/`. The single
+non-Go addition is the schema migration file
+`services/agent-memory/migrations/0022_edge_kind_overrides.sql`
+(see Section 2.2.1 and Section 4.4 for the rationale). The
+component diagram below names existing pieces (unchanged) and
+the new pieces added by this story.
 
 ```
                 +----------------------------------------+
@@ -813,13 +817,13 @@ envelope:
 
 ### 6.2 v1 implementation: subprocess to `pwsh`
 
-The Go parser file is `parser_powershell.go` (NO CGO build
-tag -- the implementation is pure subprocess invocation):
+The Go parser file is `parser_powershell.go` (no build tags --
+the implementation is pure subprocess invocation with no CGO
+or compile-time dependency on `pwsh`):
 
 ```go
-// parser_powershell.go
-//go:build !no_pwsh
-// (build tag "no_pwsh" lets CI opt out on stripped images)
+// parser_powershell.go (no build tags -- compiles under
+// CGO=on, CGO=off, with or without pwsh on the host)
 
 type powershellParser struct {
     pwshBin string  // resolved via exec.LookPath("pwsh")
@@ -844,6 +848,19 @@ func (p *powershellParser) Parse(relPath string, src []byte) (ParseResult, error
     // 4. Map the JSON onto ClassDecl / MethodDecl / Import.
 }
 ```
+
+Rationale for dropping build tags here: because `parsers_cgo.go`
+and `parsers_nocgo.go` both register `powershellParser`
+unconditionally (Section 6.3), any conditional-compilation tag
+on `parser_powershell.go` would leave the registration sites
+referencing an undefined symbol under the excluded tag. v1
+keeps the file unconditional. A future story that wants a
+"stripped image without `pwsh` support" can introduce both
+(a) a `parser_powershell_disabled.go` stub with the inverse
+build tag exporting a `powershellParser` whose `Parse` always
+returns `ErrParserUnavailable`, AND (b) matching build-tag
+guards in `parsers_cgo.go` / `parsers_nocgo.go` to skip the
+registration entirely. v1 does NOT ship that pair.
 
 Extraction is one process per file. For a worker walking
 many `.ps1` files, the implementation MAY (a follow-up
@@ -1378,69 +1395,63 @@ will be picked up by future stories:
 
 ### Prior feedback resolution
 
-Iter-3 evaluator findings (the active checklist):
+Iter-4 evaluator findings (the active checklist):
 
-- [x] 1. FIXED -- structural change to the Iteration Summary.
-  The verification quote-blocks from iter-3 inadvertently
-  reintroduced the very phrases being verified inside the
-  doc, so a fresh literal grep matched them in the Prior
-  feedback resolution section itself. This iter REPLACES the
-  inline verification blocks with concise prose entries that
-  do NOT reproduce the previously-removed phrases. The
-  removal is verified out-of-band (this turn) and not
-  in-doc.
-- [x] 2. FIXED -- the Rust `overrides` edge now ships with a
-  named migration. Section 1.1 (scope table) and Section 4.4
-  (preface) both carve out a single targeted exception to
-  the "no schema migration" claim: a new file
-  `services/agent-memory/migrations/0022_edge_kind_overrides.sql`
-  containing `ALTER TYPE edge_kind ADD VALUE 'overrides';`.
-  Section 2.2.1 lists the migration in the additive-surface
-  table. Section 9 R4 references the file by name and cites
-  the source enum location (`0001_enums.sql` lines 28-38).
-- [x] 3. FIXED -- the PowerShell missing-`pwsh` path now
-  uses a sentinel error. Section 2.2.1 introduces an
-  exported `ErrParserUnavailable` symbol on `parser.go` and
-  a new dispatcher branch in `EmitFile` between current
-  lines 196 and 198: `errors.Is(err, ErrParserUnavailable)`
-  triggers `ast.dispatch.skip` with the parser-supplied
-  reason and returns `EmitResult{}, nil`. Section 6.2's
-  pseudo-code returns the sentinel when `pwshBin == ""`.
-  Section 6.4 documents the three fallback paths
-  (unavailable -> skip; parse error -> `ast.parse.error`;
-  timeout -> `ast.parse.error`). Section 8.3 adds the new
-  `reason=pwsh_not_available` log key.
-- [x] 4. FIXED -- ReceiverAliases lookup was restructured.
-  Section 4.5.1 NO LONGER says "consult ReceiverAliases
-  after the primary lookup" (that approach was wrong for
-  the reason the evaluator gave -- the primary key
-  `Foo.Bar` would always hit the value method first).
-  Instead, Pass 2b NOW builds a `receiverIndex
-  map[string][]string` multimap at start-of-pass, seeded
-  with each method's primary key (enclosing class + simple
-  name, where `simpleName(*Foo.Bar)=Bar`) and one entry per
-  alias. Receiver-qualified resolution reads from the
-  multimap with set-size > 1 -> drop (A5). Both value and
-  pointer methods land under the same `Foo.Bar` key, so
-  same-file collisions ARE detected. The Section 9 R2
-  mitigation column was rewritten to describe the multimap
-  behaviour explicitly. Section 2.2.1 lists the dispatcher
-  Pass 2b setup diff.
+- [x] 1. FIXED -- Section 2 preamble at lines 105-110 was
+  rewritten. The old absolute claim that ALL new files live
+  under `internal/repoindexer/ast/` is gone; the new wording
+  scopes that statement to Go source files only and
+  explicitly names the single non-Go addition
+  (`services/agent-memory/migrations/0022_edge_kind_overrides.sql`)
+  with a cross-reference to Section 2.2.1 and Section 4.4
+  where the migration is defined. The file plan tables in
+  Section 2.1 (Go files), Section 2.2.1 (additive surfaces),
+  Section 4.4 (schema delta) and Section 9 R4 (Rust
+  overrides) are now mutually consistent.
+- [x] 2. FIXED -- the conditional build tag on the PowerShell
+  parser file is gone entirely. Section 6.2's
+  `parser_powershell.go` pseudo-code no longer carries any
+  `//go:build` directive; the file is unconditional. A short
+  paragraph after the code block explains why: the
+  registration sites in `parsers_cgo.go` / `parsers_nocgo.go`
+  reference `powershellParser` unconditionally, so any
+  conditional-compilation tag on the parser file would break
+  the build under the excluded tag. The paragraph also
+  documents the precise two-part recipe a future
+  "stripped image" story would need (an inverse-tagged stub
+  file PLUS matching guards at the registration sites) so
+  the optionality is captured as deferred-future-work
+  rather than handwaving.
+
+Iter-3 evaluator findings (verified still resolved this iter):
+
+- [x] 3.1 Self-referential verification quote-blocks remain
+  removed; the Prior feedback resolution section uses
+  prose only.
+- [x] 3.2 Rust `overrides` edge schema migration remains
+  named (`0022_edge_kind_overrides.sql`) in Sections 1.1,
+  2.2.1, 4.4 preface, and 9 R4.
+- [x] 3.3 PowerShell missing-`pwsh` path remains modelled as
+  `ErrParserUnavailable` sentinel with a dedicated dispatcher
+  branch (Section 2.2.1) and `ast.dispatch.skip` log key
+  (Section 8.3).
+- [x] 3.4 ReceiverAliases lookup remains a multimap built at
+  start of Pass 2b (Section 4.5.1 pseudo-code), with
+  collision-drop semantics that DO detect value/pointer
+  collisions.
 
 Iter-2 findings (verified unchanged this iter):
 
 - [x] 2.1 LangMeta + Section 2.2/2.2.1 split remains
   consistent. A1's "additive surfaces" carve-out wording is
-  unchanged; Section 2.2.1 has been EXPANDED this iter (not
-  collapsed) and remains consistent with A1.
+  unchanged.
 - [x] 2.2 Hint-alias precedence wording in Section 2.1 row
   for `normalizeHints` remains unchanged: "resolve files
   whose extension is NOT registered in `extMap`".
 - [x] 2.3 C++ sequence stale open-question reference
   remains removed; replaced with the Section 9 R1 pin.
 - [x] 2.4 Rust `overrides` decision remains FLIPPED to YES
-  per the operator answer, and is now backed by the named
-  migration (resolves iter-3 item 2).
+  per the operator answer, backed by the named migration.
 - [x] 2.5 PowerShell strategy remains anchored to the
   `Ast.PowerShell` reference example.
 

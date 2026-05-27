@@ -45,11 +45,14 @@ var ErrPGSystemTierInputSourceEmptySchema = errors.New("aggregator: NewPGSystemT
 // # Read shape (per tick)
 //
 //  1. ONE SELECT against `metric_sample_active` (JOIN through
-//     to `metric_sample`) yields the DISTINCT `(repo_id, sha)`
-//     pairs to compose for. Pairs with zero active rows are
-//     impossible by construction; pairs with active rows whose
-//     scopes lack a corresponding scope_binding row are
-//     impossible by the metric_sample.scope_id FK.
+//     to `metric_sample` + LEFT JOIN
+//     `metric_retraction` WHERE `mr.sample_id IS NULL` --
+//     the canonical retracted-row anti-join used by
+//     [PGSampleSource]) yields the DISTINCT
+//     `(repo_id, sha)` pairs to compose for. Pairs with zero
+//     non-retracted active rows do not appear (the
+//     anti-join eliminates rows whose only active pointer
+//     references a retracted sample).
 //
 //  2. ONE SELECT against `scan_run` resolves the
 //     `producer_run_id` per pair: the most recent
@@ -64,7 +67,8 @@ var ErrPGSystemTierInputSourceEmptySchema = errors.New("aggregator: NewPGSystemT
 //     DISTINCT (scope_id, scope_kind) scopes the composer
 //     needs to iterate over (per arch Sec 5.2.3, scope
 //     identity is stable across SHAs -- scope_id rows are
-//     append-only).
+//     append-only). Same retraction anti-join applies so
+//     scopes referenced ONLY by retracted samples drop out.
 //
 //  4. ONE SELECT against the active foundation samples per
 //     pair yields the `FoundationSample` slice -- the
@@ -73,7 +77,25 @@ var ErrPGSystemTierInputSourceEmptySchema = errors.New("aggregator: NewPGSystemT
 //     rows are deliberately EXCLUDED -- feeding system rows
 //     back into the system-tier composer would create a
 //     definitional cycle (per
-//     `internal/aggregator/types.go` Observation doc).
+//     `internal/aggregator/types.go` Observation doc). Same
+//     retraction anti-join applies.
+//
+// # Transactional read consistency (G6)
+//
+// All four queries above run inside ONE read-only PG
+// transaction at REPEATABLE READ isolation so the tick sees a
+// single consistent snapshot of `metric_sample_active`,
+// `metric_retraction`, `metric_sample`, `scope_binding`, and
+// `scan_run`. Without the wrapping transaction a concurrent
+// Metric Ingestor write between the repo+sha enumeration
+// query and the per-pair scope/foundation queries could tear
+// the read -- the composer would see a pair in step 1 whose
+// scopes / foundation rows / scan_run anchor have advanced
+// underneath it, breaking the deterministic-per-tick
+// invariant. REPEATABLE READ is sufficient (we do not need
+// SERIALIZABLE's predicate locking because the reads are
+// idempotent); the tx is explicitly marked read-only so PG
+// can optimise.
 //
 // # Determinism (G6)
 //
@@ -126,15 +148,23 @@ func (s *PGSystemTierInputSource) qual(table string) string {
 // pairs covered by the active sample set this tick. The JOIN
 // against `metric_sample` materialises `sha` (which lives on
 // the underlying sample row, not on the active pointer's
-// shape).
+// shape). The LEFT JOIN against `metric_retraction` +
+// `WHERE mr.sample_id IS NULL` is the canonical retracted-row
+// anti-join (same pattern as [PGSampleSource.readActiveQuery]):
+// a pair whose only active pointer references a retracted
+// sample drops out so the composer never re-attempts to
+// compose at a tombstoned SHA.
 func (s *PGSystemTierInputSource) repoShaPairsQuery() string {
 	return fmt.Sprintf(
 		`SELECT DISTINCT ms.repo_id, ms.sha
 		   FROM %s msa
 		   JOIN %s ms ON ms.sample_id = msa.sample_id
+		   LEFT JOIN %s mr ON mr.sample_id = msa.sample_id
+		  WHERE mr.sample_id IS NULL
 		  ORDER BY ms.repo_id, ms.sha`,
 		s.qual("metric_sample_active"),
 		s.qual("metric_sample"),
+		s.qual("metric_retraction"),
 	)
 }
 
@@ -157,18 +187,24 @@ func (s *PGSystemTierInputSource) producerRunQuery() string {
 
 // scopesQuery yields the DISTINCT (scope_id, scope_kind) for
 // scopes referenced by the active set for the given pair.
-// Sorted by scope_id for G6 determinism.
+// Sorted by scope_id for G6 determinism. Same retraction
+// anti-join shape as [repoShaPairsQuery] so scopes referenced
+// ONLY by retracted samples drop out of the composer's input
+// set.
 func (s *PGSystemTierInputSource) scopesQuery() string {
 	return fmt.Sprintf(
 		`SELECT DISTINCT sb.scope_id, sb.scope_kind::text
 		   FROM %s msa
 		   JOIN %s ms ON ms.sample_id = msa.sample_id
 		   JOIN %s sb ON sb.scope_id  = ms.scope_id
+		   LEFT JOIN %s mr ON mr.sample_id = msa.sample_id
 		  WHERE ms.repo_id = $1 AND ms.sha = $2
+		    AND mr.sample_id IS NULL
 		  ORDER BY sb.scope_id`,
 		s.qual("metric_sample_active"),
 		s.qual("metric_sample"),
 		s.qual("scope_binding"),
+		s.qual("metric_retraction"),
 	)
 }
 
@@ -178,14 +214,18 @@ func (s *PGSystemTierInputSource) scopesQuery() string {
 // -- system-tier rows must never be re-fed to the system-tier
 // composer; that would create a definitional cycle). The
 // `value IS NOT NULL AND degraded = false` filter mirrors the
-// G3 invariant on foundation rows.
+// G3 invariant on foundation rows. The LEFT JOIN +
+// `mr.sample_id IS NULL` anti-join drops samples whose
+// active pointer references a retracted row.
 func (s *PGSystemTierInputSource) foundationSamplesQuery() string {
 	return fmt.Sprintf(
 		`SELECT sb.scope_id, sb.scope_kind::text, ms.metric_kind, ms.value, ms.attrs_json
 		   FROM %s msa
 		   JOIN %s ms ON ms.sample_id = msa.sample_id
 		   JOIN %s sb ON sb.scope_id  = ms.scope_id
+		   LEFT JOIN %s mr ON mr.sample_id = msa.sample_id
 		  WHERE ms.repo_id = $1 AND ms.sha = $2
+		    AND mr.sample_id IS NULL
 		    AND ms.pack IN ('base', 'solid', 'ingested')
 		    AND ms.value IS NOT NULL
 		    AND ms.degraded = false
@@ -193,24 +233,45 @@ func (s *PGSystemTierInputSource) foundationSamplesQuery() string {
 		s.qual("metric_sample_active"),
 		s.qual("metric_sample"),
 		s.qual("scope_binding"),
+		s.qual("metric_retraction"),
 	)
 }
 
 // ReadSystemTierInputs implements [SystemTierInputSource].
 // Performs the four canonical SELECTs documented on
-// [PGSystemTierInputSource]. Skips repo+SHA pairs that have
-// no `succeeded` scan_run anchor.
+// [PGSystemTierInputSource] inside ONE read-only REPEATABLE
+// READ transaction so the per-tick reads cannot be torn by a
+// concurrent Metric Ingestor write landing between the
+// repo+sha enumeration and the per-pair scope / foundation /
+// scan_run lookups. Skips repo+SHA pairs that have no
+// `succeeded` scan_run anchor.
 //
 // Connection ownership: the *sql.DB is owned by the caller;
-// this method does NOT call Close. Rows.Close is deferred on
-// every cursor so a partial iteration on error releases the
-// underlying connection.
+// this method does NOT call Close. The tx is rolled back on
+// any error path AND on the happy path (read-only -- nothing
+// to commit). Rows.Close is deferred on every cursor so a
+// partial iteration on error releases the underlying
+// connection back to the pool.
 func (s *PGSystemTierInputSource) ReadSystemTierInputs(ctx context.Context) ([]SystemTierInput, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	pairs, err := s.readRepoShaPairs(ctx)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{
+		ReadOnly:  true,
+		Isolation: sql.LevelRepeatableRead,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("aggregator.PGSystemTierInputSource: BEGIN read-only repeatable-read: %w", err)
+	}
+	// Read-only tx -- nothing to commit. Rollback releases
+	// the snapshot and returns the connection to the pool;
+	// PG treats a Rollback on a read-only tx as a no-op
+	// modulo snapshot release. Safe to call on the happy
+	// path AND any error path.
+	defer func() { _ = tx.Rollback() }()
+
+	pairs, err := s.readRepoShaPairs(ctx, tx)
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +281,7 @@ func (s *PGSystemTierInputSource) ReadSystemTierInputs(ctx context.Context) ([]S
 
 	out := make([]SystemTierInput, 0, len(pairs))
 	for _, p := range pairs {
-		runID, ok, err := s.readProducerRunID(ctx, p.repoID, p.sha)
+		runID, ok, err := s.readProducerRunID(ctx, tx, p.repoID, p.sha)
 		if err != nil {
 			return nil, err
 		}
@@ -236,11 +297,11 @@ func (s *PGSystemTierInputSource) ReadSystemTierInputs(ctx context.Context) ([]S
 			// it up if the run completes.
 			continue
 		}
-		scopes, err := s.readScopes(ctx, p.repoID, p.sha)
+		scopes, err := s.readScopes(ctx, tx, p.repoID, p.sha)
 		if err != nil {
 			return nil, err
 		}
-		foundation, err := s.readFoundationSamples(ctx, p.repoID, p.sha)
+		foundation, err := s.readFoundationSamples(ctx, tx, p.repoID, p.sha)
 		if err != nil {
 			return nil, err
 		}
@@ -276,8 +337,8 @@ type repoShaPair struct {
 	sha    string
 }
 
-func (s *PGSystemTierInputSource) readRepoShaPairs(ctx context.Context) ([]repoShaPair, error) {
-	rows, err := s.db.QueryContext(ctx, s.repoShaPairsQuery())
+func (s *PGSystemTierInputSource) readRepoShaPairs(ctx context.Context, tx *sql.Tx) ([]repoShaPair, error) {
+	rows, err := tx.QueryContext(ctx, s.repoShaPairsQuery())
 	if err != nil {
 		return nil, fmt.Errorf("aggregator.PGSystemTierInputSource: query repo+sha pairs: %w", err)
 	}
@@ -303,8 +364,8 @@ func (s *PGSystemTierInputSource) readRepoShaPairs(ctx context.Context) ([]repoS
 	return out, nil
 }
 
-func (s *PGSystemTierInputSource) readProducerRunID(ctx context.Context, repoID uuid.UUID, sha string) (uuid.UUID, bool, error) {
-	row := s.db.QueryRowContext(ctx, s.producerRunQuery(), repoID, sha)
+func (s *PGSystemTierInputSource) readProducerRunID(ctx context.Context, tx *sql.Tx, repoID uuid.UUID, sha string) (uuid.UUID, bool, error) {
+	row := tx.QueryRowContext(ctx, s.producerRunQuery(), repoID, sha)
 	var runIDStr string
 	switch err := row.Scan(&runIDStr); {
 	case errors.Is(err, sql.ErrNoRows):
@@ -319,8 +380,8 @@ func (s *PGSystemTierInputSource) readProducerRunID(ctx context.Context, repoID 
 	return runID, true, nil
 }
 
-func (s *PGSystemTierInputSource) readScopes(ctx context.Context, repoID uuid.UUID, sha string) ([]ScopeRef, error) {
-	rows, err := s.db.QueryContext(ctx, s.scopesQuery(), repoID, sha)
+func (s *PGSystemTierInputSource) readScopes(ctx context.Context, tx *sql.Tx, repoID uuid.UUID, sha string) ([]ScopeRef, error) {
+	rows, err := tx.QueryContext(ctx, s.scopesQuery(), repoID, sha)
 	if err != nil {
 		return nil, fmt.Errorf("aggregator.PGSystemTierInputSource: query scopes (repo_id=%s, sha=%s): %w", repoID, sha, err)
 	}
@@ -346,8 +407,8 @@ func (s *PGSystemTierInputSource) readScopes(ctx context.Context, repoID uuid.UU
 	return out, nil
 }
 
-func (s *PGSystemTierInputSource) readFoundationSamples(ctx context.Context, repoID uuid.UUID, sha string) ([]FoundationSample, error) {
-	rows, err := s.db.QueryContext(ctx, s.foundationSamplesQuery(), repoID, sha)
+func (s *PGSystemTierInputSource) readFoundationSamples(ctx context.Context, tx *sql.Tx, repoID uuid.UUID, sha string) ([]FoundationSample, error) {
+	rows, err := tx.QueryContext(ctx, s.foundationSamplesQuery(), repoID, sha)
 	if err != nil {
 		return nil, fmt.Errorf("aggregator.PGSystemTierInputSource: query foundation samples (repo_id=%s, sha=%s): %w", repoID, sha, err)
 	}
@@ -381,12 +442,18 @@ func (s *PGSystemTierInputSource) readFoundationSamples(ctx context.Context, rep
 		if attrsRaw.Valid && strings.TrimSpace(attrsRaw.String) != "" {
 			if err := json.Unmarshal([]byte(attrsRaw.String), &attrs); err != nil {
 				// A malformed attrs_json on a foundation
-				// row is a writer-side data bug -- log and
-				// drop the attrs rather than failing the
-				// whole tick. The composer reads attrs
-				// best-effort (cycle_id, window, language
-				// tag).
-				attrs = nil
+				// row is a writer-side data bug -- the
+				// composer's downstream readers (cycle_id,
+				// language tag, window) cannot trust a
+				// silently-dropped attrs map and would
+				// compose against an incomplete shape.
+				// Surface the parse failure as a tick
+				// error so the operator can see it on
+				// /metrics and trace it back to the
+				// offending sample. Per iter-4 evaluator
+				// finding #4: do NOT silently swallow
+				// corrupt input as if it were valid.
+				return nil, fmt.Errorf("aggregator.PGSystemTierInputSource: parse attrs_json (repo_id=%s, sha=%s, scope_id=%s, metric_kind=%s): %w", repoID, sha, sid, metricKind, err)
 			}
 		}
 		out = append(out, FoundationSample{

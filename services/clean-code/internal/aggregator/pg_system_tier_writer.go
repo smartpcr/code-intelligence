@@ -21,9 +21,48 @@ var ErrPGSystemTierWriterEmptySchema = errors.New("aggregator: NewPGSystemTierWr
 
 // PGSystemTierWriter is the production [SystemTierWriter]. It
 // persists composer-emitted system-tier samples into
-// `clean_code.metric_sample` and re-points
-// `clean_code.metric_sample_active` to the new sample inside
-// a single transaction per [WriteSystemTierSamples] call.
+// `clean_code.metric_sample` and points the new sample at the
+// `clean_code.metric_sample_active` pointer table inside a
+// single transaction per [WriteSystemTierSamples] call.
+//
+// # Architecture-canonical SKIP-on-active contract
+//
+// Per architecture Sec 5.2.1 lines 1040-1048 ("for
+// source='derived' rows the Cross-Repo Aggregator writes at
+// most one row per quintuple per HEAD SHA per tick; if its
+// tick lands on a SHA where an **active** derived row already
+// exists (degraded or not), it **skips the insert** for that
+// SHA and waits for the next HEAD SHA"), the writer's per-sample
+// flow is:
+//
+//  1. EXISTS check: SELECT 1 FROM metric_sample_active msa
+//                   LEFT JOIN metric_retraction mr
+//                          ON mr.sample_id = msa.sample_id
+//                   WHERE msa.repo_id=$1 AND msa.sha=$2
+//                     AND msa.scope_id=$3
+//                     AND msa.metric_kind=$4
+//                     AND msa.metric_version=$5
+//                     AND mr.sample_id IS NULL
+//                   LIMIT 1
+//     The `mr.sample_id IS NULL` anti-join treats a retracted
+//     active row as ABSENT (the retraction is a tombstone per
+//     Sec 5.2.1 lines 1023-1030), so a tick following a
+//     `mgmt.retract_sample` correctly writes a fresh active
+//     derived row at the same quintuple.
+//  2. If step 1 returned a row, SKIP both inserts for this
+//     sample. The writer's `SystemTierSamplesSkipped` counter
+//     ticks up by one and the per-call invariant
+//     "len(written) + len(skipped) == len(samples)" holds.
+//  3. If step 1 returned zero rows, INSERT into metric_sample
+//     (fresh sample_id from the composer) AND INSERT into
+//     metric_sample_active. The active-pointer insert is a
+//     bare INSERT (no ON CONFLICT) because the EXISTS check
+//     just confirmed there is no row at the quintuple; a
+//     concurrent writer racing in between would surface as a
+//     PG UNIQUE-violation error, which is the right behaviour
+//     under the single-replica invariant (see the binary's
+//     package doc -- two replicas writing system rows is a
+//     deployment misconfiguration).
 //
 // # Insert shape
 //
@@ -41,39 +80,15 @@ var ErrPGSystemTierWriterEmptySchema = errors.New("aggregator: NewPGSystemTierWr
 // text-typed Go value (mirrors the established
 // [PGSnapshotWriter] pattern).
 //
-// # Active-pointer semantics
-//
-// Per migration `0002_measurement.up.sql:506-537` (metric_sample_active
-// DDL) the writer maintains the active pointer with:
-//
-//	INSERT INTO metric_sample_active
-//	    (repo_id, sha, scope_id, metric_kind, metric_version, sample_id)
-//	VALUES ($1, $2, $3, $4, $5, $6)
-//	ON CONFLICT (repo_id, sha, scope_id, metric_kind, metric_version)
-//	    DO UPDATE SET sample_id = EXCLUDED.sample_id
-//
-// The `DO UPDATE SET sample_id = EXCLUDED.sample_id` shape
-// mirrors the established Metric Ingestor pattern (see the
-// `metric_sample_active` table COMMENT at
-// `0002_measurement.up.sql:539-552`) and the architecture's
-// "retract-then-reinsert => re-point" semantics (Sec 5.2.1
-// line 1041 / the COMMENT at 547-552). Each composer-tick at
-// the same `(repo_id, sha, scope_id, metric_kind,
-// metric_version)` quintuple writes a NEW `metric_sample` row
-// (with a fresh `sample_id`) and re-points the active pointer
-// to it; the prior `metric_sample` row remains in the
-// append-only history as audit evidence of the prior
-// composition, matching architecture G3 row-immutability.
-//
 // # Transactional scope
 //
-// All inserts (metric_sample then metric_sample_active) for
-// the batch run inside ONE PG transaction so a partial write
-// cannot leave readers with a metric_sample row whose active
-// pointer does not exist (or, conversely, an active pointer
-// whose sample_id references a metric_sample row that was
-// never inserted). Either ALL samples persist atomically or
-// NONE do.
+// All three statements (EXISTS check + metric_sample INSERT +
+// metric_sample_active INSERT) for the batch run inside ONE
+// PG transaction so a partial write cannot leave readers with
+// a metric_sample row whose active pointer does not exist (or,
+// conversely, an active pointer whose sample_id references a
+// metric_sample row that was never inserted). Either ALL
+// non-skipped samples persist atomically or NONE do.
 //
 // # Role grants
 //
@@ -81,9 +96,11 @@ var ErrPGSystemTierWriterEmptySchema = errors.New("aggregator: NewPGSystemTierWr
 // `clean_code_xrepo_aggregator` role
 // `INSERT, SELECT` on `metric_sample` and
 // `INSERT, SELECT, UPDATE` on `metric_sample_active`. These
-// are the EXACT grants the writer's INSERT + ON CONFLICT
-// DO UPDATE pattern requires; no additional migration is
-// needed.
+// are the EXACT grants the writer's SELECT (EXISTS check) +
+// INSERT pattern requires; no additional migration is needed.
+// (The UPDATE grant is unused now that we no longer
+// ON CONFLICT DO UPDATE on the active pointer but stays as
+// defense-in-depth for future writers.)
 //
 // # FK precondition
 //
@@ -129,6 +146,30 @@ func (w *PGSystemTierWriter) qualType(typename string) string {
 	return pq.QuoteIdentifier(w.schema) + "." + pq.QuoteIdentifier(typename)
 }
 
+// existsActiveStmt returns the EXISTS-check SQL pinned to
+// architecture Sec 5.2.1 lines 1040-1048: "active" means a
+// row in `metric_sample_active` whose `sample_id` is NOT in
+// `metric_retraction`. The LEFT JOIN + `mr.sample_id IS NULL`
+// is the same canonical anti-join used by [PGSampleSource]
+// and [PGSystemTierInputSource]. Returns ZERO rows when the
+// quintuple has no active derived row (writer proceeds with
+// INSERTs) or ONE row when an active derived row already
+// exists (writer skips both INSERTs for this sample).
+func (w *PGSystemTierWriter) existsActiveStmt() string {
+	return fmt.Sprintf(
+		`SELECT 1
+		   FROM %s msa
+		   LEFT JOIN %s mr ON mr.sample_id = msa.sample_id
+		  WHERE msa.repo_id = $1 AND msa.sha = $2
+		    AND msa.scope_id = $3 AND msa.metric_kind = $4
+		    AND msa.metric_version = $5
+		    AND mr.sample_id IS NULL
+		  LIMIT 1`,
+		w.qual("metric_sample_active"),
+		w.qual("metric_retraction"),
+	)
+}
+
 // insertMetricSampleStmt returns the prepared-statement shape
 // for one [SystemTierSample] -> `metric_sample` INSERT.
 // Thirteen positional args (see doc on this method).
@@ -150,18 +191,20 @@ func (w *PGSystemTierWriter) insertMetricSampleStmt() string {
 	)
 }
 
-// upsertMetricSampleActiveStmt returns the prepared-statement
+// insertMetricSampleActiveStmt returns the prepared-statement
 // shape for one [SystemTierSample] -> `metric_sample_active`
-// INSERT-or-update. The `DO UPDATE SET sample_id` shape
-// repoints an existing active row to the newly inserted
-// `metric_sample` row per architecture Sec 5.2.1's
-// retract-then-reinsert semantics.
-func (w *PGSystemTierWriter) upsertMetricSampleActiveStmt() string {
+// INSERT. Per the architecture-canonical SKIP-on-active
+// contract documented on [PGSystemTierWriter], this is a BARE
+// INSERT (no ON CONFLICT clause): the caller has already
+// verified no active row exists at the quintuple via
+// [existsActiveStmt]. A racing concurrent writer would surface
+// as a PK-violation error, which is the correct behaviour
+// under the single-replica deployment invariant (see the
+// binary's package doc comment for the rationale).
+func (w *PGSystemTierWriter) insertMetricSampleActiveStmt() string {
 	return fmt.Sprintf(
 		`INSERT INTO %s (repo_id, sha, scope_id, metric_kind, metric_version, sample_id)
-		 VALUES ($1, $2, $3, $4, $5, $6)
-		 ON CONFLICT (repo_id, sha, scope_id, metric_kind, metric_version)
-		     DO UPDATE SET sample_id = EXCLUDED.sample_id`,
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
 		w.qual("metric_sample_active"),
 	)
 }
@@ -172,6 +215,17 @@ func (w *PGSystemTierWriter) upsertMetricSampleActiveStmt() string {
 // [validateSystemTierSample] BEFORE the transaction begins
 // so a malformed sample fails fast without leaving the
 // database in a partial state.
+//
+// Per the architecture-canonical SKIP-on-active contract
+// (Sec 5.2.1 lines 1040-1048; documented on
+// [PGSystemTierWriter]): for each sample, the writer first
+// SELECTs for an existing active row at the quintuple. If
+// one exists, BOTH inserts (metric_sample AND
+// metric_sample_active) are SKIPPED for that sample; the
+// writer's prior tick already landed a row for this SHA and
+// the architecture forbids appending a second active derived
+// row at the same quintuple. If none exists, both inserts
+// run atomically.
 //
 // An empty `samples` slice is a no-op (no transaction, no
 // error) -- matches the in-memory writer's contract.
@@ -206,20 +260,49 @@ func (w *PGSystemTierWriter) WriteSystemTierSamples(ctx context.Context, samples
 		}
 	}()
 
+	existsStmt, err := tx.PrepareContext(ctx, w.existsActiveStmt())
+	if err != nil {
+		return fmt.Errorf("aggregator.PGSystemTierWriter: prepare exists-active check: %w", err)
+	}
+	defer existsStmt.Close()
+
 	insertStmt, err := tx.PrepareContext(ctx, w.insertMetricSampleStmt())
 	if err != nil {
 		return fmt.Errorf("aggregator.PGSystemTierWriter: prepare metric_sample insert: %w", err)
 	}
 	defer insertStmt.Close()
 
-	upsertStmt, err := tx.PrepareContext(ctx, w.upsertMetricSampleActiveStmt())
+	insertActiveStmt, err := tx.PrepareContext(ctx, w.insertMetricSampleActiveStmt())
 	if err != nil {
-		return fmt.Errorf("aggregator.PGSystemTierWriter: prepare metric_sample_active upsert: %w", err)
+		return fmt.Errorf("aggregator.PGSystemTierWriter: prepare metric_sample_active insert: %w", err)
 	}
-	defer upsertStmt.Close()
+	defer insertActiveStmt.Close()
 
 	for i := range samples {
 		s := &samples[i]
+
+		// Architecture-canonical EXISTS check. The
+		// retraction anti-join lets a tick following a
+		// `mgmt.retract_sample` correctly write a fresh
+		// active row at the same quintuple (the retracted
+		// row is a tombstone per Sec 5.2.1 lines 1023-1030).
+		var dummy int
+		switch err := existsStmt.QueryRowContext(ctx,
+			s.RepoID, s.SHA, s.ScopeID, s.MetricKind, s.MetricVersion,
+		).Scan(&dummy); {
+		case err == nil:
+			// Active row already exists -- skip both
+			// inserts for this sample per architecture
+			// Sec 5.2.1 lines 1040-1048. Continue to the
+			// next sample.
+			continue
+		case errors.Is(err, sql.ErrNoRows):
+			// No active row at this quintuple -- proceed
+			// with the two inserts below.
+		default:
+			return fmt.Errorf("aggregator.PGSystemTierWriter: exists-active check (sample_id=%s, metric_kind=%s): %w", s.SampleID, s.MetricKind, err)
+		}
+
 		// Translate the composer's domain shape into the
 		// driver's wire shape:
 		//   *float64 -> sql.NullFloat64 (NULL when degraded)
@@ -248,10 +331,10 @@ func (w *PGSystemTierWriter) WriteSystemTierSamples(ctx context.Context, samples
 		); err != nil {
 			return fmt.Errorf("aggregator.PGSystemTierWriter: insert metric_sample (sample_id=%s, metric_kind=%s): %w", s.SampleID, s.MetricKind, err)
 		}
-		if _, err := upsertStmt.ExecContext(ctx,
+		if _, err := insertActiveStmt.ExecContext(ctx,
 			s.RepoID, s.SHA, s.ScopeID, s.MetricKind, s.MetricVersion, s.SampleID,
 		); err != nil {
-			return fmt.Errorf("aggregator.PGSystemTierWriter: upsert metric_sample_active (sample_id=%s, metric_kind=%s): %w", s.SampleID, s.MetricKind, err)
+			return fmt.Errorf("aggregator.PGSystemTierWriter: insert metric_sample_active (sample_id=%s, metric_kind=%s): %w", s.SampleID, s.MetricKind, err)
 		}
 	}
 

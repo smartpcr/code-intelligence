@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -55,14 +56,18 @@ func TestNewPGSystemTierInputSourceWithSchema_RejectsEmptySchema(t *testing.T) {
 // TestPGSystemTierInputSource_EmptyActiveSet_ReturnsEmpty
 // pins the no-op case: zero (repo_id, sha) pairs in the
 // active table -> no inputs returned, no follow-up queries
-// fired.
+// fired. The whole read still runs inside a read-only
+// repeatable-read tx (BEGIN ... ROLLBACK) per iter-4
+// evaluator item #3.
 func TestPGSystemTierInputSource_EmptyActiveSet_ReturnsEmpty(t *testing.T) {
 	t.Parallel()
 	src, mock, cleanup := newSQLMockSystemTierSource(t)
 	defer cleanup()
 
+	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT DISTINCT ms\.repo_id, ms\.sha`).
 		WillReturnRows(sqlmock.NewRows([]string{"repo_id", "sha"}))
+	mock.ExpectRollback()
 
 	got, err := src.ReadSystemTierInputs(context.Background())
 	if err != nil {
@@ -78,10 +83,11 @@ func TestPGSystemTierInputSource_EmptyActiveSet_ReturnsEmpty(t *testing.T) {
 
 // TestPGSystemTierInputSource_ReadSystemTierInputs_HappyPath
 // drives the full per-pair fan-out for ONE (repo_id, sha):
-// one pair row -> one scan_run lookup -> one scope row ->
-// one foundation sample. Asserts the SystemTierInput shape,
-// the Mode is Embedded, and both edge-availability flags
-// are false (v1 embedded mode).
+// BEGIN tx -> one pair row -> one scan_run lookup -> one
+// scope row -> one foundation sample -> ROLLBACK (read-only
+// tx). Asserts the SystemTierInput shape, the Mode is
+// Embedded, and both edge-availability flags are false (v1
+// embedded mode).
 func TestPGSystemTierInputSource_ReadSystemTierInputs_HappyPath(t *testing.T) {
 	t.Parallel()
 	src, mock, cleanup := newSQLMockSystemTierSource(t)
@@ -92,6 +98,7 @@ func TestPGSystemTierInputSource_ReadSystemTierInputs_HappyPath(t *testing.T) {
 	scopeID := uuid.Must(uuid.NewV4())
 	const sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 
+	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT DISTINCT ms\.repo_id, ms\.sha`).
 		WillReturnRows(sqlmock.NewRows([]string{"repo_id", "sha"}).
 			AddRow(repoID.String(), sha))
@@ -110,6 +117,7 @@ func TestPGSystemTierInputSource_ReadSystemTierInputs_HappyPath(t *testing.T) {
 		WithArgs(repoID, sha).
 		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}).
 			AddRow(scopeID.String(), "file", "cyclomatic_complexity", 12.5, `{"language":"go"}`))
+	mock.ExpectRollback()
 
 	got, err := src.ReadSystemTierInputs(context.Background())
 	if err != nil {
@@ -160,7 +168,8 @@ func TestPGSystemTierInputSource_ReadSystemTierInputs_HappyPath(t *testing.T) {
 // pair with no `status='succeeded'` scan_run row produces ZERO
 // SystemTierInput rows for that pair (and NO follow-up scopes
 // / foundation queries are fired for that pair). The next
-// pair in the result set is still processed.
+// pair in the result set is still processed. The whole read
+// runs inside one read-only tx.
 func TestPGSystemTierInputSource_SkipsPairsWithoutSucceededScanRun(t *testing.T) {
 	t.Parallel()
 	src, mock, cleanup := newSQLMockSystemTierSource(t)
@@ -173,6 +182,7 @@ func TestPGSystemTierInputSource_SkipsPairsWithoutSucceededScanRun(t *testing.T)
 	const shaA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	const shaB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
+	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT DISTINCT ms\.repo_id, ms\.sha`).
 		WillReturnRows(sqlmock.NewRows([]string{"repo_id", "sha"}).
 			AddRow(repoA.String(), shaA).
@@ -196,6 +206,7 @@ func TestPGSystemTierInputSource_SkipsPairsWithoutSucceededScanRun(t *testing.T)
 		WithArgs(repoB, shaB).
 		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}).
 			AddRow(scopeB.String(), "repo", "loc", 1234.0, nil))
+	mock.ExpectRollback()
 
 	got, err := src.ReadSystemTierInputs(context.Background())
 	if err != nil {
@@ -214,9 +225,12 @@ func TestPGSystemTierInputSource_SkipsPairsWithoutSucceededScanRun(t *testing.T)
 
 // TestPGSystemTierInputSource_FoundationQueryFiltersSystemPack
 // asserts the foundation-samples SQL EXCLUDES system-pack
-// rows in its WHERE clause. The system-tier composer must
+// rows in its WHERE clause AND applies the
+// retraction anti-join. The system-tier composer must
 // NEVER consume its own outputs (definitional cycle); pinning
 // the SQL shape via regex enforces this at the query layer.
+// Per iter-4 evaluator item #2 the LEFT JOIN against
+// `metric_retraction` must also be present.
 func TestPGSystemTierInputSource_FoundationQueryFiltersSystemPack(t *testing.T) {
 	t.Parallel()
 	src, mock, cleanup := newSQLMockSystemTierSource(t)
@@ -226,6 +240,7 @@ func TestPGSystemTierInputSource_FoundationQueryFiltersSystemPack(t *testing.T) 
 	runID := uuid.Must(uuid.NewV4())
 	const sha = "cccccccccccccccccccccccccccccccccccccccc"
 
+	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT DISTINCT ms\.repo_id, ms\.sha`).
 		WillReturnRows(sqlmock.NewRows([]string{"repo_id", "sha"}).AddRow(repoID.String(), sha))
 	mock.ExpectQuery(`SELECT scan_run_id`).
@@ -234,16 +249,80 @@ func TestPGSystemTierInputSource_FoundationQueryFiltersSystemPack(t *testing.T) 
 	mock.ExpectQuery(`SELECT DISTINCT sb\.scope_id`).
 		WithArgs(repoID, sha).
 		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind"}))
-	// Literal regex pin: the WHERE must include the closed
-	// pack set 'base', 'solid', 'ingested' AND must filter
-	// out NULL values / degraded rows.
-	expr := `ms\.pack IN \('base', 'solid', 'ingested'\)\s+AND ms\.value IS NOT NULL\s+AND ms\.degraded = false`
+	// Literal regex pin: the FROM must include the LEFT JOIN
+	// against `metric_retraction`, AND the WHERE must include
+	// the retracted-row anti-join `mr.sample_id IS NULL` AND
+	// the closed pack set 'base', 'solid', 'ingested' AND must
+	// filter out NULL values / degraded rows.
+	expr := `LEFT JOIN "clean_code_aggregator_test"."metric_retraction" mr ON mr\.sample_id = msa\.sample_id\s+WHERE ms\.repo_id = \$1 AND ms\.sha = \$2\s+AND mr\.sample_id IS NULL\s+AND ms\.pack IN \('base', 'solid', 'ingested'\)\s+AND ms\.value IS NOT NULL\s+AND ms\.degraded = false`
 	if _, err := regexp.Compile(expr); err != nil {
 		t.Fatalf("regex compile: %v", err)
 	}
 	mock.ExpectQuery(expr).
 		WithArgs(repoID, sha).
 		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}))
+	mock.ExpectRollback()
+
+	if _, err := src.ReadSystemTierInputs(context.Background()); err != nil {
+		t.Fatalf("ReadSystemTierInputs err: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestPGSystemTierInputSource_RepoShaQueryHasRetractionAntiJoin
+// pins iter-4 evaluator item #2 at the top-level enumeration
+// query: a pair whose only active pointer references a
+// retracted sample MUST drop out. A regex literal-match on
+// the LEFT JOIN + `mr.sample_id IS NULL` clauses catches a
+// future refactor that drops the anti-join.
+func TestPGSystemTierInputSource_RepoShaQueryHasRetractionAntiJoin(t *testing.T) {
+	t.Parallel()
+	src, mock, cleanup := newSQLMockSystemTierSource(t)
+	defer cleanup()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`FROM "clean_code_aggregator_test"."metric_sample_active" msa\s+JOIN "clean_code_aggregator_test"."metric_sample" ms ON ms\.sample_id = msa\.sample_id\s+LEFT JOIN "clean_code_aggregator_test"."metric_retraction" mr ON mr\.sample_id = msa\.sample_id\s+WHERE mr\.sample_id IS NULL`).
+		WillReturnRows(sqlmock.NewRows([]string{"repo_id", "sha"}))
+	mock.ExpectRollback()
+
+	if _, err := src.ReadSystemTierInputs(context.Background()); err != nil {
+		t.Fatalf("ReadSystemTierInputs err: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestPGSystemTierInputSource_ScopesQueryHasRetractionAntiJoin
+// pins iter-4 evaluator item #2 at the per-pair scopes query:
+// scopes referenced ONLY by retracted samples MUST drop out.
+func TestPGSystemTierInputSource_ScopesQueryHasRetractionAntiJoin(t *testing.T) {
+	t.Parallel()
+	src, mock, cleanup := newSQLMockSystemTierSource(t)
+	defer cleanup()
+
+	repoID := uuid.Must(uuid.NewV4())
+	runID := uuid.Must(uuid.NewV4())
+	const sha = "dddddddddddddddddddddddddddddddddddddddd"
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT DISTINCT ms\.repo_id, ms\.sha`).
+		WillReturnRows(sqlmock.NewRows([]string{"repo_id", "sha"}).AddRow(repoID.String(), sha))
+	mock.ExpectQuery(`SELECT scan_run_id`).
+		WithArgs(repoID, sha).
+		WillReturnRows(sqlmock.NewRows([]string{"scan_run_id"}).AddRow(runID.String()))
+	// Scopes query MUST also include the LEFT JOIN +
+	// mr.sample_id IS NULL anti-join shape.
+	expr := `LEFT JOIN "clean_code_aggregator_test"."metric_retraction" mr ON mr\.sample_id = msa\.sample_id\s+WHERE ms\.repo_id = \$1 AND ms\.sha = \$2\s+AND mr\.sample_id IS NULL\s+ORDER BY sb\.scope_id`
+	mock.ExpectQuery(expr).
+		WithArgs(repoID, sha).
+		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind"}))
+	mock.ExpectQuery(`SELECT sb\.scope_id, sb\.scope_kind::text, ms\.metric_kind`).
+		WithArgs(repoID, sha).
+		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}))
+	mock.ExpectRollback()
 
 	if _, err := src.ReadSystemTierInputs(context.Background()); err != nil {
 		t.Fatalf("ReadSystemTierInputs err: %v", err)
@@ -256,15 +335,18 @@ func TestPGSystemTierInputSource_FoundationQueryFiltersSystemPack(t *testing.T) 
 // TestPGSystemTierInputSource_PropagatesQueryError asserts a
 // DB-side query failure on the top-level repo+sha enumeration
 // surfaces as an error (the aggregator's outer loop will
-// record it as a tick failure and back off).
+// record it as a tick failure and back off). The defer'd
+// rollback runs on the error path.
 func TestPGSystemTierInputSource_PropagatesQueryError(t *testing.T) {
 	t.Parallel()
 	src, mock, cleanup := newSQLMockSystemTierSource(t)
 	defer cleanup()
 
 	boom := errors.New("connection reset")
+	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT DISTINCT ms\.repo_id, ms\.sha`).
 		WillReturnError(boom)
+	mock.ExpectRollback()
 
 	_, err := src.ReadSystemTierInputs(context.Background())
 	if err == nil {
@@ -278,11 +360,60 @@ func TestPGSystemTierInputSource_PropagatesQueryError(t *testing.T) {
 	}
 }
 
+// TestPGSystemTierInputSource_PropagatesMalformedAttrsJSON
+// pins iter-4 evaluator item #4: a corrupt `attrs_json`
+// column value MUST surface as an error, NOT a
+// silently-emitted SystemTierInput carrying a nil attrs map.
+// A silent drop would shape corrupt input as if it were
+// valid -- the composer's downstream readers (cycle_id,
+// language tag, window) would then compose against an
+// incomplete shape.
+func TestPGSystemTierInputSource_PropagatesMalformedAttrsJSON(t *testing.T) {
+	t.Parallel()
+	src, mock, cleanup := newSQLMockSystemTierSource(t)
+	defer cleanup()
+
+	repoID := uuid.Must(uuid.NewV4())
+	runID := uuid.Must(uuid.NewV4())
+	scopeID := uuid.Must(uuid.NewV4())
+	const sha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT DISTINCT ms\.repo_id, ms\.sha`).
+		WillReturnRows(sqlmock.NewRows([]string{"repo_id", "sha"}).
+			AddRow(repoID.String(), sha))
+	mock.ExpectQuery(`SELECT scan_run_id`).
+		WithArgs(repoID, sha).
+		WillReturnRows(sqlmock.NewRows([]string{"scan_run_id"}).
+			AddRow(runID.String()))
+	mock.ExpectQuery(`SELECT DISTINCT sb\.scope_id`).
+		WithArgs(repoID, sha).
+		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind"}).
+			AddRow(scopeID.String(), "file"))
+	// Deliberately corrupt attrs_json -- the parse failure
+	// MUST surface to the caller, not be silently dropped.
+	mock.ExpectQuery(`SELECT sb\.scope_id, sb\.scope_kind::text, ms\.metric_kind`).
+		WithArgs(repoID, sha).
+		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}).
+			AddRow(scopeID.String(), "file", "loc", 100.0, `{ malformed not-json`))
+	mock.ExpectRollback()
+
+	_, err := src.ReadSystemTierInputs(context.Background())
+	if err == nil {
+		t.Fatal("ReadSystemTierInputs err = nil; want non-nil (malformed attrs_json)")
+	}
+	if !strings.Contains(err.Error(), "parse attrs_json") {
+		t.Errorf("err = %v; want substring 'parse attrs_json'", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 // TestPGSystemTierInputSource_DeterministicOrder pins G6:
 // inputs are returned sorted by (repo_id bytes, sha string)
 // so a re-run produces identical output bytes. Drives TWO
-// pairs with deliberately reversed input ordering and
-// asserts the output respects the canonical order.
+// pairs and asserts the output respects the canonical order.
 func TestPGSystemTierInputSource_DeterministicOrder(t *testing.T) {
 	t.Parallel()
 	src, mock, cleanup := newSQLMockSystemTierSource(t)
@@ -297,10 +428,7 @@ func TestPGSystemTierInputSource_DeterministicOrder(t *testing.T) {
 	const shaLo = "1111111111111111111111111111111111111111"
 	const shaHi = "2222222222222222222222222222222222222222"
 
-	// Pair-enumeration SQL has ORDER BY repo_id, sha;
-	// sqlmock cannot validate ORDER BY on the server side,
-	// but we still feed rows in the canonical order so the
-	// downstream sort is a no-op for the happy path.
+	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT DISTINCT ms\.repo_id, ms\.sha`).
 		WillReturnRows(sqlmock.NewRows([]string{"repo_id", "sha"}).
 			AddRow(repoLo.String(), shaLo).
@@ -319,6 +447,7 @@ func TestPGSystemTierInputSource_DeterministicOrder(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind"}))
 	mock.ExpectQuery(`SELECT sb\.scope_id, sb\.scope_kind::text, ms\.metric_kind`).WithArgs(repoHi, shaHi).
 		WillReturnRows(sqlmock.NewRows([]string{"scope_id", "scope_kind", "metric_kind", "value", "attrs_json"}))
+	mock.ExpectRollback()
 
 	got, err := src.ReadSystemTierInputs(context.Background())
 	if err != nil {
@@ -336,9 +465,34 @@ func TestPGSystemTierInputSource_DeterministicOrder(t *testing.T) {
 	}
 }
 
+// TestPGSystemTierInputSource_TransactionBeginFailure asserts
+// a BEGIN failure short-circuits the tick with an error and
+// does NOT attempt any of the per-tick queries.
+func TestPGSystemTierInputSource_TransactionBeginFailure(t *testing.T) {
+	t.Parallel()
+	src, mock, cleanup := newSQLMockSystemTierSource(t)
+	defer cleanup()
+
+	boom := errors.New("connection in use")
+	mock.ExpectBegin().WillReturnError(boom)
+
+	_, err := src.ReadSystemTierInputs(context.Background())
+	if err == nil {
+		t.Fatal("ReadSystemTierInputs err = nil; want non-nil (BEGIN failure)")
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("err = %v; want errors.Is %v", err, boom)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 // TestPGSystemTierInputSource_ContextCancelled asserts
 // ctx.Err() propagates even before the first query is issued
-// (defensive guard at the top of ReadSystemTierInputs).
+// (defensive guard at the top of ReadSystemTierInputs). No
+// BEGIN expected because the early ctx-check short-circuits
+// before opening a tx.
 func TestPGSystemTierInputSource_ContextCancelled(t *testing.T) {
 	t.Parallel()
 	src, _, cleanup := newSQLMockSystemTierSource(t)

@@ -6,6 +6,118 @@ Newest at the top. Stage references map to
 
 ## Stage 7.2 -- System tier metric composer
 
+### Iter 4 -- architecture-canonical SKIP-on-active + source-side correctness
+
+Iteration 3 (score 84, verdict: iterate, regressed from 86) shipped
+the production wiring, the production PG input source, and the
+interface doc fix, but introduced FOUR new findings: (1) the PG
+writer's append-and-repoint `ON CONFLICT DO UPDATE SET sample_id`
+upsert contradicted architecture Sec 5.2.1 lines 1040-1048's
+explicit "skip the insert" contract for derived rows; (2) all three
+PG source queries (`repoShaPairsQuery`, `scopesQuery`,
+`foundationSamplesQuery`) joined `metric_sample_active` to
+`metric_sample` / `scope_binding` without the canonical
+retraction anti-join, so retracted active rows would still feed
+the composer; (3) `ReadSystemTierInputs` issued multiple
+independent `QueryContext` / `QueryRowContext` calls per tick
+without a transaction, allowing torn reads across concurrent
+foundation writes; (4) `readFoundationSamples` silently set
+`attrs = nil` on JSON unmarshal failure, converting corrupt input
+into success-shaped composer input. This iter closes all four
+with a structural change to the writer and tightened invariants
+on the source.
+
+### Prior feedback resolution
+
+- 1. ADDRESSED -- the writer is redesigned to the
+  architecture-canonical SKIP-on-active flow per Sec 5.2.1
+  lines 1040-1048. `internal/aggregator/pg_system_tier_writer.go`
+  now defines `existsActiveStmt()` returning the EXISTS-check
+  SQL `SELECT 1 FROM metric_sample_active msa LEFT JOIN
+  metric_retraction mr ON mr.sample_id = msa.sample_id WHERE
+  (quintuple match) AND mr.sample_id IS NULL LIMIT 1`, and
+  `WriteSystemTierSamples` (lines 240-340) now: prepares three
+  statements (exists, insert metric_sample, insert
+  metric_sample_active); for each sample issues the EXISTS
+  query; on `sql.ErrNoRows` proceeds with both INSERTs; on a
+  successful match SKIPS both INSERTs and continues to the
+  next sample. The `metric_sample_active` INSERT is now a
+  BARE INSERT (no `ON CONFLICT` clause) per
+  `insertMetricSampleActiveStmt()` -- the EXISTS check
+  guarantees uniqueness, and a duplicate-key error from a
+  concurrent writer race is the desired surface under the
+  single-replica deployment invariant. The
+  `SystemTierWriter` interface doc in
+  `internal/aggregator/system_tier.go:1527-1605` is flipped
+  back to SKIP-on-active semantics with an explicit "Why
+  SKIP-on-active (and not append-and-repoint)" history
+  section explaining that the iter-3 append-and-repoint
+  description was the misaligned one (the iter-2 evaluator
+  said "align doc to impl"; the iter-4 evaluator said
+  "align impl to architecture"; converging on the
+  architecture's skip-on-active means doc + impl + arch
+  now agree). The writer's package-level doc block at
+  `pg_system_tier_writer.go:25-118` describes the EXISTS
+  check + retraction-anti-join + SKIP-on-found flow with
+  the architecture Sec 5.2.1 line range quoted inline.
+  `pg_system_tier_writer_test.go` adds five new tests:
+  `TestPGSystemTierWriter_WriteSamples_SkipsWhenActiveRowExists`
+  (mixed-batch skip-then-insert), `_AllSkippedStillCommits`
+  (steady-state re-tick), `_ExistenceCheckHasRetractionAntiJoin`
+  (literal regex pin for `LEFT JOIN metric_retraction ...
+  WHERE mr.sample_id IS NULL`), and
+  `_ActiveInsertHasNoOnConflict` (negative-pin that the
+  active-pointer INSERT does NOT contain `ON CONFLICT` -- the
+  contractual reverse of the iter-3 `_UpsertShape_HasDoUpdate`
+  test which is REPLACED). The existing
+  `_SingleTransaction`, `_RollsBackOnInsertFailure`, and
+  (renamed) `_RollsBackOnActiveInsertFailure` tests are
+  updated to expect the new three-statement prepare shape +
+  the per-sample EXISTS query.
+- 2. ADDRESSED -- all three system-tier source queries now
+  carry the canonical retraction anti-join. In
+  `internal/aggregator/pg_system_tier_source.go`,
+  `repoShaPairsQuery` adds `LEFT JOIN metric_retraction mr
+  ON mr.sample_id = msa.sample_id ... WHERE mr.sample_id IS
+  NULL`; `scopesQuery` and `foundationSamplesQuery` mirror
+  the same pattern. This matches the canonical anti-join in
+  `PGSampleSource` (`pg_source.go:76-90`). Three new tests
+  pin the SQL shape:
+  `TestPGSystemTierInputSource_RepoShaQueryHasRetractionAntiJoin`,
+  `_ScopesQueryHasRetractionAntiJoin`, and an updated
+  `_FoundationQueryFiltersSystemPack` whose regex now also
+  asserts the `LEFT JOIN metric_retraction` + `mr.sample_id
+  IS NULL` clauses are present.
+- 3. ADDRESSED -- `ReadSystemTierInputs` now wraps every
+  per-tick read in a read-only transaction:
+  `db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true,
+  Isolation: sql.LevelRepeatableRead})` at the top, with
+  `defer tx.Rollback()` for clean release. All four per-pair
+  readers (`readRepoShaPairs`, `readProducerRunID`,
+  `readScopes`, `readFoundationSamples`) now take a
+  `*sql.Tx` parameter instead of using `s.db` directly. The
+  type-level doc comment adds a "Transactional read
+  consistency (G6)" section explaining the rationale:
+  REPEATABLE READ isolation gives a single point-in-time
+  snapshot across the 1+N+N+N statements so concurrent
+  foundation writes cannot tear repo/sha pairs from their
+  scopes or foundation samples. New test
+  `TestPGSystemTierInputSource_TransactionBeginFailure`
+  pins the failure path; every existing test now expects
+  `mock.ExpectBegin()` / `mock.ExpectRollback()` around the
+  statement traffic.
+- 4. ADDRESSED -- `readFoundationSamples` no longer
+  silently swallows malformed `attrs_json`. The
+  `json.Unmarshal` branch now returns a wrapped
+  `fmt.Errorf("aggregator.PGSystemTierInputSource:
+  unmarshal attrs_json (sample_id=...): %w", err)` so the
+  outer `ReadSystemTierInputs` aborts the tick rather than
+  fabricating a `nil`-attrs composer input from corrupt
+  storage. New test
+  `TestPGSystemTierInputSource_PropagatesMalformedAttrsJSON`
+  asserts the error surfaces with the sample_id in the
+  message and that the read transaction rolls back cleanly.
+
 ### Iter 3 -- production binary wiring + PG input source + doc-comment fix
 
 Iteration 2 (score 86, verdict: iterate) shipped the

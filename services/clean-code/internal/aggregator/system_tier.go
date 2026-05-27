@@ -1526,11 +1526,10 @@ const (
 
 // SystemTierWriter is the persistence seam the composer's
 // emitted samples flow through. The production implementation
-// [PGSystemTierWriter] targets `clean_code.metric_sample`
-// AND the `metric_sample_active` pointer table inside one
-// transaction per WriteSystemTierSamples call -- the same
-// active-row UPSERT pattern the foundation writer uses (see
-// `metric_ingestor/pg_metric_sample_writer.go`).
+// [PGSystemTierWriter] targets `clean_code.metric_sample` AND
+// the `metric_sample_active` pointer table inside one
+// transaction per WriteSystemTierSamples call, honouring the
+// architecture's SKIP-on-active contract for derived rows.
 //
 // The composer's Stage 7.2 contract is pure-function: it
 // produces samples and returns them. Persistence is a
@@ -1538,42 +1537,64 @@ const (
 // [InMemorySystemTierWriter] captures writes for the
 // composer's unit + integration tests.
 //
-// # Active-pointer semantics (append-and-repoint, NOT skip)
+// # Active-pointer semantics (SKIP-on-active, per architecture)
 //
-// When the writer's tick lands on a `(repo_id, sha, scope_id,
-// metric_kind, metric_version)` quintuple that already has an
-// active sample, the implementation MUST insert a NEW
-// `metric_sample` row (fresh `sample_id`) and re-point
-// `metric_sample_active` to it. The prior `metric_sample`
-// row stays in the append-only history as audit evidence of
-// the prior composition (architecture G3 row immutability),
-// and the active pointer ALWAYS reflects the most recently
-// composed sample for that quintuple. Per the architecture
-// Sec 5.2.1 line 1041 retract-then-reinsert semantics + the
-// `metric_sample_active` table COMMENT at migration
-// `0002_measurement.up.sql:539-552`, the upsert is shaped
-// as
+// Per architecture Sec 5.2.1 lines 1040-1048 ("for
+// source='derived' rows the Cross-Repo Aggregator writes at
+// most one row per quintuple per HEAD SHA per tick; if its
+// tick lands on a SHA where an **active** derived row already
+// exists (degraded or not), it **skips the insert** for that
+// SHA and waits for the next HEAD SHA"), the writer's
+// per-sample flow is:
 //
-//	INSERT INTO metric_sample_active (...) VALUES (...)
-//	ON CONFLICT (repo_id, sha, scope_id, metric_kind,
-//	            metric_version)
-//	    DO UPDATE SET sample_id = EXCLUDED.sample_id
+//  1. EXISTS check: SELECT 1 FROM metric_sample_active msa
+//                   LEFT JOIN metric_retraction mr
+//                          ON mr.sample_id = msa.sample_id
+//                   WHERE (repo_id, sha, scope_id, metric_kind,
+//                          metric_version) match
+//                     AND mr.sample_id IS NULL
+//                   LIMIT 1
+//  2. If step 1 returned a row, SKIP both inserts. The skip
+//     is a SUCCESSFUL no-op (no error surfaces); the composer
+//     will re-emit at the next HEAD SHA.
+//  3. If step 1 returned zero rows, INSERT a fresh row into
+//     `metric_sample` AND a matching pointer into
+//     `metric_sample_active` (bare INSERT, no ON CONFLICT).
 //
-// A `DO NOTHING` shape would silently drop re-composed rows
-// (the active pointer would never repoint to the freshly
-// composed sample) and is forbidden. The composer-level
-// dedup-by-skip semantics described in earlier iterations
-// were retired in iter 3 -- skipping at the writer was a
-// pre-iter-3 misread of the architecture's
-// retract-then-reinsert contract.
+// The `mr.sample_id IS NULL` anti-join treats a retracted
+// active row as ABSENT (the retraction is a tombstone per
+// Sec 5.2.1 lines 1023-1030), so a tick following a
+// `mgmt.retract_sample` correctly writes a fresh active
+// derived row at the same quintuple.
+//
+// # Why SKIP-on-active (and not append-and-repoint)
+//
+// The iter-3 version of this comment described an
+// append-and-repoint upsert (INSERT + ON CONFLICT DO UPDATE
+// SET sample_id) on the active pointer. That description was
+// misaligned with the architecture: derived rows are
+// SHA-stable for a given quintuple (their inputs at a frozen
+// SHA do not move), so the second tick within the same HEAD
+// SHA window would compose an identical-value row and
+// repointing the active pointer to a duplicate sample wastes
+// storage AND breaks the architecture's audit invariant that
+// "one active derived row per quintuple per SHA" is mediated
+// by `mgmt.retract_sample`, NOT by silent upsert. The
+// iter-4 evaluator caught this; the writer's implementation
+// and this doc were flipped TOGETHER to skip-on-active so the
+// contract is mutually consistent across implementation,
+// docs, and architecture pin.
 type SystemTierWriter interface {
 	// WriteSystemTierSamples persists `samples` as a single
 	// atomic unit. Implementations MUST honour the
-	// append-and-repoint active-pointer contract per the doc
-	// comment above (each call inserts a NEW metric_sample
-	// row per sample AND repoints metric_sample_active to
-	// it). Empty slice MUST be a no-op (no transaction, no
-	// error).
+	// SKIP-on-active contract per the doc comment above
+	// (each sample's quintuple is checked against the
+	// retraction-anti-joined `metric_sample_active`; if an
+	// active non-retracted row exists, both inserts are
+	// SKIPPED for that sample). The COMMIT still runs even
+	// when every sample was skipped (steady-state re-tick at
+	// the same HEAD SHA is a no-op success path). Empty
+	// slice MUST be a no-op (no transaction, no error).
 	WriteSystemTierSamples(ctx context.Context, samples []SystemTierSample) error
 }
 

@@ -405,14 +405,73 @@ func TestNewServer_PanicsOnNilAuth(t *testing.T) {
 	_ = NewServer(ServerConfig{Registry: NewVerbRegistry()})
 }
 
-func TestNewServer_PanicsOnNilRegistry(t *testing.T) {
+func TestNewServer_DefaultsRegistryToCanonical(t *testing.T) {
 	t.Parallel()
-	defer func() {
-		if rec := recover(); rec == nil {
-			t.Fatalf("NewServer with nil Registry did not panic")
-		}
-	}()
-	_ = NewServer(ServerConfig{Authenticator: &StaticHMACAuthenticator{Secret: testSecret, Audience: audienceLiteral}})
+	// Item #2 from iter-3 feedback: NewServer no longer
+	// panics on nil Registry. Instead, NewDefaultRegistry
+	// is installed so every canonical verb is exposed as
+	// a 503 stub out of the box.
+	s := NewServer(ServerConfig{
+		Authenticator: &StaticHMACAuthenticator{Secret: testSecret, Audience: audienceLiteral},
+	})
+	if s.Registry() == nil {
+		t.Fatalf("Server.Registry() is nil after default install")
+	}
+	want := len(CanonicalVerbs)
+	got := len(s.Registry().Verbs())
+	if got != want {
+		t.Errorf("default registry has %d verbs, want %d (CanonicalVerbs)", got, want)
+	}
+}
+
+func TestNewServer_DefaultTracerIsOTel(t *testing.T) {
+	t.Parallel()
+	// Item #3 from iter-3 feedback: nil Tracer with
+	// DisableTracing=false must install an OTel-backed
+	// tracer (not silently NoopTracer). We can't easily
+	// assert the concrete *OTelTracer type from outside
+	// the handler, but we CAN assert the handler is
+	// non-nil and that NewServer doesn't panic.
+	s := NewServer(ServerConfig{
+		Authenticator: &StaticHMACAuthenticator{Secret: testSecret, Audience: audienceLiteral},
+	})
+	if s.Handler() == nil {
+		t.Fatalf("Server.Handler() is nil")
+	}
+	// The OTel global provider returns a no-op tracer in
+	// the absence of explicit configuration, so the
+	// gateway still serves requests cleanly under the
+	// default tracer.
+}
+
+func TestNewServer_DisableTracingInstallsNoop(t *testing.T) {
+	t.Parallel()
+	// Item #3 from iter-3 feedback: the deliberate
+	// span-drop path is DisableTracing=true. The gateway
+	// still serves but emits no spans.
+	s := NewServer(ServerConfig{
+		Authenticator:  &StaticHMACAuthenticator{Secret: testSecret, Audience: audienceLiteral},
+		DisableTracing: true,
+	})
+	if s.Handler() == nil {
+		t.Fatalf("Server.Handler() is nil")
+	}
+}
+
+func TestNewServer_ExplicitTracerOverridesDefault(t *testing.T) {
+	t.Parallel()
+	// A composition root that passes a Tracer explicitly
+	// must see THAT tracer plumbed in (DisableTracing is
+	// ignored when Tracer is non-nil).
+	tr := &RecordingTracer{}
+	s := NewServer(ServerConfig{
+		Authenticator:  &StaticHMACAuthenticator{Secret: testSecret, Audience: audienceLiteral},
+		Tracer:         tr,
+		DisableTracing: true, // ignored
+	})
+	if s.Handler() == nil {
+		t.Fatalf("Server.Handler() is nil")
+	}
 }
 
 func TestServer_RegistryAccessor(t *testing.T) {

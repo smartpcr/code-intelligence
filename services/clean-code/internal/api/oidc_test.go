@@ -188,6 +188,87 @@ func TestOIDCAuthenticator_Expired(t *testing.T) {
 	}
 }
 
+// TestOIDCAuthenticator_NowOverrideThreaded asserts that
+// cfg.Now is plumbed into the jwt parser via
+// jwt.WithTimeFunc (item #4 from iter-3 feedback). Without
+// the option, golang-jwt/v5 falls back to time.Now()
+// internally and a deterministic Now override has no effect
+// on exp/nbf validation.
+//
+// Strategy: sign a token that ALREADY EXPIRED relative to
+// real wall-clock time (exp = real-now - 2h), but set
+// cfg.Now to a fixed past timestamp where the same token is
+// STILL VALID (cfg.Now = exp - 1h). Without WithTimeFunc
+// the parser sees real-now > exp and rejects; with
+// WithTimeFunc the parser sees cfg.Now < exp and accepts.
+func TestOIDCAuthenticator_NowOverrideThreaded(t *testing.T) {
+	t.Parallel()
+	jwks := httptest.NewServer(jwksHandler(t, nil))
+	defer jwks.Close()
+	// Pick a fixed past timestamp far enough back that
+	// real-now is comfortably outside any leeway.
+	frozenNow := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	auth, err := NewOIDCAuthenticator(OIDCAuthenticatorConfig{
+		Issuer:   "https://idp.example",
+		Audience: "https://gateway.example",
+		JWKSURL:  jwks.URL,
+		Now:      func() time.Time { return frozenNow },
+	})
+	if err != nil {
+		t.Fatalf("NewOIDCAuthenticator: %v", err)
+	}
+	// Token issued at frozenNow, expires 1h later. Real
+	// wall-clock time is well past 2024-01-01T13:00:00Z, so
+	// without WithTimeFunc(cfg.Now) the parser would reject
+	// this as expired.
+	token := signRS256TestToken(t, jwt.MapClaims{
+		"iss": "https://idp.example",
+		"aud": "https://gateway.example",
+		"sub": "alice",
+		"iat": frozenNow.Unix(),
+		"exp": frozenNow.Add(time.Hour).Unix(),
+		"nbf": frozenNow.Unix(),
+	})
+	id, err := auth.Authenticate(context.Background(), token)
+	if err != nil {
+		t.Fatalf("Authenticate with frozen Now: %v (cfg.Now is NOT threaded into jwt parser)", err)
+	}
+	if id.Subject != "alice" {
+		t.Errorf("Subject=%q, want alice", id.Subject)
+	}
+}
+
+// TestOIDCAuthenticator_NowOverrideRejectsExpiredAtFrozenNow
+// asserts the inverse: with cfg.Now threaded, a token whose
+// exp predates the frozen Now is still rejected as expired.
+// Pinned so a future regression that drops WithTimeFunc and
+// happens to use real-now (where the token might still be
+// valid in some test runs) is caught.
+func TestOIDCAuthenticator_NowOverrideRejectsExpiredAtFrozenNow(t *testing.T) {
+	t.Parallel()
+	jwks := httptest.NewServer(jwksHandler(t, nil))
+	defer jwks.Close()
+	frozenNow := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	auth, _ := NewOIDCAuthenticator(OIDCAuthenticatorConfig{
+		Issuer:   "https://idp.example",
+		Audience: "https://gateway.example",
+		JWKSURL:  jwks.URL,
+		Now:      func() time.Time { return frozenNow },
+		Leeway:   1 * time.Second,
+	})
+	// Token expired 1 minute before frozenNow.
+	token := signRS256TestToken(t, jwt.MapClaims{
+		"iss": "https://idp.example",
+		"aud": "https://gateway.example",
+		"sub": "alice",
+		"exp": frozenNow.Add(-time.Minute).Unix(),
+	})
+	_, err := auth.Authenticate(context.Background(), token)
+	if !errors.Is(err, ErrExpiredToken) {
+		t.Fatalf("err=%v, want ErrExpiredToken evaluated against cfg.Now", err)
+	}
+}
+
 func TestOIDCAuthenticator_AlgNoneRejected(t *testing.T) {
 	t.Parallel()
 	jwks := httptest.NewServer(jwksHandler(t, nil))

@@ -33,19 +33,40 @@ type ServerConfig struct {
 	// Authenticator verifies the bearer token. REQUIRED.
 	Authenticator Authenticator
 
-	// Registry holds the verb table. REQUIRED. Composition
-	// root populates the registry before [Server.ListenAndServe]
-	// returns. The Server holds a reference, so additional
-	// Register calls AFTER serve-start are visible to the
-	// handler (the registry's RWMutex makes the read side
-	// safe), but the canonical pattern is register-then-serve.
+	// Registry holds the verb table. When nil, [NewServer]
+	// installs [NewDefaultRegistry] so the gateway exposes
+	// every canonical verb (architecture Sec 6.2-6.5) as a
+	// 503 stub out of the box -- the composition root then
+	// replaces individual slots via [VerbRegistry.Replace]
+	// (or constructs its own registry via
+	// [NewWiredRegistry] + [NewProductionWiring]).
+	// Composition root populates the registry before
+	// [Server.ListenAndServe] returns. The Server holds a
+	// reference, so additional Register calls AFTER
+	// serve-start are visible to the handler (the
+	// registry's RWMutex makes the read side safe), but
+	// the canonical pattern is register-then-serve.
 	Registry *VerbRegistry
 
-	// Tracer receives one span per request. Nil installs
-	// [NoopTracer] -- the gateway still functions, span
-	// emission silently drops. Production wiring SHOULD
-	// pass [SlogTracer] or an OTel-backed Tracer.
+	// Tracer receives one span per request. When nil and
+	// [DisableTracing] is false (the production default),
+	// [NewServer] installs [NewOTelTracerFromGlobal] so
+	// spans flow to whatever OTel provider the composition
+	// root configured globally. To explicitly disable
+	// tracing (e.g. unit tests, smoke binaries) set
+	// `DisableTracing: true` and the gateway installs
+	// [NoopTracer]. Item #3 from iter-3 feedback: never
+	// silently drop spans -- emission must be a deliberate
+	// opt-out.
 	Tracer Tracer
+
+	// DisableTracing, when true together with a nil
+	// [Tracer], installs [NoopTracer] and silently drops
+	// spans. Use ONLY in test / smoke configurations; the
+	// production composition root MUST either pass a real
+	// Tracer or leave both Tracer nil + DisableTracing
+	// false so the OTel global provider is used.
+	DisableTracing bool
 
 	// Logger receives structured log entries for every
 	// 4xx / 5xx response and every internal-error path.
@@ -78,26 +99,42 @@ type Server struct {
 	http     *http.Server
 }
 
-// NewServer constructs a [Server] from `cfg`. PANICS on any
-// wiring error (nil Authenticator / nil Registry); failing
-// loudly at startup beats silently degraded behaviour at
-// runtime.
+// NewServer constructs a [Server] from `cfg`. PANICS only on
+// a nil [Authenticator] -- auth is the one wiring choice the
+// gateway cannot reasonably default. Other nil fields fall
+// back to safe, production-shaped defaults:
+//
+//   - nil Registry -> [NewDefaultRegistry] (every canonical
+//     verb mounted as a 503 stub; composition root replaces
+//     individual slots).
+//   - nil Tracer + DisableTracing=false ->
+//     [NewOTelTracerFromGlobal] (emits spans via the OTel
+//     global provider the composition root configured).
+//   - nil Tracer + DisableTracing=true -> [NoopTracer]
+//     (silent drop, opt-in only).
+//   - nil Logger -> [slog.Default].
+//   - zero timeouts -> the `Default*Timeout` constants.
 func NewServer(cfg ServerConfig) *Server {
 	if cfg.Authenticator == nil {
 		panic("api.NewServer: ServerConfig.Authenticator is nil")
 	}
-	if cfg.Registry == nil {
-		panic("api.NewServer: ServerConfig.Registry is nil")
+	registry := cfg.Registry
+	if registry == nil {
+		registry = NewDefaultRegistry()
 	}
 	tracer := cfg.Tracer
 	if tracer == nil {
-		tracer = NoopTracer{}
+		if cfg.DisableTracing {
+			tracer = NoopTracer{}
+		} else {
+			tracer = NewOTelTracerFromGlobal()
+		}
 	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	handler := NewGatewayHandler(cfg.Authenticator, cfg.Registry, tracer, logger)
+	handler := NewGatewayHandler(cfg.Authenticator, registry, tracer, logger)
 	readHeaderTimeout := cfg.ReadHeaderTimeout
 	if readHeaderTimeout == 0 {
 		readHeaderTimeout = DefaultReadHeaderTimeout
@@ -125,7 +162,7 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 	return &Server{
 		handler:  handler,
-		registry: cfg.Registry,
+		registry: registry,
 		logger:   logger,
 		http:     srv,
 	}

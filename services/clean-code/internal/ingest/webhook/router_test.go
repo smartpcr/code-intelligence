@@ -1124,3 +1124,84 @@ func (h *failingFakeVerbHandler) Handle(_ context.Context, _ webhook.VerbPayload
 // Ensure context import stays referenced (used by Lookup
 // above).
 var _ = errors.Is
+
+
+// TestRouter_TrustedGatewayHandler_RequiresOIDCTrustWitness
+// is the iter-6 evaluator item #1 regression: pins the
+// witness contract on [webhook.Router.TrustedGatewayHandler].
+// A zero-value [webhook.OIDCGatewayTrust] MUST cause the
+// method to refuse, returning (nil, false). Only the value
+// produced by [webhook.NewOIDCGatewayTrust] is accepted.
+//
+// The witness is the structural fence between the OIDC
+// gateway (which mints the trust) and any other caller
+// (which can only get the zero value via a composite
+// literal -- explicitly rejected).
+func TestRouter_TrustedGatewayHandler_RequiresOIDCTrustWitness(t *testing.T) {
+t.Parallel()
+r, _, _ := newRouterStack(t)
+// Zero-value witness -- mimics a caller who tried to
+// bypass the discipline via `webhook.OIDCGatewayTrust{}`.
+h, ok := r.TrustedGatewayHandler(webhook.OIDCGatewayTrust{}, "churn")
+if ok {
+t.Fatalf("zero-value witness: ok=true, want false")
+}
+if h != nil {
+t.Errorf("zero-value witness: handler=%v, want nil", h)
+}
+// Valid witness -- mimics the api package composition
+// root. Same registered verb (`churn`) must yield a
+// real handler.
+h, ok = r.TrustedGatewayHandler(webhook.NewOIDCGatewayTrust(), "churn")
+if !ok {
+t.Fatalf("NewOIDCGatewayTrust witness on registered verb: ok=false, want true")
+}
+if h == nil {
+t.Errorf("NewOIDCGatewayTrust witness on registered verb: handler=nil, want non-nil")
+}
+// Valid witness + UNregistered verb -- still false.
+h, ok = r.TrustedGatewayHandler(webhook.NewOIDCGatewayTrust(), "no_such_verb")
+if ok {
+t.Errorf("unregistered verb with valid witness: ok=true, want false")
+}
+if h != nil {
+t.Errorf("unregistered verb with valid witness: handler=%v, want nil", h)
+}
+// Nil receiver -- always false, regardless of witness.
+var nilRouter *webhook.Router
+h, ok = nilRouter.TrustedGatewayHandler(webhook.NewOIDCGatewayTrust(), "churn")
+if ok {
+t.Errorf("nil receiver: ok=true, want false")
+}
+if h != nil {
+t.Errorf("nil receiver: handler=%v, want nil", h)
+}
+}
+
+// TestRouter_TrustedGatewayHandler_ValidWitness_DispatchesWithoutHMAC
+// asserts that with a valid witness, a POST through the
+// trusted handler runs the post-auth pipeline WITHOUT any
+// HMAC headers and returns the canonical 200 envelope --
+// proving the OIDC gateway can call this path without
+// holding the deployment's HMAC keys.
+func TestRouter_TrustedGatewayHandler_ValidWitness_DispatchesWithoutHMAC(t *testing.T) {
+t.Parallel()
+r, churnStore, _ := newRouterStack(t)
+h, ok := r.TrustedGatewayHandler(webhook.NewOIDCGatewayTrust(), "churn")
+if !ok {
+t.Fatalf("setup: TrustedGatewayHandler ok=false, want true")
+}
+body := goodPayloadJSON(t)
+// NO HMAC headers -- mimics the gateway path where
+// OIDC has already authenticated upstream.
+req := httptest.NewRequest(http.MethodPost, "/v1/ingest/churn", bytes.NewReader(body))
+req.Header.Set("Content-Type", "application/json")
+rr := httptest.NewRecorder()
+h.ServeHTTP(rr, req)
+if rr.Code != http.StatusOK {
+t.Fatalf("status=%d, want 200; body=%s", rr.Code, rr.Body.String())
+}
+if churnStore.Len() == 0 {
+t.Errorf("churn store untouched -- verb did not dispatch")
+}
+}

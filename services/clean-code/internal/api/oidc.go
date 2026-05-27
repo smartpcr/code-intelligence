@@ -160,6 +160,12 @@ func NewOIDCAuthenticator(cfg OIDCAuthenticatorConfig) (*OIDCAuthenticator, erro
 	for _, a := range accepted {
 		acceptedSet[a] = struct{}{}
 	}
+	// jwt.WithTimeFunc threads cfg.Now into the library's
+	// claim-validation clock so exp/nbf/iat are evaluated
+	// against the SAME time source the tests / operator
+	// override. Without this option golang-jwt/v5 falls
+	// back to time.Now() internally, defeating the whole
+	// point of cfg.Now (item #4 from iter-3 feedback).
 	parser := jwt.NewParser(
 		jwt.WithValidMethods(accepted),
 		jwt.WithIssuer(cfg.Issuer),
@@ -167,6 +173,7 @@ func NewOIDCAuthenticator(cfg OIDCAuthenticatorConfig) (*OIDCAuthenticator, erro
 		jwt.WithExpirationRequired(),
 		jwt.WithLeeway(cfg.Leeway),
 		jwt.WithIssuedAt(),
+		jwt.WithTimeFunc(cfg.Now),
 	)
 	return &OIDCAuthenticator{
 		cfg:         cfg,

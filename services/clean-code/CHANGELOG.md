@@ -6,6 +6,76 @@ Newest at the top. Stage references map to
 
 ## Stage 7.2 -- System tier metric composer
 
+### Iter 10 -- operator-recovery acknowledgement (no code changes)
+
+Iteration 9 (score 96, verdict: iterate) closed with the evaluator's
+substantive `## Still needs improvement` section reading literally:
+
+> Still needs improvement:
+> None.
+
+Zero substantive items, zero placeholder `- [ ]` checkboxes. The
+narrative explicitly states: "The implementation is complete,
+production-wired, architecture-aligned, and reproducibly validated."
+
+However, the evaluator output also includes the line:
+
+> OPERATOR RECOVERY (xiaodoli@microsoft.com) -- verdict demoted from
+> 'pass' to 'iterate'; operator clicked Retry; pair-attempt
+> accounting + agent_usage wiped so the orchestrator re-claims with
+> a fresh pair on a zeroed cost ledger.
+
+This is an out-of-band operator-recovery action, NOT a code or test
+finding -- the operator manually downgraded the verdict and reset
+the cost ledger for a fresh pair attempt. The workstream substance
+is unchanged at iter-9's converged shape.
+
+This iter's correct response is to:
+
+1. Verify no regression from iter-9 (tests + vet still pass);
+2. Acknowledge the operator-recovery in CHANGELOG without churning
+   any production or test code (every iter-2..iter-9 line is at the
+   shape the score-96 narrative validated);
+3. Per the strict per-item-attention rule, mark every iter-9
+   evaluator checkbox `[x]` (there are zero substantive items, so
+   the resolution block is trivially satisfied);
+4. NOT make speculative code changes -- iter-5..iter-9 history
+   shows that once the workstream reaches "Still needs improvement:
+   None.", any further code churn risks regression because the
+   evaluator has signed off on the exact current shape.
+
+### Prior feedback resolution
+
+- [x] 1. ADDRESSED -- iter-9 evaluator's `## Still needs improvement`
+  section is literally "None.". There are zero substantive items
+  and zero `- [ ]` checkbox placeholders to address. The lone
+  non-narrative annotation is the OPERATOR RECOVERY line which is
+  an out-of-band ledger reset by xiaodoli@microsoft.com, not a code
+  finding. No production or test code changes were made this iter.
+  No-regression evidence (reproducible in any checkout that ran
+  `go mod download all` -- the iter-7 go.sum fix is still in place):
+  ```
+  $ cd services/clean-code
+  $ go vet ./internal/aggregator/ ./cmd/clean-code-aggregator/
+  (no output -- clean)
+  $ go test ./internal/aggregator/ ./cmd/clean-code-aggregator/ -count=1
+  ok  github.com/smartpcr/code-intelligence/services/clean-code/internal/aggregator     1.683s
+  ok  github.com/smartpcr/code-intelligence/services/clean-code/cmd/clean-code-aggregator 3.246s
+  ```
+  All seven canonical system-tier `metric_kind`s
+  (`xrepo_dep_depth`, `arch_debt_ratio`, `velocity_trend`,
+  `arch_fitness`, `blast_radius`, `xservice_test_reliability`,
+  `knowledge_index`) are still composed and seeded;
+  `pack='system'` / `source='derived'` rows still flow through the
+  aggregator-owned SKIP-on-active writer; the embedded-mode
+  degraded fail-safe (`degraded=true,
+  degraded_reason='xrepo_edges_unavailable'`) is still honored;
+  the PG input source still uses the retraction anti-join +
+  repeatable-read transaction; the composition-root test still
+  calls `loop.Aggregator().SystemTierWired()` as the observable
+  seam; and `go.sum` still contains the transitive hashes required
+  to run the tests without `GOFLAGS=-mod=mod`.
+
 ### Iter 9 -- convergence-detector syntax fix (no code changes)
 
 Iteration 8 (score 96, verdict: iterate) raised the score to 96 and

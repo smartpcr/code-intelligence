@@ -1526,7 +1526,7 @@ const (
 
 // SystemTierWriter is the persistence seam the composer's
 // emitted samples flow through. The production implementation
-// (Stage 7.x follow-up) targets `clean_code.metric_sample`
+// [PGSystemTierWriter] targets `clean_code.metric_sample`
 // AND the `metric_sample_active` pointer table inside one
 // transaction per WriteSystemTierSamples call -- the same
 // active-row UPSERT pattern the foundation writer uses (see
@@ -1534,24 +1534,46 @@ const (
 //
 // The composer's Stage 7.2 contract is pure-function: it
 // produces samples and returns them. Persistence is a
-// separate concern; this interface defines the seam so the
-// follow-up PG implementation lands cleanly. The in-memory
-// implementation [InMemorySystemTierWriter] captures writes
-// for the composer's unit + integration tests today.
+// separate concern; this interface defines the seam.
+// [InMemorySystemTierWriter] captures writes for the
+// composer's unit + integration tests.
 //
-// Per architecture Sec 5.2.1 line 1041, when the writer's
-// tick lands on a SHA where an active derived row already
-// exists for a `(repo_id, sha, scope_id, metric_kind,
-// metric_version)` quintuple, the implementation MUST skip
-// the insert for that SHA (the deduplication is a writer
-// concern, not a composer concern). The PG implementation
-// will enforce this via an existence check on
-// `metric_sample_active` before the INSERT.
+// # Active-pointer semantics (append-and-repoint, NOT skip)
+//
+// When the writer's tick lands on a `(repo_id, sha, scope_id,
+// metric_kind, metric_version)` quintuple that already has an
+// active sample, the implementation MUST insert a NEW
+// `metric_sample` row (fresh `sample_id`) and re-point
+// `metric_sample_active` to it. The prior `metric_sample`
+// row stays in the append-only history as audit evidence of
+// the prior composition (architecture G3 row immutability),
+// and the active pointer ALWAYS reflects the most recently
+// composed sample for that quintuple. Per the architecture
+// Sec 5.2.1 line 1041 retract-then-reinsert semantics + the
+// `metric_sample_active` table COMMENT at migration
+// `0002_measurement.up.sql:539-552`, the upsert is shaped
+// as
+//
+//	INSERT INTO metric_sample_active (...) VALUES (...)
+//	ON CONFLICT (repo_id, sha, scope_id, metric_kind,
+//	            metric_version)
+//	    DO UPDATE SET sample_id = EXCLUDED.sample_id
+//
+// A `DO NOTHING` shape would silently drop re-composed rows
+// (the active pointer would never repoint to the freshly
+// composed sample) and is forbidden. The composer-level
+// dedup-by-skip semantics described in earlier iterations
+// were retired in iter 3 -- skipping at the writer was a
+// pre-iter-3 misread of the architecture's
+// retract-then-reinsert contract.
 type SystemTierWriter interface {
 	// WriteSystemTierSamples persists `samples` as a single
-	// atomic unit. Implementations MUST honour the active-row
-	// uniqueness contract per the doc comment above. Empty
-	// slice MUST be a no-op (no transaction, no error).
+	// atomic unit. Implementations MUST honour the
+	// append-and-repoint active-pointer contract per the doc
+	// comment above (each call inserts a NEW metric_sample
+	// row per sample AND repoints metric_sample_active to
+	// it). Empty slice MUST be a no-op (no transaction, no
+	// error).
 	WriteSystemTierSamples(ctx context.Context, samples []SystemTierSample) error
 }
 

@@ -6,6 +6,105 @@ Newest at the top. Stage references map to
 
 ## Stage 7.2 -- System tier metric composer
 
+### Iter 3 -- production binary wiring + PG input source + doc-comment fix
+
+Iteration 2 (score 86, verdict: iterate) shipped the
+in-aggregator wiring path (`WithSystemTier` option +
+`tickSystemTier` pass) and the production `PGSystemTierWriter`,
+but the composition-root binary `cmd/clean-code-aggregator/main.go`
+still constructed `NewAggregator(source, writer)` WITHOUT the
+`WithSystemTier` option -- so the running aggregator process never
+invoked the composer and never persisted system-tier rows. There
+was also no production `SystemTierInputSource` (only the
+in-memory test implementation), and the `SystemTierWriter`
+interface doc still described the pre-iter-2 "skip insert when
+active row exists" contract that contradicted the implemented
+append-and-repoint behaviour. This iter closes all three.
+
+### Prior feedback resolution
+
+- 1. ADDRESSED -- `cmd/clean-code-aggregator/main.go`
+  `buildAggregatorLoop` (`main.go:265-330`) now constructs
+  `aggregator.NewSystemTierComposer()`,
+  `aggregator.NewPGSystemTierInputSource(db)`, and
+  `aggregator.NewPGSystemTierWriter(db)`, then wires them into
+  `aggregator.NewAggregator(source, writer,
+  aggregator.WithSystemTier(composer, sysSource, sysWriter))`. The
+  package-level doc comment (`main.go:22-43`) is updated to
+  describe the six-unit composition root (foundation + system-tier
+  passes). New `cmd/clean-code-aggregator/main_test.go` adds four
+  wiring contract tests: `TestBuildAggregatorLoop_DisabledReturnsNil`,
+  `TestBuildAggregatorLoop_NilDBWhenEnabledErrors`,
+  `TestBuildAggregatorLoop_WiresSystemTierPipeline`,
+  `TestBuildAggregatorLoop_PropagatesCadence`, plus
+  `TestWiringContract_AggregatorOptionRejectsNil` pinning the
+  panic-on-nil shape of `WithSystemTier` so a future
+  refactor that relaxes the guard cannot silently drop the
+  system-tier pipeline back to the pre-iter-3 state.
+- 2. ADDRESSED -- new
+  `internal/aggregator/pg_system_tier_source.go` implements
+  `PGSystemTierInputSource`. Per the file's doc contract it
+  performs four canonical reads per tick: (1) DISTINCT
+  `(repo_id, sha)` from `metric_sample_active` (JOIN through
+  `metric_sample` because the active pointer doesn't carry
+  `sha`), (2) latest succeeded `scan_run` at `to_sha`=$sha for
+  the `producer_run_id`, (3) DISTINCT `(scope_id, scope_kind)`
+  from `scope_binding` for the pair, (4) the non-degraded
+  non-NULL foundation samples (`pack IN ('base', 'solid',
+  'ingested')` -- explicitly EXCLUDES `pack='system'` to prevent
+  a definitional cycle where the composer reads its own
+  outputs). Pairs without a succeeded `scan_run` anchor are
+  SKIPPED for the tick (the producer_run_id is a required
+  NOT NULL FK; fabricating one would corrupt the audit chain).
+  Embedded-mode v1: every emitted `SystemTierInput` carries
+  `Mode=SystemTierModeEmbedded`,
+  `XRepoEdgesAvailable=false`,
+  `CallEdgesAvailable=false` -- the composer correctly degrades
+  `xrepo_dep_depth` and `blast_radius` with
+  `xrepo_edges_unavailable` per the architecture Sec 3.10
+  step 4 fail-safe contract. A future Stage 8.x linked-mode
+  adapter will replace this source with one that fetches edges
+  from the agent-memory service and flips the availability
+  flags `true`. Companion file
+  `internal/aggregator/pg_system_tier_source_test.go` adds
+  eight sqlmock-driven tests: nil-DB guard, empty-schema guard,
+  empty-active-set no-op, happy path (one pair, one scope, one
+  foundation sample), skip-when-no-scan-run (two pairs; the
+  first has no anchor and is skipped while the second is fully
+  processed), foundation-pack filter regex pin (asserts the SQL
+  `WHERE ms.pack IN ('base', 'solid', 'ingested')` shape so a
+  future refactor can't silently re-feed system rows), query
+  error propagation, deterministic ordering (G6), and
+  ctx-cancellation propagation.
+- 3. ADDRESSED -- updated the `SystemTierWriter` interface
+  doc comment in `internal/aggregator/system_tier.go:1527-1583`
+  to describe the implemented append-and-repoint contract: each
+  call inserts a NEW `metric_sample` row (fresh `sample_id`)
+  AND repoints `metric_sample_active` via
+  `ON CONFLICT (...) DO UPDATE SET sample_id = EXCLUDED.sample_id`
+  per architecture Sec 5.2.1 retract-then-reinsert semantics +
+  the `metric_sample_active` table COMMENT at
+  `0002_measurement.up.sql:539-552`. Explicitly notes the prior
+  "skip the insert" / "existence check on
+  metric_sample_active" language was retired in iter 3 as a
+  pre-iter-3 misread of the architecture contract; a
+  `DO NOTHING` shape is now explicitly FORBIDDEN. Confirmed via
+  `grep -rnF` that no stale references to "skip the insert" or
+  "existence check on `metric_sample_active`" remain anywhere
+  under `services/clean-code/internal/`.
+
+Files touched this iter:
+- `internal/aggregator/system_tier.go` -- interface doc
+  comment rewrite at lines 1527-1583 (item 3).
+- `internal/aggregator/pg_system_tier_source.go` -- NEW
+  (item 2).
+- `internal/aggregator/pg_system_tier_source_test.go` -- NEW
+  (item 2).
+- `cmd/clean-code-aggregator/main.go` -- doc comment +
+  `buildAggregatorLoop` wiring (item 1).
+- `cmd/clean-code-aggregator/main_test.go` -- NEW (item 1).
+- `CHANGELOG.md` -- this entry.
+
 ### Iter 2 -- aggregator wiring + PG writer + edge-availability signal + degraded-path tests
 
 Iteration 1 (score 79, verdict: iterate) shipped the

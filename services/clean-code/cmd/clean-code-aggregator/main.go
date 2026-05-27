@@ -23,13 +23,19 @@
 //
 //   - [openAndPingDB] opens a single libpq handle, fails fast on a
 //     permanently unreachable DB.
-//   - [buildAggregatorLoop] composes the [aggregator.PGSampleSource]
-//     reader, the [aggregator.PGSnapshotWriter] writer, the
-//     [aggregator.Aggregator] orchestrator, and the
-//     [aggregator.Loop] cadence driver. When the operator opts out via
-//     [config.EnvDisableAggregator] the loop is skipped and the binary
-//     serves a /healthz-only listener (matches the metric_ingestor
-//     stale-sweep opt-out pattern).
+//   - [buildAggregatorLoop] composes the foundation pass
+//     ([aggregator.PGSampleSource] reader + [aggregator.PGSnapshotWriter]
+//     writer) AND the system-tier pass
+//     ([aggregator.SystemTierComposer] + [aggregator.PGSystemTierInputSource]
+//     reader + [aggregator.PGSystemTierWriter] writer) through
+//     [aggregator.NewAggregator] + [aggregator.WithSystemTier], and
+//     wraps them in [aggregator.NewLoop] as the cadence driver. The
+//     aggregator is the SOLE writer of `pack='system'` rows per
+//     Phase 1.5 grants -- both the foundation snapshot pass and the
+//     system-tier composition pass run inside one Tick. When the
+//     operator opts out via [config.EnvDisableAggregator] the loop is
+//     skipped and the binary serves a /healthz-only listener (matches
+//     the metric_ingestor stale-sweep opt-out pattern).
 //   - [buildMux] mounts `/healthz` and `/metrics` -- the always-on
 //     surface that lets Kubernetes liveness probes succeed even on an
 //     opted-out deployment.
@@ -249,15 +255,32 @@ func openAndPingDB(dsn, role string) (*sql.DB, error) {
 
 // buildAggregatorLoop composes the Stage 7.1 cadence loop when the
 // operator has not opted out via [config.EnvDisableAggregator]. The
-// loop is composed of three units that the unit tests already pin:
+// loop is composed of six units that the unit tests pin:
 //
 //  1. [aggregator.NewPGSampleSource] -- reads ACTIVE
 //     `metric_sample` rows via the canonical
 //     `metric_sample_active` join + `metric_retraction` anti-join.
 //  2. [aggregator.NewPGSnapshotWriter] -- INSERTs into all three
 //     snapshot tables under one transaction (BEGIN ... COMMIT).
-//  3. [aggregator.NewAggregator] + [aggregator.NewLoop] -- the
+//  3. [aggregator.NewSystemTierComposer] -- pure-function Stage
+//     7.2 composer that writes the SEVEN canonical system-tier
+//     `metric_kind` rows per `(repo_id, sha, scope_id)` per
+//     architecture Sec 1.4.2 + the embedded-mode fail-safe
+//     contract from Sec 3.10 step 4.
+//  4. [aggregator.NewPGSystemTierInputSource] -- per-tick PG
+//     read of `metric_sample_active` + `scope_binding` +
+//     `scan_run` that feeds the composer one
+//     [aggregator.SystemTierInput] per active `(repo_id, sha)`
+//     pair.
+//  5. [aggregator.NewPGSystemTierWriter] -- single-tx writer
+//     that INSERTs into `metric_sample` and UPSERTs
+//     `metric_sample_active` per Phase 1.5 grants (sole writer
+//     of `pack='system'`).
+//  6. [aggregator.NewAggregator] + [aggregator.NewLoop] -- the
 //     in-process per-cohort percentile math + the cadence loop.
+//     [aggregator.WithSystemTier] wires the system-tier composer
+//     + source + writer into the same tick; the aggregator runs
+//     foundation-snapshot AND system-tier passes per Tick.
 //
 // Returns (nil, nil) when the operator has opted out; the caller
 // then runs the /healthz-only listener so K8s liveness probes still
@@ -278,7 +301,21 @@ func buildAggregatorLoop(cfg config.Config, db *sql.DB, logger *slog.Logger) (*a
 	if err != nil {
 		return nil, fmt.Errorf("buildAggregatorLoop: NewPGSnapshotWriter: %w", err)
 	}
-	agg, err := aggregator.NewAggregator(source, writer)
+	composer, err := aggregator.NewSystemTierComposer()
+	if err != nil {
+		return nil, fmt.Errorf("buildAggregatorLoop: NewSystemTierComposer: %w", err)
+	}
+	sysSource, err := aggregator.NewPGSystemTierInputSource(db)
+	if err != nil {
+		return nil, fmt.Errorf("buildAggregatorLoop: NewPGSystemTierInputSource: %w", err)
+	}
+	sysWriter, err := aggregator.NewPGSystemTierWriter(db)
+	if err != nil {
+		return nil, fmt.Errorf("buildAggregatorLoop: NewPGSystemTierWriter: %w", err)
+	}
+	agg, err := aggregator.NewAggregator(source, writer,
+		aggregator.WithSystemTier(composer, sysSource, sysWriter),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("buildAggregatorLoop: NewAggregator: %w", err)
 	}

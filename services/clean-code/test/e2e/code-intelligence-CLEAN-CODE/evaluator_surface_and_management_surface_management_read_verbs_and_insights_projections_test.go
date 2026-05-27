@@ -51,6 +51,7 @@ type mgmtReadState struct {
 	metricSampleResponse []map[string]interface{}
 
 	// cross_repo scenario
+	crossRepoPercentileID string
 	expectedP50          float64
 	expectedP90          float64
 	expectedP99          float64
@@ -180,12 +181,13 @@ func (s *mgmtReadState) populatedCrossRepoPercentileRowExists() error {
 	s.expectedP99 = 28.7
 	s.expectedHistogramJSON = `{"buckets":[0,5,10,15,20,25,30],"counts":[12,45,30,8,3,1,1]}`
 
+	s.crossRepoPercentileID = s.generateUniqueID("crp")
 	_, err := s.db.Exec(`
 		INSERT INTO cross_repo_percentile (id, metric_name, window_start, window_end, p50, p90, p99, histogram_json, created_at)
 		VALUES ($1, $2, NOW() - INTERVAL '7 days', NOW(), $3, $4, $5, $6, NOW())
 		ON CONFLICT (metric_name, window_start, window_end)
 		DO UPDATE SET p50 = $3, p90 = $4, p99 = $5, histogram_json = $6, created_at = NOW()`,
-		s.generateUniqueID("crp"), "cyclomatic_complexity",
+		s.crossRepoPercentileID, "cyclomatic_complexity",
 		s.expectedP50, s.expectedP90, s.expectedP99, s.expectedHistogramJSON)
 	if err != nil {
 		return fmt.Errorf("inserting cross_repo_percentile: %w", err)
@@ -364,6 +366,23 @@ func newMgmtReadStateFromEnv() *mgmtReadState {
 
 func InitializeScenario_evaluator_surface_and_management_surface_management_read_verbs_and_insights_projections(ctx *godog.ScenarioContext) {
 	s := newMgmtReadStateFromEnv()
+
+	// Cleanup inserted rows after each scenario to avoid accumulation in shared E2E databases.
+	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
+		if s.db == nil {
+			return ctx, nil
+		}
+		if s.retractedSampleID != "" {
+			s.db.ExecContext(ctx, `DELETE FROM metric_sample WHERE id = $1`, s.retractedSampleID)
+		}
+		if s.activeSampleID != "" {
+			s.db.ExecContext(ctx, `DELETE FROM metric_sample WHERE id = $1`, s.activeSampleID)
+		}
+		if s.crossRepoPercentileID != "" {
+			s.db.ExecContext(ctx, `DELETE FROM cross_repo_percentile WHERE id = $1`, s.crossRepoPercentileID)
+		}
+		return ctx, nil
+	})
 
 	// Scenario: sha-pinned-returns-active-row
 	ctx.Step(`^two metric_sample rows exist for the same repo, commit SHA, file path, metric name, and scope with the older one retracted$`, s.twoMetricSampleRowsExistWithOlderRetracted)

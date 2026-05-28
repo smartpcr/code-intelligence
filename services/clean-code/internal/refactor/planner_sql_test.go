@@ -62,6 +62,17 @@ func newSQLMock(t *testing.T) (*sql.DB, sqlmock.Sqlmock, func()) {
 // predicates so a future refactor that drops the join (e.g.
 // reverting to a DISTINCT-ON-by-metric_version shape) fails
 // here.
+//
+// The regex also pins the iter-4 fix: a `DISTINCT ON
+// (msa.scope_id, msa.metric_kind)` projection plus an
+// `ORDER BY ... msa.metric_version DESC` tail. The pointer
+// table's PK is on the FULL quintuple including
+// `metric_version`, so multiple co-active versions per
+// `(scope, metric_kind)` are allowed by the schema; the
+// reader collapses them to the largest version in SQL. A
+// regression that drops DISTINCT ON would let
+// `applyMetricSampleToScopeInputs` see ALL versions and the
+// last-row-wins fold would be plan-order-dependent.
 func TestSQLMetricSampleReader_ScopeMetrics_JoinsActivePointer(t *testing.T) {
 	db, mock, cleanup := newSQLMock(t)
 	defer cleanup()
@@ -78,20 +89,24 @@ func TestSQLMetricSampleReader_ScopeMetrics_JoinsActivePointer(t *testing.T) {
 		AddRow(scopeA, MetricKindModificationCountInWindow, 5.0).
 		AddRow(scopeB, MetricKindFanOut, 3.0)
 
-	// The regex pins ALL the things the iter-3 feedback
-	// asks to surface: SELECT from `metric_sample_active`
-	// (driver table) JOIN `metric_sample` on the
-	// `sample_id`, qualified `msa.*` predicates, `value IS
-	// NOT NULL` defence against bad ingestion, and the
-	// canonical column list. Whitespace is `\s+`-loose.
-	pattern := `SELECT\s+ms\.scope_id,\s+ms\.metric_kind,\s+ms\.value\s+` +
+	// The regex pins ALL the things the iter-3/iter-4
+	// feedback asks to surface: DISTINCT ON over the
+	// (scope_id, metric_kind) pair, SELECT from
+	// `metric_sample_active` (driver table) JOIN
+	// `metric_sample` on the `sample_id`, qualified `msa.*`
+	// predicates, `value IS NOT NULL` defence against bad
+	// ingestion, ORDER BY ... metric_version DESC tail.
+	// Whitespace is `\s+`-loose.
+	pattern := `SELECT\s+DISTINCT\s+ON\s*\(\s*msa\.scope_id\s*,\s*msa\.metric_kind\s*\)\s+` +
+		`msa\.scope_id,\s+msa\.metric_kind,\s+ms\.value\s+` +
 		`FROM\s+clean_code\.metric_sample_active\s+msa\s+` +
 		`JOIN\s+clean_code\.metric_sample\s+ms\s+` +
 		`ON\s+ms\.sample_id\s*=\s*msa\.sample_id\s+` +
 		`WHERE\s+msa\.repo_id\s*=\s*\$1\s+` +
 		`AND\s+msa\.sha\s*=\s*\$2\s+` +
 		`AND\s+msa\.metric_kind\s*=\s*ANY\(\$3\)\s+` +
-		`AND\s+ms\.value\s+IS\s+NOT\s+NULL`
+		`AND\s+ms\.value\s+IS\s+NOT\s+NULL\s+` +
+		`ORDER\s+BY\s+msa\.scope_id,\s+msa\.metric_kind,\s+msa\.metric_version\s+DESC`
 
 	mock.ExpectQuery(pattern).
 		WithArgs(repoID, sha, pq.Array(kinds)).
@@ -128,6 +143,91 @@ func TestSQLMetricSampleReader_ScopeMetrics_JoinsActivePointer(t *testing.T) {
 	}
 }
 
+// TestSQLMetricSampleReader_ScopeMetrics_PicksLargestMetricVersion is
+// the evaluator iter-4 item 1 regression. The
+// `metric_sample_active` PRIMARY KEY is on the FULL
+// quintuple `(repo_id, sha, scope_id, metric_kind,
+// metric_version)`, so multiple co-active versions of the
+// same `(scope, metric_kind)` are allowed by the schema.
+// The [MetricSampleReader] contract says the reader MUST
+// pick the largest active `metric_version` deterministically.
+// The production SQL achieves this via DISTINCT ON +
+// ORDER BY ... metric_version DESC. This test asserts both:
+//
+//   - the regex pins the DISTINCT ON clause and the ORDER BY
+//     metric_version DESC tail, so a refactor that drops
+//     either fails here;
+//   - the scope's [ScopeInputs] reflects the LARGEST-version
+//     value when the mock returns a single row (DISTINCT ON
+//     collapse simulated by the mock returning only the
+//     winning row, the same shape the database would return).
+//
+// Together with the in-memory contract test
+// `TestPlanner_MetricDedupe_TakesLargestMetricVersion` in
+// `planner_test.go` (which covers the InMemory reader's
+// max-by-version behavior), this guarantees both readers
+// honor the same contract.
+func TestSQLMetricSampleReader_ScopeMetrics_PicksLargestMetricVersion(t *testing.T) {
+	db, mock, cleanup := newSQLMock(t)
+	defer cleanup()
+
+	repoID := uuid.Must(uuid.NewV4())
+	sha := "abcdef"
+	kinds := HotSpotInputMetricKinds
+
+	scope := uuid.Must(uuid.FromString("00000000-0000-0000-0000-000000000c33"))
+
+	// DISTINCT ON + ORDER BY in Postgres returns ONLY the
+	// winning row per partition (here: the largest
+	// metric_version for this (scope, cyclo) pair). The
+	// mock therefore returns only the v=7 row with
+	// value=99. If a regression drops DISTINCT ON, the
+	// production code would ask for ALL versions; the
+	// regex below would fail because the SQL pattern still
+	// requires the DISTINCT ON clause -- so the test would
+	// fail at the ExpectationsWereMet stage, not in the
+	// fold logic. This is intentional: the SQL fragment
+	// itself is the contract, not the application-side
+	// fold.
+	rows := sqlmock.NewRows([]string{"scope_id", "metric_kind", "value"}).
+		AddRow(scope, MetricKindCyclo, 99.0)
+
+	pattern := `SELECT\s+DISTINCT\s+ON\s*\(\s*msa\.scope_id\s*,\s*msa\.metric_kind\s*\)\s+` +
+		`msa\.scope_id,\s+msa\.metric_kind,\s+ms\.value\s+` +
+		`FROM\s+clean_code\.metric_sample_active\s+msa\s+` +
+		`JOIN\s+clean_code\.metric_sample\s+ms\s+` +
+		`ON\s+ms\.sample_id\s*=\s*msa\.sample_id\s+` +
+		`WHERE\s+msa\.repo_id\s*=\s*\$1\s+` +
+		`AND\s+msa\.sha\s*=\s*\$2\s+` +
+		`AND\s+msa\.metric_kind\s*=\s*ANY\(\$3\)\s+` +
+		`AND\s+ms\.value\s+IS\s+NOT\s+NULL\s+` +
+		`ORDER\s+BY\s+msa\.scope_id,\s+msa\.metric_kind,\s+msa\.metric_version\s+DESC`
+
+	mock.ExpectQuery(pattern).
+		WithArgs(repoID, sha, pq.Array(kinds)).
+		WillReturnRows(rows)
+
+	r := NewSQLMetricSampleReader(db)
+	out, err := r.ScopeMetrics(context.Background(), repoID, sha, kinds)
+	if err != nil {
+		t.Fatalf("ScopeMetrics: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("len(out) = %d, want 1", len(out))
+	}
+	if out[0].ScopeID != scope {
+		t.Errorf("ScopeID = %s, want %s", out[0].ScopeID, scope)
+	}
+	if !out[0].HasCyclo || out[0].Cyclo != 99 {
+		t.Errorf("Cyclo = (%v, %v), want (99, true) (largest-version row)",
+			out[0].Cyclo, out[0].HasCyclo)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
 // TestSQLMetricSampleReader_ScopeMetrics_PropagatesQueryError
 // confirms a query failure is wrapped and returned (not
 // silently swallowed).
@@ -136,7 +236,7 @@ func TestSQLMetricSampleReader_ScopeMetrics_PropagatesQueryError(t *testing.T) {
 	defer cleanup()
 
 	wantErr := errors.New("synthetic query failure")
-	mock.ExpectQuery(`SELECT\s+ms\.scope_id`).WillReturnError(wantErr)
+	mock.ExpectQuery(`SELECT\s+DISTINCT\s+ON`).WillReturnError(wantErr)
 
 	r := NewSQLMetricSampleReader(db)
 	_, err := r.ScopeMetrics(context.Background(),

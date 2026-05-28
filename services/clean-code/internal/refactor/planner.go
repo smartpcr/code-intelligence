@@ -701,18 +701,35 @@ const schemaName = steward.DefaultSchema
 
 // SQLMetricSampleReader is the production [MetricSampleReader]
 // against `clean_code.metric_sample`. The implementation
-// enforces the architecture G2 active-row contract by joining
-// `metric_sample` through the `metric_sample_active` side
-// relation (architecture Sec 5.2.1 lines 991-1003 / tech-spec
-// Sec 7.1.b lines 1103-1119): every sample_id read MUST be
-// the active pointer's current target. Retracted samples and
-// older same-quintuple rows are filtered by the join itself
-// because `metric_sample_active.PRIMARY KEY = (repo_id, sha,
-// scope_id, metric_kind, metric_version)` and there is at
-// most one pointer per quintuple. Reading raw `metric_sample`
-// rows and deduping by `metric_version DESC` (the iter-2
-// shape) would silently include retracted samples; the active
-// pointer is the canonical filter.
+// enforces TWO architecture invariants:
+//
+//   - **Active-row contract (architecture G2 / Sec 5.2.1
+//     lines 991-1003 / tech-spec Sec 7.1.b lines 1103-1119).**
+//     Every `sample_id` read MUST be a currently-active
+//     pointer's target. Reading raw `metric_sample` rows and
+//     deduping by `metric_version DESC` (the iter-2 shape)
+//     would silently include retracted samples whose pointer
+//     has since been re-pointed; the active pointer table is
+//     the canonical filter. We drive FROM
+//     `metric_sample_active` and JOIN through `sample_id`
+//     into `metric_sample` so retracted rows are excluded by
+//     the join itself.
+//
+//   - **Largest-metric_version-wins contract
+//     ([MetricSampleReader] doc).** The active pointer table's
+//     PRIMARY KEY is on the FULL quintuple `(repo_id, sha,
+//     scope_id, metric_kind, metric_version)` -- so multiple
+//     active rows for the SAME `(scope_id, metric_kind)` at
+//     different `metric_version` values are allowed by the
+//     schema (e.g. v=1 still active while v=2 is also
+//     activated by a re-computation that has not retracted v=1
+//     yet). The reader MUST pick the row with the largest
+//     `metric_version` deterministically. We do this in SQL via
+//     `DISTINCT ON (scope_id, metric_kind) ... ORDER BY
+//     scope_id, metric_kind, metric_version DESC` so the
+//     application code never sees the older versions and the
+//     scope folding via [applyMetricSampleToScopeInputs] never
+//     depends on row arrival order.
 type SQLMetricSampleReader struct {
 	db *sql.DB
 }
@@ -727,11 +744,15 @@ func NewSQLMetricSampleReader(db *sql.DB) *SQLMetricSampleReader {
 // and assembles per-scope [ScopeInputs] rows. The SELECT
 // drives from `metric_sample_active` (so non-active samples
 // are filtered by the join) and joins through `sample_id`
-// into `metric_sample` for the `value` column. The active
-// pointer's PRIMARY KEY guarantees at most one row per
-// `(repo_id, sha, scope_id, metric_kind, metric_version)`,
-// so the result has at most one row per (scope_id,
-// metric_kind) without any application-side dedupe.
+// into `metric_sample` for the `value` column. The
+// `DISTINCT ON (msa.scope_id, msa.metric_kind) ... ORDER BY
+// msa.scope_id, msa.metric_kind, msa.metric_version DESC`
+// shape collapses multiple co-active versions of the same
+// (scope, kind) to the largest version -- the contract
+// pinned in [MetricSampleReader]. Without DISTINCT ON the
+// per-row fold in [applyMetricSampleToScopeInputs] would be
+// order-dependent (last write wins by row arrival) which is
+// nondeterministic across plan variants.
 // Result rows are folded into the [ScopeInputs] struct
 // fields via [applyMetricSampleToScopeInputs] (the single
 // metric_kind -> struct field mapping site).
@@ -742,7 +763,8 @@ func (r *SQLMetricSampleReader) ScopeMetrics(
 	metricKinds []string,
 ) ([]ScopeInputs, error) {
 	q := fmt.Sprintf(`
-		SELECT ms.scope_id, ms.metric_kind, ms.value
+		SELECT DISTINCT ON (msa.scope_id, msa.metric_kind)
+		       msa.scope_id, msa.metric_kind, ms.value
 		  FROM %s.metric_sample_active msa
 		  JOIN %s.metric_sample ms
 		    ON ms.sample_id = msa.sample_id
@@ -750,6 +772,7 @@ func (r *SQLMetricSampleReader) ScopeMetrics(
 		   AND msa.sha = $2
 		   AND msa.metric_kind = ANY($3)
 		   AND ms.value IS NOT NULL
+		 ORDER BY msa.scope_id, msa.metric_kind, msa.metric_version DESC
 	`, schemaName, schemaName)
 	rows, err := r.db.QueryContext(ctx, q, repoID, sha, pq.Array(metricKinds))
 	if err != nil {

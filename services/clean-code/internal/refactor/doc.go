@@ -48,22 +48,27 @@
 //     application code cannot drop without breaking
 //     reproducibility:
 //
-//       - [SQLMetricSampleReader] drives from
-//         `metric_sample_active` and joins through `sample_id`
-//         into `metric_sample`, so retracted samples are
-//         filtered by the join itself (architecture G2 /
-//         Sec 5.2.1 lines 991-1003 / tech-spec Sec 7.1.b
-//         lines 1103-1119). The pointer table's primary key
-//         over the (repo_id, sha, scope_id, metric_kind,
-//         metric_version) quintuple gives at most one row
-//         per (scope, metric_kind) without any application-
-//         side dedupe.
-//       - [SQLFindingReader] adds a `policy_version_id` filter
-//         scoped to the ACTIVE policy snapshot, so findings
-//         produced by parallel evaluations against an
-//         experimental policy at the same SHA do NOT inflate
-//         the active-policy hot_spot's `finding_count` (the
-//         architecture Sec 5.5.1 reproducibility invariant).
+//   - [SQLMetricSampleReader] drives from
+//     `metric_sample_active` and joins through `sample_id`
+//     into `metric_sample`, so retracted samples are
+//     filtered by the join itself (architecture G2 /
+//     Sec 5.2.1 lines 991-1003 / tech-spec Sec 7.1.b
+//     lines 1103-1119). The pointer table's primary key
+//     is over the FULL `(repo_id, sha, scope_id,
+//     metric_kind, metric_version)` quintuple, so multiple
+//     co-active versions per `(scope, metric_kind)` are
+//     allowed by the schema; the reader collapses them in
+//     SQL via `DISTINCT ON (scope_id, metric_kind) ...
+//     ORDER BY ... metric_version DESC` so the largest
+//     active version wins deterministically (the
+//     [MetricSampleReader] contract).
+//
+//   - [SQLFindingReader] adds a `policy_version_id` filter
+//     scoped to the ACTIVE policy snapshot, so findings
+//     produced by parallel evaluations against an
+//     experimental policy at the same SHA do NOT inflate
+//     the active-policy hot_spot's `finding_count` (the
+//     architecture Sec 5.5.1 reproducibility invariant).
 //
 //   - **Stage 8.2** -- refactor-plan / refactor-task generation.
 //     A `planner.go` file consumes [Computation] outputs, reads

@@ -12,7 +12,7 @@ permissions:
 
 env:
   GO_VERSION: "1.25.1"
-  COMPOSE_FILE: tests/e2e/phase-09-audit-wal/docker-compose.yml
+  COMPOSE_FILE: services/clean-code/deploy/local/docker-compose.yml
 
 jobs:
   e2e-audit-wal-frame-writer:

@@ -3,6 +3,7 @@ package wal
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
 
 	"github.com/gofrs/uuid"
@@ -93,10 +94,8 @@ func NoopVerify(payload, signature []byte) error {
 		return errors.New("wal: NoopVerify: signature length mismatch")
 	}
 	sum := sha256.Sum256(payload)
-	for i := range sum {
-		if sum[i] != signature[i] {
-			return errors.New("wal: NoopVerify: signature mismatch")
-		}
+	if subtle.ConstantTimeCompare(sum[:], signature) != 1 {
+		return errors.New("wal: NoopVerify: signature mismatch")
 	}
 	return nil
 }

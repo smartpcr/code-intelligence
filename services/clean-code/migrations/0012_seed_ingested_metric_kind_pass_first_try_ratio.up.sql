@@ -1,10 +1,25 @@
--- 0010_seed_ingested_metric_kind_pass_first_try_ratio.up.sql
+-- 0012_seed_ingested_metric_kind_pass_first_try_ratio.up.sql
 --
 -- Stage 4.3 -- seed the `pass_first_try_ratio` row in
 -- `clean_code.metric_kind` so the new `ingest.test_balance`
 -- verb's writes can satisfy the composite FK
 -- `clean_code.metric_sample.(metric_kind, metric_version)`
 -- (`migrations/0002_measurement.up.sql:348-350`).
+--
+-- Renumbered from 0010 to 0012 in the Stage 7.3 sibling-
+-- package repair pass: the original 0010 prefix collided
+-- with `0010_churn_event.{up,down}.sql` (introduced under
+-- a parallel stage). The migration runner's discover step
+-- (`internal/storage/migrate.go::DiscoverMigrations`) keys
+-- by `version` and rejects two pairs sharing the same
+-- numeric prefix. 0012 was chosen because 0011 is taken by
+-- `0011_seed_system_tier_metric_kinds`. Renumbering is
+-- safe because this migration's UP is idempotent
+-- (`ON CONFLICT (metric_kind) DO NOTHING`) and its DOWN is
+-- scoped to the exact `(metric_kind, metric_version)`
+-- tuple; databases that already applied this migration
+-- under its previous 0010 name will silently no-op when
+-- the runner re-applies it at 0012.
 --
 -- The runtime `clean_code_metric_ingestor` role has NO
 -- INSERT on `clean_code.metric_kind`
@@ -44,7 +59,7 @@
 --     `0001_catalog_lifecycle.up.sql:283-286` pins the Policy
 --     Steward as the canonical writer.
 --
--- Down: `0010_seed_ingested_metric_kind_pass_first_try_ratio.down.sql`
+-- Down: `0012_seed_ingested_metric_kind_pass_first_try_ratio.down.sql`
 -- scopes its DELETE to the EXACT `(metric_kind,
 -- metric_version) = ('pass_first_try_ratio', 1)` tuple this
 -- UP inserts.

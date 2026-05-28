@@ -158,6 +158,315 @@ restart the binary, and confirm `loop: stopped` appears in
 the structured log. Snapshot rows already in the three
 tables remain (they are append-only history).
 
+## Stage 7.3: Insights percentile freshness banner
+
+This subsection captures the rollout sequence for the
+percentile-freshness banner attached to the Management
+latest-dashboard read verbs `mgmt.read.cross_repo` and
+`mgmt.read.portfolio` (architecture Sec 6.3, tech-spec
+Sec 8.2 `freshness_window_seconds=3600`). Stage 7.3
+introduces NO new binary, NO new env var, NO migration --
+the banner is a behavior-pinning iteration of the existing
+Reader code path in
+`internal/management/insights/freshness.go` +
+`internal/management/reader.go`.
+
+### What's new
+
+1. **`internal/management/insights/freshness.go`** -- new
+   sub-package owning the `Freshness`,
+   `Status`, `Clock`, `SystemClock` types plus the
+   exported `FreshnessWindowSeconds = 3600` constant and
+   the canonical
+   `DegradedReasonPercentileStale = "percentile_stale"`
+   string.
+2. **`management.WithInsightsFreshness(*insights.Freshness)`**
+   Reader option -- the composition-root wire-up. When
+   absent, the Reader auto-defaults to
+   `insights.NewPercentileFreshness()` so a wiring slip
+   cannot silently render stale snapshots as fresh
+   (defence-in-depth contract pinned by
+   `TestReader_ReadCrossRepo_*` /
+   `TestReader_ReadPortfolio_*`).
+3. **`management.WithoutFreshness()`** -- explicit opt-out
+   for unit-test seams and developer-mode replay
+   harnesses. NOT a production runtime knob and NOT a
+   rollback lever; production composition roots MUST NOT
+   call it (see runbook "Auto-default wiring").
+4. **`internal/evaluator` gate-side rejection** --
+   `verdict.IsValidForGate()`,
+   `Gate.writeDegraded`, and
+   `SQLDegradedRunStore.AppendDegradedRun` all return
+   `ErrInvalidGateDegradedReason` when handed
+   `percentile_stale`. This is the canonical realisation
+   of the Stage 6.1 e2e scenario
+   `percentile-stale-not-on-gate`.
+
+### Pre-rollout: confirm aggregator is ticking
+
+The freshness banner is meaningful only when the cross-repo
+aggregator (Stage 7.1) is producing snapshots within the
+3600s window. Confirm BEFORE rolling out a build that
+mounts the Reader:
+
+```sql
+SELECT
+  metric_kind,
+  scope_kind,
+  EXTRACT(EPOCH FROM (now() - MAX(built_at))) AS age_seconds,
+  MAX(built_at) AS latest_built_at
+FROM clean_code.cross_repo_percentile
+GROUP BY metric_kind, scope_kind
+ORDER BY age_seconds DESC;
+```
+
+Every row's `age_seconds` MUST be `< 3600` on a healthy
+cluster. A row with `age_seconds > 3600` means the
+post-rollout read will return
+`degraded_reason='percentile_stale'` -- triage the
+aggregator (Stage 7.1 runbook) BEFORE rolling out the
+reader if the banner would mislead the dashboard.
+
+### Wiring step (composition root)
+
+**State of the read surface today.** The
+`mgmt.read.cross_repo` and `mgmt.read.portfolio` HTTP
+handlers are **not yet mounted in any production binary**
+on this branch. A literal grep confirms it:
+
+```sh
+$ grep -rn 'management.NewReader' services/clean-code/cmd/
+(no production hits -- only test-file constructions and
+ doc comments)
+
+$ grep -rn 'ReadCrossRepo\|ReadPortfolio' services/clean-code/cmd/
+(empty)
+```
+
+Stage 7.3 itself ships ONLY the Reader-side library
+behaviour (the freshness sub-package and the
+`management.Reader` wire-up) plus the eval.gate-side
+rejection carve-out. The HTTP exposure of the read verbs
+(routing, auth, role grants) is a follow-on stage; that
+stage is the one that introduces a live composition
+root. Until then, the canonical wire shape is the one
+pinned by the package tests:
+
+- `internal/management/reader_test.go:609` --
+  `NewReader(nil, WithMetricsBackend(fb), WithInsightsFreshness(fresh))`
+- `internal/management/reader_test.go:716-733` -- the
+  defence-in-depth proof that `NewReader(...)` **without**
+  `WithInsightsFreshness` auto-defaults to
+  `insights.NewPercentileFreshness()`.
+
+**Recommended wire-up when the read-surface stage lands.**
+The follow-on stage should mount the read verbs from a
+**sibling** helper to `mountMgmtRoutes` -- not by
+extending `mountMgmtRoutes` itself, because the latter
+runs under the `clean_code_management` Postgres role (see
+`migrations/0004_roles.up.sql`) and intentionally splits
+its `*sql.DB` handles between the ingestor-role
+write path and the mgmt-role audit log.
+
+The Reader's actual constructor signature (file
+`internal/management/reader.go:514`) is:
+
+```go
+func NewReader(signingKeys *keys.Manager, opts ...ReaderOption) *Reader
+```
+
+-- the first positional argument is the Stage 5.1
+`*keys.Manager`, NOT a `*PGRepoStore`. The
+`MetricsBackend` (Stage 6.3) and `*insights.Freshness`
+(Stage 7.3) are wired via the variadic options.
+`NewPGMetricsBackend` (file
+`internal/management/pg_metrics_backend.go:106`)
+returns `(*PGMetricsBackend, error)` -- two values; the
+error MUST be propagated. The Reader exposes
+domain-level methods `ReadCrossRepo(ctx, metricKind,
+scopeKind) (*CrossRepoResponse, error)` and
+`ReadPortfolio(ctx, metricKind) (*PortfolioResponse, error)`
+-- the read-surface stage owns the thin HTTP handler
+shims that bridge `*http.Request -> Reader.ReadCrossRepo`
+and write the JSON response.
+
+A complete, compile-correct future wire-up sketch:
+
+```go
+// Future file (NOT shipped by Stage 7.3):
+//   cmd/clean-code-mgmt-read/main.go OR a
+//   mountMgmtReadRoutes sibling of mountMgmtRoutes
+//   in cmd/clean-code-metric-ingestor/main.go.
+
+import (
+    "database/sql"
+    "fmt"
+    "net/http"
+
+    "github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
+    "github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
+)
+
+func mountMgmtReadRoutes(
+    mux *http.ServeMux,
+    mgmtDB *sql.DB,
+    km *keys.Manager, // Stage 5.1 signing-key manager
+) error {
+    if mgmtDB == nil {
+        return fmt.Errorf("mountMgmtReadRoutes: mgmtDB is nil")
+    }
+    backend, err := management.NewPGMetricsBackend(mgmtDB)
+    if err != nil {
+        return fmt.Errorf("mountMgmtReadRoutes: backend: %w", err)
+    }
+    reader := management.NewReader(km,
+        management.WithMetricsBackend(backend),
+        // WithInsightsFreshness is OMITTED on purpose --
+        // NewReader auto-defaults to
+        // insights.NewPercentileFreshness() so a wiring
+        // slip cannot silently render stale percentiles
+        // as fresh (see reader.go:521 auto-default
+        // branch).
+    )
+    // The thin HTTP shims that adapt *http.Request to
+    // reader.ReadCrossRepo / reader.ReadPortfolio are
+    // owned by the follow-on read-surface stage. They
+    // are conventionally named handleReadCrossRepo /
+    // handleReadPortfolio and live next to the
+    // existing mgmt_verbs.go handlers. Stage 7.3 does
+    // NOT ship those shims (the Reader exposes only the
+    // domain-level methods today; see
+    // reader.go:745 ReadCrossRepo and
+    // reader.go:792 ReadPortfolio).
+    _ = reader
+    return nil
+}
+```
+
+What Stage 7.3 **DOES** pin verbatim about the
+construction shape (the parts the follow-on stage MUST
+honour to keep the freshness-banner contract intact):
+
+1. `NewReader`'s first positional arg is the signing-key
+   manager (`*keys.Manager`). Tests stub this with
+   `nil`; production wires the Stage 5.1 manager.
+2. `WithMetricsBackend(backend)` wires the metrics
+   backend (Stage 6.3 PG-backed implementation,
+   Stage 6.3 in-memory test fake, or any future
+   `MetricsBackend` implementation).
+3. Omitting `WithInsightsFreshness` is SAFE and
+   PREFERRED in production -- the auto-default at
+   `reader.go:521` wires the canonical 3600s window.
+4. Explicitly passing `WithoutFreshness()` SUPPRESSES
+   the freshness banner. It exists ONLY for unit-test
+   seams; a code review on a production composition
+   root calling `WithoutFreshness()` SHOULD block the
+   merge.
+
+The Reader-construction shape is verified by the
+package tests at `internal/management/reader_test.go:609`
+(`NewReader(nil, WithMetricsBackend(fb), WithInsightsFreshness(fresh))`)
+and `:716-733` (the defence-in-depth proof that
+`NewReader(...)` **without** `WithInsightsFreshness`
+auto-defaults).
+
+To **explicitly** suppress the freshness banner -- which
+should only happen in a unit-test seam, NEVER in a
+production composition root -- the caller MUST opt out
+with `management.WithoutFreshness()`. A code review
+flagged on a production composition root calling
+`WithoutFreshness()` SHOULD block the merge.
+
+### No new environment variables
+
+Stage 7.3 introduces no env vars. The freshness window is
+the package-level constant
+`insights.FreshnessWindowSeconds = 3600`; changing it
+requires a tech-spec amendment (the literal is
+explicitly pinned by `TestFreshnessWindowSecondsLiteral`
+in `freshness_test.go`).
+
+### No Postgres impact
+
+No migration. No new role grant. The banner reads the
+existing `cross_repo_percentile.built_at` and
+`portfolio_snapshot.built_at` columns populated by the
+Stage 7.1 aggregator -- both are non-nullable timestamps
+already covered by the Stage 1.2 catalog migration set.
+
+### Smoke validation
+
+After deploying a build that mounts the Reader with the
+banner wired:
+
+1. `/healthz` returns 200.
+2. Issue a `GET /v1/mgmt/read/cross_repo` for any
+   `(metric_kind, scope_kind)` that the aggregator has
+   composed. Expect `200` and a JSON body whose
+   `"degraded"` field is `false`. `"degraded_reason"`
+   MUST be ABSENT from the body (the field has
+   `omitempty` and the empty string is omitted on the
+   fresh path).
+3. SIMULATE a stale read in a staging environment by
+   temporarily setting
+   `CLEAN_CODE_DISABLE_AGGREGATOR=true` on the
+   aggregator deployment and waiting > 1 hour past the
+   last tick. Re-issue the same `mgmt.read.cross_repo`
+   call. Expect `200` with body
+   `"degraded": true, "degraded_reason":
+   "percentile_stale"`. Restore the aggregator and
+   confirm the next call returns to `degraded=false`
+   WITHOUT a binary restart.
+4. SMOKE the gate-side rejection by attempting to write a
+   degraded run with `degraded_reason="percentile_stale"`:
+
+   ```sql
+   SELECT clean_code.f_assert_gate_can_persist_reason(
+     'percentile_stale'::clean_code.degraded_reason
+   );
+   ```
+
+   If your deployment ships such a probe; otherwise the
+   contract is asserted at the Go layer by the
+   `verdict_test.go` suite which runs as part of
+   `make test`.
+
+### Rollback
+
+The banner is purely additive on the response envelope. To
+roll back the wiring without a code change, redeploy the
+previous build (the banner field is `omitempty` on
+fresh-path JSON, so any consumer that ignores
+`degraded`/`degraded_reason` was already compatible).
+
+If a real defect in the freshness comparison surfaces in
+production:
+
+1. The correct first response is to fix the AGGREGATOR
+   (the most common cause of `percentile_stale` in
+   practice -- see runbook "Operator triage on
+   `percentile_stale`").
+2. ONLY if the comparison itself is mis-classifying fresh
+   rows as stale (a real implementation bug), file a
+   regression and consider a hotfix that pins the wider
+   `time.Duration` window via a custom
+   `WithInsightsFreshness(&insights.Freshness{Window:
+   2*time.Hour, Clock: insights.SystemClock{}})`
+   composition. Do NOT reach for
+   `management.WithoutFreshness()` as the rollback
+   path -- suppressing the signal does not fix the bug
+   and removes the dashboard's only staleness indicator.
+
+### Backout sequence (rare)
+
+If a Stage 7.3 hotfix turns out to be worse than the bug
+it was fixing, revert the change in the composition root
+(restore the previous `WithInsightsFreshness(...)` line)
+and redeploy. The Reader's auto-default contract
+guarantees a fresh-by-default behaviour even with the
+option omitted -- there is no DB cleanup required and the
+existing snapshot rows remain untouched.
+
 ## Stage 6.2: management write verbs and repo onboarding
 
 This subsection captures the rollout sequence for the

@@ -104,7 +104,7 @@ func main() {
 	// `migrations/0004_roles.up.sql:227-260` but NOT INSERT;
 	// the actual seeding is done by the schema-owner
 	// migrations (`0007_seed_foundation_metric_kinds.up.sql`
-	// + `0010_seed_ingested_metric_kind_pass_first_try_ratio.up.sql`).
+	// + `0012_seed_ingested_metric_kind_pass_first_try_ratio.up.sql`).
 	if err := verifyMetricKindCatalog(context.Background(), ingestorDB, metricKindCatalogSchema); err != nil {
 		log.Fatalf("verifyMetricKindCatalog: %v", err)
 	}
@@ -192,7 +192,7 @@ func main() {
 // `clean_code.metric_kind` references in the migrations
 // (`migrations/0001_catalog_lifecycle.up.sql:258`,
 // `0007_seed_foundation_metric_kinds.up.sql`,
-// `0010_seed_ingested_metric_kind_pass_first_try_ratio.up.sql`).
+// `0012_seed_ingested_metric_kind_pass_first_try_ratio.up.sql`).
 // The constant lives here (rather than imported from
 // metric_ingestor) so the wiring file does not depend on
 // internals not part of the package's exported surface.

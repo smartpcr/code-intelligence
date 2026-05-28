@@ -141,6 +141,186 @@ SELECT grantee, privilege_type
 Expected: `clean_code_xrepo_aggregator` has INSERT only;
 no other role has INSERT/UPDATE/DELETE.
 
+## Stage 7.3 -- Insights percentile freshness banner
+
+This section captures the operator-facing contract of the
+percentile-freshness banner attached to the Management
+latest-dashboard read verbs `mgmt.read.cross_repo` and
+`mgmt.read.portfolio` (Stage 6.3). The banner is the
+Insights-surface envelope decoration documented at
+architecture Sec 7.5 / tech-spec Sec 8.2
+`freshness_window_seconds`; the implementation lives in
+`internal/management/insights/freshness.go` and is wired
+into `internal/management/reader.go` via the
+`WithInsightsFreshness(*insights.Freshness)` option. The
+production constructor is
+`insights.NewPercentileFreshness()` (window =
+`FreshnessWindowSeconds = 3600s`, clock = `SystemClock`).
+
+### What the banner does
+
+On EVERY call to `mgmt.read.cross_repo(metric_kind,
+scope_kind)` or `mgmt.read.portfolio(metric_kind)` the
+Reader:
+
+1. Resolves the latest `cross_repo_percentile` (resp.
+   `portfolio_snapshot`) row through the configured
+   `MetricsBackend` (architecture Sec 6.3).
+2. Passes the row's `built_at` to
+   `insights.Freshness.Evaluate(builtAt)`.
+3. If `now() - built_at > 3600s`, stamps the response
+   envelope's `degraded=true` and
+   `degraded_reason="percentile_stale"`. Otherwise the
+   envelope carries `degraded=false` and the
+   `degraded_reason` field is omitted from JSON.
+
+`mgmt.read.portfolio` aggregates the WORST-CASE across the
+fetched rows -- `Degraded=true` iff ANY row's `built_at`
+is stale, and `OldestBuiltAt` echoes the oldest row's
+`built_at` so an operator can attribute the staleness
+verdict to a specific snapshot.
+
+### Wire shape on a stale read
+
+A response from `GET /v1/mgmt/read/cross_repo?metric_kind=
+arch_debt_ratio&scope_kind=repo` against a stale snapshot
+looks like:
+
+```json
+{
+  "row": {
+    "metric_kind":   "arch_debt_ratio",
+    "scope_kind":    "repo",
+    "p50":           0.18,
+    "p90":           0.41,
+    "p99":           0.72,
+    "histogram_json": "{...}",
+    "built_at":      "2026-05-27T17:02:11Z"
+  },
+  "degraded":        true,
+  "degraded_reason": "percentile_stale",
+  "built_at":        "2026-05-27T17:02:11Z"
+}
+```
+
+A FRESH response omits `degraded_reason` and emits
+`"degraded": false`.
+
+### Boundary semantics
+
+`Freshness.Evaluate` uses a strict-greater-than comparison
+(`age > Window`) so a row whose age EQUALS the window is
+treated as FRESH; one second past the window flips it to
+stale. The boundary contract is pinned by
+`TestFreshness_BoundaryAtExactWindowIsFresh` and
+`TestFreshness_OneSecondPastBoundaryIsStale`
+(`internal/management/insights/freshness_test.go`).
+
+Edge cases the verb handles WITHOUT operator intervention:
+
+- **Empty `built_at` (`time.Time{}` zero value)** -- some
+  backends return this when the underlying table is empty.
+  Evaluate treats it as STALE so an unpopulated dashboard
+  cannot silently render as "fresh".
+- **Future `built_at` (writer clock ahead of reader clock)**
+  -- treated as FRESH; the resulting negative age never
+  satisfies `> Window`. The Insights surface does not
+  police clock drift.
+- **Nil `Clock`** -- a `Freshness{Clock: nil}` falls back
+  to `SystemClock` rather than panicking, so a
+  composition-root wiring bug cannot crash the hot read
+  path.
+
+### INSIGHTS-ONLY: NOT a gate signal
+
+`percentile_stale` is the canonical "Insights-only"
+degraded reason. The `eval.gate` verb's degraded-reason
+taxonomy (architecture Sec 8.2) is the closed four-value
+set `{samples_pending, policy_signature_invalid,
+xrepo_edges_unavailable, ast_subprocess_unavailable}`; the
+gate's writer REJECTS `percentile_stale` with the sentinel
+`ErrInvalidGateDegradedReason` BEFORE any SQL is issued
+(`internal/evaluator/verdict.go`,
+`internal/evaluator/gate_evaluate.go:writeDegraded`,
+`internal/evaluator/sql_degraded_store.go`). The carve-out
+is pinned by
+`TestDegradedReason_IsValidForGate_RejectsPercentileStale`,
+`TestGate_writeDegraded_RejectsPercentileStaleReason`, and
+`TestSQLDegradedRunStore_RejectsPercentileStaleReasonBeforeSQL`
+(verdict_test.go) plus the Stage 6.1 e2e scenario
+`percentile-stale-not-on-gate`.
+
+Operational implication: a dashboard showing
+`degraded_reason="percentile_stale"` MUST NOT be treated as
+a block/warn input to a deploy gate. It is a *dashboard
+staleness* signal -- the underlying ACTIVE
+`metric_sample` rows are still consumable by `eval.gate`
+even when the percentile cohort summary has not been
+refreshed within the hour.
+
+### Operator triage on `percentile_stale`
+
+A persistent `degraded_reason="percentile_stale"` typically
+indicates the cross-repo aggregator loop is not ticking.
+Triage steps:
+
+1. Inspect the Stage 7.1 aggregator binary's structured
+   log for the "aggregator loop: Tick succeeded" line.
+   Absence for > 1 hour is the canonical trigger.
+2. Confirm `CLEAN_CODE_DISABLE_AGGREGATOR` is not set to
+   `true` on the aggregator deployment (Stage 7.1).
+3. Confirm exactly ONE aggregator replica is running
+   (Stage 7.1 single-replica invariant).
+4. Query the table directly:
+
+   ```sql
+   SELECT metric_kind, scope_kind, MAX(built_at) AS latest
+     FROM clean_code.cross_repo_percentile
+    GROUP BY metric_kind, scope_kind
+    ORDER BY latest;
+   ```
+
+   The `latest` column lets you attribute the
+   `percentile_stale` verdict to the specific cohort whose
+   `built_at` is oldest -- the same cohort
+   `OldestBuiltAt` echoes for `mgmt.read.portfolio`.
+
+The banner DOES NOT auto-clear: once the aggregator
+resumes ticking, the next snapshot insert advances
+`built_at` and the verb's next read returns
+`degraded=false` without operator intervention.
+
+### Auto-default wiring (defence-in-depth)
+
+A composition root that calls `management.NewReader(...)`
+WITHOUT `WithInsightsFreshness` AUTOMATICALLY receives the
+production-canonical `insights.NewPercentileFreshness()`
+(window = 3600s, clock = `SystemClock`). This auto-default
+exists so a wiring slip cannot silently render a stale
+snapshot as fresh. A composition root that genuinely needs
+to suppress the banner -- e.g. a developer-mode replay
+harness or a unit test seam -- MUST opt out explicitly via
+`management.WithoutFreshness()`.
+
+`WithoutFreshness()` is a DEVELOPER/TEST SEAM, NOT a
+production rollback knob. As of Stage 7.3 there is no
+production composition root that calls
+`management.NewReader(...)` -- a literal grep over
+`services/clean-code/cmd/` confirms this (see the rollout
+guide's "State of the read surface today" subsection).
+When the follow-on read-surface stage lands and introduces
+the first production Reader-wiring binary (a sibling
+helper to the existing
+`cmd/clean-code-metric-ingestor/main.go:mountMgmtRoutes`
+write-verb mount, or a new `cmd/clean-code-mgmt-read/`),
+that binary MUST NOT call `WithoutFreshness()`. A PR that
+adds `WithoutFreshness()` to a production composition
+root MUST be reviewed as a release-blocking change and
+the operator on call MUST be paged before it merges. If
+the banner is firing during an incident, the correct
+response is to fix the aggregator (Stage 7.1 triage
+above), not to suppress the signal.
+
 ## Stage 6.2 -- `mgmt.register_repo` and `mgmt.set_mode`
 
 This section captures the operator-facing contract of the

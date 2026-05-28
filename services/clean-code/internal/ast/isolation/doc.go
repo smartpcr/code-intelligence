@@ -122,10 +122,14 @@
 //     `DirectoryAstFileSource{Coordinator, Pool}` wiring
 //     above closes the loop.
 //   - "Should IPC use proto?" -- NO. The child handler IPC
-//     stays length-prefixed gob frames (see [RunChild] and
-//     [runExecWorker]). A proto migration is a
-//     forward-compatible swap of the codec at the
-//     frame-boundary and is deferred to a dedicated
-//     workstream so this stage's blast radius stays scoped
-//     to crash isolation + drain-before-flip.
+//     stays a small package-local binary frame (4-byte BE
+//     length per field, then payload; see [encodeRequest] /
+//     [encodeResponse] in `subprocess_exec.go`). The serialised
+//     [ParseResult.AstFileBytes] payload itself is JSON-encoded
+//     `parser.AstFile` (see [inProcessWorker.Execute] and
+//     [WrapParser]); the isolation layer treats it as opaque
+//     bytes. A proto migration is a forward-compatible swap of
+//     the inner codec at the frame boundary and is deferred to
+//     a dedicated workstream so this stage's blast radius stays
+//     scoped to crash isolation + drain-before-flip.
 package isolation

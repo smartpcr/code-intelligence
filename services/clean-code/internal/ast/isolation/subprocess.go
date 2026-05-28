@@ -70,10 +70,20 @@ type ParseRequest struct {
 // ParseResult is the canonical output shape returned by a
 // [Worker] on success.
 type ParseResult struct {
-	// AstFileBytes is the serialised AST payload (proto
-	// wire format in production; opaque to the isolation
-	// layer). Length-bounded by the worker; callers are
-	// responsible for honouring any size limit upstream.
+	// AstFileBytes is the serialised AST payload. In v1 the
+	// payload is a JSON-encoded `parser.AstFile` (see
+	// [inProcessWorker.Execute] which encodes via
+	// `json.NewEncoder`, and [WrapParser] /
+	// `metric_ingestor.DirectoryAstFileSource` which decode
+	// via `json.Unmarshal`). The isolation layer treats the
+	// bytes as opaque -- the codec lives in the parser
+	// adapter so swapping it (e.g. to the existing
+	// `internal/ast/v1` proto types) is a forward-compatible
+	// change at the adapter boundary, not a wire-protocol
+	// break.
+	//
+	// Length-bounded by the worker; callers are responsible
+	// for honouring any size limit upstream.
 	AstFileBytes []byte
 
 	// DegradedReason mirrors `AstFile.degraded_reason` (see

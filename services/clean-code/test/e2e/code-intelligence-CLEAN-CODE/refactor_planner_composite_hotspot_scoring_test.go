@@ -20,17 +20,6 @@ import (
 	_ "github.com/lib/pq"
 )
 
-// requireEnv returns the value of the named environment variable,
-// calling t.Skip when unset or empty.
-func requireEnv(t *testing.T, name string) string {
-	t.Helper()
-	v := os.Getenv(name)
-	if v == "" {
-		t.Skipf("environment variable %s is not set; skipping e2e test", name)
-	}
-	return v
-}
-
 // ---------------------------------------------------------------------------
 // Scenario 1: hotspot-score-formula
 // ---------------------------------------------------------------------------

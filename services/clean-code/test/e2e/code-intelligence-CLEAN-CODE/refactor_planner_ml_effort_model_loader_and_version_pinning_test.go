@@ -172,10 +172,12 @@ func (s *mlEffortModelState) aGeneratedRefactorTaskAndTheRefactorPlanThatOwnsIt(
 		return fmt.Errorf("CLEAN_CODE_PG_URL is not set")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// Short poll for a seeded row; fall back to the API immediately when
+	// the table is simply empty (sql.ErrNoRows) rather than burning the
+	// full timeout on a condition that won't resolve by waiting.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	// Look for a seeded refactor_task linked to a refactor_plan.
 	for {
 		err := s.db.QueryRowContext(ctx, `
 			SELECT rt.task_id, rt.plan_id
@@ -186,6 +188,10 @@ func (s *mlEffortModelState) aGeneratedRefactorTaskAndTheRefactorPlanThatOwnsIt(
 		if err == nil {
 			return nil
 		}
+		if err == sql.ErrNoRows {
+			return s.generateTaskViaAPI()
+		}
+		// Transient DB error — retry until timeout, then fall back.
 		if ctx.Err() != nil {
 			return s.generateTaskViaAPI()
 		}

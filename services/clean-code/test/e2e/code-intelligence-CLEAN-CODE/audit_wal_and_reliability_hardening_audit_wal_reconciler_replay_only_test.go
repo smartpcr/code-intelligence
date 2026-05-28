@@ -5,6 +5,7 @@ package e2e
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -205,11 +206,61 @@ func (s *auditWalReconcilerState) theReconcilerReplaysAfterRestart() error {
 		return fmt.Errorf("restart wal-reconciler: %s: %w", string(out), err)
 	}
 
-	// Wait for the reconciler to come back healthy and process pending frames.
-	time.Sleep(5 * time.Second)
+	// Poll until the wal-reconciler container is healthy (exponential backoff, ~30s cap).
+	if err := waitForContainerHealthy(composeFile, "wal-reconciler", 30*time.Second); err != nil {
+		return err
+	}
 
 	// Trigger replay to ensure pending WAL frames are processed.
 	return s.theReconcilerRuns()
+}
+
+// waitForContainerHealthy polls `docker compose ps` for the given service
+// until it reports a "running" state with health "healthy" (or "running" when
+// no healthcheck is configured). Uses exponential backoff starting at 500ms,
+// capped at the supplied timeout.
+func waitForContainerHealthy(composeFile, service string, timeout time.Duration) error {
+	type composePS struct {
+		State  string `json:"State"`
+		Health string `json:"Health"`
+	}
+
+	deadline := time.Now().Add(timeout)
+	backoff := 500 * time.Millisecond
+	const maxBackoff = 4 * time.Second
+
+	for {
+		cmd := exec.Command("docker", "compose", "-f", composeFile, "ps", "--format", "json", service)
+		out, err := cmd.Output()
+		if err == nil && len(out) > 0 {
+			// docker compose may emit one JSON object per line.
+			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				var ps composePS
+				if jsonErr := json.Unmarshal([]byte(line), &ps); jsonErr != nil {
+					continue
+				}
+				if strings.EqualFold(ps.State, "running") &&
+					(strings.EqualFold(ps.Health, "healthy") || ps.Health == "") {
+					return nil
+				}
+			}
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s waiting for %s to become healthy (last output: %s)",
+				timeout, service, strings.TrimSpace(string(out)))
+		}
+
+		time.Sleep(backoff)
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
 }
 
 func (s *auditWalReconcilerState) theReplayedRowsCallerColumnEquals(expectedCaller string) error {

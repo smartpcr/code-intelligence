@@ -41,12 +41,36 @@
 //
 //   The C# grammar does not separate `extends` from
 //   `implements`; both live inside the same `base_list` node.
-//   We populate `Extends` with every type identifier in the
-//   base list and leave `Implements` empty -- the dispatcher
-//   resolves each entry against same-file class declarations
-//   and emits `extends` edges per matched base, consistent
-//   with the Python parser which faces the same single-list
-//   shape (Python multiple-inheritance bases).
+//   This parser realises the partition contract from
+//   `tech-spec.md` Section 5.3 ("C# base-list partition rule")
+//   by walking the file twice:
+//
+//     Pass A scans every type declaration and builds a
+//       `localKind` map (simple type name -> "class" /
+//       "interface" / "struct" / "record" / "enum") -- the
+//       "file's local symbol table" the architecture
+//       references.
+//
+//     Pass B emits each `ClassDecl` with `Extends` and
+//       `Implements` already partitioned. For a class
+//       declaration the position-0 base routes by
+//       `localKind[entry]` (class -> Extends, interface ->
+//       Implements, struct/record/enum -> dropped); later
+//       positions land in Implements defensively because C#
+//       permits at most one base class. Interface
+//       declarations route every entry to Extends
+//       (super-interfaces); struct / record declarations
+//       route every entry to Implements (value types have no
+//       base class in C#).
+//
+//   The verbatim list is always retained on
+//   `LangMeta["base_raw"]` so the future cross-file resolver
+//   can re-partition with project-wide kind information.
+//   Cross-file unresolved entries default to Extends at
+//   position 0 (most likely the cross-file base class) and
+//   Implements at later positions; the dispatcher's Pass 2a
+//   drops the edge per the C4 unknown-target rule when the
+//   target cannot be resolved.
 
 package ast
 
@@ -94,7 +118,10 @@ func (csharpTreeSitterParser) Parse(relPath string, src []byte) (ParseResult, er
 	if root == nil {
 		return ParseResult{}, nil
 	}
-	w := csharpWalker{src: src}
+	w := csharpWalker{
+		src:       src,
+		localKind: classifyCSharpLocalKinds(root, src),
+	}
 	w.walkTop(root)
 	return ParseResult{
 		Classes: w.classes,
@@ -136,10 +163,54 @@ const (
 )
 
 type csharpWalker struct {
-	src     []byte
-	classes []ClassDecl
-	methods []MethodDecl
-	imports []Import
+	src []byte
+	// localKind is the same-file "local symbol table" the
+	// tech-spec partition rule references: simple type name
+	// -> declaring kind ("class" / "interface" / "struct" /
+	// "record" / "enum"). Populated by classifyCSharpLocalKinds
+	// during Pass A so handleClass (Pass B) can partition each
+	// base_list entry into Extends or Implements.
+	localKind map[string]string
+	classes   []ClassDecl
+	methods   []MethodDecl
+	imports   []Import
+}
+
+// classifyCSharpLocalKinds is the parser's Pass A walker: it
+// scans every type declaration in the file once and returns a
+// map from simple type name to declaring kind. The result is
+// the same-file local symbol table that the base-list
+// partition rule (tech-spec Section 5.3) uses to route each
+// base into Extends vs Implements.
+//
+// Same-simple-name collisions (e.g., two `Foo` classes in
+// different namespaces in the same file) overwrite; the
+// tech-spec acknowledges cross-file kind resolution is future
+// work and `LangMeta["base_raw"]` preserves the verbatim
+// entries for that resolver.
+func classifyCSharpLocalKinds(root *sitter.Node, src []byte) map[string]string {
+	out := map[string]string{}
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		switch n.Type() {
+		case csNodeClassDecl, csNodeInterfaceDecl, csNodeStructDecl,
+			csNodeRecordDecl, csNodeRecordStructDecl, csNodeEnumDecl:
+			if nameNode := n.ChildByFieldName("name"); nameNode != nil {
+				simple := strings.TrimSpace(nameNode.Content(src))
+				if simple != "" {
+					out[simple] = csKindFor(n.Type())
+				}
+			}
+		}
+		for i := uint32(0); i < n.NamedChildCount(); i++ {
+			walk(n.NamedChild(int(i)))
+		}
+	}
+	walk(root)
+	return out
 }
 
 func (w *csharpWalker) walkTop(root *sitter.Node) {
@@ -311,21 +382,27 @@ func (w *csharpWalker) handleClass(n *sitter.Node, namespace, outer string) {
 			break
 		}
 	}
-	if len(meta) > 0 {
-		cls.LangMeta = meta
+
+	// Inheritance / interface partition (tech-spec Section 5.3).
+	// The C# `base_list` mixes class + interface entries with
+	// no syntactic distinction. Pass A built w.localKind so
+	// Pass B here can route each entry into Extends or
+	// Implements per the declaring kind decision matrix. The
+	// verbatim list is always retained on
+	// `LangMeta["base_raw"]` for the future cross-file
+	// resolver to re-partition with project-wide kind info.
+	if bases := findCSharpBaseList(n); bases != nil {
+		raw := collectCSharpTypeNames(bases, w.src)
+		if len(raw) > 0 {
+			rawCopy := make([]string, len(raw))
+			copy(rawCopy, raw)
+			meta["base_raw"] = rawCopy
+			cls.Extends, cls.Implements = partitionCSharpBases(kind, raw, w.localKind)
+		}
 	}
 
-	// Inheritance / interface implementation: C# does not
-	// distinguish `extends` from `implements` syntactically;
-	// both live in the same `base_list` node. Collect every
-	// type-name leaf and put it on Extends. The
-	// resolver-side `extends` edge will still fire when a
-	// base is a same-file class; cross-file resolution is
-	// the future story's responsibility (architecture
-	// Section 4.4.3 notes this is the same shape Python
-	// multiple-inheritance bases land in).
-	if bases := findCSharpBaseList(n); bases != nil {
-		cls.Extends = collectCSharpTypeNames(bases, w.src)
+	if len(meta) > 0 {
+		cls.LangMeta = meta
 	}
 
 	w.classes = append(w.classes, cls)
@@ -376,6 +453,89 @@ func csKindFor(nodeType string) string {
 		return "enum"
 	default:
 		return "class"
+	}
+}
+
+// partitionCSharpBases applies the tech-spec Section 5.3
+// decision matrix to a `base_list` raw entry sequence. The
+// declaring kind determines which slots are Extends vs
+// Implements; localKind (built by classifyCSharpLocalKinds)
+// resolves each entry against the same-file local symbol
+// table.
+//
+// Rules per declaring kind:
+//
+//   - "class": position 0 dispatches on localKind[entry]:
+//     "class" -> Extends; "interface" -> Implements;
+//     "struct" / "record" / "enum" -> dropped (a class
+//     cannot extend a value type in C#); unresolved -> Extends
+//     (C# permits at most one base class which must appear
+//     first; an unresolved position-0 name is most likely the
+//     cross-file base). Position 1+ goes to Implements
+//     defensively (a class has exactly one base class in C#;
+//     anything else in the list is an interface or invalid).
+//   - "interface": every entry -> Extends (an interface's
+//     base list is all super-interfaces).
+//   - "struct" / "record": every entry -> Implements (value
+//     types have no base class in C#; the entire list is
+//     implemented interfaces).
+//   - "enum": both empty (enum base type is the underlying
+//     integer type, not an inheritance edge; it persists on
+//     `base_raw` for completeness).
+//
+// The verbatim list is preserved on `LangMeta["base_raw"]`
+// regardless of partition by the caller (`handleClass`).
+func partitionCSharpBases(declKind string, raw []string, localKind map[string]string) (extends, implements []string) {
+	switch declKind {
+	case "interface":
+		out := make([]string, len(raw))
+		copy(out, raw)
+		return out, nil
+	case "struct", "record":
+		out := make([]string, len(raw))
+		copy(out, raw)
+		return nil, out
+	case "enum":
+		return nil, nil
+	case "class":
+		for i, entry := range raw {
+			switch localKind[entry] {
+			case "interface":
+				implements = append(implements, entry)
+			case "class":
+				if i == 0 {
+					extends = append(extends, entry)
+				} else {
+					// Invalid C# (class has exactly one base
+					// class, must be position 0); preserve
+					// defensively in Implements so the
+					// dispatcher can still emit an edge and
+					// the verbatim list survives on base_raw.
+					implements = append(implements, entry)
+				}
+			case "struct", "record", "enum":
+				// A class cannot extend a value type; drop
+				// from both partitions. base_raw retains the
+				// verbatim entry for a future project-wide
+				// resolver to re-partition.
+			case "":
+				// Unresolved (cross-file). Position 0 is most
+				// likely the cross-file base class per C#'s
+				// at-most-one-base-class rule; later positions
+				// default to Implements defensively. The
+				// dispatcher's Pass 2a drops the edge on a
+				// classNodeID miss (C4), so a mis-classified
+				// cross-file interface produces no false edge.
+				if i == 0 {
+					extends = append(extends, entry)
+				} else {
+					implements = append(implements, entry)
+				}
+			}
+		}
+		return extends, implements
+	default:
+		return nil, nil
 	}
 }
 
@@ -603,6 +763,15 @@ func walkCSharpThisCalls(body *sitter.Node, src []byte) []string {
 // LHS of an assignment_expression. Names are deduped with
 // write-wins-over-read precedence, matching the TS / Python
 // walkers.
+//
+// Per tech-spec Section 5.3 ("Member access" row), a
+// `this.<name>` access is recorded ONLY when it sits OUTSIDE
+// any invocation_expression. When the member access is the
+// `function:` child of an invocation_expression (the receiver
+// call form `this.Method()`), it is handled by
+// walkCSharpThisCalls instead; recording it here too would
+// emit a spurious read edge on the enclosing type for every
+// receiver-qualified method call.
 func walkCSharpThisAccesses(body *sitter.Node, src []byte) []MemberAccess {
 	writes := map[string]struct{}{}
 	seen := map[string]bool{}
@@ -620,6 +789,15 @@ func walkCSharpThisAccesses(body *sitter.Node, src []byte) []MemberAccess {
 				return true
 			}
 		case csNodeMemberAccessExpr:
+			// Skip when this member access is the `function:`
+			// of an enclosing invocation_expression: that
+			// shape is a ReceiverCall (`this.M()`), not a
+			// MemberAccess. walkCSharpThisCalls handles it.
+			if parent := node.Parent(); parent != nil && parent.Type() == csNodeInvocationExpr {
+				if fn := parent.ChildByFieldName("function"); fn != nil && node.Equal(fn) {
+					return true
+				}
+			}
 			if name, ok := isCSharpThisMember(node, src); ok {
 				if !seen[name] {
 					seen[name] = true

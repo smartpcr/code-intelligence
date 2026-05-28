@@ -84,15 +84,26 @@ namespace Acme.Greetings
 	if partial, _ := greeter.LangMeta["partial"].(bool); !partial {
 		t.Errorf("Greeter.LangMeta[partial] = %v; want true", greeter.LangMeta["partial"])
 	}
-	// Inheritance edge: Greeter : IGreeter must populate Extends.
-	hasIGreeter := false
-	for _, base := range greeter.Extends {
+	// Inheritance / interface partition (tech-spec Section 5.3):
+	// IGreeter is a same-file `interface_declaration`, so the
+	// Greeter base-list entry must land in Implements (NOT
+	// Extends). The verbatim list is always retained on
+	// LangMeta["base_raw"] for the future cross-file
+	// resolver to re-partition.
+	hasIGreeterImpl := false
+	for _, base := range greeter.Implements {
 		if base == "IGreeter" {
-			hasIGreeter = true
+			hasIGreeterImpl = true
 		}
 	}
-	if !hasIGreeter {
-		t.Errorf("Greeter.Extends = %v; want IGreeter present", greeter.Extends)
+	if !hasIGreeterImpl {
+		t.Errorf("Greeter.Implements = %v; want [IGreeter] (same-file interface routes to Implements per tech-spec 5.3)", greeter.Implements)
+	}
+	if len(greeter.Extends) != 0 {
+		t.Errorf("Greeter.Extends = %v; want empty (IGreeter is a same-file interface, not a class base)", greeter.Extends)
+	}
+	if raw, _ := greeter.LangMeta["base_raw"].([]string); len(raw) != 1 || raw[0] != "IGreeter" {
+		t.Errorf("Greeter.LangMeta[base_raw] = %v; want [IGreeter]", greeter.LangMeta["base_raw"])
 	}
 
 	iface, ok := classByName["IGreeter"]
@@ -284,4 +295,407 @@ func csharpClassKeys(m map[string]ClassDecl) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// findCSharpClassByName returns a pointer to the ClassDecl
+// whose QualifiedName matches `name`, or nil.
+func findCSharpClassByName(cs []ClassDecl, name string) *ClassDecl {
+	for i := range cs {
+		if cs[i].QualifiedName == name {
+			return &cs[i]
+		}
+	}
+	return nil
+}
+
+// equalCSharpStrSlice treats nil and []string{} as equal.
+func equalCSharpStrSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestCSharpFixture_EmitsExpectedNodeAndEdgeSet covers the
+// Stage 4.3 implementation-plan fixture verbatim. It asserts
+// the C# parser emits the 3 class/interface nodes + 4 method
+// nodes the dispatcher's Pass 2a consumes to draw the
+// prescribed edge set: 1 extends, 1 implements, 1 static_calls,
+// 1 imports.
+//
+// NOTE: this test asserts the parser-level data
+// (ClassDecl.Extends / ClassDecl.Implements / MethodDecl.Calls /
+// ParseResult.Imports) that Pass 2a iterates 1:1 to emit graph
+// edges. The dispatcher integration path itself is mid-refactor
+// (two ParseResult shapes coexist in this package -- see
+// `parser.go` vs `types.go`), so a true `EmitFile` end-to-end
+// test cannot run in this iteration. When that refactor lands,
+// the assertions below can be promoted to edge-bag checks
+// against fakeWriter without changing the fixture.
+func TestCSharpFixture_EmitsExpectedNodeAndEdgeSet(t *testing.T) {
+	const src = `using System;
+
+namespace Demo
+{
+    interface IGreeter { string Greet(string name); }
+
+    class Base { public string Identify() => "base"; }
+
+    class HelloWorld : Base, IGreeter
+    {
+        private string prefix = "hi";
+
+        public string Greet(string name)
+        {
+            return FormatGreeting(this.prefix, name);
+        }
+
+        private static string FormatGreeting(string prefix, string name) => prefix + name;
+    }
+}
+`
+
+	parser := NewTreeSitterCSharpParser()
+	res, err := parser.Parse("src/HelloWorld.cs", []byte(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// 3 class/interface nodes: IGreeter, Base, HelloWorld.
+	classByName := map[string]ClassDecl{}
+	for _, c := range res.Classes {
+		classByName[c.QualifiedName] = c
+	}
+	for _, want := range []string{"IGreeter", "Base", "HelloWorld"} {
+		if _, ok := classByName[want]; !ok {
+			t.Errorf("missing class/interface %q; got %v", want, csharpClassKeys(classByName))
+		}
+	}
+	if len(res.Classes) != 3 {
+		t.Errorf("class node count = %d; want 3 (got %v)", len(res.Classes), csharpClassKeys(classByName))
+	}
+
+	// 4 method nodes per implementation-plan line 307.
+	wantMethods := []string{
+		"IGreeter.Greet",
+		"Base.Identify",
+		"HelloWorld.Greet",
+		"HelloWorld.FormatGreeting",
+	}
+	methodByName := map[string]MethodDecl{}
+	for _, m := range res.Methods {
+		methodByName[m.QualifiedName] = m
+	}
+	for _, want := range wantMethods {
+		if _, ok := methodByName[want]; !ok {
+			t.Errorf("missing method %q; got %v", want, csharpMethodKeys(methodByName))
+		}
+	}
+	if len(res.Methods) != 4 {
+		t.Errorf("method node count = %d; want 4 (got %v)", len(res.Methods), csharpMethodKeys(methodByName))
+	}
+
+	hw, ok := classByName["HelloWorld"]
+	if !ok {
+		t.Fatalf("HelloWorld class missing; cannot verify edges")
+	}
+
+	// 1 extends edge: HelloWorld -> Base (Base is a same-file
+	// class, so it must land in Extends per tech-spec 5.3).
+	if !equalCSharpStrSlice(hw.Extends, []string{"Base"}) {
+		t.Errorf("HelloWorld.Extends = %v; want [Base]", hw.Extends)
+	}
+
+	// 1 implements edge: HelloWorld -> IGreeter (IGreeter is a
+	// same-file interface, so it must land in Implements).
+	if !equalCSharpStrSlice(hw.Implements, []string{"IGreeter"}) {
+		t.Errorf("HelloWorld.Implements = %v; want [IGreeter]", hw.Implements)
+	}
+
+	// base_raw retains the verbatim source-order list.
+	rawBases, _ := hw.LangMeta["base_raw"].([]string)
+	if !equalCSharpStrSlice(rawBases, []string{"Base", "IGreeter"}) {
+		t.Errorf("HelloWorld.LangMeta[base_raw] = %v; want [Base IGreeter]", hw.LangMeta["base_raw"])
+	}
+
+	// 1 static_calls edge: HelloWorld.Greet -> HelloWorld.FormatGreeting.
+	// The parser records the bare-name callee in MethodDecl.Calls;
+	// the dispatcher's Pass 2a resolves that against the same-class
+	// method list to emit a static_calls edge.
+	greet, ok := methodByName["HelloWorld.Greet"]
+	if !ok {
+		t.Fatalf("HelloWorld.Greet method missing; cannot verify static_calls edge")
+	}
+	sawCallee := false
+	for _, c := range greet.Calls {
+		if c == "FormatGreeting" {
+			sawCallee = true
+		}
+	}
+	if !sawCallee {
+		t.Errorf("HelloWorld.Greet.Calls should include FormatGreeting (the static_calls callee); got %v", greet.Calls)
+	}
+
+	// 1 imports edge: file -> System.
+	sawSystem := false
+	for _, imp := range res.Imports {
+		if imp.Module == "System" {
+			sawSystem = true
+		}
+	}
+	if !sawSystem {
+		t.Errorf("Imports should include System; got %v", res.Imports)
+	}
+}
+
+// TestCSharpFixture_BaseListPartitionsByLocalKind covers the
+// six rows of tech-spec Section 5.3's base-list decision
+// matrix. Each sub-case fixes a declaring kind + base-list
+// shape and asserts the parser's two-pass walker partitions
+// the entries into Extends / Implements per the table.
+// `LangMeta["base_raw"]` always equals the verbatim
+// source-order list.
+func TestCSharpFixture_BaseListPartitionsByLocalKind(t *testing.T) {
+	type matrixCase struct {
+		name           string
+		src            string
+		targetClass    string
+		wantExtends    []string
+		wantImplements []string
+		wantBaseRaw    []string
+	}
+	cases := []matrixCase{
+		{
+			// Row 1: same-file class base.
+			name:           "class extends same-file class",
+			src:            `class Bar {} class Foo : Bar {}`,
+			targetClass:    "Foo",
+			wantExtends:    []string{"Bar"},
+			wantImplements: nil,
+			wantBaseRaw:    []string{"Bar"},
+		},
+		{
+			// Row 2: same-file interface base.
+			name:           "class implements same-file interface",
+			src:            `interface IFoo {} class Foo : IFoo {}`,
+			targetClass:    "Foo",
+			wantExtends:    nil,
+			wantImplements: []string{"IFoo"},
+			wantBaseRaw:    []string{"IFoo"},
+		},
+		{
+			// Row 3: mixed same-file (class + interface).
+			name:           "class mixed same-file",
+			src:            `class Bar {} interface IBaz {} class Foo : Bar, IBaz {}`,
+			targetClass:    "Foo",
+			wantExtends:    []string{"Bar"},
+			wantImplements: []string{"IBaz"},
+			wantBaseRaw:    []string{"Bar", "IBaz"},
+		},
+		{
+			// Row 4: interface-only same-file.
+			name:           "class interface-only same-file",
+			src:            `interface IBaz {} interface IQux {} class Foo : IBaz, IQux {}`,
+			targetClass:    "Foo",
+			wantExtends:    nil,
+			wantImplements: []string{"IBaz", "IQux"},
+			wantBaseRaw:    []string{"IBaz", "IQux"},
+		},
+		{
+			// Row 5: cross-file unresolved at position 0.
+			// Per tech-spec 5.3, defaults to Extends because
+			// C# permits at most one base class and position 0
+			// is most likely the cross-file base.
+			name:           "class cross-file unresolved at pos 0",
+			src:            `class Foo : Bar {}`,
+			targetClass:    "Foo",
+			wantExtends:    []string{"Bar"},
+			wantImplements: nil,
+			wantBaseRaw:    []string{"Bar"},
+		},
+		{
+			// Row 6: mixed cross-file class + same-file interface.
+			name:           "class mixed cross-file + same-file interface",
+			src:            `interface IBaz {} class Foo : Bar, IBaz {}`,
+			targetClass:    "Foo",
+			wantExtends:    []string{"Bar"},
+			wantImplements: []string{"IBaz"},
+			wantBaseRaw:    []string{"Bar", "IBaz"},
+		},
+	}
+	parser := NewTreeSitterCSharpParser()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := parser.Parse("src/p.cs", []byte(tc.src))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			target := findCSharpClassByName(res.Classes, tc.targetClass)
+			if target == nil {
+				t.Fatalf("missing target class %q; got %v", tc.targetClass, res.Classes)
+			}
+			if !equalCSharpStrSlice(target.Extends, tc.wantExtends) {
+				t.Errorf("%s.Extends = %v; want %v", tc.targetClass, target.Extends, tc.wantExtends)
+			}
+			if !equalCSharpStrSlice(target.Implements, tc.wantImplements) {
+				t.Errorf("%s.Implements = %v; want %v", tc.targetClass, target.Implements, tc.wantImplements)
+			}
+			raw, _ := target.LangMeta["base_raw"].([]string)
+			if !equalCSharpStrSlice(raw, tc.wantBaseRaw) {
+				t.Errorf("%s.LangMeta[base_raw] = %v; want %v", tc.targetClass, raw, tc.wantBaseRaw)
+			}
+		})
+	}
+}
+
+// TestCSharpFixture_BaseListPartitionsForNonClassDeclaringKinds
+// covers the partition rules for `interface` and `struct` /
+// `record` declaring kinds (tech-spec Section 5.3, second and
+// third bullets of the "two-pass walker contract"). The
+// interface row sends every base to Extends (super-interfaces);
+// the struct / record rows send every base to Implements.
+func TestCSharpFixture_BaseListPartitionsForNonClassDeclaringKinds(t *testing.T) {
+	parser := NewTreeSitterCSharpParser()
+
+	t.Run("interface declaring routes base list to Extends", func(t *testing.T) {
+		res, err := parser.Parse("src/iface.cs", []byte(`interface IBase {} interface IExt : IBase {}`))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		iExt := findCSharpClassByName(res.Classes, "IExt")
+		if iExt == nil {
+			t.Fatalf("missing IExt; got %v", res.Classes)
+		}
+		if !equalCSharpStrSlice(iExt.Extends, []string{"IBase"}) {
+			t.Errorf("IExt.Extends = %v; want [IBase]", iExt.Extends)
+		}
+		if len(iExt.Implements) != 0 {
+			t.Errorf("IExt.Implements = %v; want empty (super-interfaces route to Extends)", iExt.Implements)
+		}
+		raw, _ := iExt.LangMeta["base_raw"].([]string)
+		if !equalCSharpStrSlice(raw, []string{"IBase"}) {
+			t.Errorf("IExt.LangMeta[base_raw] = %v; want [IBase]", iExt.LangMeta["base_raw"])
+		}
+	})
+
+	t.Run("struct declaring routes base list to Implements", func(t *testing.T) {
+		res, err := parser.Parse("src/strct.cs", []byte(`interface IFoo {} struct S : IFoo {}`))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		s := findCSharpClassByName(res.Classes, "S")
+		if s == nil {
+			t.Fatalf("missing S; got %v", res.Classes)
+		}
+		if len(s.Extends) != 0 {
+			t.Errorf("S.Extends = %v; want empty (struct has no base class in C#)", s.Extends)
+		}
+		if !equalCSharpStrSlice(s.Implements, []string{"IFoo"}) {
+			t.Errorf("S.Implements = %v; want [IFoo]", s.Implements)
+		}
+	})
+
+	t.Run("record declaring routes base list to Implements", func(t *testing.T) {
+		res, err := parser.Parse("src/rec.cs", []byte(`interface IFoo {} record R(int X) : IFoo;`))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		r := findCSharpClassByName(res.Classes, "R")
+		if r == nil {
+			t.Fatalf("missing R; got %v", res.Classes)
+		}
+		if len(r.Extends) != 0 {
+			t.Errorf("R.Extends = %v; want empty (record has no base class via base-list interface convention in v1)", r.Extends)
+		}
+		if !equalCSharpStrSlice(r.Implements, []string{"IFoo"}) {
+			t.Errorf("R.Implements = %v; want [IFoo]", r.Implements)
+		}
+	})
+}
+
+// TestCSharpFixture_PartialFlagAndNamespace asserts that a
+// `partial class Foo` fragment inside `namespace Demo` populates
+// both `LangMeta["namespace"]=="Demo"` and
+// `LangMeta["partial"]==true` (the well-known C# LangMeta
+// keys per tech-spec line 487-488).
+func TestCSharpFixture_PartialFlagAndNamespace(t *testing.T) {
+	res, err := NewTreeSitterCSharpParser().Parse("src/p.cs", []byte(`namespace Demo { partial class Foo {} }`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	foo := findCSharpClassByName(res.Classes, "Foo")
+	if foo == nil {
+		t.Fatalf("missing Foo; got %v", res.Classes)
+	}
+	if ns, _ := foo.LangMeta["namespace"].(string); ns != "Demo" {
+		t.Errorf("Foo.LangMeta[namespace] = %v; want Demo", foo.LangMeta["namespace"])
+	}
+	if partial, _ := foo.LangMeta["partial"].(bool); !partial {
+		t.Errorf("Foo.LangMeta[partial] = %v; want true", foo.LangMeta["partial"])
+	}
+}
+
+// TestCSharpFixture_ReceiverCallDoesNotEmitSpuriousMemberAccess
+// pins the tech-spec Section 5.3 "Member access" rule: a
+// `this.<name>` access is recorded as a MemberAccess ONLY
+// when it sits OUTSIDE any invocation_expression. The
+// receiver call form `this.Method()` must produce a
+// ReceiverCall but NOT a MemberAccess on the enclosing type.
+// Without this rule the parser would emit a spurious read
+// edge from the method to the enclosing type for every
+// receiver-qualified call.
+func TestCSharpFixture_ReceiverCallDoesNotEmitSpuriousMemberAccess(t *testing.T) {
+	const src = `class C {
+    void Caller()
+    {
+        this.Helper();
+        var x = this.Field;
+    }
+    void Helper() {}
+    int Field;
+}`
+	res, err := NewTreeSitterCSharpParser().Parse("src/c.cs", []byte(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	var caller *MethodDecl
+	for i := range res.Methods {
+		if res.Methods[i].QualifiedName == "C.Caller" {
+			caller = &res.Methods[i]
+			break
+		}
+	}
+	if caller == nil {
+		t.Fatalf("missing C.Caller; got %v", res.Methods)
+	}
+	// this.Helper() -> ReceiverCalls, NOT MemberAccesses.
+	sawHelperCall := false
+	for _, c := range caller.ReceiverCalls {
+		if c == "Helper" {
+			sawHelperCall = true
+		}
+	}
+	if !sawHelperCall {
+		t.Errorf("C.Caller.ReceiverCalls should include Helper; got %v", caller.ReceiverCalls)
+	}
+	for _, ma := range caller.MemberAccesses {
+		if ma.Name == "Helper" {
+			t.Errorf("C.Caller.MemberAccesses must NOT include Helper (it's a receiver call, not a member access); got %v", caller.MemberAccesses)
+		}
+	}
+	// this.Field (outside any invocation) -> MemberAccesses.
+	sawFieldAccess := false
+	for _, ma := range caller.MemberAccesses {
+		if ma.Name == "Field" && !ma.IsWrite {
+			sawFieldAccess = true
+		}
+	}
+	if !sawFieldAccess {
+		t.Errorf("C.Caller.MemberAccesses should include Field (read); got %v", caller.MemberAccesses)
+	}
 }

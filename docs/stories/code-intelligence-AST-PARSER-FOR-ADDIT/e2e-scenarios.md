@@ -69,12 +69,16 @@ here so a `grep -F` from either side resolves to the same answer:
 > confirmed slug via the dedup table at section 0.1.2 below.
 > No new open question remains for this file as of this iteration;
 > the structured `open-questions` block in the iteration summary
-> re-emits five IDs (two for the confirmation slugs already pinned at
-> workstream-context lines 159 and 161, plus three dedup-marker IDs
-> that pair the three stale records on lines 152-157 with the
-> operator's choice in first position) so the wizard can dedup
-> the server-side open-questions gate that has held the score at 88
-> since iter 11.
+> re-emits ONLY the two canonical operator-confirmation IDs
+> (`phase1-compose-path` and `phase6-ci-install-pwsh`) -- the same
+> two IDs the operator-answers section of the iteration prompt has
+> been pinning since iter 66 -- with the operator-confirmed slug as
+> the first choice. Iter 67's experimental "dedup-marker" IDs are
+> NOT re-emitted in iter 69 because those custom IDs are not in the
+> operator's answer set and emitting them in iter 67 created three
+> NEW stuck UNANSWERED records (workstream-context lines 168/170/172
+> per the iter-68 evaluator feedback) instead of clearing the
+> original three. Tracking the structural retraction in 0.1.2 below.
 
 ### 0.1.2 Dedup map for the three stale UNANSWERED records
 
@@ -86,39 +90,47 @@ records must be cleared/deduped or answered for the server-side gate to
 pass."* The table below pairs each stale record (paraphrased from its
 exact opening words so a `grep -F` from the workstream context resolves
 to this doc) with the operator's confirmation slug that supersedes it.
-The same three dedup-marker IDs are re-emitted in the `open-questions`
-JSON block of the iteration summary with the operator's confirmation
-slug as the first choice, so the wizard can record the answer against
-both the legacy framing and the canonical confirmation framing.
+Both confirmation IDs are re-emitted in the `open-questions` JSON block
+of the iteration summary with the operator's confirmation slug as the
+first choice, so the wizard records the answer against the canonical
+framing the operator-answers section of the iteration prompt actually
+pins. Custom "dedup-marker" IDs are NOT emitted (see retraction note
+below the table).
 
-| Workstream line(s) | Dedup-marker id (re-emitted)                            | Stale question first-words (verbatim)                                                                                                                                               | Superseded by (operator-pinned)                                    |
+| Workstream line(s) | Canonical confirmation id (re-emitted in iter 69)       | Stale question first-words (verbatim)                                                                                                                                               | Superseded by (operator-pinned)                                    |
 | ---                | ---                                                     | ---                                                                                                                                                                                 | ---                                                                |
-| 152-153            | `phase1-compose-existing-vs-new-dedup`                  | "Should Phase 1's migration scenario reference the existing services/agent-memory/deploy/local/docker-compose.yml as I've done, or should the e2e doc commit to creating a new ..." | `confirm-create-new-standalone-postgres-only-as-doc-shows`         |
-| 154-155            | `phase1-compose-standalone-vs-include-dedup`            | "Phase 1's only postgres dependency is the 0022 migration probe; should the e2e compose file at tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml be a standalone ..."  | `confirm-create-new-standalone-postgres-only-as-doc-shows`         |
-| 156-157            | `phase6-pwsh-install-vs-skip-vs-defer-dedup`            | "Phase 6 PowerShell scenarios currently skip on the hosted ubuntu-latest runner because .github/workflows/agent-memory-ci.yml has no pwsh install step. Should this story add ..."  | `confirm-keep-skip-posture-defer-pwsh-install-to-followup-story`   |
+| 152-153            | `phase1-compose-path`                                   | "Should Phase 1's migration scenario reference the existing services/agent-memory/deploy/local/docker-compose.yml as I've done, or should the e2e doc commit to creating a new ..." | `confirm-create-new-standalone-postgres-only-as-doc-shows`         |
+| 154-155            | `phase1-compose-path`                                   | "Phase 1's only postgres dependency is the 0022 migration probe; should the e2e compose file at tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml be a standalone ..."  | `confirm-create-new-standalone-postgres-only-as-doc-shows`         |
+| 156-157            | `phase6-ci-install-pwsh`                                | "Phase 6 PowerShell scenarios currently skip on the hosted ubuntu-latest runner because .github/workflows/agent-memory-ci.yml has no pwsh install step. Should this story add ..."  | `confirm-keep-skip-posture-defer-pwsh-install-to-followup-story`   |
 
-> The three dedup-marker IDs above were introduced in iter 67. Iter 68
-> takes a different structural approach after iter 67's feedback noted
-> *"the later duplicate confirmations at lines 158-165 do not remove
-> those unanswered records, so the gate remains active"*: every prior
-> attempt (iter 11 through iter 67, all `sloppy`) emitted SOME shape of
-> the `open-questions` JSON block, and the operator's responses
-> APPENDED new "Q: ... A: <answer>" lines to workstream-context.md but
-> never RETROACTIVELY cleared the original lines 152-157 records.
-> Per the Forge rule documented at the top of every iteration prompt
-> (*"Do not treat it as a transcript or edit it"*) the agent
-> CANNOT directly modify `.forge/memory/workstream-context.md` lines
-> 152-157; only the operator-side reconciler / wizard can perform
-> that edit. Therefore iter 68 OMITS the `open-questions` JSON block
-> entirely (per the explicit rule *"Omit the block entirely when you
-> have no questions"*) since this file has no remaining ambiguity at
-> the doc level. The dedup table in 0.1.2 makes the doc-side
-> commitment unambiguous; the workstream-context dedup is the
-> operator's action item, tracked as a DEFERRED entry in the
-> Iteration Summary so the orchestrator can route the request to
-> manual reconciler intervention or to a `stalled-no-convergence`
-> exit per the convergence-detector rule (three consecutive iters
-> with the same checkbox flipping back to unchecked).
+> **Iter 69 retraction of iter-67's dedup-marker IDs.** Iter 67 emitted
+> three custom IDs (`phase1-compose-existing-vs-new-dedup`,
+> `phase1-compose-standalone-vs-include-dedup`,
+> `phase6-pwsh-install-vs-skip-vs-defer-dedup`) in an attempt to give
+> the wizard a 1:1 ID-level handle on each stale record. Iter 68's
+> evaluator feedback then noted that those three custom IDs created
+> THREE NEW UNANSWERED records at workstream-context lines 168/170/172
+> -- because the operator-answers section of the iteration prompt only
+> binds answers to the two canonical IDs (`phase1-compose-path` and
+> `phase6-ci-install-pwsh`); any other ID I emit will sit UNANSWERED
+> indefinitely. Iter 68 then OMITTED the block entirely, but the
+> evaluator confirmed the original UNANSWERED records persist anyway
+> because the agent CANNOT directly edit `.forge/memory/workstream-context.md`
+> per the Forge rule documented at the top of every iteration prompt
+> (*"Do not treat it as a transcript or edit it"*). Iter 69 therefore
+> adopts a third structural posture: emit ONLY the two canonical IDs
+> the operator actually pins, do NOT introduce any non-canonical IDs,
+> and accept that retroactively clearing lines 152-157 + 168/170/172
+> is an operator-side reconciler action that this doc cannot perform.
+> The convergence-detector rule (three consecutive iters with the same
+> checkbox flipping back to unchecked) is now applicable: iter 67,
+> 68, and 69 each tried a structurally different shape (5 IDs, 0 IDs,
+> 2 IDs); the gate remaining active across all three structurally
+> distinct attempts is the orchestrator's signal to exit with
+> `stalled-no-convergence` and escalate to manual reconciler intervention
+> or operator-pin restart, NOT a signal for iter 70 to invent a fourth
+> permutation. The DEFERRED entry in the iter 69 prior-feedback
+> resolution block carries this rationale forward.
 
 ### 0.2 Notation conventions
 

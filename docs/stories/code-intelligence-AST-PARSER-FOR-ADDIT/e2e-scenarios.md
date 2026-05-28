@@ -97,16 +97,28 @@ both the legacy framing and the canonical confirmation framing.
 | 154-155            | `phase1-compose-standalone-vs-include-dedup`            | "Phase 1's only postgres dependency is the 0022 migration probe; should the e2e compose file at tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml be a standalone ..."  | `confirm-create-new-standalone-postgres-only-as-doc-shows`         |
 | 156-157            | `phase6-pwsh-install-vs-skip-vs-defer-dedup`            | "Phase 6 PowerShell scenarios currently skip on the hosted ubuntu-latest runner because .github/workflows/agent-memory-ci.yml has no pwsh install step. Should this story add ..."  | `confirm-keep-skip-posture-defer-pwsh-install-to-followup-story`   |
 
-> The three dedup-marker IDs above are new for iter 67. Prior
-> iterations (iter 11 through iter 66, all `sloppy`) emitted only the
-> two confirmation IDs `phase1-compose-path` and
-> `phase6-ci-install-pwsh`, which matched the lines 158-161
-> confirmation records but did not dedup the lines 152-157 stale
-> records. This iteration's structurally-different approach is to
-> emit FIVE IDs (the two confirmation IDs plus the three dedup-marker
-> IDs), each carrying the operator's confirmation slug as the first
-> choice, so the wizard can attribute the same answer against both
-> framings and clear the lines 152-157 records as well.
+> The three dedup-marker IDs above were introduced in iter 67. Iter 68
+> takes a different structural approach after iter 67's feedback noted
+> *"the later duplicate confirmations at lines 158-165 do not remove
+> those unanswered records, so the gate remains active"*: every prior
+> attempt (iter 11 through iter 67, all `sloppy`) emitted SOME shape of
+> the `open-questions` JSON block, and the operator's responses
+> APPENDED new "Q: ... A: <answer>" lines to workstream-context.md but
+> never RETROACTIVELY cleared the original lines 152-157 records.
+> Per the Forge rule documented at the top of every iteration prompt
+> (*"Do not treat it as a transcript or edit it"*) the agent
+> CANNOT directly modify `.forge/memory/workstream-context.md` lines
+> 152-157; only the operator-side reconciler / wizard can perform
+> that edit. Therefore iter 68 OMITS the `open-questions` JSON block
+> entirely (per the explicit rule *"Omit the block entirely when you
+> have no questions"*) since this file has no remaining ambiguity at
+> the doc level. The dedup table in 0.1.2 makes the doc-side
+> commitment unambiguous; the workstream-context dedup is the
+> operator's action item, tracked as a DEFERRED entry in the
+> Iteration Summary so the orchestrator can route the request to
+> manual reconciler intervention or to a `stalled-no-convergence`
+> exit per the convergence-detector rule (three consecutive iters
+> with the same checkbox flipping back to unchecked).
 
 ### 0.2 Notation conventions
 

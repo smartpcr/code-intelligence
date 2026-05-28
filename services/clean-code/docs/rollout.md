@@ -5,6 +5,102 @@ production-tier environment. The instructions assume Postgres
 14+ is already running and the `clean_code_*` roles have been
 created via the `0004_roles.up.sql` migration.
 
+## Stage 9.1: Audit WAL frame writer
+
+This subsection captures the rollout sequence for the
+`internal/audit/wal/` package -- the per-process WAL writer
+scoped EXCLUSIVELY to the three Audit tables
+(`evaluation_run`, `evaluation_verdict`, `finding`).
+Architecture Sec 7.10 / tech-spec Sec 4.13.
+
+### What's new
+
+1. **`internal/audit/wal/` package** -- `Writer`, `TxBatch`,
+   `Signer`, `AuditFrame`, `ReadAll`/`ReadPartition`,
+   `MaxFrameSize = 1<<20`, and the
+   `ErrTrailingPartialFrame` / `ErrFrameSizeExceeded`
+   sentinel taxonomy.
+2. **WAL writer wired into the two audit-write Stores** --
+   `rule_engine.SQLStore` (happy-path
+   run + verdict + findings triple) and
+   `evaluator.SQLDegradedRunStore` (the gate's
+   samples-pending / policy-signature-invalid /
+   xrepo-edges-unavailable short-circuits). Both writers
+   stage WAL frames in a per-tx batch and call
+   `batch.Commit(ctx)` BEFORE `tx.Commit()`.
+3. **Conformance enforcement** -- `test/conformance/wal_scope_test.go`
+   pins the closed allow-list of importers.
+
+### What is NOT in Stage 9.1
+
+The Stage 9.2 brief covers the **reconciler** (replay of
+speculative frames against PostgreSQL keyed on
+`(table, row_pk)`, signature verification via the policy KMS
+handle, quarantine of unverifiable frames). Stage 9.1 stops
+at the writer; reconciler enablement is deferred.
+
+### Pre-rollout: provision the WAL volume
+
+1. Pick a dedicated mount for `data/wal/audit/` with at least
+   2 GiB free (per-process). The writer creates the
+   directory at startup with mode `0o755` -- the parent
+   must be writable by the binary's user.
+2. Set the env knob (composition root reads it during
+   wiring): `CLEAN_CODE_AUDIT_WAL_DIR=/srv/clean-code/data/wal/audit`.
+3. Mount the volume with `data=ordered` (ext4) or
+   `data_journal=writeback` is NOT sufficient -- the WAL
+   contract depends on `fsync(2)` durability semantics
+   typical of `data=ordered` and `xfs` defaults.
+
+### Pre-rollout: confirm KMS access
+
+The writer's `Signer` is wired in the composition root to
+the same `policy/keys` shim the policy-publication path
+uses. Stage 9.1 production deployments MUST verify the
+process has KMS access at startup; an unwired or unreachable
+KMS handle causes `NewWriter` to return an error and the
+binary refuses to start.
+
+### Pre-rollout: confirm role grants
+
+Audit table INSERTs are made by the existing
+`clean_code_evaluator` (degraded path) and
+`clean_code_solid_batch` (happy path) roles. Stage 9.1 does
+NOT add a new role; the WAL writes are local-disk only.
+A future migration may add `clean_code_wal_reconciler` for
+the Stage 9.2 replay path.
+
+### Cutover
+
+1. **Deploy the new binary** with the audit WAL volume
+   mounted and `CLEAN_CODE_AUDIT_WAL_DIR` set. The
+   composition root will wire the writer; absent the env
+   var the writer falls back to `data/wal/audit/` under
+   the binary's cwd.
+2. **Tail the WAL volume** for the first 5 minutes of
+   production traffic. Expect at most one partition file
+   per UTC day. Per-frame size is well under the 1 MiB cap
+   for typical finding rows; a `frame_size_exceeded`
+   error in the binary logs indicates a malformed audit
+   row (the SQL transaction will have rolled back, so
+   PostgreSQL is uncorrupted).
+3. **Confirm SQL writes still succeed** -- WAL fsync
+   failures cause the SQL transaction to roll back. If
+   the WAL volume is misconfigured (read-only mount,
+   wrong owner), audit writes will hard-fail with
+   `WAL flush before SQL commit` errors. Roll back the
+   deploy and re-verify the volume.
+
+### Roll-back
+
+To disable the WAL mirror at runtime, unset
+`CLEAN_CODE_AUDIT_WAL_DIR` (or set
+`CLEAN_CODE_AUDIT_WAL_DISABLED=true` if the composition
+root supports that flag). The two audit Stores transparently
+fall back to SQL-only writes -- no schema change required.
+The on-disk partition files from before the rollback remain
+readable by Stage 9.2's reconciler.
+
 ## Stage 7.1: Cross-Repo Aggregator cadence loop
 
 This subsection captures the rollout sequence for the

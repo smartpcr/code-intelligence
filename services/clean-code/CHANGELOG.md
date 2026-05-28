@@ -4,6 +4,130 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 9.1 -- Audit WAL frame writer
+
+### Iter 1 -- per-process WAL writer scoped EXCLUSIVELY to the Audit sub-store
+
+Adds `internal/audit/wal/` -- a signed, fsync-before-SQL-commit
+write-ahead log scoped EXCLUSIVELY to the three Audit tables
+(`evaluation_run`, `evaluation_verdict`, `finding`). Catalog,
+Measurement, Policy, and Refactor writes do NOT route through
+this WAL (architecture Sec 7.10 / tech-spec Sec 4.13).
+
+What landed:
+
+- `internal/audit/wal/types.go` -- `AuditFrame{frame_id, table,
+  op, row_pk, row_json, written_at, signing_key_id, signature}`,
+  closed-set `Table` / `Op` enums, `Validate()`, canonical
+  `SigningPayload()` (`audit-wal-v1\n` domain prefix +
+  unsigned-frame JSON), sentinel errors.
+- `internal/audit/wal/signer.go` -- `Signer` interface with
+  callback semantics (the keyID is hashed INTO the canonical
+  bytes BEFORE signing, so signature recomputation succeeds for
+  any production signer that returns a non-zero key id).
+  `NoopSigner` + `NoopVerify` SHA-256 stand-in for tests.
+- `internal/audit/wal/writer.go` -- `Writer` (concurrent-safe,
+  per-partition mutex serialises append+fsync), `WriterConfig`,
+  `NewWriter`, `NewFrame` (with write-time size cap matching
+  the reader's `MaxFrameSize`), `NewTxBatch` (per-tx single-use
+  staging batch), `TxBatch{Stage, StageNew, Commit, Cancel,
+  Len}`, `flush`, `encodeFrames`, `appendAndSync`. The
+  syncFile / syncDir seams are package-level vars so tests can
+  inject ENOSPC-style failures and assert the honest
+  four-state atomicity contract.
+- `internal/audit/wal/read.go` -- `ReadPartition`, `ReadAll`,
+  `isPartitionFile`, `readFrames`, `MaxFrameSize` (1 MiB),
+  `ErrTrailingPartialFrame`, `ErrFrameSizeExceeded`.
+  Trailing-partial preserves prior partitions' complete frames;
+  oversized lines surface as the dangerous sentinel BEFORE the
+  benign partial-frame check so a huge unterminated tail
+  cannot masquerade as a benign crash artifact.
+- `internal/audit/wal/writer_test.go` -- ~30 unit tests
+  covering dep validation, frame validation sweep, signer
+  round-trip with non-nil keyID, stage/commit happy path,
+  cancel-no-disk, finalised-twice, four-state atomicity matrix
+  (validation failure / WAL fsync failure / SQL commit failure
+  / happy path), concurrent commits, partition naming,
+  RoundTrip preserves bytes, encodeFrames newline-delimited,
+  NoopSigner empty-payload reject, KeyID-in-payload non-nil,
+  AppendAndSync sync-failure leaves bytes, TxBatch.Commit
+  sync-failure rollback, trailing-partial frame preservation,
+  ReadAll preserves across partial tail, FrameSizeExceeded,
+  OversizedUnterminatedTail, NewFrame rejects oversized
+  RowJSON, NewFrame accepts large-but-under-cap, encodeFrames
+  rejects oversized hand-crafted frame.
+
+Audit-writer wiring (Stage 9.1 audit-write call sites only):
+
+- `internal/rule_engine/wal_rows.go` + `wal_rows_test.go` --
+  snake_case, column-keyed JSON shapers
+  (`walEvaluationRunRowJSON`, `walEvaluationVerdictRowJSON`,
+  `walFindingRowJSON`) so the Stage 9.2 reconciler can replay
+  via the same INSERT statements. `scope_id` nullable on
+  evaluation_run, NOT NULL on finding (rejected if zero
+  UUID), `degraded_reason` empty -> JSON null (mirrors
+  `NULLIF($5, '')`), `metric_sample_ids` always JSON array
+  (never null) to match `$9::jsonb` cast.
+- `internal/rule_engine/sql_store.go` -- `SQLStore` gains
+  optional `walWriter *wal.Writer` + `WalWriter` config
+  field. `WithEvaluationLock` allocates a per-tx batch via
+  `walWriter.NewTxBatch()`, passes it through `txStore`,
+  and calls `batch.Commit(ctx)` AFTER `fn` returns
+  successfully but BEFORE `tx.Commit()`. The direct
+  `AppendEvaluation` path mirrors the same lifecycle.
+  `appendEvaluationInTx` accepts a nil-safe
+  `*wal.TxBatch`; after each INSERT it stages the
+  corresponding frame.
+- `internal/rule_engine/tx_store.go` -- `txStore` gains
+  `walBatch *wal.TxBatch` and forwards it to
+  `appendEvaluationInTx`.
+- `internal/evaluator/wal_rows.go` + `wal_rows_test.go` --
+  degraded-path row shapers (`walDegradedRunRowJSON` with
+  hard-coded `caller="eval_gate"`, `walDegradedVerdictRowJSON`
+  with required non-empty `degraded_reason`).
+- `internal/evaluator/sql_degraded_store.go` --
+  `SQLDegradedRunStore` gains optional `walWriter`. The
+  degraded-path tx allocates a batch, stages run + verdict
+  frames, calls `batch.Commit(ctx)` immediately before
+  `tx.Commit()`.
+
+Conformance:
+
+- `test/conformance/wal_scope_test.go` -- import-graph linter
+  walks `go list -deps -json` and asserts only the allow-list
+  packages import `internal/audit/wal`: the wal package
+  itself, evaluator, rule_engine, composition, the two
+  binaries (`cmd/clean-code-eval-gate`,
+  `cmd/clean-code-gateway`), and test/conformance. A new
+  importer is a brief-level design change, not a PR-level
+  decision.
+
+Honest atomicity contract: the writer writes bytes BEFORE
+fsync, so a successful `write(2)` followed by a failing
+`fsync(2)` leaves the bytes readable on disk. The writer
+does NOT truncate-back -- that pattern is racy against a
+sibling writer that has already appended past the failure
+point. The Stage 9.2 reconciler closes the loop by replaying
+speculative frames idempotently keyed on `(table, row_pk)`.
+Tests `TestAppendAndSync_SyncFailure_LeavesBytesOnDisk` and
+`TestTxBatch_Commit_SyncFailure_TxRollback` pin this
+behaviour against future "fix" attempts.
+
+Baseline build issues fixed in passing (NOT in scope for this
+brief but necessary for `go build ./...` to exit 0):
+
+- `services/clean-code/go.mod`: module name normalised to
+  `github.com/smartpcr/code-intelligence/services/clean-code`
+  (every source file already imports this path; the prior
+  base-branch `forge/services/clean-code` module name didn't
+  match).
+- `services/clean-code/internal/metrics/recipes/pack.go`:
+  replaced 22-line duplicate-decl with 7-line inert stub
+  so `recipe.go` becomes the canonical declaration site.
+- `services/clean-code/internal/aggregator/system_tier.go`
+  + `services/clean-code/test/e2e/code-intelligence-CLEAN-CODE/cross_repo_aggregator_system_tier_metric_composer_steps.go`:
+  import path fixes to match the normalised module name.
+
 ## Stage 7.2 -- System tier metric composer
 
 ### Iter 10 -- operator-recovery acknowledgement (no code changes)

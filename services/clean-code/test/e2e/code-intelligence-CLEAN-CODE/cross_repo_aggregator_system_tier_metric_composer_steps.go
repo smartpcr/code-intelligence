@@ -14,7 +14,7 @@ import (
 	"github.com/cucumber/godog"
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/aggregator"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/aggregator"
 )
 
 // lookupEnv wraps os.LookupEnv for use by requireEnv in the _test.go

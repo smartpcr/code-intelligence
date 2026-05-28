@@ -12,6 +12,7 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/lib/pq"
 
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/dsl"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 )
@@ -55,6 +56,17 @@ type SQLStore struct {
 	// than duplicating the canonical-bytes / signature
 	// round-trip the steward owns.
 	steward *steward.SQLStore
+
+	// walWriter is the optional Audit WAL writer (Stage 9.1
+	// / architecture Sec 7.10). When non-nil EVERY successful
+	// `evaluation_run` + `evaluation_verdict` + `finding`
+	// INSERT this Store performs is mirrored as a signed
+	// WAL frame fsynced BEFORE the SQL transaction commits.
+	// When nil the Store falls back to SQL-only writes; that
+	// path is for tests and deployments that have not yet
+	// enabled the WAL (the rollout pin in
+	// docs/rollout.md Stage 9.1).
+	walWriter *wal.Writer
 }
 
 // SQLStoreConfig configures the production [SQLStore].
@@ -69,6 +81,14 @@ type SQLStoreConfig struct {
 	// Steward is the policy/rule/threshold/override reader.
 	// Required -- the engine cannot evaluate without it.
 	Steward *steward.SQLStore
+	// WalWriter is the optional Audit WAL writer. When
+	// non-nil EVERY audit write this Store performs is
+	// mirrored to the WAL inside the same SQL transaction;
+	// WAL fsync precedes SQL commit (architecture Sec 7.10
+	// + tech-spec Sec 4.13). When nil the Store still works
+	// (SQL-only) so tests and pre-rollout deployments
+	// continue to function without wiring a writer.
+	WalWriter *wal.Writer
 }
 
 // NewSQLStore constructs a production [Store] backed by
@@ -85,7 +105,7 @@ func NewSQLStore(cfg SQLStoreConfig) (*SQLStore, error) {
 	if schema == "" {
 		schema = DefaultSchema
 	}
-	return &SQLStore{db: cfg.DB, schema: schema, steward: cfg.Steward}, nil
+	return &SQLStore{db: cfg.DB, schema: schema, steward: cfg.Steward, walWriter: cfg.WalWriter}, nil
 }
 
 // qualify quotes the schema identifier and joins it with
@@ -425,8 +445,35 @@ func (s *SQLStore) WithEvaluationLock(ctx context.Context, repoID uuid.UUID, sha
 		return fmt.Errorf("rule_engine: SQLStore.WithEvaluationLock: acquire advisory lock: %w", err)
 	}
 
-	if err := fn(&txStore{tx: tx, schema: s.schema, steward: s.steward}); err != nil {
+	// Allocate the per-transaction WAL batch (if WAL is
+	// wired). The batch is finalised either by
+	// `batch.Commit(ctx)` -- the happy path immediately
+	// before `tx.Commit()` -- OR by the deferred
+	// `batch.Cancel()` on every error / panic path. After
+	// either finalisation the batch returns
+	// [wal.ErrBatchClosed] on further use, so the txStore
+	// retains a safe-to-discard reference.
+	var walBatch *wal.TxBatch
+	if s.walWriter != nil {
+		walBatch = s.walWriter.NewTxBatch()
+		defer walBatch.Cancel()
+	}
+
+	if err := fn(&txStore{tx: tx, schema: s.schema, steward: s.steward, walBatch: walBatch}); err != nil {
 		return err
+	}
+
+	// WAL fsync MUST precede SQL commit so a sync-failure
+	// causes the SQL tx to roll back (architecture Sec 7.1
+	// honest four-state contract). On a successful WAL
+	// flush the SQL commit follows; if PG itself fails the
+	// commit the WAL frame is still on disk and the
+	// reconciler will replay the missing row idempotently
+	// (Stage 9.2).
+	if walBatch != nil {
+		if err := walBatch.Commit(ctx); err != nil {
+			return fmt.Errorf("rule_engine: SQLStore.WithEvaluationLock: WAL flush before SQL commit: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -509,8 +556,18 @@ func (s *SQLStore) AppendEvaluation(ctx context.Context, run EvaluationRun, verd
 			_ = tx.Rollback()
 		}
 	}()
-	if err := appendEvaluationInTx(ctx, tx, s.schema, run, verdict, findings); err != nil {
+	var walBatch *wal.TxBatch
+	if s.walWriter != nil {
+		walBatch = s.walWriter.NewTxBatch()
+		defer walBatch.Cancel()
+	}
+	if err := appendEvaluationInTx(ctx, tx, s.schema, run, verdict, findings, walBatch); err != nil {
 		return err
+	}
+	if walBatch != nil {
+		if err := walBatch.Commit(ctx); err != nil {
+			return fmt.Errorf("rule_engine: SQLStore.AppendEvaluation: WAL flush before SQL commit: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("rule_engine: SQLStore.AppendEvaluation: commit: %w", err)
@@ -599,7 +656,16 @@ func scanFindingRow(r rowScanner) (Finding, error) {
 // appendEvaluationInTx is the shared body used by both
 // [SQLStore.AppendEvaluation] (auto-committing) and the
 // txStore variant invoked under WithEvaluationLock.
-func appendEvaluationInTx(ctx context.Context, tx *sql.Tx, schema string, run EvaluationRun, verdict EvaluationVerdict, findings []Finding) error {
+//
+// When `walBatch` is non-nil, EVERY row INSERTed here is
+// mirrored as a signed WAL frame staged in the batch
+// (architecture Sec 7.10 + tech-spec Sec 4.13). The batch's
+// `Commit(ctx)` is the caller's responsibility -- it MUST
+// be called AFTER this function returns successfully but
+// BEFORE `tx.Commit()` so WAL fsync precedes SQL commit.
+// A nil batch disables the mirror (tests + pre-rollout
+// deployments).
+func appendEvaluationInTx(ctx context.Context, tx *sql.Tx, schema string, run EvaluationRun, verdict EvaluationVerdict, findings []Finding, walBatch *wal.TxBatch) error {
 	if run.EvaluationRunID == uuid.Nil {
 		return errors.New("rule_engine: AppendEvaluation: run.EvaluationRunID is the zero uuid")
 	}
@@ -641,6 +707,15 @@ func appendEvaluationInTx(ctx context.Context, tx *sql.Tx, schema string, run Ev
 	); err != nil {
 		return fmt.Errorf("rule_engine: AppendEvaluation: insert evaluation_run: %w", err)
 	}
+	if walBatch != nil {
+		rowJSON, err := walEvaluationRunRowJSON(run)
+		if err != nil {
+			return fmt.Errorf("rule_engine: AppendEvaluation: WAL row shape evaluation_run: %w", err)
+		}
+		if _, err := walBatch.StageNew(ctx, wal.TableEvaluationRun, run.EvaluationRunID, rowJSON); err != nil {
+			return fmt.Errorf("rule_engine: AppendEvaluation: WAL stage evaluation_run: %w", err)
+		}
+	}
 
 	verdictStmt := fmt.Sprintf(
 		`INSERT INTO %s
@@ -657,6 +732,15 @@ func appendEvaluationInTx(ctx context.Context, tx *sql.Tx, schema string, run Ev
 		verdict.CreatedAt.UTC(),
 	); err != nil {
 		return fmt.Errorf("rule_engine: AppendEvaluation: insert evaluation_verdict: %w", err)
+	}
+	if walBatch != nil {
+		rowJSON, err := walEvaluationVerdictRowJSON(verdict)
+		if err != nil {
+			return fmt.Errorf("rule_engine: AppendEvaluation: WAL row shape evaluation_verdict: %w", err)
+		}
+		if _, err := walBatch.StageNew(ctx, wal.TableEvaluationVerdict, verdict.VerdictID, rowJSON); err != nil {
+			return fmt.Errorf("rule_engine: AppendEvaluation: WAL stage evaluation_verdict: %w", err)
+		}
 	}
 
 	if len(findings) == 0 {
@@ -707,6 +791,15 @@ func appendEvaluationInTx(ctx context.Context, tx *sql.Tx, schema string, run Ev
 			f.CreatedAt.UTC(),
 		); err != nil {
 			return fmt.Errorf("rule_engine: AppendEvaluation: insert finding %s: %w", f.FindingID, err)
+		}
+		if walBatch != nil {
+			rowJSON, err := walFindingRowJSON(f)
+			if err != nil {
+				return fmt.Errorf("rule_engine: AppendEvaluation: WAL row shape finding %s: %w", f.FindingID, err)
+			}
+			if _, err := walBatch.StageNew(ctx, wal.TableFinding, f.FindingID, rowJSON); err != nil {
+				return fmt.Errorf("rule_engine: AppendEvaluation: WAL stage finding %s: %w", f.FindingID, err)
+			}
 		}
 	}
 	return nil

@@ -9,6 +9,8 @@ import (
 
 	"github.com/gofrs/uuid"
 	"github.com/lib/pq"
+
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
 )
 
 // SQLDegradedRunStore is the production [DegradedRunStore]
@@ -32,6 +34,16 @@ import (
 type SQLDegradedRunStore struct {
 	db     *sql.DB
 	schema string
+
+	// walWriter is the optional Audit WAL writer (Stage 9.1
+	// / architecture Sec 7.10). When non-nil EVERY degraded
+	// `evaluation_run` + `evaluation_verdict` INSERT this
+	// store performs is mirrored as a signed WAL frame
+	// fsynced BEFORE the SQL transaction commits. When nil
+	// the store falls back to SQL-only writes; that path
+	// is reserved for tests and pre-rollout deployments
+	// (docs/rollout.md Stage 9.1).
+	walWriter *wal.Writer
 }
 
 // SQLDegradedRunStoreConfig configures the production
@@ -46,6 +58,14 @@ type SQLDegradedRunStoreConfig struct {
 	// `"clean_code"` (the canonical CLEAN-CODE schema)
 	// when empty.
 	Schema string
+	// WalWriter is the optional Audit WAL writer. When
+	// non-nil EVERY degraded audit write is mirrored to
+	// the WAL inside the same SQL transaction; WAL fsync
+	// precedes SQL commit (architecture Sec 7.10). When
+	// nil the store still works (SQL-only) so tests and
+	// pre-rollout deployments continue to function
+	// without wiring a writer.
+	WalWriter *wal.Writer
 }
 
 // NewSQLDegradedRunStore wires the production
@@ -59,7 +79,7 @@ func NewSQLDegradedRunStore(cfg SQLDegradedRunStoreConfig) (*SQLDegradedRunStore
 	if schema == "" {
 		schema = "clean_code"
 	}
-	return &SQLDegradedRunStore{db: cfg.DB, schema: schema}, nil
+	return &SQLDegradedRunStore{db: cfg.DB, schema: schema, walWriter: cfg.WalWriter}, nil
 }
 
 // AppendDegradedRun persists the run + verdict pair inside
@@ -132,6 +152,16 @@ func (s *SQLDegradedRunStore) AppendDegradedRun(ctx context.Context, run Degrade
 		_ = tx.Rollback()
 	}()
 
+	// Allocate the per-tx WAL batch (when WAL is wired).
+	// `defer batch.Cancel()` ensures discard on every
+	// error / panic path; `batch.Commit(ctx)` on the
+	// happy path is a no-op for Cancel afterward.
+	var walBatch *wal.TxBatch
+	if s.walWriter != nil {
+		walBatch = s.walWriter.NewTxBatch()
+		defer walBatch.Cancel()
+	}
+
 	createdAt := time.Unix(0, run.CreatedAt).UTC()
 
 	// Iter-8 evaluator feedback #2: the degraded write
@@ -167,6 +197,15 @@ func (s *SQLDegradedRunStore) AppendDegradedRun(ctx context.Context, run Degrade
 	); err != nil {
 		return fmt.Errorf("evaluator: AppendDegradedRun: insert evaluation_run: %w", err)
 	}
+	if walBatch != nil {
+		rowJSON, err := walDegradedRunRowJSON(run)
+		if err != nil {
+			return fmt.Errorf("evaluator: AppendDegradedRun: WAL row shape evaluation_run: %w", err)
+		}
+		if _, err := walBatch.StageNew(ctx, wal.TableEvaluationRun, run.EvaluationRunID, rowJSON); err != nil {
+			return fmt.Errorf("evaluator: AppendDegradedRun: WAL stage evaluation_run: %w", err)
+		}
+	}
 
 	verdictCreatedAt := time.Unix(0, verdict.CreatedAt).UTC()
 	verdictStmt := fmt.Sprintf(
@@ -184,6 +223,26 @@ func (s *SQLDegradedRunStore) AppendDegradedRun(ctx context.Context, run Degrade
 		verdictCreatedAt,
 	); err != nil {
 		return fmt.Errorf("evaluator: AppendDegradedRun: insert evaluation_verdict: %w", err)
+	}
+	if walBatch != nil {
+		rowJSON, err := walDegradedVerdictRowJSON(verdict)
+		if err != nil {
+			return fmt.Errorf("evaluator: AppendDegradedRun: WAL row shape evaluation_verdict: %w", err)
+		}
+		if _, err := walBatch.StageNew(ctx, wal.TableEvaluationVerdict, verdict.VerdictID, rowJSON); err != nil {
+			return fmt.Errorf("evaluator: AppendDegradedRun: WAL stage evaluation_verdict: %w", err)
+		}
+	}
+
+	// WAL fsync MUST precede SQL commit (architecture
+	// Sec 7.1 / honest four-state contract): if the
+	// sync fails the SQL tx rolls back and the
+	// reconciler treats any readable speculative frame
+	// as a replay candidate.
+	if walBatch != nil {
+		if err := walBatch.Commit(ctx); err != nil {
+			return fmt.Errorf("evaluator: AppendDegradedRun: WAL flush before SQL commit: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {

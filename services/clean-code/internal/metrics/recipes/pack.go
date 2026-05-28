@@ -1,22 +1,7 @@
 package recipes
 
-// Pack is the closed enum of MetricSample.pack values.
-type Pack string
-
-// Source is the closed enum of MetricSample.source values.
-type Source string
-
-// Canonical Pack values (architecture Sec 5.2.1).
-const (
-	PackBase     Pack = "base"
-	PackSolid    Pack = "solid"
-	PackIngested Pack = "ingested"
-	PackSystem   Pack = "system"
-)
-
-// Canonical Source values (architecture Sec 5.2.1).
-const (
-	SourceComputed Source = "computed"
-	SourceIngested Source = "ingested"
-	SourceDerived  Source = "derived"
-)
+// Pack and Source enums are defined in recipe.go (with full
+// doc comments). This file is intentionally minimal to avoid
+// duplicate declarations from the prior e2e-merge stage that
+// landed a stub set; the canonical declarations live in
+// recipe.go alongside the helpers that consume them.

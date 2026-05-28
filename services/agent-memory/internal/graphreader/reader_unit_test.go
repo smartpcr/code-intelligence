@@ -52,11 +52,15 @@ func TestValidateNodeKinds(t *testing.T) {
 
 // TestValidateEdgeKinds is the edge-side analogue, ensuring
 // the `edge_kind` ENUM members are exhaustively accepted and
-// novel kinds rejected.
+// novel kinds rejected. The closed set tracks both 0001_enums.sql
+// (the original 9 labels) and 0022_edge_kind_overrides.sql which
+// appends `overrides` per AST-PARSER-FOR-ADDIT architecture §9 R4
+// (Rust trait-method shadow rule).
 func TestValidateEdgeKinds(t *testing.T) {
 	valid := []string{
 		"contains", "imports", "static_calls", "observed_calls",
 		"extends", "implements", "reads", "writes", "renamed_to",
+		"overrides",
 	}
 	if err := validateEdgeKinds(valid); err != nil {
 		t.Fatalf("valid kinds should pass, got %v", err)

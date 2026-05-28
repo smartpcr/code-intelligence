@@ -57,37 +57,31 @@
 --     "monotonically appended" guarantee the golden test
 --     (`test_migrate_test.go::TestUp_appliesEntireStage12_andEveryExpectedObjectExists`)
 --     pins via its ordered slice for `edge_kind`.
--- PostgreSQL 12+ permits `ALTER TYPE ... ADD VALUE` inside a
--- transaction block when the new value is not referenced in the
--- same transaction; the Migrator never references the value
--- itself, so the in-file BEGIN/COMMIT (kept for psql -f
--- ergonomics) is benign.
+-- PostgreSQL 12+ permits `ALTER TYPE ... ADD VALUE` inside the
+-- Migrator's per-migration transaction because the new value is
+-- never referenced inside the same transaction. No in-file
+-- BEGIN/COMMIT is emitted: per the implementation-plan stage
+-- brief, this migration is exactly one executable SQL statement.
 
 -- migrate:up
-BEGIN;
-
 ALTER TYPE edge_kind ADD VALUE 'overrides';
 
-COMMIT;
-
 -- migrate:down
-BEGIN;
-
--- PostgreSQL has no `ALTER TYPE ... DROP VALUE` form, and direct
--- `DELETE FROM pg_enum` requires `allow_system_table_mods=on`
--- which is intentionally off on production clusters. Reverting
--- this migration is therefore a logical no-op at this layer:
--- the Migrator drops the journal row regardless, and the
--- round-trip test
+-- PostgreSQL exposes no `ALTER TYPE ... DROP VALUE` form, and
+-- direct `DELETE FROM pg_enum` requires `allow_system_table_mods
+-- = on` which is intentionally off on production clusters. This
+-- migration is therefore structurally non-invertible by design;
+-- the down section contains zero executable SQL statements. The
+-- Migrator's per-revert transaction still executes this body
+-- (PostgreSQL accepts comment-only command strings as a no-op
+-- and returns CommandComplete) so `m.Down(ctx)` succeeds and the
+-- journal row is removed. The migrations round-trip test
 -- (`test_migrate_test.go::TestRoundTrip_schemaIsByteIdenticalAfterDownUp`)
 -- relies on the reverse-order Down pass reaching migration
--- 0001's `DROP TYPE edge_kind` to clear the entire enum. The
--- subsequent Up re-adds `overrides` via this migration's up
--- block, producing a byte-identical schema fingerprint.
+-- 0001's `DROP TYPE edge_kind`, which clears the entire enum;
+-- the next Up re-adds `overrides` via the up section above,
+-- yielding a byte-identical schema fingerprint.
 -- Operationally, edge-kind retraction is not a supported
 -- workflow: a future "deprecate" migration would document the
 -- label as unused rather than attempt to remove it from the
 -- closed set.
-SELECT 1;
-
-COMMIT;

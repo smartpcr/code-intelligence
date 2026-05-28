@@ -68,14 +68,33 @@ truncates an existing file.
 
 ### Composition wiring
 
-`Wal.Writer` is wired in the composition root and threaded
-into the two audit-write Stores: `rule_engine.SQLStore` via
-`SQLStoreConfig.WalWriter` and `evaluator.SQLDegradedRunStore`
-via `SQLDegradedRunStoreConfig.WalWriter`. Both fields are
-optional; a nil writer disables WAL mirroring (the SQL path
-still works) so existing tests and pre-rollout deployments
-continue to function. The Stage 9.1 rollout enables the
-writer in production; Stage 9.2 layers the reconciler on top.
+`Wal.Writer` is wired in the composition root of both
+`cmd/clean-code-eval-gate/main.go` and
+`cmd/clean-code-gateway/main.go`, and threaded into the
+two audit-write Stores via
+`rule_engine.SQLStoreConfig.WalWriter` and
+`evaluator.SQLDegradedRunStoreConfig.WalWriter`. **Both
+fields are REQUIRED** -- the two constructors error on
+nil, and the composition-root configs
+(`composition.EvalGateConfig.WalWriter`,
+`evaluator.ProductionGateConfig.WalWriter`) likewise
+error on nil. There is NO SQL-only fallback for Audit
+INSERTs in Stage 9.1.
+
+The env var `CLEAN_CODE_AUDIT_WAL_DIR` (default
+`data/wal/audit`) selects the on-disk root; both
+binaries construct a `wal.NewWriter` using
+`wal.NoopSigner` (the cryptographic signer is deferred
+to Stage 9.2, see "Pre-rollout: confirm WAL signer
+scope" in `docs/rollout.md`). Integration tests --
+`internal/rule_engine/sql_store_wal_test.go` and
+`internal/evaluator/sql_degraded_store_wal_test.go` --
+exercise sqlmock + a real `wal.Writer` to prove every
+successful `evaluation_run`, `evaluation_verdict`, and
+`finding` INSERT pairs with a fsynced WAL frame, and
+that a WAL fsync failure rolls back the SQL
+transaction. Stage 9.2 will layer the reconciler on
+top.
 
 ## Stage 7.1 -- Cross-Repo Aggregator cadence loop
 

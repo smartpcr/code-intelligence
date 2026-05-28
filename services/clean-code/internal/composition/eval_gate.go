@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/evaluator"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
@@ -38,6 +39,18 @@ type EvalGateConfig struct {
 	// `policy_signature_invalid`; a production
 	// composition root SHOULD pass a real Signer.
 	Signer steward.Signer
+
+	// WalWriter is the Audit WAL writer (Stage 9.1 /
+	// architecture Sec 7.10). REQUIRED -- every audit
+	// write performed by either the Rule Engine's
+	// `SQLStore.AppendEvaluation` (rule-pass path) OR
+	// the Evaluator's `SQLDegradedRunStore.AppendDegradedRun`
+	// (signature-invalid / samples-pending paths) is
+	// mirrored to this writer inside the same SQL
+	// transaction; WAL fsync precedes SQL commit. The
+	// binary's main reads `CLEAN_CODE_AUDIT_WAL_DIR`,
+	// constructs the writer, and passes it here.
+	WalWriter *wal.Writer
 }
 
 // BuildEvalGate assembles the production
@@ -62,17 +75,20 @@ type EvalGateConfig struct {
 //     (active-policy-resolving canonical path) plus the
 //     Gate.Evaluate admin/replay path.
 //
-// Returns a non-nil error if either DB is nil or any
-// step in the composition fails. A nil Signer is
-// PERMITTED but logged via the supplied logger -- callers
-// that want fail-loud-on-missing-Signer guard at the
-// env-loading step.
+// Returns a non-nil error if either DB / WalWriter is
+// nil or any step in the composition fails. A nil Signer
+// is PERMITTED but logged via the supplied logger --
+// callers that want fail-loud-on-missing-Signer guard at
+// the env-loading step.
 func BuildEvalGate(_ context.Context, cfg EvalGateConfig, logger *slog.Logger) (*evaluator.Gate, error) {
 	if cfg.EvaluatorDB == nil {
 		return nil, fmt.Errorf("BuildEvalGate: EvaluatorDB is nil")
 	}
 	if cfg.SolidBatchDB == nil {
 		return nil, fmt.Errorf("BuildEvalGate: SolidBatchDB is nil")
+	}
+	if cfg.WalWriter == nil {
+		return nil, fmt.Errorf("BuildEvalGate: WalWriter is nil (Stage 9.1: every Audit INSERT MUST be paired with a WAL frame fsynced before SQL commit; the binary's main reads CLEAN_CODE_AUDIT_WAL_DIR and constructs the *wal.Writer)")
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -91,8 +107,9 @@ func BuildEvalGate(_ context.Context, cfg EvalGateConfig, logger *slog.Logger) (
 	}
 
 	ruleStore, err := rule_engine.NewSQLStore(rule_engine.SQLStoreConfig{
-		DB:      cfg.SolidBatchDB,
-		Steward: stewardStore,
+		DB:        cfg.SolidBatchDB,
+		Steward:   stewardStore,
+		WalWriter: cfg.WalWriter,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("rule_engine.NewSQLStore: %w", err)
@@ -107,6 +124,7 @@ func BuildEvalGate(_ context.Context, cfg EvalGateConfig, logger *slog.Logger) (
 		Steward:      stew,
 		StewardStore: stewardStore,
 		Engine:       rule_engine.NewEvaluatorAdapter(engine),
+		WalWriter:    cfg.WalWriter,
 		// KeyManager intentionally nil -- the legacy
 		// signature-bundle Gate.VerifyPolicy surface is
 		// not the focus here. Gate.Evaluate uses its

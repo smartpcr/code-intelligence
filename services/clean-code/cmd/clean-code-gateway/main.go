@@ -123,6 +123,7 @@ import (
 	_ "github.com/lib/pq"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/api"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/composition"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
@@ -198,6 +199,14 @@ const (
 	envEvaluatorPGURL  = "CLEAN_CODE_EVALUATOR_PG_URL"
 	envSolidBatchPGURL = "CLEAN_CODE_SOLID_BATCH_PG_URL"
 
+	// envAuditWALDir is the canonical Audit WAL partition
+	// root (Stage 9.1 / architecture Sec 7.10). The gateway
+	// reads it ONLY when eval.gate is being wired (both
+	// PG URLs present). Defaults to [defaultAuditWALDir]
+	// when unset; production deployments override to point
+	// at a durable volume.
+	envAuditWALDir = "CLEAN_CODE_AUDIT_WAL_DIR"
+
 	// envKMSProvider / envKMSMasterKeyHex configure the
 	// signing-key Manager that backs the
 	// `policy.keys.list_active` reader AND the
@@ -216,6 +225,7 @@ const (
 	defaultPort            = "8082"
 	defaultShutdownSeconds = 30
 	defaultAuthMode        = authModeOIDC
+	defaultAuditWALDir     = "data/wal/audit"
 	authModeOIDC           = "oidc"
 	authModeDevHMAC        = "dev-hmac"
 	pingAttempts           = 30
@@ -359,6 +369,7 @@ type gatewayConfig struct {
 	WebhookSecret   string
 	KMSProvider     string
 	KMSMasterKeyHex string
+	AuditWALDir     string
 	ShutdownTimeout time.Duration
 }
 
@@ -382,6 +393,7 @@ func loadGatewayConfig() (gatewayConfig, error) {
 		WebhookSecret:   os.Getenv(envWebhookHMACSecret),
 		KMSProvider:     strings.ToLower(os.Getenv(envKMSProvider)),
 		KMSMasterKeyHex: os.Getenv(envKMSMasterKeyHex),
+		AuditWALDir:     envOrDefault(envAuditWALDir, defaultAuditWALDir),
 	}
 	shutdownSecs, err := envSecondsOrDefault(envShutdownTimeoutSeconds, defaultShutdownSeconds)
 	if err != nil {
@@ -681,10 +693,34 @@ func buildProductionDeps(ctx context.Context, cfg gatewayConfig, db *sql.DB, sig
 		if perr := pingDBWithRetry(ctx, solidDB); perr != nil {
 			return api.ProductionWiringDeps{}, closers, fmt.Errorf("pingDBWithRetry(solid_batch): %w", perr)
 		}
+		// Stage 9.1 -- Audit WAL writer (architecture
+		// Sec 7.10 / tech-spec Sec 4.13). REQUIRED by
+		// `composition.BuildEvalGate` because the gate's
+		// rule-pass AND degraded paths now mirror every
+		// audit INSERT to a signed WAL frame fsynced
+		// before SQL commit. The gateway reads
+		// CLEAN_CODE_AUDIT_WAL_DIR (defaults to
+		// `data/wal/audit`) and constructs the writer
+		// here.
+		//
+		// Signer: Stage 9.1 ships with `wal.NoopSigner`
+		// -- the policy-keys-backed signer adapter and
+		// the reconciler that verifies signatures are a
+		// Stage 9.2 concern.
+		walWriter, werr := wal.NewWriter(wal.WriterConfig{
+			Dir:    cfg.AuditWALDir,
+			Signer: wal.NoopSigner{},
+		})
+		if werr != nil {
+			return api.ProductionWiringDeps{}, closers, fmt.Errorf("wal.NewWriter(dir=%s): %w", cfg.AuditWALDir, werr)
+		}
+		logger.Info("gateway: Audit WAL writer wired", "dir", cfg.AuditWALDir, "signer", "NoopSigner (Stage 9.2 wires real KMS-backed signer)")
+
 		gate, gerr := composition.BuildEvalGate(ctx, composition.EvalGateConfig{
 			EvaluatorDB:  evalDB,
 			SolidBatchDB: solidDB,
 			Signer:       stewardSigner,
+			WalWriter:    walWriter,
 		}, logger)
 		if gerr != nil {
 			return api.ProductionWiringDeps{}, closers, fmt.Errorf("composition.BuildEvalGate: %w", gerr)

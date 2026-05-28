@@ -105,6 +105,28 @@ func TestBuildEvalGate_RejectsNilSolidBatchDB(t *testing.T) {
 	}
 }
 
+// TestBuildEvalGate_RejectsNilWalWriter pins the Stage 9.1
+// brief (iter-2 evaluator item #3): the composition root
+// MUST construct a *wal.Writer rooted at
+// CLEAN_CODE_AUDIT_WAL_DIR and pass it through. A nil
+// WalWriter means the gate's Audit INSERTs would commit
+// without a WAL frame, violating the row+WAL atomicity
+// contract (architecture Sec 7.10 / tech-spec Sec 4.13).
+func TestBuildEvalGate_RejectsNilWalWriter(t *testing.T) {
+	stub := openStubDB(t)
+	defer stub.Close()
+	_, err := BuildEvalGate(context.Background(), EvalGateConfig{
+		EvaluatorDB:  stub,
+		SolidBatchDB: stub,
+	}, nil)
+	if err == nil {
+		t.Fatalf("BuildEvalGate(nil WalWriter): want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "WalWriter") {
+		t.Errorf("error %q: want substring %q", err.Error(), "WalWriter")
+	}
+}
+
 // TestEvalGateHandler_NilGate_Returns503 ensures the
 // helper degrades gracefully when the composition root
 // failed to build the gate but still wired the handler

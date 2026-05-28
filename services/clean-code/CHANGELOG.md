@@ -6,6 +6,81 @@ Newest at the top. Stage references map to
 
 ## Stage 9.1 -- Audit WAL frame writer
 
+### Iter 2 -- WAL writer REQUIRED at constructors + production composition wired
+
+Closes evaluator iter-1 items 1-5: makes the WAL writer
+a hard prerequisite for every Audit-table INSERT path,
+wires it through production composition, and proves the
+contract with sqlmock + real `wal.Writer` integration
+tests.
+
+- `internal/rule_engine/sql_store.go` --
+  `SQLStoreConfig.WalWriter` is now REQUIRED.
+  `NewSQLStore` errors with
+  `"wal writer is required"` when nil; all
+  `if walBatch != nil` nil-guards dropped from
+  `WithEvaluationLock`, `AppendEvaluation`, and
+  `appendEvaluationInTx`. The Audit-write code path can
+  no longer commit SQL-only.
+- `internal/evaluator/sql_degraded_store.go` -- same
+  for `SQLDegradedRunStoreConfig.WalWriter`. The
+  degraded path (`AppendDegradedRun`) emits one
+  `evaluation_run` + one `evaluation_verdict` frame per
+  call, in canonical order, with the SQL transaction
+  rolling back on WAL fsync failure.
+- `internal/evaluator/production_gate.go` --
+  `ProductionGateConfig.WalWriter` field added,
+  threaded to `NewSQLDegradedRunStore`; nil rejected.
+- `internal/composition/eval_gate.go` --
+  `EvalGateConfig.WalWriter` field added, threaded to
+  BOTH `rule_engine.NewSQLStore` and
+  `evaluator.NewProductionGate`; nil rejected.
+  `TestBuildEvalGate_RejectsNilWalWriter` pins this.
+- `cmd/clean-code-eval-gate/main.go` and
+  `cmd/clean-code-gateway/main.go` -- both binaries
+  read `CLEAN_CODE_AUDIT_WAL_DIR` (default
+  `data/wal/audit`), construct a `wal.NewWriter` with
+  `wal.NoopSigner`, and pass it through
+  `composition.BuildEvalGate`. The KMS-backed signer is
+  deferred to Stage 9.2 (the writer's callback signer
+  contract is incompatible with the current
+  `keys.Manager.Sign(ctx, payload)->(keyID, sig)`
+  shape; adapting requires a 2-phase signing flow in
+  `keys.Manager`).
+- `internal/rule_engine/sql_store_wal_test.go` -- NEW.
+  Integration test using `go-sqlmock` + real
+  `wal.Writer` rooted at `t.TempDir()`. Two functions:
+  - `TestSQLStore_AppendEvaluation_EmitsWALFramesAroundEachInsert`:
+    asserts 4 frames (run + verdict + 2 findings) with
+    correct `Table`, `RowPK`, `Op`, and non-empty
+    `Signature` via `wal.ReadAll`.
+  - `TestSQLStore_AppendEvaluation_WALFsyncFailureRollsBackSQL`:
+    `failingSigner` errors during `StageNew`; sqlmock
+    expects `Begin -> Exec(run INSERT) -> Rollback`,
+    proving the SQL transaction NEVER commits when the
+    WAL signer fails.
+- `internal/evaluator/sql_degraded_store_wal_test.go`
+  -- NEW. Mirror of the rule_engine pair for the
+  degraded path. Asserts the run + verdict frame pair
+  AND the `degraded_reason` + `caller='eval_gate'`
+  embedding in `row_json`.
+- `internal/rule_engine/wal_test_helper_test.go`,
+  `internal/evaluator/wal_test_helper_test.go` -- NEW.
+  `newTestWALWriter(t)` helper used by all SQLStore
+  tests; constructs a `NoopSigner`-backed writer rooted
+  at `t.TempDir()`.
+- `internal/composition/composition_test.go` --
+  `TestBuildEvalGate_RejectsNilWalWriter` added.
+- `internal/evaluator/sql_degraded_store_test.go` --
+  `TestNewSQLDegradedRunStore_RejectsNilWalWriter`
+  added.
+- `docs/runbook.md`, `docs/rollout.md` -- Stage 9.1
+  sections corrected to reflect REQUIRED wiring, the
+  `CLEAN_CODE_AUDIT_WAL_DIR` env var, the NoopSigner
+  scope (KMS-backed signer arrives in 9.2), and the
+  removal of the (incorrect) "SQL-only fallback"
+  rollback path.
+
 ### Iter 1 -- per-process WAL writer scoped EXCLUSIVELY to the Audit sub-store
 
 Adds `internal/audit/wal/` -- a signed, fsync-before-SQL-commit

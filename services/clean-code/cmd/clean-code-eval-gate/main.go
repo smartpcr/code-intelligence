@@ -39,11 +39,20 @@ import (
 	"github.com/gofrs/uuid"
 	_ "github.com/lib/pq"
 
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/evaluator"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
 )
+
+// defaultAuditWALDir is the canonical Audit WAL partition
+// root the binary falls back to when CLEAN_CODE_AUDIT_WAL_DIR
+// is unset. Architecture Sec 7.10 / tech-spec Sec 4.13 pin
+// `data/wal/audit/` as the relative path. Production
+// deployments override via the env var to point at a durable
+// volume.
+const defaultAuditWALDir = "data/wal/audit"
 
 // maxRequestBodyBytes caps the JSON body size on both
 // `/v1/eval/gate` and `/v1/eval/replay`. The canonical
@@ -218,6 +227,37 @@ func main() {
 		log.Fatalf("clean-code-eval-gate: steward.New: %v", err)
 	}
 
+	// Stage 9.1 -- Audit WAL writer (architecture Sec
+	// 7.10 / tech-spec Sec 4.13). The writer is REQUIRED
+	// by both `rule_engine.NewSQLStore` and
+	// `evaluator.NewProductionGate`: every successful
+	// `evaluation_run` + `evaluation_verdict` + `finding`
+	// INSERT they perform is mirrored to a signed WAL
+	// frame fsynced BEFORE the SQL transaction commits.
+	// Iter-2 evaluator item #3: this is the production
+	// reading of CLEAN_CODE_AUDIT_WAL_DIR.
+	//
+	// Signer: Stage 9.1 ships with `wal.NoopSigner`
+	// because the policy-keys-backed signer adapter and
+	// the reconciler that verifies signatures are a
+	// Stage 9.2 concern. The frames on disk are still
+	// the canonical AuditFrame shape; the reconciler
+	// will pin the signature contract end-to-end once
+	// wired.
+	walDir := os.Getenv("CLEAN_CODE_AUDIT_WAL_DIR")
+	if walDir == "" {
+		walDir = defaultAuditWALDir
+		log.Printf("clean-code-eval-gate: CLEAN_CODE_AUDIT_WAL_DIR unset; using default %q", walDir)
+	}
+	walWriter, err := wal.NewWriter(wal.WriterConfig{
+		Dir:    walDir,
+		Signer: wal.NoopSigner{},
+	})
+	if err != nil {
+		log.Fatalf("clean-code-eval-gate: wal.NewWriter(dir=%s): %v", walDir, err)
+	}
+	log.Printf("clean-code-eval-gate: Audit WAL writer wired (dir=%s, signer=NoopSigner -- real KMS-backed signer arrives in Stage 9.2)", walDir)
+
 	// rule_engine.SQLStore consumes the solid_batch
 	// handle so the canonical Audit triple is INSERTED
 	// under the `clean_code_solid_batch` grant -- the
@@ -227,8 +267,9 @@ func main() {
 	// evaluator.NewProductionGate (signature-invalid,
 	// samples-pending).
 	ruleStore, err := rule_engine.NewSQLStore(rule_engine.SQLStoreConfig{
-		DB:      solidBatchDB,
-		Steward: stewardStore,
+		DB:        solidBatchDB,
+		Steward:   stewardStore,
+		WalWriter: walWriter,
 	})
 	if err != nil {
 		log.Fatalf("clean-code-eval-gate: rule_engine.NewSQLStore: %v", err)
@@ -251,7 +292,8 @@ func main() {
 		// also re-checks `evaluator.Verdict.IsValid`
 		// before returning, giving us a single
 		// canonical bridge between engine + gate.
-		Engine: rule_engine.NewEvaluatorAdapter(engine),
+		Engine:    rule_engine.NewEvaluatorAdapter(engine),
+		WalWriter: walWriter,
 		// KeyManager intentionally nil: the legacy
 		// signature-bundle [Gate.VerifyPolicy] surface
 		// is not the focus of Stage 5.7. The Evaluate

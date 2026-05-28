@@ -9,6 +9,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 )
@@ -73,6 +74,18 @@ type ProductionGateConfig struct {
 	// [Gate.VerifyPolicy] will return [ErrGateUnwired]
 	// while [Gate.Evaluate] still works.
 	KeyManager *keys.Manager
+
+	// WalWriter is the Audit WAL writer (Stage 9.1 /
+	// architecture Sec 7.10). REQUIRED -- the gate's
+	// degraded short-circuits (signature-invalid,
+	// samples-pending) write `evaluation_run` +
+	// `evaluation_verdict` rows that MUST be mirrored to
+	// the WAL inside the same SQL transaction. The
+	// composition root reads `CLEAN_CODE_AUDIT_WAL_DIR`,
+	// constructs the writer, and passes it here so
+	// [NewSQLDegradedRunStore] receives a non-nil writer
+	// per the brief's "row+WAL atomically" contract.
+	WalWriter *wal.Writer
 }
 
 // stewardPolicyAdapter adapts the steward's SQLStore onto
@@ -183,11 +196,14 @@ func NewProductionGate(cfg ProductionGateConfig) (*Gate, error) {
 	if cfg.Engine == nil {
 		return nil, errors.New("evaluator: NewProductionGate: Engine is required")
 	}
+	if cfg.WalWriter == nil {
+		return nil, errors.New("evaluator: NewProductionGate: WalWriter is required (Stage 9.1: every degraded Audit INSERT MUST be paired with a WAL frame fsynced before SQL commit; supply a *wal.Writer rooted at CLEAN_CODE_AUDIT_WAL_DIR)")
+	}
 	readiness, err := NewSQLSampleReadiness(SQLSampleReadinessConfig{DB: cfg.DB, Schema: cfg.Schema})
 	if err != nil {
 		return nil, fmt.Errorf("evaluator: NewProductionGate: NewSQLSampleReadiness: %w", err)
 	}
-	degraded, err := NewSQLDegradedRunStore(SQLDegradedRunStoreConfig{DB: cfg.DB, Schema: cfg.Schema})
+	degraded, err := NewSQLDegradedRunStore(SQLDegradedRunStoreConfig{DB: cfg.DB, Schema: cfg.Schema, WalWriter: cfg.WalWriter})
 	if err != nil {
 		return nil, fmt.Errorf("evaluator: NewProductionGate: NewSQLDegradedRunStore: %w", err)
 	}

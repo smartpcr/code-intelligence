@@ -764,3 +764,263 @@ func hasAll(haystack []string, want ...string) bool {
 	}
 	return true
 }
+
+// TestMergeLangMeta covers the helper in isolation, separately
+// from the classAttrs/methodAttrs wiring. The first-class-key-
+// wins rule (architecture invariant C11 / Section 4.4.2) is
+// the load-bearing contract for the AST-PARSER-FOR-ADDIT
+// dispatcher: a parser that emits a LangMeta key colliding
+// with a dispatcher first-class key MUST be silently ignored
+// rather than overwrite the dispatcher's value.
+func TestMergeLangMeta(t *testing.T) {
+	t.Run("nil in is a no-op", func(t *testing.T) {
+		out := map[string]any{"language": "go"}
+		mergeLangMeta(out, nil)
+		if len(out) != 1 || out["language"] != "go" {
+			t.Fatalf("nil merge mutated out: %#v", out)
+		}
+	})
+
+	t.Run("empty non-nil in is a no-op", func(t *testing.T) {
+		out := map[string]any{"language": "go"}
+		mergeLangMeta(out, map[string]any{})
+		if len(out) != 1 || out["language"] != "go" {
+			t.Fatalf("empty merge mutated out: %#v", out)
+		}
+	})
+
+	t.Run("new keys are added", func(t *testing.T) {
+		out := map[string]any{"language": "go"}
+		mergeLangMeta(out, map[string]any{
+			"receiver":     "*Foo",
+			"receiver_ptr": true,
+		})
+		if out["receiver"] != "*Foo" {
+			t.Errorf("receiver = %v; want *Foo", out["receiver"])
+		}
+		if out["receiver_ptr"] != true {
+			t.Errorf("receiver_ptr = %v; want true", out["receiver_ptr"])
+		}
+		if out["language"] != "go" {
+			t.Errorf("language clobbered: %v", out["language"])
+		}
+	})
+
+	t.Run("first-class key wins on collision", func(t *testing.T) {
+		out := map[string]any{
+			"language":   "go",
+			"start_line": 10,
+		}
+		mergeLangMeta(out, map[string]any{
+			"language":   "typescript", // collides; must be dropped
+			"start_line": 999,           // collides; must be dropped
+			"namespace":  "foo.bar",     // non-colliding; must land
+		})
+		if out["language"] != "go" {
+			t.Errorf("language = %v; want go (first-class must win)", out["language"])
+		}
+		if out["start_line"] != 10 {
+			t.Errorf("start_line = %v; want 10 (first-class must win)", out["start_line"])
+		}
+		if out["namespace"] != "foo.bar" {
+			t.Errorf("namespace = %v; want foo.bar (non-colliding key must merge)", out["namespace"])
+		}
+	})
+
+	t.Run("first-class key with nil value still wins", func(t *testing.T) {
+		// `_, exists := out[k]` distinguishes "absent" from
+		// "present with nil value". A first-class attr that
+		// the dispatcher intentionally set to nil MUST NOT be
+		// overwritten by LangMeta.
+		out := map[string]any{"extends_raw": nil}
+		mergeLangMeta(out, map[string]any{"extends_raw": []string{"BadBase"}})
+		if out["extends_raw"] != nil {
+			t.Errorf("extends_raw = %v; want nil (presence, not value, wins)", out["extends_raw"])
+		}
+	})
+
+	t.Run("nested slice and map values pass through by reference", func(t *testing.T) {
+		// Documents the shallow-copy contract: parsers that
+		// mutate a slice/map they put into LangMeta AFTER the
+		// merge will see the change leak into the dispatcher's
+		// attrs map. This is acceptable because mustJSON runs
+		// immediately and the dispatcher discards the merged
+		// map afterwards.
+		nested := []string{"a", "b"}
+		out := map[string]any{}
+		mergeLangMeta(out, map[string]any{"trait": nested})
+		got, ok := out["trait"].([]string)
+		if !ok {
+			t.Fatalf("trait = %T; want []string", out["trait"])
+		}
+		if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+			t.Errorf("trait = %v; want [a b]", got)
+		}
+	})
+}
+
+// TestClassAttrs_MergesLangMetaAfterFirstClassKeys pins the
+// wiring: the helper MUST run AFTER all optional first-class
+// keys (extends_raw, implements_raw) are populated, so a
+// LangMeta key that collides with an optional first-class key
+// is dropped rather than silently shadowed by the dispatcher's
+// later write. The brief is explicit: "immediately before
+// mustJSON" -- no first-class write may happen afterwards.
+func TestClassAttrs_MergesLangMetaAfterFirstClassKeys(t *testing.T) {
+	c := ClassDecl{
+		QualifiedName: "Foo",
+		Kind:          "class",
+		Extends:       []string{"RealBase"},
+		Implements:    []string{"Iface"},
+		StartLine:     10,
+		EndLine:       20,
+		LangMeta: map[string]any{
+			// Collides with mandatory first-class key.
+			"language": "wrong",
+			// Collides with optional first-class key populated
+			// from c.Extends. The merge runs AFTER extends_raw
+			// is written, so the LangMeta value MUST lose.
+			"extends_raw": []string{"FakeBase"},
+			// Non-colliding per-language keys.
+			"namespace": "foo.bar",
+			"partial":   true,
+		},
+	}
+	raw := classAttrs("csharp", c)
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal classAttrs: %v", err)
+	}
+	if got["language"] != "csharp" {
+		t.Errorf("language = %v; want csharp (first-class must win)", got["language"])
+	}
+	if got["namespace"] != "foo.bar" {
+		t.Errorf("namespace = %v; want foo.bar (LangMeta must merge non-colliding keys)", got["namespace"])
+	}
+	if got["partial"] != true {
+		t.Errorf("partial = %v; want true (LangMeta bool must round-trip)", got["partial"])
+	}
+	extends, ok := got["extends_raw"].([]any)
+	if !ok {
+		t.Fatalf("extends_raw = %T; want []any", got["extends_raw"])
+	}
+	if len(extends) != 1 || extends[0] != "RealBase" {
+		t.Errorf("extends_raw = %v; want [RealBase] (first-class optional key must win over LangMeta)", extends)
+	}
+}
+
+// TestClassAttrs_NilLangMetaIsByteIdenticalToPreHelperWorld
+// pins the "TS/JS/Python baseline pays nothing" guarantee
+// from the field doc: a parser that leaves LangMeta nil MUST
+// produce exactly the same attrs JSON keys as before the
+// helper landed.
+func TestClassAttrs_NilLangMetaIsByteIdenticalToPreHelperWorld(t *testing.T) {
+	c := ClassDecl{
+		QualifiedName: "Foo",
+		Kind:          "class",
+		StartLine:     1,
+		EndLine:       5,
+		// LangMeta intentionally left nil.
+	}
+	raw := classAttrs("typescript", c)
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal classAttrs: %v", err)
+	}
+	// Exactly the four mandatory keys, nothing else.
+	want := map[string]any{
+		"language":   "typescript",
+		"decl_kind":  "class",
+		"start_line": float64(1),
+		"end_line":   float64(5),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("classAttrs keys = %v; want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("classAttrs[%q] = %v; want %v", k, got[k], v)
+		}
+	}
+}
+
+// TestMethodAttrs_MergesLangMetaAfterFirstClassKeys mirrors
+// the class test for methods. Includes a calls_raw collision
+// because that's the method-side optional first-class key
+// most likely to collide with parser-emitted language data.
+func TestMethodAttrs_MergesLangMetaAfterFirstClassKeys(t *testing.T) {
+	m := MethodDecl{
+		QualifiedName:  "Foo.bar",
+		ParamSignature: "(x int)",
+		EnclosingClass: "Foo",
+		Modifiers:      []string{"static"},
+		Calls:          []string{"helper"},
+		StartLine:      10,
+		EndLine:        20,
+		LangMeta: map[string]any{
+			// Collides with mandatory first-class key.
+			"language": "wrong",
+			// Collides with optional first-class key populated
+			// from m.Calls. The merge runs AFTER calls_raw is
+			// written, so the LangMeta value MUST lose.
+			"calls_raw": []string{"fake_call"},
+			// Non-colliding per-language keys.
+			"receiver":     "*Foo",
+			"receiver_ptr": true,
+		},
+	}
+	raw := methodAttrs("go", m)
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal methodAttrs: %v", err)
+	}
+	if got["language"] != "go" {
+		t.Errorf("language = %v; want go (first-class must win)", got["language"])
+	}
+	if got["receiver"] != "*Foo" {
+		t.Errorf("receiver = %v; want *Foo (LangMeta must merge non-colliding keys)", got["receiver"])
+	}
+	if got["receiver_ptr"] != true {
+		t.Errorf("receiver_ptr = %v; want true (LangMeta bool must round-trip)", got["receiver_ptr"])
+	}
+	calls, ok := got["calls_raw"].([]any)
+	if !ok {
+		t.Fatalf("calls_raw = %T; want []any", got["calls_raw"])
+	}
+	if len(calls) != 1 || calls[0] != "helper" {
+		t.Errorf("calls_raw = %v; want [helper] (first-class optional key must win over LangMeta)", calls)
+	}
+}
+
+// TestMethodAttrs_NilLangMetaIsByteIdenticalToPreHelperWorld
+// mirrors the class baseline test for methods.
+func TestMethodAttrs_NilLangMetaIsByteIdenticalToPreHelperWorld(t *testing.T) {
+	m := MethodDecl{
+		QualifiedName:  "bar",
+		ParamSignature: "()",
+		StartLine:      1,
+		EndLine:        3,
+		// LangMeta intentionally left nil; no EnclosingClass,
+		// Modifiers, or Calls so the optional-key paths are
+		// skipped too.
+	}
+	raw := methodAttrs("typescript", m)
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal methodAttrs: %v", err)
+	}
+	want := map[string]any{
+		"language":   "typescript",
+		"start_line": float64(1),
+		"end_line":   float64(3),
+		"params_raw": "()",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("methodAttrs keys = %v; want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("methodAttrs[%q] = %v; want %v", k, got[k], v)
+		}
+	}
+}

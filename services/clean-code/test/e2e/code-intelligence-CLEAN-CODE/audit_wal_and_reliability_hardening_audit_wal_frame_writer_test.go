@@ -3,11 +3,13 @@
 package e2e
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"fmt"
+	"io/fs"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -60,40 +62,55 @@ func (s *walScopeState) anyCodePathInTheService() error {
 }
 
 func (s *walScopeState) greppingTheWriterCallSites() error {
-	// Use grep/ripgrep to find all Go files that import
-	// internal/audit/wal (excluding the wal package itself and test
-	// helpers inside internal/audit/wal/).
-	cmd := exec.Command("grep", "-rn", "--include=*.go",
-		"internal/audit/wal", s.repoRoot)
-	out, err := cmd.Output()
-	if err != nil {
-		// grep returns exit 1 when no matches — that is acceptable
-		// (no importers means the constraint is trivially satisfied).
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			s.importers = nil
+	// Walk the repo tree looking for .go files that reference
+	// internal/audit/wal.  Pure-Go implementation avoids a dependency
+	// on GNU grep and works on Windows, macOS, and Linux.
+	const needle = "internal/audit/wal"
+
+	err := filepath.WalkDir(s.repoRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip unreadable dirs
+		}
+		if d.IsDir() {
 			return nil
 		}
-		return fmt.Errorf("grep failed: %w", err)
-	}
-
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line == "" {
-			continue
+		if filepath.Ext(path) != ".go" {
+			return nil
 		}
+
+		// Normalise to forward slashes for consistent filtering.
+		normalised := filepath.ToSlash(path)
+
 		// Skip files inside the wal package itself.
-		if strings.Contains(line, "internal/audit/wal/") {
-			continue
+		if strings.Contains(normalised, "internal/audit/wal/") {
+			return nil
 		}
 		// Skip test infrastructure (this file, other e2e helpers).
-		if strings.Contains(line, "test/e2e/") {
-			continue
+		if strings.Contains(normalised, "test/e2e/") {
+			return nil
 		}
-		parts := strings.SplitN(line, ":", 2)
-		site := importSite{file: parts[0]}
-		if len(parts) > 1 {
-			site.line = parts[1]
+
+		f, err := os.Open(path)
+		if err != nil {
+			return nil // skip unreadable files
 		}
-		s.importers = append(s.importers, site)
+		defer f.Close()
+
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.Contains(line, needle) {
+				s.importers = append(s.importers, importSite{
+					file: path,
+					line: line,
+				})
+				break // one hit per file is enough
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("walking repo tree: %w", err)
 	}
 	return nil
 }

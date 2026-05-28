@@ -147,6 +147,20 @@ const (
 	cppNodePreprocElifdef = "preproc_elifdef"
 )
 
+// cppSeenClass tracks an already-emitted ClassDecl for
+// dedupe purposes. `hasBody` records the AST-based
+// determination (from `cppFindBody`) made at the time the
+// entry was inserted -- NOT a heuristic derived from line
+// numbers. A single-line definition like `class Foo {};`
+// has `EndLine == StartLine` but still has a body, so any
+// reasoning about whether the previous entry was a forward
+// declaration must use this flag rather than re-deriving it
+// from the stored ClassDecl's line range.
+type cppSeenClass struct {
+	idx     int
+	hasBody bool
+}
+
 type cppWalker struct {
 	src     []byte
 	classes []ClassDecl
@@ -162,7 +176,7 @@ type cppWalker struct {
 	// the dispatcher tolerates a single ClassDecl per
 	// QualifiedName and a forward decl alone still carries
 	// useful location info.
-	seenClasses map[string]int // qualifiedName -> index in w.classes
+	seenClasses map[string]cppSeenClass // qualifiedName -> entry
 }
 
 // walkTop dispatches the immediate children of a
@@ -171,7 +185,7 @@ type cppWalker struct {
 // prefix, no inherited template parameters.
 func (w *cppWalker) walkTop(root *sitter.Node) {
 	if w.seenClasses == nil {
-		w.seenClasses = map[string]int{}
+		w.seenClasses = map[string]cppSeenClass{}
 	}
 	for i := uint32(0); i < root.NamedChildCount(); i++ {
 		w.visit(root.NamedChild(int(i)), "", "", nil)
@@ -455,11 +469,18 @@ func (w *cppWalker) handleClass(n *sitter.Node, outer, namespace string, templat
 	// body) wins and overwrites it. A second forward decl
 	// after the full def is ignored. A standalone forward
 	// decl (no later body) is kept.
-	if idx, dup := w.seenClasses[qualified]; dup {
-		prev := w.classes[idx]
-		prevHadBody := prev.EndLine > prev.StartLine
-		if hasBody && !prevHadBody {
-			w.classes[idx] = cls
+	//
+	// Both sides of the comparison use the AST-derived
+	// `hasBody` flag (the previous one stashed in
+	// seenClasses at insertion time) rather than deriving
+	// it from line numbers -- a single-line definition like
+	// `class Foo {};` has `EndLine == StartLine` and would
+	// be misidentified as bodyless by a line-range
+	// heuristic.
+	if prev, dup := w.seenClasses[qualified]; dup {
+		if hasBody && !prev.hasBody {
+			w.classes[prev.idx] = cls
+			w.seenClasses[qualified] = cppSeenClass{idx: prev.idx, hasBody: true}
 		}
 		// Whether or not we overwrote, fall through to walk
 		// the body so nested classes still surface.
@@ -468,7 +489,7 @@ func (w *cppWalker) handleClass(n *sitter.Node, outer, namespace string, templat
 		}
 		return
 	}
-	w.seenClasses[qualified] = len(w.classes)
+	w.seenClasses[qualified] = cppSeenClass{idx: len(w.classes), hasBody: hasBody}
 	w.classes = append(w.classes, cls)
 
 	if hasBody {

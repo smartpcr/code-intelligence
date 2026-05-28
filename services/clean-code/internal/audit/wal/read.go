@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -150,6 +151,16 @@ const MaxFrameSize = 1 << 20
 // malformed audit records into the canonical tables, which
 // is worse than failing loudly).
 //
+// The parse is streamed via [bufio.Reader] with the internal
+// buffer sized at [MaxFrameSize]+1 (one frame's content plus
+// its trailing `\n`). Memory cost for the raw read path is
+// therefore O([MaxFrameSize]) regardless of the partition
+// file's on-disk size -- a corrupted or attacker-forged
+// multi-GiB partition cannot OOM the reader the way an
+// `io.ReadAll` over a multi-GiB cap would. (The returned
+// slice of decoded frames still grows with the number of
+// legal frames; only the raw-byte staging buffer is bounded.)
+//
 // Two non-fatal sentinels are surfaced alongside the frames
 // decoded so far:
 //
@@ -161,40 +172,52 @@ const MaxFrameSize = 1 << 20
 //     is reported as oversized rather than as a benign
 //     partial frame.
 func readFrames(r io.Reader) ([]AuditFrame, error) {
-	// Total-file cap: 16 GiB (MaxFrameSize * 2^14). Per-line
-	// cap is enforced below by inspecting the
-	// newline-to-newline distance.
-	buf, err := io.ReadAll(io.LimitReader(r, int64(MaxFrameSize)*int64(1<<14)))
-	if err != nil {
-		return nil, fmt.Errorf("wal: readFrames: read: %w", err)
-	}
+	// Buffer sized to hold one legal frame (MaxFrameSize
+	// content bytes) plus its terminating '\n'. ReadSlice
+	// returns [bufio.ErrBufferFull] as soon as a single
+	// line overruns that budget -- which we surface as
+	// [ErrFrameSizeExceeded] without ever materialising
+	// the oversized line in memory.
+	br := bufio.NewReaderSize(r, MaxFrameSize+1)
 	var out []AuditFrame
-	i := 0
-	for i < len(buf) {
-		j := i
-		for j < len(buf) && buf[j] != '\n' {
-			j++
+	for {
+		line, err := br.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			// Per-frame size cap, terminated form. The
+			// exact byte length is unknown (the reader
+			// stopped scanning once the buffer
+			// saturated), so the error reports the cap
+			// rather than a fabricated size. Fires
+			// BEFORE the trailing-partial branch below
+			// so a huge unterminated tail surfaces as
+			// oversized, not as a benign crash artifact.
+			return out, fmt.Errorf("%w: frame %d exceeds max %d bytes",
+				ErrFrameSizeExceeded, len(out), MaxFrameSize)
 		}
-		// Per-frame size cap. Enforced BEFORE the
-		// trailing-partial check so a huge unterminated
-		// tail surfaces as ErrFrameSizeExceeded, not as
-		// a benign crash artifact.
-		if j-i > MaxFrameSize {
-			return out, fmt.Errorf("%w: frame %d is %d bytes (max %d)",
-				ErrFrameSizeExceeded, len(out), j-i, MaxFrameSize)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("wal: readFrames: read: %w", err)
 		}
-		if j == len(buf) {
-			// No terminating newline -- this is either
-			// an empty tail (i == j == len(buf)) or a
-			// trailing partial frame the writer did not
-			// finish.
-			if j > i {
-				return out, ErrTrailingPartialFrame
-			}
+		if len(line) == 0 {
+			// Clean EOF -- nothing left in the buffer.
 			break
 		}
-		line := buf[i:j]
-		i = j + 1
+		if line[len(line)-1] != '\n' {
+			// Trailing bytes with no terminator. Apply
+			// the per-frame size cap FIRST so an
+			// oversized unterminated tail (one that
+			// happened to fit inside the buffer
+			// because the reader hit EOF before the
+			// buffer-full path could fire) surfaces as
+			// [ErrFrameSizeExceeded] rather than as a
+			// benign trailing-partial marker.
+			if len(line) > MaxFrameSize {
+				return out, fmt.Errorf("%w: frame %d is %d bytes (max %d)",
+					ErrFrameSizeExceeded, len(out), len(line), MaxFrameSize)
+			}
+			return out, ErrTrailingPartialFrame
+		}
+		// Strip the terminating newline.
+		line = line[:len(line)-1]
 		if len(line) == 0 {
 			continue
 		}

@@ -145,6 +145,74 @@ func AnnotateVerbDefaults(ctx context.Context) {
 	)
 }
 
+// AnnotateVerbSpanRepoID overwrites the canonical
+// [AttrRepoID] attribute on the OTel span currently in
+// `ctx`. Composition roots whose verb-span middleware opens
+// the span BEFORE the request body is parsed (the canonical
+// pattern: see [NewVerbSpanMiddleware]) stamp `repo_id=""`
+// at open time so the schema is stable; the downstream
+// handler then calls this helper as soon as the body is
+// parsed and the repo_id is known. Result: every span
+// carries the actual repo_id rather than the open-time
+// placeholder, so dashboards can filter spans by repo
+// without joining onto the audit DB.
+//
+// Stage 9.4 iter-4 hardening: this closes the natural
+// follow-up gap to iter-3's verb-span middleware. The iter-3
+// middleware admits in its own doc-comment that "production
+// handler would overwrite once the body parses"; this helper
+// is the canonical seam by which they do.
+//
+// Safe no-op when:
+//
+//   - `ctx` is nil
+//   - no OTel span is bound to `ctx` (the SDK was not
+//     initialised, or the span was opened by an `api.Tracer`
+//     seam that does not bind to the OTel context)
+//   - `repoID` is the empty string (callers should pre-
+//     validate; we guard defensively so a parse miss does
+//     NOT clobber a previously-stamped value with empty)
+func AnnotateVerbSpanRepoID(ctx context.Context, repoID string) {
+	if ctx == nil || repoID == "" {
+		return
+	}
+	span := trace.SpanFromContext(ctx)
+	if span == nil || !span.IsRecording() {
+		return
+	}
+	span.SetAttributes(attribute.String(AttrRepoID, repoID))
+}
+
+// AnnotateVerbSpanPolicyVersionID overwrites the canonical
+// [AttrPolicyVersionID] attribute on the OTel span currently
+// in `ctx`. The `policy.activate` / `policy.publish` verbs
+// produce or pin a policy_version_id BEFORE the steward call
+// returns; stamping it on the span lets dashboards correlate
+// the activation event with the downstream `eval.gate` spans
+// that ran against the same policy version.
+//
+// Stage 9.4 iter-4 hardening (mirror of
+// [AnnotateVerbSpanRepoID]): the verb middleware stamps
+// `policy_version_id=""` at open time; this helper is the
+// canonical seam handlers call once the value is known.
+//
+// Safe no-op when:
+//
+//   - `ctx` is nil
+//   - no OTel span is bound to `ctx`
+//   - `pvID` is the zero UUID (defensive guard so a parse
+//     miss does not clobber a previously-stamped value)
+func AnnotateVerbSpanPolicyVersionID(ctx context.Context, pvID uuid.UUID) {
+	if ctx == nil || pvID == uuid.Nil {
+		return
+	}
+	span := trace.SpanFromContext(ctx)
+	if span == nil || !span.IsRecording() {
+		return
+	}
+	span.SetAttributes(attribute.String(AttrPolicyVersionID, pvID.String()))
+}
+
 // uuidOrEmpty returns the canonical string form of a uuid
 // or the empty string when the uuid is the zero value. The
 // empty-string projection lets dashboards filter by

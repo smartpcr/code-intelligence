@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/gofrs/uuid"
+
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/telemetry"
 )
 
 // internalErrorClientMessage is the generic, opaque message
@@ -496,6 +498,22 @@ func (r *Router) serveAfterAuth(w http.ResponseWriter, req *http.Request, verb s
 		}
 		r.writeError(w, status, msg, code, verb)
 		return
+	}
+
+	// Stage 9.4 iter-4: the verb-span middleware
+	// (`telemetry.NewVerbSpanMiddleware`) opens the span
+	// with `repo_id=""` because the body has not been
+	// parsed yet. Now that ExtractMetadata succeeded and
+	// the canonical UUID is in hand, overwrite the
+	// open-time placeholder so dashboards can filter spans
+	// by repo without joining onto the audit DB.
+	// AnnotateVerbSpanRepoID is a safe no-op when no OTel
+	// span is bound to the request context (e.g. when the
+	// composition root skipped telemetry.Setup). We also
+	// skip the zero-UUID case so a future verb that doesn't
+	// populate RepoID doesn't stamp the all-zeros string.
+	if metadata.RepoID != uuid.Nil {
+		telemetry.AnnotateVerbSpanRepoID(req.Context(), metadata.RepoID.String())
 	}
 
 	// In-process claim. Two SAME-process retries collapse

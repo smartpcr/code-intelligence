@@ -6,6 +6,84 @@ Newest at the top. Stage references map to
 
 ## Stage 9.4 -- OTel telemetry across all surfaces
 
+### Iter-4 hardening (Stage 9.4)
+
+Iter-3 closed the five evaluator items but the verb-span
+middleware admitted in its own doc-comment that downstream
+handlers are responsible for overwriting the open-time
+`repo_id=""` / `policy_version_id=""` placeholders once they
+parse the request body. No production handler actually did,
+so emitted spans were structurally correct (every key
+present, schema stable) but operationally weak: dashboards
+filtering by `repo_id` would miss every span from the
+metric-ingestor's verb surface. Iter-4 closes that gap:
+
+1. **Two new annotator helpers
+   (`internal/telemetry/attrs.go`)** -- the canonical seam
+   by which handlers overwrite the verb-middleware's open-
+   time placeholders:
+   - `AnnotateVerbSpanRepoID(ctx, repoID string)` -- no-op
+     when ctx is nil, no OTel span is bound, or `repoID` is
+     empty (defensive guard so a parse miss does not
+     clobber a previously-stamped value).
+   - `AnnotateVerbSpanPolicyVersionID(ctx, pvID uuid.UUID)` --
+     no-op when ctx is nil, no OTel span is bound, or
+     `pvID == uuid.Nil`.
+
+2. **Webhook router wires the repo_id annotator
+   (`internal/ingest/webhook/router.go`)** -- right after
+   `handler.ExtractMetadata` produces the parsed
+   `metadata.RepoID`, `serveAfterAuth` calls the annotator.
+   Covers ALL four canonical ingest verbs (`ingest.coverage`,
+   `ingest.test_balance`, `ingest.churn`, `ingest.defects`)
+   in one place since they all flow through the same router
+   entry point.
+
+3. **Four mgmt verb handlers wire the repo_id annotator
+   (`internal/management/`)**:
+   - `mgmt_verbs.go::RetractSample` calls after the
+     `ResolveSample` lookup produces the canonical repo_id
+     for the sample.
+   - `mgmt_verbs.go::Rescan` calls after `uuid.FromString`
+     parses the wire `repo_id`.
+   - `set_mode_verb.go::SetMode` calls after the same parse.
+   - `register_repo_verb.go::RegisterRepo` calls after the
+     store's `RegisterRepo` returns the assigned
+     `res.RepoID` (the only verb that CREATES the repo_id;
+     the others receive it).
+
+4. **`policy.activate` wires the policy_version_id annotator
+   (`internal/management/policy_verbs.go`)** -- right after
+   `uuid.FromString` parses `wire.PolicyVersionID`. Lets
+   dashboards correlate the activation event with
+   downstream `eval.gate` spans bound to the same PVID
+   without joining onto the policy_activation table.
+
+5. **Five new unit tests
+   (`internal/telemetry/attrs_test.go`)** -- pin the
+   annotator contracts:
+   - `TestAnnotateVerbSpanRepoID_OverwritesOpenTimeDefault`
+     drives the full "middleware stamps empty -> handler
+     overwrites with parsed UUID" flow against the OTel
+     SDK's `tracetest.InMemoryExporter` and asserts the
+     exported span carries the LATER value.
+   - `TestAnnotateVerbSpanRepoID_EmptyDoesNotClobber` locks
+     the defensive guard so a future caller passing the
+     empty string cannot regress a previously-stamped
+     value.
+   - `TestAnnotateVerbSpanRepoID_NilCtxIsNoop` covers the
+     nil-context defensive path.
+   - `TestAnnotateVerbSpanPolicyVersionID_OverwritesOpenTimeDefault`
+     mirrors the repo_id test for the PVID helper.
+   - `TestAnnotateVerbSpanPolicyVersionID_ZeroUUIDIsNoop`
+     locks the `uuid.Nil` defensive guard so a parse miss
+     does not stamp the all-zeros UUID string.
+
+Compatibility: the helpers are additive; no existing
+caller's behaviour changes. Handlers that don't call them
+keep the open-time empty defaults, which is the schema
+contract.
+
 ### Iter-3 hardening (Stage 9.4)
 
 The iter-2 review surfaced five new gaps; iter-3 closed each

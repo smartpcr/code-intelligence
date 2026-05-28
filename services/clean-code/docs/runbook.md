@@ -29,9 +29,9 @@ Every verb span carries:
 | attribute | type | source | notes |
 |---|---|---|---|
 | `verb` | string | `internal/api` gateway | canonical dotted verb (`mgmt.register_repo`, `eval.gate`, ...). Stamped BEFORE auth runs (iter-2 fix #3) so 401/403/503 paths emit observable spans too. |
-| `repo_id` | string | request body parse | empty when the verb does not take a repo, the body has not been parsed yet, or the request was rejected by auth/authz before the extractor ran. |
+| `repo_id` | string | request body parse | empty when the verb does not take a repo, the body has not been parsed yet, or the request was rejected by auth/authz before the extractor ran. **Iter-4**: production handlers now call `telemetry.AnnotateVerbSpanRepoID` after parsing the body so the exported span carries the actual UUID rather than the open-time empty placeholder. Wired in the webhook router (covers all 4 ingest verbs) and the 4 mgmt verb handlers (`retract_sample` after sample resolver, `rescan` / `set_mode` after wire parse, `register_repo` after store-assigned UUID). |
 | `caller_subject` | string | verified bearer token `sub` claim | populated AFTER authn succeeds; empty on unauthenticated paths. |
-| `policy_version_id` | string | `evaluator.EvaluateResult.PolicyVersionID` | empty string when the verb does not bind to a policy_version (gateway default for non-eval verbs). |
+| `policy_version_id` | string | `evaluator.EvaluateResult.PolicyVersionID` | empty string when the verb does not bind to a policy_version (gateway default for non-eval verbs). **Iter-4**: `policy.activate` now calls `telemetry.AnnotateVerbSpanPolicyVersionID` after parsing `wire.PolicyVersionID` so dashboards can correlate activation spans with downstream `eval.gate` spans bound to the same PVID. |
 | `degraded` | bool | `EvaluateResult.Degraded` | `false` default on every verb span at gateway entry. |
 | `degraded_reason` | string | `EvaluateResult.DegradedReason` | empty string default; closed enum is `{samples_pending, policy_signature_invalid, xrepo_edges_unavailable}` per architecture Sec 6.1. |
 | `verdict` | string | `EvaluateResult.Verdict` | empty string default; closed enum is `{pass, warn, block}`. Stays empty on auth-rejected paths — the `verdict` enum is INTENTIONALLY DISJOINT from `auth_status`. |

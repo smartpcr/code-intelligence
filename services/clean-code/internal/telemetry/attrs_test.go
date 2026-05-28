@@ -136,3 +136,125 @@ func attrMap(attrs []attribute.KeyValue) map[string]string {
 	}
 	return out
 }
+
+// TestAnnotateVerbSpanRepoID_OverwritesOpenTimeDefault is the
+// Stage 9.4 iter-4 contract test: when the verb-span
+// middleware opens a span with `repo_id=""` and a downstream
+// handler then calls [AnnotateVerbSpanRepoID] with the
+// parsed UUID, the closed span carries the LATER value (not
+// the empty default).
+func TestAnnotateVerbSpanRepoID_OverwritesOpenTimeDefault(t *testing.T) {
+	tp, exporter := newRecordingTracer(t)
+	tracer := tp.Tracer("telemetry-test")
+
+	ctx, span := tracer.Start(context.Background(), "ingest.coverage")
+	// Stamp the canonical open-time empty default just like
+	// NewVerbSpanMiddleware does.
+	span.SetAttributes(attribute.String(AttrRepoID, ""))
+	// Downstream handler parses the body and discovers the
+	// real repo_id.
+	parsedRepoID := uuid.Must(uuid.NewV4()).String()
+	AnnotateVerbSpanRepoID(ctx, parsedRepoID)
+	span.End()
+
+	spans := exporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans; want 1", len(spans))
+	}
+	attrs := attrMap(spans[0].Attributes)
+	if got := attrs[AttrRepoID]; got != parsedRepoID {
+		t.Errorf("attr %s = %q; want %q (overwrite of open-time default)",
+			AttrRepoID, got, parsedRepoID)
+	}
+}
+
+// TestAnnotateVerbSpanRepoID_EmptyDoesNotClobber locks in the
+// defensive guard: if the downstream handler somehow calls
+// the annotator with empty string, a previously-stamped value
+// MUST NOT be clobbered.
+func TestAnnotateVerbSpanRepoID_EmptyDoesNotClobber(t *testing.T) {
+	tp, exporter := newRecordingTracer(t)
+	tracer := tp.Tracer("telemetry-test")
+
+	preExisting := uuid.Must(uuid.NewV4()).String()
+	ctx, span := tracer.Start(context.Background(), "mgmt.rescan")
+	span.SetAttributes(attribute.String(AttrRepoID, preExisting))
+	AnnotateVerbSpanRepoID(ctx, "")
+	span.End()
+
+	spans := exporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans; want 1", len(spans))
+	}
+	attrs := attrMap(spans[0].Attributes)
+	if got := attrs[AttrRepoID]; got != preExisting {
+		t.Errorf("attr %s = %q; want %q (empty-arg must NOT clobber)",
+			AttrRepoID, got, preExisting)
+	}
+}
+
+// TestAnnotateVerbSpanRepoID_NilCtxIsNoop is the same nil-
+// safety contract [AnnotateEvalGateSpan] carries; handlers
+// must be able to call the annotator with any context.
+func TestAnnotateVerbSpanRepoID_NilCtxIsNoop(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("AnnotateVerbSpanRepoID(nil ctx) panicked: %v", r)
+		}
+	}()
+	//nolint:staticcheck // intentionally testing the nil-ctx defensive guard
+	AnnotateVerbSpanRepoID(nil, "anything")
+	AnnotateVerbSpanRepoID(context.TODO(), "anything")
+}
+
+// TestAnnotateVerbSpanPolicyVersionID_OverwritesOpenTimeDefault
+// is the policy.activate mirror of the repo_id contract: the
+// middleware stamps `policy_version_id=""`, the handler
+// overwrites with the parsed UUID, the exported span carries
+// the LATER value.
+func TestAnnotateVerbSpanPolicyVersionID_OverwritesOpenTimeDefault(t *testing.T) {
+	tp, exporter := newRecordingTracer(t)
+	tracer := tp.Tracer("telemetry-test")
+
+	ctx, span := tracer.Start(context.Background(), "policy.activate")
+	span.SetAttributes(attribute.String(AttrPolicyVersionID, ""))
+	parsedPVID := uuid.Must(uuid.NewV4())
+	AnnotateVerbSpanPolicyVersionID(ctx, parsedPVID)
+	span.End()
+
+	spans := exporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans; want 1", len(spans))
+	}
+	attrs := attrMap(spans[0].Attributes)
+	if got := attrs[AttrPolicyVersionID]; got != parsedPVID.String() {
+		t.Errorf("attr %s = %q; want %q (overwrite of open-time default)",
+			AttrPolicyVersionID, got, parsedPVID.String())
+	}
+}
+
+// TestAnnotateVerbSpanPolicyVersionID_ZeroUUIDIsNoop locks in
+// the defensive guard: a zero UUID (the Go zero value of
+// `uuid.UUID`) MUST NOT clobber a previously-stamped value.
+// Prevents a future caller from accidentally stamping the
+// all-zeros UUID string when parsing failed.
+func TestAnnotateVerbSpanPolicyVersionID_ZeroUUIDIsNoop(t *testing.T) {
+	tp, exporter := newRecordingTracer(t)
+	tracer := tp.Tracer("telemetry-test")
+
+	preExisting := uuid.Must(uuid.NewV4())
+	ctx, span := tracer.Start(context.Background(), "policy.activate")
+	span.SetAttributes(attribute.String(AttrPolicyVersionID, preExisting.String()))
+	AnnotateVerbSpanPolicyVersionID(ctx, uuid.Nil)
+	span.End()
+
+	spans := exporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans; want 1", len(spans))
+	}
+	attrs := attrMap(spans[0].Attributes)
+	if got := attrs[AttrPolicyVersionID]; got != preExisting.String() {
+		t.Errorf("attr %s = %q; want %q (zero-UUID arg must NOT clobber)",
+			AttrPolicyVersionID, got, preExisting.String())
+	}
+}

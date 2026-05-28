@@ -11,6 +11,7 @@ import (
 	"github.com/gofrs/uuid"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/telemetry"
 )
 
 // Canonical HTTP paths for the Stage 5.2 write verbs. Pinned
@@ -220,6 +221,13 @@ func (pw *PolicyWriter) Activate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("invalid policy_version_id: %s", err.Error()), http.StatusBadRequest)
 		return
 	}
+	// Stage 9.4 iter-4: overwrite the verb-span's
+	// `policy_version_id=""` open-time placeholder now that
+	// the wire request has parsed and the UUID is valid.
+	// Lets dashboards correlate `policy.activate` spans
+	// with downstream `eval.gate` spans bound to the same
+	// PVID. Safe no-op when no OTel span is in ctx.
+	telemetry.AnnotateVerbSpanPolicyVersionID(r.Context(), id)
 	pa, err := pw.steward.Activate(r.Context(), steward.ActivateRequest{
 		PolicyVersionID: id,
 		ActivatedBy:     wire.ActivatedBy,

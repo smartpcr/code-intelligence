@@ -52,6 +52,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/telemetry"
 )
 
 // VerbMgmtRegisterRepoPath mounts `mgmt.register_repo` at the
@@ -227,6 +229,16 @@ func (w *MgmtWriter) RegisterRepo(rw http.ResponseWriter, r *http.Request) {
 		writeRepoStoreError(rw, r, "mgmt.register_repo", err, w.logger)
 		return
 	}
+	// Stage 9.4 iter-4: register_repo is the verb that
+	// CREATES (or idempotently returns) the canonical
+	// `repo_id`; only after the store call do we know what
+	// to stamp on the verb span. Overwrite the open-time
+	// `repo_id=""` placeholder with the assigned UUID so
+	// dashboards can correlate the onboarding span to the
+	// downstream `mgmt.set_mode` / `ingest.*` spans for
+	// the same repo. Safe no-op when no OTel span is bound
+	// to the request context.
+	telemetry.AnnotateVerbSpanRepoID(r.Context(), res.RepoID.String())
 
 	if w.logger != nil {
 		w.logger.InfoContext(r.Context(), "mgmt.register_repo succeeded",

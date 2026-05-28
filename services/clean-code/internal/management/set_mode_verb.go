@@ -34,6 +34,8 @@ import (
 	"strings"
 
 	"github.com/gofrs/uuid"
+
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/telemetry"
 )
 
 // VerbMgmtSetModePath mounts `mgmt.set_mode` at the canonical
@@ -138,6 +140,12 @@ func (w *MgmtWriter) SetMode(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, ErrMgmtSetModeZeroRepoID.Error(), http.StatusBadRequest)
 		return
 	}
+	// Stage 9.4 iter-4: overwrite the verb-span's
+	// `repo_id=""` open-time placeholder now that the wire
+	// request has parsed and the UUID is non-zero. Safe
+	// no-op when no OTel span is bound to the request
+	// context.
+	telemetry.AnnotateVerbSpanRepoID(r.Context(), repoID.String())
 	mode := strings.TrimSpace(wire.Mode)
 	if !IsAllowedRepoMode(mode) {
 		http.Error(rw, fmt.Sprintf("%s: got %q (allowed: %s, %s)", ErrRepoStoreInvalidMode.Error(), mode, RepoModeEmbedded, RepoModeLinked), http.StatusBadRequest)

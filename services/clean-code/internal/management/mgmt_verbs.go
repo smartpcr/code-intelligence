@@ -67,6 +67,7 @@ import (
 	"github.com/gofrs/uuid"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/telemetry"
 )
 
 // Canonical HTTP paths for the Stage 3.4 management write
@@ -426,6 +427,15 @@ func (w *MgmtWriter) RetractSample(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Stage 9.4 iter-4: overwrite the verb-span's
+	// `repo_id=""` open-time placeholder now that the
+	// sample resolver has produced the canonical repo_id.
+	// Safe no-op when no OTel span is bound to the
+	// request context.
+	if repoID != uuid.Nil {
+		telemetry.AnnotateVerbSpanRepoID(r.Context(), repoID.String())
+	}
+
 	// 2. Append `repo_event(kind='retract_intent', payload={sample_id, reason})`.
 	// This is the operator-intent audit row -- it lands
 	// BEFORE the dispatcher's Measurement-sub-store writes
@@ -526,6 +536,12 @@ func (w *MgmtWriter) Rescan(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, ErrMgmtRescanZeroRepoID.Error(), http.StatusBadRequest)
 		return
 	}
+	// Stage 9.4 iter-4: overwrite the verb-span's
+	// `repo_id=""` open-time placeholder now that the wire
+	// request has parsed and the UUID is non-zero. Safe
+	// no-op when no OTel span is bound to the request
+	// context.
+	telemetry.AnnotateVerbSpanRepoID(r.Context(), repoID.String())
 	sha := strings.TrimSpace(wire.SHA)
 	if sha == "" {
 		http.Error(rw, ErrMgmtRescanEmptySHA.Error(), http.StatusBadRequest)

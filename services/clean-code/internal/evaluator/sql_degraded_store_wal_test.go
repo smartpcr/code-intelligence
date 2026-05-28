@@ -2,9 +2,12 @@ package evaluator
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gofrs/uuid"
@@ -197,6 +200,98 @@ func TestSQLDegradedRunStore_AppendDegradedRun_WALFsyncFailureRollsBackSQL(t *te
 	}
 	if !strings.Contains(err.Error(), "synthetic signer error") {
 		t.Errorf("AppendDegradedRun: err = %v; want 'synthetic signer error' substring", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sqlmock expectations: %v", err)
+	}
+}
+
+// TestSQLDegradedRunStore_AppendDegradedRun_WALFlushFailureRollsBackSQL
+// is the Stage 9.1 / iter-3 evaluator item #3 test for the
+// degraded path: a REAL write/fsync failure (vs. the
+// signer-failure path covered by
+// [TestSQLDegradedRunStore_AppendDegradedRun_WALFsyncFailureRollsBackSQL])
+// MUST roll back the SQL transaction.
+//
+// Strategy mirrors the rule_engine equivalent: pin the
+// writer's clock to a deterministic date, pre-create the
+// per-day partition path AS A DIRECTORY so the writer's
+// `os.OpenFile(..., O_CREATE|O_APPEND|O_WRONLY, ...)` fails
+// at flush time, then assert the SQL mock saw both Audit
+// INSERTs followed by Rollback (NO Commit).
+//
+// This pins the contract for the actual disk-failure mode
+// the evaluator's iter-2 review flagged: signer failure is
+// one case; write/sync failure is the case the brief's
+// "WAL fsync before SQL commit" line is fundamentally
+// about.
+func TestSQLDegradedRunStore_AppendDegradedRun_WALFlushFailureRollsBackSQL(t *testing.T) {
+	t.Parallel()
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	frozen := time.Date(2026, 4, 15, 12, 0, 0, 0, time.UTC)
+	walDir := t.TempDir()
+	walWriter, err := wal.NewWriter(wal.WriterConfig{
+		Dir:    walDir,
+		Signer: wal.NoopSigner{},
+		Clock:  func() time.Time { return frozen },
+	})
+	if err != nil {
+		t.Fatalf("wal.NewWriter: %v", err)
+	}
+	saboteur := filepath.Join(walDir, "2026-04-15.wal")
+	if err := os.MkdirAll(saboteur, 0o755); err != nil {
+		t.Fatalf("pre-create saboteur directory at %s: %v", saboteur, err)
+	}
+
+	store, err := NewSQLDegradedRunStore(SQLDegradedRunStoreConfig{DB: db, WalWriter: walWriter})
+	if err != nil {
+		t.Fatalf("NewSQLDegradedRunStore: %v", err)
+	}
+
+	runID := uuid.Must(uuid.NewV4())
+	verdictID := uuid.Must(uuid.NewV4())
+	repoID := uuid.Must(uuid.NewV4())
+	pvID := uuid.Must(uuid.NewV4())
+
+	run := DegradedRun{
+		EvaluationRunID: runID,
+		RepoID:          repoID,
+		SHA:             "abc1234567890abcdef1234567890abcdef12345",
+		PolicyVersionID: pvID,
+		CreatedAt:       1,
+	}
+	verdict := DegradedVerdict{
+		VerdictID:       verdictID,
+		EvaluationRunID: runID,
+		Verdict:         VerdictWarn,
+		Degraded:        true,
+		DegradedReason:  "samples_pending",
+		CreatedAt:       2,
+	}
+
+	// Both Audit INSERTs run BEFORE the WAL flush; the
+	// degraded store calls `walBatch.Commit(ctx)` after the
+	// verdict INSERT and before `tx.Commit`. The mock MUST
+	// see Begin + run + verdict INSERTs + Rollback, NO Commit.
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO "clean_code"."evaluation_run"`)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO "clean_code"."evaluation_verdict"`)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectRollback()
+
+	err = store.AppendDegradedRun(context.Background(), run, verdict)
+	if err == nil {
+		t.Fatal("AppendDegradedRun: want error from WAL flush, got nil")
+	}
+	if !strings.Contains(err.Error(), "WAL flush before SQL commit") {
+		t.Errorf("AppendDegradedRun: err = %v; want 'WAL flush before SQL commit' substring", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sqlmock expectations: %v", err)

@@ -2,6 +2,8 @@ package rule_engine
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -252,6 +254,158 @@ func TestSQLStore_AppendEvaluation_WALFsyncFailureRollsBackSQL(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "synthetic signer error") {
 		t.Errorf("AppendEvaluation: err = %v; want 'synthetic signer error' substring", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sqlmock expectations: %v", err)
+	}
+}
+
+// TestSQLStore_AppendEvaluation_WALFlushFailureRollsBackSQL is
+// the Stage 9.1 / iter-3 evaluator item #3 test: it pins the
+// brief's atomicity contract for the REAL fsync/write-failure
+// path (vs. the signer-failure path covered by
+// [TestSQLStore_AppendEvaluation_WALFsyncFailureRollsBackSQL]).
+//
+// Strategy: use [wal.NoopSigner] so every `StageNew` succeeds
+// in memory, then force the writer's append+fsync call to
+// fail by pre-creating the per-day partition file's target
+// path AS A DIRECTORY. The writer's `os.OpenFile(path,
+// O_CREATE|O_APPEND|O_WRONLY, ...)` fails because the path
+// is a directory, NOT a writable file -- a true write/sync
+// failure mode, not a signer failure.
+//
+// The SQL mock expects every audit-row INSERT to run first
+// (Begin → run + verdict + 2 finding INSERTs) and then
+// `Rollback` after the WAL flush errors. NO `Commit` is
+// expected.
+//
+// We pin the writer's clock so the partition file name is
+// deterministic: the on-disk pre-created directory must
+// share the writer's UTC date.
+func TestSQLStore_AppendEvaluation_WALFlushFailureRollsBackSQL(t *testing.T) {
+	t.Parallel()
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	stewardStore, err := steward.NewSQLStoreWithSchema(db, "clean_code")
+	if err != nil {
+		t.Fatalf("steward.NewSQLStoreWithSchema: %v", err)
+	}
+
+	// Pin a deterministic UTC clock so the writer's
+	// partition file name resolves to the SAME date as the
+	// directory we're about to pre-create.
+	frozen := time.Date(2026, 4, 15, 12, 0, 0, 0, time.UTC)
+	walDir := t.TempDir()
+	walWriter, err := wal.NewWriter(wal.WriterConfig{
+		Dir:    walDir,
+		Signer: wal.NoopSigner{},
+		Clock:  func() time.Time { return frozen },
+	})
+	if err != nil {
+		t.Fatalf("wal.NewWriter: %v", err)
+	}
+
+	// Sabotage: pre-create `2026-04-15.wal` AS A DIRECTORY.
+	// When the writer tries to `os.OpenFile(...,
+	// O_CREATE|O_APPEND|O_WRONLY, ...)` against this path,
+	// the syscall fails because the entry is a directory,
+	// not a file. The writer's `appendAndSync` surfaces the
+	// error to `TxBatch.Commit`, which surfaces to the
+	// Store, which rolls back the SQL transaction.
+	saboteur := filepath.Join(walDir, "2026-04-15.wal")
+	if err := os.MkdirAll(saboteur, 0o755); err != nil {
+		t.Fatalf("pre-create saboteur directory at %s: %v", saboteur, err)
+	}
+
+	store, err := NewSQLStore(SQLStoreConfig{DB: db, Steward: stewardStore, WalWriter: walWriter})
+	if err != nil {
+		t.Fatalf("NewSQLStore: %v", err)
+	}
+
+	runID := uuid.Must(uuid.NewV4())
+	verdictID := uuid.Must(uuid.NewV4())
+	finding1ID := uuid.Must(uuid.NewV4())
+	finding2ID := uuid.Must(uuid.NewV4())
+	repoID := uuid.Must(uuid.NewV4())
+	pvID := uuid.Must(uuid.NewV4())
+	scopeID := uuid.Must(uuid.NewV4())
+	now := time.Now().UTC()
+
+	run := EvaluationRun{
+		EvaluationRunID: runID,
+		RepoID:          repoID,
+		SHA:             "abc1234567890abcdef1234567890abcdef12345",
+		PolicyVersionID: pvID,
+		Caller:          CallerBatchRefresh,
+		CreatedAt:       now,
+	}
+	verdict := EvaluationVerdict{
+		VerdictID:       verdictID,
+		EvaluationRunID: runID,
+		Verdict:         VerdictPass,
+		CreatedAt:       now,
+	}
+	findings := []Finding{
+		{
+			FindingID:       finding1ID,
+			EvaluationRunID: runID,
+			RepoID:          repoID,
+			SHA:             run.SHA,
+			ScopeID:         scopeID,
+			RuleID:          "solid.srp.lcom4_high",
+			RuleVersion:     1,
+			PolicyVersionID: pvID,
+			MetricSampleIDs: []uuid.UUID{uuid.Must(uuid.NewV4())},
+			Severity:        steward.SeverityBlock,
+			Delta:           DeltaNew,
+			ExplanationMD:   "LCOM4 too high (1)",
+			CreatedAt:       now,
+		},
+		{
+			FindingID:       finding2ID,
+			EvaluationRunID: runID,
+			RepoID:          repoID,
+			SHA:             run.SHA,
+			ScopeID:         scopeID,
+			RuleID:          "solid.srp.lcom4_high",
+			RuleVersion:     1,
+			PolicyVersionID: pvID,
+			MetricSampleIDs: []uuid.UUID{uuid.Must(uuid.NewV4())},
+			Severity:        steward.SeverityWarn,
+			Delta:           DeltaUnchanged,
+			ExplanationMD:   "LCOM4 too high (2)",
+			CreatedAt:       now,
+		},
+	}
+
+	// Every audit-row INSERT runs BEFORE the WAL
+	// flush (the Store stages frames in-memory during
+	// the tx, then calls `walBatch.Commit(ctx)` AFTER
+	// the last INSERT but BEFORE `tx.Commit`). The mock
+	// MUST therefore see Begin + run + verdict + 2
+	// finding INSERTs + Rollback, and NO Commit.
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO "clean_code"."evaluation_run"`)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO "clean_code"."evaluation_verdict"`)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO "clean_code"."finding"`)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO "clean_code"."finding"`)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectRollback()
+
+	err = store.AppendEvaluation(context.Background(), run, verdict, findings)
+	if err == nil {
+		t.Fatal("AppendEvaluation: want error from WAL flush, got nil")
+	}
+	if !strings.Contains(err.Error(), "WAL flush before SQL commit") {
+		t.Errorf("AppendEvaluation: err = %v; want 'WAL flush before SQL commit' substring (so operators recognise the contract)", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sqlmock expectations: %v", err)

@@ -40,6 +40,7 @@ import (
 	_ "github.com/lib/pq"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/composition"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/evaluator"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
@@ -184,6 +185,7 @@ func main() {
 	// operator can tell production-tier misconfiguration
 	// apart from intentional scaffold-mode.
 	var stewardSigner steward.Signer
+	var signingKeysManager *keys.Manager
 	var keysClose func()
 	kmsProvider := os.Getenv("CLEAN_CODE_KMS_PROVIDER")
 	switch kmsProvider {
@@ -212,6 +214,7 @@ func main() {
 			log.Fatalf("clean-code-eval-gate: keys.Build(provider=%s): %v", kmsProvider, kerr)
 		}
 		stewardSigner = keysRes.Manager
+		signingKeysManager = keysRes.Manager
 		keysClose = keysRes.Close
 		log.Printf("clean-code-eval-gate: keys.Manager wired (provider=%s); Gate.Evaluate signature-verify path is LIVE", kmsProvider)
 	default:
@@ -237,26 +240,40 @@ func main() {
 	// Iter-2 evaluator item #3: this is the production
 	// reading of CLEAN_CODE_AUDIT_WAL_DIR.
 	//
-	// Signer: Stage 9.1 ships with `wal.NoopSigner`
-	// because the policy-keys-backed signer adapter and
-	// the reconciler that verifies signatures are a
-	// Stage 9.2 concern. The frames on disk are still
-	// the canonical AuditFrame shape; the reconciler
-	// will pin the signature contract end-to-end once
-	// wired.
+	// Signer choice (iter-3 evaluator item #1): when the
+	// composition root has a real KMS-backed
+	// `keys.Manager` (CLEAN_CODE_KMS_PROVIDER=local |
+	// in-memory), the WAL signer is the production
+	// Ed25519 path
+	// ([composition.NewKeysManagerWALSigner]). In
+	// scaffold mode (KMS provider unset) the WAL signer
+	// falls back to `wal.NoopSigner`, since the gate is
+	// already degrading every request as
+	// policy_signature_invalid in that mode -- frames on
+	// disk get the SHA-256 stand-in but the binary
+	// surface still serves dev/test. Production
+	// deployments MUST set CLEAN_CODE_KMS_PROVIDER.
 	walDir := os.Getenv("CLEAN_CODE_AUDIT_WAL_DIR")
 	if walDir == "" {
 		walDir = defaultAuditWALDir
 		log.Printf("clean-code-eval-gate: CLEAN_CODE_AUDIT_WAL_DIR unset; using default %q", walDir)
 	}
+	var walSigner wal.Signer
+	if signingKeysManager != nil {
+		walSigner = composition.NewKeysManagerWALSigner(signingKeysManager)
+		log.Printf("clean-code-eval-gate: Audit WAL signer = keys.Manager-backed Ed25519 (provider=%s)", kmsProvider)
+	} else {
+		walSigner = wal.NoopSigner{}
+		log.Print("clean-code-eval-gate: WARN: Audit WAL signer = wal.NoopSigner (SHA-256 stand-in, signing_key_id=uuid.Nil). This is acceptable ONLY in scaffold mode (CLEAN_CODE_KMS_PROVIDER unset); production deployments MUST set CLEAN_CODE_KMS_PROVIDER=local + CLEAN_CODE_KMS_MASTER_KEY_HEX so the WAL signer becomes the Ed25519 keys.Manager path.")
+	}
 	walWriter, err := wal.NewWriter(wal.WriterConfig{
 		Dir:    walDir,
-		Signer: wal.NoopSigner{},
+		Signer: walSigner,
 	})
 	if err != nil {
 		log.Fatalf("clean-code-eval-gate: wal.NewWriter(dir=%s): %v", walDir, err)
 	}
-	log.Printf("clean-code-eval-gate: Audit WAL writer wired (dir=%s, signer=NoopSigner -- real KMS-backed signer arrives in Stage 9.2)", walDir)
+	log.Printf("clean-code-eval-gate: Audit WAL writer wired (dir=%s)", walDir)
 
 	// rule_engine.SQLStore consumes the solid_batch
 	// handle so the canonical Audit triple is INSERTED

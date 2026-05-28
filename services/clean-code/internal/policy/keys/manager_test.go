@@ -459,6 +459,112 @@ func TestManager_SignFailsWithNoActiveKey(t *testing.T) {
 	}
 }
 
+// TestManager_SignActive_BindsKeyIDIntoPayload is the
+// Audit-WAL signer contract: the keyID the build callback
+// receives MUST be the one SignActive uses for the KMS sign
+// AND the one returned to the caller. This protects the WAL
+// frame format where `signing_key_id` is hashed INTO the
+// canonical payload BEFORE signing -- a signer that returned
+// a different keyID would invalidate verification.
+func TestManager_SignActive_BindsKeyIDIntoPayload(t *testing.T) {
+	t.Parallel()
+	t0 := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	clock := newFakeClock(t0)
+	m, _, _ := newTestManager(t, clock, DefaultOverlap)
+	ctx := context.Background()
+
+	rec, err := m.Rotate(ctx)
+	if err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	var observedKeyID uuid.UUID
+	gotKeyID, sig, err := m.SignActive(ctx, func(keyID uuid.UUID) ([]byte, error) {
+		observedKeyID = keyID
+		return []byte("audit-wal-payload-" + keyID.String()), nil
+	})
+	if err != nil {
+		t.Fatalf("SignActive: %v", err)
+	}
+	if observedKeyID != rec.KeyID {
+		t.Errorf("build observed key_id=%s; want active=%s", observedKeyID, rec.KeyID)
+	}
+	if gotKeyID != rec.KeyID {
+		t.Errorf("SignActive returned key_id=%s; want %s", gotKeyID, rec.KeyID)
+	}
+	if len(sig) != Ed25519SignatureSize {
+		t.Errorf("SignActive sig length=%d; want %d", len(sig), Ed25519SignatureSize)
+	}
+	// Defence-in-depth: the signature MUST validate against
+	// the chosen key's public bytes when computed over the
+	// SAME payload bytes (i.e. those produced by build with
+	// the observed keyID).
+	payload := []byte("audit-wal-payload-" + observedKeyID.String())
+	if err := m.Verify(ctx, gotKeyID, payload, sig); err != nil {
+		t.Errorf("Verify of SignActive output: %v; want nil", err)
+	}
+}
+
+// TestManager_SignActive_NoActiveKey mirrors
+// [TestManager_SignFailsWithNoActiveKey] for the SignActive
+// path: an empty cache MUST surface [ErrNoActiveKey].
+func TestManager_SignActive_NoActiveKey(t *testing.T) {
+	t.Parallel()
+	t0 := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	clock := newFakeClock(t0)
+	m, _, _ := newTestManager(t, clock, DefaultOverlap)
+	ctx := context.Background()
+
+	_, _, err := m.SignActive(ctx, func(uuid.UUID) ([]byte, error) {
+		return []byte("ignored"), nil
+	})
+	if !errors.Is(err, ErrNoActiveKey) {
+		t.Errorf("SignActive empty cache: err = %v; want ErrNoActiveKey", err)
+	}
+}
+
+// TestManager_SignActive_RejectsNilBuild pins the API
+// contract: a nil build callback is a programming error and
+// must return a stable error immediately.
+func TestManager_SignActive_RejectsNilBuild(t *testing.T) {
+	t.Parallel()
+	t0 := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	clock := newFakeClock(t0)
+	m, _, _ := newTestManager(t, clock, DefaultOverlap)
+	ctx := context.Background()
+
+	if _, err := m.Rotate(ctx); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	_, _, err := m.SignActive(ctx, nil)
+	if err == nil {
+		t.Fatal("SignActive(nil build) = nil; want error")
+	}
+}
+
+// TestManager_SignActive_PropagatesBuildError pins the
+// callback-error wrapping contract: any error returned by
+// build is surfaced (so the WAL writer can surface it to
+// the audit-write call site, which rolls back the SQL tx).
+func TestManager_SignActive_PropagatesBuildError(t *testing.T) {
+	t.Parallel()
+	t0 := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	clock := newFakeClock(t0)
+	m, _, _ := newTestManager(t, clock, DefaultOverlap)
+	ctx := context.Background()
+
+	if _, err := m.Rotate(ctx); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	sentinel := errors.New("synthetic build failure")
+	_, _, err := m.SignActive(ctx, func(uuid.UUID) ([]byte, error) {
+		return nil, sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Errorf("SignActive build error: err = %v; want wraps %v", err, sentinel)
+	}
+}
+
 // TestManager_NewManagerValidatesConfig pins the required-arg
 // guards in NewManager.
 func TestManager_NewManagerValidatesConfig(t *testing.T) {

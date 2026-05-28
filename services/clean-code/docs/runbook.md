@@ -81,20 +81,43 @@ nil, and the composition-root configs
 error on nil. There is NO SQL-only fallback for Audit
 INSERTs in Stage 9.1.
 
+**No kill-switch.** There is no `CLEAN_CODE_AUDIT_WAL_DISABLED`
+env var, no feature flag, no "audit WAL off" branch. The
+two Audit-store constructors hard-error on a nil writer,
+and unsetting `CLEAN_CODE_AUDIT_WAL_DIR` does NOT disable
+the writer -- it falls through to the default
+`data/wal/audit` directory. If the WAL volume is broken,
+audit writes hard-fail with `WAL flush before SQL commit`
+errors and the entire `evaluation_run` /
+`evaluation_verdict` / `finding` triple is rolled back.
+
 The env var `CLEAN_CODE_AUDIT_WAL_DIR` (default
-`data/wal/audit`) selects the on-disk root; both
-binaries construct a `wal.NewWriter` using
-`wal.NoopSigner` (the cryptographic signer is deferred
-to Stage 9.2, see "Pre-rollout: confirm WAL signer
-scope" in `docs/rollout.md`). Integration tests --
+`data/wal/audit`) selects the on-disk root. Both binaries
+construct a `wal.NewWriter` with one of two signer
+wirings, chosen at startup:
+
+- **Production (KMS wired)** -- the binary calls
+  `composition.NewKeysManagerWALSigner(*keys.Manager)`
+  to adapt `keys.Manager.SignActive` to the writer's
+  2-phase `wal.Signer.SignFrame` callback. Frames carry a
+  non-zero `signing_key_id` and a real Ed25519 signature
+  verifiable via `keys.Manager.Verify`.
+- **Scaffold (KMS unset)** -- the binary falls back to
+  `wal.NoopSigner{}` (SHA-256 stand-in, zero
+  `signing_key_id`) and logs a loud `WARN` at startup.
+  Intended for short-lived dev/test bring-up only.
+
+Integration tests --
 `internal/rule_engine/sql_store_wal_test.go` and
 `internal/evaluator/sql_degraded_store_wal_test.go` --
 exercise sqlmock + a real `wal.Writer` to prove every
 successful `evaluation_run`, `evaluation_verdict`, and
-`finding` INSERT pairs with a fsynced WAL frame, and
-that a WAL fsync failure rolls back the SQL
-transaction. Stage 9.2 will layer the reconciler on
-top.
+`finding` INSERT pairs with a fsynced WAL frame. Both
+tests cover the signer-failure rollback case AND the
+write/fsync-failure rollback case (the per-day partition
+path is pre-created as a directory to force a real disk
+write failure at `os.OpenFile`). Stage 9.2 will layer
+the reconciler on top.
 
 ## Stage 7.1 -- Cross-Repo Aggregator cadence loop
 

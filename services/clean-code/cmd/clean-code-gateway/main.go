@@ -703,18 +703,35 @@ func buildProductionDeps(ctx context.Context, cfg gatewayConfig, db *sql.DB, sig
 		// `data/wal/audit`) and constructs the writer
 		// here.
 		//
-		// Signer: Stage 9.1 ships with `wal.NoopSigner`
-		// -- the policy-keys-backed signer adapter and
-		// the reconciler that verifies signatures are a
-		// Stage 9.2 concern.
+		// Signer choice (iter-3 evaluator item #1):
+		// when `signingKeys` is non-nil
+		// (CLEAN_CODE_KMS_PROVIDER=local | in-memory),
+		// the WAL signer is the production Ed25519
+		// path
+		// ([composition.NewKeysManagerWALSigner]). In
+		// scaffold mode (KMS provider unset) the signer
+		// falls back to `wal.NoopSigner`, since the
+		// gate's signature-verify path is already
+		// degraded -- frames on disk carry the SHA-256
+		// stand-in but the binary stays serviceable for
+		// dev/test. Production deployments MUST set
+		// CLEAN_CODE_KMS_PROVIDER.
+		var walSigner wal.Signer
+		if signingKeys != nil {
+			walSigner = composition.NewKeysManagerWALSigner(signingKeys)
+			logger.Info("gateway: Audit WAL signer = keys.Manager-backed Ed25519", "provider", cfg.KMSProvider)
+		} else {
+			walSigner = wal.NoopSigner{}
+			logger.Warn("gateway: Audit WAL signer = wal.NoopSigner (SHA-256 stand-in, signing_key_id=uuid.Nil). This is acceptable ONLY in scaffold mode (" + envKMSProvider + " unset); production deployments MUST set " + envKMSProvider + "=local + " + envKMSMasterKeyHex + " so the WAL signer becomes the Ed25519 keys.Manager path.")
+		}
 		walWriter, werr := wal.NewWriter(wal.WriterConfig{
 			Dir:    cfg.AuditWALDir,
-			Signer: wal.NoopSigner{},
+			Signer: walSigner,
 		})
 		if werr != nil {
 			return api.ProductionWiringDeps{}, closers, fmt.Errorf("wal.NewWriter(dir=%s): %w", cfg.AuditWALDir, werr)
 		}
-		logger.Info("gateway: Audit WAL writer wired", "dir", cfg.AuditWALDir, "signer", "NoopSigner (Stage 9.2 wires real KMS-backed signer)")
+		logger.Info("gateway: Audit WAL writer wired", "dir", cfg.AuditWALDir)
 
 		gate, gerr := composition.BuildEvalGate(ctx, composition.EvalGateConfig{
 			EvaluatorDB:  evalDB,

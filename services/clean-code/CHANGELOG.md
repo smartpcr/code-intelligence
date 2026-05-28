@@ -6,6 +6,75 @@ Newest at the top. Stage references map to
 
 ## Stage 9.1 -- Audit WAL frame writer
 
+### Iter 3 -- production signer + real write/fsync-failure tests + no-kill-switch docs
+
+Closes evaluator iter-2 items 1-3: replaces the test-only
+NoopSigner in both production binaries with a real
+`policy/keys`-backed signer (Ed25519 via the KMS),
+adds REAL write/fsync-failure rollback tests (separate
+from the existing signer-failure tests), and makes the
+docs unambiguous that there is NO kill-switch path.
+
+- `internal/policy/keys/manager.go` -- new
+  `Manager.SignActive(ctx, build func(uuid.UUID)([]byte, error))
+  (uuid.UUID, []byte, error)` method that satisfies the
+  WAL writer's 2-phase callback signer contract: picks
+  the active signing key, calls `build(keyID)` to obtain
+  the canonical payload (with the keyID baked in), then
+  KMS-signs and verifies against the public key.
+- `internal/policy/keys/manager_test.go` -- new
+  `TestManager_SignActive_*` suite (4 cases) covering
+  `BindsKeyIDIntoPayload`, `NoActiveKey`,
+  `RejectsNilBuild`, `PropagatesBuildError`.
+- `internal/composition/wal_signer.go` -- new
+  `NewKeysManagerWALSigner(*keys.Manager) wal.Signer`
+  adapter. Lives in `composition` (NOT `wal`) because the
+  conformance allow-list test forbids `wal` -> `keys` imports.
+  Returns nil when the manager is nil so the binary
+  branches the scaffold-mode fallback deliberately.
+- `internal/composition/wal_signer_test.go` -- new suite
+  including an end-to-end test that writes a real WAL
+  frame via `wal.Writer` and verifies it via
+  `keys.Manager.Verify`.
+- `cmd/clean-code-eval-gate/main.go` and
+  `cmd/clean-code-gateway/main.go` -- conditional signer
+  wiring at startup: when the signing keys manager is
+  non-nil (production / KMS wired), the binary uses
+  `composition.NewKeysManagerWALSigner` to obtain a real
+  Ed25519 signer with a non-zero `signing_key_id`. When
+  the signing keys manager is nil (dev / scaffold mode),
+  the binary falls back to `wal.NoopSigner` and emits a
+  loud `WARN` log at startup. The frame format is stable
+  across both wirings.
+- `internal/rule_engine/sql_store_wal_test.go` -- new
+  `TestSQLStore_AppendEvaluation_WALFlushFailureRollsBackSQL`.
+  Pins a deterministic clock onto the `wal.Writer` and
+  pre-creates the per-day partition path AS A DIRECTORY
+  in `t.TempDir()`. The writer's `os.OpenFile(...,
+  O_CREATE|O_APPEND|O_WRONLY, ...)` then fails with a
+  real disk-write error, surfacing through
+  `TxBatch.Commit` and rolling back the SQL transaction.
+  Mock expects Begin + run + verdict + 2x finding INSERTs
+  + Rollback (NO Commit). This is distinct from the
+  pre-existing signer-failure test
+  (`TestSQLStore_AppendEvaluation_WALFsyncFailureRollsBackSQL`).
+- `internal/evaluator/sql_degraded_store_wal_test.go` --
+  new
+  `TestSQLDegradedRunStore_AppendDegradedRun_WALFlushFailureRollsBackSQL`
+  using the same directory-collision pattern. Mock
+  expects Begin + run + verdict INSERTs + Rollback.
+- `docs/rollout.md` Stage 9.1 section -- new "no kill-switch"
+  bullet in "What's new" plus a rewritten
+  "Pre-rollout: confirm WAL signer scope" section that
+  documents BOTH signer wirings (production KMS-backed
+  vs scaffold NoopSigner) and what an operator must do
+  with scaffold-mode partition files before Stage 9.2
+  ships.
+- `docs/runbook.md` "Composition wiring" subsection --
+  added explicit "No kill-switch" paragraph and rewrote
+  the signer description to cover the conditional
+  KMS-backed / NoopSigner choice.
+
 ### Iter 2 -- WAL writer REQUIRED at constructors + production composition wired
 
 Closes evaluator iter-1 items 1-5: makes the WAL writer

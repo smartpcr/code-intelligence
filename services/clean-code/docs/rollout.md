@@ -49,9 +49,29 @@ Architecture Sec 7.10 / tech-spec Sec 4.13.
 5. **Integration tests prove frame emission** --
    `internal/rule_engine/sql_store_wal_test.go` and
    `internal/evaluator/sql_degraded_store_wal_test.go`
-   exercise sqlmock + real `wal.Writer`, asserting both
-   the happy-path frame triple and the WAL-failure
-   rollback contract.
+   exercise sqlmock + real `wal.Writer`, asserting the
+   happy-path frame triple, the signer-failure rollback
+   contract, AND the write/fsync-failure rollback contract
+   (`TestSQLStore_AppendEvaluation_WALFlushFailureRollsBackSQL`,
+   `TestSQLDegradedRunStore_AppendDegradedRun_WALFlushFailureRollsBackSQL`).
+6. **Production signer is `policy/keys`-backed when KMS is
+   wired** -- `cmd/clean-code-eval-gate/main.go` and
+   `cmd/clean-code-gateway/main.go` construct the writer's
+   signer via `composition.NewKeysManagerWALSigner(*keys.Manager)`
+   when the signing keys manager is non-nil. The 2-phase
+   callback contract (keyID emitted into the canonical
+   payload BEFORE signing) is satisfied by
+   `keys.Manager.SignActive(ctx, build)`. Frames signed by
+   the KMS path carry a non-zero `signing_key_id` and a
+   real Ed25519 signature verifiable via `keys.Manager.Verify`.
+7. **No kill-switch** -- there is NO `CLEAN_CODE_AUDIT_WAL_DISABLED`
+   env var, NO "audit WAL off" feature flag, and NO SQL-only
+   fallback path for Audit-table writes. Unsetting
+   `CLEAN_CODE_AUDIT_WAL_DIR` does NOT disable the writer; it
+   falls through to the default `data/wal/audit` directory.
+   The two Audit-store constructors error on nil `WalWriter`
+   and the composition root refuses to build the eval-gate
+   without one.
 
 ### What is NOT in Stage 9.1
 
@@ -76,20 +96,39 @@ at the writer; reconciler enablement is deferred.
 
 ### Pre-rollout: confirm WAL signer scope
 
-Stage 9.1 wires `wal.NoopSigner` (SHA-256 stand-in) in
-the composition root of both `cmd/clean-code-eval-gate`
-and `cmd/clean-code-gateway`. The frame format already
-carries `signing_key_id` + `signature`, so the on-disk
-encoding is stable; only the signing implementation is
-a stand-in. Stage 9.2 introduces a 2-phase
-`policy/keys`-backed signer (keyID emitted into the
-canonical payload BEFORE signing, per the writer's
-callback contract). Operators MUST NOT yet treat the
-`signature` field as cryptographically authoritative
-for Stage 9.1 traffic; the reconciler (Stage 9.2) will
-not verify NoopSigner-signed frames and a follow-up
-migration will re-sign them via the KMS path or move
-them to the quarantine queue.
+Stage 9.1 supports TWO signer wirings, chosen at startup
+based on whether the `policy/keys` signing manager was
+constructed (driven by the binary's KMS/keystore env
+variables -- see `cmd/clean-code-eval-gate/main.go` and
+`cmd/clean-code-gateway/main.go`):
+
+1. **Production (KMS wired)** -- the binary calls
+   `composition.NewKeysManagerWALSigner(*keys.Manager)`
+   which adapts `keys.Manager.SignActive(ctx, build)` to
+   the writer's 2-phase `wal.Signer.SignFrame(ctx, build)`
+   callback contract. The keyID is emitted into the
+   canonical payload BEFORE signing, so the on-disk
+   `signing_key_id` field is bound to the bytes the KMS
+   actually signed. Frames are verifiable via
+   `keys.Manager.Verify(keyID, payload, sig)`. The Stage
+   9.2 reconciler will use this verifier to gate replay
+   eligibility.
+2. **Scaffold (KMS unset)** -- the binary falls back to
+   `wal.NoopSigner{}` (SHA-256 stand-in, zero
+   `signing_key_id`) and emits a loud `WARN` log at
+   startup. This is intended for short-lived dev/test
+   bring-up while KMS provisioning catches up; operators
+   MUST NOT treat scaffold-mode frames as
+   cryptographically authoritative. Audit any
+   scaffold-mode partition files before the Stage 9.2
+   reconciler ships -- they will land in the
+   quarantine queue.
+
+The frame format itself is stable across both wirings
+(`signing_key_id` + `signature` fields are populated in
+both paths), so partition files written under scaffold
+mode remain readable by the production reader and the
+Stage 9.2 reconciler.
 
 ### Pre-rollout: confirm role grants
 

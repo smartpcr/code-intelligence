@@ -753,12 +753,39 @@ func (d *Dispatcher) emit(
 	// Pass 2d: `overrides`. Rust trait default-impl
 	// shadowing emits a typed edge from each impl method
 	// (LangMeta["trait"]=<traitName>) to the trait method
-	// with the same simple name in the SAME file. Cross-
-	// file pairs are dropped per A4 -- the verbatim trait
-	// identity persists on `LangMeta["trait"]` so the future
-	// cross-file resolver can stitch them later (architecture
-	// Section 7.2 / R4). The pass is a no-op for every other
-	// language because no other parser sets `LangMeta["trait"]`.
+	// with the same simple name in the SAME file ONLY when
+	// the trait method has a default body (LangMeta
+	// ["trait_default"]=true). Required (bodyless) trait
+	// signatures do NOT participate -- providing a required
+	// signature is "satisfies" / "implements", not
+	// "overrides" (architecture Section 7.2 / R4: overrides
+	// tracks default-impl SHADOWING). Cross-file pairs are
+	// dropped per A4 -- the verbatim trait identity persists
+	// on `LangMeta["trait"]` so the future cross-file
+	// resolver can stitch them later. The pass is a no-op
+	// for every other language because no other parser sets
+	// `LangMeta["trait"]`.
+	//
+	// traitDefaultByQN is the destination filter: a method
+	// QualifiedName is keyed only when it carries the
+	// `trait_default` flag the Rust parser sets in
+	// `appendTraitDefaultMethod`. Required-method trait
+	// signatures (from `function_signature_item`) carry no
+	// such flag and are absent from this map -- the Pass 2d
+	// lookup below treats absence as "no override target".
+	traitDefaultByQN := make(map[string]bool, len(result.Methods))
+	for _, m := range result.Methods {
+		if len(m.LangMeta) == 0 {
+			continue
+		}
+		raw, ok := m.LangMeta["trait_default"]
+		if !ok {
+			continue
+		}
+		if b, _ := raw.(bool); b {
+			traitDefaultByQN[m.QualifiedName] = true
+		}
+	}
 	for _, m := range result.Methods {
 		if len(m.LangMeta) == 0 {
 			continue
@@ -778,6 +805,12 @@ func (d *Dispatcher) emit(
 		dstKey := traitName + "." + simpleName(m.QualifiedName)
 		dstID, ok := methodNodeID[dstKey]
 		if !ok {
+			continue
+		}
+		// Architectural filter: skip required-signature
+		// targets per R4 -- the impl is providing a
+		// required method, not shadowing a default.
+		if !traitDefaultByQN[dstKey] {
 			continue
 		}
 		// Defensive: skip a self-edge. A parser bug that

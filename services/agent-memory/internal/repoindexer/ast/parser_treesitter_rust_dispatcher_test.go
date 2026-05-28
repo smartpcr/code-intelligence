@@ -224,19 +224,19 @@ pub trait Greeter {
 			gClassID, greeterClassID)
 	}
 
-	// Greeter.greet is a required (bodyless) trait method,
-	// so no overrides edge should fire (the trait method has
-	// NO default body for the impl to override -- the impl
-	// is simply providing the required implementation, which
-	// is NOT what Pass 2d's `overrides` edge tracks per
-	// architecture Section 7.2). The Pass 2d code does NOT
-	// distinguish required vs default trait methods today,
-	// so the edge WILL fire on a required-method match. Pin
-	// the current behaviour (one edge) so a future refinement
-	// is a deliberate, reviewed change rather than a silent
-	// regression.
-	if n := len(fw.edgesOf("overrides")); n != 1 {
-		t.Errorf("overrides edges = %d; want 1 (current Pass 2d matches required + default trait methods alike)", n)
+	// Greeter.greet in this fixture is a REQUIRED (bodyless)
+	// trait method -- no `trait_default` flag, so per the
+	// architecture (Section 7.2 / R4) Pass 2d MUST NOT
+	// emit an overrides edge. The impl is providing a
+	// required implementation, which is "satisfies"
+	// semantics, not "overrides" -- there is no default
+	// body for the impl method to shadow. The Stage 5.3
+	// fixture (TestDispatcherFixture_RustGraph_StageFiveThree
+	// above) covers the positive case where the trait method
+	// HAS a default body. Together they pin the both-sides
+	// contract.
+	if n := len(fw.edgesOf("overrides")); n != 0 {
+		t.Errorf("overrides edges = %d; want 0 (required trait signature is satisfies, not overrides)", n)
 	}
 }
 

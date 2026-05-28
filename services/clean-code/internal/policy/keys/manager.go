@@ -115,6 +115,39 @@ func (m *Manager) Overlap() time.Duration {
 	return m.overlap
 }
 
+// HistoricalKeys returns a snapshot copy of every KeyRecord
+// currently cached -- ACTIVE + RETIRED. The reconciler's
+// historical-keys WAL verifier consumes this to verify
+// signatures produced by a key that has since rotated out of
+// the active window (`Manager.Verify` rejects retired keys on
+// purpose; the reconciler's contract requires the opposite).
+//
+// The returned slice and the [KeyRecord] values are SAFE to
+// retain past the call: the outer slice is a fresh allocation
+// and the [KeyRecord.PublicKey] bytes are NOT shared with the
+// cache (defensive copy per record so a future cache refresh
+// cannot mutate the snapshot from underneath the verifier).
+//
+// Stage 9.2 contract: the snapshot reflects the state of the
+// in-memory cache at call time. Callers that need a
+// rotation-stable snapshot (the reconciler) MUST capture
+// HistoricalKeys() ONCE at construction and reuse the same
+// snapshot for every Verify call; do not poll on the hot path.
+func (m *Manager) HistoricalKeys() []KeyRecord {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]KeyRecord, len(m.cache))
+	for i, rec := range m.cache {
+		copyRec := rec
+		if rec.PublicKey != nil {
+			copyRec.PublicKey = make([]byte, len(rec.PublicKey))
+			copy(copyRec.PublicKey, rec.PublicKey)
+		}
+		out[i] = copyRec
+	}
+	return out
+}
+
 // Load refreshes the in-memory cache from the Store. Safe to
 // call multiple times; later Loads atomically replace the
 // cached snapshot.

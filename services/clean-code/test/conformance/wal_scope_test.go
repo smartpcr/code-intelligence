@@ -34,6 +34,10 @@ const walImportPath = "github.com/smartpcr/code-intelligence/services/clean-code
 //   - `internal/evaluator` is the degraded-path writer.
 //   - `internal/rule_engine` is the happy-path writer
 //     (engine + SQLStore + txStore + sql_store_test).
+//   - `internal/audit/reconciler` is the Stage 9.2 replay-only
+//     worker. It imports `audit/wal` to read partition frames
+//     and verify their signatures; it never WRITES to the
+//     WAL (no `wal.Writer` / `wal.TxBatch` usage).
 //   - `internal/composition` is the production wiring root
 //     (constructs the writer + the signer shim).
 //   - `cmd/clean-code-eval-gate` and `cmd/clean-code-gateway`
@@ -44,12 +48,13 @@ const walImportPath = "github.com/smartpcr/code-intelligence/services/clean-code
 //     import to mention the wal package by name.
 var allowedWalImporters = map[string]struct{}{
 	walImportPath: {},
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/evaluator":       {},
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine":     {},
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/composition":     {},
-	"github.com/smartpcr/code-intelligence/services/clean-code/cmd/clean-code-eval-gate": {},
-	"github.com/smartpcr/code-intelligence/services/clean-code/cmd/clean-code-gateway":   {},
-	"github.com/smartpcr/code-intelligence/services/clean-code/test/conformance":         {},
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/evaluator":         {},
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine":       {},
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/reconciler":  {},
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/composition":       {},
+	"github.com/smartpcr/code-intelligence/services/clean-code/cmd/clean-code-eval-gate":   {},
+	"github.com/smartpcr/code-intelligence/services/clean-code/cmd/clean-code-gateway":     {},
+	"github.com/smartpcr/code-intelligence/services/clean-code/test/conformance":           {},
 }
 
 // goListPackage mirrors the subset of `go list -deps -json`'s

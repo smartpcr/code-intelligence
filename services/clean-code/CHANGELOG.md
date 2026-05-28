@@ -4,6 +4,209 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 9.2 -- Audit WAL Reconciler (replay-only)
+
+New `internal/audit/reconciler/` package + composition
+factory that close the Stage 9.1 durability loop: on
+service restart, the reconciler walks
+`data/wal/audit/YYYY-MM-DD.wal`, verifies every frame's
+signature, and replays MISSING rows into the three Audit
+tables (`evaluation_run`, `evaluation_verdict`, `finding`).
+The reconciler honours four invariants (architecture
+Sec 7.10 / iter 1 evaluator item 11):
+
+1. NEVER inserts a row whose `(table, row_pk)` already
+   exists -- every replay statement is
+   `INSERT ... ON CONFLICT (<pk>) DO NOTHING`. A no-op
+   conflict is classified as `OutcomeSkippedExisting`
+   and counted; the existing row is left byte-identical.
+2. NEVER deletes a row -- there is no `DELETE` statement
+   anywhere in the package; the `clean_code_wal_reconciler`
+   PG role has `DELETE` revoked at the migration layer
+   (`0004_roles.up.sql`).
+3. NEVER modifies a non-Audit table -- table names are
+   package-level constants, the `replayOne` dispatcher
+   uses an explicit `switch` on `wal.AuditFrame.Table`,
+   and an unknown table value surfaces `ErrUnknownTable`
+   (does NOT reach any SQL statement).
+4. PRESERVES `evaluation_run.caller` verbatim from the
+   original frame -- the parsed string is bound to the
+   SQL parameter with NO transformation; the reconciler
+   does NOT substitute its own identity.
+
+New files:
+
+- `internal/audit/reconciler/doc.go` -- package overview
+  pinning the four invariants, verifier classification,
+  phased-replay rationale, and Stats schema.
+- `internal/audit/reconciler/types.go` -- `Verifier`
+  interface, sentinel errors (`ErrSignatureInvalid`,
+  `ErrSigningKeyUnknown`, `ErrUnknownTable`,
+  `ErrRowPKMismatch`, `ErrVerifierUnwired`,
+  `ErrReplayerUnwired`, `ErrDirUnwired`,
+  `ErrFrameValidation`), and `Stats` with `PerTable`
+  counters (`Replayed`, `SkippedExisting`,
+  `SkippedBadSig`, `SkippedBadShape`) plus a
+  `Warnings []string` channel for
+  `wal.ErrTrailingPartialFrame` /
+  `wal.ErrFrameSizeExceeded` signals.
+- `internal/audit/reconciler/replayer.go` -- `Replayer`
+  interface (three methods, one per Audit table -- NO
+  dynamic-table-name code path possible), the three row
+  shapes (`EvaluationRunRow`, `EvaluationVerdictRow`,
+  `FindingRow`) decoded from the WAL `row_json`, and the
+  `Outcome` enum (`OutcomeInserted` |
+  `OutcomeSkippedExisting`).
+- `internal/audit/reconciler/sql_replayer.go` --
+  production `SQLReplayer` issuing
+  `INSERT ... ON CONFLICT (<pk>) DO NOTHING` against
+  `clean_code.evaluation_run`, `evaluation_verdict`,
+  `finding`. `RowsAffected` classifies the outcome
+  (`1 -> OutcomeInserted`, `0 -> OutcomeSkippedExisting`,
+  anything else -> loud error). `caller` is bound
+  verbatim; `degraded_reason` is passed through
+  `NULLIF($5, '')`; `metric_sample_ids` is marshalled to
+  a JSON array and cast `$9::jsonb`.
+- `internal/audit/reconciler/sql_replayer_test.go` --
+  sqlmock suite covering `Inserted` /
+  `SkippedExisting`, caller-verbatim preservation,
+  required-field validation, the `RowsAffected > 1`
+  loud-error path, and exec-error propagation.
+- `internal/audit/reconciler/reconciler.go` --
+  `Reconciler{Run(ctx)}` + the internal `replayOne`
+  dispatcher. `Run` does a two-phase walk: pass 1 every
+  `evaluation_run` frame, pass 2 every
+  `evaluation_verdict` and `finding` frame, so FK
+  ordering is honoured even when the on-disk partition
+  has been reordered by an external corruption pass.
+  `replayOne` step-by-step: defence-in-depth table
+  guard, `wal.AuditFrame.Validate`, signature
+  verification (with sentinel classification),
+  `json.Decoder.DisallowUnknownFields()` strict decode,
+  `frame.RowPK == row_json.<pk>` equality check, then
+  dispatch to the matching Replayer method.
+- `internal/audit/reconciler/reconciler_test.go` --
+  rejects-unwired-deps suite, partial-frame-tail
+  non-fatal warning, scope-id nullable round-trip,
+  phased-replay ordering (frames are written in
+  canonical run->verdict->finding order then REVERSED
+  on disk before Run so the test actually proves the
+  two-pass walk reorders them back), strict-decode
+  loud abort (post-signature `DisallowUnknownFields`
+  failure aborts `Run`, NOT counted as
+  `SkippedBadShape`), unknown-table never reaches the
+  replayer, RowPK-mismatch loud abort (frame.RowPK
+  disagreeing with row_json.<pk> aborts `Run` via
+  `ErrRowPKMismatch`; the replayer is never called),
+  transient verifier error abort, Replayer error
+  propagation, cancelled-ctx fast path.
+- `internal/audit/reconciler/replay_test.go` -- four
+  brief-required scenarios using a hand-rolled
+  in-memory `fakeReplayer`:
+  - `TestReconciler_ReplaysMissingRows` -- three frames
+    on disk + empty replayer -> three
+    `OutcomeInserted`.
+  - `TestReconciler_LeavesExistingRowsUntouched` --
+    pre-populate the replayer with deliberately
+    DIFFERENT field values; Run classifies every frame
+    as `OutcomeSkippedExisting` AND the pre-existing
+    values are byte-identical afterwards.
+  - `TestReconciler_PreservesCallerVerbatim` -- runs
+    once per canonical caller (`eval_gate`,
+    `batch_refresh`); asserts the replayer received the
+    caller value byte-identical to the frame.
+  - `TestReconciler_BadSignatureSkips` -- tampers every
+    frame's signature on disk; Run reports
+    `SkippedBadSig=3` and the replayer is never called.
+- `internal/composition/wal_reconciler.go` -- new
+  `composition.NewWALReconciler(ctx, WALReconcilerConfig)`
+  factory + production Verifier built around the
+  policy/keys store. Lives in `composition` (NOT
+  `reconciler`) because the conformance allow-list test
+  forbids `audit/reconciler` -> `policy/keys` imports
+  (the audit-reconciler stays decoupled from any
+  specific key store). The factory returns `(nil, nil)`
+  for scaffold-mode (nil `KeyStore`) so the binary can
+  branch on "reconciler disabled" without classifying
+  the missing dependency as an error.
+
+  Two construction paths are exposed:
+  `NewHistoricalKeysWALVerifier(ctx, store keys.Store)`
+  is the production path -- it calls `store.List(ctx)`
+  ONCE at construction and pins an in-memory
+  `map[uuid.UUID]ed25519.PublicKey` snapshot. Verify
+  performs `ed25519.Verify` directly against the
+  snapshot, so RETIRED keys still verify legitimate
+  historical frames as the brief requires.
+  `NewKeysManagerWALVerifier(m *keys.Manager)` is a
+  convenience wrapper that takes the snapshot from
+  `Manager.HistoricalKeys()` for callers that already
+  hold a Manager. Both adapters share the same
+  internal verifier type, so the sentinel matrix is
+  identical: key missing from the trusted snapshot ->
+  `reconciler.ErrSigningKeyUnknown`; sig wrong length
+  OR `ed25519.Verify == false` ->
+  `reconciler.ErrSignatureInvalid`; ctx cancelled ->
+  raw ctx.Err (abort). Any other transient
+  infrastructure failure propagates as-is so `Run`
+  aborts.
+- `internal/composition/wal_reconciler_test.go` -- pins
+  the sentinel mapping, the scaffold-mode return,
+  required-field validation, and the happy-path
+  construction.
+
+Edited files:
+
+- `internal/policy/keys/manager.go` -- added
+  `Manager.HistoricalKeys()` returning a deep-copy
+  snapshot (`[]KeyRecord` plus per-record
+  `PublicKey []byte` copy) of the cache loaded by
+  `Manager.Load`. Used by the historical-keys
+  verifier so a future `Rotate` does NOT mutate the
+  reconciler's pinned snapshot.
+- `cmd/clean-code-eval-gate/main.go` -- the
+  reconciler now runs as a BLOCKING startup step
+  ahead of `rule_engine` wiring. New env var
+  `CLEAN_CODE_WAL_RECONCILER_DSN` is REQUIRED
+  whenever signing keys are configured; if signing
+  keys are present but the DSN is missing, boot is
+  refused (`log.Fatalf`) -- a silent skip would mean
+  pending WAL frames never replay. The reconciler
+  opens its own dedicated pool authenticated as
+  `clean_code_wal_reconciler`, builds the
+  historical-keys verifier via
+  `composition.NewWALReconciler`, runs to
+  completion, logs `Stats`, and only then yields to
+  the rest of boot. On `Run` error the binary aborts.
+- `cmd/clean-code-gateway/main.go` -- same wiring as
+  eval-gate, integrated into the existing
+  error-returning `run()` flow. The reconciler runs
+  between `buildSigningKeys` and `buildProductionDeps`
+  so the gateway never starts serving requests with
+  unreplayed audit frames on disk.
+- `test/conformance/wal_scope_test.go` -- added
+  `internal/audit/reconciler` to `allowedWalImporters`
+  and documented the entry as "Stage 9.2 replay-only
+  worker; READS the WAL, never WRITES".
+- `services/clean-code/docs/runbook.md` -- new
+  "Stage 9.2 -- Audit WAL Reconciler (replay-only)"
+  section after Stage 9.1, covering the four
+  invariants, phased replay, verifier classification
+  matrix (durable-broken / signing-key-not-resolved /
+  transient-infra), Stats schema, the operator triage
+  matrix, composition wiring, blocking on-restart
+  behaviour, and the `CLEAN_CODE_WAL_RECONCILER_DSN`
+  env var.
+- `services/clean-code/docs/rollout.md` -- new
+  "Stage 9.2: Audit WAL Reconciler (replay-only)"
+  section covering the cutover steps, role posture
+  reminder, the new env var, and the boot-blocking
+  behaviour.
+- `services/clean-code/go.sum` -- `go mod tidy` after
+  the `internal/audit/reconciler` package picked up
+  `github.com/DATA-DOG/go-sqlmock` as a test
+  dependency (the module was already in `go.mod`).
+
 ## Stage 9.1 -- Audit WAL frame writer
 
 ### Iter 3 -- production signer + real write/fsync-failure tests + no-kill-switch docs

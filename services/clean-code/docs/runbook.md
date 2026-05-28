@@ -116,8 +116,316 @@ successful `evaluation_run`, `evaluation_verdict`, and
 tests cover the signer-failure rollback case AND the
 write/fsync-failure rollback case (the per-day partition
 path is pre-created as a directory to force a real disk
-write failure at `os.OpenFile`). Stage 9.2 will layer
-the reconciler on top.
+write failure at `os.OpenFile`). Stage 9.2 layers the
+reconciler on top.
+
+## Stage 9.2 -- Audit WAL Reconciler (replay-only)
+
+The `internal/audit/reconciler/` package is the
+replay-only restart sweep that walks `data/wal/audit/`,
+verifies every frame's signature, and re-inserts MISSING
+rows into the three Audit tables. **The reconciler never
+modifies a non-Audit table, never deletes a row, never
+overwrites an existing row, and preserves
+`evaluation_run.caller` verbatim from the original frame.**
+Stage 9.1's WAL writer pairs with this worker to close the
+"WAL frame on disk, SQL row absent" gap caused by a fsync
+error or a process crash between the WAL flush and the SQL
+commit.
+
+### Replay-only contract (architecture Sec 7.10)
+
+1. Every Audit re-insert is issued as
+   `INSERT INTO clean_code.<table> (...) VALUES (...)
+   ON CONFLICT (<pk>) DO NOTHING`. A row whose
+   `(table, row_pk)` already exists in PostgreSQL is
+   classified as `OutcomeSkippedExisting` and left
+   byte-identical.
+2. There is NO `DELETE` / `UPDATE` statement anywhere in
+   `internal/audit/reconciler/`. The package's PG role,
+   `clean_code_wal_reconciler`, has `INSERT, SELECT`
+   granted and `UPDATE, DELETE` revoked at the migration
+   layer (migration `0004_roles.up.sql`). A bug in this
+   package CANNOT escalate to a destructive write.
+3. Only the three Audit tables are referenced; the table
+   names live as package-level constants and the
+   per-frame `replayOne` dispatcher uses an explicit
+   `switch` on `wal.AuditFrame.Table`. A frame whose
+   table is outside the closed set
+   (`evaluation_run` / `evaluation_verdict` / `finding`)
+   surfaces `ErrUnknownTable` and aborts the run --
+   defence-in-depth on top of `wal.AuditFrame.Validate`.
+4. `evaluation_run.caller` is bound verbatim from the
+   parsed frame to the SQL parameter. There is NO
+   substitution branch -- if the original writer recorded
+   `caller='batch_refresh'`, the reconciler replays the
+   row with `caller='batch_refresh'`, regardless of which
+   process started the reconciler.
+
+### Phased replay (FK ordering)
+
+The reconciler walks every frame TWICE per `Run`:
+
+1. **Pass 1** -- every `evaluation_run` frame, in WAL
+   order. By the end of this pass every WAL-known
+   `evaluation_run_id` exists in PostgreSQL.
+2. **Pass 2** -- every `evaluation_verdict` and `finding`
+   frame, in WAL order. The FK constraint
+   `evaluation_verdict.evaluation_run_id ->
+   evaluation_run.evaluation_run_id` (and the matching
+   one on `finding`) is honoured EVEN IF a corrupted
+   partition has reordered frames out of writer-order
+   (which the writer never does, but the partition file
+   is on durable disk and an external corruption pass
+   cannot be ruled out).
+
+### Verifier classification
+
+`reconciler.Verifier` distinguishes three failure modes:
+
+- **Durable-broken (skip + count)** -- the frame's
+  signature did not validate
+  (`reconciler.ErrSignatureInvalid`). The reconciler
+  bumps `Stats.SkippedBadSig` and continues with the next
+  frame. The operator MUST manually quarantine the
+  affected partition bytes (see "Operator checklist"
+  below) -- a counted skip is NOT a self-healing recovery.
+- **Signing key not in trusted snapshot (skip + count)** --
+  the frame's `signing_key_id` is not present in the
+  historical-keys snapshot taken from
+  `clean_code.policy_signing_keys` at reconciler
+  construction time
+  (`reconciler.ErrSigningKeyUnknown`). The reconciler
+  bumps `Stats.SkippedBadSig` and continues. Note that
+  "unknown" here means "not in the trusted snapshot", not
+  "cryptographically unsignable": an attacker who minted
+  a valid Ed25519 keypair can still produce a
+  cryptographically-valid signature, but the historical
+  verifier refuses to trust it.
+- **Transient infrastructure (abort `Run`)** -- any other
+  error from the verifier (DB outage during the initial
+  snapshot fetch, ctx cancellation). The reconciler
+  returns the error from `Run` so an operator can address
+  the root cause before retrying. Silently skipping every
+  frame on a verifier outage would erase the durability
+  guarantee Stage 9.1 set up.
+
+### Stats schema
+
+`reconciler.Run` returns a `Stats` value with per-table
+counters (`Replayed`, `SkippedExisting`, `SkippedBadSig`,
+`SkippedBadShape`) and a `Warnings []string` channel for
+non-fatal signals from `wal.ReadAll`
+(`ErrTrailingPartialFrame`, `ErrFrameSizeExceeded`). The
+post-Stage-9.4 OTel pipeline publishes these as
+Prometheus counters with a `table` label; operators can
+correlate skipped-row counts with disk artifacts.
+
+`SkippedBadShape` covers PRE-signature structural
+failures only -- a frame whose `wal.AuditFrame.Validate`
+or `SigningPayload` rejected it before signature
+verification could even run. POST-signature
+disagreements (decode rejection under
+`DisallowUnknownFields`, `frame.RowPK` disagreeing with
+`row_json.<pk>`) are loud `Run` aborts -- they signal
+writer-side schema drift or a durability-coordinate
+corruption and warrant immediate operator triage rather
+than silent skip.
+
+### Operator checklist
+
+1. **Trailing-partial-frame warning** -- benign for the
+   reconciler (every complete frame preceding it
+   replayed). Quarantine the tail bytes after the run by
+   `cp data/wal/audit/<date>.wal /var/quarantine/`,
+   truncating the original at the last complete-frame
+   newline. Stage 9.4 will surface a Prometheus counter
+   for the warning; until then `grep` the binary's stdout
+   for "ErrTrailingPartialFrame".
+2. **Frame-size-exceeded warning** -- pages an on-call.
+   A single frame > 1 MiB is either a Stage 9.1 writer
+   bug (no in-package check should let one through) or a
+   forged frame. Quarantine the entire partition file
+   and STOP further reconciliation runs until the source
+   is identified.
+3. **`SkippedBadSig > 0`** -- the affected frames carry
+   either a tampered signature, a payload modified
+   after signing, or were signed by a key whose UUID is
+   not present in the historical-keys snapshot taken
+   from `clean_code.policy_signing_keys` at reconciler
+   startup. (Retired-but-known keys ARE in the
+   snapshot and DO verify successfully -- the
+   "unknown key" classification means the UUID is not
+   in the trusted snapshot at all.) The reconciler does
+   NOT replay these. Investigate the partition file by
+   hand: re-parse the JSON, identify the
+   `signing_key_id` and `row_pk`, and decide whether
+   the underlying business event landed in PostgreSQL
+   via a separate path or needs manual entry by a
+   Policy Steward.
+4. **`SkippedBadShape > 0`** -- the affected frames
+   failed `wal.AuditFrame.Validate` or `SigningPayload`
+   BEFORE signature verification. None of these can
+   happen via the Stage 9.1 writer; investigate as a
+   tamper / on-disk corruption signal. (Post-signature
+   schema drift / RowPK mismatch are abort-Run, not
+   counted here.)
+5. **Run returns an error mentioning `decode failed AFTER
+   valid signature` or `ErrRowPKMismatch`** -- the
+   reconciler saw a frame whose `row_json` decoded
+   incorrectly OR whose `RowPK` disagreed with
+   `row_json.<pk>` AFTER the signature verified. This is
+   writer-side schema drift OR a signing-key compromise.
+   STOP further reconciliation runs, page the on-call,
+   quarantine the partition, audit recent Policy Steward
+   key-rotation events, and confirm the writer's audit
+   columns match the current PG schema before retrying.
+6. **Run returns an error mentioning
+   `KeyStore.List` or snapshot construction** -- the
+   historical-keys verifier could not build its
+   trusted snapshot at construction time, typically
+   because the `clean_code_wal_reconciler` role
+   cannot SELECT from `clean_code.policy_signing_keys`
+   (migration `0005_policy_signing_keys.up.sql` grants
+   this) or the
+   PostgreSQL pool is unreachable. The reconciler
+   refuses to operate without a snapshot rather than
+   silently classifying every frame as `SkippedBadSig`.
+   Check the role grants (`\du` in psql, then
+   `\dp clean_code.policy_signing_keys`) and the DSN
+   reachability before restarting.
+7. **Run returns any other error** -- the WAL reconciler
+   did not complete. The most common cause is verifier
+   transient error (KMS unreachable). Verify
+   `policy.keys.list_active` returns the expected key,
+   restart the reconciler. If the error mentions the
+   Replayer (`reconciler: replayOne: ReplayRun ...`),
+   check PostgreSQL connectivity and that the
+   `clean_code_wal_reconciler` role still has
+   `INSERT, SELECT` on the three Audit tables (it has by
+   default; a manual `REVOKE` would break this).
+
+### Composition wiring
+
+The composition factory is
+`composition.NewWALReconciler(ctx, WALReconcilerConfig)`
+returning a `*reconciler.Reconciler`. The factory:
+
+- Requires a `keys.Store` (`KeyStore` field) returning
+  `(nil, nil)` when the store is nil so the binary
+  branches "reconciler disabled" deliberately. The
+  callers in `cmd/clean-code-eval-gate` and
+  `cmd/clean-code-gateway` construct the store via
+  `keys.NewSQLStore(reconcilerDB)`.
+- Requires a non-nil `*sql.DB` authenticated as
+  `clean_code_wal_reconciler` (migration 0004 grants
+  INSERT+SELECT on the three Audit tables; UPDATE /
+  DELETE are revoked service-wide; migration 0005
+  additionally grants SELECT on
+  `clean_code.policy_signing_keys` so the
+  historical-keys verifier can build its snapshot).
+- Requires a non-empty `Dir` -- production wiring threads
+  `CLEAN_CODE_AUDIT_WAL_DIR` (default `data/wal/audit`)
+  through, matching the writer's directory.
+- Constructs the production `reconciler.SQLReplayer` and
+  a `composition.NewHistoricalKeysWALVerifier`-backed
+  Verifier; passes both into `reconciler.NewReconciler`.
+
+A `*keys.Manager` is also accepted via the convenience
+`Keys` field; the factory then takes the snapshot from
+`Manager.HistoricalKeys()` (the manager must have
+called `Load` first, which the production composition
+helpers already do).
+
+The verifier classification matrix:
+
+| Verifier returned | Reconciler classification |
+|---|---|
+| `nil` | replay row |
+| `reconciler.ErrSignatureInvalid` (sig wrong length OR `ed25519.Verify == false`) | SkippedBadSig |
+| `reconciler.ErrSigningKeyUnknown` (UUID not in trusted snapshot) | SkippedBadSig |
+| ctx error | propagated -> abort `Run` |
+| any other error | propagated -> abort `Run` |
+
+### Binary wiring (on-restart blocking step)
+
+Both binaries (`cmd/clean-code-eval-gate/main.go` and
+`cmd/clean-code-gateway/main.go`) run the reconciler as
+a BLOCKING startup step BEFORE the HTTP listener
+accepts traffic, so a missing reconciliation cannot
+serve stale gate decisions or emit unreplayed audit
+frames.
+
+Required env var:
+
+- `CLEAN_CODE_WAL_RECONCILER_DSN` -- PostgreSQL DSN
+  whose auth user is a LOGIN role that has been
+  granted `clean_code_wal_reconciler` membership
+  (which is `NOLOGIN` per migration
+  `0004_roles.up.sql:191`), with
+  `options=-c role=clean_code_wal_reconciler` (or
+  equivalent `SET ROLE`) so every statement is
+  attributed to the reconciler role in
+  `pg_stat_activity` and PG audit logs. See
+  `docs/rollout.md` Stage 9.2 -> "DSN connection
+  pattern (NOLOGIN + SET ROLE)" for the operator
+  flow.
+
+  The reconciler opens its OWN dedicated pool from
+  this DSN; reusing the gateway's evaluator /
+  solid_batch pools is NOT permitted. Note that
+  those roles ALSO carry `INSERT, SELECT` on the
+  three Audit tables (migration
+  `0004_roles.up.sql:455-465` -- the three writers
+  share one append-only path by design) and ALSO
+  carry `SELECT` on `clean_code.policy_signing_keys`
+  (migration `0005_policy_signing_keys.up.sql:169-171`),
+  so the prohibition is NOT a grant-matrix gap.
+  Instead the dedicated DSN exists for three
+  operational reasons:
+
+  1. **Activity attribution.** With
+     `options=-c role=clean_code_wal_reconciler`,
+     reconciler writes show up under a distinct role
+     in `pg_stat_activity` and PG audit logs.
+     Mixing them with evaluator / solid_batch
+     activity would erase the
+     `EvaluationRun.caller='reconciler'` <->
+     PG-role correspondence operators rely on for
+     post-hoc forensics.
+  2. **Future grant tightening.** Keeping the
+     reconciler on a separate role makes it safe to
+     tighten its grants in future migrations
+     (e.g. narrow INSERT to specific columns,
+     restrict by row-level security) without
+     touching the hot-path evaluator / solid_batch
+     grants.
+  3. **Connection budgeting.** The reconciler holds
+     a connection for the entire on-restart sweep.
+     Borrowing from the evaluator / solid_batch
+     pools would steal capacity from the hot
+     serving paths during boot -- precisely when
+     those paths need to come up cleanly. A
+     dedicated pool sized for the one-shot sweep
+     avoids that contention.
+
+Boot matrix:
+
+- `signingKeys == nil` (scaffold mode, no KMS wiring) ->
+  reconciler is skipped; the binary logs
+  "WAL reconciler: skipped (no signing keys configured)"
+  and proceeds. This matches Stage 9.1's writer, which
+  also skips frame signing in scaffold mode.
+- `signingKeys != nil` AND
+  `CLEAN_CODE_WAL_RECONCILER_DSN` UNSET -> boot is
+  REFUSED (`log.Fatalf` in eval-gate, error return in
+  gateway). A silent skip would mean pending WAL
+  frames sit on disk unreplayed forever; that is the
+  exact failure mode Stage 9.2 exists to prevent.
+- `signingKeys != nil` AND DSN SET -> reconciler runs
+  to completion, logs `Stats`, and yields to the rest
+  of boot. On `Run` error the binary aborts so the
+  operator can investigate before traffic is served.
 
 ## Stage 7.1 -- Cross-Repo Aggregator cadence loop
 

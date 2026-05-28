@@ -5,6 +5,212 @@ production-tier environment. The instructions assume Postgres
 14+ is already running and the `clean_code_*` roles have been
 created via the `0004_roles.up.sql` migration.
 
+## Stage 9.2: Audit WAL Reconciler (replay-only)
+
+This subsection captures the rollout sequence for the
+`internal/audit/reconciler/` package -- the replay-only
+restart sweep that closes the Stage 9.1 durability loop.
+Architecture Sec 7.10 / iter 1 evaluator item 11.
+
+### What's new
+
+1. **`internal/audit/reconciler/` package** -- on service
+   restart, walks `data/wal/audit/`, verifies every
+   frame's signature, and replays MISSING rows into the
+   three Audit tables via
+   `INSERT ... ON CONFLICT (<pk>) DO NOTHING`.
+2. **`composition.NewWALReconciler(ctx, WALReconcilerConfig)`**
+   factory + `composition.NewHistoricalKeysWALVerifier`
+   adapter -- the production wiring point for the
+   reconciler. Returns `(nil, nil)` for scaffold-mode
+   (nil `KeyStore`) so the binary branches on
+   "reconciler disabled" deliberately. The verifier
+   pins a `[]keys.KeyRecord` snapshot from the
+   `clean_code.policy_signing_keys` table at
+   construction time, so RETIRED-but-known keys still
+   verify legitimate historical frames.
+3. **Binary on-restart wiring (this stage)** -- both
+   `cmd/clean-code-eval-gate` and
+   `cmd/clean-code-gateway` now run the reconciler as a
+   BLOCKING startup step BEFORE the HTTP listener
+   accepts traffic. New env var
+   `CLEAN_CODE_WAL_RECONCILER_DSN` is REQUIRED whenever
+   signing keys are configured.
+4. **Four pinned invariants** (architecture Sec 7.10):
+   - NEVER inserts a row whose `(table, row_pk)` already
+     exists.
+   - NEVER deletes a row.
+   - NEVER modifies a non-Audit table.
+   - PRESERVES `evaluation_run.caller` verbatim from the
+     original frame.
+5. **Phased replay** -- pass 1 every `evaluation_run`
+   frame, pass 2 every `evaluation_verdict` + `finding`
+   frame. FK ordering is honoured even on a corrupted
+   partition that has reordered frames.
+
+### What is NOT in Stage 9.2
+
+- **Retention sweep** -- the reconciler does not delete
+  WAL partition files. Disk-capacity planning still
+  rests on the operator (see Stage 9.1 rollout).
+- **Continuous-replay / interval timer** -- the
+  reconciler runs ONCE at startup and exits. A
+  long-lived process repeating the sweep on a cadence
+  is a future enhancement and is out of scope here.
+
+### Pre-rollout: confirm role grants
+
+Verify `clean_code_wal_reconciler` exists with the right
+posture:
+
+```sql
+\du clean_code_wal_reconciler
+-- Expect: the role exists, attribute set is `NOLOGIN` (the
+--         role is assumed via `SET ROLE` after the
+--         CLEAN_CODE_WAL_RECONCILER_DSN's auth user logs in
+--         -- see "DSN connection pattern" below).
+
+SELECT grantee, privilege_type, table_name
+  FROM information_schema.role_table_grants
+ WHERE grantee = 'clean_code_wal_reconciler'
+   AND table_schema = 'clean_code'
+ ORDER BY table_name, privilege_type;
+-- Expect: INSERT, SELECT on each of evaluation_run,
+--         evaluation_verdict, finding. UPDATE and DELETE
+--         MUST be absent. SELECT on
+--         policy_signing_keys must be present (the
+--         historical-keys verifier reads this table at
+--         construction time).
+```
+
+If `UPDATE` or `DELETE` appears for this role on ANY of
+the three Audit tables, STOP -- the role posture is
+broken and the reconciler's "never deletes, never
+modifies a non-Audit table" invariants degrade to
+"depend on the application layer". Re-apply migration
+`0004_roles.up.sql`. If SELECT on
+`clean_code.policy_signing_keys` is missing, re-apply
+migration `0005_policy_signing_keys.up.sql`.
+
+### DSN connection pattern (NOLOGIN + `SET ROLE`)
+
+`clean_code_wal_reconciler` is created as `NOLOGIN` by
+migration `0004_roles.up.sql:191` -- the same posture
+the existing `clean_code_evaluator` and
+`clean_code_solid_batch` roles use. The DSN therefore
+cannot connect AS `clean_code_wal_reconciler`
+directly; instead, the DSN's auth user is a
+deployment-scoped LOGIN role (typically the same
+`clean_code_app` / `clean_code_runtime` login the
+gateway already uses) that has been granted
+membership in `clean_code_wal_reconciler` via
+`GRANT clean_code_wal_reconciler TO <login-role>`,
+and the connection assumes the role via either:
+
+- **`options='-c role=clean_code_wal_reconciler'`** in
+  the libpq connect string -- the cleanest pattern:
+  PostgreSQL issues an implicit `SET ROLE` on
+  connection establishment, so every statement the
+  reconciler runs is attributed to
+  `clean_code_wal_reconciler` in `pg_stat_activity`
+  and PG audit logs without any application-side
+  bookkeeping. This is what the gateway's
+  `runWALReconciler` pool expects.
+- **`SET ROLE clean_code_wal_reconciler`** issued as
+  the first statement on every checked-out
+  connection -- equivalent semantics, but requires
+  the application to remember to do it. The Stage 9.2
+  binary wiring uses the `options=` form so this is
+  not the active pattern.
+
+Operators MUST grant the membership BEFORE the first
+post-9.2 restart:
+
+```sql
+GRANT clean_code_wal_reconciler TO clean_code_app;
+-- (replace `clean_code_app` with whatever LOGIN role
+-- your existing CLEAN_CODE_PG_URL / EVALUATOR_PG_URL
+-- DSNs already authenticate as)
+```
+
+Failing to grant the membership produces a
+`permission denied to set role
+"clean_code_wal_reconciler"` error at reconciler boot
+-- the binary will refuse to start, which is the
+correct fail-loud behaviour.
+
+### Cutover (Stage 9.2 -- blocking on-restart sweep)
+
+1. Confirm the env vars on every replica's start
+   command / systemd unit / Kubernetes Deployment:
+   - `CLEAN_CODE_AUDIT_WAL_DIR` -- the same directory
+     the Stage 9.1 writer is using (default
+     `data/wal/audit`).
+   - `CLEAN_CODE_WAL_RECONCILER_DSN` -- PostgreSQL DSN
+     whose auth user is a LOGIN role that has been
+     granted `clean_code_wal_reconciler` membership,
+     with `options=-c role=clean_code_wal_reconciler`
+     (or equivalent `SET ROLE`) so statements are
+     attributed to the reconciler role. This DSN is
+     REQUIRED whenever the existing signing-key env
+     var `CLEAN_CODE_KMS_PROVIDER` is set (see
+     `cmd/clean-code-eval-gate/main.go:190-214` and
+     `cmd/clean-code-gateway/main.go:230-231` for the
+     production check). If the DSN is absent while
+     `CLEAN_CODE_KMS_PROVIDER` is set, boot is
+     refused.
+2. Restart the affected replica. Watch the boot logs
+   for the reconciler stanza. Expectations:
+   - First the log line indicating reconciler start
+     (`WAL reconciler: starting blocking on-restart
+     sweep ...`).
+   - Then the Stats summary on completion:
+     - `Replayed.Total() = N` where `N` is the count of
+       WAL-on-disk-but-PG-missing rows (usually 0 in a
+       clean shutdown; positive after a fsync-fail
+       incident).
+     - `SkippedExisting.Total() = M` where `M` is the
+       count of WAL-on-disk-AND-PG-present rows
+       (usually the entire WAL contents minus N).
+     - `SkippedBadSig.Total() = 0` -- ANY non-zero
+       value pages on-call.
+     - `SkippedBadShape.Total() = 0` -- ANY non-zero
+       value pages on-call. (Post-signature
+       schema-drift / RowPK-mismatch failures abort
+       `Run` instead -- see step 4.)
+     - `Warnings` empty (or 1 trailing-partial entry if
+       the last partition was mid-write at shutdown).
+3. Wait for the binary to advance past the reconciler
+   stanza into the rest of the boot sequence (rule
+   engine wiring, HTTP listener). If the binary exits
+   instead, see step 4.
+4. **If the binary exits with an error mentioning
+   `decode failed AFTER valid signature`,
+   `ErrRowPKMismatch`, or `KeyStore.List` /
+   snapshot-fetch failures:** STOP. Do NOT retry blindly.
+   The first two indicate writer-side schema drift OR
+   signing-key compromise; quarantine the partition,
+   page on-call, and audit recent Policy Steward
+   key-rotation events. The third indicates the
+   reconciler could not load the historical-keys
+   snapshot (DSN unreachable or role grant missing) --
+   verify `\dp clean_code.policy_signing_keys` shows
+   SELECT for `clean_code_wal_reconciler`. See
+   `docs/runbook.md` Stage 9.2 -> "Operator checklist"
+   for the full triage flow.
+
+### Roll-back
+
+Stage 9.2 is replay-only and additive. There is nothing
+to roll back at the data layer -- the reconciler's
+inserts are no-ops on existing rows, and a botched run
+leaves the WAL bytes durable for retry. To "roll back"
+the rollout itself: unset
+`CLEAN_CODE_WAL_RECONCILER_DSN` AND the signing-key env
+vars on the affected replica. Boot will then skip the
+reconciler (scaffold-mode branch). Any WAL frames
+already on disk remain durable for a future run.
+
 ## Stage 9.1: Audit WAL frame writer
 
 This subsection captures the rollout sequence for the

@@ -111,7 +111,30 @@ The root `Makefile` also has `test-phase-03`, which discovers Compose ports, mig
 7. migration integration
 8. container build
 
+## AST parser support matrix (Stage 3.2)
+
+The repo-indexer AST dispatcher
+(`services\agent-memory\internal\repoindexer\ast`) routes each
+file to a `LanguageParser` by extension. Two back-ends ship per
+language: tree-sitter (`//go:build cgo`, canonical per
+implementation-plan §3.2) and stdlib-only scanners
+(`//go:build !cgo`, portable fallback).
+
+| Language   | Extensions               | Tree-sitter (CGO=1) | Scanner (CGO=0) | Notes                                                                                  |
+|------------|--------------------------|---------------------|-----------------|----------------------------------------------------------------------------------------|
+| TypeScript | `.ts .tsx .js .jsx .mjs .cjs` | yes            | yes             | TSX/JSX routes through `tsx` grammar; non-JSX through `typescript`.                    |
+| Python     | `.py .pyi`               | yes                 | yes             | Receiver-qualified `self.foo()` resolved through `walkPySelfCalls`.                    |
+| Rust       | `.rs`                    | yes                 | no              | v1 emits `ClassDecl` for `struct_item` / `enum_item` / `trait_item`; trait supertraits populate `Extends`. Enum variants are NOT emitted as methods. In-file `mod_item` recurses without propagating the module name into `QualifiedName`. CGO-only by design -- no stdlib scanner fallback exists. |
+
+CGO is the default OFF state on stock Windows toolchains and on
+the portable `make test` path. To exercise the tree-sitter
+back-ends locally set `CGO_ENABLED=1` and ensure a C compiler
+(gcc/clang) is on PATH. CI's `make test-race` step in
+`.github/workflows/agent-memory-ci.yml` is the canonical
+exerciser of the CGO=1 path.
+
 ## Current local validation caveats
+
 
 During the 2026-05-27 prime run on Windows, full-suite validation was not green after merging `origin/feature/memory` and `origin/feature/clean-code` into `main`.
 

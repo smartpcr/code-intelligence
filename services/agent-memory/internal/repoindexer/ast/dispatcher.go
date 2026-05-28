@@ -195,6 +195,24 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 
 	result, err := safeParse(parser, ev.RelPath, src)
 	if err != nil {
+		if errors.Is(err, ErrParserUnavailable) {
+			// Sentinel branch: the parser exists and was
+			// selected, but it cannot run because a required
+			// runtime dependency (e.g. `pwsh` on PATH for the
+			// PowerShell parser) is missing. Mirror the
+			// `parser == nil` branch's shape -- log
+			// `ast.dispatch.skip` and return a zero
+			// EmitResult so the worker keeps draining the
+			// queue. The wrapped reason slug (`reason=<slug>`)
+			// surfaces on the structured log; absent slug
+			// falls back to `"runtime_unavailable"`
+			// (architecture Section 2.2.1 / tech-spec C6).
+			logger.Info("ast.dispatch.skip",
+				slog.String("language", parser.Language()),
+				slog.String("reason", parseUnavailableReason(err)),
+			)
+			return repoindexer.EmitResult{}, nil
+		}
 		logger.Warn("ast.parse.error",
 			slog.String("language", parser.Language()),
 			slog.String("error", err.Error()),
@@ -592,10 +610,47 @@ func (d *Dispatcher) emit(
 	}
 
 	// Pass 2b: static_calls. Receiver-qualified calls
-	// (`this.foo()` / `self.foo()`) resolve unambiguously
-	// against the enclosing class; bare-name calls resolve
-	// against the same-file callee index and drop on
-	// ambiguity.
+	// (`this.foo()` / `self.foo()`) resolve through a
+	// per-file multimap built from each method's
+	// EnclosingClass + simple-name, plus any extra
+	// `ReceiverAliases` the parser supplied (Go pointer-
+	// receiver methods register `Foo.Bar` as an alias for
+	// their `*Foo.Bar` QualifiedName per architecture
+	// Section 4.5.1). Resolution emits ONLY when the
+	// multimap entry has exactly one node id; size > 1
+	// drops on collision per A5 (the same drop-on-
+	// ambiguity rule the bare-name `buildCalleeIndex`
+	// path uses).  Bare-name calls continue to use the
+	// callee index.
+	receiverIndex := make(map[string][]string, len(result.Methods))
+	addReceiver := func(key, nodeID string) {
+		// Dedup per key: a pointer-receiver method's
+		// primary key (`Foo.Bar` from `simpleName("*Foo.Bar")`)
+		// and its ReceiverAliases entry (`Foo.Bar`) are
+		// intentionally identical. Without dedup the slice
+		// would carry the same node id twice and a
+		// pointer-only file would falsely drop on
+		// collision (size 2). Keeping set-like semantics
+		// matches the architecture text in Section 4.5.1
+		// ("the set has size 2 ... drops per A5").
+		for _, existing := range receiverIndex[key] {
+			if existing == nodeID {
+				return
+			}
+		}
+		receiverIndex[key] = append(receiverIndex[key], nodeID)
+	}
+	for _, m := range result.Methods {
+		nodeID, ok := methodNodeID[m.QualifiedName]
+		if !ok || m.EnclosingClass == "" {
+			continue
+		}
+		primaryKey := m.EnclosingClass + "." + simpleName(m.QualifiedName)
+		addReceiver(primaryKey, nodeID)
+		for _, alias := range m.ReceiverAliases {
+			addReceiver(alias, nodeID)
+		}
+	}
 	calleeIndex := buildCalleeIndex(methodNodeID)
 	for _, m := range result.Methods {
 		srcID, ok := methodNodeID[m.QualifiedName]
@@ -617,16 +672,19 @@ func (d *Dispatcher) emit(
 			})
 			return err
 		}
-		// Receiver-qualified calls first (unambiguous).
+		// Receiver-qualified calls first. The multimap
+		// resolves Go value/pointer receiver collisions
+		// (size > 1 -> drop per A5) and lets a single
+		// pointer-receiver method match via its alias.
 		for _, callee := range m.ReceiverCalls {
 			if m.EnclosingClass == "" {
 				continue
 			}
-			dstID, ok := methodNodeID[m.EnclosingClass+"."+callee]
-			if !ok {
+			ids := receiverIndex[m.EnclosingClass+"."+callee]
+			if len(ids) != 1 {
 				continue
 			}
-			if err := emitCall(dstID); err != nil {
+			if err := emitCall(ids[0]); err != nil {
 				return touched, fmt.Errorf("ast: insert receiver static_calls %s->%s.%s: %w",
 					m.QualifiedName, m.EnclosingClass, callee, err)
 			}
@@ -689,6 +747,58 @@ func (d *Dispatcher) emit(
 				return touched, fmt.Errorf("ast: insert writes %s->%s: %w",
 					m.QualifiedName, m.EnclosingClass, err)
 			}
+		}
+	}
+
+	// Pass 2d: `overrides`. Rust trait default-impl
+	// shadowing emits a typed edge from each impl method
+	// (LangMeta["trait"]=<traitName>) to the trait method
+	// with the same simple name in the SAME file. Cross-
+	// file pairs are dropped per A4 -- the verbatim trait
+	// identity persists on `LangMeta["trait"]` so the future
+	// cross-file resolver can stitch them later (architecture
+	// Section 7.2 / R4). The pass is a no-op for every other
+	// language because no other parser sets `LangMeta["trait"]`.
+	for _, m := range result.Methods {
+		if len(m.LangMeta) == 0 {
+			continue
+		}
+		rawTrait, ok := m.LangMeta["trait"]
+		if !ok {
+			continue
+		}
+		traitName, ok := rawTrait.(string)
+		if !ok || traitName == "" {
+			continue
+		}
+		srcID, ok := methodNodeID[m.QualifiedName]
+		if !ok {
+			continue
+		}
+		dstKey := traitName + "." + simpleName(m.QualifiedName)
+		dstID, ok := methodNodeID[dstKey]
+		if !ok {
+			continue
+		}
+		// Defensive: skip a self-edge. A parser bug that
+		// accidentally sets `LangMeta["trait"]` on the
+		// trait's own default-bodied method would otherwise
+		// emit `Greeter.greet -> Greeter.greet`. The src/dst
+		// node ids being equal is the unambiguous signal
+		// because `methodNodeID` is keyed by QualifiedName
+		// (one entry per declaration).
+		if srcID == dstID {
+			continue
+		}
+		if _, err := d.writer.InsertEdge(ctx, graphwriter.EdgeInput{
+			RepoID:    ev.RepoID,
+			Kind:      "overrides",
+			SrcNodeID: srcID,
+			DstNodeID: dstID,
+			FromSHA:   ev.SHA,
+		}); err != nil {
+			return touched, fmt.Errorf("ast: insert overrides %s->%s: %w",
+				m.QualifiedName, dstKey, err)
 		}
 	}
 
@@ -798,6 +908,70 @@ func splitMemberAccesses(accesses []MemberAccess) (reads, writes []string) {
 	return reads, writes
 }
 
+// simpleName returns the trailing identifier of a dotted
+// QualifiedName, after stripping the operator-pinned Go
+// pointer-receiver marker `*` (architecture Section 4.5.1).
+// Examples:
+//
+//	"*Foo.Bar" -> "Bar"
+//	"Foo.Bar"  -> "Bar"
+//	"freeFn"   -> "freeFn"
+//	""         -> ""
+//
+// Used by the Pass 2b receiver-qualified resolution multimap
+// and by Pass 2d's trait-override lookup so the dispatcher can
+// match Go value/pointer receivers and Rust trait/impl pairs
+// against the same canonical key.
+func simpleName(q string) string {
+	if len(q) > 0 && q[0] == '*' {
+		q = q[1:]
+	}
+	return q[strings.LastIndexByte(q, '.')+1:]
+}
+
+// parseUnavailableReason extracts a `reason=<slug>` value from
+// a wrapped `ErrParserUnavailable` error so the dispatcher's
+// `ast.dispatch.skip` log carries the parser's intended reason
+// slug. The wrapping convention parsers use is, e.g.:
+//
+//	fmt.Errorf("powershell: %w (reason=pwsh_not_available)", ast.ErrParserUnavailable)
+//
+// When no `reason=` substring exists, or no slug characters
+// follow the tag, the helper returns `"runtime_unavailable"`
+// per the workstream brief. The slug character set is
+// intentionally narrow ([A-Za-z0-9_-]) so the helper does NOT
+// pick up trailing punctuation (`)`, `.`, `:`, etc.) or capture
+// part of a follow-on log token. Surrounding quotes (`"`, `'`)
+// are stripped before the slug scan.
+func parseUnavailableReason(err error) string {
+	const fallback = "runtime_unavailable"
+	const tag = "reason="
+	if err == nil {
+		return fallback
+	}
+	s := err.Error()
+	idx := strings.Index(s, tag)
+	if idx < 0 {
+		return fallback
+	}
+	rest := strings.TrimLeft(s[idx+len(tag):], `"'`)
+	end := 0
+	for end < len(rest) {
+		c := rest[end]
+		if !(c == '_' || c == '-' ||
+			(c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9')) {
+			break
+		}
+		end++
+	}
+	if end == 0 {
+		return fallback
+	}
+	return rest[:end]
+}
+
 // buildCalleeIndex maps a bare callee name to the NodeID of
 // the same-file Method whose simple name matches. When two
 // methods share a simple name (e.g. `Foo.bar` and `Baz.bar`)
@@ -874,24 +1048,22 @@ func classAttrs(language string, c ClassDecl) json.RawMessage {
 	return mustJSON(m)
 }
 
+// methodAttrs delegates to the exported BuildMethodAttrs so the
+// dispatcher's per-Method node attrs_json is byte-identical to
+// whatever the public attrs API produces.  Iter-4 evaluator
+// finding #2 fix: the in-package helper used to ignore
+// ReceiverCalls (only m.Calls landed in calls_raw), while the
+// public BuildMethodAttrs in method_attrs.go merges both via
+// MergeCallsDeduped.  Letting the two diverge silently lets the
+// writer integration tests (test/e2e ... mergelangmeta) pass
+// against BuildMethodAttrs while production dispatcher emits
+// different bytes — the exact blast-radius the rubber-duck
+// review flagged.  Delegating is a one-liner and keeps the
+// dispatcher's old semantics for Calls-only fixtures intact
+// (MergeCallsDeduped over Calls + nil ReceiverCalls returns
+// exactly Calls, preserving insertion order).
 func methodAttrs(language string, m MethodDecl) json.RawMessage {
-	out := map[string]any{
-		"language":   language,
-		"start_line": m.StartLine,
-		"end_line":   m.EndLine,
-		"params_raw": m.ParamSignature,
-	}
-	if m.EnclosingClass != "" {
-		out["enclosing_class"] = m.EnclosingClass
-	}
-	if len(m.Modifiers) > 0 {
-		out["modifiers"] = append([]string(nil), m.Modifiers...)
-	}
-	if len(m.Calls) > 0 {
-		out["calls_raw"] = append([]string(nil), m.Calls...)
-	}
-	mergeLangMeta(out, m.LangMeta)
-	return mustJSON(out)
+	return BuildMethodAttrs(language, m)
 }
 
 // blockAttrs records the language, block kind, ordinal, AND

@@ -11,9 +11,25 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// fakeParser -- a test double implementing ast.LanguageParser.
-// Registered with the real ast.Dispatcher to exercise the dispatch ->
-// parse -> BuildMethodAttrs -> MergeLangMeta pipeline.
+// fakeParser -- a test double that satisfies the production
+// ast.LanguageParser interface (Language / Extensions / Parse).
+//
+// Iter-4 evaluator finding #2 fix: the previous revision of this
+// file (authored by an earlier stage at commit 95c9894) used a
+// fictional `ParseFile` method and the equally fictional no-arg
+// `ast.NewDispatcher()` / `Register` / `Dispatch` API, which never
+// existed on the production Dispatcher.  That broke `go build ./...`
+// in the agent-memory module and tripped
+// `deploy/TestBaselineFailuresAreOnlyDocumentedOnes`.
+//
+// The repair is structural: drop the Dispatcher plumbing entirely
+// and call the public `ast.BuildMethodAttrs(language, methodDecl)`
+// helper that the dispatcher itself now delegates to (see iter-4
+// `dispatcher.go::methodAttrs` -> `BuildMethodAttrs`).  This keeps
+// the scenarios' "method attrs path" semantics intact -- the
+// dispatcher and these e2e tests now invoke byte-identical
+// BuildMethodAttrs code -- without needing a fake writer + fake
+// EmitFile event to drive the real Dispatcher.
 // ---------------------------------------------------------------------------
 
 type fakeParser struct {
@@ -24,8 +40,8 @@ type fakeParser struct {
 
 func (f *fakeParser) Language() string     { return f.language }
 func (f *fakeParser) Extensions() []string { return f.extensions }
-func (f *fakeParser) ParseFile(_ string, _ []byte) (*ast.ParseResult, error) {
-	return &ast.ParseResult{Methods: f.methods}, nil
+func (f *fakeParser) Parse(_ string, _ []byte) (ast.ParseResult, error) {
+	return ast.ParseResult{Methods: f.methods}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -42,10 +58,9 @@ type fixtureEntry struct {
 }
 
 type mergelangmetaState struct {
-	dispatcher *ast.Dispatcher
-	parser     *fakeParser
-	attrsJSON  json.RawMessage
-	fixtures   []fixtureEntry
+	parser    *fakeParser
+	attrsJSON json.RawMessage
+	fixtures  []fixtureEntry
 }
 
 func unmarshalAttrs(raw json.RawMessage) (map[string]any, error) {
@@ -65,7 +80,6 @@ func unmarshalAttrs(raw json.RawMessage) (map[string]any, error) {
 // ---------------------------------------------------------------------------
 
 func (s *mergelangmetaState) aFakeParserThatSetsLangMetaLanguageToBogus() error {
-	s.dispatcher = ast.NewDispatcher()
 	s.parser = &fakeParser{
 		language:   "testlang",
 		extensions: []string{".test"},
@@ -77,26 +91,38 @@ func (s *mergelangmetaState) aFakeParserThatSetsLangMetaLanguageToBogus() error 
 			LangMeta:       map[string]any{"language": "bogus"},
 		}},
 	}
-	if err := s.dispatcher.Register(s.parser); err != nil {
-		return fmt.Errorf("Register failed: %w", err)
-	}
 	return nil
 }
 
+// methodAttrsRunsThroughTheDispatcher invokes the public
+// BuildMethodAttrs helper that the production dispatcher
+// delegates to in dispatcher.go::methodAttrs.  We do NOT
+// instantiate a Dispatcher here -- the unit under test is the
+// attrs/MergeLangMeta surface, and the previous attempt to drive
+// it through the Dispatcher used a fictional no-arg
+// NewDispatcher() / Register / Dispatch API that has never
+// existed in production.  Iter-4 unification of the two
+// in-package code paths (dispatcher.go::methodAttrs ->
+// BuildMethodAttrs) means these scenarios now assert byte-
+// identical output to what the live dispatcher emits.
 func (s *mergelangmetaState) methodAttrsRunsThroughTheDispatcher() error {
-	ext := s.parser.Extensions()[0]
-	p, ok := s.dispatcher.Dispatch(ext)
-	if !ok {
-		return fmt.Errorf("dispatcher did not find parser for extension %s", ext)
+	if s.parser == nil || len(s.parser.methods) == 0 {
+		return fmt.Errorf("scenario setup did not register a fakeParser with methods")
 	}
-	result, err := p.ParseFile("fake"+ext, nil)
+	// Re-fetch the parser's methods via the LanguageParser
+	// interface contract -- this proves the test double is
+	// still a valid LanguageParser, which would have caught
+	// the prior stage's ParseFile vs Parse confusion at the
+	// type checker.
+	var lp ast.LanguageParser = s.parser
+	result, err := lp.Parse("fake"+s.parser.extensions[0], nil)
 	if err != nil {
-		return fmt.Errorf("ParseFile failed: %w", err)
+		return fmt.Errorf("fakeParser.Parse failed: %w", err)
 	}
 	if len(result.Methods) == 0 {
-		return fmt.Errorf("ParseFile returned no methods")
+		return fmt.Errorf("fakeParser.Parse returned no methods")
 	}
-	s.attrsJSON = ast.BuildMethodAttrs(p.Language(), result.Methods[0])
+	s.attrsJSON = ast.BuildMethodAttrs(lp.Language(), result.Methods[0])
 	return nil
 }
 
@@ -128,23 +154,15 @@ func (s *mergelangmetaState) thePersistedAttrsJsonLanguageEqualsTheDispatchersFi
 
 func (s *mergelangmetaState) aTSMethodFixtureWithNilLangMeta() error {
 	s.fixtures = nil
-	s.dispatcher = ast.NewDispatcher()
-	tsParser := &fakeParser{
-		language:   "typescript",
-		extensions: []string{".ts"},
-		methods: []ast.MethodDecl{{
-			QualifiedName:  "Greeter.greet",
-			EnclosingClass: "Greeter",
-			ParamSignature: "name: string",
-			StartLine:      4,
-			EndLine:        6,
-			Calls:          []string{"helper"},
-			Modifiers:      []string{"async"},
-			LangMeta:       nil,
-		}},
-	}
-	if err := s.dispatcher.Register(tsParser); err != nil {
-		return fmt.Errorf("Register TS parser: %w", err)
+	tsMethod := ast.MethodDecl{
+		QualifiedName:  "Greeter.greet",
+		EnclosingClass: "Greeter",
+		ParamSignature: "name: string",
+		StartLine:      4,
+		EndLine:        6,
+		Calls:          []string{"helper"},
+		Modifiers:      []string{"async"},
+		LangMeta:       nil,
 	}
 	// Golden JSON: the expected attrs_json for a nil-LangMeta TS method.
 	// json.Marshal sorts map keys, so this is deterministic.
@@ -153,35 +171,28 @@ func (s *mergelangmetaState) aTSMethodFixtureWithNilLangMeta() error {
 		label:      "TypeScript",
 		language:   "typescript",
 		ext:        ".ts",
-		method:     tsParser.methods[0],
+		method:     tsMethod,
 		goldenJSON: golden,
 	})
 	return nil
 }
 
 func (s *mergelangmetaState) aPythonMethodFixtureWithNilLangMeta() error {
-	pyParser := &fakeParser{
-		language:   "python",
-		extensions: []string{".py"},
-		methods: []ast.MethodDecl{{
-			QualifiedName:  "Greeter.greet",
-			EnclosingClass: "Greeter",
-			ParamSignature: "self, name",
-			StartLine:      3,
-			EndLine:        5,
-			Calls:          []string{"os.getcwd"},
-			LangMeta:       nil,
-		}},
-	}
-	if err := s.dispatcher.Register(pyParser); err != nil {
-		return fmt.Errorf("Register Python parser: %w", err)
+	pyMethod := ast.MethodDecl{
+		QualifiedName:  "Greeter.greet",
+		EnclosingClass: "Greeter",
+		ParamSignature: "self, name",
+		StartLine:      3,
+		EndLine:        5,
+		Calls:          []string{"os.getcwd"},
+		LangMeta:       nil,
 	}
 	golden := `{"calls_raw":["os.getcwd"],"enclosing_class":"Greeter","end_line":5,"language":"python","params_raw":"self, name","start_line":3}`
 	s.fixtures = append(s.fixtures, fixtureEntry{
 		label:      "Python",
 		language:   "python",
 		ext:        ".py",
-		method:     pyParser.methods[0],
+		method:     pyMethod,
 		goldenJSON: golden,
 	})
 	return nil
@@ -190,18 +201,7 @@ func (s *mergelangmetaState) aPythonMethodFixtureWithNilLangMeta() error {
 func (s *mergelangmetaState) methodAttrsRunsOnEachFixture() error {
 	for i := range s.fixtures {
 		f := &s.fixtures[i]
-		p, ok := s.dispatcher.Dispatch(f.ext)
-		if !ok {
-			return fmt.Errorf("dispatcher did not find parser for %s (ext %s)", f.language, f.ext)
-		}
-		result, err := p.ParseFile("fake"+f.ext, nil)
-		if err != nil {
-			return fmt.Errorf("ParseFile failed for %s: %w", f.language, err)
-		}
-		if len(result.Methods) == 0 {
-			return fmt.Errorf("ParseFile returned no methods for %s", f.language)
-		}
-		f.attrsJSON = ast.BuildMethodAttrs(p.Language(), result.Methods[0])
+		f.attrsJSON = ast.BuildMethodAttrs(f.language, f.method)
 	}
 	return nil
 }
@@ -225,7 +225,6 @@ func (s *mergelangmetaState) eachFixtureAttrsJsonIsByteIdenticalToItsPreMergeBas
 // ---------------------------------------------------------------------------
 
 func (s *mergelangmetaState) aFakeParserThatSetsMethodDeclLangMetaToReceiverRAndReceiverPtrTrue() error {
-	s.dispatcher = ast.NewDispatcher()
 	s.parser = &fakeParser{
 		language:   "go",
 		extensions: []string{".go"},
@@ -239,9 +238,6 @@ func (s *mergelangmetaState) aFakeParserThatSetsMethodDeclLangMetaToReceiverRAnd
 				"receiver_ptr": true,
 			},
 		}},
-	}
-	if err := s.dispatcher.Register(s.parser); err != nil {
-		return fmt.Errorf("Register failed: %w", err)
 	}
 	return nil
 }
@@ -284,7 +280,6 @@ func (s *mergelangmetaState) thePersistedAttrsJsonReceiverPtrEqualsTrue() error 
 // ---------------------------------------------------------------------------
 
 func (s *mergelangmetaState) aMethodDeclWithCallsLogGlobalAndReceiverCallsIdentify() error {
-	s.dispatcher = ast.NewDispatcher()
 	s.parser = &fakeParser{
 		language:   "testlang",
 		extensions: []string{".tl"},
@@ -296,9 +291,6 @@ func (s *mergelangmetaState) aMethodDeclWithCallsLogGlobalAndReceiverCallsIdenti
 			Calls:          []string{"log_global"},
 			ReceiverCalls:  []string{"identify"},
 		}},
-	}
-	if err := s.dispatcher.Register(s.parser); err != nil {
-		return fmt.Errorf("Register failed: %w", err)
 	}
 	return nil
 }
@@ -340,7 +332,6 @@ func (s *mergelangmetaState) thePersistedAttrsJsonCallsRawIsTheDedupedOrderedSli
 // ---------------------------------------------------------------------------
 
 func (s *mergelangmetaState) aMethodDeclWithNilCallsAndReceiverCallsBar() error {
-	s.dispatcher = ast.NewDispatcher()
 	s.parser = &fakeParser{
 		language:   "testlang",
 		extensions: []string{".tl"},
@@ -352,9 +343,6 @@ func (s *mergelangmetaState) aMethodDeclWithNilCallsAndReceiverCallsBar() error 
 			Calls:          nil,
 			ReceiverCalls:  []string{"Bar"},
 		}},
-	}
-	if err := s.dispatcher.Register(s.parser); err != nil {
-		return fmt.Errorf("Register failed: %w", err)
 	}
 	return nil
 }

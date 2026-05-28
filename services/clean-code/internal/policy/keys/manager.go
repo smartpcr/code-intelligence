@@ -256,6 +256,77 @@ func (m *Manager) Sign(ctx context.Context, payload []byte) (uuid.UUID, []byte, 
 	return chosen.KeyID, sig, nil
 }
 
+// SignActive is the 2-phase signing path the Audit WAL writer
+// uses to bind the signing-key id INTO the canonical signing
+// payload before producing the signature. It picks the same
+// active key [Manager.Sign] would (newest with
+// `valid_from <= now`), calls `build(keyID)` to obtain the
+// caller-shaped payload bytes, then runs the KMS signature +
+// verify-against-public defence-in-depth chain Sign uses.
+//
+// Why a separate method (vs. composing
+// [Manager.Sign] + a "peek the active key" accessor):
+//
+//   - The keyID and the signature MUST come from the same
+//     critical-section view of the cache. A peek-then-sign
+//     pair would race against an in-flight [Manager.Rotate]
+//     and produce a frame whose `signing_key_id` field does
+//     not match the key that produced its signature.
+//   - The Audit WAL frame format hashes the keyID INTO the
+//     bytes the signer signs (see
+//     `internal/audit/wal.AuditFrame.SigningPayload`). A
+//     verifier that re-derives the payload from the on-disk
+//     frame must see the same keyID the signer hashed in;
+//     SignActive's callback contract gives the caller
+//     exactly one shot at building those bytes against the
+//     correct keyID.
+//
+// Returns:
+//
+//   - [ErrNoActiveKey] when the cache holds no key whose
+//     valid_from <= now (mis-bootstrap).
+//   - ctx errors when the caller cancels.
+//   - the first error returned by `build`; wrapped so
+//     `errors.Is(err, sentinel)` works.
+//   - KMS / verify errors with the same wrapping shape Sign
+//     uses, so the error chain stays consistent.
+func (m *Manager) SignActive(ctx context.Context, build func(keyID uuid.UUID) ([]byte, error)) (uuid.UUID, []byte, error) {
+	if err := ctx.Err(); err != nil {
+		return uuid.Nil, nil, err
+	}
+	if build == nil {
+		return uuid.Nil, nil, errors.New("policy/keys: Manager.SignActive: build is nil")
+	}
+	m.mu.RLock()
+	cache := append([]KeyRecord(nil), m.cache...)
+	overlap := m.overlap
+	m.mu.RUnlock()
+
+	now := m.clock()
+	chosen, ok := signingKey(cache, now, overlap)
+	if !ok {
+		return uuid.Nil, nil, ErrNoActiveKey
+	}
+	payload, err := build(chosen.KeyID)
+	if err != nil {
+		return uuid.Nil, nil, fmt.Errorf("policy/keys: Manager.SignActive: build: %w", err)
+	}
+	if len(payload) == 0 {
+		return uuid.Nil, nil, errors.New("policy/keys: Manager.SignActive: build returned empty payload")
+	}
+	sig, err := m.kms.Sign(ctx, chosen.Handle, payload)
+	if err != nil {
+		return uuid.Nil, nil, fmt.Errorf("policy/keys: Manager.SignActive: kms.Sign for key_id=%s: %w", chosen.KeyID, err)
+	}
+	if len(sig) != Ed25519SignatureSize {
+		return uuid.Nil, nil, fmt.Errorf("policy/keys: Manager.SignActive: kms.Sign returned %d bytes; want %d", len(sig), Ed25519SignatureSize)
+	}
+	if err := verifyAgainstPublic(chosen.PublicKey, payload, sig); err != nil {
+		return uuid.Nil, nil, fmt.Errorf("policy/keys: Manager.SignActive: signature does not validate against key_id=%s public key: %w", chosen.KeyID, err)
+	}
+	return chosen.KeyID, sig, nil
+}
+
 // Verify checks that signature was produced by keyID over
 // payload AND that keyID is currently inside its active
 // `[valid_from, valid_until)` window. Returns one of:

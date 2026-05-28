@@ -6,6 +6,119 @@ composition root (`cmd/clean-code-metric-ingestor/main.go`,
 which hosts the management + ingest HTTP surfaces; future
 binaries under `cmd/clean-code-*` ship their own routes).
 
+## Stage 9.1 -- Audit WAL frame writer
+
+The `internal/audit/wal/` package is the write-ahead log for
+the three Audit tables (`evaluation_run`,
+`evaluation_verdict`, `finding`). Every successful Audit
+INSERT mints a signed `AuditFrame`, fsyncs it to a per-day
+partition file under `data/wal/audit/YYYY-MM-DD.wal`, and
+ONLY THEN commits the SQL transaction (architecture
+Sec 7.10 / tech-spec Sec 4.13). Catalog, Measurement,
+Policy, and Refactor writes DO NOT route through this WAL.
+
+### Disk layout
+
+- Root: `data/wal/audit/` (configured via
+  `wal.WriterConfig.Dir`).
+- Files: `YYYY-MM-DD.wal` (UTC), one per writer-clock day.
+- Format: newline-delimited JSON (one frame per line, max
+  1 MiB per frame).
+- Per-frame fields: `frame_id`, `table`, `op`, `row_pk`,
+  `row_json`, `written_at`, `signing_key_id`, `signature`.
+
+The directory must be writable by the binary's user (the
+writer creates it with `0o755` on first start). Partition
+files are append-only -- the writer NEVER rewrites or
+truncates an existing file.
+
+### Operator checklist
+
+1. **Disk capacity** -- partition files grow without an
+   in-package rotation policy in Stage 9.1. Plan for
+   ~1 KiB per Audit row (one `evaluation_run` + one
+   `evaluation_verdict` + N `finding` rows per
+   evaluation). Sizing: the post-Stage-9.2 reconciler will
+   add a retention sweep; until then operators must
+   monitor disk free space on the WAL volume.
+2. **Fsync failures** -- a write that reaches the kernel
+   but fails `fsync(2)` returns an error to the audit
+   writer; the SQL transaction MUST roll back. The frame
+   bytes MAY be readable on disk (the writer does not
+   truncate after failure -- racy across sibling
+   processes). The Stage 9.2 reconciler treats the readable
+   frame as a "speculative" replay candidate keyed on
+   `(table, row_pk)`. Today (Stage 9.1, no reconciler)
+   operators must accept that a fsync error leaves an
+   un-replayed frame on disk; raise an incident if `df`
+   shows the WAL volume below 5%.
+3. **Signature failures** -- a frame whose
+   `signing_key_id` cannot be resolved to a public key at
+   reconciler time will be quarantined (NOT applied). The
+   policy KMS handle MUST be online when the reconciler
+   runs in Stage 9.2; operators must coordinate KMS
+   maintenance windows with the reconciler's run window.
+4. **Crash recovery** -- a process crash mid-write may
+   leave a partial trailing frame in the current partition
+   file. The reader returns the sentinel
+   `ErrTrailingPartialFrame` AND the complete frames
+   decoded so far; the Stage 9.2 reconciler quarantines
+   the tail bytes and continues from the next clean
+   record. No operator action is required at Stage 9.1.
+
+### Composition wiring
+
+`Wal.Writer` is wired in the composition root of both
+`cmd/clean-code-eval-gate/main.go` and
+`cmd/clean-code-gateway/main.go`, and threaded into the
+two audit-write Stores via
+`rule_engine.SQLStoreConfig.WalWriter` and
+`evaluator.SQLDegradedRunStoreConfig.WalWriter`. **Both
+fields are REQUIRED** -- the two constructors error on
+nil, and the composition-root configs
+(`composition.EvalGateConfig.WalWriter`,
+`evaluator.ProductionGateConfig.WalWriter`) likewise
+error on nil. There is NO SQL-only fallback for Audit
+INSERTs in Stage 9.1.
+
+**No kill-switch.** There is no `CLEAN_CODE_AUDIT_WAL_DISABLED`
+env var, no feature flag, no "audit WAL off" branch. The
+two Audit-store constructors hard-error on a nil writer,
+and unsetting `CLEAN_CODE_AUDIT_WAL_DIR` does NOT disable
+the writer -- it falls through to the default
+`data/wal/audit` directory. If the WAL volume is broken,
+audit writes hard-fail with `WAL flush before SQL commit`
+errors and the entire `evaluation_run` /
+`evaluation_verdict` / `finding` triple is rolled back.
+
+The env var `CLEAN_CODE_AUDIT_WAL_DIR` (default
+`data/wal/audit`) selects the on-disk root. Both binaries
+construct a `wal.NewWriter` with one of two signer
+wirings, chosen at startup:
+
+- **Production (KMS wired)** -- the binary calls
+  `composition.NewKeysManagerWALSigner(*keys.Manager)`
+  to adapt `keys.Manager.SignActive` to the writer's
+  2-phase `wal.Signer.SignFrame` callback. Frames carry a
+  non-zero `signing_key_id` and a real Ed25519 signature
+  verifiable via `keys.Manager.Verify`.
+- **Scaffold (KMS unset)** -- the binary falls back to
+  `wal.NoopSigner{}` (SHA-256 stand-in, zero
+  `signing_key_id`) and logs a loud `WARN` at startup.
+  Intended for short-lived dev/test bring-up only.
+
+Integration tests --
+`internal/rule_engine/sql_store_wal_test.go` and
+`internal/evaluator/sql_degraded_store_wal_test.go` --
+exercise sqlmock + a real `wal.Writer` to prove every
+successful `evaluation_run`, `evaluation_verdict`, and
+`finding` INSERT pairs with a fsynced WAL frame. Both
+tests cover the signer-failure rollback case AND the
+write/fsync-failure rollback case (the per-day partition
+path is pre-created as a directory to force a real disk
+write failure at `os.OpenFile`). Stage 9.2 will layer
+the reconciler on top.
+
 ## Stage 7.1 -- Cross-Repo Aggregator cadence loop
 
 This section captures the operator-facing contract of the

@@ -39,11 +39,21 @@ import (
 	"github.com/gofrs/uuid"
 	_ "github.com/lib/pq"
 
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/composition"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/evaluator"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
 )
+
+// defaultAuditWALDir is the canonical Audit WAL partition
+// root the binary falls back to when CLEAN_CODE_AUDIT_WAL_DIR
+// is unset. Architecture Sec 7.10 / tech-spec Sec 4.13 pin
+// `data/wal/audit/` as the relative path. Production
+// deployments override via the env var to point at a durable
+// volume.
+const defaultAuditWALDir = "data/wal/audit"
 
 // maxRequestBodyBytes caps the JSON body size on both
 // `/v1/eval/gate` and `/v1/eval/replay`. The canonical
@@ -175,6 +185,7 @@ func main() {
 	// operator can tell production-tier misconfiguration
 	// apart from intentional scaffold-mode.
 	var stewardSigner steward.Signer
+	var signingKeysManager *keys.Manager
 	var keysClose func()
 	kmsProvider := os.Getenv("CLEAN_CODE_KMS_PROVIDER")
 	switch kmsProvider {
@@ -203,6 +214,7 @@ func main() {
 			log.Fatalf("clean-code-eval-gate: keys.Build(provider=%s): %v", kmsProvider, kerr)
 		}
 		stewardSigner = keysRes.Manager
+		signingKeysManager = keysRes.Manager
 		keysClose = keysRes.Close
 		log.Printf("clean-code-eval-gate: keys.Manager wired (provider=%s); Gate.Evaluate signature-verify path is LIVE", kmsProvider)
 	default:
@@ -218,6 +230,51 @@ func main() {
 		log.Fatalf("clean-code-eval-gate: steward.New: %v", err)
 	}
 
+	// Stage 9.1 -- Audit WAL writer (architecture Sec
+	// 7.10 / tech-spec Sec 4.13). The writer is REQUIRED
+	// by both `rule_engine.NewSQLStore` and
+	// `evaluator.NewProductionGate`: every successful
+	// `evaluation_run` + `evaluation_verdict` + `finding`
+	// INSERT they perform is mirrored to a signed WAL
+	// frame fsynced BEFORE the SQL transaction commits.
+	// Iter-2 evaluator item #3: this is the production
+	// reading of CLEAN_CODE_AUDIT_WAL_DIR.
+	//
+	// Signer choice (iter-3 evaluator item #1): when the
+	// composition root has a real KMS-backed
+	// `keys.Manager` (CLEAN_CODE_KMS_PROVIDER=local |
+	// in-memory), the WAL signer is the production
+	// Ed25519 path
+	// ([composition.NewKeysManagerWALSigner]). In
+	// scaffold mode (KMS provider unset) the WAL signer
+	// falls back to `wal.NoopSigner`, since the gate is
+	// already degrading every request as
+	// policy_signature_invalid in that mode -- frames on
+	// disk get the SHA-256 stand-in but the binary
+	// surface still serves dev/test. Production
+	// deployments MUST set CLEAN_CODE_KMS_PROVIDER.
+	walDir := os.Getenv("CLEAN_CODE_AUDIT_WAL_DIR")
+	if walDir == "" {
+		walDir = defaultAuditWALDir
+		log.Printf("clean-code-eval-gate: CLEAN_CODE_AUDIT_WAL_DIR unset; using default %q", walDir)
+	}
+	var walSigner wal.Signer
+	if signingKeysManager != nil {
+		walSigner = composition.NewKeysManagerWALSigner(signingKeysManager)
+		log.Printf("clean-code-eval-gate: Audit WAL signer = keys.Manager-backed Ed25519 (provider=%s)", kmsProvider)
+	} else {
+		walSigner = wal.NoopSigner{}
+		log.Print("clean-code-eval-gate: WARN: Audit WAL signer = wal.NoopSigner (SHA-256 stand-in, signing_key_id=uuid.Nil). This is acceptable ONLY in scaffold mode (CLEAN_CODE_KMS_PROVIDER unset); production deployments MUST set CLEAN_CODE_KMS_PROVIDER=local + CLEAN_CODE_KMS_MASTER_KEY_HEX so the WAL signer becomes the Ed25519 keys.Manager path.")
+	}
+	walWriter, err := wal.NewWriter(wal.WriterConfig{
+		Dir:    walDir,
+		Signer: walSigner,
+	})
+	if err != nil {
+		log.Fatalf("clean-code-eval-gate: wal.NewWriter(dir=%s): %v", walDir, err)
+	}
+	log.Printf("clean-code-eval-gate: Audit WAL writer wired (dir=%s)", walDir)
+
 	// rule_engine.SQLStore consumes the solid_batch
 	// handle so the canonical Audit triple is INSERTED
 	// under the `clean_code_solid_batch` grant -- the
@@ -227,8 +284,9 @@ func main() {
 	// evaluator.NewProductionGate (signature-invalid,
 	// samples-pending).
 	ruleStore, err := rule_engine.NewSQLStore(rule_engine.SQLStoreConfig{
-		DB:      solidBatchDB,
-		Steward: stewardStore,
+		DB:        solidBatchDB,
+		Steward:   stewardStore,
+		WalWriter: walWriter,
 	})
 	if err != nil {
 		log.Fatalf("clean-code-eval-gate: rule_engine.NewSQLStore: %v", err)
@@ -251,7 +309,8 @@ func main() {
 		// also re-checks `evaluator.Verdict.IsValid`
 		// before returning, giving us a single
 		// canonical bridge between engine + gate.
-		Engine: rule_engine.NewEvaluatorAdapter(engine),
+		Engine:    rule_engine.NewEvaluatorAdapter(engine),
+		WalWriter: walWriter,
 		// KeyManager intentionally nil: the legacy
 		// signature-bundle [Gate.VerifyPolicy] surface
 		// is not the focus of Stage 5.7. The Evaluate

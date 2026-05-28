@@ -146,8 +146,12 @@ func TestSQLDegradedRunStore_RejectsPercentileStaleReasonBeforeSQL(t *testing.T)
 	// Construct a store without a DB handle -- the
 	// validator runs BEFORE BeginTx so this is safe.
 	// NewSQLDegradedRunStore requires DB != nil; we
-	// construct the struct directly for the test.
-	s := &SQLDegradedRunStore{db: nil, schema: "clean_code"}
+	// construct the struct directly for the test. The
+	// walWriter is wired so a future reorder that moves
+	// the WAL allocation above the percentile_stale
+	// check (Stage 9.1) does not turn this test into a
+	// nil-deref panic.
+	s := &SQLDegradedRunStore{db: nil, schema: "clean_code", walWriter: newTestWALWriter(t)}
 
 	runID := uuid.Must(uuid.NewV4())
 	verdictID := uuid.Must(uuid.NewV4())

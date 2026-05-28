@@ -9,6 +9,8 @@ import (
 
 	"github.com/gofrs/uuid"
 	"github.com/lib/pq"
+
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
 )
 
 // SQLDegradedRunStore is the production [DegradedRunStore]
@@ -32,6 +34,16 @@ import (
 type SQLDegradedRunStore struct {
 	db     *sql.DB
 	schema string
+
+	// walWriter is the Audit WAL writer (Stage 9.1 /
+	// architecture Sec 7.10). REQUIRED -- never nil after
+	// construction. Every degraded `evaluation_run` +
+	// `evaluation_verdict` INSERT this store performs is
+	// mirrored as a signed WAL frame fsynced BEFORE the
+	// SQL transaction commits. The constructor rejects a
+	// nil WalWriter so the gate's degraded short-circuits
+	// cannot silently bypass the WAL.
+	walWriter *wal.Writer
 }
 
 // SQLDegradedRunStoreConfig configures the production
@@ -46,20 +58,40 @@ type SQLDegradedRunStoreConfig struct {
 	// `"clean_code"` (the canonical CLEAN-CODE schema)
 	// when empty.
 	Schema string
+	// WalWriter is the Audit WAL writer. REQUIRED -- the
+	// constructor rejects a nil writer. Every degraded
+	// audit write is mirrored to the WAL inside the same
+	// SQL transaction; WAL fsync precedes SQL commit
+	// (architecture Sec 7.10). Tests supply a
+	// [wal.Writer] backed by `t.TempDir()` so the
+	// degraded-write path is exercised identically to
+	// production.
+	WalWriter *wal.Writer
 }
 
 // NewSQLDegradedRunStore wires the production
-// [SQLDegradedRunStore]. Returns an error when the DB
-// handle is missing.
+// [SQLDegradedRunStore]. Returns an error when any required
+// dependency is missing.
+//
+// REQUIRED -- WalWriter (Stage 9.1 brief, iter-1 evaluator
+// item #2): every successful degraded `evaluation_run` +
+// `evaluation_verdict` INSERT this store performs MUST be
+// paired with a WAL frame fsynced before the SQL commit
+// (architecture Sec 7.10 / tech-spec Sec 4.13). The
+// constructor refuses a nil WalWriter so a production
+// composition cannot silently degrade to SQL-only writes.
 func NewSQLDegradedRunStore(cfg SQLDegradedRunStoreConfig) (*SQLDegradedRunStore, error) {
 	if cfg.DB == nil {
 		return nil, errors.New("evaluator: NewSQLDegradedRunStore: DB is nil")
+	}
+	if cfg.WalWriter == nil {
+		return nil, errors.New("evaluator: NewSQLDegradedRunStore: WalWriter is nil (Stage 9.1: every degraded Audit INSERT MUST stage a WAL frame fsynced before SQL commit; supply a *wal.Writer rooted at CLEAN_CODE_AUDIT_WAL_DIR in production or t.TempDir() in tests)")
 	}
 	schema := cfg.Schema
 	if schema == "" {
 		schema = "clean_code"
 	}
-	return &SQLDegradedRunStore{db: cfg.DB, schema: schema}, nil
+	return &SQLDegradedRunStore{db: cfg.DB, schema: schema, walWriter: cfg.WalWriter}, nil
 }
 
 // AppendDegradedRun persists the run + verdict pair inside
@@ -132,6 +164,15 @@ func (s *SQLDegradedRunStore) AppendDegradedRun(ctx context.Context, run Degrade
 		_ = tx.Rollback()
 	}()
 
+	// Allocate the per-tx WAL batch. The constructor
+	// guarantees `s.walWriter != nil` (Stage 9.1 brief,
+	// iter-2 evaluator item #2). `defer batch.Cancel()`
+	// ensures discard on every error / panic path;
+	// `batch.Commit(ctx)` on the happy path renders the
+	// later Cancel a no-op.
+	walBatch := s.walWriter.NewTxBatch()
+	defer walBatch.Cancel()
+
 	createdAt := time.Unix(0, run.CreatedAt).UTC()
 
 	// Iter-8 evaluator feedback #2: the degraded write
@@ -167,6 +208,15 @@ func (s *SQLDegradedRunStore) AppendDegradedRun(ctx context.Context, run Degrade
 	); err != nil {
 		return fmt.Errorf("evaluator: AppendDegradedRun: insert evaluation_run: %w", err)
 	}
+	{
+		rowJSON, err := walDegradedRunRowJSON(run)
+		if err != nil {
+			return fmt.Errorf("evaluator: AppendDegradedRun: WAL row shape evaluation_run: %w", err)
+		}
+		if _, err := walBatch.StageNew(ctx, wal.TableEvaluationRun, run.EvaluationRunID, rowJSON); err != nil {
+			return fmt.Errorf("evaluator: AppendDegradedRun: WAL stage evaluation_run: %w", err)
+		}
+	}
 
 	verdictCreatedAt := time.Unix(0, verdict.CreatedAt).UTC()
 	verdictStmt := fmt.Sprintf(
@@ -184,6 +234,24 @@ func (s *SQLDegradedRunStore) AppendDegradedRun(ctx context.Context, run Degrade
 		verdictCreatedAt,
 	); err != nil {
 		return fmt.Errorf("evaluator: AppendDegradedRun: insert evaluation_verdict: %w", err)
+	}
+	{
+		rowJSON, err := walDegradedVerdictRowJSON(verdict)
+		if err != nil {
+			return fmt.Errorf("evaluator: AppendDegradedRun: WAL row shape evaluation_verdict: %w", err)
+		}
+		if _, err := walBatch.StageNew(ctx, wal.TableEvaluationVerdict, verdict.VerdictID, rowJSON); err != nil {
+			return fmt.Errorf("evaluator: AppendDegradedRun: WAL stage evaluation_verdict: %w", err)
+		}
+	}
+
+	// WAL fsync MUST precede SQL commit (architecture
+	// Sec 7.1 / honest four-state contract): if the
+	// sync fails the SQL tx rolls back and the
+	// reconciler treats any readable speculative frame
+	// as a replay candidate.
+	if err := walBatch.Commit(ctx); err != nil {
+		return fmt.Errorf("evaluator: AppendDegradedRun: WAL flush before SQL commit: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {

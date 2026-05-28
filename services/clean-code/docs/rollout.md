@@ -5,6 +5,187 @@ production-tier environment. The instructions assume Postgres
 14+ is already running and the `clean_code_*` roles have been
 created via the `0004_roles.up.sql` migration.
 
+## Stage 9.1: Audit WAL frame writer
+
+This subsection captures the rollout sequence for the
+`internal/audit/wal/` package -- the per-process WAL writer
+scoped EXCLUSIVELY to the three Audit tables
+(`evaluation_run`, `evaluation_verdict`, `finding`).
+Architecture Sec 7.10 / tech-spec Sec 4.13.
+
+### What's new
+
+1. **`internal/audit/wal/` package** -- `Writer`, `TxBatch`,
+   `Signer`, `AuditFrame`, `ReadAll`/`ReadPartition`,
+   `MaxFrameSize = 1<<20`, and the
+   `ErrTrailingPartialFrame` / `ErrFrameSizeExceeded`
+   sentinel taxonomy.
+2. **WAL writer REQUIRED at both audit-write Stores** --
+   `rule_engine.NewSQLStore` and
+   `evaluator.NewSQLDegradedRunStore` BOTH error if
+   `WalWriter` is nil (`internal/rule_engine/sql_store.go`
+   constructor, `internal/evaluator/sql_degraded_store.go`
+   constructor). This is the row+WAL atomicity guard
+   demanded by the brief: there is NO SQL-only fallback
+   for Audit-table writes. The two writers stage WAL
+   frames in a per-tx batch and call `batch.Commit(ctx)`
+   BEFORE `tx.Commit()`; a WAL fsync failure rolls back
+   the SQL transaction.
+3. **Production composition wires the writer** --
+   `cmd/clean-code-eval-gate/main.go` and
+   `cmd/clean-code-gateway/main.go` read
+   `CLEAN_CODE_AUDIT_WAL_DIR` (default `data/wal/audit`)
+   at startup, construct a `wal.Writer`, and pass it to
+   `composition.BuildEvalGate` /
+   `evaluator.NewProductionGate` /
+   `rule_engine.NewSQLStore`. Both
+   `composition.EvalGateConfig` and
+   `evaluator.ProductionGateConfig` REQUIRE the field
+   and error at construction time when it is nil
+   (`TestBuildEvalGate_RejectsNilWalWriter`,
+   `TestSQLDegradedRunStore_RejectsNilWalWriter`).
+4. **Conformance enforcement** -- `test/conformance/wal_scope_test.go`
+   pins the closed allow-list of importers.
+5. **Integration tests prove frame emission** --
+   `internal/rule_engine/sql_store_wal_test.go` and
+   `internal/evaluator/sql_degraded_store_wal_test.go`
+   exercise sqlmock + real `wal.Writer`, asserting the
+   happy-path frame triple, the signer-failure rollback
+   contract, AND the write/fsync-failure rollback contract
+   (`TestSQLStore_AppendEvaluation_WALFlushFailureRollsBackSQL`,
+   `TestSQLDegradedRunStore_AppendDegradedRun_WALFlushFailureRollsBackSQL`).
+6. **Production signer is `policy/keys`-backed when KMS is
+   wired** -- `cmd/clean-code-eval-gate/main.go` and
+   `cmd/clean-code-gateway/main.go` construct the writer's
+   signer via `composition.NewKeysManagerWALSigner(*keys.Manager)`
+   when the signing keys manager is non-nil. The 2-phase
+   callback contract (keyID emitted into the canonical
+   payload BEFORE signing) is satisfied by
+   `keys.Manager.SignActive(ctx, build)`. Frames signed by
+   the KMS path carry a non-zero `signing_key_id` and a
+   real Ed25519 signature verifiable via `keys.Manager.Verify`.
+7. **No kill-switch** -- there is NO `CLEAN_CODE_AUDIT_WAL_DISABLED`
+   env var, NO "audit WAL off" feature flag, and NO SQL-only
+   fallback path for Audit-table writes. Unsetting
+   `CLEAN_CODE_AUDIT_WAL_DIR` does NOT disable the writer; it
+   falls through to the default `data/wal/audit` directory.
+   The two Audit-store constructors error on nil `WalWriter`
+   and the composition root refuses to build the eval-gate
+   without one.
+
+### What is NOT in Stage 9.1
+
+The Stage 9.2 brief covers the **reconciler** (replay of
+speculative frames against PostgreSQL keyed on
+`(table, row_pk)`, signature verification via the policy KMS
+handle, quarantine of unverifiable frames). Stage 9.1 stops
+at the writer; reconciler enablement is deferred.
+
+### Pre-rollout: provision the WAL volume
+
+1. Pick a dedicated mount for `data/wal/audit/` with at least
+   2 GiB free (per-process). The writer creates the
+   directory at startup with mode `0o755` -- the parent
+   must be writable by the binary's user.
+2. Set the env knob (composition root reads it during
+   wiring): `CLEAN_CODE_AUDIT_WAL_DIR=/srv/clean-code/data/wal/audit`.
+3. Mount the volume with `data=ordered` (ext4) or
+   `data_journal=writeback` is NOT sufficient -- the WAL
+   contract depends on `fsync(2)` durability semantics
+   typical of `data=ordered` and `xfs` defaults.
+
+### Pre-rollout: confirm WAL signer scope
+
+Stage 9.1 supports TWO signer wirings, chosen at startup
+based on whether the `policy/keys` signing manager was
+constructed (driven by the binary's KMS/keystore env
+variables -- see `cmd/clean-code-eval-gate/main.go` and
+`cmd/clean-code-gateway/main.go`):
+
+1. **Production (KMS wired)** -- the binary calls
+   `composition.NewKeysManagerWALSigner(*keys.Manager)`
+   which adapts `keys.Manager.SignActive(ctx, build)` to
+   the writer's 2-phase `wal.Signer.SignFrame(ctx, build)`
+   callback contract. The keyID is emitted into the
+   canonical payload BEFORE signing, so the on-disk
+   `signing_key_id` field is bound to the bytes the KMS
+   actually signed. Frames are verifiable via
+   `keys.Manager.Verify(keyID, payload, sig)`. The Stage
+   9.2 reconciler will use this verifier to gate replay
+   eligibility.
+2. **Scaffold (KMS unset)** -- the binary falls back to
+   `wal.NoopSigner{}` (SHA-256 stand-in, zero
+   `signing_key_id`) and emits a loud `WARN` log at
+   startup. This is intended for short-lived dev/test
+   bring-up while KMS provisioning catches up; operators
+   MUST NOT treat scaffold-mode frames as
+   cryptographically authoritative. Audit any
+   scaffold-mode partition files before the Stage 9.2
+   reconciler ships -- they will land in the
+   quarantine queue.
+
+The frame format itself is stable across both wirings
+(`signing_key_id` + `signature` fields are populated in
+both paths), so partition files written under scaffold
+mode remain readable by the production reader and the
+Stage 9.2 reconciler.
+
+### Pre-rollout: confirm role grants
+
+Audit table INSERTs are made by the existing
+`clean_code_evaluator` (degraded path) and
+`clean_code_solid_batch` (happy path) roles. Stage 9.1 does
+NOT add a new role; the WAL writes are local-disk only.
+A future migration may add `clean_code_wal_reconciler` for
+the Stage 9.2 replay path.
+
+### Cutover
+
+1. **Deploy the new binary** with the audit WAL volume
+   mounted and `CLEAN_CODE_AUDIT_WAL_DIR` set.
+   `cmd/clean-code-eval-gate/main.go` and
+   `cmd/clean-code-gateway/main.go` read the env var
+   (default `data/wal/audit` relative to the binary's
+   cwd if unset) and pass the constructed `wal.Writer`
+   into `composition.BuildEvalGate`,
+   `evaluator.NewProductionGate`, and
+   `rule_engine.NewSQLStore`. A misconfigured
+   `WalWriter` causes the binary to fail to start --
+   this is intentional, the row+WAL atomicity guarantee
+   has no SQL-only fallback.
+2. **Tail the WAL volume** for the first 5 minutes of
+   production traffic. Expect at most one partition file
+   per UTC day. Per-frame size is well under the 1 MiB cap
+   for typical finding rows; a `frame_size_exceeded`
+   error in the binary logs indicates a malformed audit
+   row (the SQL transaction will have rolled back, so
+   PostgreSQL is uncorrupted).
+3. **Confirm SQL writes still succeed** -- WAL fsync
+   failures cause the SQL transaction to roll back. If
+   the WAL volume is misconfigured (read-only mount,
+   wrong owner), audit writes will hard-fail with
+   `WAL flush before SQL commit` errors. Roll back the
+   deploy and re-verify the volume.
+
+### Roll-back
+
+Audit-table writes REQUIRE a WAL writer in Stage 9.1 --
+the two store constructors error on nil `WalWriter`,
+and the composition roots refuse to build the eval-gate
+without it. There is NO env-var kill-switch and no
+SQL-only fallback path. To roll back:
+
+1. Re-deploy the prior binary (the one without the
+   WAL-required constructor guard) -- the partition
+   files written by the new build remain readable by
+   the Stage 9.2 reconciler when it ships.
+2. If the WAL volume is genuinely broken (read-only
+   mount, wrong owner) and the prior binary is
+   unavailable, point `CLEAN_CODE_AUDIT_WAL_DIR` at a
+   writable scratch directory to unblock startup; the
+   Stage 9.2 reconciler will pick up the rerouted
+   partition files.
+
 ## Stage 7.1: Cross-Repo Aggregator cadence loop
 
 This subsection captures the rollout sequence for the

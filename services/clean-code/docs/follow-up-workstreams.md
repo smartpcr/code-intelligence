@@ -201,6 +201,15 @@ Key observations:
   stage and shifted the expected pair indices in the
   discovery test). Per iter-4 git evidence the
   introducing PR was #105.
+- **Suggested targets**:
+    - `services/clean-code/internal/storage/` (migration
+      discovery and the per-stage pair fixtures)
+- **Stage 7.3 cannot fix unilaterally because**: same
+  rationale as FU-3 -- `internal/management` depends on
+  `internal/storage` at compile-time but the failing
+  tests gate migration ordering, which is a
+  release-versioning concern owned by the storage
+  workstream.
 
 ---
 
@@ -318,15 +327,6 @@ in their entirety.
       (validator + test fixture)
 - **Out-of-scope for Stage 7.3 because**: different service,
   failure pre-dates Stage 7.3 branch base.
-- **Suggested targets**:
-    - `services/clean-code/internal/storage/` (migration
-      discovery and the per-stage pair fixtures)
-- **Stage 7.3 cannot fix unilaterally because**: same
-  rationale as FU-3 -- `internal/management` depends on
-  `internal/storage` at compile-time but the failing
-  tests gate migration ordering, which is a
-  release-versioning concern owned by the storage
-  workstream.
 
 ## Verifying after each follow-up workstream lands
 

@@ -54,15 +54,11 @@ func (em *Emitter) Emit() ([]Edge, []string) {
 	for _, caller := range em.result.Methods {
 		callerQualName := caller.ClassName + "." + caller.Name
 
-		for _, callee := range em.result.Methods {
-			if callee.Name == caller.Name {
-				continue
-			}
-
-			shortName := callee.Name
-			targets := methodTargets[shortName]
-
+		// Iterate only over call-sites declared by the parser, not all methods.
+		for _, shortName := range caller.Calls {
 			callsRaw = append(callsRaw, shortName)
+
+			targets := methodTargets[shortName]
 
 			if len(targets) > 1 {
 				// A5: set size > 1 → drop, do NOT emit static_calls edge.

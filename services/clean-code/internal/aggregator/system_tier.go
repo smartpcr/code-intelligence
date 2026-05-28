@@ -1799,12 +1799,41 @@ func (w *InMemorySystemTierWriter) WriteSystemTierSamples(ctx context.Context, s
 			return fmt.Errorf("aggregator.InMemorySystemTierWriter: sample %d invariant violated: %w", i, err)
 		}
 	}
-	// Deep-copy the slice so a caller mutating its locals
-	// after the write does not perturb the captured batch.
+	// Deep-copy the slice (including each sample's Attrs map
+	// and Value pointer, both of which are reference types a
+	// plain `copy` would share with the caller) so a caller
+	// mutating its locals after the write does not perturb
+	// the captured batch. The struct copy on its own would
+	// alias `samples[i].Attrs` and `samples[i].Value`; the
+	// per-element clone breaks that aliasing.
 	cp := make([]SystemTierSample, len(samples))
-	copy(cp, samples)
+	for i := range samples {
+		cp[i] = cloneSystemTierSample(samples[i])
+	}
 	w.batches = append(w.batches, cp)
 	return nil
+}
+
+// cloneSystemTierSample returns a deep-copy of s with its
+// Attrs map and Value pointer freshly allocated. The other
+// fields ([SystemTierSample.SampleID], [SystemTierSample.RepoID],
+// [SystemTierSample.SHA], the canonical pack/source/kind
+// strings, the bool, ...) are value types whose struct-level
+// copy is already independent of the caller.
+func cloneSystemTierSample(s SystemTierSample) SystemTierSample {
+	out := s
+	if s.Value != nil {
+		v := *s.Value
+		out.Value = &v
+	}
+	if s.Attrs != nil {
+		attrs := make(map[string]string, len(s.Attrs))
+		for k, v := range s.Attrs {
+			attrs[k] = v
+		}
+		out.Attrs = attrs
+	}
+	return out
 }
 
 // Batches returns a copy of the captured write history. Each

@@ -15,8 +15,8 @@ env:
   COMPOSE_FILE: tests/e2e/phase-08-refactor-planner/docker-compose.yml
 
 jobs:
-  e2e-composite-hotspot-scoring:
-    name: "E2E – Composite Hotspot Scoring"
+  e2e-refactor-plan-and-task-generation:
+    name: "E2E – Refactor Plan and Task Generation"
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -44,14 +44,16 @@ jobs:
           echo "CLEAN_CODE_MGMT_URL=http://localhost:${MGMT_PORT}" >> "$GITHUB_ENV"
           echo "CLEAN_CODE_OTEL_ENDPOINT=http://localhost:${OTEL_PORT}" >> "$GITHUB_ENV"
 
-      - name: Bootstrap – migrate
-        run: make migrate-up CLEAN_CODE_PG_URL="${CLEAN_CODE_PG_URL}"
+      - name: Bootstrap – migrate and seed
+        run: |
+          make migrate-up CLEAN_CODE_PG_URL="${CLEAN_CODE_PG_URL}"
+          make seed-phase-08 CLEAN_CODE_PG_URL="${CLEAN_CODE_PG_URL}"
 
       - name: Run E2E tests
         working-directory: services/clean-code
         run: |
           go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
-            -run TestE2E_refactor_planner_composite_hotspot_scoring
+            -run TestE2E_refactor_planner_refactor_plan_and_task_generation
 
       - name: Tear down compose services
         if: always()

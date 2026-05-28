@@ -186,6 +186,21 @@ func run() int {
 						logger.Error("clean-code-refactor-planner: planner failed", "err", pErr)
 						exitCode = 1
 					}
+				} else if taskRes.Plan.PlanID == uuid.Nil {
+					// ErrNoActivePolicy path: executeTwoPassPlan
+					// returned (planRes, zero PlanAndTasksResult,
+					// nil) because Stage 8.1 found no active
+					// [steward.PolicyVersion]. The Stage 8.1 WARN
+					// already explained why; emit a distinct
+					// INFO so operators scanning structured logs
+					// don't see a contradictory "planner OK"
+					// line with all-zero policy_version_id /
+					// plan_id UUIDs.
+					logger.Info("clean-code-refactor-planner: no work performed",
+						"repo_id", repoID.String(),
+						"sha", sha,
+						"reason", "no active policy",
+					)
 				} else {
 					logger.Info("clean-code-refactor-planner: planner OK",
 						"repo_id", repoID.String(),

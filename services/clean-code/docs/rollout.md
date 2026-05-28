@@ -65,9 +65,10 @@ posture:
 
 ```sql
 \du clean_code_wal_reconciler
--- Expect: the role exists, with LOGIN granted (so the
---         CLEAN_CODE_WAL_RECONCILER_DSN can connect as
---         this role).
+-- Expect: the role exists, attribute set is `NOLOGIN` (the
+--         role is assumed via `SET ROLE` after the
+--         CLEAN_CODE_WAL_RECONCILER_DSN's auth user logs in
+--         -- see "DSN connection pattern" below).
 
 SELECT grantee, privilege_type, table_name
   FROM information_schema.role_table_grants
@@ -91,6 +92,53 @@ modifies a non-Audit table" invariants degrade to
 `clean_code.policy_signing_keys` is missing, re-apply
 migration `0005_grants.up.sql`.
 
+### DSN connection pattern (NOLOGIN + `SET ROLE`)
+
+`clean_code_wal_reconciler` is created as `NOLOGIN` by
+migration `0004_roles.up.sql:191` -- the same posture
+the existing `clean_code_evaluator` and
+`clean_code_solid_batch` roles use. The DSN therefore
+cannot connect AS `clean_code_wal_reconciler`
+directly; instead, the DSN's auth user is a
+deployment-scoped LOGIN role (typically the same
+`clean_code_app` / `clean_code_runtime` login the
+gateway already uses) that has been granted
+membership in `clean_code_wal_reconciler` via
+`GRANT clean_code_wal_reconciler TO <login-role>`,
+and the connection assumes the role via either:
+
+- **`options='-c role=clean_code_wal_reconciler'`** in
+  the libpq connect string -- the cleanest pattern:
+  PostgreSQL issues an implicit `SET ROLE` on
+  connection establishment, so every statement the
+  reconciler runs is attributed to
+  `clean_code_wal_reconciler` in `pg_stat_activity`
+  and PG audit logs without any application-side
+  bookkeeping. This is what the gateway's
+  `runWALReconciler` pool expects.
+- **`SET ROLE clean_code_wal_reconciler`** issued as
+  the first statement on every checked-out
+  connection -- equivalent semantics, but requires
+  the application to remember to do it. The Stage 9.2
+  binary wiring uses the `options=` form so this is
+  not the active pattern.
+
+Operators MUST grant the membership BEFORE the first
+post-9.2 restart:
+
+```sql
+GRANT clean_code_wal_reconciler TO clean_code_app;
+-- (replace `clean_code_app` with whatever LOGIN role
+-- your existing CLEAN_CODE_PG_URL / EVALUATOR_PG_URL
+-- DSNs already authenticate as)
+```
+
+Failing to grant the membership produces a
+`permission denied to set role
+"clean_code_wal_reconciler"` error at reconciler boot
+-- the binary will refuse to start, which is the
+correct fail-loud behaviour.
+
 ### Cutover (Stage 9.2 -- blocking on-restart sweep)
 
 1. Confirm the env vars on every replica's start
@@ -99,8 +147,12 @@ migration `0005_grants.up.sql`.
      the Stage 9.1 writer is using (default
      `data/wal/audit`).
    - `CLEAN_CODE_WAL_RECONCILER_DSN` -- PostgreSQL DSN
-     authenticated as `clean_code_wal_reconciler`. This
-     DSN is REQUIRED whenever the existing signing-key
+     whose auth user is a LOGIN role that has been
+     granted `clean_code_wal_reconciler` membership,
+     with `options=-c role=clean_code_wal_reconciler`
+     (or equivalent `SET ROLE`) so statements are
+     attributed to the reconciler role. This DSN is
+     REQUIRED whenever the existing signing-key
      env vars (`CLEAN_CODE_KMS_PROVIDER` +
      `CLEAN_CODE_KMS_PG_URL`) are set. If the DSN is
      absent while signing is on, boot is refused.

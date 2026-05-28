@@ -358,13 +358,55 @@ frames.
 Required env var:
 
 - `CLEAN_CODE_WAL_RECONCILER_DSN` -- PostgreSQL DSN
-  authenticated as `clean_code_wal_reconciler`. The
-  reconciler opens its own dedicated pool from this
-  DSN; reusing the gateway's evaluator / solid_batch
-  pools is NOT permitted because those roles have the
-  wrong grant matrix (INSERT on Audit tables is
-  withheld from them and only granted to
-  `clean_code_wal_reconciler`).
+  whose auth user is a LOGIN role that has been
+  granted `clean_code_wal_reconciler` membership
+  (which is `NOLOGIN` per migration
+  `0004_roles.up.sql:191`), with
+  `options=-c role=clean_code_wal_reconciler` (or
+  equivalent `SET ROLE`) so every statement is
+  attributed to the reconciler role in
+  `pg_stat_activity` and PG audit logs. See
+  `docs/rollout.md` Stage 9.2 -> "DSN connection
+  pattern (NOLOGIN + SET ROLE)" for the operator
+  flow.
+
+  The reconciler opens its OWN dedicated pool from
+  this DSN; reusing the gateway's evaluator /
+  solid_batch pools is NOT permitted. Note that
+  those roles ALSO carry `INSERT, SELECT` on the
+  three Audit tables (migration
+  `0004_roles.up.sql:455-465` -- the three writers
+  share one append-only path by design) and ALSO
+  carry `SELECT` on `clean_code.policy_signing_keys`
+  (migration `0005_policy_signing_keys.up.sql:169-171`),
+  so the prohibition is NOT a grant-matrix gap.
+  Instead the dedicated DSN exists for three
+  operational reasons:
+
+  1. **Activity attribution.** With
+     `options=-c role=clean_code_wal_reconciler`,
+     reconciler writes show up under a distinct role
+     in `pg_stat_activity` and PG audit logs.
+     Mixing them with evaluator / solid_batch
+     activity would erase the
+     `EvaluationRun.caller='reconciler'` <->
+     PG-role correspondence operators rely on for
+     post-hoc forensics.
+  2. **Future grant tightening.** Keeping the
+     reconciler on a separate role makes it safe to
+     tighten its grants in future migrations
+     (e.g. narrow INSERT to specific columns,
+     restrict by row-level security) without
+     touching the hot-path evaluator / solid_batch
+     grants.
+  3. **Connection budgeting.** The reconciler holds
+     a connection for the entire on-restart sweep.
+     Borrowing from the evaluator / solid_batch
+     pools would steal capacity from the hot
+     serving paths during boot -- precisely when
+     those paths need to come up cleanly. A
+     dedicated pool sized for the one-shot sweep
+     avoids that contention.
 
 Boot matrix:
 

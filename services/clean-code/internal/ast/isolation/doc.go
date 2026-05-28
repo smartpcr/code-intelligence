@@ -60,12 +60,34 @@
 //
 // Callers use `errors.Is(err, ErrParserOOM)` etc.
 //
-// # Wiring scope
+// # Wiring scope (Stage 9.3 iter-2 production wiring)
 //
-// This package ships the seam and its tests. Wiring the
-// Metric Ingestor's scan loop to call
-// [ModeCoordinator.BeginScan]/[ModeCoordinator.EndScan]
-// around every scan is the Stage 10.x integration follow-up;
-// the brief test file [subprocess_test.go] proves the
-// primitive in isolation.
+// As of Stage 9.3 iter-2 the seam is wired end-to-end into
+// the production composition:
+//
+//   - The clean-code-metric-ingestor binary's `main()`
+//     installs the [IsChildProcess] guard at the top of
+//     `main()` so a re-exec into the same binary lands
+//     in [RunChild] (with [ParserRegistryChildHandler]
+//     wired) instead of re-running the server bootstrap.
+//   - `mountMgmtRoutes` constructs a single
+//     [ModeCoordinator] hydrated by
+//     `management.PGRepoStore.ReadRepoMode` (the
+//     [RepoModeReader] seam introduced this stage), wraps
+//     it in a [MgmtFlipCoordinator], and hands the
+//     adapter to the [MgmtWriter] via
+//     `management.WithMgmtWriterFlipCoordinator`. The
+//     `mgmt.set_mode` handler now drains in-flight scans
+//     BEFORE invoking `repoStore.SetRepoMode` (impl-plan
+//     line 804).
+//   - The same [ModeCoordinator] (and a [Pool] with
+//     per-language [ExecWorkerFactoryFromConfig]
+//     factories registered for every entry in
+//     `parser.SupportedLanguages`) is exposed via the
+//     `metric_ingestor.DirectoryAstFileSource`
+//     `Coordinator` / `Pool` optional fields. When wired
+//     by the future Stage 10.x scan-loop integration the
+//     per-commit walk admits ONE scan into the coordinator
+//     and routes per-file parses through
+//     [Pool.ParseInScan] for crash isolation.
 package isolation

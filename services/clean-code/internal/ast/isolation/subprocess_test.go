@@ -1096,6 +1096,348 @@ func TestPool_UnknownLanguageRejected(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------
+// Stage 9.3 iter-2 additions -- ParseInScan + auto-hydrate +
+// idempotent HydrateMode tests (rubber-duck iter-2 findings).
+// ---------------------------------------------------------------------
+
+// TestPool_ParseInScan_RejectsAfterEndScan pins the
+// ParseInScan after-life-token contract (rubber-duck iter-2
+// finding #4): once EndScan has marked the lease ended, any
+// reuse of the same ScanToken via ParseInScan MUST surface
+// [ErrScanTokenInvalid]. Bypassing this would let a buggy
+// caller silently parse OUTSIDE the drain barrier -- a
+// concurrent mgmt.set_mode flip would believe drain completed
+// while the after-life parse ran against the OLD mode.
+func TestPool_ParseInScan_RejectsAfterEndScan(t *testing.T) {
+	t.Parallel()
+	coord := NewModeCoordinator()
+	repoID := mustUUID(t)
+	if err := coord.HydrateMode(repoID, ModeEmbedded); err != nil {
+		t.Fatalf("HydrateMode: %v", err)
+	}
+	pool, err := NewPool(SubprocessConfig{Timeout: 100 * time.Millisecond}, coord)
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	t.Cleanup(func() { _ = pool.Close() })
+
+	// Register a worker that would happily run if reached.
+	if err := pool.RegisterFactory("go", func(language string, _ SubprocessConfig) (Worker, error) {
+		return &fakeOKWorker{language: language}, nil
+	}); err != nil {
+		t.Fatalf("RegisterFactory: %v", err)
+	}
+
+	tok, err := coord.BeginScan(context.Background(), repoID)
+	if err != nil {
+		t.Fatalf("BeginScan: %v", err)
+	}
+	coord.EndScan(tok)
+
+	_, err = pool.ParseInScan(context.Background(), tok, ParseRequest{
+		Language: "go", Path: "x.go", Content: []byte("package x"),
+	})
+	if !errors.Is(err, ErrScanTokenInvalid) {
+		t.Fatalf("ParseInScan after EndScan: errors.Is(err, ErrScanTokenInvalid)=false; err=%v", err)
+	}
+}
+
+// TestPool_ParseInScan_ZeroTokenRejected pins the
+// other ScanToken misuse path: passing the zero token
+// (BeginScan never called) MUST surface
+// [ErrScanTokenInvalid].
+func TestPool_ParseInScan_ZeroTokenRejected(t *testing.T) {
+	t.Parallel()
+	coord := NewModeCoordinator()
+	repoID := mustUUID(t)
+	if err := coord.HydrateMode(repoID, ModeEmbedded); err != nil {
+		t.Fatalf("HydrateMode: %v", err)
+	}
+	pool, err := NewPool(SubprocessConfig{Timeout: 100 * time.Millisecond}, coord)
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	t.Cleanup(func() { _ = pool.Close() })
+	if err := pool.RegisterFactory("go", func(language string, _ SubprocessConfig) (Worker, error) {
+		return &fakeOKWorker{language: language}, nil
+	}); err != nil {
+		t.Fatalf("RegisterFactory: %v", err)
+	}
+
+	var zeroTok ScanToken
+	_, err = pool.ParseInScan(context.Background(), zeroTok, ParseRequest{
+		Language: "go", Path: "x.go", Content: []byte("package x"),
+	})
+	if !errors.Is(err, ErrScanTokenInvalid) {
+		t.Fatalf("ParseInScan(zero token): errors.Is(err, ErrScanTokenInvalid)=false; err=%v", err)
+	}
+}
+
+// TestPool_ParseInScan_HappyPath ensures the new
+// `ParseInScan` path actually invokes the per-language
+// worker when handed a valid token.
+func TestPool_ParseInScan_HappyPath(t *testing.T) {
+	t.Parallel()
+	coord := NewModeCoordinator()
+	repoID := mustUUID(t)
+	if err := coord.HydrateMode(repoID, ModeEmbedded); err != nil {
+		t.Fatalf("HydrateMode: %v", err)
+	}
+	pool, err := NewPool(SubprocessConfig{Timeout: 100 * time.Millisecond}, coord)
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	t.Cleanup(func() { _ = pool.Close() })
+
+	var calls atomic.Int32
+	if err := pool.RegisterFactory("go", func(language string, _ SubprocessConfig) (Worker, error) {
+		return &fakeOKWorker{language: language, onCall: func() { calls.Add(1) }}, nil
+	}); err != nil {
+		t.Fatalf("RegisterFactory: %v", err)
+	}
+
+	tok, err := coord.BeginScan(context.Background(), repoID)
+	if err != nil {
+		t.Fatalf("BeginScan: %v", err)
+	}
+	defer coord.EndScan(tok)
+
+	for i := 0; i < 3; i++ {
+		res, err := pool.ParseInScan(context.Background(), tok, ParseRequest{
+			Language: "go", Path: "x.go", Content: []byte("package x"),
+		})
+		if err != nil {
+			t.Fatalf("ParseInScan: %v", err)
+		}
+		if res == nil {
+			t.Fatalf("ParseInScan: nil result")
+		}
+	}
+	if got := calls.Load(); got != 3 {
+		t.Errorf("worker calls=%d, want 3", got)
+	}
+}
+
+// TestModeCoordinator_HydrateMode_Idempotent pins the
+// rubber-duck iter-2 finding #1 fix: a second HydrateMode
+// call MUST NOT overwrite a previously-stored mode.
+// Without this guard, a hydrator race could clobber a
+// successful flip:
+//
+//	T0  flip-thread:  SetMode(repo, linked) -> applyFn  -> swap to `linked`
+//	T1  scan-thread:  HydrateMode(repo, embedded)       -> overwrites to `embedded`
+//	T2  next scan:    BeginScan(repo).Mode() == `embedded`  (WRONG)
+//
+// The idempotent contract makes step T1 a no-op so the
+// post-flip state is observable.
+func TestModeCoordinator_HydrateMode_Idempotent(t *testing.T) {
+	t.Parallel()
+	coord := NewModeCoordinator()
+	repoID := mustUUID(t)
+	if err := coord.HydrateMode(repoID, ModeLinked); err != nil {
+		t.Fatalf("first HydrateMode: %v", err)
+	}
+	// Second call with a DIFFERENT mode -- must NOT overwrite.
+	if err := coord.HydrateMode(repoID, ModeEmbedded); err != nil {
+		t.Fatalf("second HydrateMode: %v", err)
+	}
+	tok, err := coord.BeginScan(context.Background(), repoID)
+	if err != nil {
+		t.Fatalf("BeginScan: %v", err)
+	}
+	defer coord.EndScan(tok)
+	if tok.Mode() != ModeLinked {
+		t.Errorf("BeginScan mode=%q, want %q (second HydrateMode incorrectly overwrote the first)", tok.Mode(), ModeLinked)
+	}
+}
+
+// TestModeCoordinator_AutoHydrateFromHydrator pins the
+// Stage 9.3 hydrator hook: BeginScan on an unhydrated repo
+// MUST consult the registered hydrator and cache the
+// returned mode, so production callers don't have to
+// pre-seed the coordinator at startup.
+func TestModeCoordinator_AutoHydrateFromHydrator(t *testing.T) {
+	t.Parallel()
+	var hydratorCalls atomic.Int32
+	hydrator := func(ctx context.Context, repoID uuid.UUID) (Mode, error) {
+		hydratorCalls.Add(1)
+		return ModeLinked, nil
+	}
+	coord := NewModeCoordinator(WithModeHydrator(hydrator))
+	repoID := mustUUID(t)
+
+	tok, err := coord.BeginScan(context.Background(), repoID)
+	if err != nil {
+		t.Fatalf("BeginScan: %v", err)
+	}
+	if tok.Mode() != ModeLinked {
+		t.Errorf("auto-hydrated mode=%q, want %q", tok.Mode(), ModeLinked)
+	}
+	coord.EndScan(tok)
+
+	// A second BeginScan MUST hit the cache, NOT the
+	// hydrator -- otherwise every scan would pay the
+	// hydrator's PG roundtrip cost.
+	tok2, err := coord.BeginScan(context.Background(), repoID)
+	if err != nil {
+		t.Fatalf("second BeginScan: %v", err)
+	}
+	defer coord.EndScan(tok2)
+	if got := hydratorCalls.Load(); got != 1 {
+		t.Errorf("hydrator calls=%d, want 1 (second BeginScan should hit cache)", got)
+	}
+}
+
+// TestModeCoordinator_AutoHydrateError surfaces hydrator
+// errors verbatim so the caller sees the underlying store
+// error (e.g. ErrRepoStoreUnknownRepo). The brief
+// explicitly rejects defaulting to ModeEmbedded on miss.
+func TestModeCoordinator_AutoHydrateError(t *testing.T) {
+	t.Parallel()
+	wantErr := errors.New("simulated repo not found")
+	hydrator := func(ctx context.Context, repoID uuid.UUID) (Mode, error) {
+		return "", wantErr
+	}
+	coord := NewModeCoordinator(WithModeHydrator(hydrator))
+	_, err := coord.BeginScan(context.Background(), mustUUID(t))
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("BeginScan with failing hydrator: want errors.Is(err, wantErr)=true; got err=%v", err)
+	}
+}
+
+// TestModeCoordinator_AutoHydrateRaceLooserDoesNotOverwrite
+// is the targeted regression for the rubber-duck iter-2
+// blocker #1: a concurrent (BeginScan auto-hydrate) +
+// (SetMode flip) race MUST NOT have the auto-hydrate clobber
+// the flip-completed mode.
+//
+// Setup: a slow hydrator that doesn't return until both
+// goroutines have started. By the time the slow hydrator
+// completes, SetMode has already swapped the per-repo mode
+// to `linked`. The idempotent guard in ensureHydrated
+// (double-check + skip if hydrated) MUST prevent the
+// hydrator's stale `embedded` from overwriting `linked`.
+func TestModeCoordinator_AutoHydrateRaceLooserDoesNotOverwrite(t *testing.T) {
+	t.Parallel()
+	hydrateRelease := make(chan struct{})
+	hydrateReached := make(chan struct{})
+	var hydrateOnce atomic.Bool
+	hydrator := func(ctx context.Context, repoID uuid.UUID) (Mode, error) {
+		if hydrateOnce.CompareAndSwap(false, true) {
+			close(hydrateReached)
+			<-hydrateRelease
+		}
+		return ModeEmbedded, nil
+	}
+	coord := NewModeCoordinator(WithModeHydrator(hydrator))
+	repoID := mustUUID(t)
+
+	// Goroutine A: BeginScan -> blocks in hydrator.
+	type scanRes struct {
+		tok ScanToken
+		err error
+	}
+	scanCh := make(chan scanRes, 1)
+	go func() {
+		tok, err := coord.BeginScan(context.Background(), repoID)
+		scanCh <- scanRes{tok: tok, err: err}
+	}()
+
+	// Wait until A is in the hydrator.
+	<-hydrateReached
+
+	// Goroutine B: pre-seed via explicit HydrateMode(linked)
+	// then directly verify SetMode would have observed it.
+	// We can't call SetMode because SetMode also goes
+	// through ensureHydrated which would block on the
+	// shared singleflight; the simpler regression is that
+	// the SLOW hydrator (returning embedded) does NOT
+	// overwrite the explicit HydrateMode(linked) that
+	// raced ahead of it.
+	if err := coord.HydrateMode(repoID, ModeLinked); err != nil {
+		t.Fatalf("HydrateMode(linked) while slow hydrator in flight: %v", err)
+	}
+
+	// Release the slow hydrator. Its return value
+	// (embedded) MUST NOT overwrite the linked we just
+	// set via HydrateMode -- otherwise auto-hydrate
+	// raced and corrupted state.
+	close(hydrateRelease)
+
+	r := <-scanCh
+	if r.err != nil {
+		t.Fatalf("BeginScan: %v", r.err)
+	}
+	defer coord.EndScan(r.tok)
+	if r.tok.Mode() != ModeLinked {
+		t.Errorf("post-race BeginScan mode=%q, want %q (slow hydrator overwrote a successful HydrateMode)", r.tok.Mode(), ModeLinked)
+	}
+}
+
+// TestPool_ParseInScan_TokenStaysActiveAcrossManyCalls
+// asserts the lease atomic is sticky (Active=true) across
+// many ParseInScan calls until EndScan. Regression for any
+// future refactor that accidentally turned the lease
+// boolean into a per-call flag.
+func TestPool_ParseInScan_TokenStaysActiveAcrossManyCalls(t *testing.T) {
+	t.Parallel()
+	coord := NewModeCoordinator()
+	repoID := mustUUID(t)
+	if err := coord.HydrateMode(repoID, ModeEmbedded); err != nil {
+		t.Fatalf("HydrateMode: %v", err)
+	}
+	pool, err := NewPool(SubprocessConfig{Timeout: 100 * time.Millisecond}, coord)
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	t.Cleanup(func() { _ = pool.Close() })
+	if err := pool.RegisterFactory("go", func(language string, _ SubprocessConfig) (Worker, error) {
+		return &fakeOKWorker{language: language}, nil
+	}); err != nil {
+		t.Fatalf("RegisterFactory: %v", err)
+	}
+
+	tok, err := coord.BeginScan(context.Background(), repoID)
+	if err != nil {
+		t.Fatalf("BeginScan: %v", err)
+	}
+	for i := 0; i < 100; i++ {
+		if !tok.Active() {
+			t.Fatalf("token went inactive mid-scan at i=%d", i)
+		}
+		if _, err := pool.ParseInScan(context.Background(), tok, ParseRequest{
+			Language: "go", Path: "x.go", Content: []byte("package x"),
+		}); err != nil {
+			t.Fatalf("ParseInScan[%d]: %v", i, err)
+		}
+	}
+	coord.EndScan(tok)
+	if tok.Active() {
+		t.Errorf("token still Active after EndScan; lease CAS path is broken")
+	}
+}
+
+// fakeOKWorker is a Worker that succeeds with an empty
+// ParseResult on every Execute call, optionally invoking a
+// per-call callback. Used by the ParseInScan tests.
+type fakeOKWorker struct {
+	language string
+	onCall   func()
+}
+
+func (w *fakeOKWorker) Language() string { return w.language }
+func (w *fakeOKWorker) Close() error     { return nil }
+func (w *fakeOKWorker) Execute(ctx context.Context, _ ParseRequest) (*ParseResult, error) {
+	if w.onCall != nil {
+		w.onCall()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return &ParseResult{AstFileBytes: nil}, nil
+}
+
+// ---------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------
 

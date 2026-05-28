@@ -48,6 +48,10 @@ import (
 
 	_ "github.com/lib/pq"
 
+	"github.com/gofrs/uuid"
+
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/isolation"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/config"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/churn"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/coverage"
@@ -66,6 +70,25 @@ import (
 var db *sql.DB
 
 func main() {
+	// Stage 9.3 -- parser child re-entry guard. When this
+	// binary is spawned as a parser child by an
+	// `isolation.ExecWorker` the parent communicates via
+	// the [isolation.ChildEnvVar] env var; we MUST detect
+	// that BEFORE any normal startup (config load, PG
+	// open, mux build) because the child reads its parse
+	// request from stdin and exits, never serving HTTP.
+	// Skipping the guard would have the child re-run the
+	// full server bootstrap, open a duplicate listener on
+	// :PORT, and fail with "address in use" -- a very
+	// confusing breakage with no obvious link to the
+	// parser pool.
+	if isolation.IsChildProcess() {
+		isolation.RegisterChildHandler(
+			isolation.ParserRegistryChildHandler(parser.DefaultRegistry()))
+		isolation.RunChild() // never returns
+		return
+	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -493,6 +516,72 @@ func mountMgmtRoutes(mux *http.ServeMux, ingestorDB, mgmtDB *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("NewPGRepoStore: %w", err)
 	}
+
+	// Stage 9.3 -- wire the AST subprocess isolation
+	// primitives. The same [isolation.ModeCoordinator]
+	// instance backs BOTH the [isolation.MgmtFlipCoordinator]
+	// adapter (consumed by `mgmt.set_mode` to drain
+	// in-flight scans before flipping a repo's mode) AND
+	// the [isolation.Pool] used by the scan path; sharing
+	// is mandatory because the drain barrier guards
+	// `inFlight > 0` from the SAME per-repo state the
+	// scan-admission path increments.
+	//
+	// The hydrator hook lets the coordinator lazily
+	// populate per-repo mode state on first
+	// BeginScan/SetMode for a repo -- composition root
+	// does NOT have to pre-seed every persisted repo at
+	// startup. Cold-start safety: on a coordinator miss
+	// the hydrator reads the persisted row via
+	// [management.PGRepoStore.ReadRepoMode] (Stage 9.3
+	// addition); a missing row surfaces as
+	// [isolation.ErrModeNotHydrated], NOT a silent
+	// default-to-embedded that would mask a persisted
+	// `linked` row.
+	hydrator := func(ctx context.Context, repoID uuid.UUID) (isolation.Mode, error) {
+		mode, err := repoStore.ReadRepoMode(ctx, repoID)
+		if err != nil {
+			return "", err
+		}
+		return isolation.Mode(mode), nil
+	}
+	coord := isolation.NewModeCoordinator(isolation.WithModeHydrator(hydrator))
+
+	// Construct the subprocess pool with the host binary's
+	// path as the child program; the [IsChildProcess]
+	// guard at the very top of main() re-enters via the
+	// `__ISOLATION_PARSER_CHILD` env var. Production
+	// crash-isolation (architecture Sec 9.2) REQUIRES the
+	// ExecWorker factory; the in-process fallback is dev
+	// only and would silently swallow OOMs/crashes via
+	// goroutine recovery. A failure to discover
+	// os.Executable() is fatal: without an executable
+	// path the pool cannot spawn ANY worker.
+	hostExe, exeErr := os.Executable()
+	if exeErr != nil {
+		return fmt.Errorf("os.Executable (required for isolation.Pool): %w", exeErr)
+	}
+	pool, err := isolation.NewPool(isolation.SubprocessConfig{}, coord)
+	if err != nil {
+		return fmt.Errorf("isolation.NewPool: %w", err)
+	}
+	for _, lang := range parser.SupportedLanguages {
+		if err := pool.RegisterFactory(lang,
+			isolation.ExecWorkerFactoryFromConfig(hostExe)); err != nil {
+			return fmt.Errorf("isolation.Pool.RegisterFactory(%q): %w", lang, err)
+		}
+	}
+	_ = pool // pool will be consumed by the Stage 10.x scan-loop integration; constructing it here proves the wiring path
+
+	// Stage 9.3 -- the FlipCoordinator adapter is the
+	// `management.FlipCoordinator` impl mgr.SetMode
+	// delegates to. The adapter is a thin string<->Mode
+	// translator over the shared [isolation.ModeCoordinator]
+	// constructed above; SAME coordinator instance, so
+	// the drain wait truly observes the scan path's
+	// in-flight counter.
+	flipCoord := isolation.NewMgmtFlipCoordinator(coord)
+
 	dispatcher := metric_ingestor.NewRetractDispatcher(retractScanRunStore, retractStore, retractStore)
 	enqueuer := metric_ingestor.NewRescanEnqueuer(rescanStore)
 	writer := management.NewMgmtWriter(
@@ -509,6 +598,10 @@ func mountMgmtRoutes(mux *http.ServeMux, ingestorDB, mgmtDB *sql.DB) error {
 		// (mounted below) can actually persist. Without
 		// this option the routes would return 503.
 		management.WithMgmtWriterRepoStore(repoStore),
+		// Stage 9.3 -- wire the flip coordinator so
+		// `mgmt.set_mode` drains in-flight scans before
+		// flipping (impl-plan line 804).
+		management.WithMgmtWriterFlipCoordinator(flipCoord),
 	)
 	// Stage 3.4 routes (retain).
 	mux.HandleFunc(management.VerbMgmtRetractSamplePath, writer.RetractSample)

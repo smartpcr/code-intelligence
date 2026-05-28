@@ -58,6 +58,23 @@ var (
 	// when no [WorkerFactory] is registered for the requested
 	// language tag.
 	ErrUnknownLanguage = errors.New("isolation: no worker factory registered for language")
+
+	// ErrScanTokenInvalid is returned by [Pool.ParseInScan] when
+	// the supplied [ScanToken] is the zero value OR already
+	// released via [ModeCoordinator.EndScan]. Surfaces the
+	// misuse pattern `EndScan(tok); ParseInScan(tok, ...)` so
+	// the offending caller does NOT silently bypass the drain
+	// contract (rubber-duck iter-2 finding #4).
+	ErrScanTokenInvalid = errors.New("isolation: scan token is zero or already ended (call BeginScan first; do NOT reuse after EndScan)")
+
+	// ErrChildRlimitFailed is returned (and logged to stderr;
+	// the child exits non-zero) when the parser child
+	// process cannot install the requested RLIMIT_AS cap.
+	// Surfacing the failure loudly is mandatory: a child
+	// running WITHOUT the rlimit could exhaust host memory
+	// silently while the parent thinks the cap is in force
+	// (evaluator iter-1 item #4).
+	ErrChildRlimitFailed = errors.New("isolation/child: failed to install RLIMIT_AS memory cap")
 )
 
 // ParserCrashError captures the diagnostic context that

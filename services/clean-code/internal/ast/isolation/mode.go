@@ -4,9 +4,44 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gofrs/uuid"
 )
+
+// ModeHydrator is the optional callback the [ModeCoordinator]
+// invokes when [BeginScan] / [SetMode] hits an unhydrated repo.
+// The callback consults the authoritative catalog
+// (`clean_code.repo.mode`) and returns the persisted mode; the
+// coordinator hydrates its cache (idempotently — concurrent
+// callers race-then-win without overwriting an already-hydrated
+// slot) and the original call proceeds.
+//
+// Production wiring supplies a callback that reads the row via
+// `management.RepoStore` (or a narrow read seam). Tests wire a
+// canned mode so the coordinator stays self-contained.
+//
+// `ctx` is the caller's original context; the hydrator MUST
+// honour ctx.Done() so a slow read does not stall a flip.
+type ModeHydrator func(ctx context.Context, repoID uuid.UUID) (Mode, error)
+
+// ModeCoordinatorOption configures a [ModeCoordinator] at
+// construction.
+type ModeCoordinatorOption func(*ModeCoordinator)
+
+// WithModeHydrator installs the auto-hydrate callback. When
+// set, [BeginScan] and [SetMode] auto-fetch the persisted mode
+// for an unhydrated repo via `hydrator` instead of returning
+// [ErrModeNotHydrated]. Tests typically wire an in-memory
+// closure; production wires a [RepoStore] read.
+//
+// The auto-hydrate path uses a hydrated-only-if-still-unhydrated
+// double-check after re-acquiring the per-repo lock so a
+// concurrent hydrator winner is not stomped by a slower one
+// (rubber-duck iter-2 finding #1).
+func WithModeHydrator(hydrator ModeHydrator) ModeCoordinatorOption {
+	return func(c *ModeCoordinator) { c.hydrator = hydrator }
+}
 
 // Mode is the AST adapter mode for a single repo. Mirrors
 // `clean_code.repo.mode` from the management/repo_store; pinned
@@ -46,9 +81,24 @@ func IsAllowedMode(m Mode) bool {
 // Calling EndScan more times than BeginScan panics -- a
 // double-EndScan would underflow the in-flight count and
 // silently break the drain contract.
+//
+// The token carries a [scanLease] that [EndScan] marks
+// `ended=true`. Downstream APIs that consume a held token
+// (notably [Pool.ParseInScan]) reject an already-ended token
+// so a misuse like `EndScan(tok); ParseInScan(tok, ...)` is
+// surfaced as a typed error rather than silently bypassing
+// the drain contract (rubber-duck iter-2 finding #4).
 type ScanToken struct {
 	state *repoState
 	mode  Mode
+	lease *scanLease
+}
+
+// scanLease is the heap-allocated handle the token carries.
+// EndScan flips `ended` atomically; ParseInScan (and any
+// future consumer) inspects it via [ScanToken.Active].
+type scanLease struct {
+	ended atomic.Bool
 }
 
 // Mode returns the mode the scan was admitted under. Holding
@@ -60,7 +110,17 @@ func (t ScanToken) Mode() Mode { return t.mode }
 // Valid reports whether the token came from a real BeginScan
 // call (vs the zero value). Used by EndScan to reject the
 // zero-token without panicking.
-func (t ScanToken) Valid() bool { return t.state != nil }
+func (t ScanToken) Valid() bool { return t.state != nil && t.lease != nil }
+
+// Active reports whether the token is still admitted
+// (BeginScan called, EndScan NOT yet called). [Pool.ParseInScan]
+// uses this to reject misuse of a token after EndScan.
+func (t ScanToken) Active() bool {
+	if !t.Valid() {
+		return false
+	}
+	return !t.lease.ended.Load()
+}
 
 // ModeCoordinator is the per-repo admission + drain primitive
 // that backs the `mgmt.set_mode(repo_id, mode)` "drain before
@@ -99,8 +159,9 @@ func (t ScanToken) Valid() bool { return t.state != nil }
 // silently default to `embedded` and disagree with a persisted
 // `linked` row (rubber-duck iter-1 finding #2).
 type ModeCoordinator struct {
-	mu     sync.Mutex
-	states map[uuid.UUID]*repoState
+	mu       sync.Mutex
+	states   map[uuid.UUID]*repoState
+	hydrator ModeHydrator
 }
 
 // repoState holds the per-repo coordinator state. The state's
@@ -140,9 +201,14 @@ func (s *repoState) addWaiter() chan struct{} {
 
 // NewModeCoordinator constructs an empty coordinator. Callers
 // hydrate each repo's mode via [HydrateMode] before the first
-// scan.
-func NewModeCoordinator() *ModeCoordinator {
-	return &ModeCoordinator{states: make(map[uuid.UUID]*repoState)}
+// scan, OR install a [WithModeHydrator] callback so the
+// coordinator auto-hydrates on first touch.
+func NewModeCoordinator(opts ...ModeCoordinatorOption) *ModeCoordinator {
+	c := &ModeCoordinator{states: make(map[uuid.UUID]*repoState)}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // getOrCreate returns the state slot for `repoID`, allocating
@@ -161,21 +227,33 @@ func (c *ModeCoordinator) getOrCreate(repoID uuid.UUID) *repoState {
 
 // HydrateMode seeds the coordinator's per-repo mode cache with
 // the value read from the authoritative catalog
-// (`clean_code.repo.mode`). MUST be called before the first
-// [BeginScan] on `repoID`. Calling HydrateMode while a flip is
-// in progress is rejected with `ErrModeNotHydrated`-shaped
-// guard (the rare race where the catalog read crosses a live
-// flip should be resolved by re-reading after SetMode returns).
+// (`clean_code.repo.mode`). Production callers either invoke
+// it explicitly at startup OR wire a [WithModeHydrator]
+// callback so [BeginScan] / [SetMode] auto-hydrate on first
+// touch.
 //
 // `mode` MUST be in [AllowedModes]; otherwise [ErrInvalidMode]
 // is returned.
 //
-// Calling HydrateMode again with a different value is a no-op
-// when a flip is not in progress -- the catalog read is the
-// source of truth, and a SetMode would arrive in flight to
-// reconcile any drift. We deliberately do NOT signal waiters
-// on hydrate; only BeginScan/EndScan/SetMode mutate the
-// drain-relevant state.
+// HydrateMode is IDEMPOTENT: if the repo is already hydrated
+// the call is a no-op (the persisted value remains the source
+// of truth; any subsequent flip arrives via [SetMode] and
+// reconciles drift). The "hydrate-only-if-still-unhydrated"
+// invariant is what makes the [WithModeHydrator] auto-hydrate
+// path safe against the race
+//
+//	g1: BeginScan auto-hydrate fetched=embedded -> [paused]
+//	g2: SetMode flipped to linked, finished
+//	g1: HydrateMode(embedded) would otherwise stale-overwrite
+//
+// (rubber-duck iter-2 finding #1). Callers needing to FORCE a
+// re-hydration (test reset, recovery from operator-side
+// manual mutation) MUST construct a fresh [ModeCoordinator]
+// or use the test-only [forceHydrateMode] helper.
+//
+// Calling HydrateMode while a flip is in progress is rejected;
+// the flip will write the new cached mode itself. Callers
+// hitting this path should re-read after SetMode returns.
 func (c *ModeCoordinator) HydrateMode(repoID uuid.UUID, mode Mode) error {
 	if repoID == uuid.Nil {
 		return fmt.Errorf("isolation: ModeCoordinator.HydrateMode: zero repoID")
@@ -192,9 +270,87 @@ func (c *ModeCoordinator) HydrateMode(repoID uuid.UUID, mode Mode) error {
 		// racing here.
 		return fmt.Errorf("isolation: ModeCoordinator.HydrateMode: cannot hydrate while flip in progress for repo_id=%s", repoID)
 	}
+	if s.hydrated {
+		// Idempotent: keep the persisted-and-cached value.
+		return nil
+	}
 	s.mode = mode
 	s.hydrated = true
 	return nil
+}
+
+// forceHydrateMode is the test-only escape hatch that REPLACES
+// the cached mode even when already hydrated. Production code
+// MUST NOT call it; the public [HydrateMode] is idempotent for
+// safety reasons (see its godoc).
+func (c *ModeCoordinator) forceHydrateMode(repoID uuid.UUID, mode Mode) error {
+	if repoID == uuid.Nil {
+		return fmt.Errorf("isolation: forceHydrateMode: zero repoID")
+	}
+	if !IsAllowedMode(mode) {
+		return fmt.Errorf("%w: got %q", ErrInvalidMode, mode)
+	}
+	s := c.getOrCreate(repoID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.flipping {
+		return fmt.Errorf("isolation: forceHydrateMode: cannot hydrate while flip in progress for repo_id=%s", repoID)
+	}
+	s.mode = mode
+	s.hydrated = true
+	return nil
+}
+
+// ensureHydrated runs the [WithModeHydrator] callback (if any)
+// to populate `s.hydrated/s.mode` for an unhydrated repo. Used
+// internally by [BeginScan] and [SetMode] so the public APIs
+// never see [ErrModeNotHydrated] when an auto-hydrate hook is
+// wired.
+//
+// Returns:
+//   - (true, nil)  if the repo is hydrated after the call.
+//   - (false, nil) if no hydrator is wired AND the repo is
+//     still unhydrated; callers translate this to
+//     [ErrModeNotHydrated].
+//   - (_, err)     for any hydrator or validation failure;
+//     err is suitable to return to the caller.
+//
+// The function uses a hydrate-only-if-still-unhydrated
+// double-check after re-acquiring the per-repo lock so a
+// concurrent hydrator winner is not stomped.
+func (c *ModeCoordinator) ensureHydrated(ctx context.Context, repoID uuid.UUID, s *repoState) (bool, error) {
+	s.mu.Lock()
+	if s.hydrated {
+		s.mu.Unlock()
+		return true, nil
+	}
+	hydrator := c.hydrator
+	if hydrator == nil {
+		s.mu.Unlock()
+		return false, nil
+	}
+	s.mu.Unlock()
+
+	mode, err := hydrator(ctx, repoID)
+	if err != nil {
+		return false, fmt.Errorf("isolation: ModeCoordinator hydrator(repo_id=%s): %w", repoID, err)
+	}
+	if !IsAllowedMode(mode) {
+		return false, fmt.Errorf("isolation: ModeCoordinator hydrator(repo_id=%s): %w: got %q", repoID, ErrInvalidMode, mode)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Double-check: if a concurrent caller hydrated first,
+	// keep their value (rubber-duck iter-2 finding #1). If a
+	// flip is in progress the SetMode that started it must
+	// have already passed its own hydrate check, so we leave
+	// it alone here.
+	if !s.hydrated && !s.flipping {
+		s.mode = mode
+		s.hydrated = true
+	}
+	return s.hydrated, nil
 }
 
 // CurrentMode returns the coordinator's cached mode for the
@@ -230,7 +386,8 @@ func (c *ModeCoordinator) InFlight(repoID uuid.UUID) int {
 // Blocks if a flip is in progress for `repoID`; returns
 // `ctx.Err()` if the context is cancelled while blocked.
 // Returns [ErrModeNotHydrated] if the caller hasn't called
-// [HydrateMode] for this repo yet.
+// [HydrateMode] for this repo yet AND no [WithModeHydrator]
+// callback is wired.
 func (c *ModeCoordinator) BeginScan(ctx context.Context, repoID uuid.UUID) (ScanToken, error) {
 	if err := ctx.Err(); err != nil {
 		return ScanToken{}, err
@@ -239,6 +396,14 @@ func (c *ModeCoordinator) BeginScan(ctx context.Context, repoID uuid.UUID) (Scan
 		return ScanToken{}, fmt.Errorf("isolation: ModeCoordinator.BeginScan: zero repoID")
 	}
 	s := c.getOrCreate(repoID)
+	// Auto-hydrate from the registered ModeHydrator (if any)
+	// so production callers do not need to pre-seed every
+	// repo at startup.
+	if ok, err := c.ensureHydrated(ctx, repoID, s); err != nil {
+		return ScanToken{}, err
+	} else if !ok {
+		return ScanToken{}, fmt.Errorf("%w: repo_id=%s", ErrModeNotHydrated, repoID)
+	}
 	for {
 		s.mu.Lock()
 		if !s.hydrated {
@@ -247,7 +412,7 @@ func (c *ModeCoordinator) BeginScan(ctx context.Context, repoID uuid.UUID) (Scan
 		}
 		if !s.flipping {
 			s.inFlight++
-			tok := ScanToken{state: s, mode: s.mode}
+			tok := ScanToken{state: s, mode: s.mode, lease: &scanLease{}}
 			s.mu.Unlock()
 			return tok, nil
 		}
@@ -269,14 +434,30 @@ func (c *ModeCoordinator) BeginScan(ctx context.Context, repoID uuid.UUID) (Scan
 // underflow the in-flight count and silently break the drain
 // contract; surfacing it as a panic forces the bug to the
 // surface.
+//
+// EndScan also marks the token's [scanLease] as ended so any
+// downstream consumer (notably [Pool.ParseInScan]) that holds
+// the token can refuse to operate on an after-life token --
+// the misuse `EndScan(tok); ParseInScan(tok, ...)` would
+// otherwise bypass the drain contract silently (rubber-duck
+// iter-2 finding #4).
 func (c *ModeCoordinator) EndScan(tok ScanToken) {
 	if !tok.Valid() {
 		return
+	}
+	// Mark the lease ended FIRST so a concurrent ParseInScan
+	// holding the same token sees `Active()==false` even if
+	// the in-flight counter mutates beneath it.
+	if !tok.lease.ended.CompareAndSwap(false, true) {
+		panic("isolation: ModeCoordinator.EndScan: token already ended (programmer bug; calling EndScan more times than BeginScan, or releasing the same token twice)")
 	}
 	s := tok.state
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.inFlight == 0 {
+		// Should not happen given the lease CAS above, but
+		// keep the defensive check so a misuse path (e.g.
+		// forging a token) still surfaces loudly.
 		panic("isolation: ModeCoordinator.EndScan: in-flight count is zero (programmer bug; calling EndScan more times than BeginScan, or releasing the same token twice)")
 	}
 	s.inFlight--
@@ -324,6 +505,20 @@ func (c *ModeCoordinator) SetMode(ctx context.Context, repoID uuid.UUID, target 
 		return "", false, fmt.Errorf("%w: got %q", ErrInvalidMode, target)
 	}
 	s := c.getOrCreate(repoID)
+
+	// Auto-hydrate from the registered ModeHydrator (if any)
+	// so production callers do not need to pre-seed the cache
+	// at startup. If neither hydrator nor explicit
+	// [HydrateMode] has populated the cache the caller gets
+	// [ErrModeNotHydrated] -- the coordinator deliberately
+	// does NOT default to `embedded` because doing so would
+	// let a coordinator cold-start disagree with a persisted
+	// `linked` row.
+	if ok, hydErr := c.ensureHydrated(ctx, repoID, s); hydErr != nil {
+		return "", false, hydErr
+	} else if !ok {
+		return "", false, fmt.Errorf("%w: repo_id=%s", ErrModeNotHydrated, repoID)
+	}
 
 	// Same-mode no-op fast path: short-circuit ONLY when no
 	// flip is in progress. If a flip is mid-stream the cached

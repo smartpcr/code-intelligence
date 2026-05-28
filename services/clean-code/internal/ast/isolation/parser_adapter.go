@@ -173,3 +173,84 @@ func (w *wrappedParser) Parse(ctx context.Context, path string, content []byte) 
 	}
 	return &ast, nil
 }
+
+// ExecWorkerFactoryFromConfig returns a [WorkerFactory] that
+// spawns the host binary as a parser child via [ExecWorker]
+// (true subprocess isolation per architecture Sec 9.2). The
+// supplied `executablePath` MUST be the host binary's own
+// path (typically `os.Args[0]` or `os.Executable()`); the
+// child re-enters via the [IsChildProcess] guard in `main()`.
+//
+// Wire this into a [Pool] in production for crash isolation:
+//
+//	exe, err := os.Executable()
+//	if err != nil { return fmt.Errorf("os.Executable: %w", err) }
+//	for _, lang := range parser.SupportedLanguages {
+//	    pool.RegisterFactory(lang,
+//	        isolation.ExecWorkerFactoryFromConfig(exe))
+//	}
+//
+// The host's `main()` MUST also call
+// [ParserRegistryChildHandler]+[RegisterChildHandler]+[RunChild]
+// under the [IsChildProcess] guard so the spawned children
+// know how to fulfil parse requests.
+func ExecWorkerFactoryFromConfig(executablePath string) WorkerFactory {
+	return func(language string, cfg SubprocessConfig) (Worker, error) {
+		return NewExecWorker(language, cfg, ExecConfig{Program: executablePath})
+	}
+}
+
+// ParserRegistryChildHandler returns a [ChildHandler] that
+// dispatches every parse request to `registry.For(req.Language).Parse(...)`
+// and serialises the resulting [parser.AstFile] to JSON in the
+// [ParseResult.AstFileBytes] field (matching the wire shape
+// that [WrapParser] decodes upstream). Register via
+// [RegisterChildHandler] before calling [RunChild] from the
+// host binary's `main()` IsChildProcess guard:
+//
+//	if isolation.IsChildProcess() {
+//	    isolation.RegisterChildHandler(
+//	        isolation.ParserRegistryChildHandler(parser.DefaultRegistry()))
+//	    isolation.RunChild()
+//	}
+//
+// The handler enforces a small input contract:
+//
+//   - Empty Language is rejected (the parent always sets it).
+//   - Unknown languages return the parser package's
+//     `ErrUnsupportedLanguage` wrapped error, which the parent
+//     can `errors.Is` on.
+//   - A nil AstFile from the parser is returned with empty
+//     bytes (the upstream WrapParser maps that to nil).
+//
+// Panics in the underlying parser are NOT recovered here -- a
+// panic in the CHILD process is the correct behaviour: the
+// child crashes, the parent observes a non-zero exit, and
+// [classifyExitFailure] returns [ErrParserCrash]. This is the
+// crash-isolation contract the brief mandates.
+func ParserRegistryChildHandler(registry *parser.Registry) ChildHandler {
+	return func(ctx context.Context, req ParseRequest) (*ParseResult, error) {
+		if req.Language == "" {
+			return nil, fmt.Errorf("isolation/child: ParserRegistryChildHandler: empty Language in request")
+		}
+		p, err := registry.For(req.Language)
+		if err != nil {
+			return nil, fmt.Errorf("isolation/child: registry.For(%q): %w", req.Language, err)
+		}
+		ast, err := p.Parse(ctx, req.Path, req.Content)
+		if err != nil {
+			return nil, err
+		}
+		if ast == nil {
+			return &ParseResult{AstFileBytes: nil}, nil
+		}
+		buf := &bytes.Buffer{}
+		if err := json.NewEncoder(buf).Encode(ast); err != nil {
+			return nil, fmt.Errorf("isolation/child: encode AstFile: %w", err)
+		}
+		return &ParseResult{
+			AstFileBytes:   buf.Bytes(),
+			DegradedReason: ast.GetDegradedReason(),
+		}, nil
+	}
+}

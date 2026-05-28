@@ -392,7 +392,11 @@ func IsChildProcess() bool {
 //
 //  1. Applies the memory cap communicated via
 //     [ChildMemoryLimitEnvVar] (Unix: `Setrlimit(RLIMIT_AS, …)`;
-//     Windows: no-op stub).
+//     Windows: documented no-op stub). A failure to install
+//     the cap is FATAL: the child writes
+//     [ErrChildRlimitFailed] to stderr and exits with code 6
+//     so the parent's [classifyExitFailure] does NOT confuse
+//     the missing cap with a successful parse.
 //  2. Reads the request from stdin.
 //  3. Invokes the registered [ChildHandler] (defaults to an
 //     error if none registered).
@@ -404,9 +408,15 @@ func IsChildProcess() bool {
 // return; it always exits.
 func RunChild() {
 	// Apply rlimit before anything else so a runaway handler
-	// can't outrun the cap.
+	// can't outrun the cap. A failure is fatal -- silently
+	// continuing without the cap would let an OOM-prone
+	// parser exhaust host memory while the parent thinks the
+	// cap is in force (evaluator iter-1 item #4).
 	if memEnv := os.Getenv(ChildMemoryLimitEnvVar); memEnv != "" {
-		_ = applyChildMemoryLimit(memEnv)
+		if err := applyChildMemoryLimit(memEnv); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", ErrChildRlimitFailed.Error(), err)
+			os.Exit(6)
+		}
 	}
 
 	req, err := decodeRequest(os.Stdin)

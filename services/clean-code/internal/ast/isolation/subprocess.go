@@ -215,7 +215,8 @@ func (p *Pool) workerFor(language string) (Worker, error) {
 // admission) and the per-language worker.
 //
 //   - The repo MUST have been hydrated via
-//     [ModeCoordinator.HydrateMode]; otherwise
+//     [ModeCoordinator.HydrateMode] OR a [WithModeHydrator]
+//     callback MUST be wired on the coordinator; otherwise
 //     [ErrModeNotHydrated] is returned.
 //   - The call honours `ctx.Done()` AND the configured
 //     [SubprocessConfig.Timeout]; whichever fires first
@@ -225,6 +226,12 @@ func (p *Pool) workerFor(language string) (Worker, error) {
 //   - A subprocess crash (OOM, segfault, panic) returns a
 //     [*ParserCrashError] with the appropriate sentinel; the
 //     host process REMAINS RUNNING.
+//
+// Callers that perform many parses inside a single
+// scan-admission window (notably the metric-ingestor's
+// [DirectoryAstFileSource] walking a checkout) should use
+// [ParseInScan] with a held token instead so the coordinator's
+// in-flight counter reflects ONE scan, not one-per-file.
 func (p *Pool) Parse(ctx context.Context, repoID uuid.UUID, req ParseRequest) (*ParseResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -234,7 +241,35 @@ func (p *Pool) Parse(ctx context.Context, repoID uuid.UUID, req ParseRequest) (*
 		return nil, err
 	}
 	defer p.coordinator.EndScan(tok)
+	return p.executeInScan(ctx, tok, req)
+}
 
+// ParseInScan runs the parse using an already-admitted scan
+// token. The caller MUST hold a valid, still-active token from
+// [ModeCoordinator.BeginScan]; an after-life token
+// (`EndScan` already called) or the zero-token is rejected
+// with [ErrScanTokenInvalid].
+//
+// Use this from callers that bracket many parses with ONE
+// BeginScan/EndScan pair (the [DirectoryAstFileSource] pattern)
+// so the coordinator's in-flight counter tracks scans -- not
+// files. The drain contract still holds because the held token
+// keeps `inFlight > 0` until EndScan.
+func (p *Pool) ParseInScan(ctx context.Context, tok ScanToken, req ParseRequest) (*ParseResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !tok.Active() {
+		return nil, fmt.Errorf("%w: token is zero or already ended; ParseInScan MUST be called between BeginScan and EndScan", ErrScanTokenInvalid)
+	}
+	return p.executeInScan(ctx, tok, req)
+}
+
+// executeInScan is the shared body of [Parse] and
+// [ParseInScan]. It owns the per-call timeout context and the
+// worker-error classification. It does NOT touch the
+// coordinator -- the caller is responsible for admission.
+func (p *Pool) executeInScan(ctx context.Context, tok ScanToken, req ParseRequest) (*ParseResult, error) {
 	worker, err := p.workerFor(req.Language)
 	if err != nil {
 		return nil, err
@@ -247,6 +282,7 @@ func (p *Pool) Parse(ctx context.Context, repoID uuid.UUID, req ParseRequest) (*
 	if execErr != nil {
 		return nil, classifyWorkerError(parseCtx, ctx, req, execErr)
 	}
+	_ = tok // referenced for godoc / future drain-aware diagnostics
 	return res, nil
 }
 

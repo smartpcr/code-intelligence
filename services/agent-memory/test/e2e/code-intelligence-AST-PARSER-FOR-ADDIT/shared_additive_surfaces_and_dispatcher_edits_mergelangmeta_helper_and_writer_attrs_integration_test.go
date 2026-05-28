@@ -1,6 +1,4 @@
-//go:build e2e
-
-package e2e
+package ast_test
 
 import (
 	"encoding/json"
@@ -428,7 +426,7 @@ func InitializeScenario_shared_additive_surfaces_and_dispatcher_edits_mergelangm
 	ctx.Then(`^the persisted attrs_json calls_raw equals exactly the slice Bar$`, s.thePersistedAttrsJsonCallsRawEqualsExactlyTheSliceBar)
 }
 
-func TestE2E_shared_additive_surfaces_and_dispatcher_edits_mergelangmeta_helper_and_writer_attrs_integration(t *testing.T) {
+func TestUnit_shared_additive_surfaces_and_dispatcher_edits_mergelangmeta_helper_and_writer_attrs_integration(t *testing.T) {
 	suite := godog.TestSuite{
 		ScenarioInitializer: InitializeScenario_shared_additive_surfaces_and_dispatcher_edits_mergelangmeta_helper_and_writer_attrs_integration,
 		Options: &godog.Options{

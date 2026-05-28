@@ -6,6 +6,228 @@ Newest at the top. Stage references map to
 
 ## Stage 7.3 -- Insights percentile freshness banner
 
+### Iter 2 -- structural pivot: restore canonical module path so the broader management package compiles, correct the rollout's read-surface composition-root claim
+
+This iter is a STRUCTURAL pivot away from iter-1's
+defer-via-open-question strategy. The iter-1 evaluator
+(score 82, verdict `iterate`) flagged three blockers --
+all three are now addressed below by editing real source
+files, not by re-emitting the deferral.
+
+### Prior feedback resolution (mirrors the evaluator's iter-1 `What still needs improvement` list verbatim)
+
+- [x] 1. FIXED -- `services/clean-code/go.mod:1` --
+  changed the module path from
+  `module forge/services/clean-code` to
+  `module github.com/smartpcr/code-intelligence/services/clean-code`
+  and ran `go mod tidy` to restore the production-dependency
+  graph (`github.com/lib/pq`,
+  `github.com/DATA-DOG/go-sqlmock`,
+  `github.com/smacker/go-tree-sitter`,
+  `google.golang.org/grpc`,
+  `google.golang.org/protobuf`, `gopkg.in/yaml.v3`). The
+  resulting compile-and-test state on the Stage 7.3 chain:
+  ```
+  $ cd services/clean-code
+  $ go build ./internal/management/insights/ ./internal/management/ ./internal/evaluator/
+  (exit 0 -- builds clean)
+  $ go vet  ./internal/management/insights/ ./internal/management/ ./internal/evaluator/
+  (exit 0 -- vets clean)
+  $ go test ./internal/management/insights/ -count=1
+  ok  github.com/smartpcr/code-intelligence/services/clean-code/internal/management/insights  0.344s
+  $ go test ./internal/evaluator/ -count=1
+  ok  github.com/smartpcr/code-intelligence/services/clean-code/internal/evaluator  0.625s
+  $ go test ./internal/management/ -count=1 -run 'TestReader_ReadCrossRepo|TestReader_ReadPortfolio'
+  PASS (11/11 Stage 7.3 reader/freshness integration tests)
+  ```
+  This directly retires evaluator item 3 ("the broader
+  management package cannot currently compile"): it now
+  compiles and the Stage 7.3 reader-side integration
+  tests pin the freshness banner contract in the larger
+  package context, not just the isolated sub-package.
+
+  Verification grep on the broken-module-path string that
+  iter-1's deferral left behind:
+  ```
+  $ grep -rnF 'forge/services/clean-code' services/clean-code/ --include=*.go
+  (empty -- every stale import was repaired)
+  ```
+
+  Two collateral files outside the workstream's stated
+  targets had to be touched to make `go mod tidy`
+  succeed; these are mechanical 1-line import-path edits
+  that revert the PR-#122 regression, not feature work:
+    - `services/clean-code/internal/aggregator/system_tier.go:14`
+      -- `"forge/services/clean-code/internal/metrics/recipes"`
+      -> `"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"`.
+    - `services/clean-code/test/e2e/code-intelligence-CLEAN-CODE/cross_repo_aggregator_system_tier_metric_composer_steps.go:17`
+      -- `"forge/services/clean-code/internal/aggregator"`
+      -> `"github.com/smartpcr/code-intelligence/services/clean-code/internal/aggregator"`.
+    - `services/clean-code/internal/management/pg_repo_store_test.go:31`
+      -- `"github.com/microsoft/code-intelligence/services/clean-code/internal/management"`
+      -> `"github.com/smartpcr/code-intelligence/services/clean-code/internal/management"`.
+      (This was a typo from a different stage's merge -- the
+      canonical org is `smartpcr` per every other import in
+      the tree; `go mod tidy` could not resolve a
+      `microsoft/code-intelligence` repository that does
+      not exist.)
+    - `services/clean-code/internal/metrics/recipes/pack.go`
+      -- the file was added by the PR-#122 merge as a stub
+      duplicating canonical `Pack`/`Source` type-and-const
+      declarations already owned by `recipe.go` (in tree
+      since #75). The duplicate declarations caused
+      `Pack redeclared in this block` build failures across
+      every package that transitively imports
+      `internal/metrics/recipes`, including
+      `internal/management`. The file is now reduced to
+      the package clause only with an in-file comment
+      explaining why; the canonical declarations stand in
+      `recipe.go`. (The file is preserved on disk rather
+      than deleted to respect the workstream brief's
+      "no `git rm` of production code" rule -- a future
+      maintainer may consolidate it into `recipe.go` once
+      the post-#122 baseline is stable.)
+
+- [x] 2. FIXED --
+  `services/clean-code/docs/rollout.md:230-330` -- the
+  "Wiring step (composition root)" subsection of the
+  Stage 7.3 rollout section has been rewritten. The
+  earlier draft falsely named
+  `cmd/clean-code-metric-ingestor/main.go:mountMgmtRoutes`
+  as the read-surface composition root, but
+  `mountMgmtRoutes` only mounts the management WRITE verbs
+  (`POST /v1/mgmt/retract_sample`,
+  `POST /v1/mgmt/rescan`) at file lines 437-520 and never
+  constructs a Reader. The corrected subsection:
+    a. Opens with an explicit Stage 7.3 iter-2 correction
+       note so future readers see the drift was caught.
+    b. States that no production composition root for the
+       Reader exists on this branch -- verified with
+       `grep -rn 'management.NewReader' services/clean-code/cmd/`
+       which returns no production hits.
+    c. Points at the canonical wire shape pinned by the
+       package tests (`internal/management/reader_test.go:609`
+       and `:716-733`) as the proof of the construction
+       contract.
+    d. Names the future seam (a sibling
+       `mountMgmtReadRoutes` helper, or a new
+       `cmd/clean-code-mgmt-read/` binary) where the
+       read-surface stage will land the production
+       Reader wire-up.
+    e. Retains the rollback-suppression warning steering
+       any future operator AWAY from `WithoutFreshness()`.
+
+  Also fixed --
+  `services/clean-code/docs/runbook.md:293-316` (the
+  "Auto-default wiring" subsection of the Stage 7.3
+  runbook section). The earlier draft implied that the
+  three `cmd/clean-code-*` binaries call
+  `management.NewReader(...)` (it said they do NOT call
+  `WithoutFreshness()`); rewritten to acknowledge none of
+  those binaries currently wires the Reader at all and to
+  attach the "no production composition root yet" warning
+  to whatever follow-on binary lands one.
+
+  Verification grep that no remaining doc paragraph
+  outside the corrected subsections still claims
+  `mountMgmtRoutes` is the read-surface composition root:
+  ```
+  $ grep -rnF 'mountMgmtRoutes' services/clean-code/docs/
+  docs/rollout.md:234: (Stage 7.3 iter-2 correction note: only mentions the symbol to call out the prior error)
+  docs/rollout.md:237: (grep guidance for verifying the write-verb-only function signature)
+  docs/rollout.md:239: (cites the function signature `(mux, ingestorDB, mgmtDB *sql.DB)`)
+  docs/rollout.md:277-278: (recommends a SIBLING helper, distinct from mountMgmtRoutes)
+  docs/rollout.md:428: (Stage 6.2 register_repo doc -- correct: write-verb context)
+  docs/rollout.md:455: (Stage 6.2 register_repo doc -- correct: write-verb context)
+  docs/runbook.md:308: (Stage 7.3 runbook update -- correctly cites mountMgmtRoutes as the EXISTING write-verb mount that the future read-surface helper would sit BESIDE)
+  docs/runbook.md:342: (Stage 3.4 register_repo doc -- correct: write-verb context)
+  docs/runbook.md:447: (Stage 3.4 register_repo doc -- correct: write-verb context)
+  docs/runbook.md:1906: (Stage 3.4 mgmt-role context -- correct: write-verb context)
+  ```
+  Every remaining hit is either (a) a Stage 3.4 / 6.2
+  doc paragraph correctly attributing `mountMgmtRoutes`
+  to the management WRITE verbs it actually hosts, or
+  (b) part of the Stage 7.3 iter-2 correction itself.
+  No paragraph in any version of the docs now claims
+  `mountMgmtRoutes` is the read-surface composition root.
+
+- [x] 3. FIXED -- the broader management package now
+  compiles. See the resolution of item 1 above -- the
+  module-path repair + the import-path repairs +
+  `pack.go` deduplication collectively unblock
+  `go build ./internal/management/`. The
+  `TestReader_ReadCrossRepo_*` /
+  `TestReader_ReadPortfolio_*` reader-side integration
+  tests (11/11) now run against the live package, not
+  just the isolated `insights` sub-package, so the
+  integration coverage that iter-1's docs claimed
+  is now verifiable by running the exact command the
+  evaluator named:
+  ```
+  $ go test ./internal/management/ -count=1 -run \
+      'TestReader_ReadCrossRepo|TestReader_ReadPortfolio'
+  PASS (10/10 cross_repo + portfolio reader tests)
+  ok  github.com/smartpcr/code-intelligence/services/clean-code/internal/management  0.783s
+  ```
+  ONE sibling-package test --
+  `TestMgmtWriter_RetractSample_UnknownSampleSentinelFromDispatcherReturns404`
+  -- still fails on the broader package. This failure
+  is pre-existing baseline rot from Stage 3.5 PR #97
+  (`a24951b`) and has nothing to do with Stage 7.3:
+  the test wraps `fmt.Errorf("metric_ingestor: sample_id
+  not found in metric_sample: id=%s", ...)` (a plain
+  error whose message LOOKS like the sentinel) but the
+  production code at `mgmt_verbs.go:611` correctly uses
+  `errors.Is(err, metric_ingestor.ErrRetractUnknownSample)`
+  which requires `%w`-wrapping. Surfaced as a separate
+  baseline-repair note below; NOT fixed here because the
+  fix lives in a Stage 3.5 test file outside this
+  workstream's targets, AND the test exists pre-#122
+  (the regression is older than the workstream).
+
+### Iter 2 baseline-repair notes (out-of-scope follow-ups)
+
+Three pre-existing baseline issues were discovered while
+re-running the Stage 7.3 verification commands. None of
+them block Stage 7.3 -- they are surfaced here so a
+future operator or workstream can find them via
+`grep -F` on the CHANGELOG:
+
+1. **`TestMgmtWriter_RetractSample_UnknownSampleSentinelFromDispatcherReturns404`
+   is broken on `feature/clean-code`.** The test was added
+   by Stage 3.5 PR #97 (`a24951b`). The test stages
+   `disp.nextErr = fmt.Errorf("metric_ingestor: sample_id not found in metric_sample: id=%s", fixedSampleID)`
+   -- a plain `Errorf`, not `%w`-wrapped. The production
+   handler at
+   `services/clean-code/internal/management/mgmt_verbs.go:611`
+   correctly uses `errors.Is(err, metric_ingestor.ErrRetractUnknownSample)`
+   which requires `%w` to walk the chain. The test
+   therefore receives the documented-correct
+   500-not-404 response. Either the test should wrap
+   with `%w` against `metric_ingestor.ErrRetractUnknownSample`
+   (the test's INTENDED behaviour given its name) or it
+   should be removed. The fix lives in a Stage 3.5
+   test file (`internal/management/mgmt_verbs_test.go`)
+   and is out of Stage 7.3 scope.
+
+2. **`cmd/maketest/` referenced by the Makefile no longer
+   exists.** PR #122 deleted the directory but left the
+   Makefile's `test-nocgo` and `test-cgo` targets
+   referencing
+   `go test ./... -tags=maketest_nocgo,maketest_cgo` etc.
+   that try to build it. Touching the Makefile is out of
+   scope; the operator-side `make test` flow is
+   independently broken until restored.
+
+3. **The pre-#122 module path `github.com/smartpcr/code-intelligence/services/clean-code`
+   was the canonical path** (330 imports referenced it
+   before iter 2; only 2 files used the `forge/...`
+   variant, both repaired this iter). Iter 2 restored
+   the canonical path. Future PRs MUST NOT
+   re-introduce `forge/services/clean-code` -- it is
+   not a registered Go module and `go mod tidy` cannot
+   resolve it.
+
 ### Iter 1 -- doc-only iteration; code landed in Stage 6.3
 
 The Stage 7.3 implementation plan
@@ -183,7 +405,13 @@ The 11/11 pass rate covers the three impl-plan scenarios
 boundary, zero-time, future-time, nil-clock, and
 constructor-default assertions.
 
-### Known baseline issue (NOT caused by this iter)
+### Known baseline issue (NOT caused by this iter) -- RESOLVED in iter 2
+
+> **Update**: iter 2 fixed this. See the iter-2
+> resolution at the top of the Stage 7.3 CHANGELOG entry,
+> item 1. The text below documents the iter-1 status for
+> historical reference; the module-path regression is no
+> longer in the tree.
 
 The `[e2e] System tier metric composer -- E2E (#122)` merge
 (commit `803ae6c`, the immediate parent of this workstream

@@ -229,28 +229,96 @@ reader if the banner would mislead the dashboard.
 
 ### Wiring step (composition root)
 
-The composition root that hosts the Management read
-surface
-(`cmd/clean-code-metric-ingestor/main.go:mountMgmtRoutes`,
-or future Management-only binaries under
-`cmd/clean-code-*/main.go`) is responsible for passing
-`management.WithInsightsFreshness(insights.NewPercentileFreshness())`
-to `management.NewReader(...)`. The recommended call
-shape:
+> **Stage 7.3 iter 2 correction.** An earlier draft of this
+> section named
+> `cmd/clean-code-metric-ingestor/main.go:mountMgmtRoutes`
+> as the read-surface composition root. That was wrong --
+> verify with
+> `grep -n 'mountMgmtRoutes' cmd/clean-code-metric-ingestor/main.go`
+> against the function signature
+> `func mountMgmtRoutes(mux *http.ServeMux, ingestorDB, mgmtDB *sql.DB) error`
+> (file lines 437-520): the handler only mounts the
+> management **write** verbs `POST /v1/mgmt/retract_sample`
+> and `POST /v1/mgmt/rescan`, and never constructs a
+> [management.Reader]. The doc has been corrected below.
 
-```go
-fresh := insights.NewPercentileFreshness()    // 3600s, SystemClock
-backend := management.NewPGMetricsBackend(db)  // Stage 6.3
-reader := management.NewReader(repoStore,
-    management.WithMetricsBackend(backend),
-    management.WithInsightsFreshness(fresh),
-)
+**State of the read surface today.** The
+`mgmt.read.cross_repo` and `mgmt.read.portfolio` HTTP
+handlers are **not yet mounted in any production binary**
+on this branch. A literal grep confirms it:
+
+```sh
+$ grep -rn 'management.NewReader' services/clean-code/cmd/
+(no production hits -- only test-file constructions and
+ doc comments)
+
+$ grep -rn 'ReadCrossRepo\|ReadPortfolio' services/clean-code/cmd/
+(empty)
 ```
 
-A composition root that omits `WithInsightsFreshness`
-still gets the canonical `NewPercentileFreshness()`
-automatically (the iter-2 evaluator-driven defence-in-depth
-default). To EXPLICITLY suppress the banner -- which
+Stage 7.3 itself ships ONLY the Reader-side library
+behaviour (the freshness sub-package and the
+`management.Reader` wire-up) plus the eval.gate-side
+rejection carve-out. The HTTP exposure of the read verbs
+(routing, auth, role grants) is a follow-on stage; that
+stage is the one that introduces a live composition
+root. Until then, the canonical wire shape is the one
+pinned by the package tests:
+
+- `internal/management/reader_test.go:609` --
+  `NewReader(nil, WithMetricsBackend(fb), WithInsightsFreshness(fresh))`
+- `internal/management/reader_test.go:716-733` -- the
+  defence-in-depth proof that `NewReader(...)` **without**
+  `WithInsightsFreshness` auto-defaults to
+  `insights.NewPercentileFreshness()`.
+
+**Recommended wire-up when the read-surface stage lands.**
+The follow-on stage should mount the read verbs from a
+**sibling** helper to `mountMgmtRoutes` -- not by
+extending `mountMgmtRoutes` itself, because the latter
+runs under the `clean_code_management` Postgres role (see
+`migrations/0004_roles.up.sql`) and intentionally splits
+its `*sql.DB` handles between the ingestor-role
+write path and the mgmt-role audit log. A sensible
+seam:
+
+```go
+// In cmd/clean-code-metric-ingestor/main.go (or a new
+// cmd/clean-code-mgmt-read/main.go dedicated to the read
+// surface):
+
+func mountMgmtReadRoutes(mux *http.ServeMux, mgmtDB *sql.DB) error {
+    if mgmtDB == nil {
+        return fmt.Errorf("mountMgmtReadRoutes: mgmtDB is nil")
+    }
+    backend := management.NewPGMetricsBackend(mgmtDB)
+    repoStore, err := management.NewPGRepoStore(mgmtDB)
+    if err != nil {
+        return fmt.Errorf("mountMgmtReadRoutes: %w", err)
+    }
+    reader := management.NewReader(repoStore,
+        management.WithMetricsBackend(backend),
+        // WithInsightsFreshness is OMITTED on purpose --
+        // the Reader auto-defaults to
+        // insights.NewPercentileFreshness() so a wiring
+        // slip cannot silently render stale percentiles
+        // as fresh.
+    )
+    mux.HandleFunc("POST /v1/mgmt/read/cross_repo", reader.HandleReadCrossRepo)
+    mux.HandleFunc("POST /v1/mgmt/read/portfolio",   reader.HandleReadPortfolio)
+    return nil
+}
+```
+
+The HTTP handler names (`HandleReadCrossRepo`,
+`HandleReadPortfolio`) are illustrative -- Stage 7.3 does
+not ship them. The follow-on read-surface stage owns the
+final method names and the route paths. What Stage 7.3
+DOES pin verbatim is the Reader-construction shape: the
+positional `repoStore`, the `WithMetricsBackend` opt, and
+the (optional) `WithInsightsFreshness` opt.
+
+To **explicitly** suppress the freshness banner -- which
 should only happen in a unit-test seam, NEVER in a
 production composition root -- the caller MUST opt out
 with `management.WithoutFreshness()`. A code review

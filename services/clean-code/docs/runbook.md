@@ -303,17 +303,23 @@ harness or a unit test seam -- MUST opt out explicitly via
 `management.WithoutFreshness()`.
 
 `WithoutFreshness()` is a DEVELOPER/TEST SEAM, NOT a
-production rollback knob. The clean-code service's
-production composition roots
-(`cmd/clean-code-metric-ingestor/main.go`,
-`cmd/clean-code-aggregator/main.go`,
-`cmd/clean-code-eval-gate/main.go`) do NOT call it; a PR
-that adds `WithoutFreshness()` to a production composition
-root MUST be reviewed as a release-blocking change and the
-operator on call MUST be paged before it merges. If the
-banner is firing during an incident, the correct response
-is to fix the aggregator (Stage 7.1 triage above), not to
-suppress the signal.
+production rollback knob. As of Stage 7.3 there is no
+production composition root that calls
+`management.NewReader(...)` -- a literal grep over
+`services/clean-code/cmd/` confirms this (see the rollout
+guide's "State of the read surface today" subsection).
+When the follow-on read-surface stage lands and introduces
+the first production Reader-wiring binary (a sibling
+helper to the existing
+`cmd/clean-code-metric-ingestor/main.go:mountMgmtRoutes`
+write-verb mount, or a new `cmd/clean-code-mgmt-read/`),
+that binary MUST NOT call `WithoutFreshness()`. A PR that
+adds `WithoutFreshness()` to a production composition
+root MUST be reviewed as a release-blocking change and
+the operator on call MUST be paged before it merges. If
+the banner is firing during an incident, the correct
+response is to fix the aggregator (Stage 7.1 triage
+above), not to suppress the signal.
 
 ## Stage 6.2 -- `mgmt.register_repo` and `mgmt.set_mode`
 

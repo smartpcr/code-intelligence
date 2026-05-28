@@ -11,7 +11,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/metrics/recipes"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
 
 // SystemTierComposer materialises the SEVEN canonical system-tier

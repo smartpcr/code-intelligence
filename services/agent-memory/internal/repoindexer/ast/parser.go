@@ -1,5 +1,26 @@
 package ast
 
+import "errors"
+
+// ErrParserUnavailable is the sentinel a `LanguageParser.Parse`
+// implementation returns (typically wrapped via `fmt.Errorf("%w",
+// ...)`) when the parser cannot run because a required runtime
+// dependency is missing on the host (e.g. `pwsh` not on PATH for
+// the PowerShell parser). `dispatcher.go::EmitFile` matches
+// against this sentinel with `errors.Is` and emits
+// `ast.dispatch.skip{reason=...}` instead of the noisier
+// `ast.parse.error` log.
+//
+// Wrappers SHOULD embed a short, machine-friendly reason slug
+// using the `reason=<slug>` convention so the dispatcher can
+// surface it on the structured log -- e.g.:
+//
+//	fmt.Errorf("powershell: %w (reason=pwsh_not_available)", ast.ErrParserUnavailable)
+//
+// When the wrapper omits a slug the dispatcher falls back to
+// `reason="runtime_unavailable"`.
+var ErrParserUnavailable = errors.New("parser: runtime dependency unavailable")
+
 // LanguageParser is the per-language hook the Stage 3.2
 // dispatcher delegates each file to. Stage 3.2 ships
 // implementations for the v1 language set -- TypeScript /
@@ -247,6 +268,28 @@ type MethodDecl struct {
 	// (`async`, `static`, `private`, etc.). Persisted in
 	// `attrs_json["modifiers"]`.
 	Modifiers []string
+	// ReceiverAliases lists extra `EnclosingClass + "." +
+	// <name>` keys that the dispatcher's Pass 2b multimap
+	// must register against this method's Node id, in addition
+	// to the primary key derived from `QualifiedName`
+	// (architecture Section 4.5.1).
+	//
+	// The Go parser is the only producer in v1: a
+	// pointer-receiver method `func (r *Foo) Bar(...)` has
+	// `QualifiedName="*Foo.Bar"` (the `*` prefix is the
+	// operator-pinned receiver-pointer marker) and
+	// `ReceiverAliases=["Foo.Bar"]` so receiver-qualified
+	// calls `r.Bar()` from sibling methods on `Foo` resolve
+	// through the alias when no value-receiver collision
+	// exists. Value-receiver methods leave the field nil --
+	// their `QualifiedName` already matches the multimap's
+	// primary-key formula.
+	//
+	// Every other parser leaves the slice nil. A nil slice
+	// is a no-op for the dispatcher, so the surface is
+	// additive and backward-compatible (architecture
+	// invariant C12: descriptive-not-identifying).
+	ReceiverAliases []string
 	// LangMeta carries per-language attrs the dispatcher
 	// folds into `attrs_json` via `mergeLangMeta` (architecture
 	// Section 4.4.2). A nil map means "no per-language attrs"

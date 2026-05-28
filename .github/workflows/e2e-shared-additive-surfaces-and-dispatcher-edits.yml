@@ -1,52 +1,97 @@
-name: E2E – shared-additive-surfaces-and-dispatcher-edits
+name: "E2E — Shared Additive Surfaces and Dispatcher Edits"
 
 on:
   pull_request:
+    branches:
+      - feature/memory
+      - "ws/code-intelligence-AST-PARSER-FOR-ADDIT/**"
     paths:
       - "services/agent-memory/migrations/**"
+      - "services/agent-memory/internal/repoindexer/ast/**"
       - "services/agent-memory/test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/**"
       - "services/agent-memory/go.mod"
       - "services/agent-memory/go.sum"
       - "tests/e2e/phase-1-shared-additive-surfaces/**"
+      - ".github/workflows/e2e-shared-additive-surfaces-and-dispatcher-edits.yml"
   push:
     branches:
       - feature/memory
+      - "ws/code-intelligence-AST-PARSER-FOR-ADDIT/**"
     paths:
       - "services/agent-memory/migrations/**"
+      - "services/agent-memory/internal/repoindexer/ast/**"
       - "services/agent-memory/test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/**"
+      - "tests/e2e/phase-1-shared-additive-surfaces/**"
+      - ".github/workflows/e2e-shared-additive-surfaces-and-dispatcher-edits.yml"
   workflow_dispatch:
 
-env:
-  AGENT_MEMORY_PG_URL: "postgres://agent_memory:agent_memory@localhost:5432/agent_memory?sslmode=disable"
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-shared-additive-surfaces-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  e2e-schema-migration:
+  additive-parser-go-struct-surfaces:
+    name: "additive-parser-go-struct-surfaces"
     runs-on: ubuntu-latest
-
+    env:
+      COMPOSE_FILE: tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml
+      AGENT_MEMORY_PG_URL: "postgres://agent_memory:agent_memory@localhost:5432/agent_memory?sslmode=disable"
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Start Phase 1 compose stack (partman-enabled postgres)
-        run: |
-          docker compose -f tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml up -d --wait
-        timeout-minutes: 5
-
-      - uses: actions/setup-go@v5
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version-file: services/agent-memory/go.mod
-          cache-dependency-path: services/agent-memory/go.sum
+          cache: true
 
-      - name: Download modules
+      - name: Start compose stack (postgres with partman)
+        run: docker compose -f $COMPOSE_FILE up -d --build
+
+      - name: Wait for postgres
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 90 ))
+          while :; do
+            status=$(docker compose -f $COMPOSE_FILE ps --format json \
+              | jq -r 'select(.Service=="postgres") | .Health // .State' 2>/dev/null || echo "unknown")
+            echo "  postgres -> $status"
+            if [ "$status" = "healthy" ]; then echo "Postgres ready"; break; fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Postgres did not become healthy within 90s"
+              docker compose -f $COMPOSE_FILE logs --tail=100
+              exit 1
+            fi
+            sleep 3
+          done
+
+      - name: Download Go dependencies
         working-directory: services/agent-memory
         run: go mod download
 
-      - name: Run E2E – schema migration for overrides edge kind
+      - name: Run dispatcher unit-test slice
         working-directory: services/agent-memory
-        run: >-
-          go test -tags e2e -v -count=1
-          ./test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/...
+        run: |
+          go test ./internal/repoindexer/ast -count=1 -v \
+            -run 'TestDispatcher|TestLangMeta|TestErrParserUnavailable|TestMergeLangMeta|TestNormalizeHints|TestPass2bMultimap|TestPass2dOverrides'
+
+      - name: Run migration apply / probe test
+        working-directory: services/agent-memory
+        run: |
+          go test ./migrations -count=1 -v \
+            -run 'TestMigrator_Up_AppliesAll|TestMigrations_0022_EdgeKindOverrides'
+
+      - name: Run E2E scenarios
+        working-directory: services/agent-memory
+        run: |
+          go test -tags e2e -v -count=1 -timeout 120s \
+            -run TestE2E_shared_additive_surfaces_and_dispatcher_edits_additive_parser_go_struct_surfaces \
+            ./test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/...
 
       - name: Tear down compose stack
         if: always()
-        run: |
-          docker compose -f tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml down -v
+        run: docker compose -f $COMPOSE_FILE down -v

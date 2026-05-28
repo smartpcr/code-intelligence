@@ -1,28 +1,26 @@
-# Phase 1 E2E compose stack — postgres only.
+# Phase 1 — Shared Additive Surfaces E2E compose stack.
 #
-# This file is the declared compose artifact for the Phase 1
-# (shared-additive-surfaces-and-dispatcher-edits) E2E scenarios.
-# It starts only the partman-enabled PostgreSQL instance the AST
-# dispatcher unit-test slice and migration-apply probe require;
-# Qdrant and the OTel collector are NOT started because Phase 1
-# scenarios exercise the AST dispatcher (in-process) and the
-# schema migration journal (postgres only).
+# Services started: postgres only — the partman-enabled image built from
+# services/agent-memory/deploy/local/postgres/Dockerfile. Qdrant and the
+# OTel collector are NOT started; Phase 1 scenarios exercise the AST
+# dispatcher (in-process) and the schema migration journal (postgres only).
 #
-# Usage (from the repo root):
+# Usage (from repo root):
 #   docker compose -f tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml up -d
 #   export AGENT_MEMORY_PG_URL="postgres://agent_memory:agent_memory@localhost:5432/agent_memory?sslmode=disable"
 #   cd services/agent-memory
-#   go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/...
+#   go test -tags e2e ./test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/...
 
-name: phase-1-e2e
+name: phase-1-shared-additive-surfaces
 
 services:
   postgres:
-    container_name: phase1_e2e_postgres
+    container_name: phase1_postgres
     build:
       context: ../../../services/agent-memory/deploy/local/postgres
       dockerfile: Dockerfile
     image: agent-memory/postgres:16-partman
+    restart: "no"
     environment:
       POSTGRES_USER: agent_memory
       POSTGRES_PASSWORD: agent_memory
@@ -35,7 +33,7 @@ services:
       - "-c"
       - "pg_partman_bgw.dbname=agent_memory"
       - "-c"
-      - "pg_partman_bgw.interval=600"
+      - "pg_partman_bgw.interval=3600"
       - "-c"
       - "pg_partman_bgw.role=agent_memory"
     ports:

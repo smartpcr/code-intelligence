@@ -15,14 +15,37 @@ pool:
 variables:
   COMPOSE_FILE: tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml
   AGENT_MEMORY_PG_URL: "postgres://agent_memory:agent_memory@localhost:5432/agent_memory?sslmode=disable"
+  GO_MOD_FILE: services/agent-memory/go.mod
 
 steps:
   - checkout: self
 
+  - script: |
+      set -euo pipefail
+      if [ ! -f "$(GO_MOD_FILE)" ]; then
+        echo "##vso[task.logissue type=error]Cannot find $(GO_MOD_FILE)"
+        exit 1
+      fi
+      # Mirror actions/setup-go's go-version-file behaviour: prefer the
+      # `toolchain` directive when present, otherwise fall back to the
+      # `go` directive.
+      GO_VERSION=$(awk '
+        /^toolchain[[:space:]]+go/ { v=$2; sub(/^go/, "", v); toolchain=v }
+        /^go[[:space:]]+[0-9]/     { goline=$2 }
+        END { if (toolchain) print toolchain; else print goline }
+      ' "$(GO_MOD_FILE)")
+      if [ -z "$GO_VERSION" ]; then
+        echo "##vso[task.logissue type=error]Could not determine Go version from $(GO_MOD_FILE)"
+        exit 1
+      fi
+      echo "Resolved Go version from $(GO_MOD_FILE): $GO_VERSION"
+      echo "##vso[task.setvariable variable=GO_VERSION]$GO_VERSION"
+    displayName: "Resolve Go version from go.mod"
+
   - task: GoTool@0
     displayName: "Set up Go"
     inputs:
-      version: "1.25"
+      version: $(GO_VERSION)
 
   - script: |
       docker compose -f $(COMPOSE_FILE) up -d --build

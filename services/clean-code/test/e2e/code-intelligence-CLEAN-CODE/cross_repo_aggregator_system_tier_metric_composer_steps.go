@@ -248,6 +248,40 @@ func (s *systemTierState) missingFoundationSamplesForScopeAtSHA(foundationKind s
 	runID, _ := uuid.NewV4()
 	repoScope, _ := uuid.NewV4()
 
+	// Map Gherkin shorthands to canonical foundation metric_kind strings.
+	aliasMap := map[string]string{
+		"cyclo": "cycle_member",
+	}
+	omitKind := foundationKind
+	if mapped, ok := aliasMap[foundationKind]; ok {
+		omitKind = mapped
+	}
+
+	// All canonical foundation kinds the composer consumes as inputs.
+	allFoundationKinds := []string{
+		"cycle_member",
+		"fan_in",
+		"coupling_between_objects",
+		"modification_count_in_window",
+		"pass_first_try_ratio",
+	}
+
+	// Supply foundation samples for every kind EXCEPT the one named
+	// in the Gherkin step, so the test validates that specifically
+	// that kind's absence triggers degradation.
+	var foundation []aggregator.FoundationSample
+	for _, kind := range allFoundationKinds {
+		if kind == omitKind {
+			continue
+		}
+		foundation = append(foundation, aggregator.FoundationSample{
+			ScopeID:    repoScope,
+			ScopeKind:  "repo",
+			MetricKind: kind,
+			Value:      1.0,
+		})
+	}
+
 	in := aggregator.SystemTierInput{
 		Mode:          aggregator.SystemTierModeEmbedded,
 		RepoID:        repoID,
@@ -256,7 +290,7 @@ func (s *systemTierState) missingFoundationSamplesForScopeAtSHA(foundationKind s
 		Scopes: []aggregator.ScopeRef{
 			{ScopeID: repoScope, ScopeKind: "repo"},
 		},
-		Foundation:      nil,
+		Foundation:      foundation,
 		VelocityWindows: nil,
 	}
 

@@ -171,6 +171,20 @@ type PlanResult struct {
 	// in [PlanResult.HotSpots].
 	PolicyVersionID uuid.UUID
 
+	// Snapshot is the FULL active policy snapshot that scored
+	// this batch (`PolicyVersionID` + `Weights`). The
+	// Stage 8.2 [TaskPlanner] needs the snapshot's
+	// `Weights.TopN` and `Weights.EffortModelVersion` for
+	// downstream plan / task emission and would otherwise
+	// have to re-read the policy -- a second read that could
+	// race a concurrent `policy.activate` and return a
+	// different `policy_version_id` than the one already
+	// stamped on every emitted `hot_spot`. Carrying the
+	// snapshot on [PlanResult] closes that race at the type
+	// level (the rubber-duck Stage 8.2 design review
+	// pinned this; finding #3).
+	Snapshot PolicySnapshot
+
 	// HotSpots is the persisted batch in canonical sort
 	// order (Score DESC, ScopeID ASC).
 	HotSpots []HotSpot
@@ -282,51 +296,21 @@ func (p *Planner) Plan(
 	repoID uuid.UUID,
 	sha string,
 ) (PlanResult, error) {
-	// Step 1: read the active policy snapshot.
-	snap, ok, err := p.policy.ActivePolicyVersion(ctx)
+	snap, comps, err := readAndCompute(
+		ctx, p.policy, p.metrics, p.findings, p.compute, repoID, sha)
 	if err != nil {
-		return PlanResult{}, fmt.Errorf("refactor.Plan: read active policy: %w", err)
+		return PlanResult{}, err
 	}
-	if !ok {
-		return PlanResult{}, ErrNoActivePolicy
-	}
-
-	// Step 2: read per-scope metric samples.
-	metricInputs, err := p.metrics.ScopeMetrics(ctx, repoID, sha, HotSpotInputMetricKinds)
-	if err != nil {
-		return PlanResult{}, fmt.Errorf("refactor.Plan: read metric_sample: %w", err)
-	}
-
-	// Step 3: read + count per-scope qualifying findings
-	// for the ACTIVE policy_version_id only. Findings
-	// produced by stale / parallel policy evaluations at
-	// the same SHA MUST NOT inflate the hot_spot row that
-	// is stamped with the active policy_version_id (the
-	// canonical "reproducible-from-policy_version_id"
-	// invariant per architecture Sec 5.5.1).
-	findingCounts, err := p.findings.FindingCountsByScope(ctx, repoID, sha, snap.PolicyVersionID)
-	if err != nil {
-		return PlanResult{}, fmt.Errorf("refactor.Plan: count findings: %w", err)
-	}
-
-	// Step 4: compose ScopeInputs (union of scope_ids).
-	inputs := mergeMetricsAndFindings(metricInputs, findingCounts)
-	if len(inputs) == 0 {
+	if len(comps) == 0 {
 		// Empty input is well-defined: write nothing, return
 		// nil HotSpots. Still call the writer (with nil) so
 		// the contract is honoured.
 		if err := p.writer.WriteHotSpots(ctx, nil); err != nil {
 			return PlanResult{}, fmt.Errorf("refactor.Plan: write empty batch: %w", err)
 		}
-		return PlanResult{PolicyVersionID: snap.PolicyVersionID}, nil
+		return PlanResult{PolicyVersionID: snap.PolicyVersionID, Snapshot: snap}, nil
 	}
 
-	comps, err := p.compute.Compute(snap, repoID, sha, inputs)
-	if err != nil {
-		return PlanResult{}, fmt.Errorf("refactor.Plan: compute: %w", err)
-	}
-
-	// Step 5: extract HotSpot + Breakdown columns and write.
 	rows := make([]HotSpot, len(comps))
 	bks := make([]Breakdown, len(comps))
 	for i, c := range comps {
@@ -339,9 +323,71 @@ func (p *Planner) Plan(
 
 	return PlanResult{
 		PolicyVersionID: snap.PolicyVersionID,
+		Snapshot:        snap,
 		HotSpots:        rows,
 		Breakdowns:      bks,
 	}, nil
+}
+
+// readAndCompute is the shared read → compute helper that the
+// Stage 8.1 [Planner.Plan] and the Stage 8.2 [TaskPlanner.Plan]
+// both invoke. It performs the canonical four steps:
+//
+//  1. Read the currently-active PolicySnapshot ONCE so a
+//     concurrent policy.activate does not produce a torn
+//     plan whose hot_spots are scored by one policy_version
+//     and whose top-N truncation uses another policy's
+//     `top_n` (the rubber-duck design review pinned this
+//     race condition).
+//  2. Read per-scope metric_sample rows.
+//  3. Read + count per-scope qualifying findings for the
+//     ACTIVE policy_version_id only.
+//  4. Compose ScopeInputs and call [Computer.Compute].
+//
+// On no-active-policy, returns [ErrNoActivePolicy] (a fresh
+// deploy signal). On an empty (no metric / no finding) input
+// returns `(snap, nil, nil)` so callers can branch.
+//
+// Error messages preserve the canonical wrapping strings
+// ("read active policy", "read metric_sample", "count findings",
+// "compute") that the Stage 8.1 tests assert on.
+func readAndCompute(
+	ctx context.Context,
+	policyReader PolicyReader,
+	metrics MetricSampleReader,
+	findings FindingReader,
+	computer *Computer,
+	repoID uuid.UUID,
+	sha string,
+) (PolicySnapshot, []Computation, error) {
+	snap, ok, err := policyReader.ActivePolicyVersion(ctx)
+	if err != nil {
+		return PolicySnapshot{}, nil, fmt.Errorf("refactor.Plan: read active policy: %w", err)
+	}
+	if !ok {
+		return PolicySnapshot{}, nil, ErrNoActivePolicy
+	}
+
+	metricInputs, err := metrics.ScopeMetrics(ctx, repoID, sha, HotSpotInputMetricKinds)
+	if err != nil {
+		return PolicySnapshot{}, nil, fmt.Errorf("refactor.Plan: read metric_sample: %w", err)
+	}
+
+	findingCounts, err := findings.FindingCountsByScope(ctx, repoID, sha, snap.PolicyVersionID)
+	if err != nil {
+		return PolicySnapshot{}, nil, fmt.Errorf("refactor.Plan: count findings: %w", err)
+	}
+
+	inputs := mergeMetricsAndFindings(metricInputs, findingCounts)
+	if len(inputs) == 0 {
+		return snap, nil, nil
+	}
+
+	comps, err := computer.Compute(snap, repoID, sha, inputs)
+	if err != nil {
+		return PolicySnapshot{}, nil, fmt.Errorf("refactor.Plan: compute: %w", err)
+	}
+	return snap, comps, nil
 }
 
 // mergeMetricsAndFindings combines the per-scope metric rows

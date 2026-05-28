@@ -5,6 +5,225 @@ Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
 
+## Stage 8.2 -- Refactor plan and task generation
+
+This workstream extends the Stage 8.1 Refactor Planner (composite
+hotspot scoring) with the canonical end-to-end plan + task
+generation contract:
+
+- A new orchestrator `internal/refactor.TaskPlanner` reads the
+  active `PolicySnapshot` ONCE per `Plan()` call (race-safe
+  shared `readAndCompute` helper extracted from
+  `internal/refactor.Planner.Plan`), persists the FULL hot_spot
+  batch via the existing `HotSpotWriter` (architecture Sec 5.5.1
+  append-only -- TopN never truncates the hot_spot row set),
+  then truncates to `Snapshot.Weights.TopN` for plan / task
+  emission.
+- The new `RefactorWeights.TopN` field (`steward/types.go`) drives
+  the per-policy plan-coverage knob. `TopN == 0` means
+  "no truncation, plan covers every scored hot_spot"
+  (backward-compatible with legacy policies); `TopN < 0` is
+  rejected at publish time by `validatePublishRequest` so a
+  malformed policy can never become active.
+- Per top-N hot_spot the planner reads qualifying finding
+  details via the new `FindingDetailReader`
+  (`SELECT DISTINCT (scope_id, rule_id) FROM finding WHERE
+  delta IN ('new','newly_failing') AND policy_version_id = $
+  AND scope_id = ANY($)`), dedupes by `(scope_id, rule_id)`,
+  and emits one `RefactorTask` per unique rule.
+- `task.kind` is the canonical five-value closed set per
+  architecture Sec 5.5.3 line 1274:
+  `split_class | extract_method | invert_dependency |
+  break_cycle | consolidate_duplication`. The iter-3 alias set
+  `extract_function | introduce_interface |
+  reduce_inheritance | reduce_coupling | reduce_lcom |
+  reduce_duplication` is REJECTED by `ValidateTaskKind` via
+  `ErrRejectedTaskKindAlias`. Unknown kinds surface
+  `ErrUnknownTaskKind`. The default `rule_id -> TaskKind`
+  mapping (`DefaultTaskKindForRule`) pins:
+  - `solid.srp.*` / `solid.isp.*` -> `split_class`
+  - `solid.ocp.*` / `solid.lsp.*` -> `extract_method`
+  - `solid.dip.*` / `decoupling.coupling.*` /
+    `decoupling.cbo.*` / `decoupling.fan_*` -> `invert_dependency`
+  - `decoupling.cycle_member` / `decoupling.cycles.*` ->
+    `break_cycle`
+  - `decoupling.duplication*` -> `consolidate_duplication`
+  Rule packs that ship a non-canonical rule fall back to the
+  `WithDefaultKind` value (default `extract_method`); the
+  `NewTaskPlanner` constructor rejects a non-canonical
+  default eagerly so a wiring slip surfaces at construction
+  rather than at first `Plan()` call.
+- The plan + every task ARE persisted atomically via
+  `RefactorPlanTaskWriter.WriteRefactorPlanAndTasks` -- one SQL
+  transaction wraps both inserts so a partial failure cannot
+  land an orphan `refactor_plan` row (the table is
+  append-only). The `SQLRefactorPlanTaskWriter` validates every
+  emitted kind BEFORE opening the transaction so a buggy custom
+  mapper aborts the whole batch.
+- A hot_spot with NO qualifying findings (metric-only signal)
+  remains listed in `RefactorPlan.HotspotIDs` but emits ZERO
+  tasks; the planner refuses to fabricate a synthetic rule_id
+  (rubber-duck Stage 8.2 design review finding #2 -- a
+  synthetic rule_id would violate the logical FK to
+  `rule.rule_id`).
+- `RefactorTask.EffortHours` is emitted as the explicit `0.0`
+  unestimated placeholder; Stage 8.3 replaces the placeholder
+  with the ML model output keyed by
+  `PolicyVersion.refactor_weights.effort_model_version`.
+- `refactor_plan` carries NO `policy_version_id` column per
+  architecture Sec 5.5.2 line 1226-1237 -- the policy is
+  recoverable through any referenced HotSpot.
+
+### What Stage 8.2 requires (implementation-plan verbatim)
+
+> - Add `internal/refactor/planner.go` reading the top-N
+>   hotspots per repo (N from
+>   `policy_version.refactor_weights.top_n`) and writing
+>   `refactor_plan(plan_id, repo_id, sha, hotspot_ids JSONB,
+>   summary_md, created_at)` per architecture Sec 5.5.2 lines
+>   1226-1237 canonical schema (NO `policy_version_id` column
+>   on `refactor_plan` -- the policy is recoverable through
+>   the referenced HotSpots).
+> - For each hotspot, emit one or more
+>   `refactor_task(task_id, plan_id, scope_id, kind,
+>   effort_hours DOUBLE, rule_id, description_md, created_at)`
+>   rows per architecture Sec 5.5.3 lines 1239-1250 canonical
+>   schema.
+> - `task.kind` is the canonical enum
+>   `split_class | extract_method | invert_dependency |
+>   break_cycle | consolidate_duplication`; refuse to write
+>   unknown kinds (the iter 3 alias set
+>   `extract_function | introduce_interface |
+>   reduce_inheritance | reduce_coupling | reduce_lcom |
+>   reduce_duplication` is REJECTED).
+
+### Where the contract lives (greppable pointers)
+
+- `services/clean-code/internal/refactor/task_planner.go` --
+  the Stage 8.2 contract surface. Owns `TaskKind`,
+  `CanonicalTaskKinds`, `RejectedTaskKindAliases`,
+  `IsCanonicalTaskKind`, `IsRejectedTaskKindAlias`,
+  `ValidateTaskKind`, `DefaultTaskKindForRule`,
+  `RefactorPlan`, `RefactorTask`, `PlanAndTasksResult`,
+  `FindingDetail`, `FindingDetailReader`,
+  `RefactorPlanTaskWriter`, sentinel errors
+  (`ErrUnknownTaskKind`, `ErrRejectedTaskKindAlias`,
+  `ErrInvalidTopN`, `ErrNilFindingDetailReader`,
+  `ErrNilPlanTaskWriter`), `TaskOption` configuration
+  (`WithTaskIDFactory`, `WithTaskClock`,
+  `WithRuleKindMapper`, `WithDefaultKind`,
+  `WithSummaryFunc`, `WithTaskDescriptionFunc`),
+  `TaskPlanner` + `NewTaskPlanner` + `TaskPlanner.Plan`,
+  `InMemoryFindingDetailReader` +
+  `InMemoryRefactorPlanTaskWriter` (test + scaffold-mode
+  composition root), and `SQLFindingDetailReader` +
+  `SQLRefactorPlanTaskWriter` (production -- atomic
+  single-transaction insert).
+- `services/clean-code/internal/refactor/task_planner_test.go`
+  -- coverage:
+  `TestCanonicalTaskKinds_AreExactlyTheFiveCanonicalValues`
+  pins the closed enum against architecture Sec 5.5.3 line
+  1274; `TestValidateTaskKind_RejectsIter3Aliases` pins all
+  six rejected aliases;
+  `TestValidateTaskKind_RejectsUnknown` pins typo handling;
+  `TestDefaultTaskKindForRule_MapsCanonicalRuleFamilies`
+  pins the v0 mapping table;
+  `TestNewTaskPlanner_RejectsNilDeps` pins every required
+  dependency;
+  `TestNewTaskPlanner_RejectsNonCanonicalDefaultKind`
+  pins the construction-time validator;
+  `TestTaskPlanner_Plan_HappyPath_TopNTruncatesPlanCoverage`
+  pins the end-to-end orchestration (FULL hot_spot persisted,
+  top-N plan coverage, one task per rule);
+  `TestTaskPlanner_Plan_TopNZeroEmitsAllHotSpots` pins the
+  no-truncation case;
+  `TestTaskPlanner_Plan_TopNExceedsHotSpotCount` pins the
+  graceful-clamp behaviour;
+  `TestTaskPlanner_Plan_HotspotWithoutFindings_EmitsZeroTasks`
+  pins the no-synthetic-rule_id contract;
+  `TestTaskPlanner_Plan_DedupesByScopeAndRule` pins the
+  duplicate-firing dedup;
+  `TestTaskPlanner_Plan_UnmappedRuleFallsBackToDefaultKind`
+  pins the default fallback;
+  `TestTaskPlanner_Plan_RuleMapperOverride` pins the
+  configurable mapper;
+  `TestTaskPlanner_Plan_RuleMapperReturnsRejectedAlias_Aborts`
+  pins the alias-rejection abort path;
+  `TestTaskPlanner_Plan_NoActivePolicy_ReturnsSentinel`
+  pins the Stage 8.1 sentinel propagation;
+  `TestTaskPlanner_Plan_EmptyInput_NoPlanWritten` pins the
+  empty-input no-op contract;
+  `TestTaskPlanner_Plan_NegativeTopN_ReturnsErrInvalidTopN`
+  pins the defensive runtime guard;
+  `TestTaskPlanner_Plan_FindingDetailReaderError_PropagatesAndWraps`
+  + `TestTaskPlanner_Plan_PlanTaskWriterError_PropagatesAndWraps`
+  pin error propagation;
+  `TestInMemoryFindingDetailReader_*` (three tests) pin the
+  in-memory reader's qualifying-delta + policy_version_id +
+  dedup contract.
+- `services/clean-code/internal/refactor/planner.go` --
+  refactored to extract the shared `readAndCompute` helper
+  (rubber-duck Stage 8.2 design review finding #3: closes the
+  policy-read race the previous two-call shape exposed).
+  `Planner.Plan` now produces `PlanResult` with the new
+  `Snapshot` field so downstream consumers can inherit the
+  exact same `PolicySnapshot` without re-reading the steward.
+- `services/clean-code/internal/policy/steward/types.go` --
+  `RefactorWeights.TopN int` field with `json:"top_n,omitempty"`
+  and the canonical doc-comment explaining the
+  `0 / >0 / <0` semantics.
+- `services/clean-code/internal/policy/steward/steward.go` --
+  `validatePublishRequest` rejects `TopN < 0` with
+  `ErrInvalidRequest`.
+- `services/clean-code/internal/policy/steward/topn_test.go`
+  -- `TestSteward_PublishRejectsNegativeTopN` /
+  `TestSteward_PublishAcceptsZeroTopN` /
+  `TestSteward_PublishAcceptsPositiveTopN` pin the publish
+  validation contract.
+- `services/clean-code/internal/refactor/doc.go` -- updated
+  `Stage scope split` section: Stage 8.2 is now annotated
+  "(this file set adds)" with the full surface enumerated;
+  Stage 8.1 keeps its prior `(this file set)` tag.
+
+### Atomic write contract
+
+Per architecture Sec 5.5 the `refactor_plan` and
+`refactor_task` tables are append-only -- there is no UPDATE,
+no DELETE, and no compensating verb that can clean up an
+orphan plan. The Stage 8.2 writer therefore wraps the plan
+insert + every task insert in a SINGLE transaction (`tx,
+err := db.BeginTx(ctx, nil); defer tx.Rollback(); ...
+tx.Commit()`). A partial failure ANYWHERE in the batch rolls
+back the plan AND every emitted task; the rubber-duck Stage
+8.2 design review finding #1 explicitly caught the
+split-writer shape this contract closes.
+
+### TopN semantics
+
+- `TopN > 0` truncates plan coverage to the top-N
+  score-DESC hot_spots; ALL scored hot_spots are still
+  persisted to `hot_spot`.
+- `TopN == 0` (legacy / unconfigured) means "no truncation,
+  plan covers every scored hot_spot".
+- `TopN < 0` is rejected at publish time. The Refactor
+  Planner ALSO surfaces `ErrInvalidTopN` at runtime so a
+  composition root that bypasses `validatePublishRequest`
+  (in-memory scaffold wiring) does not silently produce a
+  malformed plan.
+
+### task.kind canonical enum (architecture Sec 5.5.3 line 1274)
+
+The five values are emitted by exactly the canonical strings
+matching the `refactor_task_kind` PostgreSQL ENUM defined in
+`migrations/0003_policy_audit_refactor.up.sql` lines 140-146:
+`split_class`, `extract_method`, `invert_dependency`,
+`break_cycle`, `consolidate_duplication`. Adding a sixth
+value requires (a) a const in `task_planner.go`, (b) an
+entry in `CanonicalTaskKinds`, (c) a catalogue-bump
+migration extending the ENUM, AND (d) updating the
+architecture row.
+
+
 ## Stage 7.3 -- Insights percentile freshness banner
 
 This workstream is documentation-only on this branch: the entire

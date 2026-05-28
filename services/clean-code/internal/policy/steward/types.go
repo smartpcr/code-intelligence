@@ -69,6 +69,42 @@ type RefactorWeights struct {
 	EffortModelVersion     string  `json:"effort_model_version"`
 	WindowDays             int     `json:"window_days"`
 	FreshnessWindowSeconds *int    `json:"freshness_window_seconds,omitempty"`
+
+	// TopN is the Stage 8.2 refactor-plan truncation knob: the
+	// `RefactorPlanner` reads ALL `hot_spot` rows it has just
+	// scored at this SHA, then truncates the per-plan
+	// `hotspot_ids` JSONB array (and the per-hotspot task
+	// emission) to the top-`TopN` rows by composite score
+	// (architecture Sec 5.5.2 + implementation-plan Stage 8.2
+	// line 732 "reading the top-N hotspots per repo
+	// (N from `policy_version.refactor_weights.top_n`)").
+	//
+	// Semantics:
+	//
+	//   - `TopN > 0` -- truncate to that many highest-scoring
+	//     hot_spots when assembling the plan. Hot_spot rows
+	//     beyond the cut are still PERSISTED (the planner is
+	//     the sole writer of `hot_spot`; truncating storage
+	//     would lose audit signal) but are NOT referenced from
+	//     `refactor_plan.hotspot_ids` and DO NOT produce
+	//     `refactor_task` rows.
+	//
+	//   - `TopN == 0` -- "operator did not configure a
+	//     truncation knob"; the planner emits a plan covering
+	//     ALL scored hot_spots and tasks for each one (no
+	//     truncation). Default for legacy `refactor_weights`
+	//     blobs that were authored before this field existed.
+	//
+	//   - `TopN < 0` -- rejected by `validatePublishRequest`
+	//     in `steward.go` so a misconfigured policy fails at
+	//     publish time rather than silently behaving like
+	//     "no truncation".
+	//
+	// The field carries the `omitempty` tag so the canonical
+	// JSON for pre-Stage-8.2 policies (which all default to
+	// `TopN == 0`) matches the existing signed bytes and the
+	// signature verification stays stable on rollout.
+	TopN int `json:"top_n,omitempty"`
 }
 
 // PolicyVersion mirrors a row in `clean_code.policy_version`

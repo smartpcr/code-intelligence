@@ -5,6 +5,130 @@ production-tier environment. The instructions assume Postgres
 14+ is already running and the `clean_code_*` roles have been
 created via the `0004_roles.up.sql` migration.
 
+## Stage 8.2: Refactor plan and task generation
+
+This subsection captures the rollout sequence for the Stage
+8.2 extension to `internal/refactor/`: the `TaskPlanner`
+orchestrator emitting `refactor_plan` and `refactor_task`
+rows. Stage 8.2 does NOT introduce a new binary -- it ships
+inside the existing Refactor Planner process (`cmd/
+clean-code-refactor-planner/main.go`, alongside Stage 8.1).
+
+### What's new
+
+1. **`internal/refactor/task_planner.go`** -- the Stage 8.2
+   contract surface: `TaskPlanner`, `RefactorPlan`,
+   `RefactorTask`, `TaskKind` + the closed five-value
+   canonical enum, `FindingDetailReader`,
+   `RefactorPlanTaskWriter`, in-memory + SQL
+   implementations.
+2. **`steward.RefactorWeights.TopN`** -- new optional
+   `int` field with `json:"top_n,omitempty"`. Zero =
+   no truncation; positive = top-N truncation; negative
+   rejected at publish time. Legacy policies (no `top_n`
+   key in the JSONB blob) deserialize to `TopN = 0` and
+   carry the no-truncation semantics, so NO migration
+   step is required for existing rows.
+3. **`refactor_task_kind` ENUM** -- already created by
+   migration `0003_policy_audit_refactor.up.sql:140`
+   during Stage 5.1. Stage 8.2 only EMITS the five values
+   the migration already declares; no new migration step is
+   required.
+
+### Pre-rollout: confirm role grants (no change needed)
+
+The DB role `clean_code_refactor_planner` already has
+`INSERT, SELECT` on `refactor_plan` and `refactor_task` per
+migration `0004_roles.up.sql:482-509`. Stage 8.2 emits
+to those same tables, so NO new role grant is required.
+Verify with:
+
+```sql
+SELECT grantee, table_name, privilege_type
+  FROM information_schema.role_table_grants
+ WHERE table_schema = 'clean_code'
+   AND table_name IN ('refactor_plan', 'refactor_task')
+   AND grantee = 'clean_code_refactor_planner'
+ ORDER BY table_name, privilege_type;
+```
+
+Expect exactly four rows: `(INSERT, refactor_plan)`,
+`(SELECT, refactor_plan)`, `(INSERT, refactor_task)`,
+`(SELECT, refactor_task)`. NO `UPDATE`, NO `DELETE` --
+both tables are append-only.
+
+### Step 1: Republish active policies with `top_n`
+
+Stage 8.2 reads `policy_version.refactor_weights.top_n`. For
+a brand-new deployment, the default is `0` (no truncation)
+and operators may skip this step. For a production tier
+already running Stage 8.1, decide whether plan coverage
+should be truncated:
+
+- Small repos / pilot environments: keep `top_n: 0`. Every
+  scored hot_spot lands in the plan; useful for surfacing
+  the long tail.
+- Large repos / triage-mode: set `top_n: 25` (suggested
+  default). The plan covers the 25 highest-score hot_spots
+  per `(repo_id, sha)`; the long tail still persists in
+  `hot_spot` for future re-planning.
+
+Republish via the steward `policy.publish` + `policy.activate`
+verbs; the migration is signature-stable because `top_n` is
+a JSONB key with `omitempty` (so the legacy-row canonical
+bytes are unchanged when `top_n == 0`).
+
+### Step 2: Roll out the binary
+
+No env-knob changes. The Stage 8.2 surface is wired in the
+Refactor Planner composition root alongside Stage 8.1; a
+standard binary roll picks it up. The first
+`TaskPlanner.Plan` invocation after rollout will:
+
+1. Persist the full hot_spot batch (Stage 8.1 behaviour
+   unchanged).
+2. Emit ONE `refactor_plan` row + N `refactor_task` rows
+   per (repo_id, sha) in a single transaction.
+
+### Step 3: Smoke-test post-rollout
+
+Trigger a planner run against a known (repo_id, sha) and
+verify both tables landed atomically:
+
+```sql
+SELECT plan_id,
+       jsonb_array_length(hotspot_ids) AS coverage,
+       (SELECT count(*)
+          FROM clean_code.refactor_task t
+         WHERE t.plan_id = p.plan_id) AS task_count
+  FROM clean_code.refactor_plan p
+ WHERE p.repo_id = $1 AND p.sha = $2
+ ORDER BY p.created_at DESC
+ LIMIT 1;
+```
+
+Expect:
+
+- `coverage` ≤ `top_n` (or = full hot_spot count when
+  `top_n == 0`).
+- `task_count` ≥ 0 (zero is legal for metric-only signals).
+- The task kinds you SELECT back are members of
+  `('split_class','extract_method','invert_dependency',
+  'break_cycle','consolidate_duplication')` -- the ENUM
+  type itself rejects any other value.
+
+### Rollback
+
+Revert the binary. The Stage 8.2 rows that already landed
+remain (the tables are append-only). To remove them
+operationally, take an audit-tracked retraction via the
+forthcoming `refactor.retract` verb (not in Stage 8.2 --
+Stage 8.4 owns it). For an emergency stop, set
+`policy_version.refactor_weights.top_n = 0` and deactivate
+the policy via `policy.activate` with the prior PV id; no
+new plan / task rows will land until a policy is re-activated.
+
+
 ## Stage 7.1: Cross-Repo Aggregator cadence loop
 
 This subsection captures the rollout sequence for the

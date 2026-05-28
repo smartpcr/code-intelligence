@@ -6,6 +6,116 @@ composition root (`cmd/clean-code-metric-ingestor/main.go`,
 which hosts the management + ingest HTTP surfaces; future
 binaries under `cmd/clean-code-*` ship their own routes).
 
+## Stage 8.2 -- Refactor plan and task generation
+
+This section captures the operator-facing contract of the
+Stage 8.2 add-ons to `internal/refactor/`: the `TaskPlanner`
+orchestrator that emits `refactor_plan` rows + per-hot_spot
+`refactor_task` rows from the top-N hot_spots at one
+`(repo_id, sha)`.
+
+### Process layout
+
+Stage 8.2 runs inside the same Refactor Planner binary as
+Stage 8.1 (the planner cadence loop / on-demand verb under
+`cmd/clean-code-refactor-planner/main.go`). `TaskPlanner` is
+a thin extension of the Stage 8.1 `Planner`: it shares the
+same `PolicyReader`, `MetricSampleReader`, `FindingReader`,
+and `HotSpotWriter` dependencies and adds two new
+boundaries -- `FindingDetailReader` (production:
+`SQLFindingDetailReader` against `clean_code.finding`) and
+`RefactorPlanTaskWriter` (production:
+`SQLRefactorPlanTaskWriter` against the
+`refactor_plan` + `refactor_task` tables in one
+transaction). The DB role `clean_code_refactor_planner` is
+already granted `INSERT, SELECT` on both target tables
+(migration `0004_roles.up.sql:482-509`); no role change is
+required for Stage 8.2.
+
+### Knobs (`policy_version.refactor_weights`)
+
+- `top_n` (Stage 8.2 NEW, optional int) -- maximum number
+  of hot_spots a single `refactor_plan` row covers. Zero
+  means no truncation (plan covers every scored hot_spot);
+  positive truncates to the top-N by composite score
+  DESC; negative is rejected at publish time. The hot_spot
+  table is always written in full (architecture Sec 5.5.1
+  append-only) -- `top_n` only affects plan coverage and
+  emitted tasks.
+- `effort_model_version` -- Stage 8.3 effort-model pin.
+  Stage 8.2 emits `refactor_task.effort_hours = 0.0` as the
+  unestimated placeholder; Stage 8.3 backfills.
+- All Stage 8.1 weights (`alpha`, `beta`, `gamma`,
+  `delta`, `window_days`) flow through to Stage 8.2
+  unchanged via the shared `readAndCompute` helper.
+
+### What the planner writes
+
+For each `TaskPlanner.Plan(ctx, repo_id, sha)` invocation:
+
+1. ALL scored hot_spots persist via `HotSpotWriter`
+   (`clean_code.hot_spot`), in canonical sort order
+   (Score DESC, ScopeID ASC).
+2. ONE `refactor_plan` row persists via
+   `RefactorPlanTaskWriter.WriteRefactorPlanAndTasks`
+   (atomic transaction with the tasks below) covering the
+   top-N hot_spots in `hotspot_ids JSONB`. Carries NO
+   `policy_version_id` column -- recover the policy via
+   any referenced hot_spot row.
+3. ZERO OR MORE `refactor_task` rows in the same transaction,
+   one per unique `(scope_id, rule_id)` qualifying finding
+   pair. A hot_spot with NO qualifying findings IS still
+   listed in `plan.hotspot_ids` but emits ZERO tasks (the
+   planner refuses to fabricate a synthetic rule_id).
+
+### `task.kind` canonical enum
+
+The five values per architecture Sec 5.5.3 line 1274:
+
+| kind                       | typical trigger                                    |
+| -------------------------- | -------------------------------------------------- |
+| `split_class`              | SOLID SRP / ISP violation (split class / interface)|
+| `extract_method`           | SOLID OCP / LSP / unmapped rule fallback           |
+| `invert_dependency`        | SOLID DIP / high CBO / high fan_in / high fan_out  |
+| `break_cycle`              | `decoupling.cycle_member` / `decoupling.cycles.*`  |
+| `consolidate_duplication`  | `decoupling.duplication*`                          |
+
+The iter-3 alias set
+`extract_function | introduce_interface |
+reduce_inheritance | reduce_coupling | reduce_lcom |
+reduce_duplication` is REJECTED. A rule pack that emits a
+finding whose rule_id maps to an alias kind (via a custom
+`WithRuleKindMapper`) ABORTS the whole `TaskPlanner.Plan`
+batch with `ErrRejectedTaskKindAlias`; no plan row, no
+task row lands. Operators see the rejection in the
+planner's structured-log error wrap.
+
+### Failure modes / recovery
+
+| symptom                                            | likely cause                                                                   | action                                                                                       |
+| -------------------------------------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| `ErrNoActivePolicy`                                | No `policy_activation` row at planner runtime                                  | Activate a policy via the steward verb; planner is idempotent and will produce on next loop |
+| `ErrInvalidTopN`                                   | Composition root injected a snapshot with `TopN < 0`                           | Republish the policy with a non-negative `top_n`; legitimate publishes are blocked already   |
+| `ErrRejectedTaskKindAlias` / `ErrUnknownTaskKind`  | Custom rule mapper returned a non-canonical kind                               | Inspect the failing rule_id in the error wrap; remove the override or map to a canonical kind|
+| `write plan+tasks: ... transaction rollback`       | Connection drop mid-batch                                                      | Re-run the planner -- the transaction guarantees no orphan plan landed                       |
+
+### Effort-model version recovery
+
+Stage 8.2 emits `effort_hours = 0.0`. To recover the
+effort-model version a task was scored against:
+
+```
+refactor_task.task_id
+  -> refactor_task.plan_id
+  -> refactor_plan.hotspot_ids[0]
+  -> hot_spot.policy_version_id
+  -> policy_version.refactor_weights.effort_model_version
+```
+
+Stage 8.3 will replace the placeholder; the traversal path
+above stays canonical.
+
+
 ## Stage 7.1 -- Cross-Repo Aggregator cadence loop
 
 This section captures the operator-facing contract of the

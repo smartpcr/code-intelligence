@@ -11,7 +11,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
+	"forge/services/clean-code/internal/metrics/recipes"
 )
 
 // SystemTierComposer materialises the SEVEN canonical system-tier
@@ -1056,10 +1056,23 @@ func (c *SystemTierComposer) composeArchDebtRatio(
 	noInputs := len(cycleMembers) == 0
 	totalCount := float64(len(cycleMembers))
 
+	// In embedded mode with no xrepo edges available, arch_debt_ratio
+	// degrades with xrepo_edges_unavailable per the implementation-plan
+	// Stage 7.2 acceptance scenario embedded-mode-writes-degraded-row.
+	embeddedDegraded := in.Mode == SystemTierModeEmbedded && !in.XRepoEdgesAvailable
+
 	out := make([]SystemTierSample, 0, len(pkgScopes)+len(repoScopes))
 
 	// Per-package rows.
 	for _, s := range pkgScopes {
+		if embeddedDegraded {
+			row, err := c.makeDegradedSample(in, s, SystemMetricArchDebtRatio, DegradedReasonXRepoEdgesUnavailable, nil)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, row)
+			continue
+		}
 		if noInputs {
 			row, err := c.makeDegradedSample(in, s, SystemMetricArchDebtRatio, DegradedReasonSamplesPending, nil)
 			if err != nil {
@@ -1090,6 +1103,14 @@ func (c *SystemTierComposer) composeArchDebtRatio(
 	// repo that simply lacks package-scope metadata, which
 	// is semantically wrong and was the prior behaviour.)
 	for _, s := range repoScopes {
+		if embeddedDegraded {
+			row, err := c.makeDegradedSample(in, s, SystemMetricArchDebtRatio, DegradedReasonXRepoEdgesUnavailable, nil)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, row)
+			continue
+		}
 		if noInputs || len(pkgScopes) == 0 {
 			row, err := c.makeDegradedSample(in, s, SystemMetricArchDebtRatio, DegradedReasonSamplesPending, nil)
 			if err != nil {

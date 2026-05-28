@@ -199,8 +199,7 @@ func (s *refactorTaskState) insertingRefactorTaskWithKindIsRejected(invalidKind 
 	}
 
 	errMsg := strings.ToLower(err.Error())
-	if !strings.Contains(errMsg, "check") && !strings.Contains(errMsg, "violates") &&
-		!strings.Contains(errMsg, "constraint") {
+	if !strings.Contains(errMsg, "check") || !strings.Contains(errMsg, "constraint") {
 		return fmt.Errorf("expected CHECK constraint error for kind=%q, got: %w",
 			invalidKind, err)
 	}

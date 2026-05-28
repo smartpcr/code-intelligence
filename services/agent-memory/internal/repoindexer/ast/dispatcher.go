@@ -251,7 +251,19 @@ func (d *Dispatcher) selectParser(relPath string, eventHints []string) LanguageP
 // aliases for each entry in raw. The output is suitable for
 // case-insensitive comparison against `LanguageParser.Language()`
 // values, which are themselves lower-case canonical ids
-// (`typescript`, `python`).
+// (`typescript`, `python`, `c`, `cpp`, `csharp`, `go`, `rust`,
+// `powershell`).
+//
+// Alias rows below mirror the AST-PARSER-FOR-ADDIT architecture
+// (Section 3) and tech-spec (Section 4.2) table. Each new
+// language parser registers its canonical id with the
+// dispatcher; the rows here exist so that `language_hints[]`
+// values supplied by the repo indexer (which use file-extension
+// or community spellings such as `golang`, `c#`, `ps1`) resolve
+// to the canonical id the parser exposes through
+// `LanguageParser.Language()`. The canonical id is also listed
+// in the same case row so a refactor that renames the canonical
+// id surfaces in exactly one place.
 func normalizeHints(raw []string) []string {
 	if len(raw) == 0 {
 		return nil
@@ -266,6 +278,18 @@ func normalizeHints(raw []string) []string {
 			n = "typescript"
 		case "py", "pyi":
 			n = "python"
+		case "c", "h":
+			n = "c"
+		case "cc", "cxx", "cpp", "c++", "hpp":
+			n = "cpp"
+		case "cs", "csharp", "c#":
+			n = "csharp"
+		case "go", "golang":
+			n = "go"
+		case "rs", "rust":
+			n = "rust"
+		case "ps", "ps1", "psm1", "psd1", "powershell":
+			n = "powershell"
 		}
 		out = append(out, n)
 	}

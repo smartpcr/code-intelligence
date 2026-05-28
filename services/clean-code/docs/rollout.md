@@ -5,6 +5,117 @@ production-tier environment. The instructions assume Postgres
 14+ is already running and the `clean_code_*` roles have been
 created via the `0004_roles.up.sql` migration.
 
+## Stage 9.4: OTel telemetry across all surfaces
+
+Roll out the telemetry surface to every `clean-code-*` binary
+in order. The new surface is **additive** -- empty
+`CLEAN_CODE_OTEL_ENDPOINT` keeps every binary in the existing
+"telemetry disabled" path (noop tracer, Prometheus collectors
+unaffected). The rollout therefore has zero blast radius if
+the collector backend is not ready.
+
+### Pre-flight
+
+1. Deploy an OTel collector reachable from every binary's
+   network. The canonical Helm chart is
+   `deploy/k8s/otel-collector`; the canonical local-dev
+   compose file is `deploy/local/otel/config.yaml`. Confirm
+   the collector accepts OTLP gRPC on port 4317. TLS is
+   recommended for production endpoints.
+2. Stand up a Prometheus scrape target for every
+   `clean-code-*` binary's `/metrics` endpoint. The
+   gateway and aggregator already serve `/metrics`; the
+   eval-gate binary's `/metrics` is new in this stage but
+   the route is mounted on the same root mux as the
+   existing verb handlers.
+3. Verify the OTel collector's `service` pipeline exports
+   to the trace backend you intend to use (Jaeger,
+   Tempo, vendor APM, ...). The clean-code service is
+   indifferent to the backend so long as the collector
+   accepts OTLP gRPC.
+
+### Per-binary rollout sequence
+
+Apply the same env-var set to each binary, in order:
+
+1. `clean-code-metric-ingestor` -- already serves `/metrics`
+   (Stage 3.5). Set `CLEAN_CODE_OTEL_ENDPOINT` to enable
+   span export; no other changes needed.
+2. `clean-code-gateway` -- set `CLEAN_CODE_OTEL_ENDPOINT`
+   to point at the collector. The binary will log
+   `telemetry: OTel SDK initialised` at boot. The
+   `/metrics` endpoint now exposes
+   `cleancode_wal_replay_duration_seconds` and
+   `cleancode_rule_engine_evaluations_*` in addition to
+   any previously-exported counters.
+3. `clean-code-aggregator` -- set
+   `CLEAN_CODE_OTEL_ENDPOINT`. The aggregator's tick
+   duration histogram
+   (`cleancode_aggregator_tick_duration_seconds`) is now
+   served on `/metrics` (replacing the placeholder
+   handler that previously returned `# no metrics`).
+4. `clean-code-eval-gate` -- set
+   `CLEAN_CODE_OTEL_ENDPOINT`. The replay surface's
+   rule-engine evaluations are now counted on
+   `cleancode_rule_engine_evaluations_total` alongside the
+   gateway's eval.gate evaluations; dashboards should sum
+   both series for the architecture-Sec-8 "evaluations/sec"
+   panel.
+5. `clean-code-refactor-planner` -- no observable counters
+   currently. Set `CLEAN_CODE_OTEL_ENDPOINT` so any future
+   spans the planner emits are captured.
+
+### Required env var
+
+```
+CLEAN_CODE_OTEL_ENDPOINT="otel-collector.svc.cluster.local:4317"
+```
+
+Optional (already established at Stage 3.5):
+
+```
+CLEAN_CODE_PROMETHEUS_ADDR=":9090"
+```
+
+### Verification
+
+After each binary rollout:
+
+1. Tail the binary's stdout. Confirm the boot summary
+   includes a non-empty `OTel endpoint` line. An empty
+   endpoint logs as "telemetry disabled" (intentional
+   "noop tracer" path).
+2. Issue one canonical request through the binary's verb
+   surface (e.g. `mgmt.register_repo` for the gateway,
+   the SIGHUP cadence trigger for the aggregator). Wait
+   ~10 seconds for the OTel SDK's batch span processor
+   to flush.
+3. Query the trace backend for spans with
+   `service.name = "clean-code-<binary>"`. Confirm the
+   canonical attribute set
+   (`verb`, `repo_id`, `caller_subject`,
+   `policy_version_id`, `degraded`, `degraded_reason`,
+   `verdict`) is present. Empty / `false` defaults are
+   expected on non-eval verbs.
+4. Scrape `GET /metrics` from the binary. Confirm the
+   Prometheus content-type is
+   `text/plain; version=0.0.4; charset=utf-8` and the
+   expected metric names render (see Stage 9.4 entry in
+   `docs/runbook.md` for the canonical list per binary).
+5. (eval.gate only) Issue one `/v1/eval/gate` request
+   whose response carries `verdict="warn"` and
+   `degraded=true` (e.g. a samples-pending repo).
+   Confirm the corresponding span in the trace backend
+   carries the same four attribute values.
+
+### Rollback
+
+The telemetry surface is additive: clear
+`CLEAN_CODE_OTEL_ENDPOINT` and restart the binary to
+disable span export. Prometheus collectors continue to
+work regardless. No schema migration, no data backfill,
+and no policy-version transition is required.
+
 ## Stage 8.3: ML effort-model loader and version pinning
 
 This subsection captures the rollout sequence for the

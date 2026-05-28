@@ -251,7 +251,7 @@ func TestWriteEvalResponse_OpaqueInternalError(t *testing.T) {
 	// Use an arbitrary non-sentinel error; the helper
 	// must NOT echo this text to the caller.
 	leakyErr := errors.New("pq: connection terminated by peer at host db.internal.local")
-	writeEvalResponse(rec, evaluator.EvaluateResult{}, leakyErr, nil)
+	writeEvalResponse(context.Background(), rec, evaluator.EvaluateResult{}, leakyErr, nil)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d want 500", rec.Code)
 	}

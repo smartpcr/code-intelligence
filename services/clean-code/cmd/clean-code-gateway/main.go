@@ -125,9 +125,12 @@ import (
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/api"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/composition"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/config"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/telemetry"
 )
 
 // Env vars consumed by this binary. Defined as exported
@@ -268,6 +271,32 @@ func run(logger *slog.Logger) error {
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()
 
+	// Stage 9.4: initialise the OTel SDK BEFORE constructing
+	// the tracer. `telemetry.Setup` installs the global
+	// TracerProvider so `api.NewOTelTracerFromGlobal()` below
+	// picks up the OTLP exporter aimed at the operator's
+	// collector. An empty OTelEndpoint is a noop -- the
+	// global stays at the SDK default noop provider and every
+	// span is dropped, which is the intended "telemetry
+	// disabled" deployment path.
+	telCfg := config.Config{
+		OTelEndpoint:   os.Getenv(config.EnvOTelEndpoint),
+		PrometheusAddr: os.Getenv(config.EnvPrometheusAddr),
+	}
+	shutdownTelemetry, err := telemetry.Setup(rootCtx, telCfg, telemetry.SetupOptions{
+		ServiceName: gatewayServiceLabel,
+	})
+	if err != nil {
+		return fmt.Errorf("telemetry.Setup: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTelemetry(shutdownCtx); err != nil {
+			logger.Warn("clean-code-gateway: telemetry shutdown failed", slog.String("error", err.Error()))
+		}
+	}()
+
 	// Authenticator: production path = OIDC, scaffold path =
 	// StaticHMAC. Strict opt-in for the HMAC fallback per
 	// rubber-duck #1.
@@ -321,7 +350,16 @@ func run(logger *slog.Logger) error {
 	// `closers` slice. The eval.gate verb continues to
 	// use its own evaluator + solid_batch pools wired in
 	// `buildProductionDeps`.
-	if rerr := runWALReconciler(rootCtx, cfg, signingKeys, logger); rerr != nil {
+	// Stage 9.4 metric collectors. These holders are
+	// passed into `runWALReconciler` (WAL replay
+	// duration) + `buildProductionDeps` (rule engine
+	// counters) so the canonical telemetry surface is
+	// composed in ONE place. They are scraped via the
+	// `/metrics` endpoint mounted on `rootMux` below.
+	walReplayMetrics := telemetry.NewWALReplayMetrics()
+	ruleEngineMetrics := telemetry.NewRuleEngineMetrics()
+
+	if rerr := runWALReconciler(rootCtx, cfg, signingKeys, logger, walReplayMetrics); rerr != nil {
 		return fmt.Errorf("runWALReconciler: %w", rerr)
 	}
 
@@ -331,7 +369,7 @@ func run(logger *slog.Logger) error {
 	// as 503 stubs. The returned closers list owns any
 	// additional DB handles opened for the mgmt/evaluator
 	// roles.
-	deps, closers, err := buildProductionDeps(rootCtx, cfg, db, signingKeys, logger)
+	deps, closers, err := buildProductionDeps(rootCtx, cfg, db, signingKeys, logger, ruleEngineMetrics)
 	for _, c := range closers {
 		defer c()
 	}
@@ -364,6 +402,14 @@ func run(logger *slog.Logger) error {
 
 	rootMux := http.NewServeMux()
 	rootMux.HandleFunc("/healthz", healthzHandler)
+	// Stage 9.4: Prometheus scrape surface. Mounts the
+	// WAL replay + rule engine metric collectors. The
+	// telemetry handler enforces GET/HEAD only and emits
+	// Prometheus text exposition v0.0.4.
+	rootMux.Handle("/metrics", telemetry.PrometheusHandler(
+		walReplayMetrics,
+		ruleEngineMetrics,
+	))
 	// `/v1/` MUST end in a slash so the stdlib mux performs
 	// the longest-prefix match -- a literal `/v1` would only
 	// catch the exact path. The gateway's own
@@ -645,7 +691,7 @@ func buildSigningKeys(ctx context.Context, cfg gatewayConfig, db *sql.DB, logger
 //     historical-keys `keys.SQLStore`, hand both to
 //     [composition.NewWALReconciler], run, log Stats. On
 //     Run error, return the error so startup aborts.
-func runWALReconciler(ctx context.Context, cfg gatewayConfig, signingKeys *keys.Manager, logger *slog.Logger) error {
+func runWALReconciler(ctx context.Context, cfg gatewayConfig, signingKeys *keys.Manager, logger *slog.Logger, replayMetrics *telemetry.WALReplayMetrics) error {
 	if signingKeys == nil {
 		logger.Info("gateway: Stage 9.2 reconciler skipped (scaffold mode, NoopSigner WAL writer). Real KMS deployments MUST set " + envKMSProvider + " + " + envWALReconcilerDSN + ".")
 		return nil
@@ -674,6 +720,11 @@ func runWALReconciler(ctx context.Context, cfg gatewayConfig, signingKeys *keys.
 		DB:       reconcilerDB,
 		Dir:      cfg.AuditWALDir,
 		KeyStore: keyStore,
+		ReplayObserver: func(d time.Duration) {
+			if replayMetrics != nil {
+				replayMetrics.Observe(d)
+			}
+		},
 		Logger: func(msg string, kv ...any) {
 			logger.Info("gateway: reconciler: "+msg, slog.Any("kv", kv))
 		},
@@ -726,7 +777,7 @@ func runWALReconciler(ctx context.Context, cfg gatewayConfig, signingKeys *keys.
 // Verbs left as 503 stubs when their prerequisite env vars
 // are absent are logged at boot via
 // [api.Wiring.MissingVerbs] / [logBootSummary].
-func buildProductionDeps(ctx context.Context, cfg gatewayConfig, db *sql.DB, signingKeys *keys.Manager, logger *slog.Logger) (api.ProductionWiringDeps, []func(), error) {
+func buildProductionDeps(ctx context.Context, cfg gatewayConfig, db *sql.DB, signingKeys *keys.Manager, logger *slog.Logger, ruleEngineMetrics *telemetry.RuleEngineMetrics) (api.ProductionWiringDeps, []func(), error) {
 	deps := api.ProductionWiringDeps{}
 	var closers []func()
 
@@ -865,6 +916,11 @@ func buildProductionDeps(ctx context.Context, cfg gatewayConfig, db *sql.DB, sig
 			SolidBatchDB: solidDB,
 			Signer:       stewardSigner,
 			WalWriter:    walWriter,
+			RuleEngineObserver: func(_ time.Duration, verdict rule_engine.Verdict, _ error) {
+				if ruleEngineMetrics != nil {
+					ruleEngineMetrics.Observe(string(verdict))
+				}
+			},
 		}, logger)
 		if gerr != nil {
 			return api.ProductionWiringDeps{}, closers, fmt.Errorf("composition.BuildEvalGate: %w", gerr)

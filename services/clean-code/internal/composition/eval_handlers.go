@@ -1,6 +1,7 @@
 package composition
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"github.com/gofrs/uuid"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/evaluator"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/telemetry"
 )
 
 // MaxEvalRequestBodyBytes caps the request body size on
@@ -67,6 +69,12 @@ type replayRequest struct {
 // return. Includes all three audit IDs (run, verdict,
 // findings) on both happy and degraded paths so the
 // caller can render the audit trail uniformly.
+//
+// `policy_version_id` is also returned (Stage 9.4 /
+// architecture Sec 8): the canonical `eval.gate` verb may
+// resolve the active policy_version internally, and the
+// caller needs the resolved ID to correlate the response
+// with audit / dashboards.
 type evalResponse struct {
 	EvaluationRunID     string   `json:"evaluation_run_id"`
 	EvaluationVerdictID string   `json:"evaluation_verdict_id"`
@@ -74,6 +82,7 @@ type evalResponse struct {
 	Verdict             string   `json:"verdict"`
 	Degraded            bool     `json:"degraded"`
 	DegradedReason      string   `json:"degraded_reason,omitempty"`
+	PolicyVersionID     string   `json:"policy_version_id,omitempty"`
 }
 
 // rejectExtraPolicyVersionField is retained as a no-op
@@ -195,7 +204,7 @@ func EvalGateHandler(gate *evaluator.Gate, logger *slog.Logger) http.HandlerFunc
 		} else {
 			result, evalErr = gate.Gate(r.Context(), repoID, req.SHA, scope)
 		}
-		writeEvalResponse(w, result, evalErr, logger)
+		writeEvalResponse(r.Context(), w, result, evalErr, logger)
 	}
 }
 
@@ -252,7 +261,7 @@ func EvalReplayHandler(gate *evaluator.Gate, logger *slog.Logger) http.HandlerFu
 			scope = &s
 		}
 		result, evalErr := gate.Evaluate(r.Context(), repoID, req.SHA, scope, policyVersionID)
-		writeEvalResponse(w, result, evalErr, logger)
+		writeEvalResponse(r.Context(), w, result, evalErr, logger)
 	}
 }
 
@@ -260,6 +269,16 @@ func EvalReplayHandler(gate *evaluator.Gate, logger *slog.Logger) http.HandlerFu
 // + error pair into the canonical [evalResponse] JSON.
 // Used by both handlers so the audit-trail shape is
 // uniform across `/v1/eval/gate` and `/v1/eval/replay`.
+//
+// Stage 9.4 / architecture Sec 8: the function also stamps
+// the canonical eval-gate-specific OTel attributes
+// (`policy_version_id`, `degraded`, `degraded_reason`,
+// `verdict`) on the active span via
+// [telemetry.AnnotateEvalGateSpan]. The annotation is a
+// safe no-op when the request did NOT enter through an
+// OTel-backed gateway (e.g. unit tests using
+// `api.RecordingTracer` or composition-bypass tests that
+// call `EvalGateHandler.ServeHTTP` directly).
 //
 // Error-surface policy (consistent with the gateway and
 // webhook 5xx policy): unexpected evaluator errors are
@@ -272,7 +291,15 @@ func EvalReplayHandler(gate *evaluator.Gate, logger *slog.Logger) http.HandlerFu
 // signature-invalid degraded paths) map to their
 // pinned codes (409 / 200+degraded) BEFORE the opaque
 // 500 fallback.
-func writeEvalResponse(w http.ResponseWriter, result evaluator.EvaluateResult, evalErr error, logger *slog.Logger) {
+func writeEvalResponse(ctx context.Context, w http.ResponseWriter, result evaluator.EvaluateResult, evalErr error, logger *slog.Logger) {
+	// Stamp the eval-gate-specific OTel attributes on the
+	// active span BEFORE the operational-state branches
+	// below: even a 409 / 500 outcome carries the
+	// PolicyVersionID / Verdict the gate computed (zero
+	// values on the unresolved paths -- the helper
+	// projects uuid.Nil to "" so dashboards can filter
+	// `policy_version_id != ""`).
+	telemetry.AnnotateEvalGateSpan(ctx, result)
 	// Operational-state error: no activation row exists
 	// yet. Map to 409 so the caller can distinguish
 	// fresh-deploy from a 500.
@@ -302,6 +329,10 @@ func writeEvalResponse(w http.ResponseWriter, result evaluator.EvaluateResult, e
 	for _, id := range result.FindingIDs {
 		findingIDs = append(findingIDs, id.String())
 	}
+	policyVersionID := ""
+	if result.PolicyVersionID != uuid.Nil {
+		policyVersionID = result.PolicyVersionID.String()
+	}
 	resp := evalResponse{
 		EvaluationRunID:     result.EvaluationRunID.String(),
 		EvaluationVerdictID: result.EvaluationVerdictID.String(),
@@ -309,6 +340,7 @@ func writeEvalResponse(w http.ResponseWriter, result evaluator.EvaluateResult, e
 		Verdict:             string(result.Verdict),
 		Degraded:            result.Degraded,
 		DegradedReason:      string(result.DegradedReason),
+		PolicyVersionID:     policyVersionID,
 	}
 	w.Header().Set("content-type", "application/json")
 	w.WriteHeader(http.StatusOK)

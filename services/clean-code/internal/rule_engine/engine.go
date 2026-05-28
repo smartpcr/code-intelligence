@@ -47,6 +47,25 @@ type Config struct {
 	// per the architecture's `every gate call is
 	// audit-stamped` contract.
 	RunDedupTTL time.Duration
+
+	// RunObserver is an optional Stage 9.4 telemetry hook
+	// invoked ONCE per [Engine.RunSync] / [Engine.RunBatch]
+	// invocation that REACHES the evaluator core (a
+	// dedup-cache hit short-circuits BEFORE the observer
+	// fires so the histogram tracks real evaluator work,
+	// not duplicate calls). The hook receives:
+	//
+	//   - The wall-clock duration of the evaluator pass.
+	//   - The canonical [Verdict] the run produced (empty
+	//     string `""` on the error path).
+	//   - Any terminal error.
+	//
+	// Composition wires this to
+	// `telemetry.RuleEngineMetrics.Observe` so the
+	// `cleancode_rule_engine_evaluations_total` +
+	// `_by_verdict_total` Prometheus counters tick once
+	// per evaluator pass. Defaults to nil (no-op).
+	RunObserver func(duration time.Duration, verdict Verdict, err error)
 }
 
 // DefaultRunDedupTTL is the engine's "parallel call"
@@ -73,11 +92,12 @@ const DefaultRunDedupTTL = 30 * time.Second
 // row set rather than minting its own duplicate (iter-5
 // evaluator item #3, implementation-plan Stage 5.7 line 559).
 type Engine struct {
-	store       Store
-	cache       *dsl.Cache
-	clock       func() time.Time
-	newID       func() (uuid.UUID, error)
-	runDedupTTL time.Duration
+	store        Store
+	cache        *dsl.Cache
+	clock        func() time.Time
+	newID        func() (uuid.UUID, error)
+	runDedupTTL  time.Duration
+	runObserver  func(duration time.Duration, verdict Verdict, err error)
 
 	// locks holds a per-`(repo_id, sha)` [sync.Mutex] used
 	// to serialise concurrent read-modify-write windows
@@ -156,6 +176,7 @@ func New(cfg Config) (*Engine, error) {
 		clock:       clock,
 		newID:       newID,
 		runDedupTTL: dedupTTL,
+		runObserver: cfg.RunObserver,
 		locks:       make(map[string]*sync.Mutex),
 		recentRuns:  make(map[runCacheKey]runCacheEntry),
 	}, nil
@@ -245,6 +266,7 @@ func (e *Engine) run(ctx context.Context, repoID uuid.UUID, sha string, scopeID 
 		return cached, nil
 	}
 
+	runStart := e.clock()
 	var result RunResult
 	lockErr := e.store.WithEvaluationLock(ctx, repoID, sha, func(s Store) error {
 		r, err := e.runLocked(ctx, s, repoID, sha, scopeID, policyVersionID, caller)
@@ -254,6 +276,21 @@ func (e *Engine) run(ctx context.Context, repoID uuid.UUID, sha string, scopeID 
 		result = r
 		return nil
 	})
+	if e.runObserver != nil {
+		// Stage 9.4: observer fires AFTER the canonical
+		// evaluator pass (dedup-cache hits short-circuit
+		// above so the histogram tracks real evaluator
+		// work, not duplicate calls). Verdict on the
+		// error path is the canonical empty string;
+		// callers can fan out by err == nil to
+		// distinguish failed vs successful evaluations.
+		duration := e.clock().Sub(runStart)
+		var verdict Verdict
+		if lockErr == nil {
+			verdict = result.Verdict
+		}
+		e.runObserver(duration, verdict, lockErr)
+	}
 	if lockErr != nil {
 		return RunResult{}, lockErr
 	}

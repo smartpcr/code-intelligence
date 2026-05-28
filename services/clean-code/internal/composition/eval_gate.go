@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/evaluator"
@@ -51,6 +52,18 @@ type EvalGateConfig struct {
 	// binary's main reads `CLEAN_CODE_AUDIT_WAL_DIR`,
 	// constructs the writer, and passes it here.
 	WalWriter *wal.Writer
+
+	// RuleEngineObserver is the optional Stage 9.4
+	// telemetry hook the rule engine invokes once per
+	// canonical evaluator pass (not dedup-cache hits)
+	// with the duration / verdict / err triple. The
+	// composition root wires this to
+	// `telemetry.RuleEngineMetrics.Observe(string(verdict))`
+	// so the
+	// `cleancode_rule_engine_evaluations_total` +
+	// `_by_verdict_total` counters tick. nil = no
+	// observer is installed.
+	RuleEngineObserver func(duration time.Duration, verdict rule_engine.Verdict, err error)
 }
 
 // BuildEvalGate assembles the production
@@ -114,7 +127,10 @@ func BuildEvalGate(_ context.Context, cfg EvalGateConfig, logger *slog.Logger) (
 	if err != nil {
 		return nil, fmt.Errorf("rule_engine.NewSQLStore: %w", err)
 	}
-	engine, err := rule_engine.New(rule_engine.Config{Store: ruleStore})
+	engine, err := rule_engine.New(rule_engine.Config{
+		Store:       ruleStore,
+		RunObserver: cfg.RuleEngineObserver,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("rule_engine.New: %w", err)
 	}

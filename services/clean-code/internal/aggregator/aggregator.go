@@ -49,9 +49,20 @@ type Aggregator struct {
 	// existing two-arg constructor + foundation-only tests
 	// keep their behaviour; wiring is opt-in via
 	// [WithSystemTier].
-	composer       *SystemTierComposer
-	sysSource      SystemTierInputSource
-	sysWriter      SystemTierWriter
+	composer  *SystemTierComposer
+	sysSource SystemTierInputSource
+	sysWriter SystemTierWriter
+
+	// Optional Stage 9.4 telemetry hook. When non-nil [Tick]
+	// invokes the observer ONCE per call after the
+	// snapshot+system-tier passes complete (success OR
+	// failure) with the wall-clock duration of the whole
+	// tick. Composition wires this to
+	// `telemetry.AggregatorTickMetrics.Observe` so the
+	// `cleancode_aggregator_tick_duration_seconds`
+	// Prometheus histogram is populated. Defaults to nil so
+	// existing tests keep their behaviour.
+	tickObserver func(time.Duration)
 }
 
 // AggregatorOption configures an [Aggregator].
@@ -108,6 +119,19 @@ func WithSystemTier(composer *SystemTierComposer, source SystemTierInputSource, 
 		a.sysSource = source
 		a.sysWriter = writer
 	}
+}
+
+// WithTickObserver installs a callback invoked once per
+// [Aggregator.Tick] call with the wall-clock duration of the
+// tick (snapshot + system-tier passes, success or failure).
+// Composition uses this to feed the Stage 9.4 Prometheus
+// histogram `cleancode_aggregator_tick_duration_seconds` via
+// `telemetry.AggregatorTickMetrics.Observe`.
+//
+// The observer MUST be cheap and non-blocking: it runs on the
+// hot cadence path. A nil observer is a no-op.
+func WithTickObserver(observer func(time.Duration)) AggregatorOption {
+	return func(a *Aggregator) { a.tickObserver = observer }
 }
 
 // ErrAggregatorNilSource surfaces a nil [SampleSource] at
@@ -217,6 +241,10 @@ type cohortKey struct {
 // propagates with the system-tier failure context attached so
 // the operator can correlate via the Report counters.
 func (a *Aggregator) Tick(ctx context.Context) (Report, error) {
+	tickStart := time.Now()
+	if a.tickObserver != nil {
+		defer func() { a.tickObserver(time.Since(tickStart)) }()
+	}
 	report := Report{BuiltAt: a.now().UTC()}
 
 	if err := a.tickSnapshots(ctx, &report); err != nil {

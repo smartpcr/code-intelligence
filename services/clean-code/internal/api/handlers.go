@@ -217,6 +217,23 @@ func (g *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	span.SetAttribute(SpanAttrCallerSubject, identity.Subject)
 	span.SetAttribute(SpanAttrHTTPMethod, r.Method)
 	span.SetAttribute(SpanAttrHTTPRoute, verb.Path())
+	// Canonical eval-gate attribute defaults (Stage 9.4 /
+	// architecture Sec 8): every verb span carries the
+	// full attribute schema so dashboards never see a
+	// missing-key blowup. Verbs that DO know the verdict
+	// (eval.gate) overwrite these via
+	// `telemetry.AnnotateEvalGateSpan` in their downstream
+	// handler. On the OTel-backed tracer the overwrite
+	// happens via the OTel-native `trace.SpanFromContext`
+	// (the api.Tracer seam does not expose mid-handler
+	// access to the api.Span); these defaults guarantee
+	// the keys are present on EVERY span -- including
+	// spans recorded by `api.RecordingTracer` /
+	// `SlogTracer` where the OTel overwrite is a no-op.
+	span.SetAttribute(SpanAttrPolicyVersionID, "")
+	span.SetAttribute(SpanAttrDegraded, false)
+	span.SetAttribute(SpanAttrDegradedReason, "")
+	span.SetAttribute(SpanAttrVerdict, "")
 
 	// Wrap the writer so we can capture the status code
 	// after the downstream handler returns. The wrapper

@@ -42,10 +42,12 @@ import (
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/composition"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/config"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/evaluator"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/telemetry"
 )
 
 // defaultAuditWALDir is the canonical Audit WAL partition
@@ -138,6 +140,30 @@ func main() {
 
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Stage 9.4: initialise the OTel SDK + Prometheus
+	// collectors BEFORE the rule engine + reconciler are
+	// constructed so their observer hooks can be wired in
+	// one place (no late, post-construction patching).
+	telCfg := config.Config{
+		OTelEndpoint:   os.Getenv(config.EnvOTelEndpoint),
+		PrometheusAddr: os.Getenv(config.EnvPrometheusAddr),
+	}
+	shutdownTelemetry, telErr := telemetry.Setup(rootCtx, telCfg, telemetry.SetupOptions{
+		ServiceName: "clean-code-eval-gate",
+	})
+	if telErr != nil {
+		log.Fatalf("clean-code-eval-gate: telemetry.Setup: %v", telErr)
+	}
+	defer func() {
+		shutdownCtx, c := context.WithTimeout(context.Background(), 5*time.Second)
+		defer c()
+		if err := shutdownTelemetry(shutdownCtx); err != nil {
+			log.Printf("clean-code-eval-gate: telemetry shutdown error: %v", err)
+		}
+	}()
+	walReplayMetrics := telemetry.NewWALReplayMetrics()
+	ruleEngineMetrics := telemetry.NewRuleEngineMetrics()
 
 	for i := 0; i < 30; i++ {
 		if perr := db.PingContext(rootCtx); perr == nil {
@@ -306,7 +332,7 @@ func main() {
 	// signer is wal.NoopSigner, frames carry SHA-256
 	// stand-ins -- the reconciler cannot verify them.
 	// Skip reconciler wiring entirely; log INFO.
-	runWALReconciler(rootCtx, signingKeysManager, walDir)
+	runWALReconciler(rootCtx, signingKeysManager, walDir, walReplayMetrics)
 
 	// rule_engine.SQLStore consumes the solid_batch
 	// handle so the canonical Audit triple is INSERTED
@@ -324,7 +350,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("clean-code-eval-gate: rule_engine.NewSQLStore: %v", err)
 	}
-	engine, err := rule_engine.New(rule_engine.Config{Store: ruleStore})
+	engine, err := rule_engine.New(rule_engine.Config{
+		Store: ruleStore,
+		// Stage 9.4: feed the
+		// `cleancode_rule_engine_evaluations_total` +
+		// `_by_verdict_total` Prometheus counters via
+		// the engine's RunObserver hook (fires once per
+		// canonical evaluator pass, NOT on dedup-cache
+		// hits).
+		RunObserver: func(_ time.Duration, verdict rule_engine.Verdict, _ error) {
+			ruleEngineMetrics.Observe(string(verdict))
+		},
+	})
 	if err != nil {
 		log.Fatalf("clean-code-eval-gate: rule_engine.New: %v", err)
 	}
@@ -360,6 +397,14 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "ok")
 	})
+	// Stage 9.4: Prometheus scrape surface exposing the
+	// rule-engine + WAL-replay metric collectors. The
+	// `/metrics` endpoint allows `GET` / `HEAD` only and
+	// emits the Prometheus text exposition v0.0.4 shape.
+	mux.Handle("/metrics", telemetry.PrometheusHandler(
+		ruleEngineMetrics,
+		walReplayMetrics,
+	))
 	// `/v1/eval/gate` is the CANONICAL Stage 6.1 verb
 	// `eval.gate(repo_id, sha, scope?)`. It REFUSES a
 	// `policy_version_id` in the body -- step (1) of the
@@ -436,7 +481,7 @@ const envWALReconcilerDSN = "CLEAN_CODE_WAL_RECONCILER_DSN"
 //     both to `composition.NewWALReconciler`, run, log
 //     Stats summary. On Run error: log.Fatalf so a botched
 //     WAL aborts startup rather than degrading silently.
-func runWALReconciler(ctx context.Context, signingKeysManager *keys.Manager, walDir string) {
+func runWALReconciler(ctx context.Context, signingKeysManager *keys.Manager, walDir string, replayMetrics *telemetry.WALReplayMetrics) {
 	if signingKeysManager == nil {
 		log.Print("clean-code-eval-gate: Stage 9.2 reconciler skipped (scaffold mode, NoopSigner WAL writer). Real KMS deployments MUST set CLEAN_CODE_KMS_PROVIDER + CLEAN_CODE_WAL_RECONCILER_DSN.")
 		return
@@ -484,6 +529,11 @@ func runWALReconciler(ctx context.Context, signingKeysManager *keys.Manager, wal
 		DB:       reconcilerDB,
 		Dir:      walDir,
 		KeyStore: keyStore,
+		ReplayObserver: func(d time.Duration) {
+			if replayMetrics != nil {
+				replayMetrics.Observe(d)
+			}
+		},
 		Logger: func(msg string, kv ...any) {
 			// Render kv as space-separated key=value pairs.
 			// Passing `kv` (a []any) as a single `%v` arg

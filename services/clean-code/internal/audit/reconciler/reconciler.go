@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/gofrs/uuid"
 
@@ -48,6 +49,19 @@ type Config struct {
 	// operator can correlate counts with disk artifacts.
 	// Defaults to a no-op when nil.
 	Logger func(msg string, kv ...any)
+
+	// ReplayObserver is an optional Stage 9.4 telemetry
+	// hook invoked ONCE per [Reconciler.Run] call (success
+	// or failure) with the wall-clock duration of the
+	// entire replay pass. Composition wires this to
+	// `telemetry.WALReplayMetrics.Observe` so the
+	// `cleancode_wal_replay_duration_seconds` Prometheus
+	// histogram is populated.
+	//
+	// Defaults to a no-op when nil. The hook MUST be cheap
+	// and non-blocking; it runs on the startup-critical
+	// path.
+	ReplayObserver func(time.Duration)
 }
 
 // Reconciler is the Stage 9.2 replay-only worker. Construct
@@ -58,10 +72,11 @@ type Config struct {
 // concurrent-safe), but the canonical use is a single
 // startup invocation.
 type Reconciler struct {
-	dir      string
-	verifier Verifier
-	replayer Replayer
-	logger   func(msg string, kv ...any)
+	dir            string
+	verifier       Verifier
+	replayer       Replayer
+	logger         func(msg string, kv ...any)
+	replayObserver func(time.Duration)
 }
 
 // NewReconciler validates `cfg` and constructs a
@@ -82,10 +97,11 @@ func NewReconciler(cfg Config) (*Reconciler, error) {
 		logger = func(string, ...any) {}
 	}
 	return &Reconciler{
-		dir:      cfg.Dir,
-		verifier: cfg.Verifier,
-		replayer: cfg.Replayer,
-		logger:   logger,
+		dir:            cfg.Dir,
+		verifier:       cfg.Verifier,
+		replayer:       cfg.Replayer,
+		logger:         logger,
+		replayObserver: cfg.ReplayObserver,
 	}, nil
 }
 
@@ -133,6 +149,10 @@ func NewReconciler(cfg Config) (*Reconciler, error) {
 //   - Replayer SQL returns any error other than RowsAffected
 //     classification.
 func (r *Reconciler) Run(ctx context.Context) (Stats, error) {
+	if r.replayObserver != nil {
+		runStart := time.Now()
+		defer func() { r.replayObserver(time.Since(runStart)) }()
+	}
 	if err := ctx.Err(); err != nil {
 		return Stats{}, err
 	}

@@ -77,6 +77,7 @@ import (
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/aggregator"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/config"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/telemetry"
 )
 
 func main() {
@@ -115,7 +116,26 @@ func main() {
 	}
 	defer db.Close()
 
-	loop, err := buildAggregatorLoop(cfg, db, logger)
+	// Stage 9.4: initialise the OTel SDK + tick-duration
+	// Prometheus collector BEFORE buildAggregatorLoop so the
+	// Aggregator can be wired with the tick observer in one
+	// place.
+	shutdownTelemetry, err := telemetry.Setup(context.Background(), cfg, telemetry.SetupOptions{
+		ServiceName: "clean-code-aggregator",
+	})
+	if err != nil {
+		log.Fatalf("telemetry.Setup: %v", err)
+	}
+	defer func() {
+		shutdownCtx, c := context.WithTimeout(context.Background(), 5*time.Second)
+		defer c()
+		if err := shutdownTelemetry(shutdownCtx); err != nil {
+			logger.Warn("aggregator: telemetry shutdown error", "err", err)
+		}
+	}()
+	tickMetrics := telemetry.NewAggregatorTickMetrics()
+
+	loop, err := buildAggregatorLoop(cfg, db, logger, tickMetrics)
 	if err != nil {
 		log.Fatalf("buildAggregatorLoop: %v", err)
 	}
@@ -135,7 +155,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              ":" + port,
-		Handler:           buildMux(),
+		Handler:           buildMux(tickMetrics),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	httpErrCh := make(chan error, 1)
@@ -287,7 +307,7 @@ func openAndPingDB(dsn, role string) (*sql.DB, error) {
 // Returns (nil, nil) when the operator has opted out; the caller
 // then runs the /healthz-only listener so K8s liveness probes still
 // succeed.
-func buildAggregatorLoop(cfg config.Config, db *sql.DB, logger *slog.Logger) (*aggregator.Loop, error) {
+func buildAggregatorLoop(cfg config.Config, db *sql.DB, logger *slog.Logger, tickMetrics *telemetry.AggregatorTickMetrics) (*aggregator.Loop, error) {
 	if cfg.DisableAggregator {
 		return nil, nil
 	}
@@ -315,9 +335,16 @@ func buildAggregatorLoop(cfg config.Config, db *sql.DB, logger *slog.Logger) (*a
 	if err != nil {
 		return nil, fmt.Errorf("buildAggregatorLoop: NewPGSystemTierWriter: %w", err)
 	}
-	agg, err := aggregator.NewAggregator(source, writer,
+	aggOpts := []aggregator.AggregatorOption{
 		aggregator.WithSystemTier(composer, sysSource, sysWriter),
-	)
+	}
+	if tickMetrics != nil {
+		// Stage 9.4: feed the Prometheus
+		// `cleancode_aggregator_tick_duration_seconds`
+		// histogram via the tick observer.
+		aggOpts = append(aggOpts, aggregator.WithTickObserver(tickMetrics.Observe))
+	}
+	agg, err := aggregator.NewAggregator(source, writer, aggOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("buildAggregatorLoop: NewAggregator: %w", err)
 	}
@@ -328,20 +355,24 @@ func buildAggregatorLoop(cfg config.Config, db *sql.DB, logger *slog.Logger) (*a
 }
 
 // buildMux mounts the always-on operational surface: `/healthz`
-// (Kubernetes liveness) and `/metrics` (Prometheus stub -- the Stage
-// 9.1 Prometheus exporter will be wired here once the exporter
-// lands). Kept tiny so the binary stays a thin composition root.
-func buildMux() *http.ServeMux {
+// (Kubernetes liveness) and `/metrics` (Stage 9.4 Prometheus
+// scrape -- exposes the
+// `cleancode_aggregator_tick_duration_seconds` histogram via
+// `telemetry.PrometheusHandler`). Kept tiny so the binary
+// stays a thin composition root.
+func buildMux(tickMetrics *telemetry.AggregatorTickMetrics) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	// Prometheus exporter placeholder. Stage 9.1 will mount the
-	// real handler against aggregator.Report counters.
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("# clean-code-aggregator metrics placeholder\n"))
-	})
+	if tickMetrics != nil {
+		mux.Handle("/metrics", telemetry.PrometheusHandler(tickMetrics))
+	} else {
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("# clean-code-aggregator metrics: telemetry not wired\n"))
+		})
+	}
 	return mux
 }

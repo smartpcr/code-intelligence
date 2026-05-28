@@ -4,6 +4,102 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 9.4 -- OTel telemetry across all surfaces
+
+New `internal/telemetry/` package wraps the OTel SDK with the
+OTLP gRPC trace exporter and exposes a Prometheus text-
+exposition `/metrics` handler. Every verb handler (eval.gate,
+mgmt.*, ingest.*, policy.*) now opens a span stamped with the
+canonical attribute set per architecture Sec 8: `verb`,
+`repo_id`, `caller_subject`, `policy_version_id`, `degraded`,
+`degraded_reason`, `verdict`. Empty / `false` defaults are
+stamped on every verb span at gateway entry so dashboards see
+a stable schema regardless of whether the verb has verdict
+semantics; eval.gate overwrites the four eval-specific keys
+via `telemetry.AnnotateEvalGateSpan` after the evaluator
+returns (BEFORE the operational-state branches so even
+`ErrNoActivePolicy` / `INTERNAL_ERROR` outcomes carry attribute
+stamps).
+
+Composition wiring:
+
+- `cmd/clean-code-gateway/main.go` calls `telemetry.Setup` at
+  boot, constructs `WALReplayMetrics` + `RuleEngineMetrics`
+  holders, passes them through `runWALReconciler` /
+  `buildProductionDeps`, and mounts
+  `telemetry.PrometheusHandler` on `/metrics`.
+- `cmd/clean-code-aggregator/main.go` wires `AggregatorTickMetrics`
+  via `aggregator.WithTickObserver` and serves the canonical
+  `/metrics` text exposition (replacing the placeholder
+  handler).
+- `cmd/clean-code-eval-gate/main.go` wires `WALReplayMetrics`
+  and `RuleEngineMetrics` via `composition.EvalGateConfig.RuleEngineObserver`
+  -> `rule_engine.Config.RunObserver`.
+
+Subsystem hooks added:
+
+- `aggregator.Aggregator.WithTickObserver(func(d time.Duration))`
+  fires after every `Tick` (Stage 7.1).
+- `reconciler.Config.ReplayObserver` fires after `Run` returns
+  (Stage 9.2).
+- `rule_engine.Config.RunObserver` fires after the canonical
+  evaluator pass (NOT on dedup-cache hits inside the 30s
+  `RunDedupTTL`, so the counter tracks real evaluator work --
+  Stage 5.7).
+
+`evaluator.EvaluateResult` gains a `PolicyVersionID uuid.UUID`
+field populated on both the happy path and the writeDegraded
+path so the OTel attribute and the JSON `policy_version_id`
+field surface the resolved/pinned policy across every reply
+shape. The empty-uuid projection (uuid.Nil -> "") keeps
+dashboards filterable with `policy_version_id != ""`.
+
+### New env vars
+
+| env var | required | default | semantics |
+|---|---|---|---|
+| `CLEAN_CODE_OTEL_ENDPOINT` | no | `localhost:4317` (the local-dev OTel collector) | OTLP gRPC collector endpoint. Set to a non-default value (e.g. `otel-collector.svc.cluster.local:4317`) in production. Setting it to the empty string disables telemetry: the SDK falls back to its built-in noop tracer and `AnnotateEvalGateSpan` / `AnnotateVerbDefaults` short-circuit on `IsRecording()`. Composition roots that REQUIRE telemetry MUST surface the empty endpoint as a startup error themselves. |
+| `CLEAN_CODE_PROMETHEUS_ADDR` | no | binary-default | bind address for the `/metrics` HTTP listener (already established by Stage 3.5; this stage extends the collectors served on it). |
+
+### Prometheus metric names
+
+| name | type | help |
+|---|---|---|
+| `cleancode_aggregator_tick_duration_seconds` | histogram | wall-clock duration of one Cross-Repo Aggregator tick (Stage 7.1). |
+| `cleancode_wal_replay_duration_seconds` | histogram | wall-clock duration of one Audit WAL Reconciler replay pass (Stage 9.2). |
+| `cleancode_rule_engine_evaluations_total` | counter | total rule-engine evaluations completed (Stage 5.7). |
+| `cleancode_rule_engine_evaluations_by_verdict_total` | counter (label: `verdict`) | per-verdict (pass / warn / block / unknown) rule-engine evaluation counts. |
+| `cleancode_metric_ingest_runs_*` | counter (already shipped) | existing sweep counters from Stage 3.5, re-exposed under the same handler. |
+
+Histogram buckets are the canonical
+`DefaultDurationBuckets = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300]`
+mirroring `client_golang` defaults plus a 30s/60s/120s/300s
+tail so an aggregator tick over the 15-minute cadence does NOT
+silently fall into +Inf.
+
+### Tests
+
+- `internal/telemetry/attrs_test.go` -- `AnnotateEvalGateSpan`
+  stamps all four canonical attrs; uuid.Nil projects to ""; nil
+  ctx is a safe no-op.
+- `internal/telemetry/setup_test.go` -- empty endpoint -> noop
+  ShutdownFunc + nil err; empty ServiceName -> ErrSetupServiceName;
+  sampler ratio branches; local-endpoint detection.
+- `internal/telemetry/metrics_test.go` -- histogram cumulative
+  bucket counts; nil-collector safe; canonical verdict label
+  folding; DefaultDurationBuckets architecture pin.
+- `internal/telemetry/prom_test.go` -- GET/HEAD shapes,
+  Content-Type `text/plain; version=0.0.4; charset=utf-8`, POST
+  405 with `Allow: GET, HEAD`, nil-collector skip, collector
+  error -> 500 (buffer-before-flush contract).
+- `internal/telemetry/integration_test.go` -- the canonical
+  `gate-span-carries-verdict-tag` scenario (drives the full
+  in-process SDK + InMemoryExporter pipeline through
+  `AnnotateEvalGateSpan` with a samples_pending degraded
+  result) AND the `prometheus-counter-shape` scenario
+  (exercises the full `PrometheusHandler` over all three
+  histograms + counter).
+
 ## Stage 8.3 -- ML effort-model loader and version pinning
 
 New `internal/refactor/effort_model.go` package surface plus

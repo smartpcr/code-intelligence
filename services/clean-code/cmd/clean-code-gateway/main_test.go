@@ -456,7 +456,7 @@ func TestBuildProductionDeps_NoOptionalDSNs_LeavesOptionalNil(t *testing.T) {
 	cfg := stubProductionDepsCfg()
 	db := stubGatewayDB(t)
 
-	deps, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger())
+	deps, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger(), nil)
 	defer runClosers(closers)
 	if err != nil {
 		t.Fatalf("buildProductionDeps: %v", err)
@@ -498,7 +498,7 @@ func TestBuildProductionDeps_WebhookOnly_WiresIngestRouter(t *testing.T) {
 	cfg.WebhookSecret = "test-secret"
 	db := stubGatewayDB(t)
 
-	deps, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger())
+	deps, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger(), nil)
 	defer runClosers(closers)
 	if err != nil {
 		t.Fatalf("buildProductionDeps: %v", err)
@@ -529,7 +529,7 @@ func TestBuildProductionDeps_WebhookKeyWithoutSecret_StaysNil(t *testing.T) {
 	// WebhookSecret intentionally left empty.
 	db := stubGatewayDB(t)
 
-	deps, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger())
+	deps, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger(), nil)
 	defer runClosers(closers)
 	if err != nil {
 		t.Fatalf("buildProductionDeps: %v", err)
@@ -551,7 +551,7 @@ func TestBuildProductionDeps_EvalDSNHalfConfigured_StaysNil(t *testing.T) {
 	// SolidBatchPGURL intentionally left empty.
 	db := stubGatewayDB(t)
 
-	deps, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger())
+	deps, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger(), nil)
 	defer runClosers(closers)
 	if err != nil {
 		t.Fatalf("buildProductionDeps: %v", err)
@@ -583,7 +583,7 @@ func TestBuildProductionDeps_MgmtPGURL_PingFailure_PropagatesError(t *testing.T)
 	cfg.MgmtPGURL = "postgres://127.0.0.1:1/nope?sslmode=disable&connect_timeout=1"
 	db := stubGatewayDB(t)
 
-	_, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger())
+	_, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger(), nil)
 	defer runClosers(closers)
 	if err == nil {
 		t.Fatalf("buildProductionDeps: want error from unreachable MgmtPGURL, got nil")
@@ -612,7 +612,7 @@ func TestBuildProductionDeps_EvalDSN_PingFailure_PropagatesError(t *testing.T) {
 	cfg.SolidBatchPGURL = "postgres://127.0.0.1:1/nope2?sslmode=disable&connect_timeout=1"
 	db := stubGatewayDB(t)
 
-	_, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger())
+	_, closers, err := buildProductionDeps(ctx, cfg, db, nil, silentLogger(), nil)
 	defer runClosers(closers)
 	if err == nil {
 		t.Fatalf("buildProductionDeps: want error from unreachable evaluator DSN, got nil")

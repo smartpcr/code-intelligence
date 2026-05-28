@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/gofrs/uuid"
 
@@ -75,6 +76,13 @@ type WALReconcilerConfig struct {
 	// Logger is the structured-log hook the reconciler
 	// emits to. Optional.
 	Logger func(msg string, kv ...any)
+
+	// ReplayObserver is the optional Stage 9.4 telemetry
+	// hook invoked once per [reconciler.Reconciler.Run]
+	// with the wall-clock duration of the replay pass.
+	// Composition wires this to
+	// `telemetry.WALReplayMetrics.Observe`.
+	ReplayObserver func(time.Duration)
 }
 
 // NewWALReconciler is the composition-root factory for the
@@ -152,10 +160,11 @@ func NewWALReconciler(ctx context.Context, cfg WALReconcilerConfig) (*reconciler
 		return nil, fmt.Errorf("composition: NewWALReconciler: %w", err)
 	}
 	return reconciler.NewReconciler(reconciler.Config{
-		Dir:      cfg.Dir,
-		Verifier: verifier,
-		Replayer: replayer,
-		Logger:   cfg.Logger,
+		Dir:            cfg.Dir,
+		Verifier:       verifier,
+		Replayer:       replayer,
+		Logger:         cfg.Logger,
+		ReplayObserver: cfg.ReplayObserver,
 	})
 }
 

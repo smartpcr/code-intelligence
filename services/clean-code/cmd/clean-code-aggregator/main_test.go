@@ -19,7 +19,7 @@ import (
 func TestBuildAggregatorLoop_DisabledReturnsNil(t *testing.T) {
 	t.Parallel()
 	cfg := config.Config{DisableAggregator: true}
-	loop, err := buildAggregatorLoop(cfg, nil, slog.Default())
+	loop, err := buildAggregatorLoop(cfg, nil, slog.Default(), nil)
 	if err != nil {
 		t.Fatalf("buildAggregatorLoop err = %v; want nil", err)
 	}
@@ -35,7 +35,7 @@ func TestBuildAggregatorLoop_DisabledReturnsNil(t *testing.T) {
 func TestBuildAggregatorLoop_NilDBWhenEnabledErrors(t *testing.T) {
 	t.Parallel()
 	cfg := config.Config{DisableAggregator: false}
-	_, err := buildAggregatorLoop(cfg, nil, slog.Default())
+	_, err := buildAggregatorLoop(cfg, nil, slog.Default(), nil)
 	if err == nil {
 		t.Fatal("buildAggregatorLoop err = nil; want non-nil")
 	}
@@ -71,7 +71,7 @@ func TestBuildAggregatorLoop_WiresSystemTierPipeline(t *testing.T) {
 		DisableAggregator: false,
 		AggregatorCadence: 17 * time.Minute,
 	}
-	loop, err := buildAggregatorLoop(cfg, db, slog.Default())
+	loop, err := buildAggregatorLoop(cfg, db, slog.Default(), nil)
 	if err != nil {
 		t.Fatalf("buildAggregatorLoop err = %v; want nil", err)
 	}
@@ -116,7 +116,7 @@ func TestBuildAggregatorLoop_PropagatesCadence(t *testing.T) {
 		DisableAggregator: false,
 		AggregatorCadence: want,
 	}
-	loop, err := buildAggregatorLoop(cfg, db, slog.Default())
+	loop, err := buildAggregatorLoop(cfg, db, slog.Default(), nil)
 	if err != nil {
 		t.Fatalf("buildAggregatorLoop err = %v; want nil", err)
 	}

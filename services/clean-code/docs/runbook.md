@@ -6,6 +6,103 @@ composition root (`cmd/clean-code-metric-ingestor/main.go`,
 which hosts the management + ingest HTTP surfaces; future
 binaries under `cmd/clean-code-*` ship their own routes).
 
+## Stage 9.4 -- OTel telemetry + Prometheus `/metrics` (all binaries)
+
+Every `clean-code-*` binary now exports OpenTelemetry traces
+via OTLP gRPC and exposes a Prometheus text-exposition
+`/metrics` endpoint on its root HTTP mux. The span
+attribute schema and metric names are the architecture-Sec-8
+canonical surface for dashboards.
+
+### Env vars
+
+| env var | required | default | semantics |
+|---|---|---|---|
+| `CLEAN_CODE_OTEL_ENDPOINT` | no | `localhost:4317` (the local-dev OTel collector) | OTLP gRPC collector address. Override with the production collector hostname in deployment (e.g. `otel-collector.svc.cluster.local:4317`). Setting it to the empty string disables telemetry: the SDK uses its built-in noop tracer, `AnnotateEvalGateSpan` becomes a no-op via the `span.IsRecording()` short-circuit, and Prometheus collectors continue to record observations regardless (no scrape impact). Localhost / 127.0.0.1 endpoints default to plaintext gRPC; production endpoints SHOULD set telemetry options' `Insecure=false` so TLS is enforced. |
+| `CLEAN_CODE_PROMETHEUS_ADDR` | no | binary-default | bind address for the HTTP listener exposing `/metrics`. Already established at Stage 3.5; this stage extends the collectors mounted on the existing handler. |
+
+### Span taxonomy
+
+Every verb span carries:
+
+| attribute | type | source | notes |
+|---|---|---|---|
+| `verb` | string | `internal/api` gateway | canonical dotted verb (`mgmt.register_repo`, `eval.gate`, ...). |
+| `repo_id` | string | request body parse | empty when the verb does not take a repo or the body has not been parsed yet. |
+| `caller_subject` | string | verified bearer token `sub` claim | populated by the auth middleware. |
+| `policy_version_id` | string | `evaluator.EvaluateResult.PolicyVersionID` | empty string when the verb does not bind to a policy_version (gateway default for non-eval verbs). |
+| `degraded` | bool | `EvaluateResult.Degraded` | `false` default on every verb span at gateway entry. |
+| `degraded_reason` | string | `EvaluateResult.DegradedReason` | empty string default; closed enum is `{samples_pending, policy_signature_invalid, xrepo_edges_unavailable}` per architecture Sec 6.1. |
+| `verdict` | string | `EvaluateResult.Verdict` | empty string default; closed enum is `{pass, warn, block}`. |
+
+The eval-gate-specific four (`policy_version_id`, `degraded`,
+`degraded_reason`, `verdict`) are stamped via
+`telemetry.AnnotateEvalGateSpan` from within
+`composition.writeEvalResponse` BEFORE the operational-state
+branch ladder, so even `ErrNoActivePolicy` (409) and
+`INTERNAL_ERROR` (500) responses carry the partial state the
+evaluator computed before failing.
+
+### Prometheus collectors mounted per binary
+
+| binary | collectors on `/metrics` |
+|---|---|
+| `clean-code-gateway` | `WALReplayMetrics`, `RuleEngineMetrics` |
+| `clean-code-aggregator` | `AggregatorTickMetrics` |
+| `clean-code-eval-gate` | `RuleEngineMetrics`, `WALReplayMetrics` |
+| `clean-code-metric-ingestor` | `StaleScanRunSweepMetrics` (existing Stage 3.5 surface) |
+| `clean-code-refactor-planner` | placeholder `/metrics` -- no observable counters currently exported. |
+
+Metric names:
+
+| name | type | semantic |
+|---|---|---|
+| `cleancode_aggregator_tick_duration_seconds` | histogram | Cross-Repo Aggregator tick wall-clock (Stage 7.1). |
+| `cleancode_wal_replay_duration_seconds` | histogram | Audit WAL Reconciler `Run` wall-clock (Stage 9.2). |
+| `cleancode_rule_engine_evaluations_total` | counter | total rule-engine evaluations completed (Stage 5.7). Dedup-cache hits (within `RunDedupTTL=30s` for same `(repoID, sha, policy_version_id, scope_id, caller)`) are NOT counted -- the counter tracks real evaluator work, not duplicate calls. |
+| `cleancode_rule_engine_evaluations_by_verdict_total` | counter | per-verdict total; labels are the canonical `{pass, warn, block}` plus an `unknown` bucket that traps adapter bugs smuggling non-canonical verdicts. |
+
+Default histogram buckets are
+`[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300]`
+seconds. Compute `rate(cleancode_rule_engine_evaluations_total[5m])`
+for the architecture-Sec-8 "evaluations/sec" SLO panel.
+
+### Operator playbook
+
+1. Stand up an OTel collector reachable from the binary's
+   network (the canonical local-dev path is
+   `deploy/local/otel/config.yaml` listening on
+   `localhost:4317` plaintext).
+2. Set `CLEAN_CODE_OTEL_ENDPOINT` on the binary's env. The
+   binary will log `telemetry: OTel SDK initialised` at
+   boot when the endpoint is non-empty.
+3. Set `CLEAN_CODE_PROMETHEUS_ADDR` if the bind address
+   differs from the binary default. Scrape the configured
+   `/metrics` URL from Prometheus or the cluster-tier
+   collector.
+4. Confirm spans land in the OTel backend by issuing one
+   `eval.gate` request and querying for
+   `verdict in ("pass","warn","block")` -- empty result set
+   means the binary's endpoint pin is wrong or the
+   collector is dropping the OTLP-gRPC connection.
+
+### Failure modes
+
+- **Empty `CLEAN_CODE_OTEL_ENDPOINT`** -- intentional
+  "telemetry disabled" path. Binary stays functional;
+  spans become noop; Prometheus collectors continue to
+  observe.
+- **Collector unreachable** -- the OTel SDK's batch span
+  processor enqueues spans regardless of connectivity and
+  retries on the next flush. A sustained outage drops
+  spans silently after the in-memory queue overflows (the
+  SDK default is 2048 spans). Operators see queue-overflow
+  warnings in the SDK's stdout. Prometheus is unaffected.
+- **Service version not pinned (`ServiceVersion=""`)** --
+  the resource attribute defaults to `"dev"`. Set it via
+  the binary's build-time `-ldflags` injection so
+  dashboards can chart per-build regressions.
+
 ## Stage 8.3 -- ML effort-model loader (clean-code-refactor-planner)
 
 The `clean-code-refactor-planner` binary now loads an

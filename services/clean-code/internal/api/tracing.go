@@ -37,6 +37,30 @@ const (
 	// (the `/v1/{namespace}/{verb}` path the verb mounted
 	// at).
 	SpanAttrHTTPRoute = "http.route"
+	// SpanAttrPolicyVersionID is the `policy_version_id`
+	// the downstream verb evaluated against. Stamped with
+	// an empty default by the gateway on EVERY verb span
+	// so dashboards see a stable attribute schema
+	// regardless of whether the verb has policy
+	// semantics; the verb handler (eval.gate) overwrites
+	// the default via
+	// `telemetry.AnnotateEvalGateSpan` once the
+	// policy_version_id is known. Stage 9.4 /
+	// architecture Sec 8.
+	SpanAttrPolicyVersionID = "policy_version_id"
+	// SpanAttrDegraded is the boolean "did this verb
+	// take the degraded short-circuit path". Stamped
+	// false on every verb span by default; eval.gate's
+	// downstream handler overwrites when applicable.
+	SpanAttrDegraded = "degraded"
+	// SpanAttrDegradedReason is the canonical
+	// degraded-reason enum value when SpanAttrDegraded
+	// is true; empty string otherwise.
+	SpanAttrDegradedReason = "degraded_reason"
+	// SpanAttrVerdict is the canonical eval.gate verdict
+	// enum `{pass, warn, block}`. Empty string on
+	// non-eval verbs.
+	SpanAttrVerdict = "verdict"
 )
 
 // SpanName is the conventional span name the gateway uses for

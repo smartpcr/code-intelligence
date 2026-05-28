@@ -84,6 +84,14 @@ type EvaluateResult struct {
 	Verdict             Verdict
 	Degraded            bool
 	DegradedReason      DegradedReason
+	// PolicyVersionID is the `policy_version_id` the gate
+	// evaluated against. Always populated on both the
+	// happy and degraded paths so `eval.gate` span /
+	// audit dashboards can filter by policy version
+	// regardless of whether the request supplied the
+	// PVID or the canonical [Gate.Gate] resolved it from
+	// `policy_activation` (architecture Sec 8, Stage 9.4).
+	PolicyVersionID uuid.UUID
 }
 
 // RuleEngine is the narrow port the gate calls on the
@@ -430,6 +438,7 @@ func (g *Gate) Evaluate(ctx context.Context, repoID uuid.UUID, sha string, scope
 		EvaluationVerdictID: out.EvaluationVerdictID,
 		FindingIDs:          out.FindingIDs,
 		Verdict:             out.Verdict,
+		PolicyVersionID:     policyVersionID,
 	}, nil
 }
 
@@ -498,6 +507,7 @@ func (g *Gate) writeDegraded(ctx context.Context, repoID uuid.UUID, sha string, 
 		Verdict:             VerdictWarn,
 		Degraded:            true,
 		DegradedReason:      reason,
+		PolicyVersionID:     policyVersionID,
 	}, retErr
 }
 

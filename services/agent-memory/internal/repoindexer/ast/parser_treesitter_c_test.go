@@ -34,7 +34,14 @@ import (
 // Expected graph (Stage 3.4 acceptance):
 //   - 1 class node `Greeter` whose `attrs_json.decl_kind == "struct"`
 //   - 2 method nodes (`greet`, `format_greeting`)
-//   - 1 external package node `stdio.h` with `attrs_json.source == "external"`
+//   - 1 external package node identified by
+//     `attrs_json.module == "stdio.h"` AND
+//     `attrs_json.source == "external"` (architecture.md
+//     §C.0 lines 985-990 documents the package canonical
+//     signature as `<repoURL>::package::ext::<module>` --
+//     there is no `#<qualifiedName>` separator, so module
+//     identity rides in attrs_json, not in the trailing
+//     signature segment).
 //   - 3 contains edges, each `src=file-node-id` and `dst` in
 //     {Greeter, greet, format_greeting} (no dupes, no
 //     extras); C has no nested class->method containment
@@ -213,9 +220,24 @@ int greet(int n) {
 			len(pkgNodes), pkgNodes)
 	}
 	stdioNode := pkgNodes[0]
-	if got := lastSegmentAfterHash(stdioNode.CanonicalSignature); got != "stdio.h" {
-		t.Errorf("package node simple-name = %q; want stdio.h (sig=%q)",
-			got, stdioNode.CanonicalSignature)
+	// The external-package canonical signature shape per
+	// architecture.md §C.0 lines 985-990 is
+	// `<repoURL>::package::ext::<module>` -- there is NO
+	// `#<qualifiedName>` separator (unlike class / method
+	// sigs). The authoritative module identity therefore
+	// lives in `attrs_json["module"]`, not in the trailing
+	// signature segment. We assert both: the documented
+	// attrs key (canonical) AND that the signature contains
+	// "stdio.h" (defensive shape-check that survives a
+	// future swap between `::package::` and `::pkg::`
+	// separators without false positives).
+	if got := attrString(t, stdioNode.AttrsJSON, "module"); got != "stdio.h" {
+		t.Errorf("stdio.h package attrs_json.module = %q; want \"stdio.h\" (sig=%q, attrs=%s)",
+			got, stdioNode.CanonicalSignature, string(stdioNode.AttrsJSON))
+	}
+	if !strings.Contains(stdioNode.CanonicalSignature, "stdio.h") {
+		t.Errorf("stdio.h package canonical signature must contain \"stdio.h\"; got %q",
+			stdioNode.CanonicalSignature)
 	}
 	if got := attrString(t, stdioNode.AttrsJSON, "source"); got != "external" {
 		t.Errorf("stdio.h package attrs_json.source = %q; want \"external\" (attrs=%s)",

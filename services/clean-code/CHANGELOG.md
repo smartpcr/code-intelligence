@@ -11,14 +11,24 @@ This workstream extends the Stage 8.1 Refactor Planner (composite
 hotspot scoring) with the canonical end-to-end plan + task
 generation contract:
 
-- A new orchestrator `internal/refactor.TaskPlanner` reads the
-  active `PolicySnapshot` ONCE per `Plan()` call (race-safe
-  shared `readAndCompute` helper extracted from
-  `internal/refactor.Planner.Plan`), persists the FULL hot_spot
-  batch via the existing `HotSpotWriter` (architecture Sec 5.5.1
-  append-only -- TopN never truncates the hot_spot row set),
-  then truncates to `Snapshot.Weights.TopN` for plan / task
-  emission.
+- A new orchestrator `internal/refactor.TaskPlanner` READS the
+  latest top-N hot_spot batch (it does NOT recompute hot_spots --
+  Stage 8.1 `Planner.Plan` remains the sole writer of
+  `clean_code.hot_spot`). A new `HotSpotReader` interface owns
+  the `WHERE created_at = (SELECT MAX(created_at) ...)` latest-
+  batch lookup so the two stages can run in sequence under one
+  K8s Job without duplicating hot_spot rows when the same
+  (repo_id, sha, policy_version_id) tuple is replanned. The
+  reader requires a single-writer assumption against the
+  hot_spot table (see runbook for the operator contract).
+- A new race-safe entrypoint `TaskPlanner.PlanFromSnapshot(ctx,
+  repoID, sha, snap)` accepts the Stage 8.1 `PlanResult.Snapshot`
+  directly so the composition root can pin the SAME
+  `policy_version_id` across both passes -- a concurrent
+  `policy.activate` between the two passes cannot return a
+  different policy_version. The standalone entry
+  `TaskPlanner.Plan` still reads the active policy itself for
+  callers that drive Stage 8.2 in isolation.
 - The new `RefactorWeights.TopN` field (`steward/types.go`) drives
   the per-policy plan-coverage knob. `TopN == 0` means
   "no truncation, plan covers every scored hot_spot"
@@ -99,26 +109,50 @@ generation contract:
 
 ### Where the contract lives (greppable pointers)
 
+- `services/clean-code/cmd/clean-code-refactor-planner/main.go`
+  -- the production composition root. Reads
+  `CLEAN_CODE_REFACTOR_PLANNER_REPO_ID` + `CLEAN_CODE_REFACTOR_PLANNER_SHA`
+  + `CLEAN_CODE_PG_URL`, opens a libpq handle, wires the
+  Stage 8.1 `Planner` (SQL deps) + the Stage 8.2 `TaskPlanner`
+  (SQL deps), calls `planner.Plan` and then
+  `taskPlanner.PlanFromSnapshot(ctx, repoID, sha, planRes.Snapshot)`
+  to pin the same policy_version across both passes, and
+  exits 0/1. One-shot K8s Job semantics; NOT a cadence loop.
+  Mounts `/healthz` + `/metrics` placeholder. The opt-out env
+  `CLEAN_CODE_DISABLE_REFACTOR_PLANNER` skips both passes and
+  serves /healthz only.
+- `services/clean-code/cmd/clean-code-refactor-planner/main_test.go`
+  -- coverage for `parseTargetEnv` (happy, missing repo_id,
+  malformed repo_id, zero repo_id, missing sha, whitespace
+  trimming), `parseBoolEnv` (truthy/falsy/whitespace matrix),
+  and `buildMux` (/healthz, /metrics, 404 on unknown path).
 - `services/clean-code/internal/refactor/task_planner.go` --
   the Stage 8.2 contract surface. Owns `TaskKind`,
   `CanonicalTaskKinds`, `RejectedTaskKindAliases`,
   `IsCanonicalTaskKind`, `IsRejectedTaskKindAlias`,
   `ValidateTaskKind`, `DefaultTaskKindForRule`,
   `RefactorPlan`, `RefactorTask`, `PlanAndTasksResult`,
-  `FindingDetail`, `FindingDetailReader`,
-  `RefactorPlanTaskWriter`, sentinel errors
+  `FindingDetail`, `FindingDetailReader`, `HotSpotReader`
+  (new in iter 2 -- READ contract for the top-N latest-batch
+  hot_spot lookup), `RefactorPlanTaskWriter`, sentinel errors
   (`ErrUnknownTaskKind`, `ErrRejectedTaskKindAlias`,
-  `ErrInvalidTopN`, `ErrNilFindingDetailReader`,
-  `ErrNilPlanTaskWriter`), `TaskOption` configuration
+  `ErrInvalidTopN`, `ErrNilHotSpotReader`,
+  `ErrNilFindingDetailReader`, `ErrNilPlanTaskWriter`,
+  `ErrNilSummaryFunc`, `ErrNilTaskDescriptionFunc`,
+  `ErrNilRuleKindMapper`, `ErrNilIDFactoryOption`,
+  `ErrNilClockOption`), `TaskOption` configuration
   (`WithTaskIDFactory`, `WithTaskClock`,
   `WithRuleKindMapper`, `WithDefaultKind`,
-  `WithSummaryFunc`, `WithTaskDescriptionFunc`),
-  `TaskPlanner` + `NewTaskPlanner` + `TaskPlanner.Plan`,
-  `InMemoryFindingDetailReader` +
+  `WithSummaryFunc`, `WithTaskDescriptionFunc`), `TaskPlanner`
+  + `NewTaskPlanner` (4-arg: policy, hotSpotReader,
+  findingDetails, planTaskWriter) + `TaskPlanner.Plan` +
+  `TaskPlanner.PlanFromSnapshot`,
+  `InMemoryHotSpotReader` + `InMemoryFindingDetailReader` +
   `InMemoryRefactorPlanTaskWriter` (test + scaffold-mode
-  composition root), and `SQLFindingDetailReader` +
-  `SQLRefactorPlanTaskWriter` (production -- atomic
-  single-transaction insert).
+  composition root), and `SQLHotSpotReader` +
+  `SQLFindingDetailReader` + `SQLRefactorPlanTaskWriter`
+  (production -- atomic single-transaction insert with
+  `::clean_code.refactor_task_kind` ENUM cast).
 - `services/clean-code/internal/refactor/task_planner_test.go`
   -- coverage:
   `TestCanonicalTaskKinds_AreExactlyTheFiveCanonicalValues`
@@ -129,12 +163,15 @@ generation contract:
   `TestDefaultTaskKindForRule_MapsCanonicalRuleFamilies`
   pins the v0 mapping table;
   `TestNewTaskPlanner_RejectsNilDeps` pins every required
-  dependency;
+  dependency (including the new `nil HotSpotReader`);
+  `TestNewTaskPlanner_RejectsNilOptionCallbacks` pins the
+  new "nil callback at construction" guard for every TaskOption
+  (rubber-duck iter-2 finding #5);
   `TestNewTaskPlanner_RejectsNonCanonicalDefaultKind`
   pins the construction-time validator;
   `TestTaskPlanner_Plan_HappyPath_TopNTruncatesPlanCoverage`
-  pins the end-to-end orchestration (FULL hot_spot persisted,
-  top-N plan coverage, one task per rule);
+  pins the end-to-end orchestration AGAINST a pre-seeded
+  hot_spot batch (top-N plan coverage, one task per rule);
   `TestTaskPlanner_Plan_TopNZeroEmitsAllHotSpots` pins the
   no-truncation case;
   `TestTaskPlanner_Plan_TopNExceedsHotSpotCount` pins the
@@ -155,12 +192,58 @@ generation contract:
   empty-input no-op contract;
   `TestTaskPlanner_Plan_NegativeTopN_ReturnsErrInvalidTopN`
   pins the defensive runtime guard;
-  `TestTaskPlanner_Plan_FindingDetailReaderError_PropagatesAndWraps`
+  `TestTaskPlanner_Plan_HotSpotReaderError_PropagatesAndWraps`
+  + `TestTaskPlanner_Plan_FindingDetailReaderError_PropagatesAndWraps`
   + `TestTaskPlanner_Plan_PlanTaskWriterError_PropagatesAndWraps`
   pin error propagation;
-  `TestInMemoryFindingDetailReader_*` (three tests) pin the
-  in-memory reader's qualifying-delta + policy_version_id +
-  dedup contract.
+  `TestTaskPlanner_PlanFromSnapshot_BypassesPolicyRead` pins
+  the race-safe entrypoint -- a policy reader that would FAIL
+  if called is NOT called when callers use the snapshot path;
+  `TestTaskPlanner_PlanFromSnapshot_ZeroPolicyVersionID_Rejected`
+  pins the input validation;
+  `TestInMemoryHotSpotReader_*` (four tests) pin the new
+  in-memory hot_spot reader's latest-batch + policy_version
+  filter + top-N truncation contracts;
+  `TestInMemoryFindingDetailReader_*` (four tests) pin the
+  in-memory detail reader's qualifying-delta + policy_version_id
+  + dedup contracts.
+- `services/clean-code/internal/refactor/task_planner_sql_test.go`
+  -- NEW iter-2 sqlmock coverage of the production SQL shapes
+  (rubber-duck iter-2 fix for evaluator finding #4):
+  `TestSQLHotSpotReader_LatestHotSpotsByScore_TopNPositive`
+  pins the `MAX(created_at)` subquery + `LIMIT $4` tail;
+  `TestSQLHotSpotReader_LatestHotSpotsByScore_TopNZero_OmitsLimit`
+  pins the no-LIMIT branch (3 args, not 4);
+  `TestSQLHotSpotReader_LatestHotSpotsByScore_NegativeTopN_RejectsBeforeQuery`
+  pins the defensive runtime guard;
+  `TestSQLHotSpotReader_LatestHotSpotsByScore_PropagatesQueryError`
+  pins the wrap path;
+  `TestSQLFindingDetailReader_FindingDetails_PinsDistinctScopeRule`
+  pins the `SELECT DISTINCT scope_id, rule_id ... WHERE
+  delta::text = ANY($4) AND policy_version_id = $5` shape;
+  `TestSQLFindingDetailReader_FindingDetails_EmptyScopeIDs_NoQuery`
+  pins the empty-input no-op;
+  `TestSQLFindingDetailReader_FindingDetails_PropagatesQueryError`
+  pins the wrap path;
+  `TestSQLRefactorPlanTaskWriter_Write_PinsPlanInsertAndTaskEnumCast`
+  pins the canonical happy path (BEGIN, plan INSERT with
+  `$4::jsonb`, prepared task INSERT with
+  `$4::clean_code.refactor_task_kind`, COMMIT) -- catches
+  a schema drift on the columns OR the ENUM cast;
+  `TestSQLRefactorPlanTaskWriter_Write_RollsBackOnTaskInsertError`
+  pins the rollback path;
+  `TestSQLRefactorPlanTaskWriter_Write_RejectsTaskWithMismatchedPlanID`
+  pins the orphan-prevention guard;
+  `TestSQLRefactorPlanTaskWriter_Write_RejectsZeroPlanID`
+  pins the construction-time invariant;
+  `TestSQLRefactorPlanTaskWriter_Write_RejectsRejectedAliasKind_BeforeTx`
+  pins the pre-flight kind validation;
+  `TestSQLRefactorPlanTaskWriter_Write_EmptyTasks_PlanOnly`
+  pins the metric-only plan path (no per-task PREPARE);
+  `TestSQLRefactorPlanTaskWriter_Write_RollsBackOnPlanInsertError`
+  pins the rollback path on plan failure;
+  `TestSQLPatternsCompile_TaskPlanner` is the regex
+  sanity check.
 - `services/clean-code/internal/refactor/planner.go` --
   refactored to extract the shared `readAndCompute` helper
   (rubber-duck Stage 8.2 design review finding #3: closes the

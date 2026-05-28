@@ -459,6 +459,52 @@ type FindingDetailReader interface {
 	) ([]FindingDetail, error)
 }
 
+// HotSpotReader returns the LATEST batch of `hot_spot` rows
+// at one (repo_id, sha, policy_version_id) restricted to the
+// policy's `top_n` truncation. "Latest" means: the batch
+// whose `created_at` equals `MAX(created_at)` for the same
+// (repo_id, sha, policy_version_id) tuple, which under the
+// Stage 8.1 single-writer / single-replica invariant
+// (architecture Sec 3.9, rollout.md Stage 8.2) corresponds
+// to the most recently written [Planner.Plan] batch.
+//
+// `topN`:
+//
+//   - `> 0` truncates the returned slice to that many rows
+//     ordered by `score DESC, scope_id ASC` (the
+//     deterministic Computer ranking).
+//   - `0` returns the FULL latest batch (no truncation) --
+//     matches the [RefactorWeights.TopN] zero-default
+//     semantics.
+//   - `< 0` is undefined; the [TaskPlanner] caller rejects
+//     negative TopN before invoking the reader.
+//
+// Returns an empty slice (not an error) when no hot_spot
+// rows exist at the tuple -- Stage 8.1 has not run yet, or
+// every scope was filtered out by Computer eligibility.
+//
+// Implementations:
+//
+//   - [InMemoryHotSpotReader] -- a process-local slice.
+//   - [SQLHotSpotReader] -- the production reader against
+//     `clean_code.hot_spot`.
+//
+// Single-writer assumption: the production refactor-planner
+// binary runs SINGLE-REPLICA (see rollout.md Stage 8.2). A
+// future migration MAY add an explicit `batch_id` /
+// `planner_run_id` column to `hot_spot` to disambiguate
+// parallel writers; until then the `MAX(created_at)` rule
+// is sufficient.
+type HotSpotReader interface {
+	LatestHotSpotsByScore(
+		ctx context.Context,
+		repoID uuid.UUID,
+		sha string,
+		policyVersionID uuid.UUID,
+		topN int,
+	) ([]HotSpot, error)
+}
+
 // -----------------------------------------------------------------------------
 // Writers
 // -----------------------------------------------------------------------------
@@ -521,14 +567,43 @@ var (
 	ErrInvalidTopN = errors.New(
 		"refactor: refactor_weights.top_n must be >= 0")
 
-	// ErrNilFindingDetailReader / ErrNilPlanTaskWriter
-	// signal a composition-root wiring bug at
-	// [NewTaskPlanner] time. Mirror the [Planner]'s
+	// ErrNilHotSpotReader / ErrNilFindingDetailReader /
+	// ErrNilPlanTaskWriter signal a composition-root wiring
+	// bug at [NewTaskPlanner] time. Mirror the [Planner]'s
 	// nil-dependency sentinels.
+	ErrNilHotSpotReader = errors.New(
+		"refactor: HotSpotReader is nil")
 	ErrNilFindingDetailReader = errors.New(
 		"refactor: FindingDetailReader is nil")
 	ErrNilPlanTaskWriter = errors.New(
 		"refactor: RefactorPlanTaskWriter is nil")
+
+	// ErrNilSummaryFunc / ErrNilTaskDescriptionFunc /
+	// ErrNilRuleKindMapper signal that a caller passed
+	// `nil` through [WithSummaryFunc] / [WithTaskDescriptionFunc]
+	// / [WithRuleKindMapper]. Caught at construction
+	// (rubber-duck iter-2 finding #5) so the operator sees a
+	// clear error rather than a `nil pointer dereference`
+	// panic at the first [TaskPlanner.Plan] call. Each
+	// option also has a non-nil default; calling
+	// `Option(nil)` is therefore always a bug.
+	ErrNilSummaryFunc = errors.New(
+		"refactor: WithSummaryFunc was passed nil")
+	ErrNilTaskDescriptionFunc = errors.New(
+		"refactor: WithTaskDescriptionFunc was passed nil")
+	ErrNilRuleKindMapper = errors.New(
+		"refactor: WithRuleKindMapper was passed nil")
+
+	// ErrNilIDFactoryOption / ErrNilClockOption signal that a
+	// caller passed `nil` through [WithTaskIDFactory] /
+	// [WithTaskClock]. Distinct from the [ErrNilIDFactory] /
+	// [ErrNilClock] sentinels in `hotspot.go` (which signal
+	// a missing default at Plan() time, not a nil-passed
+	// option at construction time).
+	ErrNilIDFactoryOption = errors.New(
+		"refactor: WithTaskIDFactory was passed nil")
+	ErrNilClockOption = errors.New(
+		"refactor: WithTaskClock was passed nil")
 )
 
 // -----------------------------------------------------------------------------
@@ -540,6 +615,13 @@ var (
 // mutates the planner during [NewTaskPlanner]. Options are
 // applied in slice order so a later option overrides an
 // earlier one of the same kind.
+//
+// Rubber-duck iter-2 finding #5: every option that accepts a
+// callback rejects `nil` by stashing a sentinel error on the
+// planner; [NewTaskPlanner] returns that error after applying
+// all options. This catches a misconfigured composition root
+// at construction time instead of at the first [TaskPlanner.Plan]
+// call (where the nil callback would surface as a panic).
 type TaskOption func(*TaskPlanner)
 
 // WithTaskIDFactory overrides the uuid factory the
@@ -547,19 +629,31 @@ type TaskOption func(*TaskPlanner)
 // `task_id`. The factory MUST return a fresh, non-zero uuid
 // per call; collisions break the PK contract on both rows.
 // Tests inject a counter-backed factory for byte-identical
-// output across runs. A nil factory is rejected at
-// [TaskPlanner.Plan] time (deferred so a wiring bug surfaces
-// as a clean error rather than a construction-time panic).
+// output across runs. A nil factory yields
+// [ErrNilIDFactoryOption] from [NewTaskPlanner].
 func WithTaskIDFactory(f func() (uuid.UUID, error)) TaskOption {
-	return func(tp *TaskPlanner) { tp.newID = f }
+	return func(tp *TaskPlanner) {
+		if f == nil {
+			tp.optErr = errors.Join(tp.optErr, ErrNilIDFactoryOption)
+			return
+		}
+		tp.newID = f
+	}
 }
 
 // WithTaskClock overrides the clock the [TaskPlanner] reads
 // once per [TaskPlanner.Plan] call. All emitted rows share
 // the single reading so the plan + every task carry one
-// `created_at`. A nil clock is rejected at Plan() time.
+// `created_at`. A nil clock yields [ErrNilClockOption] from
+// [NewTaskPlanner].
 func WithTaskClock(f func() time.Time) TaskOption {
-	return func(tp *TaskPlanner) { tp.now = f }
+	return func(tp *TaskPlanner) {
+		if f == nil {
+			tp.optErr = errors.Join(tp.optErr, ErrNilClockOption)
+			return
+		}
+		tp.now = f
+	}
 }
 
 // WithRuleKindMapper overrides the `rule_id -> TaskKind`
@@ -569,8 +663,16 @@ func WithTaskClock(f func() time.Time) TaskOption {
 // `(kind, true)` when the rule_id maps and `(zero, false)`
 // when no mapping exists; the [TaskPlanner] then consults
 // the configured [WithDefaultKind] fallback.
+// A nil mapper yields [ErrNilRuleKindMapper] from
+// [NewTaskPlanner].
 func WithRuleKindMapper(m func(ruleID string) (TaskKind, bool)) TaskOption {
-	return func(tp *TaskPlanner) { tp.ruleKindMapper = m }
+	return func(tp *TaskPlanner) {
+		if m == nil {
+			tp.optErr = errors.Join(tp.optErr, ErrNilRuleKindMapper)
+			return
+		}
+		tp.ruleKindMapper = m
+	}
 }
 
 // WithDefaultKind overrides the fallback kind used when a
@@ -587,60 +689,84 @@ func WithDefaultKind(k TaskKind) TaskOption {
 // WithSummaryFunc overrides the per-plan summary_md generator.
 // The default is [defaultSummaryMD]; a future LLM-explainer
 // wires a richer generator without changing the writer
-// contract.
+// contract. A nil fn yields [ErrNilSummaryFunc] from
+// [NewTaskPlanner].
 func WithSummaryFunc(fn func(plan RefactorPlan, tasks []RefactorTask, snap PolicySnapshot) string) TaskOption {
-	return func(tp *TaskPlanner) { tp.summaryFn = fn }
+	return func(tp *TaskPlanner) {
+		if fn == nil {
+			tp.optErr = errors.Join(tp.optErr, ErrNilSummaryFunc)
+			return
+		}
+		tp.summaryFn = fn
+	}
 }
 
 // WithTaskDescriptionFunc overrides the per-task description_md
 // generator. The default is [defaultTaskDescriptionMD]; a
 // future LLM-explainer wires a richer generator without
-// changing the writer contract.
+// changing the writer contract. A nil fn yields
+// [ErrNilTaskDescriptionFunc] from [NewTaskPlanner].
 func WithTaskDescriptionFunc(fn func(task RefactorTask, hs HotSpot, snap PolicySnapshot) string) TaskOption {
-	return func(tp *TaskPlanner) { tp.descriptionFn = fn }
+	return func(tp *TaskPlanner) {
+		if fn == nil {
+			tp.optErr = errors.Join(tp.optErr, ErrNilTaskDescriptionFunc)
+			return
+		}
+		tp.descriptionFn = fn
+	}
 }
 
 // -----------------------------------------------------------------------------
 // TaskPlanner -- the Stage 8.2 orchestrator
 // -----------------------------------------------------------------------------
 
-// TaskPlanner is the Stage 8.2 orchestrator. It owns the
-// extended read → compute → write loop:
+// TaskPlanner is the Stage 8.2 orchestrator. It is a thin
+// adapter that READS the existing top-N hot_spot rows that
+// the Stage 8.1 [Planner] has already persisted for the
+// target (repo_id, sha), reads the per-scope finding
+// details, and writes ONE [RefactorPlan] row + N
+// [RefactorTask] rows atomically.
 //
-//  1. Read the active [PolicySnapshot] ONCE (race-safe per
-//     rubber-duck finding #3).
-//  2. Read + compute per-scope hot_spots (shared
-//     [readAndCompute] helper with Stage 8.1 [Planner]).
-//  3. Write the FULL hot_spot batch (architecture Sec 5.5.1
-//     append-only; truncating storage would lose audit
-//     signal).
-//  4. Truncate to top-`Snapshot.Weights.TopN` by Score DESC
-//     for plan / task emission (TopN == 0 means no
-//     truncation).
-//  5. Read finding details for the top-N scope set in ONE
-//     batch (rubber-duck finding #6 N+1 fix).
-//  6. Mint a plan_id; assemble [RefactorPlan] with
-//     `hotspot_ids` set to the top-N row ids; generate
-//     summary_md.
-//  7. For each top-N hot_spot: dedupe its finding details by
-//     `(scope_id, rule_id)`; for each unique pair emit a
-//     [RefactorTask] with kind from
-//     [TaskPlanner.ruleKindMapper] OR the default fallback;
-//     validate every emitted kind against the canonical
-//     enum (refuse the batch on rejection).
-//  8. WriteRefactorPlanAndTasks ATOMICALLY (rubber-duck
-//     finding #1).
+//	Stage 8.1 Planner.Plan(ctx, repoID, sha)
+//	    reads policy + metric_sample + finding ->
+//	    writes hot_spot (append-only batch).
+//	Stage 8.2 TaskPlanner.Plan(ctx, repoID, sha)
+//	    reads policy (for TopN) + LATEST hot_spot batch +
+//	    finding details -> writes refactor_plan +
+//	    refactor_task (atomic).
+//
+// The split keeps the planner's responsibilities crisp: the
+// hot_spot table stays the single source of truth for "what
+// did we score, when?" and the Stage 8.2 adapter never
+// duplicates a hot_spot row (rubber-duck iter-2 finding #3
+// fix). The append-only `hot_spot` table is read by latest
+// batch via `WHERE created_at = (SELECT MAX(created_at) ...)`
+// so a fresh Stage 8.1 run supersedes the prior batch
+// without the Stage 8.2 reader having to know which one is
+// "live".
+//
+// Race-safe sequential wiring: when the composition root
+// calls Stage 8.1 [Planner.Plan] then Stage 8.2
+// [TaskPlanner.Plan] in sequence, a concurrent
+// `policy.activate` between the two calls would produce a
+// torn plan whose hot_spot batch was scored against policy
+// version A and whose top-N truncation was driven by policy
+// version B. The cmd binary AVOIDS this race by calling
+// [TaskPlanner.PlanFromSnapshot] with the
+// [PlanResult.Snapshot] returned by Stage 8.1; the same
+// snapshot is reused for the TopN read so the two passes
+// pin the same policy_version (rubber-duck iter-2 finding
+// #1).
+//
+// [TaskPlanner.Plan] remains the standalone entry that reads
+// the active snapshot itself; it is used by tests and by
+// callers that do not also drive Stage 8.1.
 //
 // The planner is stateless across calls.
 type TaskPlanner struct {
-	// Stage 8.1 dependencies (reused via [readAndCompute]).
-	policy        PolicyReader
-	metrics       MetricSampleReader
-	findings      FindingReader
-	hotSpotWriter HotSpotWriter
-	compute       *Computer
-
-	// Stage 8.2-specific dependencies.
+	// Inputs needed by both Plan() and PlanFromSnapshot().
+	policy         PolicyReader
+	hotSpotReader  HotSpotReader
 	findingDetails FindingDetailReader
 	planTaskWriter RefactorPlanTaskWriter
 
@@ -653,29 +779,34 @@ type TaskPlanner struct {
 	defaultKind    TaskKind
 	summaryFn      func(plan RefactorPlan, tasks []RefactorTask, snap PolicySnapshot) string
 	descriptionFn  func(task RefactorTask, hs HotSpot, snap PolicySnapshot) string
+
+	// optErr accumulates errors stashed by the [TaskOption]
+	// setters (nil callbacks) so [NewTaskPlanner] can
+	// surface them after applying every option. Rubber-duck
+	// iter-2 finding #5: report ALL bad-wire options at
+	// once rather than failing on the first one.
+	optErr error
 }
 
-// NewTaskPlanner wires a [TaskPlanner] with the six required
+// NewTaskPlanner wires a [TaskPlanner] with the four required
 // dependencies + optional [TaskOption] arguments. Returns an
-// error when any dependency is nil OR when the configured
-// default kind is non-canonical.
+// error when any dependency is nil, when any callback
+// option was passed nil, OR when the configured default kind
+// is non-canonical.
 //
-// Production composition root wiring:
+// Production composition root wiring (see
+// `cmd/clean-code-refactor-planner/main.go`):
 //
 //	st := steward.New(steward.Config{Store: store, Signer: signer})
-//	planner, _ := refactor.NewTaskPlanner(
+//	tp, _ := refactor.NewTaskPlanner(
 //	    &refactor.StewardPolicyReader{Steward: st},
-//	    refactor.NewSQLMetricSampleReader(db),
-//	    refactor.NewSQLFindingReader(db),
-//	    refactor.NewSQLHotSpotWriter(db),
+//	    refactor.NewSQLHotSpotReader(db),
 //	    refactor.NewSQLFindingDetailReader(db),
 //	    refactor.NewSQLRefactorPlanTaskWriter(db),
 //	)
 func NewTaskPlanner(
 	policy PolicyReader,
-	metrics MetricSampleReader,
-	findings FindingReader,
-	hotSpotWriter HotSpotWriter,
+	hotSpotReader HotSpotReader,
 	findingDetails FindingDetailReader,
 	planTaskWriter RefactorPlanTaskWriter,
 	opts ...TaskOption,
@@ -683,14 +814,8 @@ func NewTaskPlanner(
 	if policy == nil {
 		return nil, ErrNilPolicyReader
 	}
-	if metrics == nil {
-		return nil, ErrNilMetricSampleReader
-	}
-	if findings == nil {
-		return nil, ErrNilFindingReader
-	}
-	if hotSpotWriter == nil {
-		return nil, ErrNilHotSpotWriter
+	if hotSpotReader == nil {
+		return nil, ErrNilHotSpotReader
 	}
 	if findingDetails == nil {
 		return nil, ErrNilFindingDetailReader
@@ -700,12 +825,9 @@ func NewTaskPlanner(
 	}
 	tp := &TaskPlanner{
 		policy:         policy,
-		metrics:        metrics,
-		findings:       findings,
-		hotSpotWriter:  hotSpotWriter,
+		hotSpotReader:  hotSpotReader,
 		findingDetails: findingDetails,
 		planTaskWriter: planTaskWriter,
-		compute:        NewComputer(),
 		newID:          uuid.NewV4,
 		now:            time.Now,
 		ruleKindMapper: DefaultTaskKindForRule,
@@ -716,6 +838,30 @@ func NewTaskPlanner(
 	for _, opt := range opts {
 		opt(tp)
 	}
+	if tp.optErr != nil {
+		return nil, fmt.Errorf("NewTaskPlanner: %w", tp.optErr)
+	}
+	// Belt-and-braces: a misbehaving custom option could
+	// reset a field to nil; reject those too. The default
+	// constructor body above guarantees every field is
+	// non-nil before opts are applied, so a nil here means
+	// an option overrode the default with nil despite the
+	// per-option nil rejection.
+	if tp.newID == nil {
+		return nil, ErrNilIDFactoryOption
+	}
+	if tp.now == nil {
+		return nil, ErrNilClockOption
+	}
+	if tp.ruleKindMapper == nil {
+		return nil, ErrNilRuleKindMapper
+	}
+	if tp.summaryFn == nil {
+		return nil, ErrNilSummaryFunc
+	}
+	if tp.descriptionFn == nil {
+		return nil, ErrNilTaskDescriptionFunc
+	}
 	// Validate default kind eagerly per rubber-duck finding
 	// #11 (catch bad wiring at construction, not at first
 	// Plan() call).
@@ -725,18 +871,30 @@ func NewTaskPlanner(
 	return tp, nil
 }
 
-// Plan executes the full Stage 8.2 read → compute → write
-// cycle. Returns [ErrNoActivePolicy] when no policy is
-// active, [ErrInvalidTopN] when the active policy carries a
+// Plan executes the full Stage 8.2 read → emit → write
+// cycle against the currently-active policy. The active
+// snapshot is fetched at the head of the method so a
+// standalone caller (test, ad-hoc CLI) does not need to
+// drive Stage 8.1 first.
+//
+// Production composition wiring SHOULD prefer
+// [TaskPlanner.PlanFromSnapshot] with the
+// [PlanResult.Snapshot] returned by Stage 8.1 so the two
+// passes pin the same policy_version (rubber-duck iter-2
+// finding #1).
+//
+// Returns [ErrNoActivePolicy] when no policy is active,
+// [ErrInvalidTopN] when the active policy carries a
 // negative top_n, [ErrRejectedTaskKindAlias] or
 // [ErrUnknownTaskKind] when an emitted task carries a
 // non-canonical kind, or a wrapped error from any
 // dependency.
 //
-// On empty input (no metric_sample, no finding) returns a
-// [PlanAndTasksResult] with a zero-valued [Plan] (PlanID ==
-// uuid.Nil) and an empty [Tasks] slice -- the plan / task
-// writer is NOT called.
+// On empty input (no hot_spot rows at this repo/sha for the
+// active policy_version_id) returns a [PlanAndTasksResult]
+// with a zero-valued [Plan] (PlanID == uuid.Nil) and an
+// empty [Tasks] slice -- the plan / task writer is NOT
+// called.
 //
 // Concurrency: stateless across calls; safe to invoke from
 // multiple goroutines on distinct (repo_id, sha) tuples.
@@ -745,18 +903,45 @@ func (tp *TaskPlanner) Plan(
 	repoID uuid.UUID,
 	sha string,
 ) (PlanAndTasksResult, error) {
+	snap, ok, err := tp.policy.ActivePolicyVersion(ctx)
+	if err != nil {
+		return PlanAndTasksResult{}, fmt.Errorf(
+			"refactor.TaskPlanner.Plan: read active policy: %w", err)
+	}
+	if !ok {
+		return PlanAndTasksResult{}, ErrNoActivePolicy
+	}
+	return tp.PlanFromSnapshot(ctx, repoID, sha, snap)
+}
+
+// PlanFromSnapshot is the race-safe entrypoint the
+// composition root uses when Stage 8.1 [Planner.Plan] has
+// already produced a [PolicySnapshot]. It SKIPS the
+// active-policy lookup so the hot_spot rows that Stage 8.1
+// just wrote are guaranteed to be filtered against the SAME
+// policy_version_id the Stage 8.2 reader looks for
+// (rubber-duck iter-2 finding #1).
+//
+// `snap.PolicyVersionID` MUST be non-zero; pass the
+// snapshot returned by [Planner.Plan].
+//
+// All other behaviour matches [TaskPlanner.Plan].
+func (tp *TaskPlanner) PlanFromSnapshot(
+	ctx context.Context,
+	repoID uuid.UUID,
+	sha string,
+	snap PolicySnapshot,
+) (PlanAndTasksResult, error) {
 	if tp.newID == nil {
 		return PlanAndTasksResult{}, fmt.Errorf("refactor.TaskPlanner.Plan: %w", ErrNilIDFactory)
 	}
 	if tp.now == nil {
 		return PlanAndTasksResult{}, fmt.Errorf("refactor.TaskPlanner.Plan: %w", ErrNilClock)
 	}
-
-	// Step 1 + 2 + 3: read + compute (race-safe single snapshot).
-	snap, comps, err := readAndCompute(
-		ctx, tp.policy, tp.metrics, tp.findings, tp.compute, repoID, sha)
-	if err != nil {
-		return PlanAndTasksResult{}, err
+	if snap.PolicyVersionID == uuid.Nil {
+		return PlanAndTasksResult{}, fmt.Errorf(
+			"refactor.TaskPlanner.PlanFromSnapshot: snapshot.PolicyVersionID is zero -- " +
+				"pass a [PolicySnapshot] returned by [Planner.Plan]")
 	}
 
 	// Defensive top_n validation. The steward's
@@ -770,47 +955,37 @@ func (tp *TaskPlanner) Plan(
 			ErrInvalidTopN, snap.Weights.TopN)
 	}
 
-	// Step 4 prep: extract HotSpot + Breakdown columns and
-	// persist the FULL batch (NOT truncated to top-N -- the
-	// hot_spot table is append-only and downstream consumers
-	// rely on the full ranking being visible per architecture
-	// Sec 5.5.1).
-	hotSpotRows := make([]HotSpot, len(comps))
-	for i, c := range comps {
-		hotSpotRows[i] = c.HotSpot
-	}
-	if err := tp.hotSpotWriter.WriteHotSpots(ctx, hotSpotRows); err != nil {
+	// Step 1: read the LATEST hot_spot batch for the
+	// (repo_id, sha, policy_version_id) tuple, truncated to
+	// the policy's top_n. The reader returns rows in
+	// score-DESC, scope_id-ASC order. When TopN == 0 the
+	// reader returns the FULL latest batch (no truncation).
+	topHotSpots, err := tp.hotSpotReader.LatestHotSpotsByScore(
+		ctx, repoID, sha, snap.PolicyVersionID, snap.Weights.TopN)
+	if err != nil {
 		return PlanAndTasksResult{}, fmt.Errorf(
-			"refactor.TaskPlanner.Plan: write hot_spot batch: %w", err)
+			"refactor.TaskPlanner.Plan: read hot_spot batch: %w", err)
 	}
 
-	// On empty input (no hot_spots produced), short-circuit:
-	// no plan, no tasks. Writer is NOT called -- emitting an
-	// empty plan row would be semantically meaningless.
-	if len(hotSpotRows) == 0 {
+	// Empty hot_spot set is well-defined: Stage 8.1 has not
+	// run yet OR there were no scopes with the required
+	// inputs. Skip the writer entirely -- emitting an empty
+	// plan would be semantically meaningless and would clutter
+	// the append-only refactor_plan table.
+	if len(topHotSpots) == 0 {
 		return PlanAndTasksResult{
 			PolicyVersionID: snap.PolicyVersionID,
 			HotSpots:        nil,
 		}, nil
 	}
 
-	// Step 4: truncate to top-N for plan / task emission.
-	// hotSpotRows is already sorted Score DESC (Computer
-	// guarantees this); a simple prefix slice picks the top-N.
-	topN := snap.Weights.TopN
-	if topN <= 0 || topN > len(hotSpotRows) {
-		topN = len(hotSpotRows)
-	}
-	topHotSpots := hotSpotRows[:topN]
-
-	// Collect the scope_id set for the top-N hot_spots.
-	scopeIDs := make([]uuid.UUID, 0, topN)
+	// Step 2: collect the scope_id set for the top-N
+	// hot_spots and read finding details in ONE batch
+	// (rubber-duck finding #6 N+1 fix).
+	scopeIDs := make([]uuid.UUID, 0, len(topHotSpots))
 	for _, hs := range topHotSpots {
 		scopeIDs = append(scopeIDs, hs.ScopeID)
 	}
-
-	// Step 5: ONE batch read of finding details for the
-	// top-N scope set (rubber-duck finding #6: avoid N+1).
 	details, err := tp.findingDetails.FindingDetails(
 		ctx, repoID, sha, snap.PolicyVersionID, scopeIDs)
 	if err != nil {
@@ -820,7 +995,7 @@ func (tp *TaskPlanner) Plan(
 
 	// Index details by scope_id -> dedupe by rule_id within
 	// each scope (rubber-duck finding #7).
-	detailsByScope := make(map[uuid.UUID]map[string]struct{}, topN)
+	detailsByScope := make(map[uuid.UUID]map[string]struct{}, len(topHotSpots))
 	for _, d := range details {
 		ruleSet, ok := detailsByScope[d.ScopeID]
 		if !ok {
@@ -830,7 +1005,7 @@ func (tp *TaskPlanner) Plan(
 		ruleSet[d.RuleID] = struct{}{}
 	}
 
-	// Step 6 prep: snapshot the clock ONCE so plan +
+	// Step 3 prep: snapshot the clock ONCE so plan +
 	// every task share `created_at`.
 	createdAt := tp.now()
 
@@ -846,13 +1021,13 @@ func (tp *TaskPlanner) Plan(
 	}
 
 	// Build hotspot_ids in score-DESC order (matches the
-	// hotSpotRows slice order; topHotSpots inherits it).
-	hotspotIDs := make([]uuid.UUID, 0, topN)
+	// hot_spot reader's ORDER BY).
+	hotspotIDs := make([]uuid.UUID, 0, len(topHotSpots))
 	for _, hs := range topHotSpots {
 		hotspotIDs = append(hotspotIDs, hs.HotspotID)
 	}
 
-	// Step 7: emit tasks. For each top-N hot_spot, for each
+	// Step 4: emit tasks. For each top-N hot_spot, for each
 	// unique rule_id in its dedup'd finding-detail set, emit
 	// one task. Sort rule_ids ASC within each scope so the
 	// output is deterministic. Tasks across hot_spots are
@@ -925,7 +1100,7 @@ func (tp *TaskPlanner) Plan(
 	}
 	plan.SummaryMD = tp.summaryFn(plan, tasks, snap)
 
-	// Step 8: ATOMIC plan + tasks write.
+	// Step 5: ATOMIC plan + tasks write.
 	if err := tp.planTaskWriter.WriteRefactorPlanAndTasks(ctx, plan, tasks); err != nil {
 		return PlanAndTasksResult{}, fmt.Errorf(
 			"refactor.TaskPlanner.Plan: write plan+tasks: %w", err)
@@ -933,7 +1108,7 @@ func (tp *TaskPlanner) Plan(
 
 	return PlanAndTasksResult{
 		PolicyVersionID: snap.PolicyVersionID,
-		HotSpots:        hotSpotRows,
+		HotSpots:        topHotSpots,
 		Plan:            plan,
 		Tasks:           tasks,
 	}, nil
@@ -1138,9 +1313,242 @@ func (w *InMemoryRefactorPlanTaskWriter) Reset() {
 	w.tasks = nil
 }
 
+// InMemoryHotSpotReader is a process-local [HotSpotReader]
+// backed by a slice of [HotSpot] rows. Tests Insert one or
+// more batches (each row tagged with the batch's
+// `CreatedAt`); LatestHotSpotsByScore returns the rows whose
+// `CreatedAt == max` for the matching (repo_id, sha,
+// policy_version_id) tuple, ordered by score-DESC,
+// scope_id-ASC, then truncated to topN.
+type InMemoryHotSpotReader struct {
+	mu   sync.Mutex
+	rows []HotSpot
+}
+
+// NewInMemoryHotSpotReader returns a fresh reader.
+func NewInMemoryHotSpotReader() *InMemoryHotSpotReader {
+	return &InMemoryHotSpotReader{}
+}
+
+// Insert appends a hot_spot row. Multiple calls with rows
+// sharing one `CreatedAt` model a single Stage 8.1 Planner
+// batch.
+func (r *InMemoryHotSpotReader) Insert(hs HotSpot) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rows = append(r.rows, hs)
+}
+
+// InsertBatch appends a batch of hot_spot rows in one call.
+func (r *InMemoryHotSpotReader) InsertBatch(rows []HotSpot) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rows = append(r.rows, rows...)
+}
+
+// Reset clears state. Used by tests that exercise multiple
+// Plan() calls.
+func (r *InMemoryHotSpotReader) Reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rows = nil
+}
+
+// LatestHotSpotsByScore implements [HotSpotReader] by:
+//
+//  1. Filtering to rows whose (RepoID, SHA,
+//     PolicyVersionID) match.
+//  2. Picking `max(CreatedAt)` over that subset (the latest
+//     batch's stamp).
+//  3. Returning only rows whose CreatedAt equals the max.
+//  4. Sorting score-DESC, scope_id-ASC.
+//  5. Truncating to topN (when topN > 0).
+func (r *InMemoryHotSpotReader) LatestHotSpotsByScore(
+	ctx context.Context,
+	repoID uuid.UUID,
+	sha string,
+	policyVersionID uuid.UUID,
+	topN int,
+) ([]HotSpot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Pass 1: find max(CreatedAt) for the (repo, sha,
+	// policy_version_id) tuple.
+	var (
+		maxCreatedAt time.Time
+		anyMatch     bool
+	)
+	for _, hs := range r.rows {
+		if hs.RepoID != repoID || hs.SHA != sha {
+			continue
+		}
+		if hs.PolicyVersionID != policyVersionID {
+			continue
+		}
+		if !anyMatch || hs.CreatedAt.After(maxCreatedAt) {
+			maxCreatedAt = hs.CreatedAt
+			anyMatch = true
+		}
+	}
+	if !anyMatch {
+		return nil, nil
+	}
+
+	// Pass 2: collect rows whose CreatedAt == max.
+	out := make([]HotSpot, 0)
+	for _, hs := range r.rows {
+		if hs.RepoID != repoID || hs.SHA != sha {
+			continue
+		}
+		if hs.PolicyVersionID != policyVersionID {
+			continue
+		}
+		if !hs.CreatedAt.Equal(maxCreatedAt) {
+			continue
+		}
+		out = append(out, hs)
+	}
+
+	// Sort score-DESC, scope_id-ASC for determinism (the
+	// SQL reader's ORDER BY pin).
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Score != out[j].Score {
+			return out[i].Score > out[j].Score
+		}
+		return uuidLess(out[i].ScopeID, out[j].ScopeID)
+	})
+
+	if topN > 0 && topN < len(out) {
+		out = out[:topN]
+	}
+	return out, nil
+}
+
 // -----------------------------------------------------------------------------
 // SQL-backed implementations
 // -----------------------------------------------------------------------------
+
+// SQLHotSpotReader is the production [HotSpotReader] against
+// `clean_code.hot_spot`. The reader pins the latest batch via
+// `created_at = (SELECT MAX(created_at) ...)` so a fresh
+// Stage 8.1 [Planner.Plan] run supersedes the prior batch
+// without the reader having to know which one is "live"
+// (rubber-duck iter-2 finding #2).
+//
+// Two query shapes:
+//
+//   - `topN > 0` -- appends `LIMIT $4` so the database
+//     returns AT MOST topN rows.
+//   - `topN == 0` -- omits LIMIT entirely so the full
+//     latest batch returns.
+//
+// The two-query shape avoids the obscure
+// `LIMIT NULLIF($n, 0)` trick (rubber-duck feedback) and
+// keeps the sqlmock assertions explicit.
+type SQLHotSpotReader struct {
+	db *sql.DB
+}
+
+// NewSQLHotSpotReader wraps db. The caller owns the
+// `*sql.DB` lifecycle.
+func NewSQLHotSpotReader(db *sql.DB) *SQLHotSpotReader {
+	return &SQLHotSpotReader{db: db}
+}
+
+// LatestHotSpotsByScore implements [HotSpotReader].
+//
+// SQL shape (topN > 0):
+//
+//	SELECT hotspot_id, repo_id, sha, scope_id, score,
+//	       policy_version_id, created_at
+//	  FROM clean_code.hot_spot
+//	 WHERE repo_id = $1
+//	   AND sha = $2
+//	   AND policy_version_id = $3
+//	   AND created_at = (
+//	         SELECT MAX(created_at)
+//	           FROM clean_code.hot_spot
+//	          WHERE repo_id = $1
+//	            AND sha = $2
+//	            AND policy_version_id = $3
+//	   )
+//	 ORDER BY score DESC, scope_id ASC
+//	 LIMIT $4
+//
+// SQL shape (topN == 0): identical to above without the
+// `LIMIT $4` tail.
+//
+// Negative topN is rejected as invalid input; the
+// [TaskPlanner] also rejects it upstream via [ErrInvalidTopN].
+func (r *SQLHotSpotReader) LatestHotSpotsByScore(
+	ctx context.Context,
+	repoID uuid.UUID,
+	sha string,
+	policyVersionID uuid.UUID,
+	topN int,
+) ([]HotSpot, error) {
+	if topN < 0 {
+		return nil, fmt.Errorf(
+			"refactor.SQLHotSpotReader.LatestHotSpotsByScore: %w (got %d)",
+			ErrInvalidTopN, topN)
+	}
+	base := fmt.Sprintf(`
+		SELECT hotspot_id, repo_id, sha, scope_id, score, policy_version_id, created_at
+		  FROM %s.hot_spot
+		 WHERE repo_id = $1
+		   AND sha = $2
+		   AND policy_version_id = $3
+		   AND created_at = (
+		         SELECT MAX(created_at)
+		           FROM %s.hot_spot
+		          WHERE repo_id = $1
+		            AND sha = $2
+		            AND policy_version_id = $3
+		   )
+		 ORDER BY score DESC, scope_id ASC
+	`, schemaName, schemaName)
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if topN > 0 {
+		q := base + " LIMIT $4"
+		rows, err = r.db.QueryContext(ctx, q, repoID, sha, policyVersionID, topN)
+	} else {
+		rows, err = r.db.QueryContext(ctx, base, repoID, sha, policyVersionID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf(
+			"refactor.SQLHotSpotReader.LatestHotSpotsByScore: query: %w", err)
+	}
+	defer rows.Close()
+	out := make([]HotSpot, 0)
+	for rows.Next() {
+		var hs HotSpot
+		if err := rows.Scan(
+			&hs.HotspotID,
+			&hs.RepoID,
+			&hs.SHA,
+			&hs.ScopeID,
+			&hs.Score,
+			&hs.PolicyVersionID,
+			&hs.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"refactor.SQLHotSpotReader.LatestHotSpotsByScore: scan: %w", err)
+		}
+		out = append(out, hs)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"refactor.SQLHotSpotReader.LatestHotSpotsByScore: iterate: %w", err)
+	}
+	return out, nil
+}
 
 // SQLFindingDetailReader is the production [FindingDetailReader]
 // against `clean_code.finding`. Selects DISTINCT (scope_id,

@@ -16,21 +16,63 @@ orchestrator that emits `refactor_plan` rows + per-hot_spot
 
 ### Process layout
 
-Stage 8.2 runs inside the same Refactor Planner binary as
-Stage 8.1 (the planner cadence loop / on-demand verb under
-`cmd/clean-code-refactor-planner/main.go`). `TaskPlanner` is
-a thin extension of the Stage 8.1 `Planner`: it shares the
-same `PolicyReader`, `MetricSampleReader`, `FindingReader`,
-and `HotSpotWriter` dependencies and adds two new
-boundaries -- `FindingDetailReader` (production:
-`SQLFindingDetailReader` against `clean_code.finding`) and
+Stage 8.2 runs inside `cmd/clean-code-refactor-planner/main.go`
+as a one-shot K8s Job (NOT a cadence loop). The operator
+schedules ONE pod per (repo_id, sha) — typically tied to a
+scan completion event — and the binary:
+
+1. Loads `CLEAN_CODE_PG_URL` plus the per-job env vars
+   `CLEAN_CODE_REFACTOR_PLANNER_REPO_ID` (uuid) and
+   `CLEAN_CODE_REFACTOR_PLANNER_SHA`.
+2. Opens a libpq handle (retries up to 30s for slow-starting DBs).
+3. Calls Stage 8.1 `Planner.Plan(ctx, repoID, sha)` — which
+   reads + scores + writes the `clean_code.hot_spot` batch.
+4. Calls Stage 8.2
+   `TaskPlanner.PlanFromSnapshot(ctx, repoID, sha, planRes.Snapshot)`
+   — which READS the latest top-N hot_spot rows (the ones
+   the previous step just wrote) and emits the
+   `refactor_plan` + `refactor_task` rows under one
+   transaction.
+5. Exits 0 on success; non-zero on any unhandled error.
+
+`TaskPlanner` is wired with FOUR dependencies — `PolicyReader`,
+`HotSpotReader` (NEW in iter 2: `WHERE created_at = (SELECT
+MAX(created_at) ...)` latest-batch lookup against
+`clean_code.hot_spot`), `FindingDetailReader` (production:
+`SQLFindingDetailReader` against `clean_code.finding`), and
 `RefactorPlanTaskWriter` (production:
-`SQLRefactorPlanTaskWriter` against the
-`refactor_plan` + `refactor_task` tables in one
-transaction). The DB role `clean_code_refactor_planner` is
-already granted `INSERT, SELECT` on both target tables
-(migration `0004_roles.up.sql:482-509`); no role change is
-required for Stage 8.2.
+`SQLRefactorPlanTaskWriter` against
+`refactor_plan` + `refactor_task` in one transaction). The
+DB role `clean_code_refactor_planner` is already granted
+`INSERT, SELECT` on the three target tables (migration
+`0004_roles.up.sql:482-509`) AND now ALSO needs `SELECT` on
+`clean_code.hot_spot` for the new latest-batch read (the
+existing grant set covers this — `hot_spot` SELECT was
+already in scope because Stage 8.1 needed to upsert and read
+it back, but operators should grep their role audit to
+confirm a custom role spec inherits the same row).
+
+**Single-writer assumption:** the latest-batch query uses
+`WHERE created_at = (SELECT MAX(created_at) ...)`. This is
+correct under the architecture's "one
+clean-code-refactor-planner pod per (repo, sha) at a time"
+invariant. If two pods race the same (repo, sha) tuple they
+will both insert hot_spot rows at near-identical timestamps
+and the MAX(created_at) row may end up being a mix of the
+two batches — operators MUST gate the K8s Job spec with a
+`uniqueness key = (repo_id, sha)` constraint
+(architecture Sec 5.5.1).
+
+### Race-safe wiring via `PlanFromSnapshot`
+
+Stage 8.2 deliberately uses
+`TaskPlanner.PlanFromSnapshot(ctx, repoID, sha, snap)` rather
+than `TaskPlanner.Plan`. The standalone `Plan` re-reads the
+active policy, which would race a concurrent
+`policy.activate` between Stage 8.1 and Stage 8.2 — the
+returned policy_version_id could differ from the one stamped
+on every `hot_spot` row just persisted. Passing the Stage 8.1
+`PlanResult.Snapshot` closes the race at the type level.
 
 ### Knobs (`policy_version.refactor_weights`)
 

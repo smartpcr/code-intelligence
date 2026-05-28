@@ -330,16 +330,49 @@ in their entirety.
 
 ## Verifying after each follow-up workstream lands
 
-After each FU-* workstream completes, the operator can
-re-run:
+The two follow-up classes target DIFFERENT Go modules, so
+the verification command is module-specific:
+
+**For FU-1 through FU-4** (`services/clean-code/go.mod`):
+these four entries are kept as audit trail only. The
+underlying failures were repaired in place during the
+Stage 7.3 iter-2 addendum (see `services/clean-code/
+CHANGELOG.md` -> Stage 7.3 -> "Sibling-package repairs
+landed on this branch"). The verification command is:
 
 ```
 $ cd services/clean-code
 $ go test ./... -count=1
 ```
 
-and confirm that the previously-failing siblings are now
-green. Stage 7.3's own targeted chain
+and this is already green on the current branch (all 31
+packages PASS). FU-1 through FU-4 should NOT need to be
+spawned; they remain documented so the audit trail of
+WHAT was repaired stays greppable.
+
+**For FU-A through FU-D** (`services/agent-memory/go.mod`):
+these are the GENUINE spawnable cross-service follow-ups.
+After each FU-A..FU-D workstream lands, the operator can
+re-run the agent-memory test suite in that service's own
+module root:
+
+```
+$ cd services/agent-memory
+$ go test ./... -count=1
+```
+
+and confirm the previously-failing siblings
+(`cmd/qdrant-bootstrap`, `pkg/fingerprint`,
+`internal/mgmtapi`, `internal/webhookreceiver`) are now
+green. The clean-code module (`services/clean-code/go.mod`)
+is a DIFFERENT module and is not affected by FU-A..FU-D --
+running `cd services/clean-code && go test ./...` would
+neither exercise the agent-memory fixes nor surface their
+failures.
+
+Stage 7.3's own targeted chain
 (`go test ./internal/management/insights/
-./internal/management/ ./internal/evaluator/`) was green
-throughout Stage 7.3 and should remain so.
+./internal/management/ ./internal/evaluator/` from
+`services/clean-code/`) was green throughout Stage 7.3
+and should remain so independently of the FU-A..FU-D
+agent-memory work.

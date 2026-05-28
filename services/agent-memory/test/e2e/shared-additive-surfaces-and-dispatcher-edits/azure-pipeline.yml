@@ -19,19 +19,10 @@ variables:
 steps:
   - checkout: self
 
-  - script: |
-      set -euo pipefail
-      cd services/agent-memory
-      GO_VERSION=$(grep -oP '^toolchain go\K[0-9]+\.[0-9]+(\.[0-9]+)?' go.mod \
-        || grep -oP '^go \K[0-9]+\.[0-9]+(\.[0-9]+)?' go.mod)
-      echo "Detected Go version: $GO_VERSION"
-      echo "##vso[task.setvariable variable=GO_VERSION]$GO_VERSION"
-    displayName: "Detect Go version from go.mod"
-
   - task: GoTool@0
     displayName: "Set up Go"
     inputs:
-      version: "$(GO_VERSION)"
+      version: "1.25"
 
   - script: |
       docker compose -f $(COMPOSE_FILE) up -d --build
@@ -61,8 +52,29 @@ steps:
 
   - script: |
       cd services/agent-memory
+      go build ./internal/repoindexer/ast/...
+    displayName: "Build ast package"
+
+  - script: |
+      cd services/agent-memory
+      go test ./internal/repoindexer/ast -count=1 -v \
+        -run 'TestDispatcher|TestLangMeta|TestErrParserUnavailable|TestMergeLangMeta|TestNormalizeHints|TestPass2bMultimap|TestPass2dOverrides'
+    displayName: "Run dispatcher unit-test slice"
+    env:
+      AGENT_MEMORY_PG_URL: $(AGENT_MEMORY_PG_URL)
+
+  - script: |
+      cd services/agent-memory
+      go test ./migrations -count=1 -v \
+        -run 'TestMigrator_Up_AppliesAll|TestMigrations_0022_EdgeKindOverrides'
+    displayName: "Run migration apply / probe test"
+    env:
+      AGENT_MEMORY_PG_URL: $(AGENT_MEMORY_PG_URL)
+
+  - script: |
+      cd services/agent-memory
       go test -tags e2e -v -count=1 -timeout 120s \
-        -run TestE2E_shared_additive_surfaces_and_dispatcher_edits_mergelangmeta_helper_and_writer_attrs_integration \
+        -run TestE2E_shared_additive_surfaces_and_dispatcher_edits_dispatcher_sentinel_branch_pass_2b_multimap_pass_2d_overrides \
         ./test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/...
     displayName: "Run E2E scenarios"
     env:

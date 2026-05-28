@@ -355,6 +355,9 @@ func InitializeScenario_refactor_planner_ml_effort_model_loader_and_version_pinn
 	state := newMLEffortModelState()
 
 	ctx.Before(func(bctx context.Context, sc *godog.Scenario) (context.Context, error) {
+		// Reset all fields so no stale state leaks between scenarios
+		// (e.g. exitCode/stdErr from Scenario 1 into Scenario 2).
+		*state = mlEffortModelState{}
 		if err := state.initEnv(); err != nil {
 			return bctx, err
 		}

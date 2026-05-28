@@ -81,9 +81,10 @@ func (s *migrationScenarioState) aFreshSchemaWithMigrationsThroughFile(filename 
 	}
 
 	// Load all embedded migrations and apply them one-by-one
-	// in version order, stopping just before the target file
-	// (0022). This leaves 0001–0021 applied so the When step
-	// can apply 0022 via Migrator.Up.
+	// in version order, stopping after the named file (inclusive
+	// "through" semantics). This leaves migrations up to and
+	// including `filename` applied so the When step can apply
+	// subsequent ones via Migrator.Up.
 	all, err := migrations.All()
 	if err != nil {
 		return fmt.Errorf("load migrations: %w", err)
@@ -101,9 +102,6 @@ func (s *migrationScenarioState) aFreshSchemaWithMigrationsThroughFile(filename 
 	}
 
 	for _, mg := range all {
-		if mg.Filename == "0022_edge_kind_overrides.sql" {
-			break
-		}
 		if _, err := s.db.ExecContext(ctx, mg.Up); err != nil {
 			return fmt.Errorf("apply %s: %w", mg.Filename, err)
 		}
@@ -112,6 +110,9 @@ func (s *migrationScenarioState) aFreshSchemaWithMigrationsThroughFile(filename 
 			mg.Version, mg.Name,
 		); err != nil {
 			return fmt.Errorf("journal %s: %w", mg.Filename, err)
+		}
+		if mg.Filename == filename {
+			break
 		}
 	}
 

@@ -6,42 +6,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/cucumber/godog"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/repoindexer/ast"
 )
-
-// ---------------------------------------------------------------------------
-// Shared helpers (one copy per package)
-// ---------------------------------------------------------------------------
-
-func requireEnv(t *testing.T, name string) string {
-	t.Helper()
-	v, ok := os.LookupEnv(name)
-	if !ok || v == "" {
-		t.Skipf("required env var %s is not set — skipping", name)
-	}
-	return v
-}
-
-func moduleRoot() (string, error) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		return "", fmt.Errorf("runtime.Caller failed")
-	}
-	dir := filepath.Dir(thisFile)
-	for i := 0; i < 3; i++ {
-		dir = filepath.Dir(dir)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err != nil {
-		return "", fmt.Errorf("go.mod not found at %s: %w", dir, err)
-	}
-	return dir, nil
-}
 
 // ---------------------------------------------------------------------------
 // Scenario state

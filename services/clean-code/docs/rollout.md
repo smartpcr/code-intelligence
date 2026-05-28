@@ -2028,9 +2028,10 @@ After deploying a new build, confirm:
    `mgmt.rescan`, `mgmt.register_repo`) via
    `mountMgmtRoutes`, and the external-ingest router via
    `mountIngestRouter` -- nothing registers `/readyz` or
-   calls `AddReadyCheck`. Verified by
-   `rg "(readyz|AddReadyCheck|healthHandler|signing_key_cache)"
-   cmd/clean-code-metric-ingestor/` → zero matches. The
+   calls `AddReadyCheck`. (Code inspection of
+   `cmd/clean-code-metric-ingestor/main.go` finds no
+   references to `readyz`, `AddReadyCheck`,
+   `healthHandler`, or `signing_key_cache`.) The
    `AstSourceAvailability` / `WithStateMachineSourceProbe`
    option exists in `internal/metric_ingestor` and is
    exercised by unit tests, but the metric-ingestor binary

@@ -1775,9 +1775,10 @@ counters. The mgmt verbs (`mgmt.set_mode`,
 router (`webhook.RouterPath`) are mounted by
 `mountMgmtRoutes` and `mountIngestRouter` respectively;
 none of them register a `/readyz` or call
-`AddReadyCheck`. Verified by
-`rg "(readyz|AddReadyCheck|healthHandler|signing_key_cache)"
-cmd/clean-code-metric-ingestor/` → zero matches.
+`AddReadyCheck`. (Code inspection of
+`cmd/clean-code-metric-ingestor/main.go` finds no
+references to `readyz`, `AddReadyCheck`, `healthHandler`,
+or `signing_key_cache`.)
 Operators that want `/readyz` on this binary should treat
 it as a follow-up workstream (likely a Stage 10.x readiness
 surface that aggregates a signing-key probe, a PG-ping

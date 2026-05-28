@@ -21,8 +21,8 @@ parsers registered through `parsers_cgo.go` (CGO=on) and
 | ------------ | ------------------- | -------------------- | ----------------- |
 | TypeScript   | `.ts .tsx .js .jsx .mjs .cjs` | ✓ (`parser_treesitter.go`) | ✓ (`parser_typescript.go`) |
 | Python       | `.py .pyi`          | ✓ (`parser_treesitter.go`) | ✓ (`parser_python.go`)     |
-| C#           | `.cs .csx`          | ✓ (`parser_treesitter_csharp.go`) | — (CGO-only in v1)         |
-| C++          | `.cc .cxx .cpp .c++ .hpp .hh .hxx .h++` | ✓ (`parser_treesitter_cpp.go`) | — (CGO-only; sibling Stage 4.2 workstream) |
+| C#           | `.cs .csx`          | ✓ (`parser_treesitter_csharp.go`, registered in `parsers_cgo.go`) | — (CGO-only in v1)         |
+| C++          | `.cc .cxx .cpp .c++ .hpp .hh .hxx .h++` | ✓ (`parser_treesitter_cpp.go`, registered in `parsers_cgo.go`) | — (CGO-only)               |
 | C            | `.c .h`             | planned (sibling Stage 4 workstream — no scanner fallback) | — |
 | Go           | `.go`               | planned (sibling Stage 5 workstream — no scanner fallback) | — |
 | Rust         | `.rs`               | planned (sibling Stage 5 workstream — no scanner fallback) | — |

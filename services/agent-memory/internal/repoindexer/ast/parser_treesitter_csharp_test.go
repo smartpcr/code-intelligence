@@ -444,40 +444,101 @@ namespace Demo
 		}
 	}
 
-	// Pass 2a: 1 extends edge (HelloWorld -> Base) — IGreeter
-	// is partitioned into Implements by the C# parser per the
-	// tech-spec §5.3 decision matrix.
-	if got := len(fw.edgesOf("extends")); got != 1 {
-		t.Errorf("extends edges = %d; want 1 (HelloWorld->Base)", got)
-	}
-	if got := len(fw.edgesOf("implements")); got != 1 {
-		t.Errorf("implements edges = %d; want 1 (HelloWorld->IGreeter)", got)
+	// Resolve NodeIDs through the fake writer's
+	// signature-indexed registry so the tuple assertions
+	// below do not depend on the global insertion order
+	// (Pass-0 imports may insert a package node before any
+	// class, which would shift simple `node-N` predictions).
+	hwID := fw.nodeIDBySimpleSig("class", "HelloWorld")
+	baseID := fw.nodeIDBySimpleSig("class", "Base")
+	igreeterID := fw.nodeIDBySimpleSig("class", "IGreeter")
+	greetID := fw.nodeIDBySimpleSig("method", "HelloWorld.Greet")
+	fmtID := fw.nodeIDBySimpleSig("method", "HelloWorld.FormatGreeting")
+	if hwID == "" || baseID == "" || igreeterID == "" || greetID == "" || fmtID == "" {
+		t.Fatalf("missing NodeID(s): hw=%q base=%q igreeter=%q greet=%q fmt=%q",
+			hwID, baseID, igreeterID, greetID, fmtID)
 	}
 
-	// Pass 2b: 1 static_calls edge (HelloWorld.Greet -> HelloWorld.FormatGreeting).
+	// Pass 2a: exactly one extends tuple HelloWorld -> Base.
+	extends := fw.edgesOf("extends")
+	if len(extends) != 1 {
+		t.Fatalf("extends edges = %d; want 1; edges=%+v", len(extends), extends)
+	}
+	if extends[0].SrcNodeID != hwID || extends[0].DstNodeID != baseID {
+		t.Errorf("extends tuple = %s->%s; want %s->%s (HelloWorld->Base)",
+			extends[0].SrcNodeID, extends[0].DstNodeID, hwID, baseID)
+	}
+
+	// Pass 2a: exactly one implements tuple HelloWorld -> IGreeter.
+	implements := fw.edgesOf("implements")
+	if len(implements) != 1 {
+		t.Fatalf("implements edges = %d; want 1; edges=%+v", len(implements), implements)
+	}
+	if implements[0].SrcNodeID != hwID || implements[0].DstNodeID != igreeterID {
+		t.Errorf("implements tuple = %s->%s; want %s->%s (HelloWorld->IGreeter)",
+			implements[0].SrcNodeID, implements[0].DstNodeID, hwID, igreeterID)
+	}
+
+	// Pass 2b: exactly one static_calls tuple
+	// HelloWorld.Greet -> HelloWorld.FormatGreeting.
 	staticCalls := fw.edgesOf("static_calls")
 	if len(staticCalls) != 1 {
-		t.Errorf("static_calls edges = %d; want 1 (HelloWorld.Greet -> HelloWorld.FormatGreeting); edges=%+v",
+		t.Fatalf("static_calls edges = %d; want 1 (HelloWorld.Greet -> HelloWorld.FormatGreeting); edges=%+v",
 			len(staticCalls), staticCalls)
 	}
+	if staticCalls[0].SrcNodeID != greetID || staticCalls[0].DstNodeID != fmtID {
+		t.Errorf("static_calls tuple = %s->%s; want %s->%s (Greet->FormatGreeting)",
+			staticCalls[0].SrcNodeID, staticCalls[0].DstNodeID, greetID, fmtID)
+	}
 
-	// Pass 0: 1 imports edge (file -> external package "System").
+	// Pass 0: exactly one imports tuple file -> System package.
 	importEdges := fw.edgesOf("imports")
 	if len(importEdges) != 1 {
-		t.Errorf("imports edges = %d; want 1 (file -> System)", len(importEdges))
+		t.Fatalf("imports edges = %d; want 1 (file -> System); edges=%+v", len(importEdges), importEdges)
 	}
 	pkgNodes := fw.nodesOf("package")
 	if len(pkgNodes) != 1 {
-		t.Errorf("package nodes = %d; want 1 (synthetic external System)", len(pkgNodes))
+		t.Fatalf("package nodes = %d; want 1 (synthetic external System)", len(pkgNodes))
+	}
+	systemID := fw.nodeIDBySimpleSig("package", "System")
+	if systemID == "" {
+		// External-package canonical signatures use a flat
+		// module name (no `#` segment); fall back to a
+		// direct nodes-of scan for the System node id.
+		systemID = fw.idBySig[pkgNodes[0].CanonicalSignature]
+	}
+	if importEdges[0].DstNodeID != systemID {
+		t.Errorf("imports tuple dst = %s; want %s (System package)",
+			importEdges[0].DstNodeID, systemID)
+	}
+	if !strings.Contains(pkgNodes[0].CanonicalSignature, "System") {
+		t.Errorf("package node signature = %q; want to contain \"System\"",
+			pkgNodes[0].CanonicalSignature)
 	}
 
 	// Pass 1a/1b contains edges: 3 file->class + 4 parent->method = 7.
-	// (HelloWorld.Greet & HelloWorld.FormatGreeting parent under
-	// HelloWorld class; IGreeter.Greet under IGreeter; Base.Identify
-	// under Base.) No method->block edges because each method body
-	// is well under the 80-line subdivision threshold.
 	if got := len(fw.edgesOf("contains")); got != 7 {
 		t.Errorf("contains edges = %d; want 7 (3 file->class + 4 class->method)", got)
+	}
+	// Tuple-pin two representative parent->method contains
+	// edges so a swapped enclosing-class lookup would fail:
+	//   HelloWorld -> HelloWorld.Greet
+	//   HelloWorld -> HelloWorld.FormatGreeting
+	containsHWGreet := false
+	containsHWFmt := false
+	for _, e := range fw.edgesOf("contains") {
+		if e.SrcNodeID == hwID && e.DstNodeID == greetID {
+			containsHWGreet = true
+		}
+		if e.SrcNodeID == hwID && e.DstNodeID == fmtID {
+			containsHWFmt = true
+		}
+	}
+	if !containsHWGreet {
+		t.Errorf("missing contains edge HelloWorld->HelloWorld.Greet (%s->%s)", hwID, greetID)
+	}
+	if !containsHWFmt {
+		t.Errorf("missing contains edge HelloWorld->HelloWorld.FormatGreeting (%s->%s)", hwID, fmtID)
 	}
 
 	// Sanity: the C# parser emits no Block subdivision for this

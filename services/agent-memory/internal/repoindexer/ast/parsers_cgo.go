@@ -21,5 +21,6 @@ func defaultParsers() []LanguageParser {
 		NewTreeSitterTypeScriptParser(),
 		NewTreeSitterPythonParser(),
 		NewTreeSitterCSharpParser(),
+		NewTreeSitterCppParser(),
 	}
 }

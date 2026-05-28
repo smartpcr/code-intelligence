@@ -452,10 +452,25 @@ func (d *Dispatcher) emit(
 	logger *slog.Logger,
 ) ([]repoindexer.TouchedNode, error) {
 	// classNodeID and methodNodeID build the local-symbol
-	// tables pass 2 resolves against. Keys are the parser's
-	// QualifiedName (the dotted path within the file).
+	// tables pass 2 resolves against. classNodeID keys on
+	// QualifiedName; methodNodeID is a MULTIMAP (qualified
+	// name -> list of node ids) so overloaded methods that
+	// share a QualifiedName (e.g. C# `Foo.Bar(int)` and
+	// `Foo.Bar(string)`) each contribute their own NodeID
+	// instead of overwriting. Resolvers downstream (Pass 2d
+	// destination, `buildCalleeIndex`) treat any qualified
+	// name with > 1 distinct NodeIDs as ambiguous and DROP
+	// rather than emit a false positive edge (tech-spec
+	// Section 5.3 A5 — "false `static_calls` edges are worse
+	// than missing edges").
+	//
+	// methodNodeIDs is the parallel per-method slice so each
+	// `result.Methods[i]` knows its own NodeID for the source
+	// side of static_calls / reads / writes / overrides
+	// (regardless of overload collisions on the multimap key).
 	classNodeID := make(map[string]string, len(result.Classes))
-	methodNodeID := make(map[string]string, len(result.Methods))
+	methodNodeID := make(map[string][]string, len(result.Methods))
+	methodNodeIDs := make([]string, len(result.Methods))
 
 	// receiverIndex is the Pass 2b multimap that maps
 	// `<EnclosingClass>.<simpleName>` → set of node ids. A
@@ -548,7 +563,8 @@ func (d *Dispatcher) emit(
 		if err != nil {
 			return touched, fmt.Errorf("ast: insert method %s: %w", m.QualifiedName, err)
 		}
-		methodNodeID[m.QualifiedName] = rec.NodeID
+		methodNodeID[m.QualifiedName] = append(methodNodeID[m.QualifiedName], rec.NodeID)
+		methodNodeIDs[i] = rec.NodeID
 		touched = append(touched, repoindexer.TouchedNode{
 			NodeID:             rec.NodeID,
 			Kind:               "method",
@@ -695,11 +711,14 @@ func (d *Dispatcher) emit(
 	// Pass 2b: static_calls. Receiver-qualified calls resolve
 	// against the receiverIndex multimap (drop when >1 distinct
 	// node ids); bare-name calls resolve against the same-file
-	// callee index and drop on ambiguity.
-	calleeIndex := buildCalleeIndex(methodNodeID)
-	for _, m := range result.Methods {
-		srcID, ok := methodNodeID[m.QualifiedName]
-		if !ok {
+	// callee index and drop on ambiguity. Per-method source
+	// IDs come from `methodNodeIDs[i]` so overloaded methods
+	// each emit calls from their own node (the multimap key
+	// would alias overloads into a single source).
+	calleeIndex := buildCalleeIndex(result.Methods, methodNodeIDs)
+	for i, m := range result.Methods {
+		srcID := methodNodeIDs[i]
+		if srcID == "" {
 			continue
 		}
 		seen := map[string]struct{}{}
@@ -755,12 +774,12 @@ func (d *Dispatcher) emit(
 	// touched member names recorded on the edge attrs (per
 	// rubber-duck #4). Methods with no enclosing class skip
 	// this pass entirely.
-	for _, m := range result.Methods {
+	for i, m := range result.Methods {
 		if m.EnclosingClass == "" || len(m.MemberAccesses) == 0 {
 			continue
 		}
-		srcID, ok := methodNodeID[m.QualifiedName]
-		if !ok {
+		srcID := methodNodeIDs[i]
+		if srcID == "" {
 			continue
 		}
 		dstID, ok := classNodeID[m.EnclosingClass]
@@ -801,8 +820,13 @@ func (d *Dispatcher) emit(
 	// `overrides` edge from the impl method node to the trait
 	// default-method node. Cross-file pairs are dropped (the
 	// trait identity persists on attrs_json["trait"] for the
-	// future cross-file resolver).
-	for _, m := range result.Methods {
+	// future cross-file resolver). Destination lookup uses the
+	// methodNodeID MULTIMAP and drops on overload ambiguity:
+	// if `<trait>.<simpleName>` resolves to > 1 distinct nodes
+	// (the trait has overloaded default methods with the same
+	// simple name) the edge is suppressed per the A5 conservative-
+	// drop rule.
+	for i, m := range result.Methods {
 		traitVal, ok := m.LangMeta["trait"]
 		if !ok {
 			continue
@@ -811,15 +835,16 @@ func (d *Dispatcher) emit(
 		if !ok || trait == "" {
 			continue
 		}
-		srcID, ok := methodNodeID[m.QualifiedName]
-		if !ok {
+		srcID := methodNodeIDs[i]
+		if srcID == "" {
 			continue
 		}
 		dstKey := trait + "." + simpleName(m.QualifiedName)
-		dstID, ok := methodNodeID[dstKey]
-		if !ok {
+		dstIDs := methodNodeID[dstKey]
+		if len(dstIDs) != 1 {
 			continue
 		}
+		dstID := dstIDs[0]
 		if srcID == dstID {
 			// A method cannot override itself (the trait's
 			// own default-bodied method has LangMeta["trait"]
@@ -996,33 +1021,43 @@ func splitMemberAccesses(accesses []MemberAccess) (reads, writes []string) {
 // buildCalleeIndex maps a bare callee name to the NodeID of
 // the same-file Method whose simple name matches. When two
 // methods share a simple name (e.g. `Foo.bar` and `Baz.bar`)
-// the resolver bails out for that name — ambiguous matches
-// are NOT emitted (false-positive `static_calls` edges are
-// worse than missing edges; see doc.go "v1 edge scope").
-func buildCalleeIndex(methodNodeID map[string]string) map[string]string {
+// OR two overloads share the same QualifiedName (e.g. C#
+// `Foo.Bar(int)` and `Foo.Bar(string)`), the resolver bails
+// out for that name — ambiguous matches are NOT emitted
+// (false-positive `static_calls` edges are worse than
+// missing edges; see doc.go "v1 edge scope" and tech-spec
+// Section 5.3 A5).
+//
+// The input is the per-method node-id slice (parallel to
+// `methods`) so overloads each get their own NodeID; the
+// resolver folds them into the bare-name multimap and
+// detects ambiguity at the simple-name layer.
+func buildCalleeIndex(methods []MethodDecl, methodNodeIDs []string) map[string]string {
 	bare := map[string][]string{}
-	// Sort keys for determinism so dropped-ambiguity decisions
-	// are reproducible across runs.
-	qNames := make([]string, 0, len(methodNodeID))
-	for q := range methodNodeID {
-		qNames = append(qNames, q)
-	}
-	sort.Strings(qNames)
-	for _, q := range qNames {
-		s := simpleName(q)
+	for i, m := range methods {
+		nodeID := methodNodeIDs[i]
+		if nodeID == "" {
+			continue
+		}
+		s := simpleName(m.QualifiedName)
+		if s == "" {
+			continue
+		}
 		// Dedup against the same node id so a method whose
 		// alias matches its own primary key still counts as
-		// one entry.
+		// one entry (defence in depth — parsers should not
+		// publish the same NodeID twice but this keeps the
+		// ambiguity counter honest).
 		ids := bare[s]
-		found := false
+		dup := false
 		for _, existing := range ids {
-			if existing == methodNodeID[q] {
-				found = true
+			if existing == nodeID {
+				dup = true
 				break
 			}
 		}
-		if !found {
-			bare[s] = append(ids, methodNodeID[q])
+		if !dup {
+			bare[s] = append(ids, nodeID)
 		}
 	}
 	out := make(map[string]string, len(bare))

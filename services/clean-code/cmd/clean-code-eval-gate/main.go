@@ -451,11 +451,27 @@ func runWALReconciler(ctx context.Context, signingKeysManager *keys.Manager, wal
 	}
 	defer reconcilerDB.Close()
 
+	// Mirror the gateway's pingDBWithRetry pattern
+	// (cmd/clean-code-gateway/main.go): capture the
+	// last ping error and surface it with log.Fatalf
+	// once attempts are exhausted. Falling through to
+	// `keys.NewSQLStore` / `composition.NewWALReconciler`
+	// on a dead connection produces a confusing failure
+	// far from the root cause (a downstream "driver:
+	// bad connection" or a Run-time SELECT failure)
+	// and silently violates the brief's
+	// "reconciler MUST complete before the HTTP
+	// listener accepts traffic" invariant.
+	var lastPingErr error
 	for i := 0; i < 30; i++ {
-		if perr := reconcilerDB.PingContext(ctx); perr == nil {
+		lastPingErr = reconcilerDB.PingContext(ctx)
+		if lastPingErr == nil {
 			break
 		}
 		time.Sleep(time.Second)
+	}
+	if lastPingErr != nil {
+		log.Fatalf("clean-code-eval-gate: postgres ping (%s) failed after 30 attempts: %v (Stage 9.2 reconciler cannot proceed on a dead connection; aborting startup per docs/runbook.md Stage 9.2)", envWALReconcilerDSN, lastPingErr)
 	}
 
 	keyStore, kserr := keys.NewSQLStore(reconcilerDB)

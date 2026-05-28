@@ -171,9 +171,13 @@ Explicit non-deliverables for this story:
   node, not the expanded code. Methods or types declared
   only via macros (`#[derive(...)]` does not produce
   methods at the syntax level; `lazy_static!` blocks
-  contain expressions) are NOT extracted in v1. The
-  `Calls` slice will record `macro_name!` invocations as
-  bare-name calls; the resolver drops them on miss.
+  contain expressions) are NOT extracted in v1. Macro
+  invocations themselves (`macro_invocation` nodes) are
+  NOT collected on `MethodDecl.Calls` either -- the macro
+  name is not a callable function identifier and the
+  bare-name resolver would consistently miss; the
+  authoritative rule is Section 5.5 "Macro invocation"
+  row. (See evaluator iter 1 finding 1.)
 - **PowerShell tree-sitter grammar binding.** The operator
   pinned the subprocess approach via the official
   `System.Management.Automation.Language.Parser`. Adding a
@@ -465,7 +469,7 @@ accumulating the namespace into `LangMeta["namespace"]`.
 | Record | `record_declaration` | `ClassDecl{Kind="record", ...}` |
 | Enum | `enum_declaration` | `ClassDecl{Kind="enum", ...}`; enumerators NOT emitted as Methods |
 | Partial flag | `modifier` = `partial` on any of the above | `LangMeta["partial"]=true` |
-| Base list | `base_list` -> child `identifier` or `qualified_name` | each name is appended initially to `Extends`; AFTER pass 1 of the dispatcher resolves same-file `classNodeID`, the dispatcher partitions Extends vs Implements by the resolved kind. (Implementation note: parser appends raw to `Extends` and persists raw on `LangMeta["base_raw"]`; final partition happens in dispatcher Pass 2a -- a new sub-step keyed by `language=="csharp"`.) |
+| Base list | `base_list` -> child `identifier` or `qualified_name` | partitioned at PARSE TIME via the parser's own same-file two-pass scan (see "C# base-list partition rule" below). Verbatim raw list persisted on `LangMeta["base_raw"]` regardless. |
 | Method declaration | `method_declaration` inside type body | `MethodDecl{EnclosingClass=<simple class name>, QualifiedName=<class>.<method>, ParamSignature=<text between outer parens>, BodySource=<brace-stripped body when present; signature-only methods (`abstract`, interface members) leave BodySource="">}` |
 | Constructor | `constructor_declaration` | `MethodDecl{QualifiedName=<class>.<class>}` (mirrors the existing TS constructor convention) |
 | Property accessor | `accessor_declaration` (get/set) | NOT emitted as Methods in v1; property names ARE recorded for `MemberAccesses` resolution on the enclosing type |
@@ -482,6 +486,63 @@ accumulating the namespace into `LangMeta["namespace"]`.
 
 **LangMeta keys:** `namespace` (string), `partial` (bool),
 `base_raw` ([]string), `is_static` (bool on `Import`).
+
+**C# base-list partition rule (parser-local, no dispatcher
+change).** The C# `base_list` mixes class + interface entries
+with no syntactic distinction (`class Foo : Bar, IBaz, IQux`).
+The parser partitions at parse time using a two-pass walk
+over the file so the dispatcher's Pass 2a (`dispatcher.go`
+lines 533-567) can iterate `c.Extends` / `c.Implements`
+unchanged.
+
+Two-pass walker contract:
+1. **Pass A (declarations).** Walk every `class_declaration`,
+   `interface_declaration`, `struct_declaration`,
+   `record_declaration` in the file. Build
+   `localKind map[string]string` with values `"class"`,
+   `"interface"`, `"struct"`, `"record"` keyed by simple
+   name (`Foo` -- namespace is tracked separately on
+   `LangMeta["namespace"]`).
+2. **Pass B (base-list assignment).** For each
+   declaration with a non-empty `base_list`:
+   - **Declaring kind = `class`:** entry at position 0 goes
+     to `ClassDecl.Extends` IFF `localKind[entry]=="class"`
+     OR `entry` is unresolved in `localKind` (defensible:
+     C# language rule restricts a class to at most one base
+     class, which must appear first when present; an
+     unresolved position-0 name is almost always the
+     cross-file base class). Position 0 going to `Extends`
+     under unresolved is a deliberate choice -- the entry
+     is also persisted verbatim on `LangMeta["base_raw"]`,
+     and the dispatcher's Pass 2a will silently drop the
+     edge per C4 when `classNodeID[entry]` misses, so a
+     mis-classified cross-file interface produces no false
+     edge. Every other position goes to `Implements` (a
+     class has exactly one base class in C#; positions 1+
+     are interfaces by language rule).
+   - **Declaring kind = `interface`:** every entry goes to
+     `Extends` (an interface's base list is all
+     super-interfaces). The dispatcher's Pass 2a emits
+     `extends` between interface nodes -- consistent with
+     the existing TS pattern where `interface Greeter
+     extends BaseGreeter` produces `extends` (not
+     `implements`).
+   - **Declaring kind = `struct` / `record`:** every entry
+     goes to `Implements` (structs / records have no base
+     class in C#; the entire base list is the implemented
+     interface set).
+3. **Verbatim raw retention.** Regardless of partition,
+   `LangMeta["base_raw"]` records the verbatim list in
+   source order so the future cross-file resolver can
+   re-partition with full project-wide kind information.
+
+This rule keeps the existing dispatcher Pass 2a code path
+in `dispatcher.go` lines 533-567 unchanged -- the `for _,
+target := range c.Extends` loop simply receives the
+partitioned `Extends`; the `c.Implements` loop receives
+the partitioned `Implements`. No new `classKind` map is
+added to the dispatcher. No new `language=="csharp"`
+sub-step is added. (See evaluator iter 1 finding 2.)
 
 ### 5.4 Go parser (`parser_treesitter_go.go`)
 
@@ -680,7 +741,7 @@ file is a single embedded source string that exercises:
 | Construct in fixture | Why it is there |
 | --- | --- |
 | One type/class with a same-file base (where the language has inheritance) | proves Pass 2a `extends` edge emission |
-| One interface / trait / abstract type in the same file (where applicable) | proves Pass 2a `implements` edge emission for C#, Rust, PowerShell; trait-default override case for Rust |
+| One interface / trait / abstract type in the same file (where applicable) | proves Pass 2a `implements` edge emission for **C# and Rust only**. PowerShell has no interface keyword (architecture Section 4.1 line 304; this spec Section 5.6 emits only `Extends`); the PowerShell fixture has NO `implements` assertion. C and Go have no `implements` either (C has no class, Go interfaces are structurally satisfied per Section 2.2 "Go interface satisfaction edges"). The Rust row also covers the trait-default override case. (See evaluator iter 1 finding 3.) |
 | One method on the type with a body | proves Pass 1 method node insert + `contains` edge + brace-strip body span (C8) |
 | One free function | proves the free-function `EnclosingClass=""` path |
 | One same-file static call from the method body to the free function | proves Pass 2b `static_calls` edge emission |
@@ -697,7 +758,7 @@ Cross-language dispatcher tests (added to
 | `TestDispatcher_RoutesByExtension` | `selectParser("a.cs", nil).Language() == "csharp"` for each new extension |
 | `TestDispatcher_DotHRoutesToC_EvenWithCppHint` | `selectParser("a.h", []string{"cpp"}).Language() == "c"` per Section 4.1 / Section 8 R6 |
 | `TestDispatcher_NoParserForUnknown` | `.foo` returns nil parser and logs `ast.dispatch.skip{reason:"no_parser"}` |
-| `TestDispatcher_DuplicateExtensionLastWins` | inverse of current dispatcher contract verified -- registering two parsers claiming `.go` results in the documented behaviour (panic or last-wins; whichever the existing `Register` does; this test pins it) |
+| `TestDispatcher_DuplicateExtensionLastWins` | Registering two parsers that both claim `.go` results in the LATER parser winning for that extension. The actual contract is `buildExtMap` in `dispatcher.go` lines 155-161: it iterates `parsers` in slice order and writes each `Extensions()` value into the `map[string]LanguageParser` -- a duplicate key silently overwrites the earlier entry (Go's standard map assignment). No `Register` method exists; there is no panic and no error return. The test constructs a dispatcher with `WithParsers(parserA, parserB)` where both claim `.go`, calls `selectParser("x.go", nil)`, and asserts the returned parser is `parserB`. This pins the deterministic last-wins behaviour and catches a regression that would either introduce a panic or change ordering. (See evaluator iter 1 finding 4.) |
 | `TestDispatcher_GoMultimapDropsOnReceiverCollision` | a file with `func (r Foo) Bar()` and `func (r *Foo) Bar()` both calling `r.Bar()` from a third method emits NO `static_calls` edge for that callee; verbatim `calls_raw` retains `Bar` |
 | `TestDispatcher_GoMultimapResolvesPointerReceiverAlone` | a file with ONLY `func (r *Foo) Bar()` and a sibling method calling `r.Bar()` emits ONE `static_calls` edge to the `*Foo.Bar` node, via the `ReceiverAliases` entry |
 | `TestDispatcher_ErrParserUnavailable_LogsSkip` | a mock parser returning `ErrParserUnavailable` causes EmitFile to log `ast.dispatch.skip{reason:<sentinel reason>}` and return `EmitResult{}, nil` (NOT `ast.parse.error`) |
@@ -723,7 +784,7 @@ test forces `pwshBin=""` and asserts
 | **R8** -- `LangMeta` key drift across parsers. Two parsers emitting the same `LangMeta` key with different semantics (e.g. `"receiver"` meaning "Go bound name" vs "C# `this` shadow") confuse downstream consumers. | low (only one parser populates each documented key in v1) | low (downstream filters can branch on `language`) | The authoritative key table is Section 4.4.3 of architecture (and reflected per-language in Sections 5.1-5.6 above). Each key is documented to one parser; future parsers must extend the table, not silently overload a key. |
 | **R9** -- CGO=off coverage gap discovered late. A developer running `make test` on a Windows box sees zero failures for C / C++ / C# / Go / Rust because the dispatcher's no_parser path is "silent skip" by design. | medium (developers may assume code paths are tested when they're not) | low (CI covers CGO=on; developer's local belief is the only loss) | The new dispatcher behaviour is documented in `.claude/context/tests.md` per Section 2.1 of architecture. The `tests.md` table makes the "tree-sitter-backed only" caveat explicit. A debug-level log line at startup enumerates the registered parsers; future work could elevate this to info when CGO=off is the active build. |
 | **R10** -- Pass 2d (overrides) emission ordering. Pass 2d depends on Pass 1 having populated `methodNodeID` for both the trait method and the impl method. If the dispatcher reordering ever moves Pass 2d before Pass 1 completes, the lookups silently miss. | very low (Pass 1 / 2 ordering is invariant) | high (silent loss of every overrides edge) | Pass 2d is implemented as a new method on `Dispatcher` called explicitly from `emit` AFTER Pass 2c. The dispatcher test `TestDispatcher_Rust_TraitOverrides_SameFile` asserts the edge is emitted; any reordering regression fails the test. |
-| **R11** -- C# base-list partition error. The C# `base_list` mixes class + interface entries with no syntactic distinction. The dispatcher's Pass 2a partition logic (parser fills `Extends` raw, dispatcher promotes the resolved-as-interface entries to `Implements`) needs `classNodeID` populated for both the class and the interface targets BEFORE the partition runs. | low (Pass 1 completes before Pass 2a today) | medium (mis-typed edges: class would receive `extends` to an interface it should `implements`) | The partition runs inside Pass 2a using the same `classNodeID` and `interfaceNodeID` lookups Pass 1 just populated. The parser emits the raw list on `Extends` and on `LangMeta["base_raw"]`; the dispatcher's existing pattern is to read `Extends` and resolve. The C#-only sub-step in Pass 2a is gated on `language=="csharp"` to avoid touching the TS / Python paths. Test `TestDispatcher_CSharp_BaseListPartitionsByKind` covers the case where `IBar` is declared in the same file. |
+| **R11** -- C# base-list partition error. The C# `base_list` mixes class + interface entries with no syntactic distinction (`class Foo : Bar, IBaz, IQux`). A mis-partition would emit `extends` where `implements` is correct (or vice versa). | low (the C# language rule about position-0 base class is unambiguous) | medium (mis-typed edges: a class would receive `extends` to an interface it should `implements`) | Partition runs at PARSE TIME inside the C# parser via the same-file two-pass walk documented in Section 5.3 ("C# base-list partition rule"). Pass A collects `localKind` from every type declaration in the file; Pass B partitions by declaring kind (class -> position 0 is `Extends`, rest are `Implements`; interface -> all `Extends`; struct/record -> all `Implements`). The dispatcher's existing Pass 2a code at `dispatcher.go` lines 533-567 reads `c.Extends` and `c.Implements` UNCHANGED; no new `classKind` map or `language=="csharp"` sub-step is added. Cross-file targets miss `classNodeID` and the edge is dropped per C4 -- verbatim names persist on `LangMeta["base_raw"]` for the future cross-file resolver to re-partition with project-wide kind info. Test `TestCSharp_BaseListPartitionsByDeclaringKind` covers the four-way matrix (class/interface/struct/record x base-list contents). (See evaluator iter 1 finding 2.) |
 
 ## 9. Open Questions
 

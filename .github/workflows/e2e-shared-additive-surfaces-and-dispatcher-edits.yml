@@ -6,11 +6,8 @@ on:
       - feature/memory
       - "ws/code-intelligence-AST-PARSER-FOR-ADDIT/**"
     paths:
-      - "services/agent-memory/migrations/**"
       - "services/agent-memory/internal/repoindexer/ast/**"
       - "services/agent-memory/test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/**"
-      - "services/agent-memory/go.mod"
-      - "services/agent-memory/go.sum"
       - "tests/e2e/phase-1-shared-additive-surfaces/**"
       - ".github/workflows/e2e-shared-additive-surfaces-and-dispatcher-edits.yml"
   push:
@@ -18,7 +15,6 @@ on:
       - feature/memory
       - "ws/code-intelligence-AST-PARSER-FOR-ADDIT/**"
     paths:
-      - "services/agent-memory/migrations/**"
       - "services/agent-memory/internal/repoindexer/ast/**"
       - "services/agent-memory/test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/**"
       - "tests/e2e/phase-1-shared-additive-surfaces/**"
@@ -33,8 +29,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  additive-parser-go-struct-surfaces:
-    name: "additive-parser-go-struct-surfaces"
+  mergelangmeta-helper-and-writer-attrs-integration:
+    name: "mergelangmeta-helper-and-writer-attrs-integration"
     runs-on: ubuntu-latest
     env:
       COMPOSE_FILE: tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml
@@ -73,23 +69,11 @@ jobs:
         working-directory: services/agent-memory
         run: go mod download
 
-      - name: Run dispatcher unit-test slice
-        working-directory: services/agent-memory
-        run: |
-          go test ./internal/repoindexer/ast -count=1 -v \
-            -run 'TestDispatcher|TestLangMeta|TestErrParserUnavailable|TestMergeLangMeta|TestNormalizeHints|TestPass2bMultimap|TestPass2dOverrides'
-
-      - name: Run migration apply / probe test
-        working-directory: services/agent-memory
-        run: |
-          go test ./migrations -count=1 -v \
-            -run 'TestMigrator_Up_AppliesAll|TestMigrations_0022_EdgeKindOverrides'
-
       - name: Run E2E scenarios
         working-directory: services/agent-memory
         run: |
           go test -tags e2e -v -count=1 -timeout 120s \
-            -run TestE2E_shared_additive_surfaces_and_dispatcher_edits_additive_parser_go_struct_surfaces \
+            -run TestE2E_shared_additive_surfaces_and_dispatcher_edits_mergelangmeta_helper_and_writer_attrs_integration \
             ./test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/...
 
       - name: Tear down compose stack

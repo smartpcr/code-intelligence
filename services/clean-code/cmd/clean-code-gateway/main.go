@@ -279,9 +279,17 @@ func run(logger *slog.Logger) error {
 	// global stays at the SDK default noop provider and every
 	// span is dropped, which is the intended "telemetry
 	// disabled" deployment path.
+	//
+	// Iter-2 evaluator feedback #2: when CLEAN_CODE_OTEL_ENDPOINT
+	// is UNSET we honour the canonical
+	// [config.DefaultOTelEndpoint] (`localhost:4317`) per
+	// `internal/config/config.go`. Setting the env var to
+	// the EMPTY STRING is the explicit "disable telemetry"
+	// path; only `os.LookupEnv` (NOT `os.Getenv`) can
+	// distinguish unset from empty.
 	telCfg := config.Config{
-		OTelEndpoint:   os.Getenv(config.EnvOTelEndpoint),
-		PrometheusAddr: os.Getenv(config.EnvPrometheusAddr),
+		OTelEndpoint:   lookupEnvOrDefault(config.EnvOTelEndpoint, config.DefaultOTelEndpoint),
+		PrometheusAddr: lookupEnvOrDefault(config.EnvPrometheusAddr, config.DefaultPrometheusAddr),
 	}
 	shutdownTelemetry, err := telemetry.Setup(rootCtx, telCfg, telemetry.SetupOptions{
 		ServiceName: gatewayServiceLabel,
@@ -966,6 +974,21 @@ func healthzHandler(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok\n"))
+}
+
+// lookupEnvOrDefault returns the env var's value when SET
+// (including the empty string, which is the explicit
+// "telemetry disabled" sentinel) and the supplied default
+// when UNSET. Distinguishing unset from explicitly-empty is
+// the contract iter-2 evaluator feedback #2 requires:
+// `os.Getenv` collapses both into "" and silently bypasses
+// the canonical [config.DefaultOTelEndpoint] default when
+// the operator did not configure CLEAN_CODE_OTEL_ENDPOINT.
+func lookupEnvOrDefault(name, defaultVal string) string {
+	if v, ok := os.LookupEnv(name); ok {
+		return v
+	}
+	return defaultVal
 }
 
 // serveWithGracefulShutdown runs srv until SIGINT/SIGTERM

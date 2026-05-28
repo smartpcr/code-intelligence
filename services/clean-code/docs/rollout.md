@@ -61,9 +61,16 @@ Apply the same env-var set to each binary, in order:
    gateway's eval.gate evaluations; dashboards should sum
    both series for the architecture-Sec-8 "evaluations/sec"
    panel.
-5. `clean-code-refactor-planner` -- no observable counters
-   currently. Set `CLEAN_CODE_OTEL_ENDPOINT` so any future
-   spans the planner emits are captured.
+5. `clean-code-refactor-planner` -- iter-2 wires
+   `telemetry.Setup` and emits a `refactor.plan` root span
+   tagged with the canonical Stage 9.4 attribute set
+   (`verb`, `repo_id`, `sha`, `caller_subject`,
+   `policy_version_id`, `degraded`, `degraded_reason`,
+   `verdict`). Set `CLEAN_CODE_OTEL_ENDPOINT` to point at
+   the collector; the planner will log
+   `telemetry: OTel SDK initialised` at boot. The
+   `/metrics` endpoint remains a placeholder pending the
+   Stage 8.x observable-counter brief.
 
 ### Required env var
 

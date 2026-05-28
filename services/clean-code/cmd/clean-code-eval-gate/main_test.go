@@ -117,7 +117,7 @@ func TestEvalHandler_OmitsPolicyVersionID_InvokesGateVerb(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/eval/gate", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 
-	makeEvalHandler(gate)(rec, req)
+	makeEvalHandler(gate.Gate)(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%q; want 200", rec.Code, rec.Body.String())
@@ -155,7 +155,7 @@ func TestEvalHandler_NoActivation_Returns409(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/eval/gate", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 
-	makeEvalHandler(gate)(rec, req)
+	makeEvalHandler(gate.Gate)(rec, req)
 
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status=%d body=%q; want 409 Conflict", rec.Code, rec.Body.String())
@@ -199,7 +199,7 @@ func TestEvalHandler_ExplicitPolicyVersion_Rejected400(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/eval/gate", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 
-	makeEvalHandler(gate)(rec, req)
+	makeEvalHandler(gate.Gate)(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%q; want 400 (policy_version_id rejected on canonical verb)", rec.Code, rec.Body.String())
@@ -240,7 +240,7 @@ func TestReplayHandler_AcceptsExplicitPolicyVersion(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/eval/replay", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 
-	makeReplayHandler(gate)(rec, req)
+	makeReplayHandler(gate.Evaluate)(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%q; want 200", rec.Code, rec.Body.String())
@@ -268,7 +268,7 @@ func TestReplayHandler_MissingPolicyVersion_Returns400(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/eval/replay", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
-	makeReplayHandler(gate)(rec, req)
+	makeReplayHandler(gate.Evaluate)(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d; want 400", rec.Code)
 	}
@@ -298,7 +298,7 @@ func TestEvalHandler_DegradedSignatureInvalid_Returns200(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/eval/gate", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 
-	makeEvalHandler(gate)(rec, req)
+	makeEvalHandler(gate.Gate)(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%q; want 200 (degraded path)", rec.Code, rec.Body.String())
@@ -325,7 +325,7 @@ func TestEvalHandler_BadMethod_Returns405(t *testing.T) {
 	gate := newTestGate(t, &fakeEngine{}, &fakeReadiness{}, &fakeVerifier{}, &fakeActivation{ok: false})
 	req := httptest.NewRequest(http.MethodGet, "/v1/eval/gate", nil)
 	rec := httptest.NewRecorder()
-	makeEvalHandler(gate)(rec, req)
+	makeEvalHandler(gate.Gate)(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("status=%d; want 405", rec.Code)
 	}
@@ -343,7 +343,7 @@ func TestEvalHandler_InvalidRepoID_Returns400(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/eval/gate", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
-	makeEvalHandler(gate)(rec, req)
+	makeEvalHandler(gate.Gate)(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status=%d; want 400", rec.Code)
 	}

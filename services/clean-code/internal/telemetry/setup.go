@@ -14,8 +14,6 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/config"
 )
@@ -165,9 +163,17 @@ func newTracerProvider(ctx context.Context, endpoint string, opts SetupOptions) 
 		otlptracegrpc.WithEndpoint(endpoint),
 	}
 	if opts.Insecure || isLocalEndpoint(endpoint) {
-		exporterOpts = append(exporterOpts,
-			otlptracegrpc.WithDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
-		)
+		// `WithInsecure()` is the OTel-canonical way to
+		// disable client transport security for the
+		// exporter's gRPC connection -- it bypasses the
+		// exporter's default-TLS path entirely. Using
+		// `WithDialOption(grpc.WithTransportCredentials(insecure.NewCredentials()))`
+		// here doesn't work because the OTLP exporter
+		// installs its own credentials on top, leading
+		// to a "first record does not look like a TLS
+		// handshake" failure against a plaintext
+		// receiver.
+		exporterOpts = append(exporterOpts, otlptracegrpc.WithInsecure())
 	}
 	if len(opts.Headers) > 0 {
 		exporterOpts = append(exporterOpts, otlptracegrpc.WithHeaders(opts.Headers))

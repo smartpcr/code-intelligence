@@ -182,39 +182,31 @@ func (g *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 3 -- bearer extraction + verification. The
-	// gateway maps Authenticator sentinel errors to the
-	// canonical HTTP statuses listed in the doc-comment
-	// on [Authenticator]. Runs AFTER verb-lookup so
-	// unknown verbs always 404 (per workstream brief).
-	identity, authErr := g.authenticate(r)
-	if authErr != nil {
-		g.handleAuthError(w, r, authErr, verb.DottedName())
-		return
-	}
-
-	// Step 3.5 -- group-claim authorisation (tech-spec
-	// Sec 8.5). Runs AFTER authn so the caller's
-	// Identity is verified before policy evaluation; runs
-	// BEFORE the span opens so a denied request does not
-	// pollute the verb-success metrics. A denial returns
-	// 403 with WWW-Authenticate insufficient_scope.
-	if authzErr := g.authz.Authorize(r.Context(), identity, verb.DottedName()); authzErr != nil {
-		g.handleAuthzError(w, r, authzErr, identity, verb.DottedName())
-		return
-	}
-
-	// Step 4 -- open the span and install the deferred
-	// span-end / panic-recover closure. The defer MUST
-	// be installed BEFORE the repo_id extractor runs so
-	// a panicking extractor is caught by recover()
-	// (item #6 from iter-1 evaluator feedback). The span
-	// is opened with the canonical attribute set
-	// initialised; the extractor below stamps repo_id on
-	// the same span before the defer fires End().
+	// Step 3 -- open the verb span BEFORE auth runs.
+	// Iter-2 evaluator feedback #3 (Stage 9.4): auth /
+	// authz failures previously returned BEFORE
+	// StartSpan, so 401 / 403 / 503 paths emitted no
+	// span and were invisible to dashboards keyed on
+	// `verb` / `auth_status`. Opening the span here
+	// (after the cheap path-shape + verb-lookup 404
+	// filters) means EVERY verb invocation -- success
+	// AND auth-rejection -- carries the canonical
+	// attribute set. Authn / authz failures stamp
+	// `auth_status` to one of the disjoint enum values
+	// in tracing.go before returning; the deferred
+	// closure ends the span on every path.
+	//
+	// The defer installs the panic-recover guard FIRST
+	// so a panic in authenticate / Authorize / extractor
+	// / downstream handler is caught and mapped to 500
+	// with the span carrying `http.status_code` + the
+	// recorded error. The `identity` capture is nil-safe
+	// because the defer reads through the local
+	// `currentIdentity` variable updated as auth
+	// progresses (nil until authn succeeds).
 	ctx, span := g.tracer.StartSpan(r.Context(), SpanName)
 	span.SetAttribute(SpanAttrVerb, verb.DottedName())
-	span.SetAttribute(SpanAttrCallerSubject, identity.Subject)
+	span.SetAttribute(SpanAttrCallerSubject, "")
 	span.SetAttribute(SpanAttrHTTPMethod, r.Method)
 	span.SetAttribute(SpanAttrHTTPRoute, verb.Path())
 	// Canonical eval-gate attribute defaults (Stage 9.4 /
@@ -230,40 +222,101 @@ func (g *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// the keys are present on EVERY span -- including
 	// spans recorded by `api.RecordingTracer` /
 	// `SlogTracer` where the OTel overwrite is a no-op.
+	span.SetAttribute(SpanAttrRepoID, "")
 	span.SetAttribute(SpanAttrPolicyVersionID, "")
 	span.SetAttribute(SpanAttrDegraded, false)
 	span.SetAttribute(SpanAttrDegradedReason, "")
 	span.SetAttribute(SpanAttrVerdict, "")
+	// Default auth_status to `ok`; auth-failure branches
+	// below overwrite to the disjoint enum values before
+	// returning.
+	span.SetAttribute(SpanAttrAuthStatus, AuthStatusOK)
 
 	// Wrap the writer so we can capture the status code
 	// after the downstream handler returns. The wrapper
 	// forwards every call to the underlying writer
-	// without buffering.
+	// without buffering. Constructed BEFORE auth so the
+	// auth-failure branches can write through the same
+	// wrapper and the deferred closure observes the
+	// status code on EVERY exit path.
 	sw := newStatusWriter(w)
 
-	// Recover from a downstream / extractor panic so the
-	// gateway never crashes the process and so the span
-	// always carries `http.status_code`. The defer
-	// closure fires for BOTH the extractor (step 5) and
-	// the verb handler (step 7) -- whichever panics
-	// first triggers it.
+	// `currentIdentity` is the identity captured as auth
+	// progresses: nil before authn, set after authn
+	// succeeds. The deferred panic-recover closure reads
+	// this so it has a nil-safe view of the subject for
+	// logging when a panic fires DURING auth (e.g. a
+	// rogue Authenticator implementation).
+	var currentIdentity *Identity
+
+	// Recover from a downstream / extractor / auth panic
+	// so the gateway never crashes the process and so
+	// the span always carries `http.status_code`. The
+	// defer closure fires for ALL code paths below
+	// (auth, extractor, verb handler) -- whichever
+	// panics first triggers it.
 	defer func() {
 		if rec := recover(); rec != nil {
 			err := fmt.Errorf("panic in verb pipeline %s: %v", verb.DottedName(), rec)
 			span.RecordError(err)
+			subj := ""
+			if currentIdentity != nil {
+				subj = currentIdentity.Subject
+			}
 			g.logger.ErrorContext(ctx, "gateway: panic in verb pipeline",
 				slog.String("verb", verb.DottedName()),
-				slog.String("caller_subject", identity.Subject),
+				slog.String("caller_subject", subj),
 				slog.String("error", err.Error()),
 			)
 			if !sw.HeaderWritten() {
 				g.writeError(sw, r, http.StatusInternalServerError,
-					CodeInternalError, "internal error", identity.Subject, verb.DottedName())
+					CodeInternalError, "internal error", subj, verb.DottedName())
 			}
 		}
 		span.SetAttribute(SpanAttrHTTPStatusCode, sw.Status())
 		span.End()
 	}()
+
+	// Step 4 -- bearer extraction + verification. The
+	// gateway maps Authenticator sentinel errors to the
+	// canonical HTTP statuses listed in the doc-comment
+	// on [Authenticator]. Runs AFTER verb-lookup so
+	// unknown verbs always 404 (per workstream brief).
+	// On failure we stamp `auth_status=unauthenticated`
+	// on the OPEN span before returning.
+	identity, authErr := g.authenticate(r)
+	if authErr != nil {
+		span.SetAttribute(SpanAttrAuthStatus, AuthStatusUnauthenticated)
+		g.handleAuthError(sw, r, authErr, verb.DottedName())
+		return
+	}
+	currentIdentity = identity
+	span.SetAttribute(SpanAttrCallerSubject, identity.Subject)
+
+	// Step 4.5 -- group-claim authorisation (tech-spec
+	// Sec 8.5). Runs AFTER authn so the caller's
+	// Identity is verified before policy evaluation.
+	// Denial is `auth_status=denied` (403). Any other
+	// authz error is classified as
+	// `backend_unavailable` (the Authorizer's contract
+	// is to return `ErrInsufficientGroup` for the
+	// denied path; non-sentinel errors signal an
+	// internal authorizer failure -- backend outage,
+	// rogue panic in a custom impl). `handleAuthzError`
+	// maps the non-sentinel branch to 500; the span
+	// label captures it as `backend_unavailable` so
+	// dashboards can alert on authz infrastructure
+	// health independently of the per-caller denial
+	// rate.
+	if authzErr := g.authz.Authorize(r.Context(), identity, verb.DottedName()); authzErr != nil {
+		if errors.Is(authzErr, ErrInsufficientGroup) {
+			span.SetAttribute(SpanAttrAuthStatus, AuthStatusDenied)
+		} else {
+			span.SetAttribute(SpanAttrAuthStatus, AuthStatusBackendUnavailable)
+		}
+		g.handleAuthzError(sw, r, authzErr, identity, verb.DottedName())
+		return
+	}
 
 	// Step 5 -- repo_id extraction. The extractor MAY
 	// peek the body; if it does it MUST restore the body

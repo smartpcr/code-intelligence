@@ -87,10 +87,15 @@ import (
 
 	"github.com/gofrs/uuid"
 	_ "github.com/lib/pq"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/config"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/refactor"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/telemetry"
 )
 
 const (
@@ -166,6 +171,40 @@ func run() int {
 
 	disabled := parseBoolEnv(os.Getenv(EnvDisableRefactorPlanner))
 
+	// Stage 9.4 (iter-2 evaluator feedback #5): the
+	// refactor-planner binary previously had ONLY a
+	// placeholder `/metrics` and no OTel SDK -- yet the
+	// runbook claimed every `clean-code-*` binary
+	// exports OTel traces. Wire the SDK + Prometheus
+	// collectors here so the planner shows up alongside
+	// the gateway / aggregator / eval-gate in the
+	// per-service OTel dashboards. The same
+	// `CLEAN_CODE_OTEL_ENDPOINT` env-var contract
+	// applies (unset = default `localhost:4317`, empty
+	// = explicit disable per the unset-vs-empty
+	// distinction documented on `lookupEnvOrDefault`
+	// in the gateway / eval-gate composition roots).
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
+	telCfg := config.Config{
+		OTelEndpoint:   lookupEnvOrDefault(config.EnvOTelEndpoint, config.DefaultOTelEndpoint),
+		PrometheusAddr: lookupEnvOrDefault(config.EnvPrometheusAddr, config.DefaultPrometheusAddr),
+	}
+	shutdownTelemetry, telErr := telemetry.Setup(rootCtx, telCfg, telemetry.SetupOptions{
+		ServiceName: "clean-code-refactor-planner",
+	})
+	if telErr != nil {
+		log.Printf("clean-code-refactor-planner: telemetry.Setup: %v", telErr)
+		return 1
+	}
+	defer func() {
+		shutdownCtxTel, c := context.WithTimeout(context.Background(), 5*time.Second)
+		defer c()
+		if err := shutdownTelemetry(shutdownCtxTel); err != nil {
+			log.Printf("clean-code-refactor-planner: telemetry shutdown error: %v", err)
+		}
+	}()
+
 	// /healthz listener is ALWAYS on so K8s liveness probes
 	// succeed even on an opted-out deployment. Match the
 	// aggregator + metric_ingestor pattern.
@@ -204,13 +243,35 @@ func run() int {
 				exitCode = 1
 			} else {
 				defer db.Close()
-				planRes, taskRes, pErr := runPlanner(ctx, db, logger, repoID, sha, effortModel)
+				// Stage 9.4 (iter-2 evaluator feedback #5):
+				// open an explicit `refactor.plan` root
+				// span tagged with the canonical Stage 9.4
+				// attribute set. Stamp `policy_version_id`
+				// from the Stage 8.1 PlanResult AFTER
+				// runPlanner returns (the policy version is
+				// resolved INSIDE the planner via the
+				// Steward, not known at span-open time).
+				planSpanCtx, planSpan := otel.Tracer("clean-code-refactor-planner").
+					Start(ctx, "refactor.plan", oteltrace.WithSpanKind(oteltrace.SpanKindInternal))
+				planSpan.SetAttributes(
+					attribute.String("verb", "refactor.plan"),
+					attribute.String("repo_id", repoID.String()),
+					attribute.String("sha", sha),
+					attribute.String("caller_subject", ""),
+					attribute.String("policy_version_id", ""),
+					attribute.Bool("degraded", false),
+					attribute.String("degraded_reason", ""),
+					attribute.String("verdict", ""),
+				)
+				planRes, taskRes, pErr := runPlanner(planSpanCtx, db, logger, repoID, sha, effortModel)
 				if pErr != nil {
 					if errors.Is(pErr, context.Canceled) ||
 						errors.Is(pErr, context.DeadlineExceeded) {
 						logger.Info("clean-code-refactor-planner: cancelled", "err", pErr)
 					} else {
 						logger.Error("clean-code-refactor-planner: planner failed", "err", pErr)
+						planSpan.RecordError(pErr)
+						planSpan.SetStatus(codes.Error, "planner failure")
 						exitCode = 1
 					}
 				} else if taskRes.Plan.PlanID == uuid.Nil {
@@ -228,6 +289,10 @@ func run() int {
 						"sha", sha,
 						"reason", "no active policy",
 					)
+					planSpan.SetAttributes(
+						attribute.Bool("degraded", true),
+						attribute.String("degraded_reason", "no_active_policy"),
+					)
 				} else {
 					logger.Info("clean-code-refactor-planner: planner OK",
 						"repo_id", repoID.String(),
@@ -237,7 +302,14 @@ func run() int {
 						"tasks_emitted", len(taskRes.Tasks),
 						"plan_id", taskRes.Plan.PlanID.String(),
 					)
+					planSpan.SetAttributes(
+						attribute.String("policy_version_id", planRes.PolicyVersionID.String()),
+						attribute.Int("hot_spots_written", len(planRes.HotSpots)),
+						attribute.Int("tasks_emitted", len(taskRes.Tasks)),
+						attribute.String("plan_id", taskRes.Plan.PlanID.String()),
+					)
 				}
+				planSpan.End()
 			}
 		}
 	}
@@ -518,4 +590,20 @@ func buildMux() *http.ServeMux {
 		_, _ = w.Write([]byte("# clean-code-refactor-planner metrics placeholder\n"))
 	})
 	return mux
+}
+
+// lookupEnvOrDefault returns the env var's value when SET
+// (including the empty string, which is the explicit
+// "telemetry disabled" sentinel) and the supplied default
+// when UNSET. Distinguishing unset from explicitly-empty is
+// the contract iter-2 evaluator feedback #2 requires:
+// `os.Getenv` collapses both into "" and silently bypasses
+// the canonical [config.DefaultOTelEndpoint] /
+// [config.DefaultPrometheusAddr] defaults when the operator
+// did not configure CLEAN_CODE_OTEL_ENDPOINT.
+func lookupEnvOrDefault(name, defaultVal string) string {
+	if v, ok := os.LookupEnv(name); ok {
+		return v
+	}
+	return defaultVal
 }

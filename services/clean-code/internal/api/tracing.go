@@ -61,6 +61,36 @@ const (
 	// enum `{pass, warn, block}`. Empty string on
 	// non-eval verbs.
 	SpanAttrVerdict = "verdict"
+	// SpanAttrAuthStatus is the canonical auth-pipeline
+	// outcome stamped on EVERY gateway span. Stage 9.4
+	// (iter-2 evaluator feedback #3) requires that 401 /
+	// 403 / 503 paths emit spans too -- previously the
+	// span was opened only AFTER auth succeeded, leaving
+	// auth-rejected requests unobservable. The attribute
+	// is a closed enum so dashboards can `group by
+	// auth_status`:
+	//   - `ok`               -- auth + authz both passed.
+	//   - `unauthenticated`  -- bearer missing / malformed
+	//     / invalid / expired.
+	//   - `denied`           -- bearer valid but caller
+	//     lacks the required group claim.
+	//   - `backend_unavailable` -- authz backend
+	//     (Postgres / IdP) is offline; mapped to 503.
+	//
+	// The auth_status enum is INTENTIONALLY DISJOINT from
+	// the `verdict` enum -- verdict stays the closed
+	// `{pass, warn, block}` eval-gate set, and stays
+	// empty on auth-rejected paths.
+	SpanAttrAuthStatus = "auth_status"
+)
+
+// Canonical [SpanAttrAuthStatus] enum values. See the
+// attribute's doc-comment for semantics.
+const (
+	AuthStatusOK                 = "ok"
+	AuthStatusUnauthenticated    = "unauthenticated"
+	AuthStatusDenied             = "denied"
+	AuthStatusBackendUnavailable = "backend_unavailable"
 )
 
 // SpanName is the conventional span name the gateway uses for

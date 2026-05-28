@@ -27,13 +27,14 @@ Every verb span carries:
 
 | attribute | type | source | notes |
 |---|---|---|---|
-| `verb` | string | `internal/api` gateway | canonical dotted verb (`mgmt.register_repo`, `eval.gate`, ...). |
-| `repo_id` | string | request body parse | empty when the verb does not take a repo or the body has not been parsed yet. |
-| `caller_subject` | string | verified bearer token `sub` claim | populated by the auth middleware. |
+| `verb` | string | `internal/api` gateway | canonical dotted verb (`mgmt.register_repo`, `eval.gate`, ...). Stamped BEFORE auth runs (iter-2 fix #3) so 401/403/503 paths emit observable spans too. |
+| `repo_id` | string | request body parse | empty when the verb does not take a repo, the body has not been parsed yet, or the request was rejected by auth/authz before the extractor ran. |
+| `caller_subject` | string | verified bearer token `sub` claim | populated AFTER authn succeeds; empty on unauthenticated paths. |
 | `policy_version_id` | string | `evaluator.EvaluateResult.PolicyVersionID` | empty string when the verb does not bind to a policy_version (gateway default for non-eval verbs). |
 | `degraded` | bool | `EvaluateResult.Degraded` | `false` default on every verb span at gateway entry. |
 | `degraded_reason` | string | `EvaluateResult.DegradedReason` | empty string default; closed enum is `{samples_pending, policy_signature_invalid, xrepo_edges_unavailable}` per architecture Sec 6.1. |
-| `verdict` | string | `EvaluateResult.Verdict` | empty string default; closed enum is `{pass, warn, block}`. |
+| `verdict` | string | `EvaluateResult.Verdict` | empty string default; closed enum is `{pass, warn, block}`. Stays empty on auth-rejected paths — the `verdict` enum is INTENTIONALLY DISJOINT from `auth_status`. |
+| `auth_status` | string | `internal/api` gateway | iter-2 (Stage 9.4): closed enum `{ok, unauthenticated, denied, backend_unavailable}` describing the auth/authz pipeline outcome. `ok` is the default, overwritten on the auth-failure / authz-denial / authz-backend-outage branches BEFORE the handler returns. Dashboards `group by auth_status` to alert on credential floods vs. infra outages independently of the per-verb verdict mix. |
 
 The eval-gate-specific four (`policy_version_id`, `degraded`,
 `degraded_reason`, `verdict`) are stamped via
@@ -41,17 +42,20 @@ The eval-gate-specific four (`policy_version_id`, `degraded`,
 `composition.writeEvalResponse` BEFORE the operational-state
 branch ladder, so even `ErrNoActivePolicy` (409) and
 `INTERNAL_ERROR` (500) responses carry the partial state the
-evaluator computed before failing.
+evaluator computed before failing. The standalone
+`clean-code-eval-gate` binary's `/v1/eval/gate` and
+`/v1/eval/replay` handlers go through the same path via the
+binary-local `emitEvalSpan` helper (iter-2 fix #1).
 
 ### Prometheus collectors mounted per binary
 
-| binary | collectors on `/metrics` |
-|---|---|
-| `clean-code-gateway` | `WALReplayMetrics`, `RuleEngineMetrics` |
-| `clean-code-aggregator` | `AggregatorTickMetrics` |
-| `clean-code-eval-gate` | `RuleEngineMetrics`, `WALReplayMetrics` |
-| `clean-code-metric-ingestor` | `StaleScanRunSweepMetrics` (existing Stage 3.5 surface) |
-| `clean-code-refactor-planner` | placeholder `/metrics` -- no observable counters currently exported. |
+| binary | collectors on `/metrics` | OTel traces |
+|---|---|---|
+| `clean-code-gateway` | `WALReplayMetrics`, `RuleEngineMetrics` | yes |
+| `clean-code-aggregator` | `AggregatorTickMetrics` | yes |
+| `clean-code-eval-gate` | `RuleEngineMetrics`, `WALReplayMetrics` | yes (gateway-composition + standalone `eval.gate`/`eval.replay` spans via the binary-local `emitEvalSpan` helper) |
+| `clean-code-metric-ingestor` | `StaleScanRunSweepMetrics` (existing Stage 3.5 surface) | yes |
+| `clean-code-refactor-planner` | placeholder `/metrics` -- no observable counters currently exported. | yes — iter-2 fix #5 wires `telemetry.Setup` and an explicit `refactor.plan` root span tagged with `verb`, `repo_id`, `sha`, and (on success) `policy_version_id` + `plan_id`. The placeholder `/metrics` is intentional pending the Stage 8.x observable-counter brief; the OTel side is now fully wired so the binary shows up alongside its peers in the trace dashboards. |
 
 Metric names:
 

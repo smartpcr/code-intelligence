@@ -39,6 +39,10 @@ import (
 
 	"github.com/gofrs/uuid"
 	_ "github.com/lib/pq"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/composition"
@@ -145,9 +149,17 @@ func main() {
 	// collectors BEFORE the rule engine + reconciler are
 	// constructed so their observer hooks can be wired in
 	// one place (no late, post-construction patching).
+	//
+	// Iter-2 evaluator feedback #2: when CLEAN_CODE_OTEL_ENDPOINT
+	// is UNSET we honour the canonical
+	// [config.DefaultOTelEndpoint] (`localhost:4317`) per
+	// `internal/config/config.go`. Setting the env var to
+	// the EMPTY STRING is the explicit "disable telemetry"
+	// path; only `os.LookupEnv` (NOT `os.Getenv`) can
+	// distinguish unset from empty.
 	telCfg := config.Config{
-		OTelEndpoint:   os.Getenv(config.EnvOTelEndpoint),
-		PrometheusAddr: os.Getenv(config.EnvPrometheusAddr),
+		OTelEndpoint:   lookupEnvOrDefault(config.EnvOTelEndpoint, config.DefaultOTelEndpoint),
+		PrometheusAddr: lookupEnvOrDefault(config.EnvPrometheusAddr, config.DefaultPrometheusAddr),
 	}
 	shutdownTelemetry, telErr := telemetry.Setup(rootCtx, telCfg, telemetry.SetupOptions{
 		ServiceName: "clean-code-eval-gate",
@@ -414,7 +426,7 @@ func main() {
 	// rogue client bypass the steward's activation
 	// governance and pin findings to a non-active policy.
 	// The rejection is a 400 Bad Request.
-	mux.HandleFunc("/v1/eval/gate", makeEvalHandler(gate))
+	mux.HandleFunc("/v1/eval/gate", makeEvalHandler(gate.Gate))
 	// `/v1/eval/replay` is a NON-CANONICAL admin/replay
 	// surface for batch tooling that needs to evaluate a
 	// SHA against a SPECIFIC policy_version_id (e.g.
@@ -425,7 +437,7 @@ func main() {
 	// (see CHANGELOG / runbook for the role binding). It
 	// is intentionally a distinct route so the canonical
 	// verb's audit trail remains uniform.
-	mux.HandleFunc("/v1/eval/replay", makeReplayHandler(gate))
+	mux.HandleFunc("/v1/eval/replay", makeReplayHandler(gate.Evaluate))
 
 	log.Printf("clean-code-eval-gate listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
@@ -705,7 +717,51 @@ func writeBodyReadError(w http.ResponseWriter, err error) {
 // stream an unbounded body and OOM the gate process;
 // the cap is [maxRequestBodyBytes] and is enforced
 // identically on `/v1/eval/replay`.
-func makeEvalHandler(gate *evaluator.Gate) http.HandlerFunc {
+// evalGateFunc is the narrow seam between [makeEvalHandler]
+// and the production [evaluator.Gate.Gate] method. The
+// handler depends on the function shape (not the concrete
+// `*evaluator.Gate`) so iter-2 evaluator feedback #1's
+// "exercise the real handler in tests" requirement can be
+// satisfied with a stub fn instead of standing up the full
+// evaluator harness. The signature mirrors `Gate.Gate`
+// exactly so `gate.Gate` is a valid `evalGateFunc` without
+// adapter.
+type evalGateFunc func(ctx context.Context, repoID uuid.UUID, sha string, scope *uuid.UUID) (evaluator.EvaluateResult, error)
+
+// evalReplayFunc is the equivalent seam for the NON-canonical
+// `/v1/eval/replay` admin surface bound to
+// [evaluator.Gate.Evaluate]. The trailing `policyVersionID`
+// argument is the explicit pin that distinguishes the
+// replay verb from the canonical gate verb.
+type evalReplayFunc func(ctx context.Context, repoID uuid.UUID, sha string, scope *uuid.UUID, policyVersionID uuid.UUID) (evaluator.EvaluateResult, error)
+
+// makeEvalHandler binds the CANONICAL Stage 6.1 verb
+// `eval.gate(repo_id, sha, scope?)` to the supplied
+// [evalGateFunc]. The handler:
+//
+//  1. validates the request shape (max body bytes; reject
+//     smuggled `policy_version_id`);
+//  2. opens a span tagged with the canonical Stage 9.4
+//     attribute set ([telemetry.AttrVerb] = "eval.gate",
+//     [telemetry.AttrRepoID], plus empty defaults for
+//     [telemetry.AttrPolicyVersionID] /
+//     [telemetry.AttrDegraded] / [telemetry.AttrDegradedReason]
+//     / [telemetry.AttrVerdict] so dashboards see a stable
+//     schema for every request);
+//  3. invokes the gate (which writes the canonical
+//     `evaluation_run` + `evaluation_verdict` rows for both
+//     happy and degraded paths);
+//  4. stamps the eval-gate-specific span attributes via
+//     [telemetry.AnnotateEvalGateSpan] BEFORE
+//     [writeEvalResponse] so even the operational-state
+//     branches (`ErrNoActivePolicy`, INTERNAL_ERROR) carry
+//     the partial state the gate computed.
+//
+// The request body is wrapped in [http.MaxBytesReader]
+// before [io.ReadAll] so a malicious client cannot stream
+// an unbounded body and OOM the gate process; the cap is
+// [maxRequestBodyBytes].
+func makeEvalHandler(gateFn evalGateFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -743,25 +799,36 @@ func makeEvalHandler(gate *evaluator.Gate) http.HandlerFunc {
 
 		// Canonical Stage 6.1 verb path: gate resolves
 		// the active policy_version_id itself via the
-		// latest `clean_code.policy_activation` row.
-		result, evalErr := gate.Gate(r.Context(), repoID, req.SHA, scope)
+		// latest `clean_code.policy_activation` row. The
+		// span pipeline runs around `gateFn` so the
+		// canonical eval-gate attributes are stamped
+		// regardless of whether the gate hits the happy,
+		// degraded, or `ErrNoActivePolicy` branch.
+		result, evalErr := emitEvalSpan(r.Context(), "eval.gate", req.RepoID,
+			func(ctx context.Context) (evaluator.EvaluateResult, error) {
+				return gateFn(ctx, repoID, req.SHA, scope)
+			})
 		writeEvalResponse(w, result, evalErr)
 	}
 }
 
 // makeReplayHandler binds the NON-CANONICAL
 // `/v1/eval/replay` admin handler to the supplied
-// [evaluator.Gate]. The handler REQUIRES a
-// `policy_version_id` and invokes
-// [evaluator.Gate.Evaluate] directly. It is intentionally
+// [evalReplayFunc]. The handler REQUIRES a
+// `policy_version_id` and invokes the function (typically
+// [evaluator.Gate.Evaluate]) directly. It is intentionally
 // a distinct route so the canonical verb's audit trail
 // remains uniform.
 //
 // The request body is wrapped in [http.MaxBytesReader]
 // before the [json.Decoder] runs so the admin surface
 // has the same OOM protection as the canonical verb;
-// the cap is [maxRequestBodyBytes].
-func makeReplayHandler(gate *evaluator.Gate) http.HandlerFunc {
+// the cap is [maxRequestBodyBytes]. Stage 9.4: the
+// handler opens a span named `eval.replay` tagged with
+// the canonical attribute set so dashboards can chart
+// the admin/replay surface alongside the canonical
+// verb without joining on the audit DB.
+func makeReplayHandler(replayFn evalReplayFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -800,10 +867,93 @@ func makeReplayHandler(gate *evaluator.Gate) http.HandlerFunc {
 			}
 			scope = &s
 		}
-		result, evalErr := gate.Evaluate(r.Context(), repoID, req.SHA, scope, policyVersionID)
+		result, evalErr := emitEvalSpan(r.Context(), "eval.replay", req.RepoID,
+			func(ctx context.Context) (evaluator.EvaluateResult, error) {
+				return replayFn(ctx, repoID, req.SHA, scope, policyVersionID)
+			})
 		writeEvalResponse(w, result, evalErr)
 	}
 }
+
+// emitEvalSpan opens an OTel span named `verbName`,
+// stamps the canonical Stage 9.4 attribute defaults on it
+// (per architecture Sec 8: `verb`, `repo_id`, plus the
+// four eval-gate-specific keys defaulted to empty / false),
+// invokes `fn` to drive the gate evaluation, and finally
+// calls [telemetry.AnnotateEvalGateSpan] to overwrite the
+// eval-specific attributes with the actual outcome.
+//
+// The helper exists so iter-2 evaluator feedback #1
+// (standalone eval-gate handlers must emit spans) is
+// satisfied by a SINGLE annotated path BOTH HTTP handlers
+// (`/v1/eval/gate`, `/v1/eval/replay`) share. The span is
+// a no-op when no OTel TracerProvider is installed
+// (`telemetry.Setup` skipped or `CLEAN_CODE_OTEL_ENDPOINT`
+// explicitly empty), so the helper is safe to call from
+// every test path too.
+func emitEvalSpan(
+	ctx context.Context,
+	verbName, repoID string,
+	fn func(ctx context.Context) (evaluator.EvaluateResult, error),
+) (evaluator.EvaluateResult, error) {
+	tracer := otel.Tracer(evalGateTracerName)
+	ctx, span := tracer.Start(ctx, verbName, oteltrace.WithSpanKind(oteltrace.SpanKindServer))
+	defer span.End()
+	span.SetAttributes(
+		attribute.String(telemetry.AttrVerb, verbName),
+		attribute.String(telemetry.AttrRepoID, repoID),
+		// The standalone eval-gate binary does NOT run
+		// the bearer-token authn layer (the gateway
+		// fronts it for that), so `caller_subject` is
+		// always the empty string here. The attribute
+		// is still stamped so dashboards see a stable
+		// schema across the gateway + standalone paths.
+		attribute.String(telemetry.AttrCallerSubject, ""),
+		attribute.String(telemetry.AttrPolicyVersionID, ""),
+		attribute.Bool(telemetry.AttrDegraded, false),
+		attribute.String(telemetry.AttrDegradedReason, ""),
+		attribute.String(telemetry.AttrVerdict, ""),
+	)
+	result, err := fn(ctx)
+	// Stamp the actual outcome on top of the defaults.
+	// AnnotateEvalGateSpan is a no-op when no recording
+	// span is bound to ctx, so the call is cheap when
+	// telemetry is disabled.
+	telemetry.AnnotateEvalGateSpan(ctx, result)
+	if err != nil {
+		// Record the error event on the span so OTel
+		// backends highlight it; do NOT downgrade the
+		// span status for the canonical degraded
+		// sentinels (samples_pending / signature_invalid
+		// / no_active_policy) since those are expected
+		// operational paths and would spam alert
+		// dashboards.
+		if !isExpectedEvalSentinel(err) {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "eval failure")
+		}
+	}
+	return result, err
+}
+
+// isExpectedEvalSentinel returns true for the operational-
+// state errors the gate is allowed to return as part of its
+// canonical contract. Those errors are NOT recorded on the
+// span as failures (the span attribute set captures the
+// degraded reason; double-marking would inflate alert
+// dashboards on otherwise-healthy traffic).
+func isExpectedEvalSentinel(err error) bool {
+	return errors.Is(err, evaluator.ErrNoActivePolicy) ||
+		errors.Is(err, evaluator.ErrSamplesPending) ||
+		errors.Is(err, evaluator.ErrPolicySignatureInvalid)
+}
+
+// evalGateTracerName is the OTel instrumentation library
+// name the binary tags its spans with. Dashboards can
+// filter by `otel.scope.name = "clean-code-eval-gate"` to
+// separate spans this binary emits from gateway-emitted
+// spans.
+const evalGateTracerName = "clean-code-eval-gate"
 
 // writeEvalResponse shapes the [evaluator.EvaluateResult]
 // + error pair into the canonical [evalResponse] JSON.
@@ -845,4 +995,20 @@ func writeEvalResponse(w http.ResponseWriter, result evaluator.EvaluateResult, e
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("clean-code-eval-gate: encode response: %v", err)
 	}
+}
+
+// lookupEnvOrDefault returns the env var's value when SET
+// (including the empty string, which is the explicit
+// "telemetry disabled" sentinel) and the supplied default
+// when UNSET. Distinguishing unset from explicitly-empty is
+// the contract iter-2 evaluator feedback #2 requires:
+// `os.Getenv` collapses both into "" and silently bypasses
+// the canonical [config.DefaultOTelEndpoint] /
+// [config.DefaultPrometheusAddr] defaults when the operator
+// did not configure CLEAN_CODE_OTEL_ENDPOINT.
+func lookupEnvOrDefault(name, defaultVal string) string {
+	if v, ok := os.LookupEnv(name); ok {
+		return v
+	}
+	return defaultVal
 }

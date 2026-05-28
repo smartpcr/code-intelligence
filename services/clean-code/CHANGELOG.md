@@ -6,6 +6,105 @@ Newest at the top. Stage references map to
 
 ## Stage 9.4 -- OTel telemetry across all surfaces
 
+### Iter-2 hardening (Stage 9.4)
+
+The iter-1 review surfaced five gaps; iter-2 closed each:
+
+1. **Standalone eval-gate handler spans** -- `cmd/clean-code-eval-gate/main.go`
+   now wraps both `makeEvalHandler` and `makeReplayHandler` in
+   `emitEvalSpan`, a binary-local helper that opens an OTel
+   span (`eval.gate` / `eval.replay`), stamps the canonical
+   default attribute set, invokes the gate via the
+   `evalGateFunc` / `evalReplayFunc` seam, then calls
+   `telemetry.AnnotateEvalGateSpan` so the actual outcome
+   (verdict, degraded, policy_version_id) is captured on
+   every path -- including `ErrNoActivePolicy` (409),
+   `ErrSamplesPending` / `ErrPolicySignatureInvalid`
+   degraded paths, and the 500 internal-error branch.
+   `makeEvalHandler(gate)` is now `makeEvalHandler(gate.Gate)`
+   so the function-shape seam lets the integration test stub
+   the gate without standing up the full evaluator harness.
+
+2. **`config.DefaultOTelEndpoint` honoured by default** --
+   `cmd/clean-code-gateway/main.go` and
+   `cmd/clean-code-eval-gate/main.go` now use a local
+   `lookupEnvOrDefault` helper that reads via
+   `os.LookupEnv` (not `os.Getenv`) so the UNSET case
+   falls back to `config.DefaultOTelEndpoint`
+   (`localhost:4317`) per `internal/config/config.go`.
+   The explicit EMPTY-STRING setting still flows the
+   "telemetry disabled" path -- only `LookupEnv` can
+   distinguish unset from empty.
+
+3. **Spans now open BEFORE auth runs** --
+   `internal/api/handlers.go::GatewayHandler.ServeHTTP`
+   restructured so `StartSpan` fires after the cheap
+   path-shape + verb-lookup 404 filter but BEFORE the
+   `authenticate` / `Authorize` calls. Auth-failure
+   branches (401), authz-denial branches (403), and
+   authz-backend-outage branches (500) all stamp the
+   new `auth_status` enum attribute
+   (`{ok, unauthenticated, denied, backend_unavailable}`)
+   and the deferred closure ends the span on every exit
+   path. The `auth_status` enum is INTENTIONALLY
+   DISJOINT from `verdict` so dashboards can group by
+   either dimension independently. `caller_subject` is
+   stamped empty by default and overwritten only AFTER
+   authn succeeds.
+
+4. **Real handler integration tests for every surface** --
+   `internal/api/handler_span_integration_test.go` drives
+   the real `GatewayHandler` via `httptest.NewServer` for
+   one verb in each of mgmt.*, ingest.*, policy.*, and
+   eval.* namespaces and asserts the recorded span
+   carries the full canonical attribute set. Two
+   additional tests cover the auth-failure and
+   authz-denial branches so the iter-1 regression (no
+   span on 401 / 403) is gated by the test suite.
+   `cmd/clean-code-eval-gate/span_integration_test.go`
+   wires the production OTel SDK (`sdktrace.NewTracerProvider`
+   + `tracetest.InMemoryExporter`) and drives the real
+   `makeEvalHandler` / `makeReplayHandler` through
+   `httptest.NewServer`, asserting the captured span
+   carries `verb`, `repo_id`, `verdict`,
+   `policy_version_id`, `degraded`, `degraded_reason`
+   for the happy, samples-pending degraded, and
+   no-active-policy outcomes plus the replay surface.
+   `internal/telemetry/otlp_receiver_test.go` adds the
+   literal `fake OTLP receiver` requirement from the
+   Stage 9.4 implementation-plan line 820: an in-process
+   `grpc.Server` registers a
+   `coltracepb.UnimplementedTraceServiceServer`-derived
+   receiver, the test calls `Setup` against the bound
+   localhost endpoint, emits one span per canonical
+   namespace (mgmt.*, ingest.*, policy.*, eval.gate),
+   triggers the OTel SDK shutdown to flush the batch,
+   and asserts the receiver captured the canonical
+   Stage 9.4 attribute set for every surface over the
+   actual OTLP/gRPC wire protocol.
+
+5. **Refactor-planner wired with OTel** --
+   `cmd/clean-code-refactor-planner/main.go` now calls
+   `telemetry.Setup` at boot and opens a `refactor.plan`
+   root span around `runPlanner`. The span carries the
+   canonical Stage 9.4 attribute set (`verb`, `repo_id`,
+   `sha`, `caller_subject`, `policy_version_id`,
+   `degraded`, `degraded_reason`, `verdict`) with
+   `policy_version_id` / `plan_id` / `hot_spots_written`
+   / `tasks_emitted` stamped from the
+   `refactor.PlanResult` AFTER `runPlanner` returns
+   (the policy version is resolved INSIDE the planner via
+   the Steward, not known at span-open time). The
+   no-active-policy branch stamps `degraded=true` and
+   `degraded_reason="no_active_policy"`; planner errors
+   are recorded via `RecordError` + `codes.Error`. The
+   `/metrics` endpoint remains a placeholder pending
+   the Stage 8.x observable-counter brief; the runbook
+   table now distinguishes the OTel-traces column from
+   the Prometheus-collectors column to reflect this.
+
+### Original Stage 9.4 implementation
+
 New `internal/telemetry/` package wraps the OTel SDK with the
 OTLP gRPC trace exporter and exposes a Prometheus text-
 exposition `/metrics` handler. Every verb handler (eval.gate,

@@ -58,6 +58,8 @@ From `services\agent-memory`:
 
 ```powershell
 make test
+make test-nocgo
+make test-cgo
 make test-race
 go test ./...
 ```

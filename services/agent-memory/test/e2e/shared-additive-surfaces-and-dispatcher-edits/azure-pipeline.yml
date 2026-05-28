@@ -1,0 +1,40 @@
+trigger:
+  paths:
+    - "services/agent-memory/migrations/**"
+    - "services/agent-memory/test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/**"
+    - "services/agent-memory/go.mod"
+    - "services/agent-memory/go.sum"
+    - "tests/e2e/phase-1-shared-additive-surfaces/**"
+
+pool:
+  vmImage: "ubuntu-latest"
+
+variables:
+  AGENT_MEMORY_PG_URL: "postgres://agent_memory:agent_memory@localhost:5432/agent_memory?sslmode=disable"
+
+steps:
+  - checkout: self
+
+  - script: |
+      docker compose -f tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml up -d --wait
+    displayName: "Start Phase 1 compose stack (partman-enabled postgres)"
+    timeoutInMinutes: 5
+
+  - task: GoTool@0
+    inputs:
+      version: "1.25"
+
+  - script: |
+      cd services/agent-memory
+      go mod download
+    displayName: "Download Go modules"
+
+  - script: |
+      cd services/agent-memory
+      go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/...
+    displayName: "Run E2E – schema migration for overrides edge kind"
+
+  - script: |
+      docker compose -f tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml down -v
+    displayName: "Tear down compose stack"
+    condition: always()

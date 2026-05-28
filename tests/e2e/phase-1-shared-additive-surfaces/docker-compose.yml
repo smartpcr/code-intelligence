@@ -1,0 +1,50 @@
+# Phase 1 E2E compose stack — postgres only.
+#
+# This file is the declared compose artifact for the Phase 1
+# (shared-additive-surfaces-and-dispatcher-edits) E2E scenarios.
+# It starts only the partman-enabled PostgreSQL instance the AST
+# dispatcher unit-test slice and migration-apply probe require;
+# Qdrant and the OTel collector are NOT started because Phase 1
+# scenarios exercise the AST dispatcher (in-process) and the
+# schema migration journal (postgres only).
+#
+# Usage (from the repo root):
+#   docker compose -f tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml up -d
+#   export AGENT_MEMORY_PG_URL="postgres://agent_memory:agent_memory@localhost:5432/agent_memory?sslmode=disable"
+#   cd services/agent-memory
+#   go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/...
+
+name: phase-1-e2e
+
+services:
+  postgres:
+    container_name: phase1_e2e_postgres
+    build:
+      context: ../../../services/agent-memory/deploy/local/postgres
+      dockerfile: Dockerfile
+    image: agent-memory/postgres:16-partman
+    environment:
+      POSTGRES_USER: agent_memory
+      POSTGRES_PASSWORD: agent_memory
+      POSTGRES_DB: agent_memory
+      PG_PARTMAN_BGW_DBNAME: agent_memory
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=pg_partman_bgw"
+      - "-c"
+      - "pg_partman_bgw.dbname=agent_memory"
+      - "-c"
+      - "pg_partman_bgw.interval=600"
+      - "-c"
+      - "pg_partman_bgw.role=agent_memory"
+    ports:
+      - "5432:5432"
+    volumes:
+      - ../../../services/agent-memory/deploy/local/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_memory -d agent_memory"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s

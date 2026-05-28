@@ -499,9 +499,20 @@ func TestDispatcher_EmitsReadsAndWritesEdgesToEnclosingClass(t *testing.T) {
 // evaluator finding #5: `this.helper()` / `self.helper()`
 // MUST produce `static_calls` edges resolved against
 // `<EnclosingClass>.helper` in the local symbol table.
-// Receiver-qualified calls are unambiguous (scoped to the
-// enclosing class) so the resolver does not drop on
-// collisions the way bare-name calls do.
+//
+// Resolution runs through the Pass 2b receiver-index
+// multimap (`dispatcher.go::emit` lines 612-690). The
+// multimap is keyed by `<EnclosingClass>.<simpleName>` and
+// can hold multiple node ids per key when the Go parser
+// emits a value-receiver + pointer-receiver pair whose
+// simple name collides (the same `Bar` exposed as both
+// `Foo.Bar` and `*Foo.Bar`); the resolver then DROPS the
+// callee per the A5 rule (`len(ids) != 1` -> skip). This
+// TS fixture exercises only the unambiguous size==1 path
+// where `Foo.helper` has a single producer; the sister
+// tests `TestDispatcher_GoMultimapDropsOnReceiverCollision`
+// and `TestDispatcher_GoMultimapResolvesPointerReceiverAlone`
+// cover the collision-drop and pointer-only-alias paths.
 func TestDispatcher_ResolvesReceiverQualifiedStaticCalls(t *testing.T) {
 	fw := newFakeWriter()
 	d := NewDispatcher(fw)

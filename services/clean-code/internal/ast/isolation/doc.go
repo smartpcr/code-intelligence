@@ -60,34 +60,72 @@
 //
 // Callers use `errors.Is(err, ErrParserOOM)` etc.
 //
-// # Wiring scope (Stage 9.3 iter-2 production wiring)
+// # Wiring scope (Stage 9.3 iter-3 production wiring)
 //
-// As of Stage 9.3 iter-2 the seam is wired end-to-end into
-// the production composition:
+// As of Stage 9.3 iter-3 the seam is wired end-to-end into
+// the production composition. The primitives are built ONCE
+// at the metric-ingestor binary's composition root and shared
+// across BOTH the management flip path AND the foundation
+// scan path so the per-repo in-flight counter the flip drains
+// against is the SAME counter the scan path increments:
 //
 //   - The clean-code-metric-ingestor binary's `main()`
 //     installs the [IsChildProcess] guard at the top of
 //     `main()` so a re-exec into the same binary lands
 //     in [RunChild] (with [ParserRegistryChildHandler]
 //     wired) instead of re-running the server bootstrap.
-//   - `mountMgmtRoutes` constructs a single
-//     [ModeCoordinator] hydrated by
+//   - `buildIsolation` (cmd/clean-code-metric-ingestor/main.go)
+//     constructs a single [ModeCoordinator] hydrated by
 //     `management.PGRepoStore.ReadRepoMode` (the
-//     [RepoModeReader] seam introduced this stage), wraps
-//     it in a [MgmtFlipCoordinator], and hands the
-//     adapter to the [MgmtWriter] via
+//     [RepoModeReader] seam introduced this stage), a single
+//     [Pool] with per-language [ExecWorkerFactoryFromConfig]
+//     factories registered for every entry in
+//     `parser.SupportedLanguages`, and a single
+//     [MgmtFlipCoordinator] adapter. The resulting bundle is
+//     passed to BOTH `mountMgmtRoutes` AND
+//     `mountIngestRouter`; the iter-2 layout that built the
+//     primitives inside `mountMgmtRoutes` (and therefore
+//     drained a coordinator the scan path never touched) is
+//     gone.
+//   - `mountMgmtRoutes` hands the [MgmtFlipCoordinator] to
+//     the [MgmtWriter] via
 //     `management.WithMgmtWriterFlipCoordinator`. The
 //     `mgmt.set_mode` handler now drains in-flight scans
 //     BEFORE invoking `repoStore.SetRepoMode` (impl-plan
 //     line 804).
-//   - The same [ModeCoordinator] (and a [Pool] with
-//     per-language [ExecWorkerFactoryFromConfig]
-//     factories registered for every entry in
-//     `parser.SupportedLanguages`) is exposed via the
-//     `metric_ingestor.DirectoryAstFileSource`
-//     `Coordinator` / `Pool` optional fields. When wired
-//     by the future Stage 10.x scan-loop integration the
-//     per-commit walk admits ONE scan into the coordinator
-//     and routes per-file parses through
-//     [Pool.ParseInScan] for crash isolation.
+//   - `mountIngestRouter` wires
+//     `metric_ingestor.RegistryBackedFoundationDispatcher`
+//     with a `metric_ingestor.DirectoryAstFileSource` whose
+//     `Coordinator` / `Pool` fields point at the SAME
+//     primitives the flip drains. The per-commit walk admits
+//     ONE scan into the coordinator (deferring `EndScan`)
+//     and routes per-file parses through [Pool.ParseInScan]
+//     so subprocess crashes surface as typed errors AND the
+//     in-flight counter tracks one scan, not one-per-file.
+//     This branch is conditional on
+//     `config.Config.AstScanRoot` being set; when unset the
+//     binary falls back to
+//     `metric_ingestor.NoopFoundationRecipeDispatcher` so a
+//     webhook-only deployment still boots without an on-disk
+//     scan root.
+//
+// # Open-question decisions (closed by this stage)
+//
+//   - "Does scan-path `BeginScan`/`EndScan` wiring belong in
+//     this stage?" -- YES. The drain barrier is only
+//     observable end-to-end if the scan path admits into the
+//     same coordinator the flip waits on; deferring the
+//     scan-path wiring to a future stage left the flip
+//     observing an empty in-flight set, which is the bug
+//     iter-2 evaluator items 2/3/4 surfaced. The
+//     `RegistryBackedFoundationDispatcher` /
+//     `DirectoryAstFileSource{Coordinator, Pool}` wiring
+//     above closes the loop.
+//   - "Should IPC use proto?" -- NO. The child handler IPC
+//     stays length-prefixed gob frames (see [RunChild] and
+//     [runExecWorker]). A proto migration is a
+//     forward-compatible swap of the codec at the
+//     frame-boundary and is deferred to a dedicated
+//     workstream so this stage's blast radius stays scoped
+//     to crash isolation + drain-before-flip.
 package isolation

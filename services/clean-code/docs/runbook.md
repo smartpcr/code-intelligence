@@ -116,8 +116,283 @@ successful `evaluation_run`, `evaluation_verdict`, and
 tests cover the signer-failure rollback case AND the
 write/fsync-failure rollback case (the per-day partition
 path is pre-created as a directory to force a real disk
-write failure at `os.OpenFile`). Stage 9.2 will layer
-the reconciler on top.
+write failure at `os.OpenFile`). Stage 9.2 layers the
+reconciler on top.
+
+## Stage 9.2 -- Audit WAL Reconciler (replay-only)
+
+The `internal/audit/reconciler/` package is the
+replay-only restart sweep that walks `data/wal/audit/`,
+verifies every frame's signature, and re-inserts MISSING
+rows into the three Audit tables. **The reconciler never
+modifies a non-Audit table, never deletes a row, never
+overwrites an existing row, and preserves
+`evaluation_run.caller` verbatim from the original frame.**
+Stage 9.1's WAL writer pairs with this worker to close the
+"WAL frame on disk, SQL row absent" gap caused by a fsync
+error or a process crash between the WAL flush and the SQL
+commit.
+
+### Replay-only contract (architecture Sec 7.10)
+
+1. Every Audit re-insert is issued as
+   `INSERT INTO clean_code.<table> (...) VALUES (...)
+   ON CONFLICT (<pk>) DO NOTHING`. A row whose
+   `(table, row_pk)` already exists in PostgreSQL is
+   classified as `OutcomeSkippedExisting` and left
+   byte-identical.
+2. There is NO `DELETE` / `UPDATE` statement anywhere in
+   `internal/audit/reconciler/`. The package's PG role,
+   `clean_code_wal_reconciler`, has `INSERT, SELECT`
+   granted and `UPDATE, DELETE` revoked at the migration
+   layer (migration `0004_roles.up.sql`). A bug in this
+   package CANNOT escalate to a destructive write.
+3. Only the three Audit tables are referenced; the table
+   names live as package-level constants and the
+   per-frame `replayOne` dispatcher uses an explicit
+   `switch` on `wal.AuditFrame.Table`. A frame whose
+   table is outside the closed set
+   (`evaluation_run` / `evaluation_verdict` / `finding`)
+   surfaces `ErrUnknownTable` and aborts the run --
+   defence-in-depth on top of `wal.AuditFrame.Validate`.
+4. `evaluation_run.caller` is bound verbatim from the
+   parsed frame to the SQL parameter. There is NO
+   substitution branch -- if the original writer recorded
+   `caller='batch_refresh'`, the reconciler replays the
+   row with `caller='batch_refresh'`, regardless of which
+   process started the reconciler.
+
+### Phased replay (FK ordering)
+
+The reconciler walks every frame TWICE per `Run`:
+
+1. **Pass 1** -- every `evaluation_run` frame, in WAL
+   order. By the end of this pass every WAL-known
+   `evaluation_run_id` exists in PostgreSQL.
+2. **Pass 2** -- every `evaluation_verdict` and `finding`
+   frame, in WAL order. The FK constraint
+   `evaluation_verdict.evaluation_run_id ->
+   evaluation_run.evaluation_run_id` (and the matching
+   one on `finding`) is honoured EVEN IF a corrupted
+   partition has reordered frames out of writer-order
+   (which the writer never does, but the partition file
+   is on durable disk and an external corruption pass
+   cannot be ruled out).
+
+### Verifier classification
+
+`reconciler.Verifier` distinguishes three failure modes:
+
+- **Durable-broken (skip + count)** -- the frame's
+  signature did not validate
+  (`reconciler.ErrSignatureInvalid`). The reconciler
+  bumps `Stats.SkippedBadSig` and continues with the next
+  frame. The operator MUST manually quarantine the
+  affected partition bytes (see "Operator checklist"
+  below) -- a counted skip is NOT a self-healing recovery.
+- **Signing key not resolved (abort `Run`, Stage 9.2)** --
+  the live `keys.Manager.Verify` returned `ErrUnknownKey`,
+  which the live-only adapter cannot distinguish from
+  "retired but legitimate". The composition adapter
+  surfaces this as a NON-sentinel error so `Run` aborts
+  (loud failure) rather than silently dropping a
+  potentially-legitimate historical frame. Stage 9.3's
+  historical-keys adapter resolves retired keys against
+  the full `policy_signing_keys` table and only then
+  classifies "truly unknown" as
+  `reconciler.ErrSigningKeyUnknown` -> SkippedBadSig.
+- **Transient infrastructure (abort `Run`)** -- any other
+  error from the verifier (KMS unreachable, DB outage,
+  ctx cancellation). The reconciler returns the error from
+  `Run` so an operator can address the root cause before
+  retrying. Silently skipping every frame on a KMS outage
+  would erase the durability guarantee Stage 9.1 set up.
+
+### Stats schema
+
+`reconciler.Run` returns a `Stats` value with per-table
+counters (`Replayed`, `SkippedExisting`, `SkippedBadSig`,
+`SkippedBadShape`) and a `Warnings []string` channel for
+non-fatal signals from `wal.ReadAll`
+(`ErrTrailingPartialFrame`, `ErrFrameSizeExceeded`). The
+post-Stage-9.4 OTel pipeline publishes these as
+Prometheus counters with a `table` label; operators can
+correlate skipped-row counts with disk artifacts.
+
+`SkippedBadShape` covers PRE-signature structural
+failures only -- a frame whose `wal.AuditFrame.Validate`
+or `SigningPayload` rejected it before signature
+verification could even run. POST-signature
+disagreements (decode rejection under
+`DisallowUnknownFields`, `frame.RowPK` disagreeing with
+`row_json.<pk>`) are loud `Run` aborts -- they signal
+writer-side schema drift or a durability-coordinate
+corruption and warrant immediate operator triage rather
+than silent skip.
+
+### Operator checklist
+
+1. **Trailing-partial-frame warning** -- benign for the
+   reconciler (every complete frame preceding it
+   replayed). Quarantine the tail bytes after the run by
+   `cp data/wal/audit/<date>.wal /var/quarantine/`,
+   truncating the original at the last complete-frame
+   newline. Stage 9.4 will surface a Prometheus counter
+   for the warning; until then `grep` the binary's stdout
+   for "ErrTrailingPartialFrame".
+2. **Frame-size-exceeded warning** -- pages an on-call.
+   A single frame > 1 MiB is either a Stage 9.1 writer
+   bug (no in-package check should let one through) or a
+   forged frame. Quarantine the entire partition file
+   and STOP further reconciliation runs until the source
+   is identified.
+3. **`SkippedBadSig > 0`** -- the affected frames carry
+   either a tampered signature or a payload modified
+   after signing. (Retired-key frames are NOT classified
+   here in Stage 9.2; they abort `Run` instead -- see
+   "Known limitation" below.) The reconciler does NOT
+   replay these. Investigate the partition file by hand:
+   re-parse the JSON, identify the `signing_key_id` and
+   `row_pk`, and decide whether the underlying business
+   event landed in PostgreSQL via a separate path or
+   needs manual entry by a Policy Steward.
+4. **`SkippedBadShape > 0`** -- the affected frames
+   failed `wal.AuditFrame.Validate` or `SigningPayload`
+   BEFORE signature verification. None of these can
+   happen via the Stage 9.1 writer; investigate as a
+   tamper / on-disk corruption signal. (Post-signature
+   schema drift / RowPK mismatch are abort-Run, not
+   counted here.)
+5. **Run returns an error mentioning `decode failed AFTER
+   valid signature` or `ErrRowPKMismatch`** -- the
+   reconciler saw a frame whose `row_json` decoded
+   incorrectly OR whose `RowPK` disagreed with
+   `row_json.<pk>` AFTER the signature verified. This is
+   writer-side schema drift OR a signing-key compromise.
+   STOP further reconciliation runs, page the on-call,
+   quarantine the partition, audit recent Policy Steward
+   key-rotation events, and confirm the writer's audit
+   columns match the current PG schema before retrying.
+6. **Run returns an error mentioning
+   `live keys.Manager cannot resolve key id=`** -- the
+   live-only adapter cannot distinguish "retired but
+   legitimate" from "truly unknown" signing keys. The
+   Stage 9.2 composition refuses to skip such frames
+   silently and aborts the run. Until Stage 9.3's
+   historical-keys adapter lands, do NOT enable the
+   reconciler in production unless you have confirmed no
+   frames signed by now-retired keys are pending replay.
+7. **Run returns any other error** -- the WAL reconciler
+   did not complete. The most common cause is verifier
+   transient error (KMS unreachable). Verify
+   `policy.keys.list_active` returns the expected key,
+   restart the reconciler. If the error mentions the
+   Replayer (`reconciler: replayOne: ReplayRun ...`),
+   check PostgreSQL connectivity and that the
+   `clean_code_wal_reconciler` role still has
+   `INSERT, SELECT` on the three Audit tables (it has by
+   default; a manual `REVOKE` would break this).
+
+### Composition wiring
+
+The composition factory is
+`composition.NewWALReconciler(WALReconcilerConfig)`
+returning a `*reconciler.Reconciler`. The factory:
+
+- Requires a `*keys.Manager` (returns `(nil, nil)` when
+  the manager is nil so the binary branches "reconciler
+  disabled" deliberately).
+- Requires a non-nil `*sql.DB` authenticated as
+  `clean_code_wal_reconciler` (migration 0004 grants
+  INSERT+SELECT only; UPDATE / DELETE are revoked
+  service-wide).
+- Requires a non-empty `Dir` -- production wiring threads
+  `CLEAN_CODE_AUDIT_WAL_DIR` (default `data/wal/audit`)
+  through, matching the writer's directory.
+- Constructs the production `reconciler.SQLReplayer` and
+  a `composition.NewKeysManagerWALVerifier`-backed
+  Verifier; passes both into `reconciler.NewReconciler`.
+
+The verifier adapter maps the manager's sentinels to the
+reconciler's classification:
+
+| `keys.Manager.Verify` returned | Reconciler classification |
+|---|---|
+| `nil` | replay row |
+| `keys.ErrSignatureMismatch` | wraps `reconciler.ErrSignatureInvalid` -> SkippedBadSig |
+| `keys.ErrUnknownKey` (incl. retired-key path) | NON-sentinel error -> ABORT `Run` (intentional fail-loud until Stage 9.3) |
+| any other error | propagated -> abort `Run` |
+
+### Known limitation (Stage 9.3 follow-up)
+
+The verifier adapter calls `keys.Manager.Verify`, which
+rejects keys OUTSIDE their `[valid_from, valid_until)`
+window with `ErrUnknownKey`. A frame signed yesterday by
+a key that rotated out of the active window today CANNOT
+verify against the live manager. To preserve the
+brief's durability guarantee, the Stage 9.2 adapter
+ABORTS `Run` on this condition rather than silently
+classifying the frame as `SkippedBadSig` and dropping
+it. The historical-keys adapter -- which consults the
+full `clean_code.policy_signing_keys` table (including
+`retired_at IS NOT NULL` rows) -- lands in Stage 9.3.
+Until then production wiring SHOULD NOT enable the
+reconciler unless the operator has confirmed no
+retired-key frames are pending replay; otherwise the
+binary will abort on first contact with such a frame
+and a manual one-shot replay (see "Deferred binary
+wiring" below) is required.
+
+### Binary wiring (deferred, Stage 9.3)
+
+`cmd/clean-code-eval-gate/main.go` and
+`cmd/clean-code-gateway/main.go` do NOT yet construct a
+reconciler at startup. The full wiring requires:
+
+- A third PostgreSQL DSN env var
+  (`CLEAN_CODE_WAL_RECONCILER_DSN`) so the reconciler's
+  pool authenticates as `clean_code_wal_reconciler`
+  rather than reusing the gateway's `clean_code_evaluator`
+  / `clean_code_solid_batch` pools.
+- A bounded one-shot `Run` invocation at startup,
+  BEFORE the HTTP listener accepts traffic, so a missing
+  reconcilation cannot serve stale gate decisions.
+
+Until Stage 9.3 lands the binary, operators can run the
+reconciler manually via a Go one-shot:
+
+```go
+package main
+
+import (
+    "context"
+    "database/sql"
+    "log"
+    "os"
+
+    _ "github.com/lib/pq"
+
+    "github.com/smartpcr/code-intelligence/services/clean-code/internal/composition"
+    "github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
+)
+
+func main() {
+    db, err := sql.Open("postgres", os.Getenv("CLEAN_CODE_WAL_RECONCILER_DSN"))
+    if err != nil { log.Fatal(err) }
+    defer db.Close()
+    var mgr *keys.Manager // construct via existing composition helpers
+    r, err := composition.NewWALReconciler(composition.WALReconcilerConfig{
+        DB:   db,
+        Dir:  os.Getenv("CLEAN_CODE_AUDIT_WAL_DIR"),
+        Keys: mgr,
+    })
+    if err != nil { log.Fatal(err) }
+    if r == nil { log.Fatal("reconciler disabled (no Manager wired)") }
+    stats, err := r.Run(context.Background())
+    if err != nil { log.Fatal(err) }
+    log.Printf("reconciler complete: %+v", stats)
+}
+```
 
 ## Stage 7.1 -- Cross-Repo Aggregator cadence loop
 

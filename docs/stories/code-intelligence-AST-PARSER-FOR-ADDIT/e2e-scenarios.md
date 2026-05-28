@@ -84,6 +84,29 @@ process or runtime dependencies (pwsh on PATH for Phase 6, postgres +
 qdrant + otel via docker compose for Phase 1 migration + Phase 7
 full-service suite).
 
+### 0.4 New e2e compose-file inventory (artifacts this story introduces)
+
+Per the brief's compose convention (`tests/e2e/{phase-slug}/docker-compose.yml`),
+this story introduces two new compose files. They are NOT alternatives
+to the existing service-local stack at
+`services/agent-memory/deploy/local/docker-compose.yml`; that file
+remains the source of truth for full-service local development. The
+e2e files below are scoped to the AST-PARSER story's QA needs and are
+created as part of the Phase 1 / Phase 7 implementation:
+
+| Compose path                                                       | Services started                       | Used by         |
+| ---                                                                | ---                                    | ---             |
+| `tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml`    | `postgres` (with init SQL from `services/agent-memory/deploy/local/postgres/`) | Phase 1 migration probe; Phase 1 dispatcher unit tests do not need postgres but inherit the same compose to keep `make` lines uniform |
+| `tests/e2e/phase-7-cross-cutting-validation/docker-compose.yml`    | `postgres`, `qdrant`, `otel-collector` (overlay over the service-local Dockerfiles) | Phase 7 targeted + CGO-off + full-service validation runs |
+
+Connection-string variables resolved by these compose files
+(`AGENT_MEMORY_PG_URL`, `AGENT_MEMORY_QDRANT_URL`,
+`AGENT_MEMORY_OTEL_ENDPOINT`) are read by the Go tests through the
+`os.Getenv` pattern already used by `internal/recallcontext/log_integration_test.go`
+and the agent-memory-ci workflow. Tests skip when the env var is
+unset (the existing convention for integration tests in this repo);
+the doc never inlines the underlying DSN.
+
 ---
 
 # Phase 1: Shared additive surfaces and dispatcher edits
@@ -98,10 +121,11 @@ full-service suite).
 ### Setup
 
 - **Type**: compose
-- **Local**: From `services/agent-memory`, run `docker compose -f deploy/local/docker-compose.yml up -d postgres` to start the schema-bearing postgres. Export `AGENT_MEMORY_PG_URL=postgres://agent_memory:agent_memory@localhost:5432/agent_memory?sslmode=disable`. Then run `go test ./internal/repoindexer/ast -count=1 -run 'TestDispatcher|TestParserGo|TestLangMeta|TestErrParserUnavailable'` for the dispatcher unit-test slice and `go test ./internal/datastore -count=1 -run 'TestMigrations_0022_EdgeKindOverrides'` for the migration apply / probe test.
-- **CI runner**: GitHub-hosted `ubuntu-latest` per `.github/workflows/agent-memory-ci.yml` (the existing `lint-build-test` job already brings up the compose stack). No new runner pool required.
-- **Secrets**: None for the unit / migration tests at this phase -- postgres credentials are baked into the local compose at `deploy/local/docker-compose.yml` and used only inside the disposable CI container. The agent-memory-ci workflow consumes `AGENT_MEMORY_PG_URL`, `AGENT_MEMORY_QDRANT_URL`, `AGENT_MEMORY_OTEL_ENDPOINT` as workflow `env`. No KeyVault and no GitHub environment scoped secret is needed because no production credential crosses the boundary.
-- **Pre-test bootstrap**: `make migrate-up` from `services/agent-memory` applies migrations `0001` through `0022` against `$AGENT_MEMORY_PG_URL`. The migration phase test asserts the new `0022_edge_kind_overrides.sql` is reachable.
+- **Compose file**: `tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml` (NEW artifact this story introduces). Services started: `postgres` only (the postgres image plus init SQL from `services/agent-memory/deploy/local/postgres/`, exposing port 5432 on the runner's loopback). Qdrant and the OTel collector are NOT started; the Phase 1 scenarios only exercise the AST dispatcher (in-process) and the schema migration journal (postgres only).
+- **Local**: From the repo root, run `docker compose -f tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml up -d` to start postgres. Export `AGENT_MEMORY_PG_URL` to the env-var convention used by the agent-memory test suite (the value is supplied by the compose file's documented mapping; tests read the env var, never a literal DSN). Then run `go test ./internal/repoindexer/ast -count=1 -run 'TestDispatcher|TestLangMeta|TestErrParserUnavailable|TestMergeLangMeta|TestNormalizeHints|TestPass2bMultimap|TestPass2dOverrides'` for the dispatcher unit-test slice and `go test ./migrations -count=1 -run 'TestMigrator_Up_AppliesAll|TestMigrations_0022_EdgeKindOverrides'` for the migration apply / probe test.
+- **CI runner**: GitHub-hosted `ubuntu-latest` per `.github/workflows/agent-memory-ci.yml` (the existing `integration-stack` job already starts a postgres container with healthchecks). No new runner pool, labels, or hosted image required.
+- **Secrets**: None. The Phase 1 unit + migration tests run against the disposable runner-local postgres started from the compose file. The agent-memory-ci workflow reads `AGENT_MEMORY_PG_URL` / `AGENT_MEMORY_QDRANT_URL` / `AGENT_MEMORY_OTEL_ENDPOINT` as workflow-scoped `env` keys; no KeyVault path and no GitHub environment-scoped secret is referenced because no production credential crosses the boundary.
+- **Pre-test bootstrap**: `go mod download` from `services/agent-memory`; then the migration apply happens in-process at test setup via `migrations.New(db).Up(ctx)` (the embedded `migrations` package iterates `0001` through `0022` in lexicographic order against `$AGENT_MEMORY_PG_URL`). The migration probe test asserts the new `0022_edge_kind_overrides.sql` is reachable and that `'overrides'::edge_kind` resolves.
 
 ### Scenarios
 
@@ -225,7 +249,7 @@ Scenario: Pass 2d cross-file miss is silent
 @migration
 Scenario: Migration 0022 appends overrides to edge_kind enum
   Given postgres is reachable at $AGENT_MEMORY_PG_URL with migrations applied through 0021
-  When `make migrate-up` runs
+  When the test harness calls migrations.New(db).Up(ctx) against $AGENT_MEMORY_PG_URL
   Then migration 0022_edge_kind_overrides.sql applies without error
   And `SELECT 'overrides'::edge_kind` returns the string "overrides"
   And `SELECT unnest(enum_range(NULL::edge_kind))` includes "overrides" along with the pre-existing values (contains, imports, static_calls, observed_calls, extends, implements, reads, writes, renamed_to)
@@ -234,8 +258,8 @@ Scenario: Migration 0022 appends overrides to edge_kind enum
 ```gherkin
 @migration @regression
 Scenario: Migration 0022 is idempotent on the runner re-pass
-  Given postgres has migration 0022_edge_kind_overrides.sql applied once
-  When the migration runner runs again
+  Given postgres has migration 0022_edge_kind_overrides.sql applied once via migrations.New(db).Up(ctx)
+  When migrations.New(db).Up(ctx) is invoked a second time
   Then 0022 is skipped by filename (no duplicate ALTER TYPE ... ADD VALUE issued)
   And `SELECT count(*) FROM pg_enum WHERE enumlabel='overrides'` returns exactly 1
 ```
@@ -848,10 +872,10 @@ Scenario: .rs file is skipped under CGO=off
 ### Setup
 
 - **Type**: inline
-- **Local**: From `services/agent-memory`, ensure `pwsh` is on PATH (`pwsh --version` returns >= 7.0). Then run `go test ./internal/repoindexer/ast -count=1 -run 'TestPowerShellFixture|TestPowerShellParser|TestParserPowerShell'` under either `CGO_ENABLED=0` or `CGO_ENABLED=1`. When `pwsh` is absent the fixture tests call `t.Skip` and remain green; the sentinel scenario forces `pwshBin=""` and runs unconditionally.
-- **CI runner**: GitHub-hosted `ubuntu-latest`. The agent-memory-ci workflow installs `pwsh` once via the official `apt` repository (`microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb` plus `apt-get install -y powershell`) before the `make test` step. The same install line covers Phase 7 below. No new runner pool required.
+- **Local**: From `services/agent-memory`, ensure `pwsh` is on PATH (`pwsh --version` returns >= 7.0). Then run `go test ./internal/repoindexer/ast -count=1 -run 'TestPowerShellFixture|TestPowerShellParser|TestParserPowerShell'` under either `CGO_ENABLED=0` or `CGO_ENABLED=1`. When `pwsh` is absent the fixture tests call `t.Skip` and remain green; the sentinel scenario (`TestPowerShellParser_NoPwsh_ReturnsSentinel`) forces `pwshBin=""` and runs unconditionally.
+- **CI runner**: GitHub-hosted `ubuntu-latest` per the existing `.github/workflows/agent-memory-ci.yml`. The workflow does NOT install `pwsh` today (no apt step for `powershell` exists in the `lint-build-test`, `pre-commit`, or `integration-stack` jobs at lines 39-258 of that workflow). Per `implementation-plan.md` Stage 6.3 lines 417, 428, the canonical CI posture for v1 is "PowerShell fixture tests `t.Skip` when `pwsh` is not on PATH", which keeps the hosted runner green without adding a pwsh install step. Adding a pwsh install line to the workflow is out of scope for this story and is tracked as the deferred open question `phase6-ci-install-pwsh` below.
 - **Secrets**: None. The subprocess invocation passes source bytes on stdin and consumes JSON on stdout; no credentials cross the process boundary.
-- **Pre-test bootstrap**: `pwsh -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion'` to confirm runtime availability. CI bootstrap also runs the apt install before `go test`. Tests that depend on `pwsh` carry `@needs-pwsh`; tests that prove the absent-pwsh skip path carry `@no-pwsh`.
+- **Pre-test bootstrap**: `go mod download`. On a developer workstation with `pwsh` present, run `pwsh -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion'` to confirm runtime availability before invoking `go test`. Tests that depend on `pwsh` carry `@needs-pwsh`; tests that prove the absent-pwsh skip path carry `@no-pwsh`. On the agent-memory-ci hosted runner the `@needs-pwsh` scenarios skip and the `@no-pwsh` sentinel + dispatcher-skip scenarios provide the only Phase 6 coverage until the deferred workflow change lands.
 
 ### Scenarios
 
@@ -1001,10 +1025,11 @@ Scenario: Top-level function emits no modifiers; class method emits static / hid
 ### Setup
 
 - **Type**: compose
-- **Local**: From `services/agent-memory`, run `docker compose -f deploy/local/docker-compose.yml up -d` to bring up postgres + qdrant + otel collector. Export `AGENT_MEMORY_PG_URL`, `AGENT_MEMORY_QDRANT_URL`, `AGENT_MEMORY_OTEL_ENDPOINT` as in the agent-memory-ci workflow. Then run, in order: `CGO_ENABLED=1 go test ./internal/repoindexer/ast -count=1` (targeted), `CGO_ENABLED=0 go test ./internal/repoindexer/ast -count=1` (CGO-off portable matrix), `CGO_ENABLED=1 go test ./... -count=1` (full service suite), and `make lint`.
-- **CI runner**: GitHub-hosted `ubuntu-latest` per `.github/workflows/agent-memory-ci.yml`. The existing job already runs the compose stack + the lint/build/test triple; this story extends the matrix to include a `cgo-off` leg so the no_parser skip is regression-tested. No new runner pool required.
-- **Secrets**: None for the in-repo validation. Local compose credentials are bake-test-only. The agent-memory-ci workflow does NOT consume any KeyVault or GitHub-environment-scoped secret for this story.
-- **Pre-test bootstrap**: `make migrate-up` (applies migrations 0001-0022 including the new `0022_edge_kind_overrides.sql` from Phase 1), `go mod download`, and `pwsh --version` to confirm Phase 6's runtime is present (otherwise the PS fixture skips, which is acceptable but reduces coverage).
+- **Compose file**: `tests/e2e/phase-7-cross-cutting-validation/docker-compose.yml` (NEW artifact this story introduces). Services started: `postgres`, `qdrant`, and `otel-collector` (the same three the existing `services/agent-memory/deploy/local/docker-compose.yml` brings up; the Phase 7 compose file is a thin overlay that points its build context at the service-local Dockerfiles so the e2e tree owns the new file path without forking the image definitions). Ports 5432 (postgres), 6333 (qdrant), and 4317 (otel gRPC) bind to runner loopback.
+- **Local**: From the repo root, run `docker compose -f tests/e2e/phase-7-cross-cutting-validation/docker-compose.yml up -d` to bring up the three services. Export `AGENT_MEMORY_PG_URL`, `AGENT_MEMORY_QDRANT_URL`, `AGENT_MEMORY_OTEL_ENDPOINT` via the env-var convention already used by `.github/workflows/agent-memory-ci.yml` (the workflow keys these in its job `env`; local developers can `source` a `.envrc` that mirrors the same keys, never inlining the literal DSNs in the doc or in shell history). Then run, in order: `CGO_ENABLED=1 go test ./internal/repoindexer/ast -count=1` (targeted), `CGO_ENABLED=0 go test ./internal/repoindexer/ast -count=1` (CGO-off portable matrix), `CGO_ENABLED=1 go test ./... -count=1` (full service suite), and `make lint`.
+- **CI runner**: GitHub-hosted `ubuntu-latest` per `.github/workflows/agent-memory-ci.yml`. The existing `integration-stack` job already runs the compose stack + the lint/build/test triple. This story adds an additional matrix leg with `CGO_ENABLED=0` to regression-test the no_parser skip; the workflow file edit for that matrix leg is part of Phase 7's implementation. No new runner pool, labels, or hosted image required.
+- **Secrets**: None for the in-repo validation. The runner-local postgres / qdrant / otel containers use credentials baked into the compose file's service definitions and never persist beyond the job container. The agent-memory-ci workflow does NOT consume any KeyVault path or GitHub environment-scoped secret for this story.
+- **Pre-test bootstrap**: `go mod download`; then the integration-class tests apply migrations in-process via `migrations.New(db).Up(ctx)` from the embedded `migrations` package against `$AGENT_MEMORY_PG_URL` (the `0022_edge_kind_overrides.sql` file from Phase 1 ships in the embed). On a developer workstation with `pwsh` present, `pwsh --version` confirms Phase 6's runtime; on the hosted runner the PS fixture skips per Phase 6 above. The runner also primes the qdrant collection via `cmd/qdrant-bootstrap` if any persistence-touching tests in `./...` require the collection (covered by the existing integration-stack scripts).
 
 ### Scenarios
 

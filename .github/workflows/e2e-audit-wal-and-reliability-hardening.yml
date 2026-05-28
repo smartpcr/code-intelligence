@@ -1,59 +1,63 @@
-name: E2E – Audit WAL and Reliability Hardening
+name: "E2E – Audit WAL & Reliability Hardening"
 
 on:
+  push:
+    branches:
+      - feature/clean-code
+      - "ws/code-intelligence-CLEAN-CODE/**"
+    paths:
+      - "services/clean-code/**"
   pull_request:
-    branches: [main]
+    branches:
+      - feature/clean-code
     paths:
       - "services/clean-code/**"
   workflow_dispatch:
 
-permissions:
-  contents: read
-
-env:
-  GO_VERSION: "1.25.1"
-  COMPOSE_FILE: services/clean-code/deploy/local/docker-compose.yml
+concurrency:
+  group: e2e-audit-wal-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  e2e-audit-wal-frame-writer:
-    name: "E2E – Audit WAL Frame Writer"
+  e2e-audit-wal-reconciler:
+    name: "Audit WAL Reconciler Replay Only"
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version: "1.25"
           cache-dependency-path: services/clean-code/go.sum
 
       - name: Start compose services
-        run: docker compose -f ${{ env.COMPOSE_FILE }} up -d --build
-
-      - name: Export compose-provided env vars
         run: |
-          PG_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port postgres 5432 | cut -d: -f2)
-          EVAL_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port evaluator 8080 | cut -d: -f2)
-          OTEL_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port otel-collector 4317 | cut -d: -f2)
-          echo "CLEAN_CODE_PG_URL=postgres://postgres:postgres@localhost:${PG_PORT}/clean_code?sslmode=disable" >> "$GITHUB_ENV"
-          echo "CLEAN_CODE_EVALUATOR_URL=http://localhost:${EVAL_PORT}" >> "$GITHUB_ENV"
-          echo "CLEAN_CODE_OTEL_ENDPOINT=http://localhost:${OTEL_PORT}" >> "$GITHUB_ENV"
-          echo "CLEAN_CODE_REPO_ROOT=${{ github.workspace }}/services/clean-code" >> "$GITHUB_ENV"
+          docker compose -f tests/e2e/phase-09-audit-wal/docker-compose.yml up -d --build
+          sleep 10
 
-      - name: Bootstrap – migrate and seed
+      - name: Bootstrap DB
+        working-directory: services/clean-code
         run: |
-          make migrate-up CLEAN_CODE_PG_URL="${CLEAN_CODE_PG_URL}"
-          make seed-phase-09 CLEAN_CODE_PG_URL="${CLEAN_CODE_PG_URL}"
+          make migrate-up
+          make seed-phase-09
 
       - name: Run E2E tests
         working-directory: services/clean-code
+        env:
+          CLEAN_CODE_PG_URL: postgres://clean_code_admin:e2e_test_password@localhost:5432/clean_code?sslmode=disable
+          CLEAN_CODE_OTEL_ENDPOINT: http://localhost:4317
         run: |
-          go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
-            -run TestE2E_audit_wal_and_reliability_hardening_audit_wal_frame_writer
+          go test -tags e2e -v -count=1 -timeout 120s \
+            ./test/e2e/code-intelligence-CLEAN-CODE/...
 
-      - name: Tear down compose services
+      - name: Collect compose logs
         if: always()
-        run: docker compose -f ${{ env.COMPOSE_FILE }} down -v --remove-orphans
+        run: |
+          docker compose -f tests/e2e/phase-09-audit-wal/docker-compose.yml logs --tail=200
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose -f tests/e2e/phase-09-audit-wal/docker-compose.yml down -v

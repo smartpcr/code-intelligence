@@ -60,6 +60,23 @@
 //     of an `assignment_statement`. Plural assignments
 //     (`a.x, a.y = 1, 2`) are handled by walking the LHS
 //     expression list.
+//
+// Operator pins applied to this file:
+//   - `receiver_type` is the canonical LangMeta key for the
+//     receiver type name on MethodDecl (operator pin
+//     `confirm-receiver_type` from the iter-2/3 stable choice;
+//     re-confirmed by the iter-12 operator-answers block).
+//     Do NOT rename to `recv_type` / `receiver_class` without
+//     a fresh pin -- the architecture catalog (§4.4.3) and
+//     downstream consumers key off this exact string.
+//   - The sibling `internal/repoindexer/ast` baseline compile
+//     is resolved by the //go:build canonical_dispatcher tag
+//     on the iter-2 structural fix (operator pin
+//     `ratify-iter2-canonical_dispatcher-tag`). This file
+//     intentionally does NOT depend on the canonical_dispatcher
+//     symbols; it only uses the parser.go-canonical
+//     `ParseResult`, `ClassDecl`, `MethodDecl`, and `Import`
+//     types so it compiles unconditionally under CGO=1.
 
 package ast
 

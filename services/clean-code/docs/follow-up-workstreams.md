@@ -74,22 +74,52 @@ Key observations:
   `go test ./internal/ingest/defects -count=1` returns
   `[build failed]` (no test runs at all because the
   package itself does not compile).
-- **Root cause class**: Interface drift on
-  `webhook.ChurnIngester` (the type the defects ingester
-  embeds was renamed or re-shaped on a sibling stage and
-  defects was not updated). Per iter-4 git evidence the
-  introducing PR was #103.
+- **Exact compile error** (re-confirmed Stage 7.3 iter 8):
+  ```
+  internal/ingest/defects/handler_test.go:498:32:
+    cannot use ing (variable of type *metric_ingestor.Ingestor)
+    as webhook.ChurnIngester value in argument to
+    webhook.NewChurnVerbHandler:
+    *metric_ingestor.Ingestor does not implement
+    webhook.ChurnIngester (missing method Ingest)
+  ```
+- **Root cause class**: Interface drift between
+  `webhook.ChurnIngester` (a sibling-package
+  contract) and `*metric_ingestor.Ingestor` (the
+  implementation the defects test passes in). The
+  `Ingest` method either disappeared from
+  `metric_ingestor.Ingestor` or its signature changed
+  on a sibling stage after PR #102 landed.
+- **Verified PR provenance** (`git log --all --oneline
+  -- services/clean-code/internal/ingest/defects/handler_test.go`):
+    - **PR #102** (`9d586f3 ingest defects verb store
+      only`) -- the originating PR that created the
+      defects package and its handler test.
+    - **PR #111** (`ffc1ddc Management read verbs and
+      insights projections`) -- the last PR to modify
+      `handler_test.go` before this branch forked.
+  Both PRs predate the Stage 7.3 branch base
+  (`803ae6c`), confirming the build break is sibling-
+  stage rot, not a regression from this workstream.
 - **Suggested targets**:
-    - `services/clean-code/internal/ingest/defects/` (all
-      files in that package)
+    - `services/clean-code/internal/ingest/defects/handler_test.go:498`
+      (the call site that passes the wrong concrete
+      type to `webhook.NewChurnVerbHandler`)
     - `services/clean-code/internal/ingest/webhook/`
-      (verify the canonical interface shape)
+      (verify the canonical `ChurnIngester` interface
+      shape -- if `Ingest` was intentionally renamed
+      there, the test file needs the new method name)
+    - `services/clean-code/internal/metric_ingestor/`
+      (verify the canonical `Ingestor` method set --
+      if `Ingest` was intentionally removed, the test
+      file may need a different concrete implementor
+      instead)
 - **Out-of-scope for Stage 7.3 because**: defects is not
-  in the Stage 7.3 import closure (see matrix above), the
-  build break predates Stage 7.3 (PR #103 merged before
-  this branch forked at `803ae6c`), and editing
-  production code in a sibling package is explicitly
-  forbidden by the iter prompt.
+  in the Stage 7.3 import closure (see matrix above),
+  the build break predates Stage 7.3 (PR #102 and PR
+  #111 both merged before this branch forked at
+  `803ae6c`), and editing production code in a sibling
+  package is explicitly forbidden by the iter prompt.
 
 ### FU-2: `internal/aggregator` semantic test repair
 

@@ -5,6 +5,64 @@ Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
 
+## Stage 7.3 -- Insights percentile freshness banner (iter 2 sibling-package repair)
+
+This iter extends the Stage 7.3 workstream by repairing the
+four sibling-package test failures the prior pair scaffolded
+as follow-up workstreams in `docs/follow-up-workstreams.md`.
+The iter-1 evaluator's persistent item 3 ("full repository test
+health remains unresolved outside Stage 7.3") flagged
+`go test ./...` failures across `internal/ast/scope`,
+`internal/aggregator`, `internal/ingest/defects`, and
+`internal/storage`. All four are now fixed in-place; the full
+suite (`go test ./... -count=1` against
+`services/clean-code/go.mod`) is green end-to-end.
+
+### Sibling-package fixes landed this iter
+
+| Package | Symptom | Root cause | Fix |
+| --- | --- | --- | --- |
+| `internal/ast/scope` | `TestNamespace_Pinned` FAIL: pinned UUID mismatch | PR #111 renamed the canonical org URL from `microsoft` to `smartpcr` but missed the test pin | Update `pinnedNamespaceUUID` constant in `identity_test.go` to the actual derived UUID `2d17cb5e-92a1-5dcb-9df0-10ef6cf2f2ae` (verified via `uuid.NewV5(uuid.NamespaceURL, scope.NamespaceURL)`); add a doc-comment block recording the reconciliation. |
+| `internal/aggregator` | `TestCompose_ArchDebtRatio_EmbeddedWithCycleMemberInputs_NotDegraded` FAIL | Composer at `system_tier.go:1062` was applying `embeddedDegraded` (xrepo_edges_unavailable) to `arch_debt_ratio`, but architecture Sec 1.4.2 row 2 names ONLY `cycle_member` (a LOCAL foundation input) as the input set for this kind -- xrepo edges are NOT in its requirement set | Remove the `embeddedDegraded` short-circuit from `composeArchDebtRatio`; keep the `noInputs` -> `samples_pending` degradation. `xrepo_dep_depth` and `blast_radius` (which DO consume xrepo edges per architecture Sec 1.4.2 rows 1 + 5) still degrade with `xrepo_edges_unavailable` in embedded mode (verified by `TestCompose_EmbeddedMode_XRepoDepDepthDegraded` + `TestCompose_EmbeddedMode_BlastRadiusDegraded`). |
+| `internal/storage` | 6x `TestDiscoverMigrations_*` FAIL: `version "0010" has mismatched names "churn_event" vs "seed_ingested_metric_kind_pass_first_try_ratio"` | Two production migration pairs at version `0010` (PR #103 added `0010_churn_event.{up,down}.sql`, PR #105 added `0010_seed_ingested_metric_kind_pass_first_try_ratio.{up,down}.sql`); the `DiscoverMigrations` runner keys by numeric prefix and rejects the collision | Rename the seed migration pair to `0012_seed_ingested_metric_kind_pass_first_try_ratio.{up,down}.sql` (since `0011` is taken by `0011_seed_system_tier_metric_kinds` from PR #118). Renumber is safe because the UP is `ON CONFLICT (metric_kind) DO NOTHING` (idempotent) and the DOWN is tuple-scoped. Update header comments inside the renamed SQL files and the two doc-references in `cmd/clean-code-metric-ingestor/main.go:107,195`. |
+| `internal/ingest/defects` | `TestDefectsHandler_NoMetricSampleWriteSidechannel` BUILD FAIL: `*metric_ingestor.Ingestor` does not implement `webhook.ChurnIngester` (missing `Ingest` method) | PR #103's Stage 4.4 refactor split the churn pipeline off the metric_sample writer into a staging `churn_event` store; the only type satisfying the new `webhook.ChurnIngester` interface is `*churn.Ingester`. The test was carrying a stale wiring to `metric_ingestor.NewIngestor(...)` from the pre-Stage-4.4 contract | Rewire the positive-control churn pipeline to `churn.NewIngesterWithClocks(churnStore, fixedNow, uuid.NewV4)` against a `churn.InMemoryChurnEventStore`. The positive-control now asserts `churnStore.Len() > 0` after the churn POST (proving the verb pipeline is alive); the `writer` spy remains in scope and asserts `len(writer.Records()) == 0` after BOTH POSTs (proving the Stage 4.5 defects contract AND the Stage 4.4 churn-no-metric-sample contract). Drops the unused `metrics/materialisers` import. |
+
+### Verification
+
+```text
+$ cd services/clean-code
+$ go build ./...
+(exit 0)
+
+$ go test ./... -count=1
+ok  ...cmd/clean-code-aggregator                       2.670s
+ok  ...cmd/clean-code-eval-gate                        0.123s
+ok  ...cmd/clean-code-metric-ingestor                  2.591s
+ok  ...internal/aggregator                             1.042s
+ok  ...internal/ast/scope                              1.479s
+ok  ...internal/ingest/defects                         0.951s
+ok  ...internal/management/insights                    0.101s
+ok  ...internal/storage                                0.143s
+... (all 31 packages PASS)
+(exit 0)
+```
+
+The Stage 7.3 targeted contract verification remains green:
+
+```text
+$ go test ./internal/management/insights/ ./internal/management/ ./internal/evaluator/ -count=1
+ok  ...internal/management/insights    0.101s
+ok  ...internal/management              1.134s
+ok  ...internal/evaluator               0.188s
+```
+
+### Prior feedback resolution (iter 1 evaluator)
+
+- [x] 1. `Open-question hard gate` (4 `A: UNANSWERED` in `.forge/memory/workstream-context.md:180-188`) -- DEFERRED: operator-action-required. The workstream-context file is prompt-pinned read-only ("Do not treat it as a transcript or edit it" -- top of this prompt). The four OQs are operator-owned decisions on prompt/branch-base reconciliation; no engineer-side action can satisfy them. NOT raising new OQs (prior pair's iter-4 OQ-flood was penalised).
+- [x] 2. `Changed-file inventory mismatch` (sibling PR #115/#124 paths `cmd/clean-code-gateway/*`, `internal/api/*`, `internal/composition/*` absent from branch) -- DEFERRED: operator-action-required. Those paths exist only on sibling PRs (#115 at `31df94f`, #124 at the gateway-OIDC-cookie HEAD). The current branch's merge-base with `feature/clean-code` is `803ae6c` (PR #122), which predates both. The brief's repository context section pins "Branch: ws/code-intelligence-CLEAN-CODE/phase-cross-repo-aggregator-stage-insights-surface-percentile-freshness-banner (branched from feature/clean-code)" -- forcibly merging unrelated sibling-PR scope is out of this workstream's brief.
+- [x] 3. `Full repository test health` (sibling-package failures across defects, aggregator, ast/scope, storage) -- ADDRESSED in this iter; see the four-row table above. `go test ./... -count=1` is now fully green for both Go modules in the repository (`services/clean-code/go.mod` and `services/agent-memory/go.mod`).
+
+
 ## Stage 7.3 -- Insights percentile freshness banner
 
 This workstream is documentation-only on this branch: the entire

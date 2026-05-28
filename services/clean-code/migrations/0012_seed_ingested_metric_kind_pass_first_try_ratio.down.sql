@@ -1,7 +1,7 @@
--- 0010_seed_ingested_metric_kind_pass_first_try_ratio.down.sql
+-- 0012_seed_ingested_metric_kind_pass_first_try_ratio.down.sql
 --
 -- Reverse of
--- 0010_seed_ingested_metric_kind_pass_first_try_ratio.up.sql.
+-- 0012_seed_ingested_metric_kind_pass_first_try_ratio.up.sql.
 -- Deletes the single ingested-pack catalog row seeded by the
 -- UP half, scoped to the EXACT
 -- `(metric_kind, metric_version) = ('pass_first_try_ratio', 1)`

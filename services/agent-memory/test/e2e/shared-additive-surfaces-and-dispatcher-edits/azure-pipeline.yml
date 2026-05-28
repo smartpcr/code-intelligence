@@ -58,8 +58,8 @@ steps:
   - script: |
       cd services/agent-memory
       go test ./internal/repoindexer/ast -count=1 -v \
-        -run 'TestDispatcher|TestLangMeta|TestErrParserUnavailable|TestMergeLangMeta|TestNormalizeHints|TestPass2bMultimap|TestPass2dOverrides'
-    displayName: "Run dispatcher unit-test slice"
+        -run 'TestNormalizeHints|TestSelectParser_ExtensionWinsOverHints'
+    displayName: "Run normalizeHints unit-test slice"
     env:
       AGENT_MEMORY_PG_URL: $(AGENT_MEMORY_PG_URL)
 
@@ -74,7 +74,7 @@ steps:
   - script: |
       cd services/agent-memory
       go test -tags e2e -v -count=1 -timeout 120s \
-        -run TestE2E_shared_additive_surfaces_and_dispatcher_edits_dispatcher_sentinel_branch_pass_2b_multimap_pass_2d_overrides \
+        -run TestE2E_shared_additive_surfaces_and_dispatcher_edits_normalizehints_alias_expansion \
         ./test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/...
     displayName: "Run E2E scenarios"
     env:

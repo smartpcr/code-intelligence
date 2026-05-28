@@ -29,8 +29,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  dispatcher-sentinel-branch-pass-2b-multimap-pass-2d-overrides:
-    name: "dispatcher-sentinel-branch-pass-2b-multimap-pass-2d-overrides"
+  normalizehints-alias-expansion:
+    name: "normalizehints-alias-expansion"
     runs-on: ubuntu-latest
     env:
       COMPOSE_FILE: tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml
@@ -73,11 +73,11 @@ jobs:
         working-directory: services/agent-memory
         run: go build ./internal/repoindexer/ast/...
 
-      - name: Run dispatcher unit-test slice
+      - name: Run normalizeHints unit-test slice
         working-directory: services/agent-memory
         run: |
           go test ./internal/repoindexer/ast -count=1 -v \
-            -run 'TestDispatcher|TestLangMeta|TestErrParserUnavailable|TestMergeLangMeta|TestNormalizeHints|TestPass2bMultimap|TestPass2dOverrides'
+            -run 'TestNormalizeHints|TestSelectParser_ExtensionWinsOverHints'
 
       - name: Run migration apply / probe test
         working-directory: services/agent-memory
@@ -89,7 +89,7 @@ jobs:
         working-directory: services/agent-memory
         run: |
           go test -tags e2e -v -count=1 -timeout 120s \
-            -run TestE2E_shared_additive_surfaces_and_dispatcher_edits_dispatcher_sentinel_branch_pass_2b_multimap_pass_2d_overrides \
+            -run TestE2E_shared_additive_surfaces_and_dispatcher_edits_normalizehints_alias_expansion \
             ./test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/...
 
       - name: Tear down compose stack

@@ -85,7 +85,7 @@ func (r failingMetricSampleReader) ScopeMetrics(ctx context.Context, _ uuid.UUID
 
 type failingFindingReader struct{ err error }
 
-func (r failingFindingReader) FindingCountsByScope(ctx context.Context, _ uuid.UUID, _ string) (map[uuid.UUID]int, error) {
+func (r failingFindingReader) FindingCountsByScope(ctx context.Context, _ uuid.UUID, _ string, _ uuid.UUID) (map[uuid.UUID]int, error) {
 	return nil, r.err
 }
 
@@ -215,20 +215,24 @@ func TestPlanner_Plan_HappyPath_ReadsActivePolicyAndWritesHotSpots(t *testing.T)
 	findings := NewInMemoryFindingReader()
 	// Scope A: 2 qualifying findings (1 new + 1 newly_failing).
 	findings.Insert(InMemoryFinding{
-		RepoID: repoID, SHA: sha, ScopeID: scopeA, Delta: rule_engine.DeltaNew,
+		RepoID: repoID, SHA: sha, ScopeID: scopeA,
+		PolicyVersionID: wantPVID, Delta: rule_engine.DeltaNew,
 	})
 	findings.Insert(InMemoryFinding{
-		RepoID: repoID, SHA: sha, ScopeID: scopeA, Delta: rule_engine.DeltaNewlyFailing,
+		RepoID: repoID, SHA: sha, ScopeID: scopeA,
+		PolicyVersionID: wantPVID, Delta: rule_engine.DeltaNewlyFailing,
 	})
 	// Scope A: 1 non-qualifying finding (unchanged) -- MUST NOT
 	// be counted. This is the canonical filter-correctness pin.
 	findings.Insert(InMemoryFinding{
-		RepoID: repoID, SHA: sha, ScopeID: scopeA, Delta: rule_engine.DeltaUnchanged,
+		RepoID: repoID, SHA: sha, ScopeID: scopeA,
+		PolicyVersionID: wantPVID, Delta: rule_engine.DeltaUnchanged,
 	})
 	// Scope A: 1 non-qualifying finding (resolved) -- MUST NOT
 	// be counted (counting would invert the signal).
 	findings.Insert(InMemoryFinding{
-		RepoID: repoID, SHA: sha, ScopeID: scopeA, Delta: rule_engine.DeltaResolved,
+		RepoID: repoID, SHA: sha, ScopeID: scopeA,
+		PolicyVersionID: wantPVID, Delta: rule_engine.DeltaResolved,
 	})
 
 	writer := NewInMemoryHotSpotWriter()
@@ -320,7 +324,7 @@ func TestPlanner_Plan_HappyPath_ReadsActivePolicyAndWritesHotSpots(t *testing.T)
 // `new` and `newly_failing` MUST count. (See architecture
 // Sec 5.4.1 line 1189 canonical enum.)
 func TestPlanner_Plan_FindingFilter_CountsOnlyQualifyingDeltas(t *testing.T) {
-	st, _ := inMemoryStewardWithActivePolicy(t, steward.RefactorWeights{
+	st, pvID := inMemoryStewardWithActivePolicy(t, steward.RefactorWeights{
 		Alpha: 0, Beta: 0, Gamma: 0, Delta: 1, // finding-only weight
 	})
 	repoID := mustUUID(t)
@@ -334,7 +338,8 @@ func TestPlanner_Plan_FindingFilter_CountsOnlyQualifyingDeltas(t *testing.T) {
 		rule_engine.DeltaResolved,
 	} {
 		findings.Insert(InMemoryFinding{
-			RepoID: repoID, SHA: sha, ScopeID: scope, Delta: d,
+			RepoID: repoID, SHA: sha, ScopeID: scope,
+			PolicyVersionID: pvID, Delta: d,
 		})
 	}
 	writer := NewInMemoryHotSpotWriter()
@@ -362,6 +367,136 @@ func TestPlanner_Plan_FindingFilter_CountsOnlyQualifyingDeltas(t *testing.T) {
 	}
 	if got.Breakdowns[0].FindingCount != 2 {
 		t.Errorf("FindingCount = %d, want 2", got.Breakdowns[0].FindingCount)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Planner.Plan -- active-policy scoping pin for findings
+// -----------------------------------------------------------------------------
+
+// TestPlanner_Plan_FilterFindingsByActivePolicyVersionID is
+// the critical pin for evaluator iter-3 item 2. A scope has
+// (a) one qualifying finding stamped with the active
+// policy_version_id and (b) ten qualifying findings stamped
+// with a DIFFERENT policy_version_id (a parallel evaluation
+// against an experimental policy at the same SHA). Only (a)
+// must count. Without policy-version scoping the (b) rows
+// would inflate finding_count and the resulting hot_spot
+// row's `policy_version_id` stamp would no longer reproduce
+// the score from `policy_version.refactor_weights` (the
+// architecture Sec 5.5.1 reproducibility invariant).
+func TestPlanner_Plan_FilterFindingsByActivePolicyVersionID(t *testing.T) {
+	st, activePV := inMemoryStewardWithActivePolicy(t, steward.RefactorWeights{
+		Alpha: 0, Beta: 0, Gamma: 0, Delta: 1, // finding-only weight
+	})
+	otherPV := mustUUID(t)
+	if otherPV == activePV {
+		// vanishingly unlikely; defensive guard
+		t.Fatalf("otherPV collided with activePV; rerun")
+	}
+	repoID := mustUUID(t)
+	sha := "sha"
+	scope := mustUUID(t)
+
+	findings := NewInMemoryFindingReader()
+	// One qualifying finding under the ACTIVE policy.
+	findings.Insert(InMemoryFinding{
+		RepoID: repoID, SHA: sha, ScopeID: scope,
+		PolicyVersionID: activePV, Delta: rule_engine.DeltaNew,
+	})
+	// Ten qualifying findings under an INACTIVE policy at
+	// the same (repo_id, sha, scope_id). These MUST NOT be
+	// counted in the hot_spot stamped with activePV.
+	for i := 0; i < 10; i++ {
+		findings.Insert(InMemoryFinding{
+			RepoID: repoID, SHA: sha, ScopeID: scope,
+			PolicyVersionID: otherPV, Delta: rule_engine.DeltaNewlyFailing,
+		})
+	}
+
+	writer := NewInMemoryHotSpotWriter()
+	planner, err := NewPlanner(
+		&StewardPolicyReader{Steward: st},
+		NewInMemoryMetricSampleReader(),
+		findings, writer,
+		WithIDFactory(countingIDFactory()),
+		WithClock(fixedClock(time.Unix(0, 0).UTC())),
+	)
+	if err != nil {
+		t.Fatalf("NewPlanner: %v", err)
+	}
+
+	got, err := planner.Plan(context.Background(), repoID, sha)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	if got.PolicyVersionID != activePV {
+		t.Errorf("PolicyVersionID = %s, want %s", got.PolicyVersionID, activePV)
+	}
+	if len(got.HotSpots) != 1 {
+		t.Fatalf("len(got.HotSpots) = %d, want 1", len(got.HotSpots))
+	}
+	// Score = 0+0+0+1*1 = 1 (only the active-policy finding counts).
+	if got.HotSpots[0].Score != 1 {
+		t.Errorf("Score = %v, want 1 (active-policy finding count is 1, NOT 11)",
+			got.HotSpots[0].Score)
+	}
+	if got.Breakdowns[0].FindingCount != 1 {
+		t.Errorf("FindingCount = %d, want 1 (other-policy findings must be excluded)",
+			got.Breakdowns[0].FindingCount)
+	}
+	if got.HotSpots[0].PolicyVersionID != activePV {
+		t.Errorf("HotSpot.PolicyVersionID = %s, want %s",
+			got.HotSpots[0].PolicyVersionID, activePV)
+	}
+}
+
+// TestInMemoryFindingReader_FiltersByPolicyVersionID exercises
+// the reader contract in isolation: findings stamped with a
+// different policy_version_id MUST be excluded.
+func TestInMemoryFindingReader_FiltersByPolicyVersionID(t *testing.T) {
+	repoID := mustUUID(t)
+	sha := "sha"
+	scope := mustUUID(t)
+	pvActive := mustUUID(t)
+	pvOther := mustUUID(t)
+	r := NewInMemoryFindingReader()
+	// Three under active PV.
+	for i := 0; i < 3; i++ {
+		r.Insert(InMemoryFinding{
+			RepoID: repoID, SHA: sha, ScopeID: scope,
+			PolicyVersionID: pvActive, Delta: rule_engine.DeltaNew,
+		})
+	}
+	// Five under other PV.
+	for i := 0; i < 5; i++ {
+		r.Insert(InMemoryFinding{
+			RepoID: repoID, SHA: sha, ScopeID: scope,
+			PolicyVersionID: pvOther, Delta: rule_engine.DeltaNew,
+		})
+	}
+	got, err := r.FindingCountsByScope(context.Background(), repoID, sha, pvActive)
+	if err != nil {
+		t.Fatalf("FindingCountsByScope: %v", err)
+	}
+	if got[scope] != 3 {
+		t.Errorf("count for active PV = %d, want 3", got[scope])
+	}
+	got, err = r.FindingCountsByScope(context.Background(), repoID, sha, pvOther)
+	if err != nil {
+		t.Fatalf("FindingCountsByScope: %v", err)
+	}
+	if got[scope] != 5 {
+		t.Errorf("count for other PV = %d, want 5", got[scope])
+	}
+	// A third unknown pvID returns empty.
+	got, err = r.FindingCountsByScope(context.Background(), repoID, sha, mustUUID(t))
+	if err != nil {
+		t.Fatalf("FindingCountsByScope: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("count for unknown PV = %d, want 0", len(got))
 	}
 }
 
@@ -430,7 +565,7 @@ func TestPlanner_Plan_MetricFilter_IgnoresNonHotSpotMetricKinds(t *testing.T) {
 // older rows are still there; the planner sees only the
 // latest re-computation.)
 func TestPlanner_Plan_MetricDedupe_TakesLargestMetricVersion(t *testing.T) {
-	st, _ := inMemoryStewardWithActivePolicy(t, steward.RefactorWeights{
+	st, pvID := inMemoryStewardWithActivePolicy(t, steward.RefactorWeights{
 		Alpha: 0, Beta: 0, Gamma: 0, Delta: 1, // finding-only score
 	})
 	// We use a finding-only weight + supply a finding so the
@@ -468,7 +603,8 @@ func TestPlanner_Plan_MetricDedupe_TakesLargestMetricVersion(t *testing.T) {
 	// the same dedupe.
 	findings := NewInMemoryFindingReader()
 	findings.Insert(InMemoryFinding{
-		RepoID: repoID, SHA: sha, ScopeID: scope, Delta: rule_engine.DeltaNew,
+		RepoID: repoID, SHA: sha, ScopeID: scope,
+		PolicyVersionID: pvID, Delta: rule_engine.DeltaNew,
 	})
 	writer := NewInMemoryHotSpotWriter()
 	planner, err := NewPlanner(
@@ -499,7 +635,7 @@ func TestPlanner_Plan_MetricDedupe_TakesLargestMetricVersion(t *testing.T) {
 // planner is per-(repo, sha); a row from another commit must
 // not pollute the distribution.
 func TestPlanner_Plan_ScopesByRepoAndSHA(t *testing.T) {
-	st, _ := inMemoryStewardWithActivePolicy(t, steward.RefactorWeights{
+	st, pvID := inMemoryStewardWithActivePolicy(t, steward.RefactorWeights{
 		Alpha: 1, Beta: 1, Gamma: 1, Delta: 1,
 	})
 	repoID := mustUUID(t)
@@ -534,15 +670,18 @@ func TestPlanner_Plan_ScopesByRepoAndSHA(t *testing.T) {
 
 	findings := NewInMemoryFindingReader()
 	findings.Insert(InMemoryFinding{
-		RepoID: repoID, SHA: "target", ScopeID: scope, Delta: rule_engine.DeltaNew,
+		RepoID: repoID, SHA: "target", ScopeID: scope,
+		PolicyVersionID: pvID, Delta: rule_engine.DeltaNew,
 	})
 	findings.Insert(InMemoryFinding{
-		RepoID: otherRepo, SHA: "target", ScopeID: scope, Delta: rule_engine.DeltaNew,
+		RepoID: otherRepo, SHA: "target", ScopeID: scope,
+		PolicyVersionID: pvID, Delta: rule_engine.DeltaNew,
 	})
 	findings.Insert(InMemoryFinding{
-		RepoID: repoID, SHA: "other-sha", ScopeID: scope, Delta: rule_engine.DeltaNew,
+		RepoID: repoID, SHA: "other-sha", ScopeID: scope,
+		PolicyVersionID: pvID, Delta: rule_engine.DeltaNew,
 	})
-	counts, err := findings.FindingCountsByScope(context.Background(), repoID, "target")
+	counts, err := findings.FindingCountsByScope(context.Background(), repoID, "target", pvID)
 	if err != nil {
 		t.Fatalf("FindingCountsByScope: %v", err)
 	}
@@ -765,7 +904,7 @@ func TestPlanner_Plan_EmptyInput_WritesNothing(t *testing.T) {
 // has finding_count=0; the finding-only scope has every
 // metric z=0 (no inputs to a dimension -> z=0 fallback).
 func TestPlanner_Plan_UnionsMetricOnlyAndFindingOnlyScopes(t *testing.T) {
-	st, _ := inMemoryStewardWithActivePolicy(t, steward.RefactorWeights{
+	st, pvID := inMemoryStewardWithActivePolicy(t, steward.RefactorWeights{
 		Alpha: 1, Beta: 0, Gamma: 0, Delta: 1,
 	})
 	repoID := mustUUID(t)
@@ -781,7 +920,8 @@ func TestPlanner_Plan_UnionsMetricOnlyAndFindingOnlyScopes(t *testing.T) {
 
 	findings := NewInMemoryFindingReader()
 	findings.Insert(InMemoryFinding{
-		RepoID: repoID, SHA: sha, ScopeID: scopeFindingOnly, Delta: rule_engine.DeltaNew,
+		RepoID: repoID, SHA: sha, ScopeID: scopeFindingOnly,
+		PolicyVersionID: pvID, Delta: rule_engine.DeltaNew,
 	})
 
 	writer := NewInMemoryHotSpotWriter()
@@ -1022,19 +1162,21 @@ func TestInMemoryFindingReader_ExcludesAllNonQualifyingDeltas(t *testing.T) {
 	repoID := mustUUID(t)
 	sha := "sha"
 	scope := mustUUID(t)
+	pvID := mustUUID(t)
 	r := NewInMemoryFindingReader()
 	for _, d := range []rule_engine.Delta{
-		rule_engine.DeltaNew,          // qualifies
-		rule_engine.DeltaNewlyFailing, // qualifies
-		rule_engine.DeltaUnchanged,    // excluded
-		rule_engine.DeltaResolved,     // excluded
+		rule_engine.DeltaNew,            // qualifies
+		rule_engine.DeltaNewlyFailing,   // qualifies
+		rule_engine.DeltaUnchanged,      // excluded
+		rule_engine.DeltaResolved,       // excluded
 		rule_engine.Delta("regression"), // legacy alias, MUST NOT qualify
 	} {
 		r.Insert(InMemoryFinding{
-			RepoID: repoID, SHA: sha, ScopeID: scope, Delta: d,
+			RepoID: repoID, SHA: sha, ScopeID: scope,
+			PolicyVersionID: pvID, Delta: d,
 		})
 	}
-	got, err := r.FindingCountsByScope(context.Background(), repoID, sha)
+	got, err := r.FindingCountsByScope(context.Background(), repoID, sha, pvID)
 	if err != nil {
 		t.Fatalf("FindingCountsByScope: %v", err)
 	}
@@ -1047,7 +1189,7 @@ func TestInMemoryFindingReader_ExcludesAllNonQualifyingDeltas(t *testing.T) {
 // an empty store returns an empty (not nil-violating) map.
 func TestInMemoryFindingReader_ZeroCountWhenNoFindings(t *testing.T) {
 	r := NewInMemoryFindingReader()
-	got, err := r.FindingCountsByScope(context.Background(), mustUUID(t), "sha")
+	got, err := r.FindingCountsByScope(context.Background(), mustUUID(t), "sha", mustUUID(t))
 	if err != nil {
 		t.Fatalf("FindingCountsByScope: %v", err)
 	}
@@ -1064,7 +1206,7 @@ func TestInMemoryFindingReader_RespectsContextCancellation(t *testing.T) {
 	r := NewInMemoryFindingReader()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := r.FindingCountsByScope(ctx, mustUUID(t), "sha")
+	_, err := r.FindingCountsByScope(ctx, mustUUID(t), "sha", mustUUID(t))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}

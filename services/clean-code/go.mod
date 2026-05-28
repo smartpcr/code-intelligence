@@ -9,6 +9,7 @@ require (
 )
 
 require (
+	github.com/DATA-DOG/go-sqlmock v1.5.0 // indirect
 	github.com/cucumber/gherkin/go/v26 v26.2.0 // indirect
 	github.com/cucumber/messages/go/v21 v21.0.1 // indirect
 	github.com/hashicorp/go-immutable-radix v1.3.1 // indirect

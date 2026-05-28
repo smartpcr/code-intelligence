@@ -76,12 +76,23 @@ type MetricSampleReader interface {
 }
 
 // FindingReader returns the per-scope count of "qualifying"
-// findings for a given (repo_id, sha). The canonical filter
-// is `delta IN ('new', 'newly_failing')` per architecture
+// findings for a given (repo_id, sha) AND a given
+// `policy_version_id`. The canonical filter is
+// `delta IN ('new', 'newly_failing')` per architecture
 // Sec 5.4.1 lines 1186-1190 -- the two delta values that
 // represent fresh tech-debt the planner should surface.
 // (`unchanged` rows would double-count chronic issues;
 // `resolved` rows would invert the signal.)
+//
+// The `policyVersionID` parameter is REQUIRED. The
+// `clean_code.finding` table carries `policy_version_id`
+// (migration 0003 line 693) and the canonical hot_spot row
+// stamps the ACTIVE policy_version_id; counting findings
+// produced by ANY OTHER policy evaluation at the same SHA
+// would inflate `finding_count` and break the
+// "reproducible-from-policy_version_id" guarantee
+// (architecture Sec 5.5.1). Readers MUST filter
+// `finding.policy_version_id = policyVersionID`.
 //
 // The reader MUST NOT include findings whose `delta` is
 // outside the qualifying set; the [IsHotSpotQualifyingDelta]
@@ -100,6 +111,7 @@ type FindingReader interface {
 		ctx context.Context,
 		repoID uuid.UUID,
 		sha string,
+		policyVersionID uuid.UUID,
 	) (map[uuid.UUID]int, error)
 }
 
@@ -285,8 +297,14 @@ func (p *Planner) Plan(
 		return PlanResult{}, fmt.Errorf("refactor.Plan: read metric_sample: %w", err)
 	}
 
-	// Step 3: read + count per-scope qualifying findings.
-	findingCounts, err := p.findings.FindingCountsByScope(ctx, repoID, sha)
+	// Step 3: read + count per-scope qualifying findings
+	// for the ACTIVE policy_version_id only. Findings
+	// produced by stale / parallel policy evaluations at
+	// the same SHA MUST NOT inflate the hot_spot row that
+	// is stamped with the active policy_version_id (the
+	// canonical "reproducible-from-policy_version_id"
+	// invariant per architecture Sec 5.5.1).
+	findingCounts, err := p.findings.FindingCountsByScope(ctx, repoID, sha, snap.PolicyVersionID)
 	if err != nil {
 		return PlanResult{}, fmt.Errorf("refactor.Plan: count findings: %w", err)
 	}
@@ -556,12 +574,17 @@ func applyMetricSampleToScopeInputs(in *ScopeInputs, metricKind string, value fl
 
 // InMemoryFinding is a single `finding` row used by
 // [InMemoryFindingReader]. Only the columns the planner's
-// COUNT consumes are modelled.
+// COUNT consumes are modelled: `(repo_id, sha, scope_id,
+// policy_version_id, delta)`. The `policy_version_id` is
+// the policy whose evaluation produced this finding -- see
+// [FindingReader.FindingCountsByScope] for why the planner
+// MUST filter by active policy.
 type InMemoryFinding struct {
-	RepoID  uuid.UUID
-	SHA     string
-	ScopeID uuid.UUID
-	Delta   rule_engine.Delta
+	RepoID          uuid.UUID
+	SHA             string
+	ScopeID         uuid.UUID
+	PolicyVersionID uuid.UUID
+	Delta           rule_engine.Delta
 }
 
 // InMemoryFindingReader is a process-local [FindingReader]
@@ -588,11 +611,13 @@ func (r *InMemoryFindingReader) Insert(f InMemoryFinding) {
 
 // FindingCountsByScope implements [FindingReader]. Counts
 // only rows whose `Delta` qualifies per
-// [IsHotSpotQualifyingDelta].
+// [IsHotSpotQualifyingDelta] AND whose `PolicyVersionID`
+// matches the supplied active policy_version_id.
 func (r *InMemoryFindingReader) FindingCountsByScope(
 	ctx context.Context,
 	repoID uuid.UUID,
 	sha string,
+	policyVersionID uuid.UUID,
 ) (map[uuid.UUID]int, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -603,6 +628,9 @@ func (r *InMemoryFindingReader) FindingCountsByScope(
 	out := make(map[uuid.UUID]int)
 	for _, f := range r.findings {
 		if f.RepoID != repoID || f.SHA != sha {
+			continue
+		}
+		if f.PolicyVersionID != policyVersionID {
 			continue
 		}
 		if !IsHotSpotQualifyingDelta(f.Delta) {
@@ -673,9 +701,18 @@ const schemaName = steward.DefaultSchema
 
 // SQLMetricSampleReader is the production [MetricSampleReader]
 // against `clean_code.metric_sample`. The implementation
-// applies the dedupe-by-max-`metric_version` rule via SQL
-// (DISTINCT ON) so the application code never sees more than
-// one row per (scope_id, metric_kind).
+// enforces the architecture G2 active-row contract by joining
+// `metric_sample` through the `metric_sample_active` side
+// relation (architecture Sec 5.2.1 lines 991-1003 / tech-spec
+// Sec 7.1.b lines 1103-1119): every sample_id read MUST be
+// the active pointer's current target. Retracted samples and
+// older same-quintuple rows are filtered by the join itself
+// because `metric_sample_active.PRIMARY KEY = (repo_id, sha,
+// scope_id, metric_kind, metric_version)` and there is at
+// most one pointer per quintuple. Reading raw `metric_sample`
+// rows and deduping by `metric_version DESC` (the iter-2
+// shape) would silently include retracted samples; the active
+// pointer is the canonical filter.
 type SQLMetricSampleReader struct {
 	db *sql.DB
 }
@@ -688,12 +725,16 @@ func NewSQLMetricSampleReader(db *sql.DB) *SQLMetricSampleReader {
 
 // ScopeMetrics issues the canonical foundation-tier query
 // and assembles per-scope [ScopeInputs] rows. The SELECT
-// uses PostgreSQL's `DISTINCT ON` to pick the largest
-// `metric_version` per (scope_id, metric_kind); the result
-// rows are scanned and folded into the [ScopeInputs] struct
-// fields via [applyMetricSampleToScopeInputs] (so the
-// metric_kind -> struct field mapping has ONE definition
-// site).
+// drives from `metric_sample_active` (so non-active samples
+// are filtered by the join) and joins through `sample_id`
+// into `metric_sample` for the `value` column. The active
+// pointer's PRIMARY KEY guarantees at most one row per
+// `(repo_id, sha, scope_id, metric_kind, metric_version)`,
+// so the result has at most one row per (scope_id,
+// metric_kind) without any application-side dedupe.
+// Result rows are folded into the [ScopeInputs] struct
+// fields via [applyMetricSampleToScopeInputs] (the single
+// metric_kind -> struct field mapping site).
 func (r *SQLMetricSampleReader) ScopeMetrics(
 	ctx context.Context,
 	repoID uuid.UUID,
@@ -701,15 +742,15 @@ func (r *SQLMetricSampleReader) ScopeMetrics(
 	metricKinds []string,
 ) ([]ScopeInputs, error) {
 	q := fmt.Sprintf(`
-		SELECT DISTINCT ON (scope_id, metric_kind)
-		    scope_id, metric_kind, value
-		  FROM %s.metric_sample
-		 WHERE repo_id = $1
-		   AND sha = $2
-		   AND metric_kind = ANY($3)
-		   AND value IS NOT NULL
-		 ORDER BY scope_id, metric_kind, metric_version DESC
-	`, schemaName)
+		SELECT ms.scope_id, ms.metric_kind, ms.value
+		  FROM %s.metric_sample_active msa
+		  JOIN %s.metric_sample ms
+		    ON ms.sample_id = msa.sample_id
+		 WHERE msa.repo_id = $1
+		   AND msa.sha = $2
+		   AND msa.metric_kind = ANY($3)
+		   AND ms.value IS NOT NULL
+	`, schemaName, schemaName)
 	rows, err := r.db.QueryContext(ctx, q, repoID, sha, pq.Array(metricKinds))
 	if err != nil {
 		return nil, fmt.Errorf("refactor.SQLMetricSampleReader.ScopeMetrics: query: %w", err)
@@ -763,13 +804,22 @@ func NewSQLFindingReader(db *sql.DB) *SQLFindingReader {
 
 // FindingCountsByScope issues the canonical qualifying-
 // findings query: COUNT(*) GROUP BY scope_id where
-// `delta IN ('new', 'newly_failing')`. The IN list is built
-// from [HotSpotQualifyingDeltas] so a future canonical-set
-// change lands in one place.
+// `delta IN ('new', 'newly_failing')` AND
+// `policy_version_id = $4`. The IN list is built from
+// [HotSpotQualifyingDeltas] so a future canonical-set change
+// lands in one place. The policy_version_id filter pins the
+// count to the SAME policy whose `refactor_weights` are
+// being applied -- without it, parallel evaluations against
+// experimental policy versions at the same SHA would
+// inflate the active-policy hot_spot's `finding_count` and
+// the `hot_spot.policy_version_id` stamp would no longer
+// reproduce the score (architecture Sec 5.5.1
+// reproducibility invariant).
 func (r *SQLFindingReader) FindingCountsByScope(
 	ctx context.Context,
 	repoID uuid.UUID,
 	sha string,
+	policyVersionID uuid.UUID,
 ) (map[uuid.UUID]int, error) {
 	qualifying := make([]string, len(HotSpotQualifyingDeltas))
 	for i, d := range HotSpotQualifyingDeltas {
@@ -781,9 +831,10 @@ func (r *SQLFindingReader) FindingCountsByScope(
 		 WHERE repo_id = $1
 		   AND sha = $2
 		   AND delta::text = ANY($3)
+		   AND policy_version_id = $4
 		 GROUP BY scope_id
 	`, schemaName)
-	rows, err := r.db.QueryContext(ctx, q, repoID, sha, pq.Array(qualifying))
+	rows, err := r.db.QueryContext(ctx, q, repoID, sha, pq.Array(qualifying), policyVersionID)
 	if err != nil {
 		return nil, fmt.Errorf("refactor.SQLFindingReader.FindingCountsByScope: query: %w", err)
 	}

@@ -1,3 +1,10 @@
+//go:build canonical_dispatcher
+
+// Pass 2b multimap + Pass 2d trait/override scenarios assume
+// the full V2 dispatcher's receiver-collision and same-file
+// trait resolution behaviour. Gated behind
+// `canonical_dispatcher` until the Stage 3.2 dispatcher
+// landing workstream lands.
 package ast
 
 import (

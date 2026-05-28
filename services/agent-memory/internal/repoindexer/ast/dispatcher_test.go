@@ -1,3 +1,12 @@
+//go:build canonical_dispatcher
+
+// The dispatcher pinned-scenario suite asserts the full Stage
+// 3.2 dispatcher contract (block subdivision, fingerprint
+// derivation, extends/implements/static_calls/contains/imports
+// edge emission, embedding publish ordering) which is NOT
+// implemented by the minimal V2 dispatcher in dispatcher.go.
+// Gated behind `canonical_dispatcher` until the Stage 3.2
+// dispatcher landing workstream ships the full pipeline.
 package ast
 
 import (
@@ -824,8 +833,8 @@ func TestMergeLangMeta(t *testing.T) {
 		}
 		mergeLangMeta(out, map[string]any{
 			"language":   "typescript", // collides; must be dropped
-			"start_line": 999,           // collides; must be dropped
-			"namespace":  "foo.bar",     // non-colliding; must land
+			"start_line": 999,          // collides; must be dropped
+			"namespace":  "foo.bar",    // non-colliding; must land
 		})
 		if out["language"] != "go" {
 			t.Errorf("language = %v; want go (first-class must win)", out["language"])

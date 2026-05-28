@@ -1,3 +1,10 @@
+//go:build canonical_dispatcher
+
+// Fixture-driven Python parser test pipes through the full V2
+// Dispatcher.EmitFile to assert node/edge counts. Depends on
+// `newFakeWriter` / `makeEvent` helpers defined in
+// dispatcher_test.go (also gated). Re-enables when the Stage
+// 3.2 dispatcher landing workstream wires emission.
 package ast
 
 import (

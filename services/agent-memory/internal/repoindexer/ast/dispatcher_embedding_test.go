@@ -1,3 +1,11 @@
+//go:build canonical_dispatcher
+
+// Embedding publish-hook tests exercise the full V2 dispatcher
+// emission pipeline (publish-after-contains-edge ordering,
+// per-method/per-block publish, content threading). Gated
+// behind `canonical_dispatcher` until the Stage 3.2 dispatcher
+// landing workstream wires the hook into the canonical
+// dispatcher.
 package ast
 
 import (

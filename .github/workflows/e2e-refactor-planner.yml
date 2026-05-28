@@ -1,0 +1,58 @@
+name: E2E – Refactor Planner
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "services/clean-code/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25.1"
+  COMPOSE_FILE: tests/e2e/phase-08-refactor-planner/docker-compose.yml
+
+jobs:
+  e2e-composite-hotspot-scoring:
+    name: "E2E – Composite Hotspot Scoring"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: services/clean-code/go.sum
+
+      - name: Start compose services
+        run: docker compose -f ${{ env.COMPOSE_FILE }} up -d --build
+
+      - name: Export compose-provided env vars
+        run: |
+          PG_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port postgres 5432 | cut -d: -f2)
+          PLANNER_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port refactor-planner 8080 | cut -d: -f2)
+          MGMT_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port mgmt-surface 8080 | cut -d: -f2)
+          OTEL_PORT=$(docker compose -f ${{ env.COMPOSE_FILE }} port otel-collector 4317 | cut -d: -f2)
+          echo "CLEAN_CODE_PG_URL=postgres://postgres:postgres@localhost:${PG_PORT}/clean_code?sslmode=disable" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_PLANNER_URL=http://localhost:${PLANNER_PORT}" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_MGMT_URL=http://localhost:${MGMT_PORT}" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_OTEL_ENDPOINT=http://localhost:${OTEL_PORT}" >> "$GITHUB_ENV"
+
+      - name: Bootstrap – migrate
+        run: make migrate-up CLEAN_CODE_PG_URL="${CLEAN_CODE_PG_URL}"
+
+      - name: Run E2E tests
+        working-directory: services/clean-code
+        run: |
+          go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
+            -run TestE2E_refactor_planner_composite_hotspot_scoring
+
+      - name: Tear down compose services
+        if: always()
+        run: docker compose -f ${{ env.COMPOSE_FILE }} down -v --remove-orphans

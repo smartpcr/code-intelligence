@@ -1048,24 +1048,22 @@ func classAttrs(language string, c ClassDecl) json.RawMessage {
 	return mustJSON(m)
 }
 
+// methodAttrs delegates to the exported BuildMethodAttrs so the
+// dispatcher's per-Method node attrs_json is byte-identical to
+// whatever the public attrs API produces.  Iter-4 evaluator
+// finding #2 fix: the in-package helper used to ignore
+// ReceiverCalls (only m.Calls landed in calls_raw), while the
+// public BuildMethodAttrs in method_attrs.go merges both via
+// MergeCallsDeduped.  Letting the two diverge silently lets the
+// writer integration tests (test/e2e ... mergelangmeta) pass
+// against BuildMethodAttrs while production dispatcher emits
+// different bytes — the exact blast-radius the rubber-duck
+// review flagged.  Delegating is a one-liner and keeps the
+// dispatcher's old semantics for Calls-only fixtures intact
+// (MergeCallsDeduped over Calls + nil ReceiverCalls returns
+// exactly Calls, preserving insertion order).
 func methodAttrs(language string, m MethodDecl) json.RawMessage {
-	out := map[string]any{
-		"language":   language,
-		"start_line": m.StartLine,
-		"end_line":   m.EndLine,
-		"params_raw": m.ParamSignature,
-	}
-	if m.EnclosingClass != "" {
-		out["enclosing_class"] = m.EnclosingClass
-	}
-	if len(m.Modifiers) > 0 {
-		out["modifiers"] = append([]string(nil), m.Modifiers...)
-	}
-	if len(m.Calls) > 0 {
-		out["calls_raw"] = append([]string(nil), m.Calls...)
-	}
-	mergeLangMeta(out, m.LangMeta)
-	return mustJSON(out)
+	return BuildMethodAttrs(language, m)
 }
 
 // blockAttrs records the language, block kind, ordinal, AND

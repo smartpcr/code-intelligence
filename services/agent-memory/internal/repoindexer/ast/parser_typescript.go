@@ -138,11 +138,15 @@ var tsCallRE = regexp.MustCompile(
 		`\s*\(`)
 
 // tsReceiverCallRE matches `this.<name>(` -- receiver-qualified
-// method calls. Receiver-qualified calls are unambiguous (the
-// receiver scopes the lookup to the enclosing class) so the
-// dispatcher resolves them against `<EnclosingClass>.<name>`
-// without the bare-name ambiguity check that drops collisions
-// from `tsCallRE`. Per evaluator finding #5.
+// method calls. The dispatcher's Pass 2b resolves each `<name>`
+// against the receiver-index multimap keyed by
+// `<EnclosingClass>.<name>` -> []NodeID (built from the primary
+// `simpleName(QualifiedName)` plus every `ReceiverAliases`
+// entry). Single-target lookups emit a static_calls edge;
+// size>=2 lookups DROP per the A5 rule (same drop-on-ambiguity
+// contract the bare-name `tsCallRE` path uses). See
+// `dispatcher.go::emit` Pass 2b for the resolution loop.
+// Per iter-4 evaluator finding #3.
 var tsReceiverCallRE = regexp.MustCompile(
 	`\bthis\.([A-Za-z_$][\w$]*)\s*\(`)
 

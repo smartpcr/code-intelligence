@@ -7,7 +7,7 @@ require (
 	github.com/cucumber/godog v0.15.1
 	github.com/gofrs/uuid v4.3.1+incompatible
 	github.com/golang-jwt/jwt/v5 v5.3.1
-	github.com/lib/pq v1.10.9
+	github.com/lib/pq v1.12.3
 	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/sdk v1.44.0

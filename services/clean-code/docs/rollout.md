@@ -279,44 +279,109 @@ extending `mountMgmtRoutes` itself, because the latter
 runs under the `clean_code_management` Postgres role (see
 `migrations/0004_roles.up.sql`) and intentionally splits
 its `*sql.DB` handles between the ingestor-role
-write path and the mgmt-role audit log. A sensible
-seam:
+write path and the mgmt-role audit log.
+
+The Reader's actual constructor signature (file
+`internal/management/reader.go:514`) is:
 
 ```go
-// In cmd/clean-code-metric-ingestor/main.go (or a new
-// cmd/clean-code-mgmt-read/main.go dedicated to the read
-// surface):
+func NewReader(signingKeys *keys.Manager, opts ...ReaderOption) *Reader
+```
 
-func mountMgmtReadRoutes(mux *http.ServeMux, mgmtDB *sql.DB) error {
+-- the first positional argument is the Stage 5.1
+`*keys.Manager`, NOT a `*PGRepoStore`. The
+`MetricsBackend` (Stage 6.3) and `*insights.Freshness`
+(Stage 7.3) are wired via the variadic options.
+`NewPGMetricsBackend` (file
+`internal/management/pg_metrics_backend.go:106`)
+returns `(*PGMetricsBackend, error)` -- two values; the
+error MUST be propagated. The Reader exposes
+domain-level methods `ReadCrossRepo(ctx, metricKind,
+scopeKind) (*CrossRepoResponse, error)` and
+`ReadPortfolio(ctx, metricKind) (*PortfolioResponse, error)`
+-- the read-surface stage owns the thin HTTP handler
+shims that bridge `*http.Request -> Reader.ReadCrossRepo`
+and write the JSON response.
+
+A complete, compile-correct future wire-up sketch:
+
+```go
+// Future file (NOT shipped by Stage 7.3):
+//   cmd/clean-code-mgmt-read/main.go OR a
+//   mountMgmtReadRoutes sibling of mountMgmtRoutes
+//   in cmd/clean-code-metric-ingestor/main.go.
+
+import (
+    "database/sql"
+    "fmt"
+    "net/http"
+
+    "github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
+    "github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
+)
+
+func mountMgmtReadRoutes(
+    mux *http.ServeMux,
+    mgmtDB *sql.DB,
+    km *keys.Manager, // Stage 5.1 signing-key manager
+) error {
     if mgmtDB == nil {
         return fmt.Errorf("mountMgmtReadRoutes: mgmtDB is nil")
     }
-    backend := management.NewPGMetricsBackend(mgmtDB)
-    repoStore, err := management.NewPGRepoStore(mgmtDB)
+    backend, err := management.NewPGMetricsBackend(mgmtDB)
     if err != nil {
-        return fmt.Errorf("mountMgmtReadRoutes: %w", err)
+        return fmt.Errorf("mountMgmtReadRoutes: backend: %w", err)
     }
-    reader := management.NewReader(repoStore,
+    reader := management.NewReader(km,
         management.WithMetricsBackend(backend),
         // WithInsightsFreshness is OMITTED on purpose --
-        // the Reader auto-defaults to
+        // NewReader auto-defaults to
         // insights.NewPercentileFreshness() so a wiring
         // slip cannot silently render stale percentiles
-        // as fresh.
+        // as fresh (see reader.go:521 auto-default
+        // branch).
     )
-    mux.HandleFunc("POST /v1/mgmt/read/cross_repo", reader.HandleReadCrossRepo)
-    mux.HandleFunc("POST /v1/mgmt/read/portfolio",   reader.HandleReadPortfolio)
+    // The thin HTTP shims that adapt *http.Request to
+    // reader.ReadCrossRepo / reader.ReadPortfolio are
+    // owned by the follow-on read-surface stage. They
+    // are conventionally named handleReadCrossRepo /
+    // handleReadPortfolio and live next to the
+    // existing mgmt_verbs.go handlers. Stage 7.3 does
+    // NOT ship those shims (the Reader exposes only the
+    // domain-level methods today; see
+    // reader.go:745 ReadCrossRepo and
+    // reader.go:792 ReadPortfolio).
+    _ = reader
     return nil
 }
 ```
 
-The HTTP handler names (`HandleReadCrossRepo`,
-`HandleReadPortfolio`) are illustrative -- Stage 7.3 does
-not ship them. The follow-on read-surface stage owns the
-final method names and the route paths. What Stage 7.3
-DOES pin verbatim is the Reader-construction shape: the
-positional `repoStore`, the `WithMetricsBackend` opt, and
-the (optional) `WithInsightsFreshness` opt.
+What Stage 7.3 **DOES** pin verbatim about the
+construction shape (the parts the follow-on stage MUST
+honour to keep the freshness-banner contract intact):
+
+1. `NewReader`'s first positional arg is the signing-key
+   manager (`*keys.Manager`). Tests stub this with
+   `nil`; production wires the Stage 5.1 manager.
+2. `WithMetricsBackend(backend)` wires the metrics
+   backend (Stage 6.3 PG-backed implementation,
+   Stage 6.3 in-memory test fake, or any future
+   `MetricsBackend` implementation).
+3. Omitting `WithInsightsFreshness` is SAFE and
+   PREFERRED in production -- the auto-default at
+   `reader.go:521` wires the canonical 3600s window.
+4. Explicitly passing `WithoutFreshness()` SUPPRESSES
+   the freshness banner. It exists ONLY for unit-test
+   seams; a code review on a production composition
+   root calling `WithoutFreshness()` SHOULD block the
+   merge.
+
+The Reader-construction shape is verified by the
+package tests at `internal/management/reader_test.go:609`
+(`NewReader(nil, WithMetricsBackend(fb), WithInsightsFreshness(fresh))`)
+and `:716-733` (the defence-in-depth proof that
+`NewReader(...)` **without** `WithInsightsFreshness`
+auto-defaults).
 
 To **explicitly** suppress the freshness banner -- which
 should only happen in a unit-test seam, NEVER in a

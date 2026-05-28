@@ -600,6 +600,153 @@ func TestDispatcher_PerEventLanguageHintsOverrideGlobal(t *testing.T) {
 	}
 }
 
+// TestNormalizeHints_AliasExpansion pins the v1 alias rows
+// described in the AST-PARSER-FOR-ADDIT architecture
+// (Section 3) and tech spec (Section 4.2). Each row asserts:
+//   - case-folding (`TS` -> `typescript`);
+//   - whitespace trimming (`  cpp  ` -> `cpp`);
+//   - alias -> canonical (e.g. `golang` -> `go`, `c#` -> `csharp`);
+//   - canonical pass-through (e.g. `python` -> `python`).
+//
+// Regression rows for `ts`, `tsx`, `js`, `jsx`, `mjs`, `cjs`,
+// `py`, and `pyi` guard against the existing TypeScript /
+// Python contract drifting when new rows are added.
+func TestNormalizeHints_AliasExpansion(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		// --- regression: existing TS / Python rows must not drift ---
+		{name: "ts -> typescript", in: []string{"ts"}, want: []string{"typescript"}},
+		{name: "tsx -> typescript", in: []string{"tsx"}, want: []string{"typescript"}},
+		{name: "js -> typescript", in: []string{"js"}, want: []string{"typescript"}},
+		{name: "jsx -> typescript", in: []string{"jsx"}, want: []string{"typescript"}},
+		{name: "mjs -> typescript", in: []string{"mjs"}, want: []string{"typescript"}},
+		{name: "cjs -> typescript", in: []string{"cjs"}, want: []string{"typescript"}},
+		{name: "py -> python", in: []string{"py"}, want: []string{"python"}},
+		{name: "pyi -> python", in: []string{"pyi"}, want: []string{"python"}},
+		// --- new: C ---
+		{name: "c -> c", in: []string{"c"}, want: []string{"c"}},
+		{name: "h -> c", in: []string{"h"}, want: []string{"c"}},
+		// --- new: C++ ---
+		{name: "cc -> cpp", in: []string{"cc"}, want: []string{"cpp"}},
+		{name: "cxx -> cpp", in: []string{"cxx"}, want: []string{"cpp"}},
+		{name: "cpp -> cpp", in: []string{"cpp"}, want: []string{"cpp"}},
+		{name: "c++ -> cpp", in: []string{"c++"}, want: []string{"cpp"}},
+		{name: "hpp -> cpp", in: []string{"hpp"}, want: []string{"cpp"}},
+		// --- new: C# ---
+		{name: "cs -> csharp", in: []string{"cs"}, want: []string{"csharp"}},
+		{name: "csharp -> csharp", in: []string{"csharp"}, want: []string{"csharp"}},
+		{name: "c# -> csharp", in: []string{"c#"}, want: []string{"csharp"}},
+		// --- new: Go ---
+		{name: "go -> go", in: []string{"go"}, want: []string{"go"}},
+		{name: "golang -> go", in: []string{"golang"}, want: []string{"go"}},
+		// --- new: Rust ---
+		{name: "rs -> rust", in: []string{"rs"}, want: []string{"rust"}},
+		{name: "rust -> rust", in: []string{"rust"}, want: []string{"rust"}},
+		// --- new: PowerShell ---
+		{name: "ps -> powershell", in: []string{"ps"}, want: []string{"powershell"}},
+		{name: "ps1 -> powershell", in: []string{"ps1"}, want: []string{"powershell"}},
+		{name: "psm1 -> powershell", in: []string{"psm1"}, want: []string{"powershell"}},
+		{name: "psd1 -> powershell", in: []string{"psd1"}, want: []string{"powershell"}},
+		{name: "powershell -> powershell", in: []string{"powershell"}, want: []string{"powershell"}},
+		// --- canonical TS / Python pass-through (unchanged) ---
+		{name: "typescript -> typescript", in: []string{"typescript"}, want: []string{"typescript"}},
+		{name: "python -> python", in: []string{"python"}, want: []string{"python"}},
+		// --- normalization: case + whitespace ---
+		{name: "upper-case TS folded", in: []string{"TS"}, want: []string{"typescript"}},
+		{name: "mixed-case CSharp folded", in: []string{"CSharp"}, want: []string{"csharp"}},
+		{name: "padded cpp trimmed", in: []string{"  cpp  "}, want: []string{"cpp"}},
+		{name: "padded mixed-case Go folded+trimmed", in: []string{"  Golang "}, want: []string{"go"}},
+		// --- empty / blank entries skipped ---
+		{name: "empty entry skipped", in: []string{""}, want: nil},
+		{name: "whitespace-only entry skipped", in: []string{"   "}, want: nil},
+		// --- unknown hint passes through (lowercased, trimmed) ---
+		{name: "unknown java passes through", in: []string{"Java"}, want: []string{"java"}},
+		// --- multi-entry: order preserved, mixed mappings ---
+		{
+			name: "multi: ts + golang + c# preserves order",
+			in:   []string{"ts", "Golang", "C#"},
+			want: []string{"typescript", "go", "csharp"},
+		},
+		// --- multi-entry with blanks interleaved ---
+		{
+			name: "multi: blanks dropped, others kept in order",
+			in:   []string{"", "ps1", "  ", "rust"},
+			want: []string{"powershell", "rust"},
+		},
+		// --- nil / empty input ---
+		{name: "nil input -> nil", in: nil, want: nil},
+		{name: "empty input -> nil", in: []string{}, want: nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeHints(tc.in)
+			if !equalStringSlice(got, tc.want) {
+				t.Errorf("normalizeHints(%q) = %q; want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNormalizeHints_PreservesEntryOrder pins ordering as a
+// separable guarantee: selectParser iterates the normalised
+// slice in order and returns the first matching parser, so a
+// silent re-ordering would silently change routing for repos
+// whose `language_hints[]` lists multiple languages.
+func TestNormalizeHints_PreservesEntryOrder(t *testing.T) {
+	in := []string{"rust", "go", "powershell", "c", "cpp"}
+	got := normalizeHints(in)
+	want := []string{"rust", "go", "powershell", "c", "cpp"}
+	if !equalStringSlice(got, want) {
+		t.Fatalf("normalizeHints order drifted: got %q; want %q", got, want)
+	}
+}
+
+// TestSelectParser_ExtensionWinsOverHints pins the resolution
+// precedence documented at dispatcher.go:219-248: a known
+// file extension MUST route to its parser even when the
+// per-event LanguageHints (or the dispatcher-default hints
+// from `WithLanguageHints`) name a different language.
+//
+// Without this guard a repo whose `language_hints[]` lists
+// `python` could silently swallow a `.ts` file with the
+// Python parser and emit zero nodes (regression observed
+// during the Stage 1.5 alias-expansion design review).
+func TestSelectParser_ExtensionWinsOverHints(t *testing.T) {
+	fw := newFakeWriter()
+	d := NewDispatcher(fw, WithLanguageHints([]string{"python"}))
+	src := "class Foo { bar() { return 1; } }"
+	ev := makeEvent("src/a.ts", src)
+	ev.LanguageHints = []string{"python"}
+	if _, err := d.EmitFile(context.Background(), ev); err != nil {
+		t.Fatalf("EmitFile: %v", err)
+	}
+	classes := fw.nodesOf("class")
+	if len(classes) != 1 {
+		t.Fatalf("expected 1 class node from extension routing; got %d", len(classes))
+	}
+	if got := attrString(t, classes[0].AttrsJSON, "language"); got != "typescript" {
+		t.Errorf("language attr = %q; want typescript (extension must win over hints)", got)
+	}
+}
+
+// equalStringSlice is a tiny helper because the test table
+// includes nil-vs-empty distinctions that `reflect.DeepEqual`
+// already supports but we want a single-line call site.
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // hasAll returns true when every want entry is present in
 // haystack. Linear scan since the slices are tiny.
 func hasAll(haystack []string, want ...string) bool {

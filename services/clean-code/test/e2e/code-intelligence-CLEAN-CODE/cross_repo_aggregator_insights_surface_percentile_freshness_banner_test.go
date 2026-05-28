@@ -451,6 +451,9 @@ func (s *freshnessBannerState) noneOfTheEvaluationVerdictRowsContainDegradedReas
 	for rows.Next() {
 		count++
 	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating evaluation_verdict rows: %w", err)
+	}
 
 	if count > 0 {
 		return fmt.Errorf("found %d evaluation_verdict row(s) with degraded_reason=%q across eval.gate code paths; expected zero", count, forbidden)

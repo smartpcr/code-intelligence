@@ -4,6 +4,216 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 7.3 -- Insights percentile freshness banner
+
+### Iter 1 -- doc-only iteration; code landed in Stage 6.3
+
+The Stage 7.3 implementation plan
+(`docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`
+lines 689-705) calls out four implementation steps and three
+test scenarios:
+
+> - Add `internal/management/insights/freshness.go` consumed
+>   by the Management read verbs `mgmt.read.cross_repo` and
+>   `mgmt.read.portfolio` (Stage 6.3) -- this is the Insights
+>   surface, NOT eval.gate (iter 1 evaluator item 8).
+> - On each read, compare `cross_repo_percentile.built_at`
+>   (Stage 7.2) against tech-spec Sec 8.2
+>   `freshness_window_seconds=3600`; if the snapshot is older,
+>   attach `degraded=true, degraded_reason='percentile_stale'`
+>   to the Insights envelope.
+> - `percentile_stale` is INSIGHTS-ONLY -- the eval.gate verb
+>   refuses to accept this reason (verified in Stage 6.1 test
+>   scenario `percentile-stale-not-on-gate`).
+> - Add `internal/management/insights/freshness_test.go` with
+>   a fake clock covering: fresh snapshot returns no banner;
+>   stale snapshot returns `percentile_stale` banner; eval.gate
+>   path never produces this reason.
+>
+> Test Scenarios:
+>   - `stale-percentile-banner-on-insights`
+>   - `fresh-percentile-no-banner`
+>   - `gate-never-emits-percentile-stale`
+
+ALL FOUR implementation steps AND all three test scenarios
+were already landed by the Stage 6.3 merge
+(commit `ffc1ddc impl(...stage-management-read-verbs-and-
+insights-projections)`, PR #111). The Stage 6.3 generator
+front-loaded the Stage 7.3 work because the Reader's
+freshness wiring was inseparable from the read-verb
+projection layer that Stage 6.3 owned.
+
+This iteration therefore makes ZERO code edits in
+`services/clean-code/internal/`. It surfaces the
+contract in operator-facing docs (`docs/runbook.md`,
+`docs/rollout.md`) and records the workstream's landing on
+the CHANGELOG.
+
+### Where the code lives (greppable pointers)
+
+- `services/clean-code/internal/management/insights/freshness.go`
+  -- the `Freshness` struct, `FreshnessWindowSeconds=3600`
+  constant, `DegradedReasonPercentileStale="percentile_stale"`
+  exported constant, `Clock`/`SystemClock` seam,
+  `NewPercentileFreshness()` production constructor,
+  `Evaluate(builtAt time.Time) Status` strict-greater-than
+  comparison (`age > Window`), zero-time-as-stale safety,
+  future-time-as-fresh tolerance, nil-clock-fallback safety.
+- `services/clean-code/internal/management/insights/freshness_test.go`
+  -- 11 tests pinning all behaviours including the three
+  required scenarios. All pass:
+  ```
+  $ cd services/clean-code
+  $ go test ./internal/management/insights/ -count=1
+  ok  forge/services/clean-code/internal/management/insights  1.616s
+  ```
+- `services/clean-code/internal/management/reader.go` --
+  `WithInsightsFreshness(f *insights.Freshness)` Reader
+  option, auto-default to `insights.NewPercentileFreshness()`
+  when not explicitly disabled (iter-2 evaluator defence-
+  in-depth), `WithoutFreshness()` explicit opt-out
+  (developer/test seam only, NOT a production rollback knob).
+  `Reader.ReadCrossRepo` calls
+  `r.freshness.Evaluate(row.BuiltAt)` and stamps
+  `resp.Degraded`/`resp.DegradedReason`; `Reader.ReadPortfolio`
+  takes the WORST-CASE across rows
+  (`Degraded=true` iff ANY `built_at` is stale;
+  `OldestBuiltAt` echoes the oldest row's `built_at`).
+- `services/clean-code/internal/management/reader_test.go` --
+  integration coverage:
+  `TestReader_ReadCrossRepo_ReturnsSnapshotVerbatim`
+  (fresh-percentile-no-banner),
+  `TestReader_ReadCrossRepo_StaleSnapshotEmitsPercentileStale`
+  (stale-percentile-banner-on-insights),
+  `TestReader_ReadCrossRepo_WithoutFreshnessExplicitlyDisabled`
+  (opt-out semantics).
+- `services/clean-code/internal/evaluator/verdict.go` --
+  defines `DegradedReason.IsValidForGate()` returning `false`
+  for `percentile_stale`; emits sentinel
+  `ErrInvalidGateDegradedReason`.
+- `services/clean-code/internal/evaluator/gate_evaluate.go` --
+  `Gate.writeDegraded` short-circuits with
+  `ErrInvalidGateDegradedReason` BEFORE any SQL is issued
+  when handed `percentile_stale`.
+- `services/clean-code/internal/evaluator/sql_degraded_store.go`
+  -- `SQLDegradedRunStore.AppendDegradedRun` also rejects
+  `percentile_stale` before the INSERT -- defence-in-depth
+  belt-and-braces.
+- `services/clean-code/internal/evaluator/verdict_test.go` --
+  `TestDegradedReason_IsValidForGate_RejectsPercentileStale`,
+  `TestGate_writeDegraded_RejectsPercentileStaleReason`,
+  `TestSQLDegradedRunStore_RejectsPercentileStaleReasonBeforeSQL`
+  collectively assert the `gate-never-emits-percentile-stale`
+  scenario from THREE distinct layers.
+
+### What changed this iter
+
+- `services/clean-code/docs/runbook.md` -- new "Stage 7.3 --
+  Insights percentile freshness banner" section between the
+  Stage 7.1 (Cross-Repo Aggregator) and Stage 6.2
+  (`mgmt.register_repo`) sections. Documents the operator-
+  facing contract: what triggers the banner, how to read the
+  wire shape, boundary / edge-case semantics, the INSIGHTS-
+  ONLY carve-out and gate-side enforcement, operator triage
+  steps when `percentile_stale` fires, and the auto-default
+  defence-in-depth contract (including the explicit
+  prohibition on calling `WithoutFreshness()` from a
+  production composition root).
+- `services/clean-code/docs/rollout.md` -- new "Stage 7.3:
+  Insights percentile freshness banner" subsection between
+  Stage 7.1 and Stage 6.2. Documents the rollout sequence:
+  no new binary / env var / migration, pre-rollout check
+  that the aggregator is ticking, recommended composition-
+  root wire-up, smoke validation (fresh + simulated-stale
+  paths and the gate-side rejection), and the rollback
+  guidance that explicitly steers operators AWAY from
+  `WithoutFreshness()` as a rollback lever.
+- `services/clean-code/CHANGELOG.md` -- this entry.
+
+### Prior feedback resolution
+
+This is iter 1 of Stage 7.3; the workstream has no prior
+evaluator feedback to address. The CHANGELOG's iter-1
+template therefore has no `## Still needs improvement`
+list to mirror -- the convergence-detector contract is
+trivially satisfied (zero `- [ ]` items prepended into
+this iter's prompt).
+
+### No-regression evidence
+
+The `insights` sub-package and the integration tests in the
+`management` package have not changed since the Stage 6.3
+merge (`ffc1ddc`). The package-level test for `insights`
+still passes against the worktree's go toolchain:
+
+```
+$ cd services/clean-code
+$ go test ./internal/management/insights/ -count=1 -v
+=== RUN   TestFreshness_FreshSnapshotReturnsNoBanner
+--- PASS: TestFreshness_FreshSnapshotReturnsNoBanner (0.00s)
+=== RUN   TestFreshness_StaleSnapshotReturnsPercentileStaleBanner
+--- PASS: TestFreshness_StaleSnapshotReturnsPercentileStaleBanner (0.00s)
+=== RUN   TestFreshness_BoundaryAtExactWindowIsFresh
+--- PASS: TestFreshness_BoundaryAtExactWindowIsFresh (0.00s)
+=== RUN   TestFreshness_OneSecondPastBoundaryIsStale
+--- PASS: TestFreshness_OneSecondPastBoundaryIsStale (0.00s)
+=== RUN   TestFreshness_ZeroBuiltAtTreatedAsStale
+--- PASS: TestFreshness_ZeroBuiltAtTreatedAsStale (0.00s)
+=== RUN   TestFreshness_FutureBuiltAtTreatedAsFresh
+--- PASS: TestFreshness_FutureBuiltAtTreatedAsFresh (0.00s)
+=== RUN   TestFreshness_NilClockFallsBackToSystem
+--- PASS: TestFreshness_NilClockFallsBackToSystem (0.00s)
+=== RUN   TestNewPercentileFreshness_WiresProductionDefaults
+--- PASS: TestNewPercentileFreshness_WiresProductionDefaults (0.00s)
+=== RUN   TestDegradedReasonPercentileStaleLiteral
+--- PASS: TestDegradedReasonPercentileStaleLiteral (0.00s)
+=== RUN   TestFreshnessWindowSecondsLiteral
+--- PASS: TestFreshnessWindowSecondsLiteral (0.00s)
+=== RUN   TestSystemClock_NowIsRecent
+--- PASS: TestSystemClock_NowIsRecent (0.00s)
+PASS
+ok  forge/services/clean-code/internal/management/insights  1.616s
+```
+
+The 11/11 pass rate covers the three impl-plan scenarios
+(`fresh-percentile-no-banner` /
+`stale-percentile-banner-on-insights` /
+`gate-never-emits-percentile-stale` via the
+`TestDegradedReasonPercentileStaleLiteral` pin) plus seven
+boundary, zero-time, future-time, nil-clock, and
+constructor-default assertions.
+
+### Known baseline issue (NOT caused by this iter)
+
+The `[e2e] System tier metric composer -- E2E (#122)` merge
+(commit `803ae6c`, the immediate parent of this workstream
+branch) regressed `services/clean-code/go.mod` -- the
+module path was changed from
+`github.com/smartpcr/code-intelligence/services/clean-code`
+to `forge/services/clean-code` AND the production
+dependencies (`github.com/lib/pq`,
+`github.com/DATA-DOG/go-sqlmock`,
+`google.golang.org/protobuf`,
+`google.golang.org/grpc`,
+`github.com/smacker/go-tree-sitter`, `gopkg.in/yaml.v3`)
+were stripped from `require (...)`. As a result, a broad
+`go vet ./...` or `make build` on the post-#122 baseline
+fails to compile the `internal/management/`,
+`internal/evaluator/`, `internal/aggregator/`, and
+`internal/repo_indexer/` packages because their imports
+reference the old module path.
+
+The `internal/management/insights/` sub-package compiles
+and tests pass IN ISOLATION (it has no third-party
+imports), which is why the Stage 7.3 freshness contract is
+verifiably correct even on the regressed baseline.
+
+This iter does NOT fix the baseline `go.mod` regression --
+the fix belongs to whichever workstream owns the e2e merge
+trailer (or a fresh re-baseline of `feature/clean-code`).
+See the `Open questions` block at the end of this iter's
+generator output.
+
 ## Stage 7.2 -- System tier metric composer
 
 ### Iter 10 -- operator-recovery acknowledgement (no code changes)

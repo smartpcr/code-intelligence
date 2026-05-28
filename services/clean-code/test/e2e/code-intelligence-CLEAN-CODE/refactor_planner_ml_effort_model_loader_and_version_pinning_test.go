@@ -133,23 +133,23 @@ func (s *mlEffortModelState) startupExitsNonZeroWithErrorNamingMissingConfig() e
 	}
 
 	lower := strings.ToLower(s.stdErr)
-	// The planner should mention the missing config key in its error output.
-	indicators := []string{
+	// The planner must mention a specific config key so we don't false-positive
+	// on generic "missing" or "ml model" strings from unrelated errors.
+	specificIndicators := []string{
 		"clean_code_ml_model_uri",
 		"model_uri",
 		"model uri",
 		"effort_source",
 		"effort source",
-		"ml model",
-		"missing",
 	}
-	for _, ind := range indicators {
+	for _, ind := range specificIndicators {
 		if strings.Contains(lower, ind) {
 			return nil
 		}
 	}
 	return fmt.Errorf(
-		"expected error output to name the missing config key; got: %s",
+		"expected error output to name the missing config key (one of %v); got: %s",
+		specificIndicators,
 		s.stdErr,
 	)
 }

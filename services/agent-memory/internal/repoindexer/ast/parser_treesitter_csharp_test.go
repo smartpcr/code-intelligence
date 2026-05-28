@@ -987,3 +987,43 @@ func TestCSharpFixture_ReceiverCallDoesNotEmitSpuriousMemberAccess(t *testing.T)
 		t.Errorf("C.Caller.MemberAccesses should include Field (read); got %v", caller.MemberAccesses)
 	}
 }
+
+// TestTreeSitterCSharpParser_RegisteredInDefaultParsers verifies
+// the parser is reachable through `defaultParsers()` (the
+// factory parsers_cgo.go::defaultParsers wires into the
+// dispatcher). Without this assertion, the parser could be
+// implemented but silently unreachable -- the
+// implemented-but-unreachable failure mode previously flagged
+// by the rubber-duck review for the C tree-sitter parser. This
+// test is the C# twin of TestTreeSitterCParser_RegisteredInDefaultParsers
+// and pins the `parsers_cgo.go` registration line so a future
+// edit that drops `NewTreeSitterCSharpParser()` from
+// `defaultParsers()` fails loudly here instead of silently
+// regressing `.cs` / `.csx` ingestion to "no parser registered
+// for extension" skips.
+//
+// The test runs on the CGO build path only (the file's `//go:build cgo`
+// tag); the CGO=off counterpart in parsers_nocgo.go intentionally
+// does NOT register C# (per the workstream brief and the
+// parsers_nocgo.go doc comment), so a parallel CGO=off assertion
+// would contradict the documented "no scanner-backed fallback in
+// v1" stance.
+func TestTreeSitterCSharpParser_RegisteredInDefaultParsers(t *testing.T) {
+	parsers := defaultParsers()
+	want := map[string]bool{".cs": false, ".csx": false}
+	for _, p := range parsers {
+		if p.Language() != "csharp" {
+			continue
+		}
+		for _, ext := range p.Extensions() {
+			if _, ok := want[ext]; ok {
+				want[ext] = true
+			}
+		}
+	}
+	for ext, found := range want {
+		if !found {
+			t.Errorf("defaultParsers() does not register the C# parser for %q; saw %d parsers", ext, len(parsers))
+		}
+	}
+}

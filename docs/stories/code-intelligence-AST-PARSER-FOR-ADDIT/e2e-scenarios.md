@@ -64,14 +64,49 @@ here so a `grep -F` from either side resolves to the same answer:
 | `phase6-ci-install-pwsh` | `confirm-keep-skip-posture-defer-pwsh-install-to-followup-story`   | Should this story add a `pwsh` install step to `.github/workflows/agent-memory-ci.yml`, keep the skip posture, or defer to a follow-up?                                  | KEEP SKIP POSTURE. The hosted runner does not install `pwsh` in v1; `@needs-pwsh` scenarios `t.Skip` per `implementation-plan.md` Stage 6.3 lines 417 and 428. Workflow change is the scope of a separate follow-up story (`code-intelligence:CI-INSTALL-PWSH-FOR-AGENT-MEMORY`), not part of this story. Recorded in 0.2 and in Phase 6 Setup. |
 
 > Note: the three earlier UNANSWERED rows in `.forge/memory/workstream-context.md`
-> (the original `phase1-compose-existing-vs-new` framing, the original
-> `phase1-compose-path` framing, and the original `phase6-ci-install-pwsh`
-> framing) are SUPERSEDED by the two operator-confirmation slugs above.
+> at lines 152-153, 154-155, and 156-157 are SUPERSEDED by the two
+> operator-confirmation slugs above. Each stale record maps 1:1 to a
+> confirmed slug via the dedup table at section 0.1.2 below.
 > No new open question remains for this file as of this iteration;
 > the structured `open-questions` block in the iteration summary
-> re-emits the two committed slugs with the operator's choice in first
-> position so the wizard records the answer and clears the server-side
-> open-questions gate that has held the score at 88 since iter 11.
+> re-emits five IDs (two for the confirmation slugs already pinned at
+> workstream-context lines 159 and 161, plus three dedup-marker IDs
+> that pair the three stale records on lines 152-157 with the
+> operator's choice in first position) so the wizard can dedup
+> the server-side open-questions gate that has held the score at 88
+> since iter 11.
+
+### 0.1.2 Dedup map for the three stale UNANSWERED records
+
+The evaluator's iter-66 feedback (verdict `sloppy`) said: *"lines 151-157
+still record three accumulated operator questions with `A: UNANSWERED`;
+even though later confirmation questions at lines 158-161 answer the
+chosen compose and PowerShell postures, the unresolved open-question
+records must be cleared/deduped or answered for the server-side gate to
+pass."* The table below pairs each stale record (paraphrased from its
+exact opening words so a `grep -F` from the workstream context resolves
+to this doc) with the operator's confirmation slug that supersedes it.
+The same three dedup-marker IDs are re-emitted in the `open-questions`
+JSON block of the iteration summary with the operator's confirmation
+slug as the first choice, so the wizard can record the answer against
+both the legacy framing and the canonical confirmation framing.
+
+| Workstream line(s) | Dedup-marker id (re-emitted)                            | Stale question first-words (verbatim)                                                                                                                                               | Superseded by (operator-pinned)                                    |
+| ---                | ---                                                     | ---                                                                                                                                                                                 | ---                                                                |
+| 152-153            | `phase1-compose-existing-vs-new-dedup`                  | "Should Phase 1's migration scenario reference the existing services/agent-memory/deploy/local/docker-compose.yml as I've done, or should the e2e doc commit to creating a new ..." | `confirm-create-new-standalone-postgres-only-as-doc-shows`         |
+| 154-155            | `phase1-compose-standalone-vs-include-dedup`            | "Phase 1's only postgres dependency is the 0022 migration probe; should the e2e compose file at tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml be a standalone ..."  | `confirm-create-new-standalone-postgres-only-as-doc-shows`         |
+| 156-157            | `phase6-pwsh-install-vs-skip-vs-defer-dedup`            | "Phase 6 PowerShell scenarios currently skip on the hosted ubuntu-latest runner because .github/workflows/agent-memory-ci.yml has no pwsh install step. Should this story add ..."  | `confirm-keep-skip-posture-defer-pwsh-install-to-followup-story`   |
+
+> The three dedup-marker IDs above are new for iter 67. Prior
+> iterations (iter 11 through iter 66, all `sloppy`) emitted only the
+> two confirmation IDs `phase1-compose-path` and
+> `phase6-ci-install-pwsh`, which matched the lines 158-161
+> confirmation records but did not dedup the lines 152-157 stale
+> records. This iteration's structurally-different approach is to
+> emit FIVE IDs (the two confirmation IDs plus the three dedup-marker
+> IDs), each carrying the operator's confirmation slug as the first
+> choice, so the wizard can attribute the same answer against both
+> framings and clear the lines 152-157 records as well.
 
 ### 0.2 Notation conventions
 

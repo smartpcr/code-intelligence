@@ -23,8 +23,12 @@ var nodeKinds = map[string]struct{}{
 }
 
 // edgeKinds is the closed set defined by the `edge_kind` ENUM in
-// migration 0001 (architecture.md §5.2.2). Same Go-side guard
-// rationale as nodeKinds.
+// migration 0001 (architecture.md §5.2.2), extended by migration
+// 0022_edge_kind_overrides.sql with `overrides` per the Rust
+// trait-method shadow rule (AST-PARSER-FOR-ADDIT architecture
+// §9 R4 / §7.2). Same Go-side guard rationale as nodeKinds: when
+// a future migration appends another label, add it here so
+// reader-side validation stays in lock-step with the SQL enum.
 var edgeKinds = map[string]struct{}{
 	"contains":       {},
 	"imports":        {},
@@ -35,6 +39,7 @@ var edgeKinds = map[string]struct{}{
 	"reads":          {},
 	"writes":         {},
 	"renamed_to":     {},
+	"overrides":      {},
 }
 
 // validateNodeKinds returns an error if any element of `kinds`
@@ -56,7 +61,7 @@ func validateEdgeKinds(kinds []string) error {
 		if _, ok := edgeKinds[k]; !ok {
 			return fmt.Errorf("graphreader: invalid edge kind %q "+
 				"(allowed: contains/imports/static_calls/observed_calls/"+
-				"extends/implements/reads/writes/renamed_to)", k)
+				"extends/implements/reads/writes/renamed_to/overrides)", k)
 		}
 	}
 	return nil

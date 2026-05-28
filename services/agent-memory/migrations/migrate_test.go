@@ -38,9 +38,13 @@ func TestAll_parsesEveryEmbeddedFile(t *testing.T) {
 		// Stage 6.1 Consolidator iter-4: durable candidate-support staging
 		// for sub-threshold accumulation across ticks (see migration header).
 		"0021",
+		// AST-PARSER-FOR-ADDIT Stage 1.2: append `overrides` to the
+		// `edge_kind` ENUM for the Rust trait-method shadow rule
+		// (architecture §9 R4).
+		"0022",
 	}
 	if len(all) != len(wantVersions) {
-		t.Fatalf("All() returned %d migrations, want %d (Stage 1.2 + 1.3 + 1.4 + 2.2 + 3.4 + 3.5 + 4.2 + 6.1 set)",
+		t.Fatalf("All() returned %d migrations, want %d (Stage 1.2 + 1.3 + 1.4 + 2.2 + 3.4 + 3.5 + 4.2 + 6.1 + AST-overrides set)",
 			len(all), len(wantVersions))
 	}
 	for i, w := range wantVersions {
@@ -218,6 +222,10 @@ func TestAll_filenamesMatchPlannedSet(t *testing.T) {
 		"0020_method_solo_observation.sql":  true,
 		// Stage 6.1 Consolidator iter-4 durable candidate-support staging.
 		"0021_concept_candidate.sql": true,
+		// AST-PARSER-FOR-ADDIT Stage 1.2: schema migration appending
+		// `overrides` to the closed-set `edge_kind` ENUM (architecture
+		// §4.4 preface + §9 R4 Rust trait-method shadow rule).
+		"0022_edge_kind_overrides.sql": true,
 	}
 	all, err := All()
 	if err != nil {

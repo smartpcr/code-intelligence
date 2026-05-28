@@ -26,6 +26,7 @@ skipped.
 | Python     | `.py .pyi`               | tree-sitter (`python`)    | scanner (`parser_python.go`) |
 | Go         | `.go`                    | tree-sitter (`golang`)    | (none -- file skipped) |
 | C          | `.c .h`                  | tree-sitter (`c`) — **stub** in this stage; full walker lands via sibling `stage-3.1-ctreesitterparser-implementation` | (none -- file skipped) |
+| C#         | `.cs`                    | tree-sitter (`csharp`) — **stub** in this stage (iter 9); full walker lands via sibling `stage-4.1-csharptreesitterparser-implementation` | (none -- file skipped) |
 
 Notes:
 
@@ -182,7 +183,9 @@ go test -count=1 .\internal\repoindexer\ast    # ok ~0.7s
 
 (The `C:\vcpkg\downloads\tools\perl\...\c\bin` path is the MinGW-W64 13.2.0 bundle that ships with the vcpkg-managed Strawberry Perl distribution and is the de-facto C toolchain on this Windows worktree; substitute any TDM-GCC / mingw-w64 install if present.)
 
-#### Out-of-scope baseline debt (waived for this workstream)
+#### Out-of-scope baseline debt (ACCEPTED WAIVER for this workstream)
+
+> **EXPLICIT WAIVER** — recorded per iter-9 evaluator request. The full-service validation gate (`go test ./...` from `services\agent-memory`) cannot go green on this branch because the `migrations` package has a duplicate `Migrator`/`New`/`Up` declaration inherited from upstream. The duplicate is **out of scope** for the Go-parser workstream and is **explicitly waived** here. The Go-parser stage's own package builds and tests clean under both CGO=0 and CGO=1; the inherited migrations conflict is the only failure under `go test ./...` and is owned by a separate (future) migrations-cleanup workstream.
 
 The full `services\agent-memory` test suite (`go test ./...`) remains red on a pre-existing duplicate-declaration in `migrations\`:
 
@@ -191,9 +194,13 @@ migrations\migrator.go:19:6: Migrator redeclared in this block
 migrations\migrate.go:143:6: other declaration of Migrator
 migrations\migrator.go:24:6: New redeclared in this block
 migrations\migrate.go:150:6: other declaration of New
+migrations\migrator.go:25:19: unknown field db in struct literal of type Migrator, but does have DB
+migrations\migrator.go:31:20: method Migrator.Up already declared at migrations\migrate.go:157:20
 ```
 
 `migrations\migrate.go` originates from `[impl] Structural schema migrations (#7)` (commit `f2bec92`), and the colliding `migrations\migrator.go` was introduced by `[e2e] Dispatcher sentinel branch, Pass 2b multimap, Pass 2d overrides — E2E (#143)` (commit `d60d8d8`); both pre-date this branch and the conflict was inherited via the upstream `feature/memory` merge. The Go-parser workstream does not own the `migrations` package — fixing it requires its own workstream to decide which `Migrator` shape to retain (`{DB *sql.DB}` from `migrate.go` vs. `{db *sql.DB}` from `migrator.go`). For this stage's validation gate, the duplicate is a documented waiver; the AST package itself builds and tests clean under both CGO modes as shown above.
+
+**Validation-gate substitution rule for this workstream**: instead of full `go test ./...`, use `go test -count=1 ./internal/repoindexer/ast` (CGO=0) and the CGO=1 equivalent. Both gates must exit 0 for this workstream to count as green. The migrations duplicate is not a regression introduced by this workstream; pre-existing git blame confirms commits `f2bec92` and `d60d8d8` both pre-date this branch's first commit.
 
 #### Sibling stage workstreams (NOT owned here)
 

@@ -1,9 +1,8 @@
-module github.com/smartpcr/code-intelligence/services/clean-code
+module forge/services/clean-code
 
 go 1.25.1
 
 require (
-	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/cucumber/godog v0.15.1
 	github.com/gofrs/uuid v4.3.1+incompatible
 	github.com/golang-jwt/jwt/v5 v5.2.3

@@ -6,6 +6,146 @@ composition root (`cmd/clean-code-metric-ingestor/main.go`,
 which hosts the management + ingest HTTP surfaces; future
 binaries under `cmd/clean-code-*` ship their own routes).
 
+## Stage 8.3 -- ML effort-model loader (clean-code-refactor-planner)
+
+The `clean-code-refactor-planner` binary now loads an
+external ML effort-model artefact at startup and stamps a
+per-task hour estimate onto every emitted `refactor_task`,
+replacing the Stage 8.2 `0.0` placeholder.
+
+### Operator pins (env vars)
+
+| env var | required | default | semantics |
+|---|---|---|---|
+| `CLEAN_CODE_REFACTOR_EFFORT_SOURCE` | no | `ML model from historical commits` | operator pin per architecture Sec 1.6. Closed set today: `"ML model from historical commits"` (REQUIRES a model artefact) or `"none"` (opt-out -- planner runs without an estimator and emits `effort_hours = 0.0`). Any other value refuses startup with the `ErrEffortModelSourceUnknown` sentinel. |
+| `CLEAN_CODE_REFACTOR_EFFORT_MODEL_URI` | YES when source = `"ML model from historical commits"` | `""` | local-disk URI of the JSON-on-disk effort-model artefact. Accepted forms: bare local path (`/abs/path/model.json`, `C:\path\model.json`, `C:/path/model.json`, `./rel/path.json`); `file://` URI (`file:///abs/path` on POSIX, `file:///C:/path` on Windows). Schemes other than `file://` are refused. |
+
+### Artefact format
+
+JSON object:
+
+```json
+{
+  "version": "v1.2.0-trained-2026-04-15",
+  "kind_base_hours": {
+    "split_class": 6.0,
+    "extract_method": 1.5,
+    "invert_dependency": 4.0,
+    "break_cycle": 8.0,
+    "consolidate_duplication": 3.0
+  },
+  "score_coef": 0.25,
+  "intercept": 0.0
+}
+```
+
+Strict-schema invariants enforced by `LoadModelFromFile`:
+
+- `version` is non-empty after trim (the load-bearing pin
+  per architecture Sec 5.3.3).
+- Every value in
+  `{split_class, extract_method, invert_dependency, break_cycle, consolidate_duplication}`
+  has a finite, non-negative entry in `kind_base_hours`.
+  Missing entries refuse load with `ErrEffortModelMissingKindBase`.
+- `score_coef`, `intercept`, and every entry in
+  `kind_base_hours` are IEEE-finite (no NaN / no Inf).
+  Otherwise refuse with `ErrEffortModelNonFiniteCoefficient`.
+- Unknown top-level fields refuse load with
+  `ErrEffortModelMalformed` (the decoder uses
+  `json.Decoder.DisallowUnknownFields`).
+
+Per-task formula (deterministic, same input -> bit-identical
+output):
+
+    hours = max(0,
+                kind_base_hours[task.kind]
+              + score_coef * hot_spot.score
+              + intercept)
+
+### Version-pinning chain (architecture Sec 5.3.3)
+
+The effort-model version is NOT duplicated on
+`refactor_plan` or `refactor_task`. Reproducing an
+estimate requires walking:
+
+    refactor_task
+      -> refactor_plan                                    (via refactor_task.plan_id)
+      -> refactor_plan.hotspot_ids[0]
+      -> hot_spot.policy_version_id                       (architecture Sec 5.5.1)
+      -> policy_version.refactor_weights.effort_model_version
+
+The loaded artefact's `version` MUST equal
+`policy_version.refactor_weights.effort_model_version` for
+every active policy snapshot the planner serves.
+`EffortModel.Estimate` returns the
+`ErrEffortModelVersionMismatch` sentinel when the snapshot's
+`Weights.EffortModelVersion` differs from the loaded
+`Version`; the error aborts the WHOLE batch (no plan row,
+no task row lands) rather than silently emitting
+`effort_hours = 0`.
+
+### Startup failure modes
+
+| condition | exit | log surface |
+|---|---|---|
+| `CLEAN_CODE_REFACTOR_EFFORT_SOURCE` set to anything other than the two pins | 1 | `ErrEffortModelSourceUnknown` |
+| source = ML pin AND `CLEAN_CODE_REFACTOR_EFFORT_MODEL_URI=""` | 1 | `ErrEffortModelURIRequired` (names both env vars) |
+| URI uses a scheme other than `file://` or a bare local path | 1 | `ErrEffortModelUnsupportedScheme` |
+| artefact file missing | 1 | wrapped `os.ErrNotExist` |
+| artefact JSON malformed / has unknown top-level fields | 1 | `ErrEffortModelMalformed` |
+| artefact missing a canonical kind base or has non-finite coefficients | 1 | `ErrEffortModelMissingKindBase` / `ErrEffortModelNonFiniteCoefficient` |
+| `version` empty after trim | 1 | `ErrEffortModelVersionEmpty` |
+
+When source = `"none"` and URI is empty, the binary starts
+normally; the composition root emits a `warn` log line
+indicating the estimator is disabled and the planner will
+emit `effort_hours = 0.0` for every task. Production
+deployments should NOT use this path.
+
+### Runtime failure modes (per planner call)
+
+| condition | behaviour |
+|---|---|
+| `EffortModel.Version != snap.Weights.EffortModelVersion` | `Plan` returns `ErrEffortModelVersionMismatch`; NO plan or task rows are written. |
+| `task.Kind` not in `EffortModel.KindBaseHours` (e.g. a custom rule mapper bypassed `ValidateTaskKind`) | `Plan` returns `ErrEffortModelMissingKindBase`; NO plan or task rows are written. |
+| `hot_spot.score` is +/-Inf (defensive; Stage 8.1 never produces this) | `Plan` returns `ErrEffortModelNonFiniteCoefficient`; NO plan or task rows are written. |
+| computed `hours < 0` (e.g. `intercept` set sufficiently negative) | clamped to `0`; estimate is still emitted. |
+
+### Operator playbook
+
+1. **Train / update model.** Publish a new artefact at the
+   URI; bump `version` to a new unique string (e.g.
+   `v1.3.0-trained-2026-06-01`).
+2. **Publish a new policy version** through the Policy
+   Steward with `refactor_weights.effort_model_version` set
+   to the new artefact's `version`.
+3. **Roll the planner.** Deploy `clean-code-refactor-planner`
+   binaries pointing at the new URI. Old planners (still
+   loaded with the previous artefact) will refuse to run
+   the new policy at all (`ErrEffortModelVersionMismatch`);
+   freshly-rolled planners will run the new policy and
+   refuse the old (same sentinel). The blast radius is
+   self-contained: a planner that finds a mismatched
+   snapshot writes NOTHING, so partial-rollout state is
+   never persisted.
+
+### Code locations
+
+- `internal/refactor/effort_model.go` -- loader, validator,
+  estimator, URI resolver, sentinel errors.
+- `internal/refactor/task_planner.go` --
+  `WithEffortEstimator` option + the per-task estimator call
+  inside `PlanFromSnapshot`.
+- `internal/config/config.go` -- `EnvRefactorEffortModelURI`
+  constant and `Config.RefactorEffortModelURI` field. NOT
+  validated in `Config.Validate()`; the model interlock is
+  binary-local to `clean-code-refactor-planner`.
+- `cmd/clean-code-refactor-planner/main.go` -- composition
+  root: calls `refactor.LoadFromConfig(cfg)` immediately
+  after `config.Load()`; exits 1 on loader error; wires
+  `refactor.WithEffortEstimator(model)` only when the
+  loader returned a non-nil model.
+
 ## Stage 9.1 -- Audit WAL frame writer
 
 The `internal/audit/wal/` package is the write-ahead log for

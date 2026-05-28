@@ -5,6 +5,149 @@ production-tier environment. The instructions assume Postgres
 14+ is already running and the `clean_code_*` roles have been
 created via the `0004_roles.up.sql` migration.
 
+## Stage 8.3: ML effort-model loader and version pinning
+
+This subsection captures the rollout sequence for the
+`internal/refactor/effort_model.go` loader -- the
+external-artefact + version-pinning interlock that
+replaces the Stage 8.2 `refactor_task.effort_hours = 0.0`
+placeholder. The unit of rollout is the
+`clean-code-refactor-planner` binary; no schema migration
+is required (the effort-model version is recovered
+transitively through `hot_spot.policy_version_id`, NOT a
+new column on `refactor_plan` / `refactor_task`).
+
+### Required env vars
+
+Set on every `clean-code-refactor-planner` instance:
+
+```
+CLEAN_CODE_REFACTOR_EFFORT_SOURCE="ML model from historical commits"
+CLEAN_CODE_REFACTOR_EFFORT_MODEL_URI="file:///var/lib/clean-code/models/effort-v1.2.0.json"
+```
+
+- `CLEAN_CODE_REFACTOR_EFFORT_SOURCE` -- defaults to the ML
+  pin per architecture Sec 1.6. Setting it explicitly is
+  optional in v0 but recommended so the operator-pin
+  surface is auditable. The other accepted value is
+  `"none"` (opt-out -- planner runs without an
+  estimator; not for production).
+- `CLEAN_CODE_REFACTOR_EFFORT_MODEL_URI` -- REQUIRED when
+  source is the ML pin. v0 accepts local-disk URIs only:
+  bare paths (`/abs/path/model.json`, `C:\path\model.json`,
+  `C:/path/model.json`, `./rel/path.json`); `file://` URIs
+  (`file:///abs/path` on POSIX, `file:///C:/path` on
+  Windows). Schemes other than `file://` are refused at
+  startup.
+
+### Artefact deployment
+
+The JSON artefact MUST be present on disk at the URI BEFORE
+the binary starts. Recommended layout:
+
+```
+/var/lib/clean-code/models/effort-v1.2.0.json     <- this build
+/var/lib/clean-code/models/effort-v1.1.3.json     <- previous build (kept for one rollout cycle)
+```
+
+Use distinct filenames per `version` (the artefact's
+internal pin) so an in-flight rollback can re-point the env
+var without overwriting the new artefact.
+
+Distribute through your existing config / secret
+distribution channel (Ansible / Kubernetes ConfigMap mount
+/ Vault sidecar -- pick whatever the rest of the
+deployment uses). The loader does NOT integrate with
+anything other than the local filesystem in v0.
+
+### Rollout sequence (ZERO-DOWNTIME, version-pinned)
+
+The version-pinning interlock means the model artefact and
+the active policy MUST move together. Roll in this order:
+
+1. **Stage the new model artefact** on every planner host
+   under a NEW filename (do NOT overwrite the old one).
+   Verify with `cat`.
+2. **Publish the new `policy_version`** through
+   `cmd/clean-code-gateway` (Stage 5.2 verbs). The
+   `refactor_weights.effort_model_version` field MUST
+   equal the new artefact's `version` string verbatim.
+   Activate the new `policy_version` via
+   `mgmt.activate_policy` (Stage 5.2). The active
+   activation is what `PolicyReader.ActivePolicyVersion`
+   returns; the planner reads it once per `Plan` call.
+3. **Roll the planner binaries** with the new env var
+   pointing at the new artefact path. As each instance
+   restarts:
+   - On the new instance: load + validate succeeds; the
+     instance starts serving and emits estimates against
+     the new policy. If the active policy still references
+     the OLD model version, `Plan` returns
+     `ErrEffortModelVersionMismatch` and NO `refactor_plan`
+     or `refactor_task` rows are written -- so a misordered
+     rollout (step 3 before step 2) is harmless but stalls
+     planning until corrected.
+   - On the old instances: still loaded with the OLD
+     artefact, they also return `ErrEffortModelVersionMismatch`
+     for the new active policy (same write-nothing safety
+     net). Old instances drain naturally as their
+     deployment slot recycles.
+4. **Remove the old artefact file** after all planner hosts
+   have rolled. Optional -- safe to keep for one cycle in
+   case of rollback.
+
+### Rollback
+
+Two-step rollback (mirror of rollout):
+
+1. Re-activate the previous `policy_version` via
+   `mgmt.activate_policy`.
+2. Roll planner binaries back with the env var pointing at
+   the previous artefact path (which you kept on disk).
+
+NO `refactor_plan` or `refactor_task` rows need to be
+deleted; the rolled-forward rows are valid relative to the
+policy they were emitted under, and the
+`policy_version_id` they reference (via the `hot_spot` row)
+preserves their reproducibility.
+
+### Smoke checks post-rollout
+
+- `clean-code-refactor-planner` process is running on every
+  host (`systemctl status` or pod readiness).
+- Structured log line on startup names the loaded
+  artefact's `version` (level `info`, message
+  `effort_model_loaded`).
+- A single round of planning emits non-zero
+  `refactor_task.effort_hours` values:
+
+  ```sql
+  SELECT plan_id, kind, effort_hours
+  FROM clean_code.refactor_task
+  WHERE created_at > NOW() - INTERVAL '5 minutes'
+  ORDER BY created_at DESC
+  LIMIT 20;
+  ```
+
+  Every `effort_hours` should be `> 0` (or exactly `0`
+  only when the formula legitimately clamps -- e.g.
+  `intercept` set so that
+  `base + score_coef*0 + intercept <= 0` for a particular
+  kind/score combination).
+- No `ErrEffortModelVersionMismatch` lines in the planner
+  logs after step 3 completes.
+
+### Failure-mode checklist
+
+| symptom | cause | remediation |
+|---|---|---|
+| planner exits 1 with `ErrEffortModelURIRequired` | env var unset | set `CLEAN_CODE_REFACTOR_EFFORT_MODEL_URI`. |
+| planner exits 1 with `ErrEffortModelUnsupportedScheme` | URI uses `http://` / `s3://` / etc. | switch to `file://` or a bare path; v0 supports local only. |
+| planner exits 1 with `ErrEffortModelMalformed` | JSON has unknown top-level field or invalid syntax | re-validate the artefact (`jq '.' < artefact.json`); compare keys to the schema in `runbook.md`. |
+| planner exits 1 with `ErrEffortModelMissingKindBase` | `kind_base_hours` lacks one of the five canonical kinds | add the missing kind to the artefact. |
+| every `Plan` call returns `ErrEffortModelVersionMismatch` | active policy's `effort_model_version` != loaded artefact's `Version` | re-activate the matching `policy_version` OR re-deploy planner with the matching artefact. |
+| `effort_hours` always exactly `0` | wired `ZeroEffortEstimator` OR source = `"none"` | check env: `CLEAN_CODE_REFACTOR_EFFORT_SOURCE` must be the ML pin; URI must point at a real artefact. |
+
 ## Stage 9.2: Audit WAL Reconciler (replay-only)
 
 This subsection captures the rollout sequence for the

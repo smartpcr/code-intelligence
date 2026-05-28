@@ -137,6 +137,33 @@ func run() int {
 		return 1
 	}
 
+	// Stage 8.3: load the ML effort-model artefact named by
+	// the operator pin `refactor-effort-source` (architecture
+	// Sec 1.6 row 5). When the pin requires a model AND the
+	// URI is empty, [refactor.LoadFromConfig] returns
+	// [refactor.ErrEffortModelURIRequired]; we exit non-zero
+	// per the workstream `missing-model-blocks-startup`
+	// scenario. The model is wired into Stage 8.2 task
+	// emission via [refactor.WithEffortEstimator] inside
+	// [runPlanner].
+	effortModel, err := refactor.LoadFromConfig(cfg)
+	if err != nil {
+		log.Printf("clean-code-refactor-planner: effort-model load: %v", err)
+		return 1
+	}
+	if effortModel != nil {
+		logger.Info("clean-code-refactor-planner: effort model loaded",
+			"version", effortModel.Version,
+			"source", cfg.RefactorEffortSource,
+			"uri", cfg.RefactorEffortModelURI,
+		)
+	} else {
+		logger.Warn("clean-code-refactor-planner: effort estimator disabled",
+			"source", cfg.RefactorEffortSource,
+			"note", "refactor_task.effort_hours will be 0.0 (Stage 8.2 placeholder)",
+		)
+	}
+
 	disabled := parseBoolEnv(os.Getenv(EnvDisableRefactorPlanner))
 
 	// /healthz listener is ALWAYS on so K8s liveness probes
@@ -177,7 +204,7 @@ func run() int {
 				exitCode = 1
 			} else {
 				defer db.Close()
-				planRes, taskRes, pErr := runPlanner(ctx, db, logger, repoID, sha)
+				planRes, taskRes, pErr := runPlanner(ctx, db, logger, repoID, sha, effortModel)
 				if pErr != nil {
 					if errors.Is(pErr, context.Canceled) ||
 						errors.Is(pErr, context.DeadlineExceeded) {
@@ -406,6 +433,14 @@ func executeTwoPassPlan(
 // SAME `policy_version_id` -- the race-safe wiring the
 // architecture Sec 5.5.1 reproducibility invariant requires.
 //
+// When `effortModel != nil` the Stage 8.3 estimator is wired
+// into the Stage 8.2 TaskPlanner via
+// [refactor.WithEffortEstimator]; emitted
+// `refactor_task.effort_hours` carries the model's estimate.
+// When `effortModel == nil` (operator pin
+// `refactor-effort-source=none`) the Stage 8.2 byte-identical
+// `effort_hours = 0.0` placeholder is preserved.
+//
 // The function is a thin SQL-wiring adapter over
 // [executeTwoPassPlan]; the two-pass orchestration itself is
 // pinned by `TestExecuteTwoPassPlan_*` cases.
@@ -415,6 +450,7 @@ func runPlanner(
 	logger *slog.Logger,
 	repoID uuid.UUID,
 	sha string,
+	effortModel *refactor.EffortModel,
 ) (refactor.PlanResult, refactor.PlanAndTasksResult, error) {
 	stewardStore, err := steward.NewSQLStore(db)
 	if err != nil {
@@ -447,11 +483,18 @@ func runPlanner(
 
 	// Stage 8.2 wiring. Note PlanFromSnapshot pins the SAME
 	// policy_version_id as the hot_spot batch we just wrote.
+	// Stage 8.3 wires the optional [refactor.EffortEstimator]
+	// when an artefact was loaded.
+	taskOpts := []refactor.TaskOption{}
+	if effortModel != nil {
+		taskOpts = append(taskOpts, refactor.WithEffortEstimator(effortModel))
+	}
 	taskPlanner, err := refactor.NewTaskPlanner(
 		policy,
 		refactor.NewSQLHotSpotReader(db),
 		refactor.NewSQLFindingDetailReader(db),
 		refactor.NewSQLRefactorPlanTaskWriter(db),
+		taskOpts...,
 	)
 	if err != nil {
 		return refactor.PlanResult{}, refactor.PlanAndTasksResult{},

@@ -594,6 +594,16 @@ var (
 	ErrNilRuleKindMapper = errors.New(
 		"refactor: WithRuleKindMapper was passed nil")
 
+	// ErrNilEffortEstimator signals that [WithEffortEstimator]
+	// was called with a nil receiver. The Stage 8.3 estimator
+	// is OPTIONAL (default behaviour emits `effort_hours = 0.0`
+	// per Stage 8.2); passing `nil` is therefore unambiguously
+	// a wiring bug -- the caller intended to wire an estimator
+	// but the underlying value was nil. Mirrors the other
+	// [TaskOption] nil sentinels.
+	ErrNilEffortEstimator = errors.New(
+		"refactor: WithEffortEstimator was passed nil")
+
 	// ErrNilIDFactoryOption / ErrNilClockOption signal that a
 	// caller passed `nil` through [WithTaskIDFactory] /
 	// [WithTaskClock]. Distinct from the [ErrNilIDFactory] /
@@ -716,6 +726,35 @@ func WithTaskDescriptionFunc(fn func(task RefactorTask, hs HotSpot, snap PolicyS
 	}
 }
 
+// WithEffortEstimator wires the Stage 8.3 [EffortEstimator]
+// into the [TaskPlanner]. When set, the planner calls
+// `e.Estimate(task, hs, snap)` for each emitted task and
+// stamps the returned float on `task.EffortHours` (replacing
+// the Stage 8.2 `0.0` placeholder).
+//
+// Estimator errors abort the WHOLE batch (no plan row, no
+// task row lands) -- silent fallback to `0.0` would hide a
+// production model/schema misconfiguration (rubber-duck
+// Stage 8.3 design review #2). The
+// [ErrEffortModelVersionMismatch] sentinel is the canonical
+// "the loaded model and the active policy disagree on the
+// pinned version" signal; the operator MUST reconcile the
+// two before re-running the planner.
+//
+// When the option is NOT supplied (the default), the planner
+// preserves the Stage 8.2 byte-identical placeholder
+// behaviour (`effort_hours = 0.0` per task). A nil estimator
+// yields [ErrNilEffortEstimator] from [NewTaskPlanner].
+func WithEffortEstimator(e EffortEstimator) TaskOption {
+	return func(tp *TaskPlanner) {
+		if e == nil {
+			tp.optErr = errors.Join(tp.optErr, ErrNilEffortEstimator)
+			return
+		}
+		tp.effortEstimator = e
+	}
+}
+
 // -----------------------------------------------------------------------------
 // TaskPlanner -- the Stage 8.2 orchestrator
 // -----------------------------------------------------------------------------
@@ -779,6 +818,14 @@ type TaskPlanner struct {
 	defaultKind    TaskKind
 	summaryFn      func(plan RefactorPlan, tasks []RefactorTask, snap PolicySnapshot) string
 	descriptionFn  func(task RefactorTask, hs HotSpot, snap PolicySnapshot) string
+
+	// effortEstimator is the optional Stage 8.3 estimator.
+	// Nil = Stage 8.2 byte-identical behaviour (every emitted
+	// task carries `EffortHours = 0.0`). Non-nil = the
+	// estimator's value lands on `task.EffortHours`; an
+	// estimator error aborts the whole batch (no plan or
+	// task row lands). Wired via [WithEffortEstimator].
+	effortEstimator EffortEstimator
 
 	// optErr accumulates errors stashed by the [TaskOption]
 	// setters (nil callbacks) so [NewTaskPlanner] can
@@ -1082,9 +1129,25 @@ func (tp *TaskPlanner) PlanFromSnapshot(
 				PlanID:      planID,
 				ScopeID:     hs.ScopeID,
 				Kind:        kind,
-				EffortHours: 0.0, // Stage 8.3 ML model populates
+				EffortHours: 0.0, // Stage 8.3 ML model populates below when wired
 				RuleID:      ruleID,
 				CreatedAt:   createdAt,
+			}
+			// Stage 8.3: when an [EffortEstimator] is wired
+			// via [WithEffortEstimator], swap the Stage 8.2
+			// `0.0` placeholder for the model's estimate.
+			// Estimator errors abort the WHOLE batch -- no
+			// plan row, no task row lands (rubber-duck Stage
+			// 8.3 design review #2: silent fallback to 0
+			// would hide a model/policy version drift).
+			if tp.effortEstimator != nil {
+				hours, eErr := tp.effortEstimator.Estimate(task, hs, snap)
+				if eErr != nil {
+					return PlanAndTasksResult{}, fmt.Errorf(
+						"refactor.TaskPlanner.Plan: effort estimator for rule_id=%q kind=%q: %w",
+						ruleID, kind, eErr)
+				}
+				task.EffortHours = hours
 			}
 			task.DescriptionMD = tp.descriptionFn(task, hs, snap)
 			tasks = append(tasks, task)

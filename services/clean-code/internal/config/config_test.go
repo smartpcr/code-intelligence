@@ -20,6 +20,7 @@ func clearCleanCodeEnv(t *testing.T) {
 		EnvGateDegradedPolicy,
 		EnvPolicySigningRequired,
 		EnvRefactorEffortSource,
+		EnvRefactorEffortModelURI,
 		EnvHTTPAddr,
 		EnvPrometheusAddr,
 		EnvOTelEndpoint,

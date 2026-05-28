@@ -609,6 +609,94 @@ namespace ns {
 	})
 }
 
+// TestTreeSitterCppParser_FunctionLocalClassesSkipped is the
+// policy test the iter-2 evaluator asked for: confirms that
+// classes declared inside a function body (free function or
+// namespaced free function) do NOT surface as namespace-
+// scope `ClassDecl`s. Without the explicit
+// `function_definition` / `lambda_expression` /
+// `compound_statement` skip cases in `visit()`, the default
+// recursive descent (added in iter 2 to handle preprocessor
+// wrappers) would walk into function bodies and produce
+// bogus entries like `ns.Local` for any local class.
+//
+// The sibling C++ methods workstream owns function-body
+// extraction; this stage's `ClassDecl` list is
+// type-declarations-only. Both the `MustEmit` assertions
+// (top-level types still surface) AND the `MustNotEmit`
+// assertions (function-local types are filtered out) are
+// load-bearing -- the fix must keep the wanted classes while
+// suppressing the unwanted ones.
+func TestTreeSitterCppParser_FunctionLocalClassesSkipped(t *testing.T) {
+	const src = `
+namespace ns {
+
+class Visible {
+public:
+  void api();
+};
+
+void freeFunction() {
+  class LocalInFree {};
+  struct TagInFree {};
+}
+
+class Outer {
+public:
+  void method() {
+    class LocalInMethod {};
+  }
+};
+
+}
+
+void globalFreeFn() {
+  class GlobalLocal {};
+}
+`
+	p := NewTreeSitterCppParser()
+	res, err := p.Parse("src/local.cpp", []byte(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	got := map[string]bool{}
+	for _, c := range res.Classes {
+		got[c.QualifiedName] = true
+	}
+
+	mustEmit := []string{"ns.Visible", "ns.Outer"}
+	for _, qn := range mustEmit {
+		if !got[qn] {
+			t.Errorf("missing expected class %q; got %v", qn, classNames(res.Classes))
+		}
+	}
+
+	// The forbidden set: function-local classes (free fn,
+	// method body, namespaced free fn, and a global free
+	// fn for good measure). Each should be filtered by the
+	// function-body skip in visit(). If any appears, the
+	// dispatcher would route a bogus extends/contains edge
+	// against a namespace-qualified name that no other
+	// translation unit can resolve.
+	mustNotEmit := []string{
+		"ns.LocalInFree",
+		"ns.TagInFree",
+		"ns.LocalInMethod",
+		"ns.Outer.LocalInMethod",
+		"LocalInFree",
+		"TagInFree",
+		"LocalInMethod",
+		"GlobalLocal",
+		"ns.GlobalLocal",
+	}
+	for _, qn := range mustNotEmit {
+		if got[qn] {
+			t.Errorf("function-local class %q should NOT surface as a namespace-scope ClassDecl; full list=%v",
+				qn, classNames(res.Classes))
+		}
+	}
+}
+
 // classNames is a small helper for error messages -- it
 // keeps test failure output readable without bloating each
 // assertion with formatting boilerplate.

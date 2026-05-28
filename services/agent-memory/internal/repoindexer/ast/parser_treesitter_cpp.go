@@ -114,6 +114,24 @@ const (
 	cppNodeLinkageSpecification      = "linkage_specification"
 	cppNodeIdentifier                = "identifier"
 	cppNodeNamespaceIdentifier       = "namespace_identifier"
+	// Function-body-bearing nodes. The walker NEVER
+	// descends into these: function-local classes (e.g.
+	// `void ns::foo() { class Local {}; }`) are
+	// implementation details of the function body and must
+	// NOT surface as `ns.Local` in the top-level class list
+	// alongside namespace-scope classes. This is the
+	// explicit guard against the failure mode the iter-2
+	// evaluator called out: without this, the visit()
+	// default branch would recursively walk every node
+	// type, eventually reaching a function body's
+	// compound_statement and emitting locals with
+	// namespace-only qualified names. The sibling C++
+	// methods workstream owns function-body extraction (and
+	// will surface methods/local classes via its own
+	// MethodDecl pipeline, not via ClassDecl).
+	cppNodeFunctionDefinition = "function_definition"
+	cppNodeLambdaExpression   = "lambda_expression"
+	cppNodeCompoundStatement  = "compound_statement"
 	// Preprocessor wrapper node types. tree-sitter-cpp
 	// emits the same string name whether the node lives
 	// at translation-unit scope or inside a
@@ -187,6 +205,16 @@ func (w *cppWalker) walkTop(root *sitter.Node) {
 // wrappers still surface as `ClassDecl`s, instead of being
 // silently dropped because the walker only knew about the
 // closed set of node types it special-cases.
+//
+// Body-bearing function nodes (`function_definition`,
+// `lambda_expression`, and bare `compound_statement`) are
+// explicitly STOPPED -- the default recursion would
+// otherwise walk into a function body and emit any local
+// class declarations as if they were namespace-scope
+// classes (a `void ns::foo() { class Inner {}; }` would
+// produce a bogus `ns.Inner` ClassDecl). This is the iter-2
+// evaluator's policy concern; the sibling C++ methods
+// workstream owns function-body extraction.
 func (w *cppWalker) visit(n *sitter.Node, container, namespace string, templateParams []string) {
 	if n == nil {
 		return
@@ -209,6 +237,21 @@ func (w *cppWalker) visit(n *sitter.Node, container, namespace string, templateP
 				w.visit(body.NamedChild(int(i)), container, namespace, nil)
 			}
 		}
+	case cppNodeFunctionDefinition,
+		cppNodeLambdaExpression,
+		cppNodeCompoundStatement:
+		// Policy: do NOT descend into function bodies,
+		// lambda bodies, or bare compound statements.
+		// Anything class-like declared inside a function
+		// body is a local implementation detail; surfacing
+		// it as a namespace-scope `ClassDecl` would mislead
+		// downstream graph consumers. The C++ methods
+		// workstream owns function-body extraction and will
+		// route local types through its own pipeline if
+		// they ever become in-scope. Emitting NOTHING here
+		// is the conservative correct behaviour for the
+		// "classes-only" scope this workstream owns.
+		return
 	default:
 		// Generic recursive descent for every other node
 		// type -- includes preproc wrappers
@@ -220,7 +263,9 @@ func (w *cppWalker) visit(n *sitter.Node, container, namespace string, templateP
 		// class/namespace in. The recursive walk is bounded
 		// because the only emission sites are the explicit
 		// switch cases above; an unknown wrapper merely
-		// passes through.
+		// passes through. Function-body-bearing nodes are
+		// stopped by the explicit case above so this
+		// recursion can NEVER reach a local class.
 		for i := uint32(0); i < n.NamedChildCount(); i++ {
 			w.visit(n.NamedChild(int(i)), container, namespace, templateParams)
 		}

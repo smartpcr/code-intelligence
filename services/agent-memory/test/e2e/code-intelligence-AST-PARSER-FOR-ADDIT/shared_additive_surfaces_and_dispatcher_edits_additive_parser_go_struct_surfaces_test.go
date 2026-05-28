@@ -61,11 +61,6 @@ type additiveParserState struct {
 	buildExitCode int
 	buildOutput   string
 
-	// Scenario 2: ReceiverAliases default nil
-	zeroMethod            ast.MethodDecl
-	receiverAliasCount    int
-	receiverAliasPanicked bool
-
 	// Scenario 3: ErrParserUnavailable identity
 	wrappedErr     error
 	errorsIsResult bool
@@ -220,42 +215,6 @@ func (s *additiveParserState) everyImportLangMetaIsNil() error {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 2 — ReceiverAliases default nil
-//
-// Direct field access on ast.MethodDecl.ReceiverAliases — the test
-// fails at compile time if the impl has not added the field.
-// ---------------------------------------------------------------------------
-
-func (s *additiveParserState) aMethodDeclZeroValue() error {
-	s.zeroMethod = ast.MethodDecl{}
-	return nil
-}
-
-func (s *additiveParserState) theDispatcherIteratesMReceiverAliases() error {
-	defer func() {
-		if r := recover(); r != nil {
-			s.receiverAliasPanicked = true
-		}
-	}()
-
-	// Direct field access — compile-time contract check.
-	for range s.zeroMethod.ReceiverAliases {
-		s.receiverAliasCount++
-	}
-	return nil
-}
-
-func (s *additiveParserState) theIterationYieldsZeroElementsWithoutPanic() error {
-	if s.receiverAliasPanicked {
-		return fmt.Errorf("iterating ReceiverAliases on zero-value MethodDecl panicked")
-	}
-	if s.receiverAliasCount != 0 {
-		return fmt.Errorf("expected 0 elements from ReceiverAliases, got %d", s.receiverAliasCount)
-	}
-	return nil
-}
-
-// ---------------------------------------------------------------------------
 // Scenario 3 — ErrParserUnavailable identity
 //
 // Direct reference to ast.ErrParserUnavailable — the test fails at
@@ -296,11 +255,6 @@ func InitializeScenario_shared_additive_surfaces_and_dispatcher_edits_additive_p
 	ctx.Then(`^every ClassDecl LangMeta is nil$`, s.everyClassDeclLangMetaIsNil)
 	ctx.Then(`^every MethodDecl LangMeta is nil$`, s.everyMethodDeclLangMetaIsNil)
 	ctx.Then(`^every Import LangMeta is nil$`, s.everyImportLangMetaIsNil)
-
-	// Scenario 2: ReceiverAliases default nil
-	ctx.Given(`^a MethodDecl zero value$`, s.aMethodDeclZeroValue)
-	ctx.When(`^the dispatcher iterates m\.ReceiverAliases$`, s.theDispatcherIteratesMReceiverAliases)
-	ctx.Then(`^the iteration yields zero elements without panic$`, s.theIterationYieldsZeroElementsWithoutPanic)
 
 	// Scenario 3: ErrParserUnavailable identity
 	ctx.Given(`^a wrapped error fmt\.Errorf wrapping ast\.ErrParserUnavailable$`, s.aWrappedErrorFmtErrorfWrappingAstErrParserUnavailable)

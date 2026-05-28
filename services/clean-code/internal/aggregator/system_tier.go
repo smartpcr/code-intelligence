@@ -852,31 +852,177 @@ func (c *SystemTierComposer) composeXRepoDepDepth(
 	return out, nil
 }
 
-// longestDepDepth returns the longest simple path (in
-// edges) reachable from `start` in the directed graph
-// `adj`. The traversal uses an explicit visited set per
-// recursion stack so cycles in the dependency graph terminate
-// rather than blow the call stack -- v1 treats a cycle as a
-// "depth cap" at the SCC entry point.
+// longestDepDepth returns the length (in edges) of the longest
+// path in the condensation DAG reachable from the SCC
+// containing `start`. Strongly-connected components are
+// collapsed to a single super-node so a cycle contributes
+// ZERO additional depth past the SCC entry point -- this is
+// the v1 "depth cap at the SCC entry point" semantic the
+// package has always documented. For an acyclic graph (the
+// expected production shape of the cross-repo dependency
+// graph) the answer is identical to "longest path in edges
+// from `start`".
+//
+// Cost: O(V + E) over the subgraph reachable from `start`.
+// The previous implementation walked all simple paths via
+// backtracking (`set-then-delete` on `visited`), which makes
+// the worst case O(V!) -- the classical NP-hard
+// longest-simple-path problem. For a linked-mode tick with
+// hundreds of repos and a dense agent-memory-adapter
+// response that path could hang the Cross-Repo Aggregator
+// tick for minutes; Tarjan's SCC plus DP on the
+// condensation bounds the work to linear time regardless of
+// graph density.
+//
+// Implementation note: both phases (Tarjan's traversal AND
+// the longest-path DP) are iterative. A chain of 100k repos
+// that linked mode might surface MUST NOT blow the goroutine
+// stack just because the dependency graph is deep.
 func longestDepDepth(start uuid.UUID, adj map[uuid.UUID][]uuid.UUID) int {
-	visited := make(map[uuid.UUID]bool)
-	return dfsLongestPath(start, adj, visited)
-}
-
-func dfsLongestPath(node uuid.UUID, adj map[uuid.UUID][]uuid.UUID, visited map[uuid.UUID]bool) int {
-	if visited[node] {
+	sccID, sccCount := tarjanSCC(start, adj)
+	if sccCount == 0 {
 		return 0
 	}
-	visited[node] = true
-	defer delete(visited, node)
-	best := 0
-	for _, next := range adj[node] {
-		d := 1 + dfsLongestPath(next, adj, visited)
-		if d > best {
-			best = d
+	// Build the condensation as a `from-SCC -> set of to-SCC`
+	// adjacency, deduplicated so parallel edges in the
+	// original graph don't inflate the DP-step constant
+	// factor. Only edges between two reachable-from-start
+	// nodes are emitted (unreachable nodes have no sccID).
+	condEdges := make(map[int]map[int]struct{}, sccCount)
+	for from, tos := range adj {
+		fromSCC, ok := sccID[from]
+		if !ok {
+			continue
+		}
+		for _, to := range tos {
+			toSCC, ok := sccID[to]
+			if !ok {
+				continue
+			}
+			if fromSCC == toSCC {
+				continue
+			}
+			set := condEdges[fromSCC]
+			if set == nil {
+				set = make(map[int]struct{})
+				condEdges[fromSCC] = set
+			}
+			set[toSCC] = struct{}{}
 		}
 	}
-	return best
+	// Tarjan's assigns SCC ids in reverse topological order:
+	// the first SCC popped (id 0) has no still-unfinished
+	// descendants in the condensation, and the last popped
+	// (id sccCount-1) is the component containing `start`.
+	// Iterating ids ascending therefore visits each SCC
+	// AFTER its condensation descendants, so `dp[next]` is
+	// already computed by the time we reach `dp[scc]`. No
+	// recursion required -- a 100k-SCC chain cannot blow
+	// the goroutine stack here.
+	dp := make([]int, sccCount)
+	for scc := 0; scc < sccCount; scc++ {
+		best := 0
+		for next := range condEdges[scc] {
+			if d := 1 + dp[next]; d > best {
+				best = d
+			}
+		}
+		dp[scc] = best
+	}
+	return dp[sccID[start]]
+}
+
+// tarjanSCC computes the strongly-connected components of the
+// subgraph reachable from `start` in `adj` using Tarjan's
+// algorithm in iterative form. It returns a `node -> scc_index`
+// map and the total number of SCCs discovered. The SCC index
+// is assigned at the moment Tarjan's pops the component,
+// which is reverse topological order in the condensation:
+// index 0 is a condensation sink, index `sccCount-1` is the
+// component containing `start`. [longestDepDepth] relies on
+// this ordering to compute the longest path iteratively
+// without a second topological sort.
+//
+// Iterative (rather than recursive) so a 100k-node chain of
+// repos surfaced by the linked-mode agent-memory adapter
+// cannot exhaust the Go goroutine stack.
+func tarjanSCC(start uuid.UUID, adj map[uuid.UUID][]uuid.UUID) (map[uuid.UUID]int, int) {
+	type frame struct {
+		node    uuid.UUID
+		nextIdx int
+	}
+	var (
+		sccID     = make(map[uuid.UUID]int)
+		index     = make(map[uuid.UUID]int)
+		lowlink   = make(map[uuid.UUID]int)
+		onStack   = make(map[uuid.UUID]bool)
+		tarStack  []uuid.UUID
+		callStack []frame
+		nextIndex int
+		sccCount  int
+	)
+	push := func(node uuid.UUID) {
+		index[node] = nextIndex
+		lowlink[node] = nextIndex
+		nextIndex++
+		tarStack = append(tarStack, node)
+		onStack[node] = true
+		callStack = append(callStack, frame{node: node, nextIdx: 0})
+	}
+	push(start)
+	for len(callStack) > 0 {
+		top := &callStack[len(callStack)-1]
+		children := adj[top.node]
+		if top.nextIdx < len(children) {
+			next := children[top.nextIdx]
+			top.nextIdx++
+			if _, seen := index[next]; !seen {
+				push(next)
+				continue
+			}
+			if onStack[next] {
+				// Back edge into the current SCC: update
+				// lowlink with the child's index (NOT its
+				// lowlink -- that's the standard Tarjan's
+				// invariant for stack-resident neighbours).
+				if idx := index[next]; idx < lowlink[top.node] {
+					lowlink[top.node] = idx
+				}
+			}
+			// Cross edge to a finished SCC: ignore.
+			continue
+		}
+		// All children of `node` processed; close the frame.
+		node := top.node
+		if lowlink[node] == index[node] {
+			// `node` is the root of a new SCC -- pop the
+			// Tarjan stack down to it.
+			for {
+				w := tarStack[len(tarStack)-1]
+				tarStack = tarStack[:len(tarStack)-1]
+				onStack[w] = false
+				sccID[w] = sccCount
+				if w == node {
+					break
+				}
+			}
+			sccCount++
+		}
+		nodeLow := lowlink[node]
+		callStack = callStack[:len(callStack)-1]
+		if len(callStack) > 0 {
+			// Propagate this node's lowlink to its caller --
+			// the iterative equivalent of the recursive
+			// `parent.lowlink = min(parent.lowlink,
+			// child.lowlink)` step after the recursive call
+			// returns.
+			parent := &callStack[len(callStack)-1]
+			if nodeLow < lowlink[parent.node] {
+				lowlink[parent.node] = nodeLow
+			}
+		}
+	}
+	return sccID, sccCount
 }
 
 // composeArchDebtRatio emits one row per `package` scope and

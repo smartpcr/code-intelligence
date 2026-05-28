@@ -1,3 +1,13 @@
+//go:build canonical_dispatcher
+
+// V1-only dispatcher + emitter tests are gated behind
+// `canonical_dispatcher` because they exercise the old
+// `NewDispatcher(opts...)` / `WithParser(...)` / `EmitFile(string, []byte)`
+// surface plus `NewEmitter` / `Pass2dOverrides`, all of which
+// live in the gated V1 stub files (types.go / dispatcher.go /
+// emitter.go / pass2d.go). The Stage 3.2 dispatcher landing
+// workstream will retire these tests in favour of the
+// canonical pinned scenarios in dispatcher_test.go.
 package ast
 
 import (

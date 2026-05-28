@@ -1,3 +1,8 @@
+// Fixture-driven TypeScript parser test pipes through the full
+// V2 Dispatcher.EmitFile to assert node/edge counts. Depends on
+// `newFakeWriter` / `makeEvent` helpers in dispatcher_test.go
+// (also un-gated in iter 6). Defines `signatureSimpleNames`
+// which is used by parser_python_test.go.
 package ast
 
 import (

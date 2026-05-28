@@ -11,6 +11,50 @@
 - Some parser paths require CGO and a C compiler because of tree-sitter.
 - Race-detector tests require CGO and are intended for Linux CI.
 
+## AST parser language support
+
+`services/agent-memory/internal/repoindexer/ast` ships per-language
+parsers registered through `parsers_cgo.go` (CGO=on) and
+`parsers_nocgo.go` (CGO=off):
+
+| Language     | Extensions          | CGO=on (tree-sitter) | CGO=off (scanner) |
+| ------------ | ------------------- | -------------------- | ----------------- |
+| TypeScript   | `.ts .tsx .js .jsx .mjs .cjs` | ✓ (`parser_treesitter.go`) | ✓ (`parser_typescript.go`) |
+| Python       | `.py .pyi`          | ✓ (`parser_treesitter.go`) | ✓ (`parser_python.go`)     |
+| C#           | `.cs .csx`          | ✓ (`parser_treesitter_csharp.go`, registered in `parsers_cgo.go`) | — (CGO-only in v1)         |
+| C++          | `.cc .cxx .cpp .c++ .hpp .hh .hxx .h++` | ✓ (`parser_treesitter_cpp.go`, registered in `parsers_cgo.go`) | — (CGO-only)               |
+| C            | `.c .h`             | planned (sibling Stage 4 workstream — no scanner fallback) | — |
+| Go           | `.go`               | planned (sibling Stage 5 workstream — no scanner fallback) | — |
+| Rust         | `.rs`               | planned (sibling Stage 5 workstream — no scanner fallback) | — |
+| PowerShell   | `.ps1 .psm1 .psd1`  | planned (requires `tree-sitter-powershell` grammar binding work; tracked separately) | — |
+
+Notes:
+
+- Tree-sitter-backed parsers require CGO and a C compiler. CI's
+  `make test-race` step runs on a Linux runner with gcc available;
+  local Windows dev with the default CGO=0 toolchain silently skips
+  the `//go:build cgo` parser files.
+- C# (`.cs`, `.csx`) has no scanner-backed fallback in v1. Files of
+  these extensions are not indexed on the CGO=off path -- the
+  dispatcher logs a structured skip event for each one and the AST
+  graph simply does not contain those declarations until CGO=on is
+  used.
+- C++ (`.cc`, `.cpp`, `.hpp`, etc.) follows the same CGO-only model
+  as C# in v1. Header-only / `.h` files that may be either C or C++
+  currently route to the planned C parser path.
+- C, Go, Rust, and PowerShell rows are listed for completeness against
+  `docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/implementation-plan.md`
+  (Stage 4 / 5 / 6 acceptance matrix). Their parser files are not in
+  this branch -- the dispatcher will emit a structured skip per file
+  (`reason=parser_unavailable`) until those workstreams land.
+- Language alias normalization (`cs` / `c#` -> `csharp`, `cpp` /
+  `cxx` / `c++` -> `cpp`, `golang` -> `go`, `rs` -> `rust`, `ps` /
+  `ps1` / `psm1` / `psd1` -> `powershell`, etc.) happens centrally in
+  `dispatcher.go::normalizeHints`; per-event `Language` /
+  `LanguageHint` hints route through that table before
+  `pickParser` runs an extension comparison. The full alias matrix
+  is pinned by `TestNormalizeHints_AliasExpansion`.
+
 ## Common commands
 
 ### agent-memory

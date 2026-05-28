@@ -1976,31 +1976,41 @@ their own zero-findings verdict pair via the
    | `CLEAN_CODE_PERIODIC_SWEEP_CADENCE`  | Sweeper tick interval (Go duration; default is the value in `config.go`) |
    | `CLEAN_CODE_SCAN_TIMEOUT`            | Per-scan timeout passed to `WithStateMachineTimeout`                   |
 
-   Production deploys MUST set BOTH `CLEAN_CODE_PG_URL`
+   Production scan pods MUST set BOTH `CLEAN_CODE_PG_URL`
    and `CLEAN_CODE_AST_SCAN_ROOT`. The composition root
-   (`cmd/clean-coded/main.go:402-448`) is strict about the
-   pairing:
+   (`cmd/clean-code-metric-ingestor/main.go:837-891`)
+   selects the dispatcher based on the pairing:
 
-   - **Both set** → `PGScanRunStore` +
-     `DirectoryAstFileSource` are wired and the sweeper
-     launches.
+   - **Both set** → `RegistryBackedFoundationDispatcher`
+     is wired with a
+     `DirectoryAstFileSource{Coordinator, Pool}` rooted at
+     `CLEAN_CODE_AST_SCAN_ROOT` and threaded with the
+     shared `iso.coord` / `iso.pool` (so mode-flip drains
+     observe the SAME in-flight counter the scan path
+     increments). The sweeper is launched separately by
+     `buildSweepLoop` at `main.go:160`.
    - **`CLEAN_CODE_PG_URL` set, `CLEAN_CODE_AST_SCAN_ROOT`
-     unset** → the process **fails to start** with a
-     non-zero exit and the actionable boot error
-     "CLEAN_CODE_AST_SCAN_ROOT is REQUIRED when
-     CLEAN_CODE_PG_URL is configured" (see
-     `main.go:438-448`). It does NOT silently fall back to
-     `EmptyAstFileSource`; iter-4 made this fail-fast
-     after an evaluator finding that a production process
-     could otherwise start against live PG without ever
-     processing pending commits.
-   - **`CLEAN_CODE_PG_URL` unset** → scaffold mode. The
-     composition root logs `metric ingestor sweep loop
-     NOT STARTED (scaffold mode: CLEAN_CODE_AST_SCAN_ROOT
-     unset)` (`main.go:454-460`), closes `sweepDone`
-     immediately, and does NOT launch the sweeper. The
-     HTTP surface still serves; nothing claims commits.
-     This is dev-loop only.
+     unset** → the foundation dispatcher falls back to
+     `NoopFoundationRecipeDispatcher{Logger: logger}`
+     (`main.go:860`, `:887-890`) and the binary boots
+     normally. Stage 9.3 iter-3 intentionally reverted the
+     iter-4 fail-fast contract so that a webhook-only
+     metric-ingestor pod (one that serves `mgmt.*` and
+     `/v1/ingest/*` without owning the on-disk checkout
+     layout) still starts. A single info log
+     `foundation dispatcher = noop
+     (CLEAN_CODE_AST_SCAN_ROOT unset)` is emitted at
+     startup; operators deploying a SCAN pod (rather than
+     a webhook pod) MUST verify this log line is absent
+     and that `isolation_pool_languages` appears in the
+     `wired production foundation dispatcher` info log
+     instead.
+   - **`CLEAN_CODE_PG_URL` unset** → scaffold mode.
+     `buildSweepLoop` returns a nil loop
+     (`main.go:392-401`) and the foundation dispatcher
+     still resolves to the noop fallback. The HTTP
+     surface still serves; nothing claims commits. This
+     is dev-loop only.
 
 ### Per-rollout verification
 

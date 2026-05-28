@@ -1651,17 +1651,21 @@ ever written. The state alphabet is pinned in
 
 ### Configuration (env vars)
 
-The metric ingestor is wired in `cmd/clean-coded/main.go`
-(`buildMetricIngestor` + the sweeper construction below it)
-and consumes the existing service-wide config knobs -- it
-does NOT introduce a `CLEAN_CODE_METRIC_INGESTOR_*`
-namespace. The relevant env vars are:
+The metric ingestor is wired in
+`cmd/clean-code-metric-ingestor/main.go` (Stage 9.3 iter-3
+hoisted the shared `isolationBundle` at
+`main.go:143-158` and refactored the route mounters --
+`mountMgmtRoutes` at `:190-196` and `mountIngestRouter` at
+`:198-205`). It consumes the existing service-wide config
+knobs -- it does NOT introduce a
+`CLEAN_CODE_METRIC_INGESTOR_*` namespace. The relevant env
+vars are:
 
 | Env var                           | Meaning                                                                                                                                                                                                          | Required when                       |
 | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
 | `CLEAN_CODE_PG_URL`               | PostgreSQL connection URL. The pool MUST be reachable by the `clean_code_metric_ingestor` role. When empty, the composition root falls back to in-memory stores ([`metric_ingestor.NewInMemoryScanRunStore`]).   | always in production                |
-| `CLEAN_CODE_AST_SCAN_ROOT`        | Root directory under which per-repo checkouts live. The composition root reads it as the root of `DirectoryAstFileSource`; if empty the root falls back to `EmptyAstFileSource` (no work to do).                 | always in production                |
-| `CLEAN_CODE_PERIODIC_SWEEP_CADENCE` | The `Sweeper` tick interval (Go duration). Drives `WithSweeperCadence` in `cmd/clean-coded/main.go`. Default value lives in `internal/config/config.go`.                                                       | never (defaulted)                   |
+| `CLEAN_CODE_AST_SCAN_ROOT`        | Root directory under which per-repo checkouts live. When set, the composition root wires `RegistryBackedFoundationDispatcher` with a `DirectoryAstFileSource{Coordinator, Pool}` rooted here (see `cmd/clean-code-metric-ingestor/main.go:860-891`). When empty the dispatcher falls back to `NoopFoundationRecipeDispatcher{Logger: logger}` so a webhook-only metric-ingestor pod still boots cleanly. | production scan pods                |
+| `CLEAN_CODE_PERIODIC_SWEEP_CADENCE` | The `Sweeper` tick interval (Go duration). Drives `WithSweeperCadence` in `cmd/clean-code-metric-ingestor/main.go`. Default value lives in `internal/config/config.go`.                                       | never (defaulted)                   |
 | `CLEAN_CODE_SCAN_TIMEOUT`         | Per-scan timeout passed to `WithStateMachineTimeout`. A sweep that exceeds this is aborted and the commit is marked `'failed'` rather than left in `'scanning'` indefinitely.                                    | never (defaulted)                   |
 
 There is intentionally NO `CLEAN_CODE_METRIC_INGESTOR_*`
@@ -1672,31 +1676,39 @@ sizing) may introduce a dedicated namespace; until then,
 operators should NOT set fictional env vars expecting
 them to work.
 
-Mode selection (per `cmd/clean-coded/main.go:402-460`):
+Mode selection (per `cmd/clean-code-metric-ingestor/main.go:837-891`):
 
-- **Production**: `CLEAN_CODE_PG_URL` is set AND
+- **Production scan pod**: `CLEAN_CODE_PG_URL` is set AND
   `CLEAN_CODE_AST_SCAN_ROOT` is set. The composition root
-  wires `PGScanRunStore` + `DirectoryAstFileSource` and
-  launches the sweeper.
-- **Fail-fast**: `CLEAN_CODE_PG_URL` is set but
-  `CLEAN_CODE_AST_SCAN_ROOT` is empty. The composition
-  root **refuses to start** and returns an actionable
-  error (`main.go:438-448`): "CLEAN_CODE_AST_SCAN_ROOT is
-  REQUIRED when CLEAN_CODE_PG_URL is configured -- the
-  Metric Ingestor sweep loop is the SOLE driver of
-  `commit.scan_status` transitions...". This is the
-  iter-4 evaluator structural fix: rather than silently
-  letting pending commits accumulate against a live PG
-  instance with no source of AST files, the process
-  exits non-zero so the operator sees the misconfiguration
-  at boot, not 30 minutes of silent backlog later.
+  wires `PGScanRunStore` and a
+  `RegistryBackedFoundationDispatcher` whose `AstFiles` is a
+  `DirectoryAstFileSource` rooted at the scan root and
+  threaded with the shared `iso.coord` / `iso.pool`
+  (`main.go:866-879`). The same `iso.coord` backs
+  `mgmt.set_mode`'s drain barrier, so a mode flip blocks
+  until in-flight scans for the repo release. The sweeper
+  is launched separately by `buildSweepLoop` (`main.go:160`).
+- **Webhook-only / no-checkout pod**: `CLEAN_CODE_PG_URL`
+  is set but `CLEAN_CODE_AST_SCAN_ROOT` is empty. The
+  composition root does **not** fail-fast (Stage 9.3 iter-3
+  intentionally reverted the iter-4 fail-fast contract so
+  that a webhook-only metric-ingestor pod -- one that
+  serves `mgmt.*` and `/v1/ingest/*` without a local
+  checkout layout -- still boots). Instead the foundation
+  dispatcher falls back to
+  `NoopFoundationRecipeDispatcher{Logger: logger}`
+  (`main.go:860`, `:887-890`) and emits a single info log
+  `foundation dispatcher = noop (CLEAN_CODE_AST_SCAN_ROOT
+  unset)` at startup. Operators deploying a SCAN pod (one
+  expected to claim pending commits) MUST verify the
+  `wired production foundation dispatcher` info log
+  appears with `isolation_pool_languages` populated, NOT
+  the noop log line above.
 - **Scaffold mode**: `CLEAN_CODE_PG_URL` is empty (which
-  implies in-memory stores). The composition root logs
-  `metric ingestor sweep loop NOT STARTED (scaffold mode:
-  CLEAN_CODE_AST_SCAN_ROOT unset)` (`main.go:454-460`),
-  closes `sweepDone` immediately so shutdown does not
-  block, and the sweeper is **NEVER launched**. The HTTP
-  surface still serves; nothing claims commits. This is
+  implies in-memory stores). `buildSweepLoop` returns a
+  nil loop (`main.go:392-401`); the foundation dispatcher
+  still resolves to the noop fallback. The HTTP surface
+  still serves; nothing claims commits. This is
   acceptable for the dev loop only.
 
 ### Source-availability pre-flight (NOT a `/readyz` probe)
@@ -1704,8 +1716,10 @@ Mode selection (per `cmd/clean-coded/main.go:402-460`):
 The composition root threads an `AstSourceAvailability`
 probe (`metric_ingestor.AstSourceAvailability`, defined in
 `internal/metric_ingestor/availability.go`) into the state
-machine via `WithStateMachineSourceProbe` (see
-`cmd/clean-coded/main.go:917-957`). The directory AST
+machine via `WithStateMachineSourceProbe` (wired in the
+ingest router; see
+`cmd/clean-code-metric-ingestor/main.go` — search
+`WithStateMachineSourceProbe`). The directory AST
 source itself implements `HasFilesFor`, so the probe is
 non-nil whenever `CLEAN_CODE_AST_SCAN_ROOT` is set; in
 scaffold mode the probe is nil and the pre-flight is
@@ -1727,7 +1741,7 @@ The probe is plumbed into the state machine, NOT into
 `/readyz`. The composition root currently registers only
 the Policy-Steward signing-key cache ready-check via
 `healthHandler.AddReadyCheck("signing_key_cache", ...)`
-(see `cmd/clean-coded/main.go:526`); there is no
+(in `cmd/clean-code-metric-ingestor/main.go`); there is no
 `AddReadyCheck("ast_source", ...)` call today. Operators
 that want `/readyz` to reflect AST-source readiness should
 treat this as a follow-up workstream, not a Stage 3.2

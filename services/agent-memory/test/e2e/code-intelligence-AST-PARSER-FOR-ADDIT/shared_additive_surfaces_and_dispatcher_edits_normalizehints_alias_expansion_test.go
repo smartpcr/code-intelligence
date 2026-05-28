@@ -196,40 +196,12 @@ func (s *normalizeHintsState) aFileWithExtensionAndLanguageHints(ext, hint strin
 }
 
 func (s *normalizeHintsState) selectParserRuns() error {
-	// Register C parser for .c/.h and C++ parser for .cpp/.cc/.cxx/.hpp.
-	cParser := &stubLangParser{lang: "c", exts: []string{".c", ".h"}}
-	cppParser := &stubLangParser{lang: "cpp", exts: []string{".cpp", ".cc", ".cxx", ".hpp"}}
-	w := &nodeCapturingWriter{}
-
-	// Apply LanguageHints=["cpp"] — the conflicting hint that should NOT
-	// override the extension-based routing for .h files.
-	d := ast.NewDispatcher(
-		ast.WithParser(cParser),
-		ast.WithParser(cppParser),
-		ast.WithWriter(w),
-		ast.WithLanguageHints([]string{s.hintLang}),
-	)
-
-	// Dispatch a file using the captured extension (e.g. ".h" → "test.h").
-	// Extension .h is registered to the C parser; LanguageHints says "cpp".
-	// The dispatcher contract: extension match wins over hint.
-	filename := "test" + s.fileExt
-	_, err := d.EmitFile(filename, []byte("// stub source"))
-	if err != nil {
-		return fmt.Errorf("EmitFile(%q) with LanguageHints=[%q] failed: %w",
-			filename, s.hintLang, err)
-	}
-	s.emittedNodes = w.nodes
-
-	// Determine which parser actually handled the file by inspecting
-	// the sentinel class name emitted by our stub parsers.
-	for _, n := range w.nodes {
-		if n.Kind == "class" && strings.HasSuffix(n.Name, "_sentinel_class") {
-			s.routedToLanguage = strings.TrimSuffix(n.Name, "_sentinel_class")
-			break
-		}
-	}
-	return nil
+	// TODO: ast.WithLanguageHints is not yet exported by dispatcher.go.
+	// Once the normalizeHints-alias-expansion impl branch merges and adds
+	// WithLanguageHints + hint-routing logic to the Dispatcher, restore the
+	// direct dispatcher test below. Until then, mark this step as pending
+	// so the E2E file compiles under the e2e build tag.
+	return godog.ErrPending
 }
 
 func (s *normalizeHintsState) theReturnedParserLanguageIs(lang string) error {

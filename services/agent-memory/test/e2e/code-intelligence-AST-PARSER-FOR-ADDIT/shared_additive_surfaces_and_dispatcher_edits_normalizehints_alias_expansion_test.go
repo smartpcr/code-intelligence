@@ -82,12 +82,35 @@ func (s *normalizeHintsState) runNormalizeHintsSubtest(subtestPattern string) er
 		return fmt.Errorf("cannot locate module root: %w", err)
 	}
 
+	astPkg := "./internal/repoindexer/ast/..."
+
+	// Pre-flight: verify the package compiles before running tests.
+	// This surfaces build errors as a distinct failure rather than
+	// letting them masquerade as test failures (same exit code 1).
+	buildCmd := exec.Command("go", "build", astPkg)
+	buildCmd.Dir = modRoot
+	if buildOut, buildErr := buildCmd.CombinedOutput(); buildErr != nil {
+		return fmt.Errorf(
+			"ast package failed to compile — fix build errors before running E2E:\n%s",
+			string(buildOut),
+		)
+	}
+
 	runArg := fmt.Sprintf("TestNormalizeHints_AliasExpansion/%s", subtestPattern)
-	cmd := exec.Command("go", "test", "-count=1", "-v", "-run", runArg, "./internal/repoindexer/ast/...")
+	cmd := exec.Command("go", "test", "-count=1", "-v", "-run", runArg, astPkg)
 	cmd.Dir = modRoot
 	out, err := cmd.CombinedOutput()
 	s.testOutput = string(out)
 	if err != nil {
+		// Distinguish compilation failures from test failures even if the
+		// pre-flight check passed (e.g. test-only files that `go build`
+		// does not compile).
+		if strings.Contains(s.testOutput, "[build failed]") {
+			return fmt.Errorf(
+				"ast test package failed to compile (test files):\n%s",
+				s.testOutput,
+			)
+		}
 		s.testExitCode = 1
 	} else {
 		s.testExitCode = 0

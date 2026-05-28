@@ -49,15 +49,42 @@ docs:
   `overrides` to the `edge_kind` enum) lives in
   `implementation-plan.md` Stage 1.2 and `tech-spec.md` Section 2.1.
 
+### 0.1.1 Decisions committed (no longer open questions)
+
+Two ambiguities that earlier iterations surfaced as open questions
+are now committed decisions in the body of this doc. They are
+listed here so QA and the orchestrator know the questions are
+CLOSED and no operator answer is pending:
+
+| Decision id              | What was asked                                                                                                                                                            | Committed answer (binding for this story)                                                                                                                                                                                                                                          |
+| ---                      | ---                                                                                                                                                                       | ---                                                                                                                                                                                                                                                                                |
+| `phase1-compose-path`    | Should Phase 1 reuse `services/agent-memory/deploy/local/docker-compose.yml`, or create a new `tests/e2e/{phase-slug}/docker-compose.yml`, or symlink to the service-local file? | CREATE NEW. Phase 1 owns a standalone postgres-only compose file at `tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml`. It pulls the same `postgres:16-alpine` image and references the init SQL from `services/agent-memory/deploy/local/postgres/`, but does NOT `include:` the service-local file (avoids cross-tree coupling). Recorded in 0.4 and in Phase 1 Setup. |
+| `phase6-ci-install-pwsh` | Should this story add a `pwsh` install step to `.github/workflows/agent-memory-ci.yml`, keep the skip posture, or defer to a follow-up?                                  | KEEP SKIP POSTURE. The hosted runner does not install `pwsh` in v1; `@needs-pwsh` scenarios `t.Skip` per `implementation-plan.md` Stage 6.3 lines 417 and 428. Workflow change is the scope of a separate follow-up story (`code-intelligence:CI-INSTALL-PWSH-FOR-AGENT-MEMORY`), not an open question on this story. Recorded in 0.2 and in Phase 6 Setup. |
+
+These decisions are now part of the doc body and the open-questions
+JSON block is INTENTIONALLY omitted from this iteration's summary.
+If the operator wants to overturn either decision they can do so via
+the wizard against the recorded `Decision id`; otherwise the
+generator will stop surfacing both.
+
 ### 0.2 Notation conventions
 
 - **Feature / Background / Scenario / Scenario Outline / Examples** --
   standard Gherkin. AND-steps use `And` (not `*`) for diff stability.
 - **Tags** (`@happy`, `@edge`, `@regression`, `@cgo-on`, `@cgo-off`,
-  `@needs-pwsh`, `@migration`, `@invariant`) appear immediately above
-  each Scenario. CI runs `@happy + @edge + @regression + @invariant`
-  on every PR; `@cgo-off` runs on the Windows portable matrix leg;
-  `@needs-pwsh` runs on the runner with `pwsh` installed.
+  `@needs-pwsh`, `@no-pwsh`, `@migration`, `@invariant`) appear
+  immediately above each Scenario. CI runs
+  `@happy + @edge + @regression + @invariant` on every PR;
+  `@cgo-off` runs on the Windows portable matrix leg;
+  `@needs-pwsh` is FILTERED on the existing hosted runner because
+  `pwsh` is not installed there (per Phase 6 Setup), so those
+  scenarios `t.Skip` and contribute zero coverage on
+  `agent-memory-ci`. `@needs-pwsh` is exercised only on a developer
+  workstation with `pwsh >= 7.0` on PATH (or by a follow-up story
+  that adds a pwsh install step to the workflow -- see
+  `Decisions committed` in 0.1.1). `@no-pwsh` covers the absent-pwsh
+  sentinel skip path and always runs on every leg, hosted runner
+  included.
 - **Parser ids** (`c`, `cpp`, `csharp`, `go`, `rust`, `powershell`)
   match `LanguageParser.Language()` exactly.
 - **Build-tag matrix** is referenced as `@cgo-on` (`CGO_ENABLED=1`)
@@ -873,9 +900,9 @@ Scenario: .rs file is skipped under CGO=off
 
 - **Type**: inline
 - **Local**: From `services/agent-memory`, ensure `pwsh` is on PATH (`pwsh --version` returns >= 7.0). Then run `go test ./internal/repoindexer/ast -count=1 -run 'TestPowerShellFixture|TestPowerShellParser|TestParserPowerShell'` under either `CGO_ENABLED=0` or `CGO_ENABLED=1`. When `pwsh` is absent the fixture tests call `t.Skip` and remain green; the sentinel scenario (`TestPowerShellParser_NoPwsh_ReturnsSentinel`) forces `pwshBin=""` and runs unconditionally.
-- **CI runner**: GitHub-hosted `ubuntu-latest` per the existing `.github/workflows/agent-memory-ci.yml`. The workflow does NOT install `pwsh` today (no apt step for `powershell` exists in the `lint-build-test`, `pre-commit`, or `integration-stack` jobs at lines 39-258 of that workflow). Per `implementation-plan.md` Stage 6.3 lines 417, 428, the canonical CI posture for v1 is "PowerShell fixture tests `t.Skip` when `pwsh` is not on PATH", which keeps the hosted runner green without adding a pwsh install step. Adding a pwsh install line to the workflow is out of scope for this story and is tracked as the deferred open question `phase6-ci-install-pwsh` below.
+- **CI runner**: GitHub-hosted `ubuntu-latest` per the existing `.github/workflows/agent-memory-ci.yml`. The workflow does NOT install `pwsh` today (no apt step for `powershell` exists in the `lint-build-test`, `pre-commit`, or `integration-stack` jobs at lines 39-258 of that workflow). Per `implementation-plan.md` Stage 6.3 lines 417, 428, the canonical CI posture for v1 is "PowerShell fixture tests `t.Skip` when `pwsh` is not on PATH", which keeps the hosted runner green without adding a pwsh install step. This story COMMITS TO that skip-posture (recorded in 0.1.1 Decisions committed); adding a pwsh install step to the workflow is explicitly OUT OF SCOPE and is the subject of follow-up story `code-intelligence:CI-INSTALL-PWSH-FOR-AGENT-MEMORY` (to be filed separately, not an open question on this story).
 - **Secrets**: None. The subprocess invocation passes source bytes on stdin and consumes JSON on stdout; no credentials cross the process boundary.
-- **Pre-test bootstrap**: `go mod download`. On a developer workstation with `pwsh` present, run `pwsh -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion'` to confirm runtime availability before invoking `go test`. Tests that depend on `pwsh` carry `@needs-pwsh`; tests that prove the absent-pwsh skip path carry `@no-pwsh`. On the agent-memory-ci hosted runner the `@needs-pwsh` scenarios skip and the `@no-pwsh` sentinel + dispatcher-skip scenarios provide the only Phase 6 coverage until the deferred workflow change lands.
+- **Pre-test bootstrap**: `go mod download`. On a developer workstation with `pwsh` present, run `pwsh -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion'` to confirm runtime availability before invoking `go test`. Tests that depend on `pwsh` carry `@needs-pwsh`; tests that prove the absent-pwsh skip path carry `@no-pwsh`. On the agent-memory-ci hosted runner the `@needs-pwsh` scenarios skip and the `@no-pwsh` sentinel + dispatcher-skip scenarios provide the only Phase 6 CI coverage; this is the committed v1 posture (see 0.1.1) and is not a gap that this story will close.
 
 ### Scenarios
 

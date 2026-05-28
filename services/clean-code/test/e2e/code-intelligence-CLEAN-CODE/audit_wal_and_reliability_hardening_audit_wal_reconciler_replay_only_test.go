@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/cucumber/godog"
-	_ "github.com/lib/pq" // PostgreSQL driver
+	"github.com/lib/pq" // PostgreSQL driver
 )
 
 // requireEnv returns the value of the named environment variable or skips the
@@ -124,7 +124,7 @@ func (s *auditWalReconcilerState) aWALFrameForARowMissingFrom(table string) erro
 
 	var exists bool
 	query := fmt.Sprintf(
-		`SELECT EXISTS(SELECT 1 FROM %s WHERE id = $1)`, s.targetTable)
+		`SELECT EXISTS(SELECT 1 FROM %s WHERE id = $1)`, pq.QuoteIdentifier(s.targetTable))
 	if err := s.db.QueryRowContext(ctx, query, s.walRowID).Scan(&exists); err != nil {
 		return fmt.Errorf("check existence in %s: %w", s.targetTable, err)
 	}
@@ -161,7 +161,7 @@ func (s *auditWalReconcilerState) theRowIsINSERTedAndReadsReturnIt(table string)
 
 	var exists bool
 	query := fmt.Sprintf(
-		`SELECT EXISTS(SELECT 1 FROM %s WHERE id = $1)`, table)
+		`SELECT EXISTS(SELECT 1 FROM %s WHERE id = $1)`, pq.QuoteIdentifier(table))
 	if err := s.db.QueryRowContext(ctx, query, s.walRowID).Scan(&exists); err != nil {
 		return fmt.Errorf("read from %s: %w", table, err)
 	}
@@ -220,7 +220,7 @@ func (s *auditWalReconcilerState) theReplayedRowsCallerColumnEquals(expectedCall
 	defer cancel()
 
 	var caller string
-	query := fmt.Sprintf(`SELECT caller FROM %s WHERE id = $1`, s.targetTable)
+	query := fmt.Sprintf(`SELECT caller FROM %s WHERE id = $1`, pq.QuoteIdentifier(s.targetTable))
 	if err := s.db.QueryRowContext(ctx, query, s.walRowID).Scan(&caller); err != nil {
 		return fmt.Errorf("read caller from %s: %w", s.targetTable, err)
 	}
@@ -241,7 +241,7 @@ func (s *auditWalReconcilerState) theRoleBoundToASession(role string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	_, err := s.db.ExecContext(ctx, fmt.Sprintf("SET ROLE %s", role))
+	_, err := s.db.ExecContext(ctx, fmt.Sprintf("SET ROLE %s", pq.QuoteIdentifier(role)))
 	if err != nil {
 		return fmt.Errorf("SET ROLE %s: %w", role, err)
 	}
@@ -258,7 +258,7 @@ func (s *auditWalReconcilerState) theReconcilerAttemptsINSERTInto(table string) 
 	rowID := fmt.Sprintf("perm-test-%d", time.Now().UnixNano())
 	// Use a minimal but schema-valid INSERT for metric_sample (non-audit table).
 	_, s.permissionErr = s.db.ExecContext(ctx,
-		fmt.Sprintf(`INSERT INTO %s (id, created_at) VALUES ($1, NOW())`, table), rowID)
+		fmt.Sprintf(`INSERT INTO %s (id, created_at) VALUES ($1, NOW())`, pq.QuoteIdentifier(table)), rowID)
 	return nil
 }
 
@@ -301,7 +301,7 @@ func (s *auditWalReconcilerState) insertIntoTableSucceeds(table string) error {
 			 VALUES ($1, 'e2e-stub-run', 'e2e-rule', 'info', 'permission test', NOW())`, rowID)
 	default:
 		_, err = s.db.ExecContext(ctx,
-			fmt.Sprintf(`INSERT INTO %s (id, created_at) VALUES ($1, NOW())`, table), rowID)
+			fmt.Sprintf(`INSERT INTO %s (id, created_at) VALUES ($1, NOW())`, pq.QuoteIdentifier(table)), rowID)
 	}
 	if err != nil {
 		s.insertResults[table] = err

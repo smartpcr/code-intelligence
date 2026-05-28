@@ -41,6 +41,12 @@ jobs:
       - name: Mint OIDC bearer tokens
         run: make tokens
 
+      - name: Export minted tokens
+        run: |
+          DEV_TOKEN=$(cat tokens/dev.jwt)
+          echo "CLEAN_CODE_DEV_TOKEN=${DEV_TOKEN}" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_OIDC_DEV_TOKEN=${DEV_TOKEN}" >> "$GITHUB_ENV"
+
       - name: Export compose-provided env vars
         run: |
           # No external secrets needed — compose exports all URLs.

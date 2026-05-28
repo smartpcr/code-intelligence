@@ -36,11 +36,17 @@ type txStore struct {
 	schema  string
 	steward *steward.SQLStore
 	// walBatch is the per-tx WAL staging batch allocated by
-	// [SQLStore.WithEvaluationLock]. May be nil when the
-	// surrounding store was constructed without a WAL writer
-	// (tests + pre-rollout). When non-nil, every audit
-	// INSERT in [appendEvaluationInTx] mirrors to the batch
-	// and the outer caller flushes the batch BEFORE
+	// [SQLStore.WithEvaluationLock]. It is ALWAYS non-nil:
+	// [NewSQLStore] rejects a nil [wal.Writer] (Stage 9.1
+	// iter-1 evaluator item #1) and
+	// [SQLStore.WithEvaluationLock] unconditionally calls
+	// `s.walWriter.NewTxBatch()` before constructing this
+	// struct, so call sites in [appendEvaluationInTx] do
+	// not need a nil guard -- the guard there is a
+	// defence-in-depth assertion against a future refactor
+	// that forgets to wire the batch, not a supported mode.
+	// Every audit INSERT stages a frame onto the batch and
+	// the outer caller flushes (fsyncs) it BEFORE
 	// `tx.Commit()`.
 	walBatch *wal.TxBatch
 }

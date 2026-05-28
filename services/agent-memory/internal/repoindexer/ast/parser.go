@@ -125,6 +125,30 @@ type ClassDecl struct {
 	// ends on (the line containing the closing `}` for
 	// TS/JS; the last indented body line for Python).
 	EndLine int
+	// LangMeta carries per-language attrs the dispatcher
+	// folds into `attrs_json` via `mergeLangMeta` (architecture
+	// Section 4.4.2). A nil map means "no per-language attrs"
+	// -- the merge is a no-op and the existing TS/JS/Python
+	// parsers leave it nil, so dispatcher output for those
+	// languages is byte-identical across this surface.
+	//
+	// LangMeta is DESCRIPTIVE, NOT IDENTIFYING (architecture
+	// invariant C12): two `ClassDecl`s that differ ONLY in
+	// `LangMeta` values MUST collide on the same canonical
+	// signature. Parsers MUST NOT route language-specific
+	// data into `QualifiedName` (the Go pointer-receiver `*`
+	// prefix is the one operator-pinned exception described
+	// in architecture Section 4.5).
+	//
+	// Parsers MUST NOT set keys whose names collide with the
+	// dispatcher's first-class attrs keys (e.g. `language`,
+	// `decl_kind`, `extends_raw`, `start_line`, `end_line`)
+	// -- the merge helper's first-class-key-wins rule
+	// silently drops them. Well-known per-language keys for
+	// classes (`namespace`, `embeds`, `partial`,
+	// `template_params`, `base_access`) are catalogued in
+	// architecture Section 4.4.3.
+	LangMeta map[string]any
 }
 
 // MethodDecl describes one method or free-function
@@ -223,6 +247,31 @@ type MethodDecl struct {
 	// (`async`, `static`, `private`, etc.). Persisted in
 	// `attrs_json["modifiers"]`.
 	Modifiers []string
+	// LangMeta carries per-language attrs the dispatcher
+	// folds into `attrs_json` via `mergeLangMeta` (architecture
+	// Section 4.4.2). A nil map means "no per-language attrs"
+	// -- the merge is a no-op and the existing TS/JS/Python
+	// parsers leave it nil, so dispatcher output for those
+	// languages is byte-identical across this surface.
+	//
+	// LangMeta is DESCRIPTIVE, NOT IDENTIFYING (architecture
+	// invariant C12): two `MethodDecl`s that differ ONLY in
+	// `LangMeta` values MUST collide on the same canonical
+	// signature. Parsers MUST NOT route language-specific
+	// data into `QualifiedName` or `ParamSignature` (the Go
+	// pointer-receiver `*` prefix in `QualifiedName` is the
+	// one operator-pinned exception described in architecture
+	// Section 4.5).
+	//
+	// Parsers MUST NOT set keys whose names collide with the
+	// dispatcher's first-class attrs keys (e.g. `language`,
+	// `enclosing_class`, `params_raw`, `calls_raw`,
+	// `modifiers`, `start_line`, `end_line`, `start_byte`,
+	// `end_byte`) -- the merge helper's first-class-key-wins
+	// rule silently drops them. Well-known per-language keys
+	// for methods (`receiver`, `receiver_ptr`, `trait`) are
+	// catalogued in architecture Section 4.4.3.
+	LangMeta map[string]any
 }
 
 // MemberAccess is one receiver-qualified field touch the
@@ -260,4 +309,28 @@ type Import struct {
 	// records the flag on the `imports` edge attrs but does
 	// NOT skip the edge. Always false for Python.
 	IsTypeOnly bool
+	// LangMeta carries per-language attrs the dispatcher
+	// folds into the `imports` edge `attrs_json` via
+	// `mergeLangMeta` (architecture Section 4.4.2). A nil map
+	// means "no per-language attrs" -- the merge is a no-op
+	// and the existing TS/JS/Python parsers leave it nil, so
+	// dispatcher output for those languages is byte-identical
+	// across this surface.
+	//
+	// LangMeta is DESCRIPTIVE, NOT IDENTIFYING (architecture
+	// invariant C12): two `Import`s that differ ONLY in
+	// `LangMeta` values describe the same dependency edge and
+	// are NOT routed into the import's identity (Module +
+	// Symbols + Alias). Parsers MUST NOT push language-
+	// specific data into those identifying fields.
+	//
+	// Parsers MUST NOT set keys whose names collide with the
+	// dispatcher's first-class import-edge attrs keys (e.g.
+	// `module`, `line`, `symbols`, `alias`, `is_type_only`,
+	// `language`) -- the merge helper's first-class-key-wins
+	// rule silently drops them. Well-known per-language keys
+	// for imports (`dot_import`, `blank_import`, `is_static`,
+	// `cmdlet_verb`, `module_kind`) are catalogued in
+	// architecture Section 4.4.3.
+	LangMeta map[string]any
 }

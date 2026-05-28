@@ -1081,11 +1081,16 @@ func (c *SystemTierComposer) composeArchDebtRatio(
 	}
 
 	// Per-repo row(s). The repo aggregate is the mean of the
-	// per-package ratios; when there are no package scopes,
-	// the aggregate is the bare cycle-fraction (cycles per
-	// foundation row -- a trivial proxy for v1).
+	// per-package ratios. When there are no package scopes
+	// the denominator is undefined -- a flat-module repo has
+	// no package granularity to anchor a ratio against -- so
+	// the repo row degrades with samples_pending rather than
+	// emit a misleading value. (A non-degraded 1.0 would
+	// surface in Insights as "100% architectural debt" for a
+	// repo that simply lacks package-scope metadata, which
+	// is semantically wrong and was the prior behaviour.)
 	for _, s := range repoScopes {
-		if noInputs {
+		if noInputs || len(pkgScopes) == 0 {
 			row, err := c.makeDegradedSample(in, s, SystemMetricArchDebtRatio, DegradedReasonSamplesPending, nil)
 			if err != nil {
 				return nil, err
@@ -1093,19 +1098,14 @@ func (c *SystemTierComposer) composeArchDebtRatio(
 			out = append(out, row)
 			continue
 		}
-		var ratio float64
-		if len(pkgScopes) > 0 {
-			var acc float64
-			for _, p := range pkgScopes {
-				cnt := float64(len(bySampleAll[foundationKey{ScopeID: p.ScopeID, MetricKind: foundationKindCycleMember}]))
-				if totalCount > 0 {
-					acc += cnt / totalCount
-				}
+		var acc float64
+		for _, p := range pkgScopes {
+			cnt := float64(len(bySampleAll[foundationKey{ScopeID: p.ScopeID, MetricKind: foundationKindCycleMember}]))
+			if totalCount > 0 {
+				acc += cnt / totalCount
 			}
-			ratio = acc / float64(len(pkgScopes))
-		} else {
-			ratio = 1.0
 		}
+		ratio := acc / float64(len(pkgScopes))
 		row, err := c.makeSample(in, s, SystemMetricArchDebtRatio, ratio, nil)
 		if err != nil {
 			return nil, err

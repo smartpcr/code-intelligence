@@ -1663,7 +1663,7 @@ vars are:
 
 | Env var                           | Meaning                                                                                                                                                                                                          | Required when                       |
 | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
-| `CLEAN_CODE_PG_URL`               | PostgreSQL connection URL. The pool MUST be reachable by the `clean_code_metric_ingestor` role. When empty, the composition root falls back to in-memory stores ([`metric_ingestor.NewInMemoryScanRunStore`]).   | always in production                |
+| `CLEAN_CODE_PG_URL`               | PostgreSQL connection URL. The pool MUST be reachable by the `clean_code_metric_ingestor` role. **Required** -- `cmd/clean-code-metric-ingestor/main.go:102-104` does `log.Fatalf("%s is required", config.EnvPGURL)` when this var is empty, before any listener is bound. There is no in-memory fallback in this binary. (`metric_ingestor.NewInMemoryScanRunStore` exists for unit tests; the production binary does not construct it.) | always (mandatory at boot)          |
 | `CLEAN_CODE_AST_SCAN_ROOT`        | Root directory under which per-repo checkouts live. When set, the composition root wires `RegistryBackedFoundationDispatcher` with a `DirectoryAstFileSource{Coordinator, Pool}` rooted here (see `cmd/clean-code-metric-ingestor/main.go:860-891`). When empty the dispatcher falls back to `NoopFoundationRecipeDispatcher{Logger: logger}` so a webhook-only metric-ingestor pod still boots cleanly. | production scan pods                |
 | `CLEAN_CODE_PERIODIC_SWEEP_CADENCE` | The `Sweeper` tick interval (Go duration). Drives `WithSweeperCadence` in `cmd/clean-code-metric-ingestor/main.go`. Default value lives in `internal/config/config.go`.                                       | never (defaulted)                   |
 | `CLEAN_CODE_SCAN_TIMEOUT`         | Per-scan timeout passed to `WithStateMachineTimeout`. A sweep that exceeds this is aborted and the commit is marked `'failed'` rather than left in `'scanning'` indefinitely.                                    | never (defaulted)                   |
@@ -1761,15 +1761,28 @@ scan path should treat it as a follow-up workstream
 in a Stage 10.x scan-loop integration); the option is
 ready and tested but unused in this binary today.
 
-The probe is also NOT plumbed into `/readyz`. The
-composition root currently registers only the
-Policy-Steward signing-key cache ready-check via
-`healthHandler.AddReadyCheck("signing_key_cache", ...)`
-(in `cmd/clean-code-metric-ingestor/main.go`); there is no
-`AddReadyCheck("ast_source", ...)` call today. Operators
-that want `/readyz` to reflect AST-source readiness should
-treat this as a follow-up workstream, not a Stage 3.2
-deliverable.
+The probe is also NOT plumbed into `/readyz`, because
+`cmd/clean-code-metric-ingestor` does not expose a
+`/readyz` endpoint at all. `buildMux` at
+`cmd/clean-code-metric-ingestor/main.go:431-438` mounts
+only `/healthz` (always), `/metrics` (always), and the
+optional `/v1/ingestor/process` + `/v1/ingestor/scan-run`
+legacy routes when `EnableLegacyDemoAPI=true`; the
+`/metrics` route is overridden in `main()` at
+`main.go:177-178` to surface the wired sweep-loop's live
+counters. The mgmt verbs (`mgmt.set_mode`,
+`mgmt.retract_sample`, etc.) and the external-ingest
+router (`webhook.RouterPath`) are mounted by
+`mountMgmtRoutes` and `mountIngestRouter` respectively;
+none of them register a `/readyz` or call
+`AddReadyCheck`. Verified by
+`rg "(readyz|AddReadyCheck|healthHandler|signing_key_cache)"
+cmd/clean-code-metric-ingestor/` → zero matches.
+Operators that want `/readyz` on this binary should treat
+it as a follow-up workstream (likely a Stage 10.x readiness
+surface that aggregates a signing-key probe, a PG-ping
+probe, and the AST-source-availability probe described
+above).
 
 ### State-machine invariants
 

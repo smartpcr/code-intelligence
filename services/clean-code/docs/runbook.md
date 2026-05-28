@@ -1743,9 +1743,11 @@ disk.
 **The metric-ingestor binary does NOT wire this probe
 today.** `cmd/clean-code-metric-ingestor/main.go` does
 not call `NewStateMachine`, `WithStateMachineSourceProbe`,
-or construct an `AstSourceAvailability` value (verified by
-`rg WithStateMachineSourceProbe cmd/clean-code-metric-ingestor/`
-returning zero matches). The only callers of
+or construct an `AstSourceAvailability` value. (Code
+inspection of `cmd/clean-code-metric-ingestor/main.go`
+finds no references to `NewStateMachine`,
+`WithStateMachineSourceProbe`, or `AstSourceAvailability`.)
+The only callers of
 `NewStateMachine` today are unit tests in
 `internal/metric_ingestor/state_test.go`,
 `availability_test.go`, and `sweep_loop_test.go`. The

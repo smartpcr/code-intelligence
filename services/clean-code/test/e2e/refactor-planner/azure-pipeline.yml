@@ -16,8 +16,8 @@ variables:
   COMPOSE_FILE: tests/e2e/phase-08-refactor-planner/docker-compose.yml
 
 stages:
-  - stage: e2e_refactor_plan_and_task_generation
-    displayName: "E2E – Refactor Plan and Task Generation"
+  - stage: e2e_ml_effort_model_loader_and_version_pinning
+    displayName: "E2E – ML Effort Model Loader and Version Pinning"
     jobs:
       - job: run_e2e
         displayName: "Run godog E2E tests"
@@ -42,11 +42,12 @@ stages:
               export CLEAN_CODE_PLANNER_URL="http://localhost:${PLANNER_PORT}"
               export CLEAN_CODE_MGMT_URL="http://localhost:${MGMT_PORT}"
               export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:${OTEL_PORT}"
+              export CLEAN_CODE_ML_MODEL_VERSION="1.0.0"
               make migrate-up
               make seed-phase-08
               cd services/clean-code
               go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
-                -run TestE2E_refactor_planner_refactor_plan_and_task_generation
+                -run TestE2E_refactor_planner_ml_effort_model_loader_and_version_pinning
             displayName: "Export compose URLs, bootstrap, and run E2E tests"
             workingDirectory: $(Build.SourcesDirectory)
 

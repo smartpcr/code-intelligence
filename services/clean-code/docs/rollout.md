@@ -90,7 +90,7 @@ modifies a non-Audit table" invariants degrade to
 "depend on the application layer". Re-apply migration
 `0004_roles.up.sql`. If SELECT on
 `clean_code.policy_signing_keys` is missing, re-apply
-migration `0005_grants.up.sql`.
+migration `0005_policy_signing_keys.up.sql`.
 
 ### DSN connection pattern (NOLOGIN + `SET ROLE`)
 
@@ -152,10 +152,13 @@ correct fail-loud behaviour.
      with `options=-c role=clean_code_wal_reconciler`
      (or equivalent `SET ROLE`) so statements are
      attributed to the reconciler role. This DSN is
-     REQUIRED whenever the existing signing-key
-     env vars (`CLEAN_CODE_KMS_PROVIDER` +
-     `CLEAN_CODE_KMS_PG_URL`) are set. If the DSN is
-     absent while signing is on, boot is refused.
+     REQUIRED whenever the existing signing-key env
+     var `CLEAN_CODE_KMS_PROVIDER` is set (see
+     `cmd/clean-code-eval-gate/main.go:190-214` and
+     `cmd/clean-code-gateway/main.go:230-231` for the
+     production check). If the DSN is absent while
+     `CLEAN_CODE_KMS_PROVIDER` is set, boot is
+     refused.
 2. Restart the affected replica. Watch the boot logs
    for the reconciler stanza. Expectations:
    - First the log line indicating reconciler start

@@ -286,7 +286,8 @@ than silent skip.
    trusted snapshot at construction time, typically
    because the `clean_code_wal_reconciler` role
    cannot SELECT from `clean_code.policy_signing_keys`
-   (migration `0005_grants.up.sql` grants this) or the
+   (migration `0005_policy_signing_keys.up.sql` grants
+   this) or the
    PostgreSQL pool is unreachable. The reconciler
    refuses to operate without a snapshot rather than
    silently classifying every frame as `SkippedBadSig`.

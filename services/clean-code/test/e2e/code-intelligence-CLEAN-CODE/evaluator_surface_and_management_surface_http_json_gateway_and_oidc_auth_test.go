@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -207,6 +208,13 @@ func newOidcGatewayStateFromEnv() *oidcGatewayState {
 
 func InitializeScenario_evaluator_surface_and_management_surface_http_json_gateway_and_oidc_auth(ctx *godog.ScenarioContext) {
 	s := newOidcGatewayStateFromEnv()
+
+	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
+		if s.db != nil {
+			s.db.Close()
+		}
+		return ctx, nil
+	})
 
 	// Scenario: oidc-rejects-missing-token
 	ctx.Step(`^an HTTP request to any "/v1/\*" route without an Authorization header$`, s.anHTTPRequestToV1RouteWithoutAuthorizationHeader)

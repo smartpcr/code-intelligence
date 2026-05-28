@@ -13,7 +13,7 @@ pool:
 
 variables:
   GO_VERSION: "1.25.1"
-  COMPOSE_FILE: tests/e2e/phase-09-audit-wal/docker-compose.yml
+  COMPOSE_FILE: services/clean-code/deploy/local/docker-compose.yml
 
 stages:
   - stage: e2e_audit_wal_frame_writer

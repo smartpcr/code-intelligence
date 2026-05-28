@@ -1,12 +1,12 @@
-//go:build canonical_dispatcher
-
 // The dispatcher pinned-scenario suite asserts the full Stage
 // 3.2 dispatcher contract (block subdivision, fingerprint
 // derivation, extends/implements/static_calls/contains/imports
-// edge emission, embedding publish ordering) which is NOT
-// implemented by the minimal V2 dispatcher in dispatcher.go.
-// Gated behind `canonical_dispatcher` until the Stage 3.2
-// dispatcher landing workstream ships the full pipeline.
+// edge emission, embedding publish ordering). The full V2
+// pipeline now lives in dispatcher.go (iter 6 restored the
+// emission code from commit 9a61865 with TouchedNodes +
+// receiver multimap + Pass 2d overrides + alias-aware hints +
+// embedding publisher hook); these tests are un-gated so they
+// run in the default `go test` suite.
 package ast
 
 import (

@@ -3,6 +3,7 @@
 package ast
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -322,30 +323,22 @@ func equalCSharpStrSlice(a, b []string) bool {
 }
 
 // TestCSharpFixture_EmitsExpectedNodeAndEdgeSet exercises the
-// Stage 4.3 implementation-plan fixture through a self-contained
-// edge-emission harness (`simulateCSharpDispatcherPass`) that
-// mirrors the dispatcher Pass 2a contract from tech-spec Section
-// 5.3. The harness runs the C# parser, pipes the ParseResult
-// through the same resolution logic the production dispatcher
-// uses, collects the typed edges into a fake bag, and asserts
-// the prescribed graph edges fire: 1 extends, 1 implements,
-// 1 static_calls, 1 imports -- with the right Source / Target /
-// Kind tuples (not just the parser-level data the dispatcher
-// would consume). It also asserts the contains edges that
-// hold the file -> class -> method tree together.
+// Stage 4.3 implementation-plan fixture (line 307) through the
+// production `Dispatcher.EmitFile` pipeline. The fixture
+// declares one interface (IGreeter), one base class (Base),
+// and one derived class (HelloWorld : Base, IGreeter) inside
+// namespace `Demo` with the HelloWorld.Greet method calling
+// HelloWorld.FormatGreeting plus a `using System;` directive
+// — the exact shape the implementation-plan calls out as the
+// C# acceptance scenario for the Stage 4.3 dispatcher.
 //
-// In-test re-implementation rationale: `dispatcher.go` in this
-// branch is the v1 stub whose duplicate ClassDecl / ParseResult /
-// MethodDecl / Import declarations against parser.go currently
-// block the package from compiling (see the iter 3 open-questions
-// block asking the operator to authorise stub cleanup). The
-// resolution algorithm itself is small and fully specified in
-// tech-spec Section 5.3, so the test re-implements it in
-// `simulateCSharpDispatcherPass` rather than waiting on the
-// dispatcher reconciliation. When the operator authorises
-// cleanup, this test can be ported to `Dispatcher.EmitFile`
-// against the same fixture with no fixture changes; the edge
-// assertions below already match the typed-edge contract.
+// Driving the real dispatcher (rather than the simulator
+// `simulateCSharpDispatcherPass` previously used while the
+// dispatcher was a no-op stub) ensures the fixture exercises
+// the same two-pass insert protocol production callers run
+// through `worker.go::runFull`. The simulator helper is kept
+// alive by `TestCSharpFixture_DispatcherHarnessDropsUnresolvedAndAmbiguous`
+// which pins the conservative-drop rules in isolation.
 func TestCSharpFixture_EmitsExpectedNodeAndEdgeSet(t *testing.T) {
 	const src = `using System;
 
@@ -370,15 +363,14 @@ namespace Demo
 `
 	const relPath = "src/HelloWorld.cs"
 
+	// --- Parser-level shape pre-checks (what Pass 1 consumes). ---
+
 	parser := NewTreeSitterCSharpParser()
 	res, err := parser.Parse(relPath, []byte(src))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
 
-	// --- Shape pre-checks (the data Pass 2a consumes). ---
-
-	// 3 class/interface nodes: IGreeter, Base, HelloWorld.
 	classByName := map[string]ClassDecl{}
 	for _, c := range res.Classes {
 		classByName[c.QualifiedName] = c
@@ -392,7 +384,6 @@ namespace Demo
 		t.Errorf("class node count = %d; want 3 (got %v)", len(res.Classes), csharpClassKeys(classByName))
 	}
 
-	// 4 method nodes per implementation-plan line 307.
 	wantMethods := []string{
 		"IGreeter.Greet",
 		"Base.Identify",
@@ -416,54 +407,83 @@ namespace Demo
 	if !ok {
 		t.Fatalf("HelloWorld class missing; cannot verify edges")
 	}
-
-	// base_raw retains the verbatim source-order list (tech-spec
-	// line 472 / 564-567).
 	rawBases, _ := hw.LangMeta["base_raw"].([]string)
 	if !equalCSharpStrSlice(rawBases, []string{"Base", "IGreeter"}) {
 		t.Errorf("HelloWorld.LangMeta[base_raw] = %v; want [Base IGreeter]", hw.LangMeta["base_raw"])
 	}
 
-	// --- True edge-emission assertions. ---
+	// --- Production dispatcher emission assertions. ---
 
-	bag := simulateCSharpDispatcherPass(res, relPath)
-
-	// Exact-tuple edge assertions (Source / Target / Kind) the
-	// implementation-plan Stage 4.3 line 307 prescribes.
-	wantEdges := []csharpDispatcherEdge{
-		{Kind: "extends", Source: "HelloWorld", Target: "Base"},
-		{Kind: "implements", Source: "HelloWorld", Target: "IGreeter"},
-		{Kind: "static_calls", Source: "HelloWorld.Greet", Target: "HelloWorld.FormatGreeting"},
-		{Kind: "imports", Source: relPath, Target: "System"},
+	fw := newFakeWriter()
+	d := NewDispatcher(fw, WithParsers(NewTreeSitterCSharpParser()))
+	if _, err := d.EmitFile(context.Background(), makeEvent(relPath, src)); err != nil {
+		t.Fatalf("Dispatcher.EmitFile: %v", err)
 	}
-	for _, want := range wantEdges {
-		if !bag.has(want) {
-			t.Errorf("missing edge %+v; emitted=%v", want, bag.edges)
+
+	// Pass 1a: 3 class/interface nodes.
+	classNodes := fw.nodesOf("class")
+	if len(classNodes) != 3 {
+		t.Errorf("class nodes = %d; want 3 (IGreeter, Base, HelloWorld)", len(classNodes))
+	}
+	classSigs := signatureSimpleNames(classNodes)
+	for _, want := range []string{"IGreeter", "Base", "HelloWorld"} {
+		if !classSigs[want] {
+			t.Errorf("class node %q missing; got %v", want, classSigs)
 		}
 	}
 
-	// Edge-kind counts: exactly one of each typed inheritance /
-	// call / import edge per the Stage 4.3 spec line 307.
-	if got, want := bag.countKind("extends"), 1; got != want {
-		t.Errorf("extends edges = %d; want %d (edges=%v)", got, want, bag.edges)
+	// Pass 1b: 4 method nodes.
+	methodNodes := fw.nodesOf("method")
+	if len(methodNodes) != 4 {
+		t.Errorf("method nodes = %d; want 4", len(methodNodes))
 	}
-	if got, want := bag.countKind("implements"), 1; got != want {
-		t.Errorf("implements edges = %d; want %d (edges=%v)", got, want, bag.edges)
-	}
-	if got, want := bag.countKind("static_calls"), 1; got != want {
-		t.Errorf("static_calls edges = %d; want %d (edges=%v)", got, want, bag.edges)
-	}
-	if got, want := bag.countKind("imports"), 1; got != want {
-		t.Errorf("imports edges = %d; want %d (edges=%v)", got, want, bag.edges)
+	methodSigs := signatureSimpleNames(methodNodes)
+	for _, want := range wantMethods {
+		if !methodSigs[want] {
+			t.Errorf("method node %q missing; got %v", want, methodSigs)
+		}
 	}
 
-	// Contains edges: 3 file->class + 4 class->method = 7. The
-	// implementation-plan story description (line: "For all
-	// languages: emit class/type-like nodes, method/function
-	// nodes, contains, ...") requires contains coverage for
-	// every class and every method.
-	if got, want := bag.countKind("contains"), 3+4; got != want {
-		t.Errorf("contains edges = %d; want %d (3 file->class + 4 class->method); edges=%v", got, want, bag.edges)
+	// Pass 2a: 1 extends edge (HelloWorld -> Base) — IGreeter
+	// is partitioned into Implements by the C# parser per the
+	// tech-spec §5.3 decision matrix.
+	if got := len(fw.edgesOf("extends")); got != 1 {
+		t.Errorf("extends edges = %d; want 1 (HelloWorld->Base)", got)
+	}
+	if got := len(fw.edgesOf("implements")); got != 1 {
+		t.Errorf("implements edges = %d; want 1 (HelloWorld->IGreeter)", got)
+	}
+
+	// Pass 2b: 1 static_calls edge (HelloWorld.Greet -> HelloWorld.FormatGreeting).
+	staticCalls := fw.edgesOf("static_calls")
+	if len(staticCalls) != 1 {
+		t.Errorf("static_calls edges = %d; want 1 (HelloWorld.Greet -> HelloWorld.FormatGreeting); edges=%+v",
+			len(staticCalls), staticCalls)
+	}
+
+	// Pass 0: 1 imports edge (file -> external package "System").
+	importEdges := fw.edgesOf("imports")
+	if len(importEdges) != 1 {
+		t.Errorf("imports edges = %d; want 1 (file -> System)", len(importEdges))
+	}
+	pkgNodes := fw.nodesOf("package")
+	if len(pkgNodes) != 1 {
+		t.Errorf("package nodes = %d; want 1 (synthetic external System)", len(pkgNodes))
+	}
+
+	// Pass 1a/1b contains edges: 3 file->class + 4 parent->method = 7.
+	// (HelloWorld.Greet & HelloWorld.FormatGreeting parent under
+	// HelloWorld class; IGreeter.Greet under IGreeter; Base.Identify
+	// under Base.) No method->block edges because each method body
+	// is well under the 80-line subdivision threshold.
+	if got := len(fw.edgesOf("contains")); got != 7 {
+		t.Errorf("contains edges = %d; want 7 (3 file->class + 4 class->method)", got)
+	}
+
+	// Sanity: the C# parser emits no Block subdivision for this
+	// fixture (every method body is <= 80 logical lines).
+	if got := len(fw.nodesOf("block")); got != 0 {
+		t.Errorf("block nodes = %d; want 0 (every method body is <= 80 logical lines)", got)
 	}
 }
 

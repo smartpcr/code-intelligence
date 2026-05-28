@@ -22,6 +22,11 @@ parsers registered through `parsers_cgo.go` (CGO=on) and
 | TypeScript   | `.ts .tsx .js .jsx .mjs .cjs` | ✓ (`parser_treesitter.go`) | ✓ (`parser_typescript.go`) |
 | Python       | `.py .pyi`          | ✓ (`parser_treesitter.go`) | ✓ (`parser_python.go`)     |
 | C#           | `.cs .csx`          | ✓ (`parser_treesitter_csharp.go`) | — (CGO-only in v1)         |
+| C++          | `.cc .cxx .cpp .c++ .hpp .hh .hxx .h++` | ✓ (`parser_treesitter_cpp.go`) | — (CGO-only; sibling Stage 4.2 workstream) |
+| C            | `.c .h`             | planned (sibling Stage 4 workstream — no scanner fallback) | — |
+| Go           | `.go`               | planned (sibling Stage 5 workstream — no scanner fallback) | — |
+| Rust         | `.rs`               | planned (sibling Stage 5 workstream — no scanner fallback) | — |
+| PowerShell   | `.ps1 .psm1 .psd1`  | planned (requires `tree-sitter-powershell` grammar binding work; tracked separately) | — |
 
 Notes:
 
@@ -34,6 +39,21 @@ Notes:
   dispatcher logs a structured skip event for each one and the AST
   graph simply does not contain those declarations until CGO=on is
   used.
+- C++ (`.cc`, `.cpp`, `.hpp`, etc.) follows the same CGO-only model
+  as C# in v1. Header-only / `.h` files that may be either C or C++
+  currently route to the planned C parser path.
+- C, Go, Rust, and PowerShell rows are listed for completeness against
+  `docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/implementation-plan.md`
+  (Stage 4 / 5 / 6 acceptance matrix). Their parser files are not in
+  this branch -- the dispatcher will emit a structured skip per file
+  (`reason=parser_unavailable`) until those workstreams land.
+- Language alias normalization (`cs` / `c#` -> `csharp`, `cpp` /
+  `cxx` / `c++` -> `cpp`, `golang` -> `go`, `rs` -> `rust`, `ps` /
+  `ps1` / `psm1` / `psd1` -> `powershell`, etc.) happens centrally in
+  `dispatcher.go::normalizeHints`; per-event `Language` /
+  `LanguageHint` hints route through that table before
+  `pickParser` runs an extension comparison. The full alias matrix
+  is pinned by `TestNormalizeHints_AliasExpansion`.
 
 ## Common commands
 

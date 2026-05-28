@@ -13,10 +13,14 @@
 //   - `ClassDecl{Kind:"struct"|"union"|"enum",
 //     QualifiedName:<identifier>}` for `struct_specifier` /
 //     `union_specifier` / `enum_specifier` nodes with a
-//     non-empty body. Anonymous specifiers (no identifier --
-//     typedef carriers such as `typedef struct { ... } Foo;`)
-//     are SKIPPED, as are forward declarations (`struct
-//     Foo;`, no body).
+//     non-empty body. The specifier may appear directly at
+//     translation_unit scope, nested under a `declaration`
+//     (`struct Foo { ... };`), or nested under a
+//     `type_definition` (`typedef struct Foo { ... } FooT;`,
+//     `typedef enum Color { RED } ColorT;`). Anonymous
+//     specifiers (no `name` field -- typedef carriers such as
+//     `typedef struct { ... } Foo;`) are SKIPPED, as are
+//     forward declarations (`struct Foo;`, no body).
 //   - `MethodDecl{EnclosingClass:"",
 //     QualifiedName:<declarator-id>,
 //     ParamSignature:<between outer parens>,
@@ -119,6 +123,7 @@ const (
 	cNodeStorageClass       = "storage_class_specifier"
 	cNodeTypeQualifier      = "type_qualifier"
 	cNodeLinkageSpec        = "linkage_specification"
+	cNodeTypeDefinition     = "type_definition"
 	cNodePreprocIfdef       = "preproc_ifdef"
 	cNodePreprocIf          = "preproc_if"
 	cNodePreprocElse        = "preproc_else"
@@ -154,6 +159,28 @@ func (w *cWalker) visitTopLevel(n *sitter.Node) {
 		w.handleFunctionDefinition(n)
 	case cNodeDeclaration:
 		w.handleDeclaration(n)
+	case cNodeTypeDefinition:
+		// `typedef struct Foo { ... } FooT;` and the
+		// enum / union variants. Tree-sitter wraps the
+		// underlying specifier under the `type` field; the
+		// `declarator` field holds the typedef alias
+		// (`FooT`). The struct/enum/union name we surface
+		// as the ClassDecl is the INNER specifier's own
+		// `name` field (`Foo`), matching the non-typedef
+		// case so a downstream consumer sees one canonical
+		// signature whether or not the type happens to be
+		// behind a typedef.  Anonymous typedefs (e.g.
+		// `typedef struct { int x; } AnonT;`) are skipped
+		// because their inner specifier has no `name`
+		// field, which matches the v1 "skip anonymous
+		// structs" rule from the tech spec. This branch is
+		// TERMINAL -- we dispatch directly to
+		// handleStructLike instead of falling back through
+		// visitTopLevel to avoid double-emitting on a
+		// future grammar revision where the inner
+		// specifier might also surface at translation_unit
+		// scope.
+		w.handleTypeDefinition(n)
 	case cNodeStructSpecifier:
 		w.handleStructLike(n, "struct")
 	case cNodeUnionSpecifier:
@@ -227,6 +254,49 @@ func (w *cWalker) handleDeclaration(n *sitter.Node) {
 		case cNodeEnumSpecifier:
 			w.handleStructLike(child, "enum")
 		}
+	}
+}
+
+// handleTypeDefinition owns every `type_definition` (i.e.
+// `typedef ...;`) child of the translation unit. The inner
+// type is exposed via the `type` field on the node; when it
+// is one of `struct_specifier` / `union_specifier` /
+// `enum_specifier`, we route through the same
+// handleStructLike path the non-typedef branch uses so the
+// emitted ClassDecl is byte-for-byte identical regardless of
+// whether the type happens to live behind a typedef. Other
+// inner types (e.g. `typedef int (*cb_t)(int);`, where the
+// type field is a `primitive_type` and the declarator is a
+// function-pointer chain) are intentionally NOT extracted in
+// v1 -- typedef aliases for primitives / function pointers
+// do not introduce a struct-like node in the graph.
+func (w *cWalker) handleTypeDefinition(n *sitter.Node) {
+	inner := n.ChildByFieldName("type")
+	if inner == nil {
+		// Fall back to scanning the named children in case
+		// a future grammar revision moves the specifier
+		// out of the field.
+		for i := uint32(0); i < n.NamedChildCount(); i++ {
+			c := n.NamedChild(int(i))
+			switch c.Type() {
+			case cNodeStructSpecifier, cNodeUnionSpecifier, cNodeEnumSpecifier:
+				inner = c
+			}
+			if inner != nil {
+				break
+			}
+		}
+	}
+	if inner == nil {
+		return
+	}
+	switch inner.Type() {
+	case cNodeStructSpecifier:
+		w.handleStructLike(inner, "struct")
+	case cNodeUnionSpecifier:
+		w.handleStructLike(inner, "union")
+	case cNodeEnumSpecifier:
+		w.handleStructLike(inner, "enum")
 	}
 }
 

@@ -3,6 +3,7 @@
 package ast
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -14,6 +15,128 @@ import (
 // silently skip this file -- that's intentional and matches
 // the rest of the tree-sitter test suite
 // (parser_treesitter_test.go).
+
+// TestCFixture_EmitsExpectedNodeAndEdgeSet is the
+// dispatcher-level acceptance test mandated by
+// implementation-plan.md Stage 3.4 (lines 232-238). It pushes
+// the canonical C fixture through the full `EmitFile`
+// pipeline -- not just the parser's `Parse` method -- and
+// asserts the resulting graph matches the documented Node +
+// Edge contract exactly.
+//
+// Fixture shape per implementation-plan.md Stage 3.4:
+//   - struct Greeter { int n; };
+//   - int format_greeting(int n) { return n + 1; }   // declared first so greet's same-file call resolves
+//   - int greet(int n) { return format_greeting(n); } // same-file static_call
+//   - #include <stdio.h>                              // system include -> external package node + imports edge
+//   - #include "local.h"                              // relative include -> dropped at dispatcher (no imports edge)
+//
+// Expected graph (Stage 3.4 acceptance):
+//   - 1 class node `Greeter` (Kind="struct")
+//   - 2 method nodes (`greet`, `format_greeting`)
+//   - 3 contains edges (file -> Greeter, file -> greet,
+//     file -> format_greeting); C has no nested
+//     class->method containment because EnclosingClass is
+//     always empty for v1.
+//   - 1 static_calls edge (greet -> format_greeting)
+//   - 1 imports edge (file -> stdio.h package node)
+//   - 0 imports edges for `./local.h` (relative-include drop
+//     happens at the dispatcher per architecture Section 4.3)
+//
+// This mirrors the same shape as
+// `TestPythonFixture_EmitsExpectedNodeAndEdgeSet` (the v1
+// reference) and is the C analogue of Stage 3.5's C++
+// fixture test (`TestCppFixture_EmitsExpectedNodeAndEdgeSet`).
+func TestCFixture_EmitsExpectedNodeAndEdgeSet(t *testing.T) {
+	const src = `#include <stdio.h>
+#include "local.h"
+
+struct Greeter {
+    int n;
+};
+
+int format_greeting(int n) {
+    return n + 1;
+}
+
+int greet(int n) {
+    return format_greeting(n);
+}
+`
+	fw := newFakeWriter()
+	d := NewDispatcher(fw)
+	if _, err := d.EmitFile(context.Background(), makeEvent("src/hello.c", src)); err != nil {
+		t.Fatalf("EmitFile: %v", err)
+	}
+
+	classes := fw.nodesOf("class")
+	classNames := signatureSimpleNames(classes)
+	if !classNames["Greeter"] {
+		t.Errorf("class Greeter missing from emitted set: got %v", classNames)
+	}
+	if len(classes) != 1 {
+		t.Errorf("expected 1 class node (Greeter); got %d (%v)",
+			len(classes), classNames)
+	}
+
+	methods := fw.nodesOf("method")
+	methodNames := signatureSimpleNames(methods)
+	for _, want := range []string{"greet", "format_greeting"} {
+		if !methodNames[want] {
+			t.Errorf("method %q missing: got %v", want, methodNames)
+		}
+	}
+	if len(methods) != 2 {
+		t.Errorf("expected 2 method nodes (greet, format_greeting); got %d (%v)",
+			len(methods), methodNames)
+	}
+
+	// contains edges: 1 file->class (Greeter) + 2 file->method
+	// (greet, format_greeting) = 3 contains. C has no
+	// class->method containment in v1 because every method's
+	// EnclosingClass is "".
+	contains := fw.edgesOf("contains")
+	if len(contains) != 3 {
+		t.Errorf("expected 3 contains edges (file->Greeter, file->greet, file->format_greeting); got %d",
+			len(contains))
+	}
+
+	// static_calls: greet -> format_greeting. The same-file
+	// multimap resolver matches because format_greeting is
+	// declared in the same file with EnclosingClass="" (free
+	// function) and the lookup key is the bare callee name.
+	staticCalls := fw.edgesOf("static_calls")
+	if len(staticCalls) != 1 {
+		t.Errorf("expected 1 static_calls edge (greet -> format_greeting); got %d",
+			len(staticCalls))
+	}
+
+	// imports: stdio.h materialises an external package node
+	// + a file->package imports edge. The `./local.h`
+	// relative include is dropped at the dispatcher
+	// (`isRelativeImport`) so it produces ZERO imports
+	// edges. This is the C analogue of the TypeScript
+	// `./util` relative-import drop covered by
+	// `TestTypeScriptFixture_EmitsExpectedNodeAndEdgeSet`.
+	importEdges := fw.edgesOf("imports")
+	if len(importEdges) != 1 {
+		t.Errorf("expected exactly 1 imports edge (file->stdio.h); got %d (edges=%+v)",
+			len(importEdges), importEdges)
+	}
+	for _, e := range importEdges {
+		// Defensive: the relative-include drop guarantees
+		// no edge targets a path beginning with `./`. If a
+		// future grammar change accidentally surfaces the
+		// relative include, this assertion fails before the
+		// count check above masks the regression.
+		// We inspect both Source and Target so a future
+		// rename in either direction is still caught.
+		if strings.HasPrefix(e.Source, "./") || strings.HasPrefix(e.Target, "./") {
+			t.Errorf("imports edge must not reference a relative-include path; got source=%q target=%q",
+				e.Source, e.Target)
+		}
+	}
+}
 
 // TestTreeSitterCParser_Metadata pins the parser's Language /
 // Extensions surface so a future grammar bump that forgets to
@@ -383,6 +506,80 @@ int apply(int (*cb)(int), int x) {
 	// crossed into the parameter list.
 	if _, ok := names["cb"]; ok {
 		t.Errorf("function-pointer parameter `cb` should NOT be emitted as a method; got %v", methodKeys(names))
+	}
+}
+
+// TestTreeSitterCParser_TypedefNamedContainers pins the
+// type_definition handling added to address evaluator
+// feedback iter-1#1. The grammar wraps `typedef struct Foo
+// { ... } FooT;` in a `type_definition` whose `type` field is
+// a `struct_specifier` (with name=Foo, body=...). The same
+// shape applies to `typedef enum Color { RED } ColorT;` and
+// `typedef union Num { ... } NumT;`. The walker MUST descend
+// into the type_definition and emit a ClassDecl whose
+// QualifiedName is the INNER specifier's own identifier
+// (`Foo` / `Color` / `Num`), NOT the typedef alias. The
+// typedef alias is intentionally ignored in v1; downstream
+// consumers see one canonical signature whether or not the
+// type lives behind a typedef. Anonymous typedef carriers
+// (`typedef struct { int x; } AnonT;`) and primitive /
+// function-pointer typedefs (`typedef int (*cb_t)(int);`)
+// still emit nothing -- the rule remains "named, body-
+// bearing struct/union/enum only" exactly as before, with
+// the type_definition wrapper now being transparent.
+func TestTreeSitterCParser_TypedefNamedContainers(t *testing.T) {
+	const src = `typedef struct Foo {
+    int x;
+} FooT;
+
+typedef enum Color {
+    RED,
+    GREEN,
+    BLUE
+} ColorT;
+
+typedef union Num {
+    int i;
+    float f;
+} NumT;
+
+typedef struct {
+    int hidden;
+} AnonT;
+
+typedef int (*cb_t)(int);
+typedef int my_int;
+`
+	res, err := NewTreeSitterCParser().Parse("src/td.c", []byte(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	byName := map[string]ClassDecl{}
+	for _, c := range res.Classes {
+		byName[c.QualifiedName] = c
+	}
+
+	if got, ok := byName["Foo"]; !ok || got.Kind != "struct" {
+		t.Errorf("missing typedef'd struct Foo (Kind=struct); classes=%v", classDeclKeys(res.Classes))
+	}
+	if got, ok := byName["Color"]; !ok || got.Kind != "enum" {
+		t.Errorf("missing typedef'd enum Color (Kind=enum); classes=%v", classDeclKeys(res.Classes))
+	}
+	if got, ok := byName["Num"]; !ok || got.Kind != "union" {
+		t.Errorf("missing typedef'd union Num (Kind=union); classes=%v", classDeclKeys(res.Classes))
+	}
+
+	for _, alias := range []string{"FooT", "ColorT", "NumT", "AnonT", "cb_t", "my_int"} {
+		if _, ok := byName[alias]; ok {
+			t.Errorf("typedef alias %q must NOT be emitted as a ClassDecl (v1 surfaces only the inner specifier's own name); classes=%v",
+				alias, classDeclKeys(res.Classes))
+		}
+	}
+
+	// Anonymous typedef carriers must remain skipped.
+	if len(res.Classes) != 3 {
+		t.Errorf("expected exactly 3 classes (Foo, Color, Num); got %d (%v)",
+			len(res.Classes), classDeclKeys(res.Classes))
 	}
 }
 

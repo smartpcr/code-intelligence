@@ -1,3 +1,11 @@
+//go:build canonical_dispatcher
+
+// Stub Emitter / NewGoParser / NewTypeScriptParser /
+// NewPythonParser declarations duplicate the canonical
+// `LanguageParser`-returning factories in parser_typescript.go
+// and parser_python.go; gated behind `canonical_dispatcher`
+// (never enabled) so the package builds without symbol-
+// collision errors. See types.go for the migration history.
 package ast
 
 import (
@@ -107,8 +115,8 @@ func (p *goParser) Parse(filename string, src []byte) (ParseResult, error) {
 	return ParseResult{}, nil
 }
 
-func (p *goParser) Language() string        { return "go" }
-func (p *goParser) Extensions() []string    { return []string{".go"} }
+func (p *goParser) Language() string     { return "go" }
+func (p *goParser) Extensions() []string { return []string{".go"} }
 
 // ---------------------------------------------------------------------------
 // NewTypeScriptParser returns a TypeScript parser stub.

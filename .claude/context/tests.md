@@ -43,9 +43,12 @@ Notes:
   `make test-cgo` in `services\agent-memory` exercises this
   path.
 - Non-CGO scanner support is narrower (TS/Python only). New
-  languages without a non-CGO scanner are CGO-only by design;
-  the dispatcher logs an `ast.dispatch.skip{reason=cgo_required}`
-  event when CGO is unavailable.
+  languages without a non-CGO scanner are CGO-only by design:
+  when the no-CGO build runs, those extensions are simply not
+  registered in `defaultParsers()`, so the dispatcher's lookup
+  misses and it emits an `ast.dispatch.skip` event with
+  `reason="no_parser"` (the same skip reason used for any
+  unrecognized extension).
 
 ## Common commands
 

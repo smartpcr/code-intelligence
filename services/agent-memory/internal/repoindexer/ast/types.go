@@ -1,5 +1,19 @@
-// Package ast defines the types and interfaces for the AST parser/emitter
-// pipeline used by the repo-indexer subsystem.
+//go:build canonical_dispatcher
+
+// Package ast — stub type declarations are gated behind the
+// `canonical_dispatcher` build tag (never enabled in the
+// current code base). The canonical declarations of
+// ParseResult / ClassDecl / MethodDecl / Import /
+// ErrParserUnavailable / LanguageParser live in parser.go.
+// This file is kept on disk (rather than deleted) to preserve
+// the half-rolled-back Stage 3.1 migration's history; once the
+// Stage 3.2 dispatcher landing workstream lands, the canonical
+// dispatcher / EmitResult / Edge / Node decls will move into a
+// fresh file and this stub can be retired.
+//
+// See `.forge/iter-notes.md` and the open question
+// `ast-stub-conflict` raised by the goTreeSitterParser
+// workstream for the operator decision that gated this gating.
 package ast
 
 import (

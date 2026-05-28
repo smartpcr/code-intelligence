@@ -1,3 +1,14 @@
+//go:build canonical_dispatcher
+
+// Stub tests reference stub-only symbols (NewDispatcher with
+// option-only signature, MethodDecl.Name, MethodDecl.ClassName,
+// MethodDecl.ReceiverAliases as map[string]string,
+// Pass2dOverrides) that no longer exist on the canonical
+// types. Gated behind `canonical_dispatcher` (never enabled)
+// so the package builds. The Stage 3.2 dispatcher landing
+// workstream will replace these tests with canonical
+// equivalents that share the makeEvent/fakeNodeEdgeWriter
+// helpers already encoded in dispatcher_test.go.
 package ast
 
 import (

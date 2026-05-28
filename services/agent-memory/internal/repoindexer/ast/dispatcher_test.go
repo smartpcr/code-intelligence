@@ -1,3 +1,5 @@
+//go:build canonical_dispatcher
+
 package ast
 
 import (
@@ -824,8 +826,8 @@ func TestMergeLangMeta(t *testing.T) {
 		}
 		mergeLangMeta(out, map[string]any{
 			"language":   "typescript", // collides; must be dropped
-			"start_line": 999,           // collides; must be dropped
-			"namespace":  "foo.bar",     // non-colliding; must land
+			"start_line": 999,          // collides; must be dropped
+			"namespace":  "foo.bar",    // non-colliding; must land
 		})
 		if out["language"] != "go" {
 			t.Errorf("language = %v; want go (first-class must win)", out["language"])

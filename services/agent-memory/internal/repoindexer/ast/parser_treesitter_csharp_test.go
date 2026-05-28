@@ -605,6 +605,61 @@ func simulateCSharpDispatcherPass(res ParseResult, relPath string) *csharpDispat
 	return bag
 }
 
+// TestCSharpFixture_DispatcherHarnessDropsUnresolvedAndAmbiguous
+// exercises the conservative-drop rules embedded in
+// `simulateCSharpDispatcherPass`: extends / implements targets
+// that do not resolve to a same-file declaration of the matching
+// kind are dropped (the dispatcher's C4 unknown-target rule);
+// static_calls callees whose bare name resolves to more than one
+// same-class method are dropped (the dispatcher's A5 ambiguity
+// rule). These drops match the production dispatcher's
+// edge-emission contract per tech-spec §5.3 and prevent false-
+// positive edges from showing up in the graph.
+func TestCSharpFixture_DispatcherHarnessDropsUnresolvedAndAmbiguous(t *testing.T) {
+	// `OnlyHere` extends `MissingBase` (cross-file, no same-file
+	// declaration -> extends edge MUST be dropped) and
+	// implements `IMissing` (cross-file -> implements edge MUST
+	// be dropped). `Run` calls `Helper`, but the class declares
+	// TWO `Helper` overloads -> the static_calls edge MUST be
+	// dropped per A5.
+	res := ParseResult{
+		Classes: []ClassDecl{
+			{
+				QualifiedName: "OnlyHere",
+				Kind:          "class",
+				Extends:       []string{"MissingBase"},
+				Implements:    []string{"IMissing"},
+			},
+		},
+		Methods: []MethodDecl{
+			{QualifiedName: "OnlyHere.Run", EnclosingClass: "OnlyHere", Calls: []string{"Helper"}},
+			{QualifiedName: "OnlyHere.Helper", EnclosingClass: "OnlyHere"},
+			{QualifiedName: "OnlyHere.Helper", EnclosingClass: "OnlyHere"},
+		},
+		Imports: []Import{{Module: "System"}},
+	}
+
+	bag := simulateCSharpDispatcherPass(res, "src/OnlyHere.cs")
+
+	if got := bag.countKind("extends"); got != 0 {
+		t.Errorf("extends edges = %d; want 0 (cross-file MissingBase must be dropped per C4); edges=%v", got, bag.edges)
+	}
+	if got := bag.countKind("implements"); got != 0 {
+		t.Errorf("implements edges = %d; want 0 (cross-file IMissing must be dropped per C4); edges=%v", got, bag.edges)
+	}
+	if got := bag.countKind("static_calls"); got != 0 {
+		t.Errorf("static_calls edges = %d; want 0 (ambiguous Helper overloads must be dropped per A5); edges=%v", got, bag.edges)
+	}
+
+	// Sanity: imports + contains are unaffected by the drop rules.
+	if got, want := bag.countKind("imports"), 1; got != want {
+		t.Errorf("imports edges = %d; want %d; edges=%v", got, want, bag.edges)
+	}
+	if got, want := bag.countKind("contains"), 1+3; got != want {
+		t.Errorf("contains edges = %d; want %d (1 file->class + 3 class->method); edges=%v", got, want, bag.edges)
+	}
+}
+
 // TestCSharpFixture_BaseListPartitionsByLocalKind covers the
 // six rows of tech-spec Section 5.3's base-list decision
 // matrix. Each sub-case fixes a declaring kind + base-list

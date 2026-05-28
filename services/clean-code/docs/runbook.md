@@ -1704,42 +1704,66 @@ Mode selection (per `cmd/clean-code-metric-ingestor/main.go:837-891`):
   `wired production foundation dispatcher` info log
   appears with `isolation_pool_languages` populated, NOT
   the noop log line above.
-- **Scaffold mode**: `CLEAN_CODE_PG_URL` is empty (which
-  implies in-memory stores). `buildSweepLoop` returns a
-  nil loop (`main.go:392-401`); the foundation dispatcher
-  still resolves to the noop fallback. The HTTP surface
-  still serves; nothing claims commits. This is
-  acceptable for the dev loop only.
+- **Scaffold / PG-less mode is NOT supported by this binary**:
+  `cmd/clean-code-metric-ingestor/main.go:102-104` does
+  `log.Fatalf("%s is required", config.EnvPGURL)` when
+  `cfg.PostgresURL == ""`. The process exits before
+  `openMgmtDB`, `buildIsolation`, or `buildSweepLoop` are
+  reached, so there is no `/healthz` listener and no in-memory
+  fallback. `CLEAN_CODE_PG_URL` is mandatory for this binary.
+  (Historical note: the old `cmd/clean-coded/main.go`
+  supported an in-memory scaffold mode; the metric-ingestor
+  binary intentionally does not.) Operators who want a
+  PG-less dev loop should run unit tests against
+  `metric_ingestor.NewInMemoryScanRunStore` rather than
+  starting this binary.
 
-### Source-availability pre-flight (NOT a `/readyz` probe)
+### Source-availability pre-flight (NOT a `/readyz` probe, NOT wired in production today)
 
-The composition root threads an `AstSourceAvailability`
-probe (`metric_ingestor.AstSourceAvailability`, defined in
-`internal/metric_ingestor/availability.go`) into the state
-machine via `WithStateMachineSourceProbe` (wired in the
-ingest router; see
-`cmd/clean-code-metric-ingestor/main.go` — search
-`WithStateMachineSourceProbe`). The directory AST
-source itself implements `HasFilesFor`, so the probe is
-non-nil whenever `CLEAN_CODE_AST_SCAN_ROOT` is set; in
-scaffold mode the probe is nil and the pre-flight is
-disabled. When the probe is wired,
-`StateMachine.ProcessOne` peeks **up to `probeFanout`
-pending commits** (default 16 per
-`state.go:813`) and iterates them in commit-time order,
-claiming the FIRST one whose `HasFilesFor` returns true
-via `ClaimSpecificPendingCommit`
-(`state.go:950-1019`). Every skipped candidate stays in
-`'pending'` (no canonical edge crossed); if NO candidate
-in the fanout is ready, `ProcessOne` returns
-`DidWork=false` with `SkipReason=SourceNotReady` and the
-next tick re-peeks. This keeps the four-state Commit
-diagram intact AND avoids head-of-line blocking when the
-oldest commit's checkout hasn't yet landed on disk.
+The `AstSourceAvailability` interface and
+`WithStateMachineSourceProbe` option are defined in
+`internal/metric_ingestor/availability.go` and
+`internal/metric_ingestor/state.go` respectively. The
+`DirectoryAstFileSource` implements `HasFilesFor`, and the
+state-machine `ProcessOne` honors the probe when wired
+(`internal/metric_ingestor/state.go` — search
+`AstSourceAvailability`): it peeks **up to `probeFanout`
+pending commits** (default 16 per `state.go:813`) and
+iterates them in commit-time order, claiming the FIRST
+one whose `HasFilesFor` returns true via
+`ClaimSpecificPendingCommit` (`state.go:950-1019`).
+Every skipped candidate stays in `'pending'` (no canonical
+edge crossed); if NO candidate in the fanout is ready,
+`ProcessOne` returns `DidWork=false` with
+`SkipReason=SourceNotReady`. This keeps the four-state
+Commit diagram intact AND avoids head-of-line blocking
+when the oldest commit's checkout hasn't yet landed on
+disk.
 
-The probe is plumbed into the state machine, NOT into
-`/readyz`. The composition root currently registers only
-the Policy-Steward signing-key cache ready-check via
+**The metric-ingestor binary does NOT wire this probe
+today.** `cmd/clean-code-metric-ingestor/main.go` does
+not call `NewStateMachine`, `WithStateMachineSourceProbe`,
+or construct an `AstSourceAvailability` value (verified by
+`rg WithStateMachineSourceProbe cmd/clean-code-metric-ingestor/`
+returning zero matches). The only callers of
+`NewStateMachine` today are unit tests in
+`internal/metric_ingestor/state_test.go`,
+`availability_test.go`, and `sweep_loop_test.go`. The
+foundation-dispatch scan path
+(`RegistryBackedFoundationDispatcher` →
+`DirectoryAstFileSource`) wired at
+`cmd/clean-code-metric-ingestor/main.go:860-891` runs
+WITHOUT a `ProcessOne`/`AstSourceAvailability` gate; it
+parses whatever the commit walker yields. Operators
+that want a pre-flight source-availability gate on the
+scan path should treat it as a follow-up workstream
+(e.g. wire `NewStateMachine` + `WithStateMachineSourceProbe`
+in a Stage 10.x scan-loop integration); the option is
+ready and tested but unused in this binary today.
+
+The probe is also NOT plumbed into `/readyz`. The
+composition root currently registers only the
+Policy-Steward signing-key cache ready-check via
 `healthHandler.AddReadyCheck("signing_key_cache", ...)`
 (in `cmd/clean-code-metric-ingestor/main.go`); there is no
 `AddReadyCheck("ast_source", ...)` call today. Operators

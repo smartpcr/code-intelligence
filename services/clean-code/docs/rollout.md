@@ -2005,12 +2005,15 @@ their own zero-findings verdict pair via the
      and that `isolation_pool_languages` appears in the
      `wired production foundation dispatcher` info log
      instead.
-   - **`CLEAN_CODE_PG_URL` unset** → scaffold mode.
-     `buildSweepLoop` returns a nil loop
-     (`main.go:392-401`) and the foundation dispatcher
-     still resolves to the noop fallback. The HTTP
-     surface still serves; nothing claims commits. This
-     is dev-loop only.
+   - **`CLEAN_CODE_PG_URL` unset** → the binary refuses
+     to start. `cmd/clean-code-metric-ingestor/main.go:102-104`
+     does `log.Fatalf("%s is required", config.EnvPGURL)`
+     before any listener is bound, so there is no
+     `/healthz` to probe and no in-memory fallback. The
+     metric-ingestor binary deliberately does not support
+     a PG-less scaffold mode; operators who want one
+     should fall back to unit tests against
+     `metric_ingestor.NewInMemoryScanRunStore`.
 
 ### Per-rollout verification
 
@@ -2018,12 +2021,18 @@ After deploying a new build, confirm:
 
 1. `/healthz` returns 200 within 5s of pod-ready.
 2. `/readyz` flips to 200 within 30s. Note: Stage 3.2 does
-   NOT register an `ast_source` ready-check; the AST
-   source availability is enforced inside the state
-   machine's pre-flight (`WithStateMachineSourceProbe`),
-   not on the `/readyz` surface. The only `/readyz` probe
-   registered today is `signing_key_cache` (Policy
-   Steward, Stage 5.1).
+   NOT register an `ast_source` ready-check. The
+   `AstSourceAvailability` / `WithStateMachineSourceProbe`
+   option exists in `internal/metric_ingestor` and is
+   exercised by unit tests, but the metric-ingestor binary
+   does NOT wire it today (`NewStateMachine` is only called
+   from tests; the production scan path goes through
+   `RegistryBackedFoundationDispatcher` →
+   `DirectoryAstFileSource` without a `ProcessOne` gate).
+   The only `/readyz` probe registered today is
+   `signing_key_cache` (Policy Steward, Stage 5.1).
+   Wiring the source-availability probe into either the
+   scan loop or `/readyz` is a follow-up workstream.
 3. The first sweeper tick (after
    `CLEAN_CODE_PERIODIC_SWEEP_CADENCE`) fires and emits a
    structured log line of the form:

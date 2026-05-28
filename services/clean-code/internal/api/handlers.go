@@ -282,11 +282,34 @@ func (g *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// canonical HTTP statuses listed in the doc-comment
 	// on [Authenticator]. Runs AFTER verb-lookup so
 	// unknown verbs always 404 (per workstream brief).
-	// On failure we stamp `auth_status=unauthenticated`
-	// on the OPEN span before returning.
+	// On failure we stamp the canonical `auth_status`
+	// enum on the OPEN span before returning:
+	//
+	//   - ErrAuthBackend -> backend_unavailable (503).
+	//     The IdP / JWKS endpoint is down; dashboards
+	//     alert on this independently of caller-error
+	//     401 floods.
+	//   - ErrBadAudience -> denied (403). The bearer
+	//     verifies but is not for this gateway; auth-
+	//     status semantically matches the authz-denial
+	//     path because the caller is authenticated but
+	//     not authorised for this resource.
+	//   - default fallback (500 -- authenticator-internal
+	//     failure) -> backend_unavailable. Same alert
+	//     class as the JWKS-down path; the caller cannot
+	//     be authenticated through no fault of theirs.
+	//   - all other sentinels (missing / malformed /
+	//     invalid / expired / bad-issuer) -> unauthenticated
+	//     (401). Caller-supplied credential is bad.
+	//
+	// Stage 9.4 iter-3 evaluator item #3: previously
+	// EVERY auth error stamped `unauthenticated`, which
+	// papered over the 503 and 500 distinction so
+	// dashboards could not tell "the IdP is down" apart
+	// from "a caller mistyped their token".
 	identity, authErr := g.authenticate(r)
 	if authErr != nil {
-		span.SetAttribute(SpanAttrAuthStatus, AuthStatusUnauthenticated)
+		span.SetAttribute(SpanAttrAuthStatus, classifyAuthError(authErr))
 		g.handleAuthError(sw, r, authErr, verb.DottedName())
 		return
 	}
@@ -452,6 +475,46 @@ func (g *GatewayHandler) handleAuthError(w http.ResponseWriter, r *http.Request,
 		)
 		g.writeError(w, r, http.StatusInternalServerError, CodeInternalError,
 			"internal error", "", verb)
+	}
+}
+
+// classifyAuthError maps the [Authenticator] sentinel-error
+// set onto the canonical Stage 9.4 `auth_status` span enum.
+// Mirrors the HTTP-status mapping in [handleAuthError]:
+//
+//   - [ErrAuthBackend]     -> [AuthStatusBackendUnavailable] (503)
+//   - [ErrBadAudience]     -> [AuthStatusDenied]             (403)
+//   - default (non-sentinel, mapped to 500 in handleAuthError)
+//     -> [AuthStatusBackendUnavailable]. Same alert class as
+//     the JWKS-down path because the caller cannot
+//     authenticate through no fault of theirs.
+//   - everything else (missing / malformed / invalid /
+//     expired / bad-issuer) -> [AuthStatusUnauthenticated] (401).
+//
+// Kept package-private and BESIDE [handleAuthError] so a
+// future contributor adding a new sentinel updates both the
+// status table AND the span enum in the same edit.
+//
+// Stage 9.4 iter-3 evaluator item #3.
+func classifyAuthError(err error) string {
+	switch {
+	case errors.Is(err, ErrAuthBackend):
+		return AuthStatusBackendUnavailable
+	case errors.Is(err, ErrBadAudience):
+		return AuthStatusDenied
+	case errors.Is(err, ErrMissingToken),
+		errors.Is(err, ErrMalformedToken),
+		errors.Is(err, ErrExpiredToken),
+		errors.Is(err, ErrBadIssuer),
+		errors.Is(err, ErrInvalidToken):
+		return AuthStatusUnauthenticated
+	default:
+		// Non-sentinel = authenticator-internal failure
+		// (the default branch of [handleAuthError]
+		// returns 500). Surface it as backend_unavailable
+		// for dashboards -- the caller cannot
+		// authenticate and the cause is server-side.
+		return AuthStatusBackendUnavailable
 	}
 }
 

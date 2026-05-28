@@ -763,35 +763,57 @@ type evalReplayFunc func(ctx context.Context, repoID uuid.UUID, sha string, scop
 // [maxRequestBodyBytes].
 func makeEvalHandler(gateFn evalGateFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Stage 9.4 iter-3 evaluator item #4: the OTel
+		// span MUST be opened BEFORE method / body /
+		// JSON / repo_id validation so every invocation
+		// -- including 400 / 405 / 413 validation
+		// failures -- is observable with the canonical
+		// attribute set. Previously validation returned
+		// before emitEvalSpan, leaving those branches
+		// unobservable.
+		ctx, span := openEvalSpan(r.Context(), "eval.gate")
+		defer span.End()
+		sw := &statusCaptureWriter{ResponseWriter: w, status: http.StatusOK}
+		span.SetAttributes(attribute.String(telemetry.AttrHTTPMethod, r.Method))
+		defer func() {
+			span.SetAttributes(attribute.Int(telemetry.AttrHTTPStatusCode, sw.status))
+		}()
+
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			http.Error(sw, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		r.Body = http.MaxBytesReader(sw, r.Body, maxRequestBodyBytes)
 		raw, err := io.ReadAll(r.Body)
 		if err != nil {
-			writeBodyReadError(w, err)
+			writeBodyReadError(sw, err)
 			return
 		}
 		if rerr := rejectExtraPolicyVersionField(raw); rerr != nil {
-			http.Error(w, "bad request: "+rerr.Error(), http.StatusBadRequest)
+			http.Error(sw, "bad request: "+rerr.Error(), http.StatusBadRequest)
 			return
 		}
 		var req evalGateRequest
 		if err := json.Unmarshal(raw, &req); err != nil {
-			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			http.Error(sw, "bad request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 		repoID, err := uuid.FromString(req.RepoID)
 		if err != nil {
-			http.Error(w, "bad request: invalid repo_id: "+err.Error(), http.StatusBadRequest)
+			http.Error(sw, "bad request: invalid repo_id: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+		// repo_id is now known; stamp it on the open span
+		// so downstream dashboards can correlate even
+		// transport-error responses to the originating
+		// repo.
+		span.SetAttributes(attribute.String(telemetry.AttrRepoID, req.RepoID))
+
 		var scope *uuid.UUID
 		if req.Scope != nil && *req.Scope != "" {
 			s, perr := uuid.FromString(*req.Scope)
 			if perr != nil {
-				http.Error(w, "bad request: invalid scope: "+perr.Error(), http.StatusBadRequest)
+				http.Error(sw, "bad request: invalid scope: "+perr.Error(), http.StatusBadRequest)
 				return
 			}
 			scope = &s
@@ -799,16 +821,17 @@ func makeEvalHandler(gateFn evalGateFunc) http.HandlerFunc {
 
 		// Canonical Stage 6.1 verb path: gate resolves
 		// the active policy_version_id itself via the
-		// latest `clean_code.policy_activation` row. The
-		// span pipeline runs around `gateFn` so the
-		// canonical eval-gate attributes are stamped
-		// regardless of whether the gate hits the happy,
-		// degraded, or `ErrNoActivePolicy` branch.
-		result, evalErr := emitEvalSpan(r.Context(), "eval.gate", req.RepoID,
-			func(ctx context.Context) (evaluator.EvaluateResult, error) {
-				return gateFn(ctx, repoID, req.SHA, scope)
-			})
-		writeEvalResponse(w, result, evalErr)
+		// latest `clean_code.policy_activation` row.
+		// AnnotateEvalGateSpan stamps the four eval-
+		// gate-specific attributes (`policy_version_id`,
+		// `degraded`, `degraded_reason`, `verdict`) on
+		// the open span regardless of whether the gate
+		// hit the happy, degraded, or `ErrNoActivePolicy`
+		// branch.
+		result, evalErr := gateFn(ctx, repoID, req.SHA, scope)
+		telemetry.AnnotateEvalGateSpan(ctx, result)
+		recordEvalError(span, evalErr)
+		writeEvalResponse(sw, result, evalErr)
 	}
 }
 
@@ -830,78 +853,93 @@ func makeEvalHandler(gateFn evalGateFunc) http.HandlerFunc {
 // verb without joining on the audit DB.
 func makeReplayHandler(replayFn evalReplayFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Stage 9.4 iter-3 evaluator item #4: open the
+		// span BEFORE validation so the four validation
+		// branches (wrong method, bad body, missing
+		// policy_version_id, invalid uuid) all emit
+		// observable spans with the canonical attribute
+		// set.
+		ctx, span := openEvalSpan(r.Context(), "eval.replay")
+		defer span.End()
+		sw := &statusCaptureWriter{ResponseWriter: w, status: http.StatusOK}
+		span.SetAttributes(attribute.String(telemetry.AttrHTTPMethod, r.Method))
+		defer func() {
+			span.SetAttributes(attribute.Int(telemetry.AttrHTTPStatusCode, sw.status))
+		}()
+
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			http.Error(sw, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		r.Body = http.MaxBytesReader(sw, r.Body, maxRequestBodyBytes)
 		var req replayRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeBodyReadError(w, err)
+			writeBodyReadError(sw, err)
 			return
 		}
 		repoID, err := uuid.FromString(req.RepoID)
 		if err != nil {
-			http.Error(w, "bad request: invalid repo_id: "+err.Error(), http.StatusBadRequest)
+			http.Error(sw, "bad request: invalid repo_id: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 		if req.PolicyVersionID == "" {
-			http.Error(w, "bad request: policy_version_id is required on /v1/eval/replay; use /v1/eval/gate for the canonical active-policy verb", http.StatusBadRequest)
+			http.Error(sw, "bad request: policy_version_id is required on /v1/eval/replay; use /v1/eval/gate for the canonical active-policy verb", http.StatusBadRequest)
 			return
 		}
 		policyVersionID, perr := uuid.FromString(req.PolicyVersionID)
 		if perr != nil {
-			http.Error(w, "bad request: invalid policy_version_id: "+perr.Error(), http.StatusBadRequest)
+			http.Error(sw, "bad request: invalid policy_version_id: "+perr.Error(), http.StatusBadRequest)
 			return
 		}
 		if policyVersionID == uuid.Nil {
-			http.Error(w, "bad request: policy_version_id is the zero uuid", http.StatusBadRequest)
+			http.Error(sw, "bad request: policy_version_id is the zero uuid", http.StatusBadRequest)
 			return
 		}
 		var scope *uuid.UUID
 		if req.Scope != nil && *req.Scope != "" {
 			s, perr := uuid.FromString(*req.Scope)
 			if perr != nil {
-				http.Error(w, "bad request: invalid scope: "+perr.Error(), http.StatusBadRequest)
+				http.Error(sw, "bad request: invalid scope: "+perr.Error(), http.StatusBadRequest)
 				return
 			}
 			scope = &s
 		}
-		result, evalErr := emitEvalSpan(r.Context(), "eval.replay", req.RepoID,
-			func(ctx context.Context) (evaluator.EvaluateResult, error) {
-				return replayFn(ctx, repoID, req.SHA, scope, policyVersionID)
-			})
-		writeEvalResponse(w, result, evalErr)
+		span.SetAttributes(attribute.String(telemetry.AttrRepoID, req.RepoID))
+		result, evalErr := replayFn(ctx, repoID, req.SHA, scope, policyVersionID)
+		telemetry.AnnotateEvalGateSpan(ctx, result)
+		recordEvalError(span, evalErr)
+		writeEvalResponse(sw, result, evalErr)
 	}
 }
 
-// emitEvalSpan opens an OTel span named `verbName`,
-// stamps the canonical Stage 9.4 attribute defaults on it
-// (per architecture Sec 8: `verb`, `repo_id`, plus the
-// four eval-gate-specific keys defaulted to empty / false),
-// invokes `fn` to drive the gate evaluation, and finally
-// calls [telemetry.AnnotateEvalGateSpan] to overwrite the
-// eval-specific attributes with the actual outcome.
+// openEvalSpan opens an OTel server-kind span named
+// `verbName` and stamps the canonical Stage 9.4 attribute
+// defaults on it (per architecture Sec 8: `verb`,
+// `repo_id`, plus the four eval-gate-specific keys
+// defaulted to empty / false). The caller MUST defer
+// `span.End()` on the returned span.
 //
-// The helper exists so iter-2 evaluator feedback #1
-// (standalone eval-gate handlers must emit spans) is
-// satisfied by a SINGLE annotated path BOTH HTTP handlers
-// (`/v1/eval/gate`, `/v1/eval/replay`) share. The span is
-// a no-op when no OTel TracerProvider is installed
+// Stage 9.4 iter-3 evaluator item #4: the span is opened
+// BEFORE method / body / JSON / repo_id validation in
+// [makeEvalHandler] and [makeReplayHandler] so every verb-
+// handler invocation -- including the 400 / 405 / 413
+// validation-failure branches -- is observable. The span
+// is a no-op when no OTel TracerProvider is installed
 // (`telemetry.Setup` skipped or `CLEAN_CODE_OTEL_ENDPOINT`
 // explicitly empty), so the helper is safe to call from
 // every test path too.
-func emitEvalSpan(
-	ctx context.Context,
-	verbName, repoID string,
-	fn func(ctx context.Context) (evaluator.EvaluateResult, error),
-) (evaluator.EvaluateResult, error) {
+//
+// `repo_id` is stamped empty here and overwritten by the
+// handler once parsing of the request body succeeds; the
+// downstream `telemetry.AnnotateEvalGateSpan` call
+// overwrites the four eval-gate-specific attributes with
+// the actual outcome when the gate runs.
+func openEvalSpan(ctx context.Context, verbName string) (context.Context, oteltrace.Span) {
 	tracer := otel.Tracer(evalGateTracerName)
 	ctx, span := tracer.Start(ctx, verbName, oteltrace.WithSpanKind(oteltrace.SpanKindServer))
-	defer span.End()
 	span.SetAttributes(
 		attribute.String(telemetry.AttrVerb, verbName),
-		attribute.String(telemetry.AttrRepoID, repoID),
+		attribute.String(telemetry.AttrRepoID, ""),
 		// The standalone eval-gate binary does NOT run
 		// the bearer-token authn layer (the gateway
 		// fronts it for that), so `caller_subject` is
@@ -914,26 +952,66 @@ func emitEvalSpan(
 		attribute.String(telemetry.AttrDegradedReason, ""),
 		attribute.String(telemetry.AttrVerdict, ""),
 	)
-	result, err := fn(ctx)
-	// Stamp the actual outcome on top of the defaults.
-	// AnnotateEvalGateSpan is a no-op when no recording
-	// span is bound to ctx, so the call is cheap when
-	// telemetry is disabled.
-	telemetry.AnnotateEvalGateSpan(ctx, result)
-	if err != nil {
-		// Record the error event on the span so OTel
-		// backends highlight it; do NOT downgrade the
-		// span status for the canonical degraded
-		// sentinels (samples_pending / signature_invalid
-		// / no_active_policy) since those are expected
-		// operational paths and would spam alert
-		// dashboards.
-		if !isExpectedEvalSentinel(err) {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, "eval failure")
-		}
+	return ctx, span
+}
+
+// recordEvalError records `err` on the OTel span when it
+// represents a true failure (not one of the
+// operational-state sentinels the gate is allowed to
+// return). The split mirrors [isExpectedEvalSentinel] /
+// [writeEvalResponse]: the canonical degraded paths
+// (samples_pending, policy_signature_invalid, no_active_policy)
+// are NOT recorded as errors because their semantics are
+// captured by the `degraded` / `degraded_reason` /
+// `verdict` attributes already; double-marking them as
+// span errors would spam alert dashboards on otherwise-
+// healthy operational state.
+func recordEvalError(span oteltrace.Span, err error) {
+	if err == nil || isExpectedEvalSentinel(err) {
+		return
 	}
-	return result, err
+	span.RecordError(err)
+	span.SetStatus(codes.Error, "eval failure")
+}
+
+// statusCaptureWriter wraps an [http.ResponseWriter] so the
+// handler can stamp the eventual HTTP status on its OTel
+// span via [telemetry.AttrHTTPStatusCode]. When the handler
+// calls `Write` without first calling `WriteHeader`, the
+// status defaults to 200 (per net/http semantics).
+//
+// Stage 9.4 iter-3: needed because the standalone eval-
+// gate handlers call `http.Error` for every validation
+// branch, and `http.Error` writes the status via
+// `WriteHeader` -- the OTel span must see that status to
+// classify the request as success / client-error / server-
+// error on dashboards.
+type statusCaptureWriter struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+// WriteHeader records the first written status code; later
+// calls are ignored (mirroring net/http's behaviour: only
+// the first WriteHeader actually flushes a status).
+func (s *statusCaptureWriter) WriteHeader(code int) {
+	if !s.wroteHeader {
+		s.status = code
+		s.wroteHeader = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+// Write defers to the underlying writer and stamps an
+// implicit 200 when WriteHeader was never called (the
+// net/http contract).
+func (s *statusCaptureWriter) Write(b []byte) (int, error) {
+	if !s.wroteHeader {
+		s.status = http.StatusOK
+		s.wroteHeader = true
+	}
+	return s.ResponseWriter.Write(b)
 }
 
 // isExpectedEvalSentinel returns true for the operational-

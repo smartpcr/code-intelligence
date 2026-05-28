@@ -232,6 +232,166 @@ func TestIntegration_EvalReplayHandlerEmitsSpan(t *testing.T) {
 	}
 }
 
+// TestIntegration_EvalHandlerEmitsSpanOnValidationFailure
+// is the Stage 9.4 iter-3 evaluator item #4 proof: every
+// validation branch in [makeEvalHandler] /
+// [makeReplayHandler] (wrong method, oversized body, bad
+// JSON, malformed repo_id, missing policy_version_id on
+// replay) MUST emit an observable span carrying the
+// canonical Stage 9.4 attribute set BEFORE the handler
+// returns to the caller. Previously these branches
+// returned before [emitEvalSpan] opened a span, leaving
+// 400 / 405 / 413 invocations invisible to dashboards.
+//
+// On a successful pass, the gate stub is never invoked
+// (validation rejects the request first) and the in-
+// process OTel SDK exporter captures exactly one span
+// per request carrying the verb name and the canonical
+// default attribute set.
+func TestIntegration_EvalHandlerEmitsSpanOnValidationFailure(t *testing.T) {
+	cases := []struct {
+		name       string
+		method     string
+		body       string
+		wantStatus int
+		wantVerb   string
+		handlerFn  func() http.HandlerFunc
+	}{
+		{
+			name:       "eval_gate_wrong_method",
+			method:     http.MethodGet,
+			body:       "",
+			wantStatus: http.StatusMethodNotAllowed,
+			wantVerb:   "eval.gate",
+			handlerFn: func() http.HandlerFunc {
+				return makeEvalHandler(func(_ context.Context, _ uuid.UUID, _ string, _ *uuid.UUID) (evaluator.EvaluateResult, error) {
+					t.Fatalf("gateFn MUST NOT be invoked on wrong-method validation failure")
+					return evaluator.EvaluateResult{}, nil
+				})
+			},
+		},
+		{
+			name:       "eval_gate_bad_json",
+			method:     http.MethodPost,
+			body:       "{not-json",
+			wantStatus: http.StatusBadRequest,
+			wantVerb:   "eval.gate",
+			handlerFn: func() http.HandlerFunc {
+				return makeEvalHandler(func(_ context.Context, _ uuid.UUID, _ string, _ *uuid.UUID) (evaluator.EvaluateResult, error) {
+					t.Fatalf("gateFn MUST NOT be invoked on bad-JSON validation failure")
+					return evaluator.EvaluateResult{}, nil
+				})
+			},
+		},
+		{
+			name:       "eval_gate_bad_repo_id",
+			method:     http.MethodPost,
+			body:       `{"repo_id":"not-a-uuid","sha":"deadbeef"}`,
+			wantStatus: http.StatusBadRequest,
+			wantVerb:   "eval.gate",
+			handlerFn: func() http.HandlerFunc {
+				return makeEvalHandler(func(_ context.Context, _ uuid.UUID, _ string, _ *uuid.UUID) (evaluator.EvaluateResult, error) {
+					t.Fatalf("gateFn MUST NOT be invoked on bad-repo_id validation failure")
+					return evaluator.EvaluateResult{}, nil
+				})
+			},
+		},
+		{
+			name:       "eval_replay_missing_policy_version_id",
+			method:     http.MethodPost,
+			body:       `{"repo_id":"11111111-1111-1111-1111-111111111111","sha":"deadbeef"}`,
+			wantStatus: http.StatusBadRequest,
+			wantVerb:   "eval.replay",
+			handlerFn: func() http.HandlerFunc {
+				return makeReplayHandler(func(_ context.Context, _ uuid.UUID, _ string, _ *uuid.UUID, _ uuid.UUID) (evaluator.EvaluateResult, error) {
+					t.Fatalf("replayFn MUST NOT be invoked on missing-pvid validation failure")
+					return evaluator.EvaluateResult{}, nil
+				})
+			},
+		},
+		{
+			name:       "eval_replay_bad_json",
+			method:     http.MethodPost,
+			body:       "not-json-at-all",
+			wantStatus: http.StatusBadRequest,
+			wantVerb:   "eval.replay",
+			handlerFn: func() http.HandlerFunc {
+				return makeReplayHandler(func(_ context.Context, _ uuid.UUID, _ string, _ *uuid.UUID, _ uuid.UUID) (evaluator.EvaluateResult, error) {
+					t.Fatalf("replayFn MUST NOT be invoked on bad-JSON validation failure")
+					return evaluator.EvaluateResult{}, nil
+				})
+			},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			prev := otel.GetTracerProvider()
+			exp := tracetest.NewInMemoryExporter()
+			tp := sdktrace.NewTracerProvider(
+				sdktrace.WithSyncer(exp),
+				sdktrace.WithSampler(sdktrace.AlwaysSample()),
+			)
+			otel.SetTracerProvider(tp)
+			t.Cleanup(func() {
+				_ = tp.Shutdown(context.Background())
+				otel.SetTracerProvider(prev)
+			})
+
+			srv := httptest.NewServer(tc.handlerFn())
+			defer srv.Close()
+
+			req, err := http.NewRequest(tc.method, srv.URL, bytes.NewReader([]byte(tc.body)))
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("status=%d, want %d", resp.StatusCode, tc.wantStatus)
+			}
+			spans := exp.GetSpans()
+			if len(spans) != 1 {
+				t.Fatalf("validation-failure span count=%d, want 1 (Stage 9.4 iter-3 evaluator item #4: every verb-handler invocation MUST emit a span)", len(spans))
+			}
+			s := spans[0]
+			if s.Name != tc.wantVerb {
+				t.Errorf("span name=%q, want %q", s.Name, tc.wantVerb)
+			}
+			attrs := attrMap(s.Attributes)
+			if got := attrs[telemetry.AttrVerb]; got != tc.wantVerb {
+				t.Errorf("verb attr = %v, want %q", got, tc.wantVerb)
+			}
+			// The canonical default attribute set is
+			// stamped even when validation fails -- this
+			// is the key contract the evaluator's item
+			// #4 calls out.
+			if _, ok := attrs[telemetry.AttrRepoID]; !ok {
+				t.Errorf("repo_id attr missing from validation-failure span (canonical default MUST be stamped)")
+			}
+			if _, ok := attrs[telemetry.AttrPolicyVersionID]; !ok {
+				t.Errorf("policy_version_id attr missing from validation-failure span (canonical default MUST be stamped)")
+			}
+			if _, ok := attrs[telemetry.AttrDegraded]; !ok {
+				t.Errorf("degraded attr missing from validation-failure span (canonical default MUST be stamped)")
+			}
+			if _, ok := attrs[telemetry.AttrVerdict]; !ok {
+				t.Errorf("verdict attr missing from validation-failure span (canonical default MUST be stamped)")
+			}
+			// HTTP status MUST be recorded so dashboards
+			// can split validation failures (400 / 405 /
+			// 413) from happy 200s.
+			if got, ok := attrs[telemetry.AttrHTTPStatusCode].(int64); !ok || got != int64(tc.wantStatus) {
+				t.Errorf("http.status_code attr = %v (ok=%v), want %d", got, ok, tc.wantStatus)
+			}
+		})
+	}
+}
+
 // attrMap converts the OTel SDK attribute slice into a
 // map keyed by attribute name. Returns the canonical Go
 // value (string / bool / int64) so the assertions can

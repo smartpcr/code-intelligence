@@ -6,6 +6,115 @@ Newest at the top. Stage references map to
 
 ## Stage 9.4 -- OTel telemetry across all surfaces
 
+### Iter-3 hardening (Stage 9.4)
+
+The iter-2 review surfaced five new gaps; iter-3 closed each
+through structural -- not cosmetic -- changes:
+
+1. **Sampler default semantics fixed (`internal/telemetry/setup.go`)** --
+   `buildSampler(0)` previously returned `AlwaysOffSampler`,
+   silently dropping EVERY span when composition roots left
+   `SetupOptions.SamplerRatio` unset (the canonical happy
+   path: all four production binaries omit the field). The
+   contract is now:
+   - `ratio == 0` -> `AlwaysSample` (the documented default
+     that matches `SamplerRatio` doc-comment).
+   - `ratio < 0` -> `NeverSample` (explicit "disable
+     sampling without touching the endpoint" knob).
+   - `ratio >= 1.0` -> `AlwaysSample`.
+   - `0 < ratio < 1.0` -> `ParentBased{TraceIDRatioBased}`.
+
+   **Compatibility note**: callers that previously set
+   `SamplerRatio: 0` to disable sampling will now get full
+   sampling. The canonical disable path remains clearing
+   `OTelEndpoint`. `internal/telemetry/setup_test.go::TestBuildSampler_Branches`
+   asserts the new contract.
+
+2. **`clean-code-metric-ingestor` now wired for OTel
+   (`cmd/clean-code-metric-ingestor/main.go`)** -- the
+   binary previously mounted production `mgmt.*` /
+   `ingest.*` verb surfaces (lines 514-518, 719) with NO
+   `telemetry.Setup` call. Iter-3 adds:
+   - `telemetry.Setup` at boot (with `defer Shutdown` on a
+     5 s bounded context), using `lookupEnvOrDefault` to
+     honour `config.DefaultOTelEndpoint` per the iter-2
+     #2 pattern.
+   - `telemetry.NewVerbSpanMiddleware` wrapping the
+     binary's `rootMux` so every canonical
+     `/v1/mgmt/{verb}` and `/v1/ingest/{verb}` request
+     emits a server-kind span tagged with the canonical
+     Stage 9.4 attribute set (`verb`, `repo_id`,
+     `policy_version_id`, `degraded`, `degraded_reason`,
+     `verdict`, `http.method`, `http.route`,
+     `http.status_code`).
+   - The middleware is a CLOSED-SET filter keyed on the
+     concrete dotted-verb path table
+     (`telemetry.CanonicalMetricIngestorVerbs`) so legacy
+     `/v1/ingestor/process`, `/healthz`, and `/metrics`
+     do NOT pollute the verb-span surface with non-
+     canonical span names.
+
+3. **`auth_status` classification fixed
+   (`internal/api/handlers.go`)** -- the previous edit
+   stamped `unauthenticated` on EVERY auth-error branch,
+   even when `handleAuthError` mapped the error to 503
+   (`ErrAuthBackend`) or 403 (`ErrBadAudience`). A new
+   `classifyAuthError` helper now maps:
+   - `ErrAuthBackend` -> `backend_unavailable` (503).
+   - `ErrBadAudience` -> `denied` (403).
+   - Default fallback (500 -- authenticator-internal
+     failure) -> `backend_unavailable`.
+   - All other sentinels (missing / malformed / invalid
+     / expired / bad-issuer) -> `unauthenticated` (401).
+
+   `internal/api/handler_span_integration_test.go` now
+   locks in the correct classification for each branch
+   plus the new `ErrBadAudience` and
+   "authenticator-internal failure" cases. Dashboards
+   can now alert on JWKS-down independently of caller
+   401 floods.
+
+4. **eval-gate handlers open span BEFORE validation
+   (`cmd/clean-code-eval-gate/main.go`)** -- both
+   `makeEvalHandler` and `makeReplayHandler` previously
+   returned `405 / 400 / 413` for method / body / JSON /
+   repo_id validation failures BEFORE opening a span,
+   leaving those branches invisible to dashboards. The
+   iter-3 form opens the span at the TOP of the closure
+   via a new `openEvalSpan` helper, stamps the canonical
+   defaults immediately, performs validation inside the
+   span scope, and stamps `repo_id` + the eval-gate-
+   specific attributes only once they are known.
+
+   A `statusCaptureWriter` wraps the response writer so
+   the eventual HTTP status (400 / 405 / 413 / 200 / 409
+   / 500) is stamped on the span via
+   `telemetry.AttrHTTPStatusCode`. The new
+   `cmd/clean-code-eval-gate/span_integration_test.go::TestIntegration_EvalHandlerEmitsSpanOnValidationFailure`
+   covers all 5 validation branches (wrong method, bad
+   JSON, bad repo_id, missing pvid on replay, bad-JSON on
+   replay).
+
+5. **OTLP receiver test drives real handlers
+   (`internal/telemetry/otlp_receiver_test.go`)** -- the
+   iter-2 form manually called `otel.Tracer(...).Start(...)`,
+   forced `SamplerRatio: 1.0`, and used the non-canonical
+   verb `ingest.metric`. The iter-3 form:
+   - Drives REAL HTTP requests through
+     `NewVerbSpanMiddleware` for `mgmt.register_repo` /
+     `ingest.coverage` / `policy.activate`.
+   - Drives a real eval.gate handler that calls
+     `AnnotateEvalGateSpan` with a stub
+     `evaluator.EvaluateResult` inside the verb-span
+     scope (proving the production wiring stamps verdict
+     / policy_version_id end-to-end over OTLP/gRPC).
+   - Omits `SamplerRatio` from `SetupOptions` so the test
+     passes ONLY when the iter-3 #1 sampler-default fix
+     holds; a regression would surface as
+     `fake OTLP receiver got fewer than N spans`.
+   - Uses ONLY canonical ingest verbs per
+     `internal/api/defaults.go:228-231`.
+
 ### Iter-2 hardening (Stage 9.4)
 
 The iter-1 review surfaced five gaps; iter-2 closed each:

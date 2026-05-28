@@ -71,11 +71,35 @@ type SetupOptions struct {
 	Headers map[string]string
 
 	// SamplerRatio is the head-based sampling ratio in
-	// [0.0, 1.0]. 0 OR negative disables sampling (drops
-	// every span); >=1.0 samples everything. Defaults to
-	// 1.0 (sample everything) -- the canonical v0 default
-	// since the clean-code service emits low-volume spans
-	// (a handful per verb call).
+	// [0.0, 1.0]. Semantics (Stage 9.4 iter-3 evaluator
+	// item #1):
+	//
+	//   - zero (i.e. the Go zero value, the default when
+	//     no composition root sets the field) -> sample
+	//     everything. This is the canonical v0 default
+	//     since the clean-code service emits low-volume
+	//     spans (a handful per verb call) and ALL
+	//     production composition roots leave this field
+	//     unset.
+	//   - negative -> NEVER sample. Reserved for the
+	//     emergency "disable telemetry but keep resource
+	//     attributes" deployment without touching the
+	//     endpoint pin. Operators who simply want to
+	//     disable telemetry should clear OTelEndpoint
+	//     instead (the canonical disable path).
+	//   - >=1.0 -> sample everything (explicit form of
+	//     the default).
+	//   - 0 < ratio < 1.0 -> parent-based
+	//     TraceIDRatioBased sampler at the given ratio.
+	//
+	// COMPATIBILITY NOTE: prior to Stage 9.4 iter-3,
+	// `ratio == 0` was treated as "never sample", which
+	// made `telemetry.Setup` silently drop EVERY span
+	// when composition roots omitted the field (the
+	// canonical happy path). The new contract treats
+	// zero as "default" so composition roots get the
+	// documented "sample everything" behaviour without
+	// having to discover the field exists.
 	SamplerRatio float64
 }
 
@@ -215,13 +239,25 @@ func buildResource(opts SetupOptions) *sdkresource.Resource {
 
 func buildSampler(ratio float64) sdktrace.Sampler {
 	switch {
-	case ratio <= 0:
-		// Negative / zero ratio = never sample. Useful
-		// for emergency "disable telemetry but keep
-		// resource attributes" deployments without
-		// touching the endpoint pin.
+	case ratio < 0:
+		// Negative ratio = never sample. The emergency
+		// "disable telemetry but keep resource
+		// attributes" deployment knob; operators who
+		// want to disable telemetry entirely should
+		// clear OTelEndpoint instead (Setup short-
+		// circuits to a noop ShutdownFunc).
+		//
+		// Stage 9.4 iter-3 evaluator item #1: the
+		// `< 0` branch (NOT `<= 0`) reserves the zero
+		// value for the documented "sample everything"
+		// default so composition roots that omit
+		// SamplerRatio get the canonical happy path
+		// (see SetupOptions.SamplerRatio doc).
 		return sdktrace.NeverSample()
-	case ratio >= 1.0:
+	case ratio == 0, ratio >= 1.0:
+		// Zero = documented default (sample
+		// everything); ratio >= 1.0 = explicit
+		// form. Stage 9.4 iter-3 evaluator item #1.
 		return sdktrace.AlwaysSample()
 	default:
 		return sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio))

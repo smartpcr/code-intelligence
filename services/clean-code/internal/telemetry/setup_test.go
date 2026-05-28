@@ -35,13 +35,19 @@ func TestSetup_EmptyServiceNameIsRejected(t *testing.T) {
 }
 
 func TestBuildSampler_Branches(t *testing.T) {
+	// Stage 9.4 iter-3 evaluator item #1: ratio==0 means
+	// "use the documented default (sample everything)" so
+	// composition roots that omit SamplerRatio get the
+	// canonical happy path. Negative ratio is the explicit
+	// "never sample" knob. See SetupOptions.SamplerRatio
+	// doc for the full contract.
 	for _, tc := range []struct {
 		name   string
 		ratio  float64
 		expect string
 	}{
-		{"never_on_zero", 0, "AlwaysOffSampler"},
-		{"never_on_negative", -1.5, "AlwaysOffSampler"},
+		{"always_on_zero_default", 0, "AlwaysOnSampler"},
+		{"never_on_negative_explicit_disable", -1.5, "AlwaysOffSampler"},
 		{"always_on_one", 1.0, "AlwaysOnSampler"},
 		{"always_on_high", 2.0, "AlwaysOnSampler"},
 	} {

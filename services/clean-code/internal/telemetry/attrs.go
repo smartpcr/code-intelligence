@@ -63,6 +63,26 @@ const (
 	// AttrVerdict is the canonical eval.gate verdict enum
 	// {pass, warn, block}. Empty string on non-eval verbs.
 	AttrVerdict = "verdict"
+
+	// AttrHTTPStatusCode is the OTel-semantic-convention
+	// HTTP status-code attribute. Stamped on every verb
+	// span when the handler captures the response status.
+	// Stage 9.4 iter-3: the eval-gate handlers and the
+	// metric-ingestor middleware capture this so validation-
+	// failure spans (400 / 405 / 413) are distinguishable
+	// from happy-path 200s.
+	AttrHTTPStatusCode = "http.status_code"
+
+	// AttrHTTPMethod is the OTel-semantic-convention
+	// HTTP method attribute. Stamped by the same surfaces
+	// that capture AttrHTTPStatusCode.
+	AttrHTTPMethod = "http.method"
+
+	// AttrHTTPRoute is the OTel-semantic-convention HTTP
+	// route attribute. Stamped by the verb-span middleware
+	// to record the route pattern the request matched
+	// (e.g. `/v1/mgmt/register_repo`).
+	AttrHTTPRoute = "http.route"
 )
 
 // AnnotateEvalGateSpan stamps the four eval-gate-specific

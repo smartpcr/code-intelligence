@@ -38,7 +38,7 @@ func TestIntegration_AllSurfaceVerbsEmitSpans(t *testing.T) {
 		wantVerb  string
 	}{
 		{"mgmt", "register_repo", "mgmt.register_repo"},
-		{"ingest", "metric", "ingest.metric"},
+		{"ingest", "coverage", "ingest.coverage"},
 		{"policy", "activate", "policy.activate"},
 		{"eval", "gate", "eval.gate"},
 	}
@@ -153,7 +153,19 @@ func TestIntegration_AuthRejectedRequestStillEmitsSpan(t *testing.T) {
 			name:         "backend_unavailable",
 			authErr:      ErrAuthBackend,
 			wantStatus:   http.StatusServiceUnavailable,
-			wantAuthAttr: AuthStatusUnauthenticated,
+			wantAuthAttr: AuthStatusBackendUnavailable,
+		},
+		{
+			name:         "denied_audience_mismatch",
+			authErr:      ErrBadAudience,
+			wantStatus:   http.StatusForbidden,
+			wantAuthAttr: AuthStatusDenied,
+		},
+		{
+			name:         "authenticator_internal_failure_backend_unavailable",
+			authErr:      errors.New("unexpected: non-sentinel authenticator error"),
+			wantStatus:   http.StatusInternalServerError,
+			wantAuthAttr: AuthStatusBackendUnavailable,
 		},
 	}
 	for _, tc := range cases {

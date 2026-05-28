@@ -19,6 +19,7 @@ canonical surface for dashboards.
 | env var | required | default | semantics |
 |---|---|---|---|
 | `CLEAN_CODE_OTEL_ENDPOINT` | no | `localhost:4317` (the local-dev OTel collector) | OTLP gRPC collector address. Override with the production collector hostname in deployment (e.g. `otel-collector.svc.cluster.local:4317`). Setting it to the empty string disables telemetry: the SDK uses its built-in noop tracer, `AnnotateEvalGateSpan` becomes a no-op via the `span.IsRecording()` short-circuit, and Prometheus collectors continue to record observations regardless (no scrape impact). Localhost / 127.0.0.1 endpoints default to plaintext gRPC; production endpoints SHOULD set telemetry options' `Insecure=false` so TLS is enforced. |
+| `CLEAN_CODE_OTEL_SAMPLER_RATIO` *(programmatic only via `SetupOptions.SamplerRatio`; not yet env-bound)* | no | `0` -> sample everything (iter-3 default) | Head-based trace-sampling ratio. Stage 9.4 iter-3 contract: `0` means "use the documented default (sample everything)" so composition roots that omit the field get the canonical happy path; `< 0` is the explicit "never sample" knob; `>= 1.0` samples everything; `0 < ratio < 1.0` uses `ParentBased{TraceIDRatioBased}`. Prior iter-2 form treated `0` as `AlwaysOff`, silently disabling all spans in production. |
 | `CLEAN_CODE_PROMETHEUS_ADDR` | no | binary-default | bind address for the HTTP listener exposing `/metrics`. Already established at Stage 3.5; this stage extends the collectors mounted on the existing handler. |
 
 ### Span taxonomy
@@ -34,7 +35,7 @@ Every verb span carries:
 | `degraded` | bool | `EvaluateResult.Degraded` | `false` default on every verb span at gateway entry. |
 | `degraded_reason` | string | `EvaluateResult.DegradedReason` | empty string default; closed enum is `{samples_pending, policy_signature_invalid, xrepo_edges_unavailable}` per architecture Sec 6.1. |
 | `verdict` | string | `EvaluateResult.Verdict` | empty string default; closed enum is `{pass, warn, block}`. Stays empty on auth-rejected paths — the `verdict` enum is INTENTIONALLY DISJOINT from `auth_status`. |
-| `auth_status` | string | `internal/api` gateway | iter-2 (Stage 9.4): closed enum `{ok, unauthenticated, denied, backend_unavailable}` describing the auth/authz pipeline outcome. `ok` is the default, overwritten on the auth-failure / authz-denial / authz-backend-outage branches BEFORE the handler returns. Dashboards `group by auth_status` to alert on credential floods vs. infra outages independently of the per-verb verdict mix. |
+| `auth_status` | string | `internal/api` gateway | iter-2 (Stage 9.4): closed enum `{ok, unauthenticated, denied, backend_unavailable}` describing the auth/authz pipeline outcome. `ok` is the default, overwritten on the auth-failure / authz-denial / authz-backend-outage branches BEFORE the handler returns. Dashboards `group by auth_status` to alert on credential floods vs. infra outages independently of the per-verb verdict mix. **Iter-3 fix**: `classifyAuthError` (internal/api/handlers.go) now correctly maps `ErrAuthBackend` -> `backend_unavailable` (503), `ErrBadAudience` -> `denied` (403), authenticator-internal failures (500) -> `backend_unavailable`, and all other sentinels (missing / malformed / invalid / expired / bad-issuer) -> `unauthenticated` (401). The prior single-line stamp incorrectly bucketed every auth error as `unauthenticated`, masking the JWKS-down alert path. |
 
 The eval-gate-specific four (`policy_version_id`, `degraded`,
 `degraded_reason`, `verdict`) are stamped via
@@ -51,10 +52,10 @@ binary-local `emitEvalSpan` helper (iter-2 fix #1).
 
 | binary | collectors on `/metrics` | OTel traces |
 |---|---|---|
-| `clean-code-gateway` | `WALReplayMetrics`, `RuleEngineMetrics` | yes |
+| `clean-code-gateway` | `WALReplayMetrics`, `RuleEngineMetrics` | yes -- gateway-handler spans tagged with the canonical attribute set including the iter-3-corrected `auth_status` enum (`{ok, unauthenticated, denied, backend_unavailable}`). |
 | `clean-code-aggregator` | `AggregatorTickMetrics` | yes |
-| `clean-code-eval-gate` | `RuleEngineMetrics`, `WALReplayMetrics` | yes (gateway-composition + standalone `eval.gate`/`eval.replay` spans via the binary-local `emitEvalSpan` helper) |
-| `clean-code-metric-ingestor` | `StaleScanRunSweepMetrics` (existing Stage 3.5 surface) | yes |
+| `clean-code-eval-gate` | `RuleEngineMetrics`, `WALReplayMetrics` | yes (gateway-composition + standalone `eval.gate`/`eval.replay` spans via the binary-local `openEvalSpan` helper; iter-3 fix #4 opens the span BEFORE validation so 400/405/413 branches emit observable spans too). |
+| `clean-code-metric-ingestor` | `StaleScanRunSweepMetrics` (existing Stage 3.5 surface) | yes -- iter-3 fix #2 wires `telemetry.Setup` and wraps `rootMux` in `telemetry.NewVerbSpanMiddleware` keyed on the canonical `/v1/mgmt/{retract_sample,rescan,register_repo,set_mode}` + `/v1/ingest/{coverage,test_balance,churn,defects}` route table. Legacy `/v1/ingestor/*`, `/healthz`, and `/metrics` pass through without a span so the verb-span surface stays canonical-only. |
 | `clean-code-refactor-planner` | placeholder `/metrics` -- no observable counters currently exported. | yes — iter-2 fix #5 wires `telemetry.Setup` and an explicit `refactor.plan` root span tagged with `verb`, `repo_id`, `sha`, and (on success) `policy_version_id` + `plan_id`. The placeholder `/metrics` is intentional pending the Stage 8.x observable-counter brief; the OTel side is now fully wired so the binary shows up alongside its peers in the trace dashboards. |
 
 Metric names:

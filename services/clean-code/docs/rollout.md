@@ -229,19 +229,6 @@ reader if the banner would mislead the dashboard.
 
 ### Wiring step (composition root)
 
-> **Stage 7.3 iter 2 correction.** An earlier draft of this
-> section named
-> `cmd/clean-code-metric-ingestor/main.go:mountMgmtRoutes`
-> as the read-surface composition root. That was wrong --
-> verify with
-> `grep -n 'mountMgmtRoutes' cmd/clean-code-metric-ingestor/main.go`
-> against the function signature
-> `func mountMgmtRoutes(mux *http.ServeMux, ingestorDB, mgmtDB *sql.DB) error`
-> (file lines 437-520): the handler only mounts the
-> management **write** verbs `POST /v1/mgmt/retract_sample`
-> and `POST /v1/mgmt/rescan`, and never constructs a
-> [management.Reader]. The doc has been corrected below.
-
 **State of the read surface today.** The
 `mgmt.read.cross_repo` and `mgmt.read.portfolio` HTTP
 handlers are **not yet mounted in any production binary**

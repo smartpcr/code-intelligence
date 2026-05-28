@@ -329,20 +329,27 @@ func (p *Planner) Plan(
 	}, nil
 }
 
-// readAndCompute is the shared read → compute helper that the
-// Stage 8.1 [Planner.Plan] and the Stage 8.2 [TaskPlanner.Plan]
-// both invoke. It performs the canonical four steps:
+// readAndCompute is the Stage 8.1 [Planner.Plan] read → compute
+// helper. It performs the canonical four steps:
 //
 //  1. Read the currently-active PolicySnapshot ONCE so a
 //     concurrent policy.activate does not produce a torn
 //     plan whose hot_spots are scored by one policy_version
-//     and whose top-N truncation uses another policy's
-//     `top_n` (the rubber-duck design review pinned this
-//     race condition).
+//     and whose Stage 8.2 top-N truncation uses another
+//     policy's `top_n` (the rubber-duck design review
+//     pinned this race condition). [Planner.Plan] returns
+//     the snapshot inside [PlanResult.Snapshot] so the
+//     composition root can pass it to
+//     [TaskPlanner.PlanFromSnapshot] for a race-safe Stage 8.2
+//     pass that pins the same `policy_version_id`.
 //  2. Read per-scope metric_sample rows.
 //  3. Read + count per-scope qualifying findings for the
 //     ACTIVE policy_version_id only.
 //  4. Compose ScopeInputs and call [Computer.Compute].
+//
+// Stage 8.2 [TaskPlanner] does NOT invoke this helper -- it
+// READS the hot_spot batch Stage 8.1 already persisted via
+// [HotSpotReader] rather than recomputing.
 //
 // On no-active-policy, returns [ErrNoActivePolicy] (a fresh
 // deploy signal). On an empty (no metric / no finding) input

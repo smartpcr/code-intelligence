@@ -76,25 +76,38 @@
 //     [RefactorPlan] / [RefactorTask] / [TaskKind] +
 //     [CanonicalTaskKinds] / [RejectedTaskKindAliases] /
 //     [ValidateTaskKind] / [DefaultTaskKindForRule] AND the
-//     orchestration boundaries [FindingDetailReader] +
-//     [RefactorPlanTaskWriter] (the latter writes ONE
+//     orchestration boundaries [HotSpotReader] (latest-batch
+//     read for `clean_code.hot_spot`), [FindingDetailReader],
+//     and [RefactorPlanTaskWriter] (the latter writes ONE
 //     [RefactorPlan] row + N [RefactorTask] rows in a single
 //     ATOMIC transaction per the rubber-duck Stage 8.2 design
 //     review finding #1).
 //
-//     The [TaskPlanner.Plan] orchestrator reads the active
-//     [PolicySnapshot], computes the full hot_spot batch
-//     (shared [readAndCompute] helper with [Planner.Plan]),
-//     persists the FULL batch to `hot_spot` (architecture
-//     Sec 5.5.1 append-only), then truncates to
-//     `Snapshot.Weights.TopN` for plan / task emission. For
-//     each top-N hot_spot, the planner reads the qualifying
-//     finding details, dedupes by `(scope_id, rule_id)`,
-//     maps each unique rule_id to a canonical
+//     The [TaskPlanner.Plan] / [TaskPlanner.PlanFromSnapshot]
+//     orchestrator READS the LATEST top-N [HotSpot] batch
+//     written by Stage 8.1 [Planner.Plan] (via
+//     [HotSpotReader.LatestHotSpotsByScore], pinned to the
+//     same `policy_version_id` the Stage 8.1 pass wrote);
+//     it never recomputes hot_spots and never writes
+//     `clean_code.hot_spot`. Stage 8.1 [Planner.Plan]
+//     remains the SOLE writer of the hot_spot table.
+//     For each top-N hot_spot, the planner reads the
+//     qualifying finding details, dedupes by `(scope_id,
+//     rule_id)`, maps each unique rule_id to a canonical
 //     [TaskKind] via [DefaultTaskKindForRule] (with a
 //     configured fallback for unmapped rules), validates
 //     every emitted kind against the canonical enum, and
 //     writes the plan + tasks atomically.
+//
+//     The race-safe two-pass composition root (production
+//     binary `cmd/clean-code-refactor-planner`) calls
+//     [Planner.Plan] then
+//     [TaskPlanner.PlanFromSnapshot](snap = planRes.Snapshot)
+//     so the same `policy_version_id` is pinned across both
+//     passes; a concurrent `policy.activate` between the
+//     two passes cannot produce a torn plan whose hot_spots
+//     were scored by one PV and whose top-N truncation used
+//     another PV's `top_n`.
 //
 //     A hot_spot with NO qualifying findings (metric-only
 //     signal) is STILL listed in

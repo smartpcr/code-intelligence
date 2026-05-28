@@ -89,22 +89,34 @@ on every `hot_spot` row just persisted. Passing the Stage 8.1
   unestimated placeholder; Stage 8.3 backfills.
 - All Stage 8.1 weights (`alpha`, `beta`, `gamma`,
   `delta`, `window_days`) flow through to Stage 8.2
-  unchanged via the shared `readAndCompute` helper.
+  unchanged: the Stage 8.1 `Planner.Plan` pass uses them
+  to score and persist the `hot_spot` batch; the Stage 8.2
+  `TaskPlanner.PlanFromSnapshot` pass inherits the same
+  `PolicySnapshot` and consults `Weights.TopN` only.
 
 ### What the planner writes
 
-For each `TaskPlanner.Plan(ctx, repo_id, sha)` invocation:
+For each `cmd/clean-code-refactor-planner` invocation
+(one-shot K8s Job per `(repo_id, sha)`):
 
-1. ALL scored hot_spots persist via `HotSpotWriter`
+1. The Stage 8.1 `refactor.Planner.Plan` pass writes ALL
+   scored hot_spots via `HotSpotWriter`
    (`clean_code.hot_spot`), in canonical sort order
-   (Score DESC, ScopeID ASC).
-2. ONE `refactor_plan` row persists via
+   (Score DESC, ScopeID ASC). Stage 8.1 is the SOLE writer
+   of `clean_code.hot_spot`.
+2. The Stage 8.2 `refactor.TaskPlanner.PlanFromSnapshot`
+   pass then READS the LATEST top-N rows back from
+   `clean_code.hot_spot` (via the new `HotSpotReader` →
+   `SQLHotSpotReader.LatestHotSpotsByScore`, pinned by
+   `policy_version_id = $snap.PolicyVersionID`) -- it does
+   NOT recompute scores and does NOT write `hot_spot`.
+3. ONE `refactor_plan` row persists via
    `RefactorPlanTaskWriter.WriteRefactorPlanAndTasks`
    (atomic transaction with the tasks below) covering the
    top-N hot_spots in `hotspot_ids JSONB`. Carries NO
    `policy_version_id` column -- recover the policy via
    any referenced hot_spot row.
-3. ZERO OR MORE `refactor_task` rows in the same transaction,
+4. ZERO OR MORE `refactor_task` rows in the same transaction,
    one per unique `(scope_id, rule_id)` qualifying finding
    pair. A hot_spot with NO qualifying findings IS still
    listed in `plan.hotspot_ids` but emits ZERO tasks (the

@@ -278,12 +278,106 @@ func openAndPingDB(dsn, role string) (*sql.DB, error) {
 		role, pingAttempts, pingErr)
 }
 
+// stage1Planner is the narrow surface
+// [executeTwoPassPlan] needs from the Stage 8.1 hot_spot
+// scorer. Pinning this as an interface (rather than the
+// concrete `*refactor.Planner`) lets `main_test.go` inject a
+// fake that records `Plan` invocations and asserts the
+// composition root's two-pass orchestration without spinning
+// up Postgres.
+type stage1Planner interface {
+	Plan(ctx context.Context, repoID uuid.UUID, sha string) (refactor.PlanResult, error)
+}
+
+// stage2Planner is the narrow surface
+// [executeTwoPassPlan] needs from the Stage 8.2 plan / task
+// emitter. The test-only fake uses this to assert that the
+// Stage 8.1 [PlanResult.Snapshot] is forwarded verbatim into
+// Stage 8.2 (the race-safe wiring the architecture Sec 5.5.1
+// reproducibility invariant requires).
+type stage2Planner interface {
+	PlanFromSnapshot(
+		ctx context.Context,
+		repoID uuid.UUID,
+		sha string,
+		snap refactor.PolicySnapshot,
+	) (refactor.PlanAndTasksResult, error)
+}
+
+// executeTwoPassPlan is the TESTABLE body of the composition
+// root's two-pass orchestration. It is independent of the
+// SQL wiring [runPlanner] performs so unit tests can pin the
+// orchestration without sqlmock'ing the underlying readers /
+// writers (which are already covered by
+// `internal/refactor/task_planner_sql_test.go` and
+// `internal/refactor/planner_sql_test.go`).
+//
+// Contract:
+//
+//  1. Calls `p.Plan(ctx, repoID, sha)`. On
+//     [refactor.ErrNoActivePolicy] returns the captured
+//     PlanResult, an empty PlanAndTasksResult, and `nil`
+//     error -- the binary exits 0 because "no active policy"
+//     is a fresh-deploy signal, not a fault.
+//  2. On any other Stage 8.1 error, wraps with
+//     `planner.Plan: %w` and returns; Stage 8.2 is NOT
+//     invoked.
+//  3. Calls `tp.PlanFromSnapshot(ctx, repoID, sha,
+//     planRes.Snapshot)`. The snapshot is FORWARDED VERBATIM
+//     so the two passes pin the same `policy_version_id`
+//     (rubber-duck iter-2 finding #1).
+//  4. On Stage 8.2 error, wraps with
+//     `taskPlanner.PlanFromSnapshot: %w` and returns the
+//     populated PlanResult so the caller can log what the
+//     Stage 8.1 pass actually produced.
+func executeTwoPassPlan(
+	ctx context.Context,
+	logger *slog.Logger,
+	repoID uuid.UUID,
+	sha string,
+	p stage1Planner,
+	tp stage2Planner,
+) (refactor.PlanResult, refactor.PlanAndTasksResult, error) {
+	logger.Info("clean-code-refactor-planner: Stage 8.1 Plan starting",
+		"repo_id", repoID.String(), "sha", sha)
+	planRes, err := p.Plan(ctx, repoID, sha)
+	if err != nil {
+		if errors.Is(err, refactor.ErrNoActivePolicy) {
+			logger.Warn("clean-code-refactor-planner: no active policy -- exiting cleanly",
+				"err", err)
+			return planRes, refactor.PlanAndTasksResult{}, nil
+		}
+		return planRes, refactor.PlanAndTasksResult{},
+			fmt.Errorf("planner.Plan: %w", err)
+	}
+	logger.Info("clean-code-refactor-planner: Stage 8.1 Plan complete",
+		"hot_spots", len(planRes.HotSpots),
+		"policy_version_id", planRes.PolicyVersionID.String())
+
+	logger.Info("clean-code-refactor-planner: Stage 8.2 PlanFromSnapshot starting",
+		"snapshot_pv_id", planRes.Snapshot.PolicyVersionID.String(),
+		"top_n", planRes.Snapshot.Weights.TopN)
+	taskRes, err := tp.PlanFromSnapshot(ctx, repoID, sha, planRes.Snapshot)
+	if err != nil {
+		return planRes, taskRes,
+			fmt.Errorf("taskPlanner.PlanFromSnapshot: %w", err)
+	}
+	logger.Info("clean-code-refactor-planner: Stage 8.2 PlanFromSnapshot complete",
+		"plan_id", taskRes.Plan.PlanID.String(),
+		"tasks_emitted", len(taskRes.Tasks))
+	return planRes, taskRes, nil
+}
+
 // runPlanner composes Stage 8.1 + Stage 8.2 against the supplied
 // db and invokes the two-pass sequence in order. The Stage 8.2
 // pass uses [refactor.TaskPlanner.PlanFromSnapshot] with the
 // Stage 8.1 [PlanResult.Snapshot] so the two passes pin the
 // SAME `policy_version_id` -- the race-safe wiring the
 // architecture Sec 5.5.1 reproducibility invariant requires.
+//
+// The function is a thin SQL-wiring adapter over
+// [executeTwoPassPlan]; the two-pass orchestration itself is
+// pinned by `TestExecuteTwoPassPlan_*` cases.
 func runPlanner(
 	ctx context.Context,
 	db *sql.DB,
@@ -320,22 +414,6 @@ func runPlanner(
 			fmt.Errorf("refactor.NewPlanner: %w", err)
 	}
 
-	logger.Info("clean-code-refactor-planner: Stage 8.1 Plan starting",
-		"repo_id", repoID.String(), "sha", sha)
-	planRes, err := planner.Plan(ctx, repoID, sha)
-	if err != nil {
-		if errors.Is(err, refactor.ErrNoActivePolicy) {
-			logger.Warn("clean-code-refactor-planner: no active policy -- exiting cleanly",
-				"err", err)
-			return planRes, refactor.PlanAndTasksResult{}, nil
-		}
-		return planRes, refactor.PlanAndTasksResult{},
-			fmt.Errorf("planner.Plan: %w", err)
-	}
-	logger.Info("clean-code-refactor-planner: Stage 8.1 Plan complete",
-		"hot_spots", len(planRes.HotSpots),
-		"policy_version_id", planRes.PolicyVersionID.String())
-
 	// Stage 8.2 wiring. Note PlanFromSnapshot pins the SAME
 	// policy_version_id as the hot_spot batch we just wrote.
 	taskPlanner, err := refactor.NewTaskPlanner(
@@ -345,22 +423,11 @@ func runPlanner(
 		refactor.NewSQLRefactorPlanTaskWriter(db),
 	)
 	if err != nil {
-		return planRes, refactor.PlanAndTasksResult{},
+		return refactor.PlanResult{}, refactor.PlanAndTasksResult{},
 			fmt.Errorf("refactor.NewTaskPlanner: %w", err)
 	}
 
-	logger.Info("clean-code-refactor-planner: Stage 8.2 PlanFromSnapshot starting",
-		"snapshot_pv_id", planRes.Snapshot.PolicyVersionID.String(),
-		"top_n", planRes.Snapshot.Weights.TopN)
-	taskRes, err := taskPlanner.PlanFromSnapshot(ctx, repoID, sha, planRes.Snapshot)
-	if err != nil {
-		return planRes, taskRes,
-			fmt.Errorf("taskPlanner.PlanFromSnapshot: %w", err)
-	}
-	logger.Info("clean-code-refactor-planner: Stage 8.2 PlanFromSnapshot complete",
-		"plan_id", taskRes.Plan.PlanID.String(),
-		"tasks_emitted", len(taskRes.Tasks))
-	return planRes, taskRes, nil
+	return executeTwoPassPlan(ctx, logger, repoID, sha, planner, taskPlanner)
 }
 
 // buildMux mounts the always-on operational surface: `/healthz`

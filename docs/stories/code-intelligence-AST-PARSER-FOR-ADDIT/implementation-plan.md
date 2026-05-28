@@ -132,7 +132,7 @@ storyId: "code-intelligence:AST-PARSER-FOR-ADDIT"
 - _none -- start stage_
 
 ### Test Scenarios
-- [ ] Scenario: Build under CGO=on -- Given `CGO_ENABLED=1`, When `go build ./services/agent-memory/internal/repoindexer/ast/...` runs, Then it succeeds (smacker/go-tree-sitter/golang import resolves).
+- [ ] Scenario: Build under CGO=on -- Given `CGO_ENABLED=1`, When `go build ./internal/repoindexer/ast/...` runs from `services/agent-memory`, Then it succeeds (smacker/go-tree-sitter/golang import resolves).
 - [ ] Scenario: Pointer receiver canonical -- Given a Go source string containing `func (r *Foo) Bar(s string) {}`, When `goTreeSitterParser.Parse` runs, Then the returned `MethodDecl` has `QualifiedName == "*Foo.Bar"`, `EnclosingClass == "Foo"`, `ReceiverAliases == []string{"Foo.Bar"}`, and `LangMeta["receiver_ptr"] == true`.
 - [ ] Scenario: Value receiver canonical -- Given `func (r Foo) Bar() {}`, When parsed, Then `MethodDecl.QualifiedName == "Foo.Bar"`, `ReceiverAliases == nil`, and `LangMeta["receiver_ptr"] == false`.
 
@@ -187,7 +187,7 @@ storyId: "code-intelligence:AST-PARSER-FOR-ADDIT"
 - _none -- start stage_
 
 ### Test Scenarios
-- [ ] Scenario: Build under CGO=on -- Given `CGO_ENABLED=1`, When `go build ./services/agent-memory/internal/repoindexer/ast/...` includes `parser_treesitter_c.go`, Then it succeeds.
+- [ ] Scenario: Build under CGO=on -- Given `CGO_ENABLED=1`, When `go build ./internal/repoindexer/ast/...` runs from `services/agent-memory` (so the `parser_treesitter_c.go` file participates), Then it succeeds.
 - [ ] Scenario: C struct + free function -- Given a C source string with `struct Greeter { int n; };` and `int greet(int n) { return n; }`, When `cTreeSitterParser.Parse` runs, Then `ParseResult.Classes` has one entry `{QualifiedName:"Greeter", Kind:"struct"}` and `ParseResult.Methods` has one entry `{QualifiedName:"greet", ParamSignature:"int n"}`.
 - [ ] Scenario: Relative include dropped -- Given `#include "local.h"`, When the dispatcher's Pass 0 runs against the parsed result, Then zero `imports` edges are emitted for that include (the `./local.h` module passes `isRelativeImport`).
 
@@ -207,7 +207,7 @@ storyId: "code-intelligence:AST-PARSER-FOR-ADDIT"
 - _none -- start stage_
 
 ### Test Scenarios
-- [ ] Scenario: Build under CGO=on -- Given `CGO_ENABLED=1`, When `go build ./services/agent-memory/internal/repoindexer/ast/...` includes `parser_treesitter_cpp.go`, Then it succeeds.
+- [ ] Scenario: Build under CGO=on -- Given `CGO_ENABLED=1`, When `go build ./internal/repoindexer/ast/...` runs from `services/agent-memory` (so the `parser_treesitter_cpp.go` file participates), Then it succeeds.
 - [ ] Scenario: Class + base + in-class method -- Given `class Greeter : public Base { void greet() {} };`, When parsed, Then one `ClassDecl{QualifiedName:"Greeter", Extends:["Base"], LangMeta:{"base_access":{"Base":"public"}}}` and one `MethodDecl{QualifiedName:"Greeter.greet", EnclosingClass:"Greeter"}` are emitted.
 - [ ] Scenario: In-class declaration + out-of-line definition dedupe -- Given `class Foo { void bar(); }; void Foo::bar() { log(); }`, When parsed, Then `ParseResult.Methods` contains exactly one `Foo.bar` entry and that entry's `BodySource` is non-empty.
 
@@ -245,7 +245,7 @@ storyId: "code-intelligence:AST-PARSER-FOR-ADDIT"
 ### Implementation Steps
 - [ ] Create `parser_treesitter_cpp_test.go` with `//go:build cgo`; add `TestCppFixture_EmitsExpectedNodeAndEdgeSet`.
 - [ ] Embed a fixture: `class Base { public: void identify() {} }; class Greeter : public Base { public: void greet() { this->identify(); log_global(); } }; void log_global() {}` plus `#include <string>` and `#include "base.h"`.
-- [ ] Assert: 2 class nodes (`Base`, `Greeter`); 3 method nodes (`Base.identify`, `Greeter.greet`, `log_global`); 1 extends edge (`Greeter` -> `Base`); 1 static_calls edge (`Greeter.greet` -> `log_global`) plus 1 static_calls edge (`Greeter.greet` -> `Base.identify` via the ReceiverCalls `this->identify()` resolving through `Greeter.identify`-lookup miss -> falls back via inherited but cross-file-only -> assert NO edge per A4 instead; revise the assertion to only expect `log_global` edge).
+- [ ] Assert: 2 class nodes (`Base`, `Greeter`); 3 method nodes (`Base.identify`, `Greeter.greet`, `log_global`); 1 extends edge (`Greeter` -> `Base`); exactly 1 `static_calls` edge (`Greeter.greet` -> `log_global`). The `this->identify()` call resolves through the Pass 2b receiver-qualified path against `methodNodeID["Greeter.identify"]`; because `identify` is declared only on `Base` (different class in the same file), the lookup misses and the edge is correctly dropped per A4. The verbatim name persists on `attrs_json["calls_raw"]` for the future cross-file resolver.
 - [ ] Add a sub-test for the dedupe rule: fixture `class Foo { void bar(); }; void Foo::bar() { log_global(); }` -> exactly one `Foo.bar` method node whose `static_calls` edge targets `log_global`.
 - [ ] Add a sub-test for `LangMeta["base_access"]={"Base":"public"}` on the `Greeter` class node's `attrs_json`.
 
@@ -278,7 +278,7 @@ storyId: "code-intelligence:AST-PARSER-FOR-ADDIT"
 - _none -- start stage_
 
 ### Test Scenarios
-- [ ] Scenario: Build under CGO=on -- Given `CGO_ENABLED=1`, When `go build ./services/agent-memory/internal/repoindexer/ast/...` includes `parser_treesitter_csharp.go`, Then it succeeds.
+- [ ] Scenario: Build under CGO=on -- Given `CGO_ENABLED=1`, When `go build ./internal/repoindexer/ast/...` runs from `services/agent-memory` (so the `parser_treesitter_csharp.go` file participates), Then it succeeds.
 - [ ] Scenario: Class with same-file interface implements -- Given `interface IFoo {} class Foo : IFoo {}`, When parsed, Then the `Foo` ClassDecl has `Extends=[]`, `Implements=["IFoo"]`, and `LangMeta["base_raw"]=["IFoo"]`.
 - [ ] Scenario: Class with same-file class extends -- Given `class Bar {} class Foo : Bar {}`, When parsed, Then the `Foo` ClassDecl has `Extends=["Bar"]`, `Implements=[]`, and `LangMeta["base_raw"]=["Bar"]`.
 - [ ] Scenario: Mixed same-file partition -- Given `class Bar {} interface IBaz {} class Foo : Bar, IBaz {}`, When parsed, Then `Foo.Extends=["Bar"]` and `Foo.Implements=["IBaz"]`.
@@ -334,7 +334,7 @@ storyId: "code-intelligence:AST-PARSER-FOR-ADDIT"
 - _none -- start stage_
 
 ### Test Scenarios
-- [ ] Scenario: Build under CGO=on -- Given `CGO_ENABLED=1`, When `go build ./services/agent-memory/internal/repoindexer/ast/...` includes `parser_treesitter_rust.go`, Then it succeeds.
+- [ ] Scenario: Build under CGO=on -- Given `CGO_ENABLED=1`, When `go build ./internal/repoindexer/ast/...` runs from `services/agent-memory` (so the `parser_treesitter_rust.go` file participates), Then it succeeds.
 - [ ] Scenario: Trait + impl method emit -- Given `trait Greeter { fn greet(&self) -> String { String::new() } } struct G; impl Greeter for G { fn greet(&self) -> String { String::from("hi") } }`, When parsed, Then `Methods` contains both `Greeter.greet` (`LangMeta["trait_default"]==true`) and `G.greet` (`LangMeta["trait"]=="Greeter"`); `G.Implements==["Greeter"]`.
 - [ ] Scenario: Supertrait extends -- Given `trait A {} trait B: A {}`, When parsed, Then the `B` ClassDecl has `Extends==["A"]`.
 
@@ -390,7 +390,7 @@ storyId: "code-intelligence:AST-PARSER-FOR-ADDIT"
 - _none -- start stage_
 
 ### Test Scenarios
-- [ ] Scenario: Build under both CGO=on and CGO=off -- Given the file has no build tags, When `go build ./services/agent-memory/internal/repoindexer/ast/...` runs under both `CGO_ENABLED=1` and `CGO_ENABLED=0`, Then both succeed.
+- [ ] Scenario: Build under both CGO=on and CGO=off -- Given the file has no build tags, When `go build ./internal/repoindexer/ast/...` runs from `services/agent-memory` under both `CGO_ENABLED=1` and `CGO_ENABLED=0`, Then both succeed.
 - [ ] Scenario: pwsh missing returns sentinel -- Given a `powershellParser{pwshBin:""}`, When `Parse("foo.ps1", []byte("function Foo {}"))` runs, Then it returns `(ParseResult{}, err)` where `errors.Is(err, ErrParserUnavailable)` is true.
 - [ ] Scenario: pwsh timeout returns error not sentinel -- Given a fake `pwshBin` that sleeps longer than the timeout, When `Parse` runs, Then it returns a non-nil error and `errors.Is(err, ErrParserUnavailable)` is false (so `safeParse` logs `ast.parse.error` per Section 6.4).
 
@@ -412,7 +412,7 @@ storyId: "code-intelligence:AST-PARSER-FOR-ADDIT"
 
 ### Implementation Steps
 - [ ] Create `parser_powershell_test.go` (no build tags); the top of each test calls `if _, err := exec.LookPath("pwsh"); err != nil { t.Skip("pwsh not on PATH") }` so PowerShell-less CI stays green.
-- [ ] Add `TestPowerShellFixture_EmitsExpectedNodeAndEdgeSet`: embed a fixture `class Greeter { [string] $Prefix; static [string] Format([string]$prefix, [string]$name) { return "$prefix $name" } [string] Greet([string]$name) { return [Greeter]::Format($this.Prefix, $name) } } function Format-Hello { param([string]$Name) return "hi $Name" } Import-Module Foo` and assert: 1 class node (`Greeter`); 3 method nodes (`Greeter.Format`, `Greeter.Greet`, `Format-Hello`); 1 contains edge per node + file; 1 imports edge to `Foo`; `Greeter.Greet`'s `static_calls` to `Greeter.Format` resolves through the receiver-qualified path.
+- [ ] Add `TestPowerShellFixture_EmitsExpectedNodeAndEdgeSet`: embed a fixture `class Greeter { [string] $Prefix; [string] Format([string]$name) { return "$($this.Prefix) $name" } [string] Greet([string]$name) { return $this.Format($name) } } function Format-Hello { param([string]$Name) return "hi $Name" } Import-Module Foo` and assert: 1 class node (`Greeter`); 3 method nodes (`Greeter.Format`, `Greeter.Greet`, `Format-Hello`); 1 contains edge per node + file; 1 imports edge to `Foo`; `Greeter.Greet`'s `static_calls` to `Greeter.Format` resolves through the `$this.Format(...)` receiver-qualified path covered by the Stage 6.1 `$this.X(...)` extractor (tech-spec Section 5.6). Note: `[Greeter]::Format(...)` static class invocations are explicitly out of v1 scope; the fixture uses an instance receiver call instead.
 - [ ] Add `TestPowerShellParser_NoPwsh_ReturnsSentinel` that constructs `&powershellParser{pwshBin:""}` directly and asserts `errors.Is(err, ErrParserUnavailable)` is true.
 - [ ] Add `TestPowerShellFixture_DotSourceDropped` asserting `. ./helpers.ps1` produces zero `imports` edges (the `./helpers.ps1` module trips `isRelativeImport`) but `LangMeta["module_kind"]=="dot_source"` flows into the parser's emission.
 

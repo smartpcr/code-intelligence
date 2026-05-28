@@ -181,18 +181,32 @@ const (
 // across a single Parse call. The `classByName` map is used by
 // impl_item handling to mutate a previously-emitted ClassDecl's
 // Implements list when the impl carries a trait clause.
+//
+// `pendingImpls` is the impl-before-decl buffer per evaluator
+// iter-3 finding #1. Valid Rust permits `impl Trait for Foo
+// { ... }` to appear BEFORE `struct Foo;` in source order. The
+// walker streams items in document order, so a forward-only
+// `classByName` lookup in `handleImpl` would silently lose the
+// Implements metadata (and the same-file `implements` edge the
+// dispatcher's Pass 2a emits from it). The buffer records the
+// trait name keyed by the target type; `appendClass` drains
+// matching entries the first time the target is declared, then
+// deletes the key so a later same-name declaration in a sibling
+// in-file `mod_item` does NOT inherit the bond.
 type rustWalker struct {
-	src         []byte
-	classes     []ClassDecl
-	methods     []MethodDecl
-	imports     []Import
-	classByName map[string]int // QualifiedName -> classes[] index
+	src          []byte
+	classes      []ClassDecl
+	methods      []MethodDecl
+	imports      []Import
+	classByName  map[string]int      // QualifiedName -> classes[] index
+	pendingImpls map[string][]string // target QN -> trait names awaiting decl
 }
 
 func newRustWalker(src []byte) *rustWalker {
 	return &rustWalker{
-		src:         src,
-		classByName: map[string]int{},
+		src:          src,
+		classByName:  map[string]int{},
+		pendingImpls: map[string][]string{},
 	}
 }
 
@@ -348,9 +362,20 @@ func (w *rustWalker) handleTrait(n *sitter.Node) {
 // impl body. The `type` field carries the target (e.g. the
 // struct being impl'd); the optional `trait` field carries the
 // trait being implemented. For trait impls we additionally
-// append the trait name to the target type's Implements list
-// (when the type was declared earlier in this file -- cross-
-// file impls just record the methods).
+// append the trait name to the target type's Implements list.
+//
+// Two source-order cases:
+//
+//   - target class ALREADY declared earlier in this file:
+//     append the trait to its `Implements` immediately.
+//   - target class NOT yet declared (impl precedes struct OR
+//     target lives in a different file): buffer the trait in
+//     `pendingImpls`. `appendClass` drains the buffer when the
+//     in-file `struct Foo` is later seen; cross-file targets
+//     remain in the buffer at end-of-Parse and are dropped on
+//     the next `Parse` call (the dispatcher persists trait
+//     identity on each method's LangMeta["trait"] regardless,
+//     so a future cross-file resolver can still emit the edge).
 func (w *rustWalker) handleImpl(n *sitter.Node) {
 	targetType := w.extractImplTarget(n)
 	if targetType == "" {
@@ -361,14 +386,15 @@ func (w *rustWalker) handleImpl(n *sitter.Node) {
 		traitName = collectRustHeadIdent(tr, w.src)
 	}
 	if traitName != "" {
-		// Append trait to target type's Implements list when
-		// the target is a class we've already seen in this
-		// file. Cross-file targets are silently skipped; the
-		// dispatcher persists trait identity on each method's
-		// LangMeta["trait"] regardless so a future cross-file
-		// resolver can still emit the edge.
 		if idx, ok := w.classByName[targetType]; ok {
+			// Already-seen path: mutate the existing
+			// ClassDecl's Implements in place.
 			w.classes[idx].Implements = appendUnique(w.classes[idx].Implements, traitName)
+		} else {
+			// impl-before-decl / cross-file path: buffer
+			// the trait for `appendClass` to flush when
+			// (or if) the target declaration arrives.
+			w.pendingImpls[targetType] = appendUnique(w.pendingImpls[targetType], traitName)
 		}
 	}
 
@@ -834,7 +860,22 @@ func isSelfField(n *sitter.Node, src []byte) (string, bool) {
 // appendClass records a new ClassDecl AND remembers its index
 // in classByName so impl_item handling can mutate its
 // Implements list in place.
+//
+// Per evaluator iter-3 finding #1: any traits buffered in
+// `pendingImpls` for this QualifiedName are flushed onto the
+// ClassDecl's `Implements` AFTER any trait-bound entries the
+// caller pre-populated (the caller's order wins on dedup), then
+// the buffer key is DELETED. The deletion matters when an
+// in-file `mod_item` later declares a struct with the same
+// name -- without it, the second declaration would inherit
+// trait bonds that semantically belong to a different type.
 func (w *rustWalker) appendClass(c ClassDecl) {
+	if pending, ok := w.pendingImpls[c.QualifiedName]; ok {
+		for _, trait := range pending {
+			c.Implements = appendUnique(c.Implements, trait)
+		}
+		delete(w.pendingImpls, c.QualifiedName)
+	}
 	idx := len(w.classes)
 	w.classes = append(w.classes, c)
 	w.classByName[c.QualifiedName] = idx

@@ -746,3 +746,146 @@ func rustContainsString(haystack []string, needle string) bool {
 	}
 	return false
 }
+
+// TestTreeSitterRustParser_ImplBeforeStructPopulatesImplements
+// pins evaluator iter-3 finding #1: when `impl Trait for Foo`
+// appears in source BEFORE `struct Foo;`, the walker MUST
+// still populate `Foo.Implements = [Trait]` AND attach
+// `LangMeta["trait"]=Trait` to each impl-block method. The
+// pre-fix code only mutated `Implements` when the target
+// class was already in `classByName`, so impl-first ordering
+// silently lost the metadata and the dispatcher's same-file
+// `implements` edge with it.
+//
+// The fix is the `pendingImpls` buffer drained in
+// `appendClass`; this test exercises BOTH halves of that
+// contract (trait on Implements + LangMeta["trait"] on the
+// impl method).
+func TestTreeSitterRustParser_ImplBeforeStructPopulatesImplements(t *testing.T) {
+	// impl precedes the struct declaration AND precedes the
+	// trait declaration; only the trait being declared later
+	// in the SAME file matters for the dispatcher's Pass 2a
+	// `implements` edge (which Pass-2a looks up via
+	// `classNodeID`). Both flush paths get exercised:
+	// pending struct flush via `pendingImpls["Greeter"]`,
+	// and the trait reference itself which is just a name
+	// the dispatcher resolves later.
+	const src = `
+impl Greeter for G {
+    fn greet(&self, name: &str) -> String {
+        String::new()
+    }
+}
+
+pub struct G;
+
+pub trait Greeter {
+    fn greet(&self, name: &str) -> String;
+}
+`
+	p := NewTreeSitterRustParser()
+	res, err := p.Parse("src/lib.rs", []byte(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	byName := rustClassByName(res.Classes)
+	g, ok := byName["G"]
+	if !ok {
+		t.Fatalf("missing struct G; classes=%v", rustClassNames(res.Classes))
+	}
+	if !rustStringSlicesEqual(g.Implements, []string{"Greeter"}) {
+		t.Errorf("G.Implements = %v; want [Greeter] (impl-before-struct must still populate Implements)",
+			g.Implements)
+	}
+
+	byQN := rustMethodByQN(res.Methods)
+	impl, ok := byQN["G.greet"]
+	if !ok {
+		t.Fatalf("missing impl method G.greet; methods=%v", rustMethodQNs(res.Methods))
+	}
+	if impl.LangMeta == nil || impl.LangMeta["trait"] != "Greeter" {
+		t.Errorf("G.greet.LangMeta[trait] = %v; want Greeter (impl method must carry trait identity for Pass 2d)",
+			impl.LangMeta)
+	}
+}
+
+// TestTreeSitterRustParser_ImplWithoutDeclIsCrossFile pins
+// the cross-file half of evaluator iter-3 finding #1: an
+// `impl Trait for Foo` whose target type `Foo` is NEVER
+// declared in this file MUST NOT mint a spurious ClassDecl
+// for `Foo` (it lives in another file; the cross-file
+// resolver story handles that later). The impl-block methods
+// ARE emitted with `EnclosingClass="Foo"` AND
+// `LangMeta["trait"]=Trait` so the future cross-file resolver
+// can still stitch the relationship.
+func TestTreeSitterRustParser_ImplWithoutDeclIsCrossFile(t *testing.T) {
+	const src = `
+impl ExternalTrait for ExternalType {
+    fn run(&self) {
+        let _ = 1;
+    }
+}
+`
+	p := NewTreeSitterRustParser()
+	res, err := p.Parse("src/impls.rs", []byte(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(res.Classes) != 0 {
+		t.Errorf("cross-file impl must NOT mint a class for ExternalType; got %d classes (%+v)",
+			len(res.Classes), res.Classes)
+	}
+	byQN := rustMethodByQN(res.Methods)
+	run, ok := byQN["ExternalType.run"]
+	if !ok {
+		t.Fatalf("missing impl method ExternalType.run; methods=%v", rustMethodQNs(res.Methods))
+	}
+	if run.EnclosingClass != "ExternalType" {
+		t.Errorf("ExternalType.run.EnclosingClass = %q; want ExternalType",
+			run.EnclosingClass)
+	}
+	if run.LangMeta == nil || run.LangMeta["trait"] != "ExternalTrait" {
+		t.Errorf("ExternalType.run.LangMeta[trait] = %v; want ExternalTrait (cross-file resolver needs this)",
+			run.LangMeta)
+	}
+}
+
+// TestTreeSitterRustParser_ImplBeforeStruct_MultipleTraits
+// exercises the pendingImpls accumulator: two `impl A for Foo`
+// and `impl B for Foo` blocks that both precede `struct Foo;`
+// must produce `Foo.Implements = [A, B]` with no duplicates.
+func TestTreeSitterRustParser_ImplBeforeStruct_MultipleTraits(t *testing.T) {
+	const src = `
+impl A for Foo {
+    fn one(&self) {}
+}
+
+impl B for Foo {
+    fn two(&self) {}
+}
+
+impl A for Foo {
+    fn three(&self) {}
+}
+
+pub struct Foo;
+`
+	p := NewTreeSitterRustParser()
+	res, err := p.Parse("src/multi.rs", []byte(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	byName := rustClassByName(res.Classes)
+	foo, ok := byName["Foo"]
+	if !ok {
+		t.Fatalf("missing struct Foo; classes=%v", rustClassNames(res.Classes))
+	}
+	got := append([]string(nil), foo.Implements...)
+	sort.Strings(got)
+	want := []string{"A", "B"}
+	if !rustStringSlicesEqual(got, want) {
+		t.Errorf("Foo.Implements = %v; want %v (multi-impl pre-decl flush with dedup)",
+			got, want)
+	}
+}

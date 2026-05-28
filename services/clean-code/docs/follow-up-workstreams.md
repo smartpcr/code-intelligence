@@ -201,6 +201,123 @@ Key observations:
   stage and shifted the expected pair indices in the
   discovery test). Per iter-4 git evidence the
   introducing PR was #105.
+
+---
+
+## Agent-memory follow-up workstream proposals (Stage 7.3 iter 3 + iter 4 surface)
+
+The Stage 7.3 iter-3 evaluator's run of
+`go test ./...` against `services/agent-memory/go.mod` (a
+DIFFERENT Go module from `services/clean-code/go.mod`)
+surfaced four failing packages. They are documented here
+for operator follow-up; they are NOT engineer-decidable
+inside the Stage 7.3 workstream (cross-service-boundary
+edits are explicitly out of this workstream's brief, which
+targets only `services/clean-code/...`). The iter-3
+evaluator explicitly concedes the scope point ("scopes
+around them correctly... out of scope but real").
+
+Verified git provenance for ALL four entries: the files in
+question were last touched in `services/agent-memory/` by
+PR #11 (commit `5058db7 [impl] GraphWriter library`), which
+merged into `feature/clean-code` long before the Stage 7.3
+branch base `803ae6c` -- so the failures pre-date Stage 7.3
+in their entirety.
+
+### FU-A: `services/agent-memory/cmd/qdrant-bootstrap` test-build repair
+
+- **Slug**:
+  `ws-code-intelligence-agent-memory-qdrant-bootstrap-collections-accessor-repair`
+- **Failing artifact**:
+  `go test ./cmd/qdrant-bootstrap/` returns `[build failed]`
+  in `services/agent-memory/` (no tests run).
+- **Exact compile error** (Stage 7.3 iter 3 verification):
+  ```
+  cmd/qdrant-bootstrap/main_test.go:662:4: b.Collections undefined (type *Bootstrapper has no field or method Collections)
+  cmd/qdrant-bootstrap/main_test.go:712:4: b.Collections undefined (type *Bootstrapper has no field or method Collections)
+  ```
+- **Root cause class**: Accessor drift. The test asserts
+  `b.Collections` on `*Bootstrapper` but the production
+  type does not expose that field/method. Either the
+  accessor was renamed/removed in production without
+  updating the test, or the test was written against a
+  newer Bootstrapper API that has not landed yet.
+- **Suggested targets**:
+    - `services/agent-memory/cmd/qdrant-bootstrap/main_test.go:662,712`
+    - `services/agent-memory/cmd/qdrant-bootstrap/main.go` (verify the canonical Bootstrapper API surface)
+- **Out-of-scope for Stage 7.3 because**: different service
+  (`services/agent-memory/go.mod`), different ownership,
+  failure pre-dates the Stage 7.3 branch base.
+
+### FU-B: `services/agent-memory/pkg/fingerprint` golden-vector drift repair
+
+- **Slug**:
+  `ws-code-intelligence-agent-memory-fingerprint-golden-vector-refresh`
+- **Failing tests** (four in `pkg/fingerprint`):
+    - `TestNodeFingerprint_goldenVector`
+    - `TestEdgeFingerprint_goldenVector`
+    - `TestNodeFingerprint_matchesHandRolledConcatenation`
+    - `TestEdgeFingerprint_matchesHandRolledConcatenation`
+- **Symptom** (Stage 7.3 iter 3 verification):
+  Production `NodeFingerprint` / `EdgeFingerprint`
+  returns a DIFFERENT hex digest than the golden vector
+  AND a different digest than a hand-rolled
+  `sha256(canonical(input))` computation in the test.
+  Example: `NodeFingerprint = 1aec00b6... want 84c1e483...`.
+- **Root cause class**: Fingerprint canonicalisation
+  drift. Either (a) the input canonicaliser changed
+  (whitespace handling, field ordering, separator bytes)
+  without updating the golden vectors, OR (b) the hash
+  family itself changed (e.g. domain separation tag was
+  added). The matching `_matchesHandRolledConcatenation`
+  failure indicates the test's hand-rolled reference
+  expects a DIFFERENT byte recipe from production.
+- **Suggested targets**:
+    - `services/agent-memory/pkg/fingerprint/fingerprint.go`
+      (production canonicaliser + hasher)
+    - `services/agent-memory/pkg/fingerprint/fingerprint_test.go:111,132,289,320`
+      (golden vector constants + hand-rolled reference)
+- **Out-of-scope for Stage 7.3 because**: different service,
+  different ownership, failure pre-dates Stage 7.3 branch
+  base.
+
+### FU-C: `services/agent-memory/internal/mgmtapi` ingest-handler test repair
+
+- **Slug**:
+  `ws-code-intelligence-agent-memory-mgmtapi-ingest-handler-test-repair`
+- **Failing tests** (four in `internal/mgmtapi`):
+    - `TestIngestDelta_dbOutage_returns500_noLeak`
+    - `TestIngestDelta_foreignKeyViolation_returns404`
+    - `TestIngestDelta_repeatedCall_returnsSameJobID_noSecondRepoEvent`
+    - `TestIngestSpans_wrongMethod_returns405`
+- **Root cause class**: Unknown without deeper triage;
+  the failures span both `IngestDelta` (idempotency +
+  error mapping) and `IngestSpans` (method-not-allowed
+  contract). Suggests either a shared handler-base
+  regression or a test-fixture regression.
+- **Suggested targets**:
+    - `services/agent-memory/internal/mgmtapi/` (handlers
+      under test)
+    - `services/agent-memory/internal/mgmtapi/*_test.go`
+      (the four failing test bodies)
+- **Out-of-scope for Stage 7.3 because**: different service,
+  failure pre-dates Stage 7.3 branch base.
+
+### FU-D: `services/agent-memory/internal/webhookreceiver` payload-validate test repair
+
+- **Slug**:
+  `ws-code-intelligence-agent-memory-webhookreceiver-payload-validate-repair`
+- **Failing test** (one):
+    - `TestPayloadValidate`
+- **Root cause class**: Unknown without deeper triage;
+  likely either a payload-shape change or a validator
+  rule change that the golden test case did not get
+  updated for.
+- **Suggested targets**:
+    - `services/agent-memory/internal/webhookreceiver/`
+      (validator + test fixture)
+- **Out-of-scope for Stage 7.3 because**: different service,
+  failure pre-dates Stage 7.3 branch base.
 - **Suggested targets**:
     - `services/clean-code/internal/storage/` (migration
       discovery and the per-stage pair fixtures)

@@ -1022,6 +1022,30 @@ func TestComputer_Compute_PropagatesIDFactoryError(t *testing.T) {
 	}
 }
 
+// TestComputer_Compute_RejectsNilUUIDFromIDFactory confirms
+// the regression case for evaluator iter-1 finding #4: a
+// factory that returns `(uuid.Nil, nil)` MUST surface
+// [ErrIDFactoryReturnedNil] rather than emit a hot_spot row
+// with a zero PRIMARY KEY. (A zero uuid would either fail
+// the SQL CHECK or succeed once and collide on the next
+// batch -- a particularly nasty silent-data-corruption
+// failure mode.)
+func TestComputer_Compute_RejectsNilUUIDFromIDFactory(t *testing.T) {
+	c := NewComputer(WithIDFactory(func() (uuid.UUID, error) {
+		// Note: error is nil, only the uuid is zero.
+		return uuid.Nil, nil
+	}))
+	_, err := c.Compute(
+		PolicySnapshot{PolicyVersionID: mustUUID(t), Weights: weightsUnit()},
+		mustUUID(t),
+		"sha",
+		[]ScopeInputs{{ScopeID: mustUUID(t)}},
+	)
+	if !errors.Is(err, ErrIDFactoryReturnedNil) {
+		t.Fatalf("err = %v, want ErrIDFactoryReturnedNil", err)
+	}
+}
+
 // -----------------------------------------------------------------------------
 // Real-world-shape integration: PolicyVersion -> PolicySnapshot
 // -----------------------------------------------------------------------------

@@ -15,26 +15,34 @@
 // # Wen Zhong principle (architecture Sec 3.9 lines 622-624)
 //
 // The Refactor Planner NEVER mutates source code. Every output
-// is a row, never a patch. The package therefore exposes pure
-// compute helpers ([Score], [RobustZ]) plus a [Computer] that
-// returns in-memory [Computation] values; persisting those into
-// the `clean_code.hot_spot` table is a later stage's
-// responsibility.
+// is a row, never a patch. The package exposes pure compute
+// helpers ([Score], [RobustZ]), a [Computer] that returns
+// in-memory [Computation] values, AND a [Planner] that
+// orchestrates the canonical read → compute → write cycle
+// against the steward (for the active policy) and the
+// measurement / audit sub-stores (for metric_sample / finding
+// rows).
 //
 // # Stage scope split
 //
 // Per `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`
 // Phase 8, this package is built up across three stages:
 //
-//   - **Stage 8.1 (this file set)** -- composite hotspot scoring.
-//     Ships [Computer] / [Computation] / [HotSpot] / [Score] /
-//     [RobustZ] plus the canonical input metric_kind constants.
-//     The Computer takes per-scope [ScopeInputs] + a
-//     [PolicySnapshot] and returns ranked [Computation] values
-//     ready for persistence by a follow-up stage. Persistence
-//     itself is NOT in this stage's scope (the SQL writer
-//     ships in Stage 8.2 alongside `refactor_plan` /
-//     `refactor_task` row emission).
+//   - **Stage 8.1 (this file set)** -- composite hotspot scoring
+//     END-TO-END. Ships (a) [Computer] / [Computation] /
+//     [HotSpot] / [Score] / [RobustZ] plus the canonical input
+//     metric_kind constants, AND (b) [Planner] with the
+//     orchestrator boundaries ([PolicyReader],
+//     [MetricSampleReader], [FindingReader], [HotSpotWriter])
+//     and concrete implementations: [StewardPolicyReader] for
+//     the active-policy READ, [SQLMetricSampleReader] /
+//     [SQLFindingReader] for metric+finding ingestion against
+//     `clean_code.metric_sample` / `clean_code.finding`, and
+//     [SQLHotSpotWriter] for the canonical
+//     `hot_spot(hotspot_id, repo_id, sha, scope_id, score,
+//     policy_version_id, created_at)` row emission. In-memory
+//     variants of all three boundaries are also exposed for
+//     test / scaffold-mode wiring.
 //
 //   - **Stage 8.2** -- refactor-plan / refactor-task generation.
 //     A `planner.go` file consumes [Computation] outputs, reads

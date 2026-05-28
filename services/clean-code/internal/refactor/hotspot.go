@@ -731,6 +731,17 @@ func (c *Computer) Compute(
 			return nil, fmt.Errorf(
 				"refactor.Compute: input[%d]: mint hotspot_id: %w", i, err)
 		}
+		// A factory that returns (uuid.Nil, nil) would produce
+		// a hot_spot row with a zero PRIMARY KEY -- the
+		// hot_spot SQL writer would either fail the
+		// PK-uniqueness CHECK or, worse, succeed once and
+		// then collide on the next batch. Reject up front
+		// rather than emit a poisoned row.
+		if id == uuid.Nil {
+			return nil, fmt.Errorf(
+				"refactor.Compute: input[%d] (scope_id=%s): %w",
+				i, inputs[i].ScopeID, ErrIDFactoryReturnedNil)
+		}
 
 		out[i] = Computation{
 			HotSpot: HotSpot{
@@ -905,4 +916,14 @@ var (
 	// ErrNilClock is the same shape but for [WithClock].
 	ErrNilClock = errors.New(
 		"refactor: WithClock function is nil")
+
+	// ErrIDFactoryReturnedNil is returned by [Computer.Compute]
+	// when the configured ID factory returns `(uuid.Nil, nil)`.
+	// The hot_spot row's `hotspot_id` is the table's PRIMARY
+	// KEY; a zero uuid is either rejected by the SQL CHECK or
+	// (worse) succeeds the first INSERT and collides on the
+	// second. The planner refuses to emit a row whose primary
+	// key is zero rather than rely on the database to catch it.
+	ErrIDFactoryReturnedNil = errors.New(
+		"refactor: ID factory returned uuid.Nil")
 )

@@ -133,6 +133,34 @@ const (
 	EnvGateDegradedPolicy           = "CLEAN_CODE_GATE_DEGRADED_POLICY"
 	EnvPolicySigningRequired        = "CLEAN_CODE_POLICY_SIGNING_REQUIRED"
 	EnvRefactorEffortSource         = "CLEAN_CODE_REFACTOR_EFFORT_SOURCE"
+	// EnvRefactorEffortModelURI is the operator-facing env
+	// var pointing at the Stage 8.3 ML effort-model artefact
+	// on disk. Accepted forms (parsed by
+	// `refactor.LoadFromConfig` -> `resolveModelPath`):
+	//
+	//   - A bare local path: `/abs/path/model.json` (POSIX),
+	//     `C:\path\model.json` (Windows).
+	//   - A `file://` URI: `file:///abs/path` (POSIX),
+	//     `file:///C:/path` (Windows).
+	//
+	// Other schemes (`http://`, `s3://`, ...) are REJECTED in
+	// v0; the operator may rotate to a remote-fetch scheme
+	// only after a future Stage opens the closed set.
+	//
+	// Empty is permitted ONLY when [EnvRefactorEffortSource]
+	// is `"none"` (the explicit opt-out). When the source
+	// pin requires a model AND this var is empty, the
+	// `clean-code-refactor-planner` binary REFUSES to start
+	// (architecture Sec 1.6 + workstream brief
+	// `missing-model-blocks-startup` scenario).
+	//
+	// The interlock is enforced INSIDE the planner binary
+	// (`cmd/clean-code-refactor-planner/main.go` ->
+	// `refactor.LoadFromConfig`) rather than in
+	// `Config.Validate` so other binaries (eval-gate,
+	// aggregator, ...) that share the `config` package are
+	// not forced to set the var.
+	EnvRefactorEffortModelURI       = "CLEAN_CODE_REFACTOR_EFFORT_MODEL_URI"
 	EnvHTTPAddr                     = "CLEAN_CODE_HTTP_ADDR"
 	EnvPrometheusAddr               = "CLEAN_CODE_PROMETHEUS_ADDR"
 	EnvOTelEndpoint                 = "CLEAN_CODE_OTEL_ENDPOINT"
@@ -375,6 +403,19 @@ type Config struct {
 	// RefactorEffortSource carries the `refactor-effort-source`
 	// pin. Default: `ML model from historical commits`.
 	RefactorEffortSource string
+
+	// RefactorEffortModelURI carries the [EnvRefactorEffortModelURI]
+	// pin -- the on-disk URI of the Stage 8.3 ML effort-model
+	// artefact. Consumed by the refactor-planner binary's
+	// composition root via `refactor.LoadFromConfig`. Empty
+	// in scaffold deploys (and in all binaries other than
+	// the refactor-planner); the planner binary refuses to
+	// start when the var is empty AND
+	// [RefactorEffortSource] requires a model. The interlock
+	// is enforced INSIDE the planner binary, NOT inside
+	// [Config.Validate], so other binaries can leave the
+	// var unset.
+	RefactorEffortModelURI string
 
 	// --- Network bind addresses ---
 
@@ -726,6 +767,7 @@ func readEnvOverrides() map[string]string {
 		EnvGateDegradedPolicy,
 		EnvPolicySigningRequired,
 		EnvRefactorEffortSource,
+		EnvRefactorEffortModelURI,
 		EnvHTTPAddr,
 		EnvPrometheusAddr,
 		EnvOTelEndpoint,
@@ -776,6 +818,8 @@ func applyOverrides(cfg *Config, overrides map[string]string) error {
 			cfg.PolicySigningRequired = v
 		case EnvRefactorEffortSource:
 			cfg.RefactorEffortSource = v
+		case EnvRefactorEffortModelURI:
+			cfg.RefactorEffortModelURI = v
 		case EnvHTTPAddr:
 			cfg.HTTPAddr = v
 		case EnvPrometheusAddr:

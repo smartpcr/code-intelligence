@@ -4,6 +4,169 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 8.3 -- ML effort-model loader and version pinning
+
+New `internal/refactor/effort_model.go` package surface plus
+composition wiring through `cmd/clean-code-refactor-planner/main.go`
+that loads an external ML effort-model artefact named by the
+operator pin `refactor-effort-source` (architecture Sec 1.6,
+default `"ML model from historical commits"`) and stamps a
+deterministic per-task hour estimate onto every emitted
+`refactor_task.effort_hours` -- replacing the Stage 8.2 `0.0`
+placeholder.
+
+### Architecture invariants pinned by this stage
+
+- **Version pinning is transitive through `hot_spot`**, NOT
+  duplicated on `refactor_plan` or `refactor_task`. Per
+  architecture Sec 5.5.1 lines 1216-1226 each `hot_spot` row
+  carries `policy_version_id`; per Sec 5.5.2 lines 1228-1237
+  `refactor_plan` itself has NO `policy_version_id` column;
+  per Sec 5.5.3 `refactor_task` carries no
+  `effort_model_version` either. The chain that reproduces an
+  effort estimate is therefore:
+
+      refactor_task
+        -> refactor_plan        (via refactor_task.plan_id)
+        -> refactor_plan.hotspot_ids[0]
+        -> hot_spot.policy_version_id
+        -> policy_version.refactor_weights.effort_model_version
+
+  A new conformance test
+  (`TestEffortModelVersionPinnedViaHotspot_TraversalReproducesVersion`)
+  walks this full path against an in-memory store and asserts
+  the recovered version equals the loaded artefact's
+  `EffortModel.Version`. A second test
+  (`TestRefactorTaskHasNoEffortModelVersionField`) uses
+  reflection to fail-fast if a future iter silently
+  re-introduces an `effort_model_version` field on
+  `RefactorPlan` or `RefactorTask`.
+
+- **Estimator errors abort the whole batch.** A version
+  mismatch, missing kind base, or non-finite intermediate
+  inside `EffortModel.Estimate` aborts the entire
+  `TaskPlanner.Plan` call (no plan row, no task row lands)
+  rather than silently emitting `effort_hours=0`. Verified by
+  `TestTaskPlanner_WithEffortEstimator_VersionMismatchAbortsBatch`.
+
+### New / changed types
+
+- `internal/refactor/effort_model.go` (NEW):
+  - `EffortEstimator` interface (one method,
+    `Estimate(task, hs, snap) (float64, error)`) keeps the
+    `TaskPlanner` decoupled from the concrete model.
+  - `EffortModel` struct -- JSON-on-disk artefact: `version`
+    (the load-bearing pin), `kind_base_hours` (every
+    canonical `TaskKind` MUST have an entry), `score_coef`
+    (linear coefficient on `hs.Score`), `intercept` (additive
+    constant). Formula:
+    `hours = max(0, kind_base_hours[task.Kind]
+                  + score_coef * hs.Score
+                  + intercept)`.
+  - `ZeroEffortEstimator` value-receiver type -- the Stage
+    8.2 byte-identical fallback (`effort_hours = 0.0`)
+    available for non-production composition roots that need
+    the estimator interface satisfied.
+  - `LoadFromConfig(cfg config.Config) (*EffortModel, error)`
+    -- the canonical composition entrypoint. When
+    `cfg.RefactorEffortSource == RefactorEffortSourceNone`
+    returns `(nil, nil)`; when source is the default ML pin
+    AND `cfg.RefactorEffortModelURI == ""` returns the
+    `ErrEffortModelURIRequired` sentinel (the
+    `missing-model-blocks-startup` scenario); otherwise
+    resolves the URI to a local path and decodes the JSON
+    artefact via `LoadModelFromFile`.
+  - `LoadModelFromFile(path string) (*EffortModel, error)` --
+    strict-schema decoder (`json.Decoder.DisallowUnknownFields`)
+    + `validateLoadedModel` (non-empty version, every
+    canonical `TaskKind` populated, every coefficient finite,
+    every base-hour non-negative).
+  - `resolveModelPath(raw string) (string, error)` --
+    Windows-safe URI parser. Accepts: bare local paths
+    (`/abs/path/foo.json`, `C:\foo\bar.json`, `C:/foo/bar.json`,
+    `./rel/path.json`); `file://` URIs (`file:///abs/path`
+    on POSIX, `file:///C:/path` on Windows). Rejects any
+    other scheme (`http://`, `https://`, `s3://`, `ftp://`)
+    with the `ErrEffortModelUnsupportedScheme` sentinel.
+  - Sentinels: `ErrEffortModelURIRequired`,
+    `ErrEffortModelSourceUnknown`,
+    `ErrEffortModelUnsupportedScheme`,
+    `ErrEffortModelMalformed`,
+    `ErrEffortModelVersionEmpty`,
+    `ErrEffortModelVersionMismatch`,
+    `ErrEffortModelMissingKindBase`,
+    `ErrEffortModelNonFiniteCoefficient`.
+
+- `internal/refactor/task_planner.go` (MODIFIED):
+  - `WithEffortEstimator(EffortEstimator) TaskOption` -- new
+    functional option for `NewTaskPlanner`. Without it, the
+    planner preserves the Stage 8.2 `effort_hours = 0.0`
+    placeholder (covered by
+    `TestTaskPlanner_NoEstimator_PreservesStage82Placeholder`).
+    With it, every emitted task carries the estimator's
+    return value; any estimator error aborts the batch.
+  - New `ErrNilEffortEstimator` sentinel mirrors the existing
+    nil-guard pattern (`WithRuleKindMapper`, `WithSummaryFunc`).
+  - SQL writer (`InsertPlanWithTasksTx`, lines 1682-1719)
+    unchanged -- canonical column lists for `refactor_plan`
+    and `refactor_task` continue to omit
+    `policy_version_id` and `effort_model_version`
+    respectively.
+
+- `internal/config/config.go` (MODIFIED):
+  - New `EnvRefactorEffortModelURI = "CLEAN_CODE_REFACTOR_EFFORT_MODEL_URI"`
+    constant and matching `RefactorEffortModelURI string`
+    field on `Config`. The env override is honoured by
+    `readEnvOverrides` and `applyOverrides`.
+  - **No change to `Config.Validate()`.** The
+    `missing-model-blocks-startup` interlock lives ONLY in
+    `refactor.LoadFromConfig` (called from the
+    `clean-code-refactor-planner` binary's `run()`); putting
+    it in `Config.Validate()` would break the Stage 1.x
+    `TestLoad_NoEnvReturnsDefaults` test (which calls
+    `Load()` with all envs empty and expects success), and
+    it would couple every clean-code binary (gateway,
+    aggregator, indexer, ...) to a model URI they don't
+    consume.
+
+- `cmd/clean-code-refactor-planner/main.go` (MODIFIED):
+  - `run()` calls `refactor.LoadFromConfig(cfg)` immediately
+    after `config.Load()`; a non-nil error exits with status
+    1 and a clear message naming both env vars. When the
+    loader returns `(nil, nil)` (source = `"none"`), the
+    planner is wired WITHOUT an estimator and a structured
+    `warn` log line is emitted.
+  - `runPlanner` signature gained a `effortModel *refactor.EffortModel`
+    parameter; when non-nil it is wired via
+    `refactor.WithEffortEstimator(effortModel)`.
+
+### Tests added
+
+- `internal/refactor/effort_model_test.go` (NEW). 16 tests
+  covering: missing-URI interlock; `none` source opt-out;
+  unknown source rejected; happy-path load; malformed JSON;
+  unknown JSON field; empty version; missing canonical kind;
+  non-finite coefficient (NaN/Inf in any of: base hours,
+  score_coef, intercept); negative base rejected; bare-path
+  resolution (POSIX + Windows); `file://` POSIX; `file:///C:/...`
+  Windows; unsupported scheme; deterministic estimate;
+  version-mismatch refused; negative clamped to zero;
+  unknown kind rejected; non-finite score rejected;
+  `WithEffortEstimator` stamps hours; estimator error aborts
+  batch; no estimator preserves placeholder; nil estimator
+  rejected; full traversal pinning chain; schema invariant
+  (no `effort_model_version` field on plan/task).
+
+### Files touched
+
+- NEW: `services/clean-code/internal/refactor/effort_model.go`
+- NEW: `services/clean-code/internal/refactor/effort_model_test.go`
+- MODIFIED: `services/clean-code/internal/refactor/task_planner.go`
+- MODIFIED: `services/clean-code/internal/config/config.go`
+- MODIFIED: `services/clean-code/cmd/clean-code-refactor-planner/main.go`
+- MODIFIED: `services/clean-code/docs/runbook.md`
+- MODIFIED: `services/clean-code/docs/rollout.md`
+
 ## Stage 9.2 -- Audit WAL Reconciler (replay-only)
 
 New `internal/audit/reconciler/` package + composition

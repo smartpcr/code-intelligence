@@ -32,21 +32,32 @@ import (
 //   - #include "local.h"                              // relative include -> dropped at dispatcher (no imports edge)
 //
 // Expected graph (Stage 3.4 acceptance):
-//   - 1 class node `Greeter` (Kind="struct")
+//   - 1 class node `Greeter` whose `attrs_json.decl_kind == "struct"`
 //   - 2 method nodes (`greet`, `format_greeting`)
-//   - 3 contains edges (file -> Greeter, file -> greet,
-//     file -> format_greeting); C has no nested
-//     class->method containment because EnclosingClass is
-//     always empty for v1.
-//   - 1 static_calls edge (greet -> format_greeting)
-//   - 1 imports edge (file -> stdio.h package node)
-//   - 0 imports edges for `./local.h` (relative-include drop
-//     happens at the dispatcher per architecture Section 4.3)
+//   - 1 external package node `stdio.h` with `attrs_json.source == "external"`
+//   - 3 contains edges, each `src=file-node-id` and `dst` in
+//     {Greeter, greet, format_greeting} (no dupes, no
+//     extras); C has no nested class->method containment
+//     because EnclosingClass is always empty for v1.
+//   - 1 static_calls edge with `src=greet` AND
+//     `dst=format_greeting` (direction-checked, not just
+//     count-checked).
+//   - 1 imports edge with `src=file-node-id` AND
+//     `dst=stdio.h-package-node` (endpoint identity, not
+//     just count).
+//   - 0 nodes / 0 edges referencing `local.h` -- the
+//     relative-include drop happens at the dispatcher per
+//     architecture Section 4.3.
 //
-// This mirrors the same shape as
-// `TestPythonFixture_EmitsExpectedNodeAndEdgeSet` (the v1
-// reference) and is the C analogue of Stage 3.5's C++
-// fixture test (`TestCppFixture_EmitsExpectedNodeAndEdgeSet`).
+// Endpoint-identity assertions (not just count assertions)
+// were added in response to iter-2 evaluator feedback: count
+// checks alone admit regressions like a `format_greeting ->
+// greet` swap, a `Greeter -> Greeter` self-contains, or an
+// imports edge pointing at the file node itself. The lookups
+// below resolve each declared symbol to its synthetic
+// `node-N` ID via the `fakeNodeEdgeWriter.idBySig` map and
+// then verify every edge's `(SrcNodeID, DstNodeID)` tuple
+// exactly.
 func TestCFixture_EmitsExpectedNodeAndEdgeSet(t *testing.T) {
 	const src = `#include <stdio.h>
 #include "local.h"
@@ -69,72 +80,179 @@ int greet(int n) {
 		t.Fatalf("EmitFile: %v", err)
 	}
 
-	classes := fw.nodesOf("class")
-	classNames := signatureSimpleNames(classes)
-	if !classNames["Greeter"] {
-		t.Errorf("class Greeter missing from emitted set: got %v", classNames)
-	}
-	if len(classes) != 1 {
-		t.Errorf("expected 1 class node (Greeter); got %d (%v)",
-			len(classes), classNames)
+	// lookupNodeID resolves the synthetic NodeID assigned by
+	// newFakeWriter for the unique (kind, simple-name) pair.
+	// Fails the test if the node is missing or ambiguous --
+	// either condition means the parser or the dispatcher
+	// drifted from the Stage 3.4 contract.
+	lookupNodeID := func(kind, simpleName string) string {
+		t.Helper()
+		var hits []string
+		for _, n := range fw.nodesOf(kind) {
+			if lastSegmentAfterHash(n.CanonicalSignature) == simpleName {
+				hits = append(hits, fw.idBySig[n.CanonicalSignature])
+			}
+		}
+		switch len(hits) {
+		case 0:
+			t.Fatalf("no %q node with simple name %q (have=%+v)",
+				kind, simpleName, fw.nodesOf(kind))
+		case 1:
+			return hits[0]
+		default:
+			t.Fatalf("ambiguous %q nodes with simple name %q: %v",
+				kind, simpleName, hits)
+		}
+		return ""
 	}
 
+	// === Class node: Greeter must carry decl_kind="struct" ===
+	classes := fw.nodesOf("class")
+	if len(classes) != 1 {
+		t.Fatalf("expected exactly 1 class node (Greeter); got %d (%+v)",
+			len(classes), classes)
+	}
+	greeterNode := classes[0]
+	if got := lastSegmentAfterHash(greeterNode.CanonicalSignature); got != "Greeter" {
+		t.Errorf("class node simple-name = %q; want Greeter (sig=%q)",
+			got, greeterNode.CanonicalSignature)
+	}
+	// decl_kind is the v1 class-shape discriminant from
+	// tech-spec §5.2.1. The C parser MUST stamp "struct" on
+	// `struct Greeter { ... }` (vs. "union" / "enum" / the
+	// language-specific "class" the TS/Python parsers use).
+	if got := attrString(t, greeterNode.AttrsJSON, "decl_kind"); got != "struct" {
+		t.Errorf("Greeter attrs_json.decl_kind = %q; want \"struct\" (attrs=%s)",
+			got, string(greeterNode.AttrsJSON))
+	}
+
+	// === Method nodes: greet + format_greeting ===
 	methods := fw.nodesOf("method")
+	if len(methods) != 2 {
+		t.Fatalf("expected exactly 2 method nodes (greet, format_greeting); got %d (%+v)",
+			len(methods), methods)
+	}
 	methodNames := signatureSimpleNames(methods)
 	for _, want := range []string{"greet", "format_greeting"} {
 		if !methodNames[want] {
 			t.Errorf("method %q missing: got %v", want, methodNames)
 		}
 	}
-	if len(methods) != 2 {
-		t.Errorf("expected 2 method nodes (greet, format_greeting); got %d (%v)",
-			len(methods), methodNames)
-	}
 
-	// contains edges: 1 file->class (Greeter) + 2 file->method
-	// (greet, format_greeting) = 3 contains. C has no
+	// Resolve synthetic NodeIDs once, then re-use for all
+	// endpoint identity checks. The "file-node-id" literal
+	// is the FileNodeID baked into makeEvent in
+	// dispatcher_test.go.
+	const fileNodeID = "file-node-id"
+	greeterID := lookupNodeID("class", "Greeter")
+	greetID := lookupNodeID("method", "greet")
+	formatGreetingID := lookupNodeID("method", "format_greeting")
+
+	// === contains edges: each src=file, each dst is one of
+	// the three expected children, no duplicates. C has no
 	// class->method containment in v1 because every method's
-	// EnclosingClass is "".
+	// EnclosingClass is "". ===
 	contains := fw.edgesOf("contains")
 	if len(contains) != 3 {
-		t.Errorf("expected 3 contains edges (file->Greeter, file->greet, file->format_greeting); got %d",
-			len(contains))
+		t.Fatalf("expected 3 contains edges (file->Greeter, file->greet, file->format_greeting); got %d (%+v)",
+			len(contains), contains)
+	}
+	expectedContains := map[string]string{
+		greeterID:        "Greeter",
+		greetID:          "greet",
+		formatGreetingID: "format_greeting",
+	}
+	seenContains := map[string]bool{}
+	for i, e := range contains {
+		if e.SrcNodeID != fileNodeID {
+			t.Errorf("contains[%d].src = %q; want %q (dst=%q)",
+				i, e.SrcNodeID, fileNodeID, e.DstNodeID)
+		}
+		name, ok := expectedContains[e.DstNodeID]
+		if !ok {
+			t.Errorf("contains[%d].dst = %q is not one of {Greeter=%s, greet=%s, format_greeting=%s}",
+				i, e.DstNodeID, greeterID, greetID, formatGreetingID)
+			continue
+		}
+		if seenContains[name] {
+			t.Errorf("contains edge for %q duplicated", name)
+		}
+		seenContains[name] = true
+	}
+	for _, name := range []string{"Greeter", "greet", "format_greeting"} {
+		if !seenContains[name] {
+			t.Errorf("contains edge for %q missing from emitted set", name)
+		}
 	}
 
-	// static_calls: greet -> format_greeting. The same-file
-	// multimap resolver matches because format_greeting is
-	// declared in the same file with EnclosingClass="" (free
-	// function) and the lookup key is the bare callee name.
+	// === static_calls: greet -> format_greeting (direction
+	// matters; a same-file multimap that resolves the wrong
+	// way would still pass a count-only check). ===
 	staticCalls := fw.edgesOf("static_calls")
 	if len(staticCalls) != 1 {
-		t.Errorf("expected 1 static_calls edge (greet -> format_greeting); got %d",
-			len(staticCalls))
+		t.Fatalf("expected exactly 1 static_calls edge (greet -> format_greeting); got %d (%+v)",
+			len(staticCalls), staticCalls)
+	}
+	if staticCalls[0].SrcNodeID != greetID {
+		t.Errorf("static_calls.src = %q; want greet (%q)",
+			staticCalls[0].SrcNodeID, greetID)
+	}
+	if staticCalls[0].DstNodeID != formatGreetingID {
+		t.Errorf("static_calls.dst = %q; want format_greeting (%q)",
+			staticCalls[0].DstNodeID, formatGreetingID)
 	}
 
-	// imports: stdio.h materialises an external package node
-	// + a file->package imports edge. The `./local.h`
-	// relative include is dropped at the dispatcher
-	// (`isRelativeImport`) so it produces ZERO imports
-	// edges. This is the C analogue of the TypeScript
-	// `./util` relative-import drop covered by
-	// `TestTypeScriptFixture_EmitsExpectedNodeAndEdgeSet`.
+	// === package nodes: exactly 1 external package for
+	// stdio.h, ZERO for local.h. The package node carries
+	// `source=external` so the worker-emitted first-party
+	// packages stay distinguishable (mirrors
+	// TestDispatcher_EmitsImportsEdgesForExternalModules). ===
+	pkgNodes := fw.nodesOf("package")
+	if len(pkgNodes) != 1 {
+		t.Fatalf("expected exactly 1 external package node (stdio.h); got %d (%+v)",
+			len(pkgNodes), pkgNodes)
+	}
+	stdioNode := pkgNodes[0]
+	if got := lastSegmentAfterHash(stdioNode.CanonicalSignature); got != "stdio.h" {
+		t.Errorf("package node simple-name = %q; want stdio.h (sig=%q)",
+			got, stdioNode.CanonicalSignature)
+	}
+	if got := attrString(t, stdioNode.AttrsJSON, "source"); got != "external" {
+		t.Errorf("stdio.h package attrs_json.source = %q; want \"external\" (attrs=%s)",
+			got, string(stdioNode.AttrsJSON))
+	}
+	// Belt-and-suspenders: a future grammar change that
+	// surfaces local.h would either (a) inflate the package
+	// count above (already caught) or (b) substitute local.h
+	// for stdio.h in the single package -- the simple-name
+	// check above catches (b), and this scan double-checks
+	// that NO emitted package signature contains "local.h"
+	// no matter what the dispatcher labels it.
+	for _, n := range pkgNodes {
+		if strings.Contains(n.CanonicalSignature, "local.h") {
+			t.Errorf("relative include local.h MUST NOT materialise a package node; got %q",
+				n.CanonicalSignature)
+		}
+	}
+	stdioID := fw.idBySig[stdioNode.CanonicalSignature]
+
+	// === imports edge: file -> stdio.h (endpoint identity).
+	// The relative-include drop guarantees zero edges for
+	// `./local.h`; we verify both the count AND that the
+	// single edge's `dst` is exactly the stdio.h package
+	// node, not some other random node. ===
 	importEdges := fw.edgesOf("imports")
 	if len(importEdges) != 1 {
-		t.Errorf("expected exactly 1 imports edge (file->stdio.h); got %d (edges=%+v)",
+		t.Fatalf("expected exactly 1 imports edge (file->stdio.h); got %d (%+v)",
 			len(importEdges), importEdges)
 	}
-	for _, e := range importEdges {
-		// Defensive: the relative-include drop guarantees
-		// no edge targets a path beginning with `./`. If a
-		// future grammar change accidentally surfaces the
-		// relative include, this assertion fails before the
-		// count check above masks the regression.
-		// We inspect both Source and Target so a future
-		// rename in either direction is still caught.
-		if strings.HasPrefix(e.Source, "./") || strings.HasPrefix(e.Target, "./") {
-			t.Errorf("imports edge must not reference a relative-include path; got source=%q target=%q",
-				e.Source, e.Target)
-		}
+	if importEdges[0].SrcNodeID != fileNodeID {
+		t.Errorf("imports.src = %q; want %q",
+			importEdges[0].SrcNodeID, fileNodeID)
+	}
+	if importEdges[0].DstNodeID != stdioID {
+		t.Errorf("imports.dst = %q; want stdio.h package node (%q)",
+			importEdges[0].DstNodeID, stdioID)
 	}
 }
 

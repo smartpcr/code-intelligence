@@ -85,20 +85,42 @@ func NewTreeSitterGoParser() LanguageParser {
 // node name as a named const at the top of the file so a
 // future grammar bump has one place to look.
 const (
-	goNodeSourceFile         = "source_file"
-	goNodePackageClause      = "package_clause"
-	goNodeImportDecl         = "import_declaration"
-	goNodeImportSpecList     = "import_spec_list"
-	goNodeImportSpec         = "import_spec"
-	goNodeTypeDecl           = "type_declaration"
-	goNodeTypeSpec           = "type_spec"
-	goNodeTypeAlias          = "type_alias"
-	goNodeStructType         = "struct_type"
-	goNodeInterfaceType      = "interface_type"
-	goNodeFieldDeclList      = "field_declaration_list"
-	goNodeFieldDecl          = "field_declaration"
-	goNodeFieldIdentifier    = "field_identifier"
-	goNodeMethodSpec         = "method_spec"
+	goNodeSourceFile      = "source_file"
+	goNodePackageClause   = "package_clause"
+	goNodeImportDecl      = "import_declaration"
+	goNodeImportSpecList  = "import_spec_list"
+	goNodeImportSpec      = "import_spec"
+	goNodeTypeDecl        = "type_declaration"
+	goNodeTypeSpec        = "type_spec"
+	goNodeTypeAlias       = "type_alias"
+	goNodeStructType      = "struct_type"
+	goNodeInterfaceType   = "interface_type"
+	goNodeFieldDeclList   = "field_declaration_list"
+	goNodeFieldDecl       = "field_declaration"
+	goNodeFieldIdentifier = "field_identifier"
+	// goNodeMethodElem is the modern smacker / upstream Go
+	// grammar node name for an interface method declaration
+	// (e.g. `Foo()` inside `interface { Foo() }`). The pinned
+	// `github.com/smacker/go-tree-sitter` revision
+	// `v0.0.0-20240827094217-dd81d9e9be82` emits `method_elem`,
+	// NOT the legacy `method_spec` symbol (which is absent from
+	// the grammar at that revision -- verified by `grep -c
+	// method_spec parser.c` returning 0). `goNodeMethodSpec`
+	// is retained as a fall-back so older grammars continue to
+	// work if the dependency is bumped backwards.
+	goNodeMethodElem = "method_elem"
+	goNodeMethodSpec = "method_spec"
+	// goNodeTypeElem is the modern interface-body wrapper for
+	// an embedded type or a type-set union (Go 1.18+ generics).
+	// In the pinned grammar, embedded interfaces appear as a
+	// `type_elem` child of `interface_type` containing a single
+	// `type_identifier` / `qualified_type` / `pointer_type`
+	// (architecture §4.4.3 `embeds` key). Type-set unions
+	// (`int | float64`) produce a single `type_elem` with
+	// multiple type children separated by `|`; we treat each
+	// distinct type child as a separate embed entry so the
+	// downstream consumer can still see the named constraints.
+	goNodeTypeElem           = "type_elem"
 	goNodeFunctionDecl       = "function_declaration"
 	goNodeMethodDecl         = "method_declaration"
 	goNodeParamList          = "parameter_list"
@@ -231,20 +253,26 @@ func (w *goWalker) handleTypeSpec(spec *sitter.Node) {
 	w.classes = append(w.classes, cls)
 
 	// For interfaces, emit method declarations for each
-	// method_spec child so the dispatcher can mint method
-	// nodes against the interface (matches the TS/JS
-	// `interface_declaration` path in parser_treesitter.go).
+	// `method_elem` (modern grammar) or `method_spec` (legacy)
+	// child so the dispatcher can mint method nodes against
+	// the interface (matches the TS/JS `interface_declaration`
+	// path in parser_treesitter.go). Both node shapes expose
+	// `name` and `parameters` fields with identical semantics,
+	// so a single handler covers them.
 	if kind == "interface" && typeNode != nil {
 		for i := uint32(0); i < typeNode.NamedChildCount(); i++ {
 			child := typeNode.NamedChild(int(i))
-			if child.Type() == goNodeMethodSpec {
-				w.handleInterfaceMethodSpec(child, name)
+			if child == nil {
+				continue
+			}
+			if child.Type() == goNodeMethodElem || child.Type() == goNodeMethodSpec {
+				w.handleInterfaceMethodElem(child, name)
 			}
 		}
 	}
 }
 
-func (w *goWalker) handleInterfaceMethodSpec(n *sitter.Node, enclosing string) {
+func (w *goWalker) handleInterfaceMethodElem(n *sitter.Node, enclosing string) {
 	nameNode := n.ChildByFieldName("name")
 	if nameNode == nil {
 		return
@@ -533,8 +561,33 @@ func goCollectInterfaceEmbeds(interfaceType *sitter.Node, src []byte) []string {
 	var out []string
 	for i := uint32(0); i < interfaceType.NamedChildCount(); i++ {
 		c := interfaceType.NamedChild(int(i))
+		if c == nil {
+			continue
+		}
 		switch c.Type() {
+		case goNodeTypeElem:
+			// Modern grammar wraps each embedded type in a
+			// `type_elem` node, e.g.
+			//   interface { io.Reader; Closer }
+			// produces two `type_elem` children, each with a
+			// single type child (qualified_type / type_identifier).
+			// Type-set unions (Go 1.18+ generics) produce a
+			// single `type_elem` containing multiple type
+			// children; we extract each as a separate embed so
+			// the constraint surface is preserved.
+			for j := uint32(0); j < c.NamedChildCount(); j++ {
+				inner := c.NamedChild(int(j))
+				if inner == nil {
+					continue
+				}
+				switch inner.Type() {
+				case goNodeTypeIdentifier, goNodeQualifiedType, goNodePointerType:
+					out = append(out, goEmbedTypeName(inner, src))
+				}
+			}
 		case goNodeTypeIdentifier, goNodeQualifiedType:
+			// Fallback for older grammar revisions that did
+			// not yet wrap interface embeds in `type_elem`.
 			out = append(out, goEmbedTypeName(c, src))
 		}
 	}

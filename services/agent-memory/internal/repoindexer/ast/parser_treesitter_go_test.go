@@ -98,7 +98,7 @@ func (g *Greeter) rename(p string) {
 	}
 	for _, want := range []string{"Stringer", "Celsius", "Greeter", "Base"} {
 		if _, ok := classByName[want]; !ok {
-			t.Errorf("class %q missing from emitted set; got %v", want, classNames(res.Classes))
+			t.Errorf("class %q missing from emitted set; got %v", want, goClassNames(res.Classes))
 		}
 	}
 	if got := classByName["Stringer"].Kind; got != "interface" {
@@ -359,7 +359,12 @@ type (
 
 // --- helpers ---
 
-func classNames(cs []ClassDecl) []string {
+// goClassNames returns just the QualifiedName slice for a slice
+// of ClassDecls; named with the `go` prefix so it does not
+// collide with the sibling C++ test helper of the same shape
+// in `parser_treesitter_cpp_test.go` (under //go:build cgo both
+// files compile into the same package).
+func goClassNames(cs []ClassDecl) []string {
 	out := make([]string, 0, len(cs))
 	for _, c := range cs {
 		out = append(out, c.QualifiedName)

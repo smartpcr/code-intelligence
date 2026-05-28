@@ -145,11 +145,11 @@ func (g *Greeter) rename(p string) {
 	if fmtGreet.EnclosingClass != "" {
 		t.Errorf("formatGreeting.EnclosingClass = %q; want empty", fmtGreet.EnclosingClass)
 	}
-	if !containsString(fmtGreet.Calls, "Sprintf") && !containsString(fmtGreet.Calls, "TrimSpace") {
-		// The free function calls `fmt.Sprintf(...)` and
-		// `strings.TrimSpace(...)` -- both are selector
-		// calls (pkg.Func), which the walker correctly
-		// drops. Bare-call set should be empty.
+	// The free function calls `fmt.Sprintf(...)` and
+	// `strings.TrimSpace(...)` -- both are selector
+	// calls (pkg.Func), which the walker correctly
+	// drops. Bare-call set should be empty.
+	if containsString(fmtGreet.Calls, "Sprintf") || containsString(fmtGreet.Calls, "TrimSpace") {
 		t.Errorf("formatGreeting.Calls leaked selector calls: got %v", fmtGreet.Calls)
 	}
 	if len(fmtGreet.Calls) != 0 {

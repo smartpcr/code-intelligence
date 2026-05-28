@@ -552,9 +552,41 @@ func goCollectStructEmbeds(structType *sitter.Node, src []byte) []string {
 		if typeNode == nil {
 			continue
 		}
-		out = append(out, goEmbedTypeName(typeNode, src))
+		name := goEmbedTypeName(typeNode, src)
+		// Pinned smacker grammar represents embedded pointer
+		// fields as `field_declaration` with an anonymous `*`
+		// token followed by the bare type child (NOT wrapped
+		// in a `pointer_type` node). Detect the pointer
+		// marker by scanning the field_declaration's leading
+		// bytes up to the type child's start.
+		if goFieldHasLeadingStar(fd, typeNode, src) {
+			name = "*" + name
+		}
+		out = append(out, name)
 	}
 	return out
+}
+
+// goFieldHasLeadingStar reports whether the bytes of fd
+// between its own start and the type child's start contain a
+// `*` token (modulo whitespace). Pinned grammar lays out
+// embedded `*T` as: anonymous `*` token + type_identifier
+// "T", without wrapping the pair in a `pointer_type`.
+func goFieldHasLeadingStar(fd, typeNode *sitter.Node, src []byte) bool {
+	if fd == nil || typeNode == nil {
+		return false
+	}
+	start := fd.StartByte()
+	end := typeNode.StartByte()
+	if end <= start || int(end) > len(src) {
+		return false
+	}
+	for _, b := range src[start:end] {
+		if b == '*' {
+			return true
+		}
+	}
+	return false
 }
 
 func goCollectInterfaceEmbeds(interfaceType *sitter.Node, src []byte) []string {

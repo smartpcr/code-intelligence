@@ -159,3 +159,36 @@ During the 2026-05-27 prime run on Windows, full-suite validation was not green 
 
 Re-check these before assuming the branch has a clean baseline.
 
+### Workstream-scoped validation status: `phase-go-parser/stage-gotreesitterparser-implementation`
+
+The Go tree-sitter parser stage's package (`services\agent-memory\internal\repoindexer\ast`) passes the targeted gates locally in both CGO modes:
+
+```powershell
+Set-Location services\agent-memory
+
+# Non-CGO scanner / dispatcher path
+$env:CGO_ENABLED = '0'
+go test -count=1 .\internal\repoindexer\ast    # ok ~0.7s
+
+# Tree-sitter / CGO path (requires a MinGW-W64 / TDM-GCC compiler on PATH)
+$env:PATH = "C:\vcpkg\downloads\tools\perl\5.42.0.1\c\bin;$env:PATH"
+$env:CGO_ENABLED = '1'
+$env:CC = 'gcc'
+go test -count=1 .\internal\repoindexer\ast    # ok ~0.7s
+```
+
+(The `C:\vcpkg\downloads\tools\perl\...\c\bin` path is the MinGW-W64 13.2.0 bundle that ships with the vcpkg-managed Strawberry Perl distribution and is the de-facto C toolchain on this Windows worktree; substitute any TDM-GCC / mingw-w64 install if present.)
+
+#### Out-of-scope baseline debt (waived for this workstream)
+
+The full `services\agent-memory` test suite (`go test ./...`) remains red on a pre-existing duplicate-declaration in `migrations\`:
+
+```
+migrations\migrator.go:19:6: Migrator redeclared in this block
+migrations\migrate.go:143:6: other declaration of Migrator
+migrations\migrator.go:24:6: New redeclared in this block
+migrations\migrate.go:150:6: other declaration of New
+```
+
+`migrations\migrate.go` originates from `[impl] Structural schema migrations (#7)` (commit `f2bec92`), and the colliding `migrations\migrator.go` was introduced by `[e2e] Dispatcher sentinel branch, Pass 2b multimap, Pass 2d overrides — E2E (#143)` (commit `d60d8d8`); both pre-date this branch and the conflict was inherited via the upstream `feature/memory` merge. The Go-parser workstream does not own the `migrations` package — fixing it requires its own workstream to decide which `Migrator` shape to retain (`{DB *sql.DB}` from `migrate.go` vs. `{db *sql.DB}` from `migrator.go`). For this stage's validation gate, the duplicate is a documented waiver; the AST package itself builds and tests clean under both CGO modes as shown above.
+

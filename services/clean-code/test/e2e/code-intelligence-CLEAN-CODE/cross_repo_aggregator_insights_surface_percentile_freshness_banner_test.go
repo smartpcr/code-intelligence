@@ -374,18 +374,24 @@ func (s *freshnessBannerState) evalGateIsCalledThroughEveryDegradedCodePath() er
 	sha1 := fmt.Sprintf("freshness-gate-clean-%d", time.Now().UnixNano())
 	s.gateTestSHAs = append(s.gateTestSHAs, sha1)
 	seedMetricSamplesForGate(s.db, repoID, sha1)
-	_, _, _ = callEvalGate(s.evaluatorURL, sha1, repoID, policyVersionID, nil)
+	if _, _, err = callEvalGate(s.evaluatorURL, sha1, repoID, policyVersionID, nil); err != nil {
+		return fmt.Errorf("eval.gate call failed for clean-pass path (sha=%s): %w", sha1, err)
+	}
 
 	// Path 2: samples_pending degraded — use a SHA with no samples.
 	sha2 := fmt.Sprintf("freshness-gate-degraded-%d", time.Now().UnixNano())
 	s.gateTestSHAs = append(s.gateTestSHAs, sha2)
-	_, _, _ = callEvalGate(s.evaluatorURL, sha2, repoID, policyVersionID, nil)
+	if _, _, err = callEvalGate(s.evaluatorURL, sha2, repoID, policyVersionID, nil); err != nil {
+		return fmt.Errorf("eval.gate call failed for samples_pending degraded path (sha=%s): %w", sha2, err)
+	}
 
 	// Path 3: signature_invalid degraded — pass an invalid policy signature.
 	sha3 := fmt.Sprintf("freshness-gate-siginv-%d", time.Now().UnixNano())
 	s.gateTestSHAs = append(s.gateTestSHAs, sha3)
-	_, _, _ = callEvalGate(s.evaluatorURL, sha3, repoID, policyVersionID,
-		map[string]interface{}{"signature": "INVALID-SIGNATURE"})
+	if _, _, err = callEvalGate(s.evaluatorURL, sha3, repoID, policyVersionID,
+		map[string]interface{}{"signature": "INVALID-SIGNATURE"}); err != nil {
+		return fmt.Errorf("eval.gate call failed for signature_invalid degraded path (sha=%s): %w", sha3, err)
+	}
 
 	return nil
 }

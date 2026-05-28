@@ -16,8 +16,8 @@ variables:
   COMPOSE_FILE: tests/e2e/phase-06-evaluator-mgmt/docker-compose.yml
 
 stages:
-  - stage: e2e_management_write_verbs_and_repo_onboarding
-    displayName: "E2E – Management Write Verbs and Repo Onboarding"
+  - stage: e2e_http_json_gateway_and_oidc_auth
+    displayName: "E2E – HTTP JSON Gateway and OIDC Auth"
     jobs:
       - job: run_e2e
         displayName: "Run godog E2E tests"
@@ -60,13 +60,9 @@ stages:
               export CLEAN_CODE_RULE_ENGINE_URL="http://localhost:${RULE_ENGINE_PORT}"
               export CLEAN_CODE_OIDC_ISSUER="http://localhost:${DEX_PORT}"
               export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:${OTEL_PORT}"
-              # OIDC bearer tokens minted by `make tokens`; read the dev-role token.
-              if [ -f tokens/dev.jwt ]; then
-                export CLEAN_CODE_OIDC_DEV_TOKEN="$(cat tokens/dev.jwt)"
-              fi
               cd services/clean-code
               go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
-                -run TestE2E_evaluator_surface_and_management_surface_management_write_verbs_and_repo_onboarding
+                -run TestE2E_evaluator_surface_and_management_surface_http_json_gateway_and_oidc_auth
             displayName: "Export compose URLs and run E2E tests"
             workingDirectory: $(Build.SourcesDirectory)
 

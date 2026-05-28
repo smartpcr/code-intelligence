@@ -36,6 +36,23 @@ func TestSQLDegradedRunStore_New_RejectsNilDB(t *testing.T) {
 	}
 }
 
+// TestSQLDegradedRunStore_New_RejectsNilWalWriter pins the
+// Stage 9.1 / iter-2 requirement that EVERY degraded
+// `evaluation_run` + `evaluation_verdict` INSERT MUST be
+// paired with a WAL frame. The constructor refuses a nil
+// writer so a production composition cannot silently
+// commit SQL-only degraded audit rows (architecture Sec
+// 7.10 + tech-spec Sec 4.13).
+func TestSQLDegradedRunStore_New_RejectsNilWalWriter(t *testing.T) {
+	_, err := NewSQLDegradedRunStore(SQLDegradedRunStoreConfig{DB: openTestDB(t)})
+	if err == nil {
+		t.Fatal("NewSQLDegradedRunStore: want error for nil WalWriter, got nil")
+	}
+	if !strings.Contains(err.Error(), "WalWriter is nil") {
+		t.Fatalf("NewSQLDegradedRunStore: err = %v; want substring 'WalWriter is nil'", err)
+	}
+}
+
 // TestSQLDegradedRunStore_AppendDegradedRun_ValidationContract
 // pins the eight zero-uuid + empty-field invariants on
 // AppendDegradedRun. We do NOT exercise the SQL round-trip
@@ -43,7 +60,7 @@ func TestSQLDegradedRunStore_New_RejectsNilDB(t *testing.T) {
 // in-memory validation.
 func TestSQLDegradedRunStore_AppendDegradedRun_ValidationContract(t *testing.T) {
 	t.Parallel()
-	s, err := NewSQLDegradedRunStore(SQLDegradedRunStoreConfig{DB: openTestDB(t)})
+	s, err := NewSQLDegradedRunStore(SQLDegradedRunStoreConfig{DB: openTestDB(t), WalWriter: newTestWALWriter(t)})
 	if err != nil {
 		t.Fatalf("NewSQLDegradedRunStore: %v", err)
 	}

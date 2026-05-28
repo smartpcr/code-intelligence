@@ -34,16 +34,27 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gofrs/uuid"
 	_ "github.com/lib/pq"
 
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/composition"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/evaluator"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
 )
+
+// defaultAuditWALDir is the canonical Audit WAL partition
+// root the binary falls back to when CLEAN_CODE_AUDIT_WAL_DIR
+// is unset. Architecture Sec 7.10 / tech-spec Sec 4.13 pin
+// `data/wal/audit/` as the relative path. Production
+// deployments override via the env var to point at a durable
+// volume.
+const defaultAuditWALDir = "data/wal/audit"
 
 // maxRequestBodyBytes caps the JSON body size on both
 // `/v1/eval/gate` and `/v1/eval/replay`. The canonical
@@ -175,6 +186,7 @@ func main() {
 	// operator can tell production-tier misconfiguration
 	// apart from intentional scaffold-mode.
 	var stewardSigner steward.Signer
+	var signingKeysManager *keys.Manager
 	var keysClose func()
 	kmsProvider := os.Getenv("CLEAN_CODE_KMS_PROVIDER")
 	switch kmsProvider {
@@ -203,6 +215,7 @@ func main() {
 			log.Fatalf("clean-code-eval-gate: keys.Build(provider=%s): %v", kmsProvider, kerr)
 		}
 		stewardSigner = keysRes.Manager
+		signingKeysManager = keysRes.Manager
 		keysClose = keysRes.Close
 		log.Printf("clean-code-eval-gate: keys.Manager wired (provider=%s); Gate.Evaluate signature-verify path is LIVE", kmsProvider)
 	default:
@@ -218,6 +231,83 @@ func main() {
 		log.Fatalf("clean-code-eval-gate: steward.New: %v", err)
 	}
 
+	// Stage 9.1 -- Audit WAL writer (architecture Sec
+	// 7.10 / tech-spec Sec 4.13). The writer is REQUIRED
+	// by both `rule_engine.NewSQLStore` and
+	// `evaluator.NewProductionGate`: every successful
+	// `evaluation_run` + `evaluation_verdict` + `finding`
+	// INSERT they perform is mirrored to a signed WAL
+	// frame fsynced BEFORE the SQL transaction commits.
+	// Iter-2 evaluator item #3: this is the production
+	// reading of CLEAN_CODE_AUDIT_WAL_DIR.
+	//
+	// Signer choice (iter-3 evaluator item #1): when the
+	// composition root has a real KMS-backed
+	// `keys.Manager` (CLEAN_CODE_KMS_PROVIDER=local |
+	// in-memory), the WAL signer is the production
+	// Ed25519 path
+	// ([composition.NewKeysManagerWALSigner]). In
+	// scaffold mode (KMS provider unset) the WAL signer
+	// falls back to `wal.NoopSigner`, since the gate is
+	// already degrading every request as
+	// policy_signature_invalid in that mode -- frames on
+	// disk get the SHA-256 stand-in but the binary
+	// surface still serves dev/test. Production
+	// deployments MUST set CLEAN_CODE_KMS_PROVIDER.
+	walDir := os.Getenv("CLEAN_CODE_AUDIT_WAL_DIR")
+	if walDir == "" {
+		walDir = defaultAuditWALDir
+		log.Printf("clean-code-eval-gate: CLEAN_CODE_AUDIT_WAL_DIR unset; using default %q", walDir)
+	}
+	var walSigner wal.Signer
+	if signingKeysManager != nil {
+		walSigner = composition.NewKeysManagerWALSigner(signingKeysManager)
+		log.Printf("clean-code-eval-gate: Audit WAL signer = keys.Manager-backed Ed25519 (provider=%s)", kmsProvider)
+	} else {
+		walSigner = wal.NoopSigner{}
+		log.Print("clean-code-eval-gate: WARN: Audit WAL signer = wal.NoopSigner (SHA-256 stand-in, signing_key_id=uuid.Nil). This is acceptable ONLY in scaffold mode (CLEAN_CODE_KMS_PROVIDER unset); production deployments MUST set CLEAN_CODE_KMS_PROVIDER=local + CLEAN_CODE_KMS_MASTER_KEY_HEX so the WAL signer becomes the Ed25519 keys.Manager path.")
+	}
+	walWriter, err := wal.NewWriter(wal.WriterConfig{
+		Dir:    walDir,
+		Signer: walSigner,
+	})
+	if err != nil {
+		log.Fatalf("clean-code-eval-gate: wal.NewWriter(dir=%s): %v", walDir, err)
+	}
+	log.Printf("clean-code-eval-gate: Audit WAL writer wired (dir=%s)", walDir)
+
+	// Stage 9.2 -- Audit WAL Reconciler (replay-only).
+	// Architecture Sec 7.10 / implementation-plan Stage
+	// 9.2: on service restart, the reconciler walks
+	// `data/wal/audit/YYYY-MM-DD.wal`, verifies every
+	// frame's signature against the historical
+	// signing-key snapshot, and replays MISSING rows
+	// into the three Audit tables. Stage 9.2 iter 2
+	// evaluator item #1 wired this into the binary so
+	// the brief's "on service restart" requirement is a
+	// LITERAL blocking startup step -- the reconciler
+	// MUST complete before the HTTP listener accepts
+	// traffic, otherwise an external caller could
+	// observe an inconsistent audit state (some rows
+	// still in WAL, some in PG).
+	//
+	// Production gate: when `signingKeysManager != nil`
+	// (real KMS configured) the binary REQUIRES
+	// CLEAN_CODE_WAL_RECONCILER_DSN to be set. The DSN
+	// MUST be authenticated as `clean_code_wal_reconciler`
+	// per migration 0004 (INSERT+SELECT on the three
+	// Audit tables; UPDATE+DELETE REVOKED). The same
+	// pool answers the `policy_signing_keys` SELECT used
+	// by the historical-keys verifier (migration 0005
+	// grants SELECT on policy_signing_keys to the same
+	// role).
+	//
+	// Scaffold-mode (signingKeysManager == nil): WAL
+	// signer is wal.NoopSigner, frames carry SHA-256
+	// stand-ins -- the reconciler cannot verify them.
+	// Skip reconciler wiring entirely; log INFO.
+	runWALReconciler(rootCtx, signingKeysManager, walDir)
+
 	// rule_engine.SQLStore consumes the solid_batch
 	// handle so the canonical Audit triple is INSERTED
 	// under the `clean_code_solid_batch` grant -- the
@@ -227,8 +317,9 @@ func main() {
 	// evaluator.NewProductionGate (signature-invalid,
 	// samples-pending).
 	ruleStore, err := rule_engine.NewSQLStore(rule_engine.SQLStoreConfig{
-		DB:      solidBatchDB,
-		Steward: stewardStore,
+		DB:        solidBatchDB,
+		Steward:   stewardStore,
+		WalWriter: walWriter,
 	})
 	if err != nil {
 		log.Fatalf("clean-code-eval-gate: rule_engine.NewSQLStore: %v", err)
@@ -251,7 +342,8 @@ func main() {
 		// also re-checks `evaluator.Verdict.IsValid`
 		// before returning, giving us a single
 		// canonical bridge between engine + gate.
-		Engine: rule_engine.NewEvaluatorAdapter(engine),
+		Engine:    rule_engine.NewEvaluatorAdapter(engine),
+		WalWriter: walWriter,
 		// KeyManager intentionally nil: the legacy
 		// signature-bundle [Gate.VerifyPolicy] surface
 		// is not the focus of Stage 5.7. The Evaluate
@@ -292,6 +384,155 @@ func main() {
 
 	log.Printf("clean-code-eval-gate listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
+}
+
+// envWALReconcilerDSN is the DSN the binary uses to
+// authenticate the Stage 9.2 reconciler's PostgreSQL pool.
+// Required when `CLEAN_CODE_KMS_PROVIDER` is set (i.e. when
+// the WAL writer is producing real Ed25519 signatures);
+// optional and ignored in scaffold mode (NoopSigner frames
+// cannot be verified, so there is no replay path).
+//
+// Production deployments authenticate this DSN as the
+// `clean_code_wal_reconciler` PG role per migration 0004
+// (INSERT+SELECT on the three Audit tables ONLY; UPDATE
+// and DELETE REVOKED) and migration 0005 (SELECT on
+// `clean_code.policy_signing_keys` for historical-key
+// resolution). The migration-level grants are the outer
+// guard for the brief's "never deletes a row; never
+// modifies a non-Audit table" invariants.
+const envWALReconcilerDSN = "CLEAN_CODE_WAL_RECONCILER_DSN"
+
+// runWALReconciler builds and runs the Stage 9.2 Audit
+// WAL Reconciler as a BLOCKING startup step. The
+// reconciler walks `walDir`, verifies every frame's
+// signature against the historical signing-key snapshot
+// pulled from `clean_code.policy_signing_keys`, and
+// replays MISSING rows into the three Audit tables. Per
+// the brief and per Stage 9.2 iter-2 evaluator item #1
+// the call BLOCKS startup so an external caller cannot
+// observe an inconsistent audit state (some rows still in
+// WAL, some in PG).
+//
+// Gate matrix:
+//
+//   - signingKeysManager == nil (scaffold mode, NoopSigner
+//     WAL writer): skip reconciler -- the SHA-256
+//     stand-in frames carry no Ed25519 signature so there
+//     is nothing meaningful to verify on replay. Log INFO
+//     and return.
+//
+//   - signingKeysManager != nil AND
+//     CLEAN_CODE_WAL_RECONCILER_DSN unset: log.Fatalf.
+//     The binary is producing real signed frames but the
+//     operator has not wired the replay path; serving
+//     traffic in this configuration would silently lose
+//     durability on the first restart with pending WAL
+//     frames.
+//
+//   - signingKeysManager != nil AND DSN set: open the
+//     dedicated pool, ping with retry, build a
+//     `keys.SQLStore` for historical-key resolution, hand
+//     both to `composition.NewWALReconciler`, run, log
+//     Stats summary. On Run error: log.Fatalf so a botched
+//     WAL aborts startup rather than degrading silently.
+func runWALReconciler(ctx context.Context, signingKeysManager *keys.Manager, walDir string) {
+	if signingKeysManager == nil {
+		log.Print("clean-code-eval-gate: Stage 9.2 reconciler skipped (scaffold mode, NoopSigner WAL writer). Real KMS deployments MUST set CLEAN_CODE_KMS_PROVIDER + CLEAN_CODE_WAL_RECONCILER_DSN.")
+		return
+	}
+	dsn := os.Getenv(envWALReconcilerDSN)
+	if dsn == "" {
+		log.Fatalf("clean-code-eval-gate: %s is REQUIRED when CLEAN_CODE_KMS_PROVIDER is set (Stage 9.2 reconciler MUST run before traffic is served; see docs/runbook.md Stage 9.2)", envWALReconcilerDSN)
+	}
+
+	reconcilerDB, oerr := sql.Open("postgres", dsn)
+	if oerr != nil {
+		log.Fatalf("clean-code-eval-gate: open postgres (%s): %v", envWALReconcilerDSN, oerr)
+	}
+	defer reconcilerDB.Close()
+
+	// Mirror the gateway's pingDBWithRetry pattern
+	// (cmd/clean-code-gateway/main.go): capture the
+	// last ping error and surface it with log.Fatalf
+	// once attempts are exhausted. Falling through to
+	// `keys.NewSQLStore` / `composition.NewWALReconciler`
+	// on a dead connection produces a confusing failure
+	// far from the root cause (a downstream "driver:
+	// bad connection" or a Run-time SELECT failure)
+	// and silently violates the brief's
+	// "reconciler MUST complete before the HTTP
+	// listener accepts traffic" invariant.
+	var lastPingErr error
+	for i := 0; i < 30; i++ {
+		lastPingErr = reconcilerDB.PingContext(ctx)
+		if lastPingErr == nil {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	if lastPingErr != nil {
+		log.Fatalf("clean-code-eval-gate: postgres ping (%s) failed after 30 attempts: %v (Stage 9.2 reconciler cannot proceed on a dead connection; aborting startup per docs/runbook.md Stage 9.2)", envWALReconcilerDSN, lastPingErr)
+	}
+
+	keyStore, kserr := keys.NewSQLStore(reconcilerDB)
+	if kserr != nil {
+		log.Fatalf("clean-code-eval-gate: keys.NewSQLStore: %v", kserr)
+	}
+
+	rec, rerr := composition.NewWALReconciler(ctx, composition.WALReconcilerConfig{
+		DB:       reconcilerDB,
+		Dir:      walDir,
+		KeyStore: keyStore,
+		Logger: func(msg string, kv ...any) {
+			// Render kv as space-separated key=value pairs.
+			// Passing `kv` (a []any) as a single `%v` arg
+			// to log.Printf renders the variadic slice flat
+			// (`[k1 v1 k2 v2]`) instead of paired
+			// (`k1=v1 k2=v2`), which defeats the structured
+			// logging contract the reconciler relies on
+			// (see gateway main.go, which uses
+			// `slog.Any("kv", kv)` for the same purpose).
+			// The eval-gate binary uses the stdlib `log`
+			// package throughout, so rather than introduce
+			// `slog` for this one call site we iterate the
+			// pairs explicitly; an odd-length tail is
+			// rendered with a "(MISSING)" sentinel so the
+			// emitter sees the malformed call instead of
+			// silently dropping the orphan key.
+			var sb strings.Builder
+			sb.WriteString("clean-code-eval-gate: reconciler: ")
+			sb.WriteString(msg)
+			for i := 0; i < len(kv); i += 2 {
+				if i+1 < len(kv) {
+					fmt.Fprintf(&sb, " %v=%v", kv[i], kv[i+1])
+				} else {
+					fmt.Fprintf(&sb, " %v=(MISSING)", kv[i])
+				}
+			}
+			log.Print(sb.String())
+		},
+	})
+	if rerr != nil {
+		log.Fatalf("clean-code-eval-gate: composition.NewWALReconciler: %v", rerr)
+	}
+	if rec == nil {
+		// Should not happen given the gates above, but
+		// keep the assertion explicit so a refactor
+		// that introduces a silent scaffold-mode return
+		// is loud at startup.
+		log.Fatalf("clean-code-eval-gate: composition.NewWALReconciler returned (nil, nil) despite non-nil KeyStore -- scaffold-mode regression")
+	}
+
+	stats, runErr := rec.Run(ctx)
+	if runErr != nil {
+		log.Fatalf("clean-code-eval-gate: reconciler.Run: %v (aborting startup; operator triage required per docs/runbook.md Stage 9.2)", runErr)
+	}
+	log.Printf("clean-code-eval-gate: Stage 9.2 reconciler completed: replayed=%+v skipped_existing=%+v skipped_bad_sig=%+v skipped_bad_shape=%+v warnings=%d",
+		stats.Replayed, stats.SkippedExisting, stats.SkippedBadSig, stats.SkippedBadShape, len(stats.Warnings))
+	for _, w := range stats.Warnings {
+		log.Printf("clean-code-eval-gate: reconciler warning: %s", w)
+	}
 }
 
 // evalGateRequest is the JSON body the CANONICAL

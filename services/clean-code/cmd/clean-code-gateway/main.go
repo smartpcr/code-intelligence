@@ -123,6 +123,7 @@ import (
 	_ "github.com/lib/pq"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/api"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/composition"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
@@ -198,6 +199,28 @@ const (
 	envEvaluatorPGURL  = "CLEAN_CODE_EVALUATOR_PG_URL"
 	envSolidBatchPGURL = "CLEAN_CODE_SOLID_BATCH_PG_URL"
 
+	// envAuditWALDir is the canonical Audit WAL partition
+	// root (Stage 9.1 / architecture Sec 7.10). The gateway
+	// reads it ONLY when eval.gate is being wired (both
+	// PG URLs present). Defaults to [defaultAuditWALDir]
+	// when unset; production deployments override to point
+	// at a durable volume.
+	envAuditWALDir = "CLEAN_CODE_AUDIT_WAL_DIR"
+
+	// envWALReconcilerDSN is the dedicated PG DSN the
+	// Stage 9.2 Audit WAL Reconciler authenticates as
+	// `clean_code_wal_reconciler` (migration 0004:
+	// INSERT+SELECT on the three Audit tables; UPDATE +
+	// DELETE REVOKED; migration 0005: SELECT on
+	// `clean_code.policy_signing_keys` for historical-key
+	// resolution). REQUIRED when [envKMSProvider] is set
+	// AND eval.gate wiring is complete (the WAL writer is
+	// producing real Ed25519 frames that need to be
+	// replayable). The gateway BLOCKS startup on
+	// reconciler completion so traffic is not served
+	// against an inconsistent audit state.
+	envWALReconcilerDSN = "CLEAN_CODE_WAL_RECONCILER_DSN"
+
 	// envKMSProvider / envKMSMasterKeyHex configure the
 	// signing-key Manager that backs the
 	// `policy.keys.list_active` reader AND the
@@ -216,6 +239,7 @@ const (
 	defaultPort            = "8082"
 	defaultShutdownSeconds = 30
 	defaultAuthMode        = authModeOIDC
+	defaultAuditWALDir     = "data/wal/audit"
 	authModeOIDC           = "oidc"
 	authModeDevHMAC        = "dev-hmac"
 	pingAttempts           = 30
@@ -275,6 +299,30 @@ func run(logger *slog.Logger) error {
 	}
 	if keysClose != nil {
 		defer keysClose()
+	}
+
+	// Stage 9.2 -- Audit WAL Reconciler (replay-only).
+	// Architecture Sec 7.10 / implementation-plan Stage
+	// 9.2: on service restart, the reconciler walks the
+	// Audit WAL partition, verifies every frame's
+	// signature against the historical signing-key
+	// snapshot, and replays MISSING rows into the three
+	// Audit tables. Stage 9.2 iter-2 evaluator item #1
+	// wired this into the gateway binary so the brief's
+	// "on service restart" requirement is a LITERAL
+	// blocking startup step -- the reconciler MUST
+	// complete before the HTTP listener accepts traffic.
+	//
+	// Closer ownership: runWALReconciler manages its own
+	// dedicated DB pool lifecycle (open + close inside
+	// the function) -- the pool is only needed for the
+	// one-shot replay, NOT for traffic serving, so it
+	// does NOT need to live in the gateway-wide
+	// `closers` slice. The eval.gate verb continues to
+	// use its own evaluator + solid_batch pools wired in
+	// `buildProductionDeps`.
+	if rerr := runWALReconciler(rootCtx, cfg, signingKeys, logger); rerr != nil {
+		return fmt.Errorf("runWALReconciler: %w", rerr)
 	}
 
 	// Build the production wiring deps. Each non-nil dep
@@ -344,22 +392,24 @@ func run(logger *slog.Logger) error {
 // and so the boot-time invariants (mode-consistent OIDC vs
 // HMAC fields) live in [validateGatewayConfig].
 type gatewayConfig struct {
-	Port            string
-	AuthMode        string
-	OIDCIssuer      string
-	OIDCAudience    string
-	OIDCJWKSURL     string
-	HMACSecret      []byte
-	HMACAudience    string
-	PGURL           string
-	MgmtPGURL       string
-	EvaluatorPGURL  string
-	SolidBatchPGURL string
-	WebhookKeyID    string
-	WebhookSecret   string
-	KMSProvider     string
-	KMSMasterKeyHex string
-	ShutdownTimeout time.Duration
+	Port             string
+	AuthMode         string
+	OIDCIssuer       string
+	OIDCAudience     string
+	OIDCJWKSURL      string
+	HMACSecret       []byte
+	HMACAudience     string
+	PGURL            string
+	MgmtPGURL        string
+	EvaluatorPGURL   string
+	SolidBatchPGURL  string
+	WebhookKeyID     string
+	WebhookSecret    string
+	KMSProvider      string
+	KMSMasterKeyHex  string
+	AuditWALDir      string
+	WALReconcilerDSN string
+	ShutdownTimeout  time.Duration
 }
 
 // loadGatewayConfig reads the canonical env vars and returns
@@ -368,20 +418,22 @@ type gatewayConfig struct {
 // names the failing var.
 func loadGatewayConfig() (gatewayConfig, error) {
 	cfg := gatewayConfig{
-		Port:            envOrDefault(envPort, defaultPort),
-		AuthMode:        strings.ToLower(envOrDefault(envGatewayAuthMode, defaultAuthMode)),
-		OIDCIssuer:      os.Getenv(envOIDCIssuer),
-		OIDCAudience:    os.Getenv(envOIDCAudience),
-		OIDCJWKSURL:     os.Getenv(envOIDCJWKSURL),
-		HMACAudience:    os.Getenv(envGatewayHMACAudience),
-		PGURL:           pickPGURL(),
-		MgmtPGURL:       os.Getenv(envMgmtPGURL),
-		EvaluatorPGURL:  os.Getenv(envEvaluatorPGURL),
-		SolidBatchPGURL: os.Getenv(envSolidBatchPGURL),
-		WebhookKeyID:    os.Getenv(envWebhookSigningKeyID),
-		WebhookSecret:   os.Getenv(envWebhookHMACSecret),
-		KMSProvider:     strings.ToLower(os.Getenv(envKMSProvider)),
-		KMSMasterKeyHex: os.Getenv(envKMSMasterKeyHex),
+		Port:             envOrDefault(envPort, defaultPort),
+		AuthMode:         strings.ToLower(envOrDefault(envGatewayAuthMode, defaultAuthMode)),
+		OIDCIssuer:       os.Getenv(envOIDCIssuer),
+		OIDCAudience:     os.Getenv(envOIDCAudience),
+		OIDCJWKSURL:      os.Getenv(envOIDCJWKSURL),
+		HMACAudience:     os.Getenv(envGatewayHMACAudience),
+		PGURL:            pickPGURL(),
+		MgmtPGURL:        os.Getenv(envMgmtPGURL),
+		EvaluatorPGURL:   os.Getenv(envEvaluatorPGURL),
+		SolidBatchPGURL:  os.Getenv(envSolidBatchPGURL),
+		WebhookKeyID:     os.Getenv(envWebhookSigningKeyID),
+		WebhookSecret:    os.Getenv(envWebhookHMACSecret),
+		KMSProvider:      strings.ToLower(os.Getenv(envKMSProvider)),
+		KMSMasterKeyHex:  os.Getenv(envKMSMasterKeyHex),
+		AuditWALDir:      envOrDefault(envAuditWALDir, defaultAuditWALDir),
+		WALReconcilerDSN: os.Getenv(envWALReconcilerDSN),
 	}
 	shutdownSecs, err := envSecondsOrDefault(envShutdownTimeoutSeconds, defaultShutdownSeconds)
 	if err != nil {
@@ -563,6 +615,93 @@ func buildSigningKeys(ctx context.Context, cfg gatewayConfig, db *sql.DB, logger
 	}
 }
 
+// runWALReconciler is the Stage 9.2 Audit WAL Reconciler
+// startup step. Blocking. See [composition.NewWALReconciler]
+// + `internal/audit/reconciler` for the replay-only
+// contract and `services/clean-code/docs/runbook.md` Stage
+// 9.2 for the operational expectations.
+//
+// Gate matrix:
+//
+//   - `signingKeys == nil` (scaffold-mode WAL writer using
+//     [wal.NoopSigner]): skip reconciler -- SHA-256
+//     stand-in frames carry no Ed25519 signature so there
+//     is nothing meaningful to verify on replay. INFO log
+//     and return nil.
+//
+//   - `signingKeys != nil` AND
+//     [envWALReconcilerDSN] unset: return an error. The
+//     gateway is producing real signed frames but the
+//     operator has not wired the replay path; serving
+//     traffic in this configuration would silently lose
+//     durability on the first restart with pending WAL
+//     frames. Returning an error (instead of log.Fatal)
+//     keeps the failure inside `run`'s error-return
+//     contract so SystemD / Kubernetes restart loops
+//     surface the operator-actionable line.
+//
+//   - `signingKeys != nil` AND DSN set: open the
+//     dedicated PG pool, ping with retry, build the
+//     historical-keys `keys.SQLStore`, hand both to
+//     [composition.NewWALReconciler], run, log Stats. On
+//     Run error, return the error so startup aborts.
+func runWALReconciler(ctx context.Context, cfg gatewayConfig, signingKeys *keys.Manager, logger *slog.Logger) error {
+	if signingKeys == nil {
+		logger.Info("gateway: Stage 9.2 reconciler skipped (scaffold mode, NoopSigner WAL writer). Real KMS deployments MUST set " + envKMSProvider + " + " + envWALReconcilerDSN + ".")
+		return nil
+	}
+	if cfg.WALReconcilerDSN == "" {
+		return fmt.Errorf("%s is REQUIRED when %s is set (Stage 9.2 reconciler MUST run before traffic is served; see docs/runbook.md Stage 9.2)",
+			envWALReconcilerDSN, envKMSProvider)
+	}
+
+	reconcilerDB, oerr := openDB(cfg.WALReconcilerDSN)
+	if oerr != nil {
+		return fmt.Errorf("openDB(%s): %w", envWALReconcilerDSN, oerr)
+	}
+	defer reconcilerDB.Close()
+
+	if perr := pingDBWithRetry(ctx, reconcilerDB); perr != nil {
+		return fmt.Errorf("pingDBWithRetry(%s): %w", envWALReconcilerDSN, perr)
+	}
+
+	keyStore, kserr := keys.NewSQLStore(reconcilerDB)
+	if kserr != nil {
+		return fmt.Errorf("keys.NewSQLStore: %w", kserr)
+	}
+
+	rec, rerr := composition.NewWALReconciler(ctx, composition.WALReconcilerConfig{
+		DB:       reconcilerDB,
+		Dir:      cfg.AuditWALDir,
+		KeyStore: keyStore,
+		Logger: func(msg string, kv ...any) {
+			logger.Info("gateway: reconciler: "+msg, slog.Any("kv", kv))
+		},
+	})
+	if rerr != nil {
+		return fmt.Errorf("composition.NewWALReconciler: %w", rerr)
+	}
+	if rec == nil {
+		return fmt.Errorf("composition.NewWALReconciler returned (nil, nil) despite non-nil KeyStore -- scaffold-mode regression")
+	}
+
+	stats, runErr := rec.Run(ctx)
+	if runErr != nil {
+		return fmt.Errorf("reconciler.Run: %w (aborting startup; operator triage required per docs/runbook.md Stage 9.2)", runErr)
+	}
+	logger.Info("gateway: Stage 9.2 reconciler completed",
+		slog.Any("replayed", stats.Replayed),
+		slog.Any("skipped_existing", stats.SkippedExisting),
+		slog.Any("skipped_bad_sig", stats.SkippedBadSig),
+		slog.Any("skipped_bad_shape", stats.SkippedBadShape),
+		slog.Int("warnings", len(stats.Warnings)),
+	)
+	for _, w := range stats.Warnings {
+		logger.Warn("gateway: reconciler warning", slog.String("warning", w))
+	}
+	return nil
+}
+
 // buildProductionDeps assembles the [api.ProductionWiringDeps]
 // from the constructed Postgres-backed stores and the
 // optional signing-key Manager. The function is intentionally
@@ -681,10 +820,51 @@ func buildProductionDeps(ctx context.Context, cfg gatewayConfig, db *sql.DB, sig
 		if perr := pingDBWithRetry(ctx, solidDB); perr != nil {
 			return api.ProductionWiringDeps{}, closers, fmt.Errorf("pingDBWithRetry(solid_batch): %w", perr)
 		}
+		// Stage 9.1 -- Audit WAL writer (architecture
+		// Sec 7.10 / tech-spec Sec 4.13). REQUIRED by
+		// `composition.BuildEvalGate` because the gate's
+		// rule-pass AND degraded paths now mirror every
+		// audit INSERT to a signed WAL frame fsynced
+		// before SQL commit. The gateway reads
+		// CLEAN_CODE_AUDIT_WAL_DIR (defaults to
+		// `data/wal/audit`) and constructs the writer
+		// here.
+		//
+		// Signer choice (iter-3 evaluator item #1):
+		// when `signingKeys` is non-nil
+		// (CLEAN_CODE_KMS_PROVIDER=local | in-memory),
+		// the WAL signer is the production Ed25519
+		// path
+		// ([composition.NewKeysManagerWALSigner]). In
+		// scaffold mode (KMS provider unset) the signer
+		// falls back to `wal.NoopSigner`, since the
+		// gate's signature-verify path is already
+		// degraded -- frames on disk carry the SHA-256
+		// stand-in but the binary stays serviceable for
+		// dev/test. Production deployments MUST set
+		// CLEAN_CODE_KMS_PROVIDER.
+		var walSigner wal.Signer
+		if signingKeys != nil {
+			walSigner = composition.NewKeysManagerWALSigner(signingKeys)
+			logger.Info("gateway: Audit WAL signer = keys.Manager-backed Ed25519", "provider", cfg.KMSProvider)
+		} else {
+			walSigner = wal.NoopSigner{}
+			logger.Warn("gateway: Audit WAL signer = wal.NoopSigner (SHA-256 stand-in, signing_key_id=uuid.Nil). This is acceptable ONLY in scaffold mode (" + envKMSProvider + " unset); production deployments MUST set " + envKMSProvider + "=local + " + envKMSMasterKeyHex + " so the WAL signer becomes the Ed25519 keys.Manager path.")
+		}
+		walWriter, werr := wal.NewWriter(wal.WriterConfig{
+			Dir:    cfg.AuditWALDir,
+			Signer: walSigner,
+		})
+		if werr != nil {
+			return api.ProductionWiringDeps{}, closers, fmt.Errorf("wal.NewWriter(dir=%s): %w", cfg.AuditWALDir, werr)
+		}
+		logger.Info("gateway: Audit WAL writer wired", "dir", cfg.AuditWALDir)
+
 		gate, gerr := composition.BuildEvalGate(ctx, composition.EvalGateConfig{
 			EvaluatorDB:  evalDB,
 			SolidBatchDB: solidDB,
 			Signer:       stewardSigner,
+			WalWriter:    walWriter,
 		}, logger)
 		if gerr != nil {
 			return api.ProductionWiringDeps{}, closers, fmt.Errorf("composition.BuildEvalGate: %w", gerr)

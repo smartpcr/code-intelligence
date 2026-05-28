@@ -4,6 +4,208 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 9.2 -- Audit WAL Reconciler (replay-only)
+
+New `internal/audit/reconciler/` package + composition
+factory that close the Stage 9.1 durability loop: on
+service restart, the reconciler walks
+`data/wal/audit/YYYY-MM-DD.wal`, verifies every frame's
+signature, and replays MISSING rows into the three Audit
+tables (`evaluation_run`, `evaluation_verdict`, `finding`).
+The reconciler honours four invariants (architecture
+Sec 7.10 / iter 1 evaluator item 11):
+
+1. NEVER inserts a row whose `(table, row_pk)` already
+   exists -- every replay statement is
+   `INSERT ... ON CONFLICT (<pk>) DO NOTHING`. A no-op
+   conflict is classified as `OutcomeSkippedExisting`
+   and counted; the existing row is left byte-identical.
+2. NEVER deletes a row -- there is no `DELETE` statement
+   anywhere in the package; the `clean_code_wal_reconciler`
+   PG role has `DELETE` revoked at the migration layer
+   (`0004_roles.up.sql`).
+3. NEVER modifies a non-Audit table -- table names are
+   package-level constants, the `replayOne` dispatcher
+   uses an explicit `switch` on `wal.AuditFrame.Table`,
+   and an unknown table value surfaces `ErrUnknownTable`
+   (does NOT reach any SQL statement).
+4. PRESERVES `evaluation_run.caller` verbatim from the
+   original frame -- the parsed string is bound to the
+   SQL parameter with NO transformation; the reconciler
+   does NOT substitute its own identity.
+
+New files:
+
+- `internal/audit/reconciler/doc.go` -- package overview
+  pinning the four invariants, verifier classification,
+  phased-replay rationale, and Stats schema.
+- `internal/audit/reconciler/types.go` -- `Verifier`
+  interface, sentinel errors (`ErrSignatureInvalid`,
+  `ErrSigningKeyUnknown`, `ErrUnknownTable`,
+  `ErrRowPKMismatch`, `ErrVerifierUnwired`,
+  `ErrReplayerUnwired`, `ErrDirUnwired`,
+  `ErrFrameValidation`), and `Stats` with `PerTable`
+  counters (`Replayed`, `SkippedExisting`,
+  `SkippedBadSig`, `SkippedBadShape`) plus a
+  `Warnings []string` channel for
+  `wal.ErrTrailingPartialFrame` /
+  `wal.ErrFrameSizeExceeded` signals.
+- `internal/audit/reconciler/replayer.go` -- `Replayer`
+  interface (three methods, one per Audit table -- NO
+  dynamic-table-name code path possible), the three row
+  shapes (`EvaluationRunRow`, `EvaluationVerdictRow`,
+  `FindingRow`) decoded from the WAL `row_json`, and the
+  `Outcome` enum (`OutcomeInserted` |
+  `OutcomeSkippedExisting`).
+- `internal/audit/reconciler/sql_replayer.go` --
+  production `SQLReplayer` issuing
+  `INSERT ... ON CONFLICT (<pk>) DO NOTHING` against
+  `clean_code.evaluation_run`, `evaluation_verdict`,
+  `finding`. `RowsAffected` classifies the outcome
+  (`1 -> OutcomeInserted`, `0 -> OutcomeSkippedExisting`,
+  anything else -> loud error). `caller` is bound
+  verbatim; `degraded_reason` is passed through
+  `NULLIF($5, '')`; `metric_sample_ids` is marshalled to
+  a JSON array and cast `$9::jsonb`.
+- `internal/audit/reconciler/sql_replayer_test.go` --
+  sqlmock suite covering `Inserted` /
+  `SkippedExisting`, caller-verbatim preservation,
+  required-field validation, the `RowsAffected > 1`
+  loud-error path, and exec-error propagation.
+- `internal/audit/reconciler/reconciler.go` --
+  `Reconciler{Run(ctx)}` + the internal `replayOne`
+  dispatcher. `Run` does a two-phase walk: pass 1 every
+  `evaluation_run` frame, pass 2 every
+  `evaluation_verdict` and `finding` frame, so FK
+  ordering is honoured even when the on-disk partition
+  has been reordered by an external corruption pass.
+  `replayOne` step-by-step: defence-in-depth table
+  guard, `wal.AuditFrame.Validate`, signature
+  verification (with sentinel classification),
+  `json.Decoder.DisallowUnknownFields()` strict decode,
+  `frame.RowPK == row_json.<pk>` equality check, then
+  dispatch to the matching Replayer method.
+- `internal/audit/reconciler/reconciler_test.go` --
+  rejects-unwired-deps suite, partial-frame-tail
+  non-fatal warning, scope-id nullable round-trip,
+  phased-replay ordering (frames are written in
+  canonical run->verdict->finding order then REVERSED
+  on disk before Run so the test actually proves the
+  two-pass walk reorders them back), strict-decode
+  loud abort (post-signature `DisallowUnknownFields`
+  failure aborts `Run`, NOT counted as
+  `SkippedBadShape`), unknown-table never reaches the
+  replayer, RowPK-mismatch loud abort (frame.RowPK
+  disagreeing with row_json.<pk> aborts `Run` via
+  `ErrRowPKMismatch`; the replayer is never called),
+  transient verifier error abort, Replayer error
+  propagation, cancelled-ctx fast path.
+- `internal/audit/reconciler/replay_test.go` -- four
+  brief-required scenarios using a hand-rolled
+  in-memory `fakeReplayer`:
+  - `TestReconciler_ReplaysMissingRows` -- three frames
+    on disk + empty replayer -> three
+    `OutcomeInserted`.
+  - `TestReconciler_LeavesExistingRowsUntouched` --
+    pre-populate the replayer with deliberately
+    DIFFERENT field values; Run classifies every frame
+    as `OutcomeSkippedExisting` AND the pre-existing
+    values are byte-identical afterwards.
+  - `TestReconciler_PreservesCallerVerbatim` -- runs
+    once per canonical caller (`eval_gate`,
+    `batch_refresh`); asserts the replayer received the
+    caller value byte-identical to the frame.
+  - `TestReconciler_BadSignatureSkips` -- tampers every
+    frame's signature on disk; Run reports
+    `SkippedBadSig=3` and the replayer is never called.
+- `internal/composition/wal_reconciler.go` -- new
+  `composition.NewWALReconciler(ctx, WALReconcilerConfig)`
+  factory + production Verifier built around the
+  policy/keys store. Lives in `composition` (NOT
+  `reconciler`) because the conformance allow-list test
+  forbids `audit/reconciler` -> `policy/keys` imports
+  (the audit-reconciler stays decoupled from any
+  specific key store). The factory returns `(nil, nil)`
+  for scaffold-mode (nil `KeyStore`) so the binary can
+  branch on "reconciler disabled" without classifying
+  the missing dependency as an error.
+
+  Two construction paths are exposed:
+  `NewHistoricalKeysWALVerifier(ctx, store keys.Store)`
+  is the production path -- it calls `store.List(ctx)`
+  ONCE at construction and pins an in-memory
+  `map[uuid.UUID]ed25519.PublicKey` snapshot. Verify
+  performs `ed25519.Verify` directly against the
+  snapshot, so RETIRED keys still verify legitimate
+  historical frames as the brief requires.
+  `NewKeysManagerWALVerifier(m *keys.Manager)` is a
+  convenience wrapper that takes the snapshot from
+  `Manager.HistoricalKeys()` for callers that already
+  hold a Manager. Both adapters share the same
+  internal verifier type, so the sentinel matrix is
+  identical: key missing from the trusted snapshot ->
+  `reconciler.ErrSigningKeyUnknown`; sig wrong length
+  OR `ed25519.Verify == false` ->
+  `reconciler.ErrSignatureInvalid`; ctx cancelled ->
+  raw ctx.Err (abort). Any other transient
+  infrastructure failure propagates as-is so `Run`
+  aborts.
+- `internal/composition/wal_reconciler_test.go` -- pins
+  the sentinel mapping, the scaffold-mode return,
+  required-field validation, and the happy-path
+  construction.
+
+Edited files:
+
+- `internal/policy/keys/manager.go` -- added
+  `Manager.HistoricalKeys()` returning a deep-copy
+  snapshot (`[]KeyRecord` plus per-record
+  `PublicKey []byte` copy) of the cache loaded by
+  `Manager.Load`. Used by the historical-keys
+  verifier so a future `Rotate` does NOT mutate the
+  reconciler's pinned snapshot.
+- `cmd/clean-code-eval-gate/main.go` -- the
+  reconciler now runs as a BLOCKING startup step
+  ahead of `rule_engine` wiring. New env var
+  `CLEAN_CODE_WAL_RECONCILER_DSN` is REQUIRED
+  whenever signing keys are configured; if signing
+  keys are present but the DSN is missing, boot is
+  refused (`log.Fatalf`) -- a silent skip would mean
+  pending WAL frames never replay. The reconciler
+  opens its own dedicated pool authenticated as
+  `clean_code_wal_reconciler`, builds the
+  historical-keys verifier via
+  `composition.NewWALReconciler`, runs to
+  completion, logs `Stats`, and only then yields to
+  the rest of boot. On `Run` error the binary aborts.
+- `cmd/clean-code-gateway/main.go` -- same wiring as
+  eval-gate, integrated into the existing
+  error-returning `run()` flow. The reconciler runs
+  between `buildSigningKeys` and `buildProductionDeps`
+  so the gateway never starts serving requests with
+  unreplayed audit frames on disk.
+- `test/conformance/wal_scope_test.go` -- added
+  `internal/audit/reconciler` to `allowedWalImporters`
+  and documented the entry as "Stage 9.2 replay-only
+  worker; READS the WAL, never WRITES".
+- `services/clean-code/docs/runbook.md` -- new
+  "Stage 9.2 -- Audit WAL Reconciler (replay-only)"
+  section after Stage 9.1, covering the four
+  invariants, phased replay, verifier classification
+  matrix (durable-broken / signing-key-not-resolved /
+  transient-infra), Stats schema, the operator triage
+  matrix, composition wiring, blocking on-restart
+  behaviour, and the `CLEAN_CODE_WAL_RECONCILER_DSN`
+  env var.
+- `services/clean-code/docs/rollout.md` -- new
+  "Stage 9.2: Audit WAL Reconciler (replay-only)"
+  section covering the cutover steps, role posture
+  reminder, the new env var, and the boot-blocking
+  behaviour.
+- `services/clean-code/go.sum` -- `go mod tidy` after
+  the `internal/audit/reconciler` package picked up
+  `github.com/DATA-DOG/go-sqlmock` as a test
+  dependency (the module was already in `go.mod`).
 
 ## Stage 8.2 -- Refactor plan and task generation
 
@@ -839,50 +1041,273 @@ accounted for:
   49
   ```
 
-  Forty-nine `### Iter N` sub-section headers remain in
-  the file across all stages, but the FIRST one (the
-  highest-numbered iter in the Stage 7.2 block) appears
-  strictly AFTER the `## Stage 7.2` boundary. The entire
-  Stage 7.3 block above is structurally free of
-  iter-by-iter sub-sections (specific line numbers omitted
-  here so the claim does not go stale on the next edit;
-  re-run `grep -nE "^## Stage 7" services/clean-code/CHANGELOG.md`
-  and `grep -nE "^### Iter [0-9]" services/clean-code/CHANGELOG.md`
-  to confirm the first `### Iter` line is greater than the
-  `## Stage 7.2` line). The broken `#### Repo-wide grep
-  verification` sub-heading the iter-8 evaluator flagged
-  no longer exists as a heading anywhere in the file
-  (`grep -nE "^#### Repo-wide ..."` returns empty), so the
-  verification surface that produced the false-positive is
-  structurally retired.
-- [x] **3. ADDRESSED** -- Changed-file inventory mismatch.
-  Operator answer `ground-truth-file-list-reconcile`
-  explicitly relaxes this check ("Future-stage references
-  inherited from impl-plan -- not Stage 7.3 scope; relax the
-  changed-file inventory check"). Quoted and evidenced in
-  sub-section #4 above.
-- [x] **4. ADDRESSED** -- Full repository test health red
-  outside Stage 7.3. Operator answer
-  `broader-baseline-test-rot` directs Stage 7.3 to FIX all
-  four failing sibling packages, and the fixes are already
-  present at HEAD `29708dc`. Verification: all four
-  packages pass tests in the evidence block under
-  sub-section #1 above (defects, aggregator, ast/scope,
-  storage all OK). Stage 7.3 chain remains green
-  (insights/management/evaluator all OK).
+## Stage 9.1 -- Audit WAL frame writer
 
-### Prior-attempt note
+### Iter 3 -- production signer + real write/fsync-failure tests + no-kill-switch docs
 
-A previous attempt at this workstream stalled on
-operator-owned metadata issues (the workstream's open-question
-records in `.forge/memory/workstream-context.md`) and on the
-changed-file inventory mismatch between the prompt's
-ground-truth list and the branch's actual diff (the
-sibling-PR paths documented above). Both items are external
-to the engineering surface and are documented here for
-audit trail; the underlying Stage 7.3 source-code contract
-and verification trail described above are unchanged from
-that attempt and remain green.
+Closes evaluator iter-2 items 1-3: replaces the test-only
+NoopSigner in both production binaries with a real
+`policy/keys`-backed signer (Ed25519 via the KMS),
+adds REAL write/fsync-failure rollback tests (separate
+from the existing signer-failure tests), and makes the
+docs unambiguous that there is NO kill-switch path.
+
+- `internal/policy/keys/manager.go` -- new
+  `Manager.SignActive(ctx, build func(uuid.UUID)([]byte, error))
+  (uuid.UUID, []byte, error)` method that satisfies the
+  WAL writer's 2-phase callback signer contract: picks
+  the active signing key, calls `build(keyID)` to obtain
+  the canonical payload (with the keyID baked in), then
+  KMS-signs and verifies against the public key.
+- `internal/policy/keys/manager_test.go` -- new
+  `TestManager_SignActive_*` suite (4 cases) covering
+  `BindsKeyIDIntoPayload`, `NoActiveKey`,
+  `RejectsNilBuild`, `PropagatesBuildError`.
+- `internal/composition/wal_signer.go` -- new
+  `NewKeysManagerWALSigner(*keys.Manager) wal.Signer`
+  adapter. Lives in `composition` (NOT `wal`) because the
+  conformance allow-list test forbids `wal` -> `keys` imports.
+  Returns nil when the manager is nil so the binary
+  branches the scaffold-mode fallback deliberately.
+- `internal/composition/wal_signer_test.go` -- new suite
+  including an end-to-end test that writes a real WAL
+  frame via `wal.Writer` and verifies it via
+  `keys.Manager.Verify`.
+- `cmd/clean-code-eval-gate/main.go` and
+  `cmd/clean-code-gateway/main.go` -- conditional signer
+  wiring at startup: when the signing keys manager is
+  non-nil (production / KMS wired), the binary uses
+  `composition.NewKeysManagerWALSigner` to obtain a real
+  Ed25519 signer with a non-zero `signing_key_id`. When
+  the signing keys manager is nil (dev / scaffold mode),
+  the binary falls back to `wal.NoopSigner` and emits a
+  loud `WARN` log at startup. The frame format is stable
+  across both wirings.
+- `internal/rule_engine/sql_store_wal_test.go` -- new
+  `TestSQLStore_AppendEvaluation_WALFlushFailureRollsBackSQL`.
+  Pins a deterministic clock onto the `wal.Writer` and
+  pre-creates the per-day partition path AS A DIRECTORY
+  in `t.TempDir()`. The writer's `os.OpenFile(...,
+  O_CREATE|O_APPEND|O_WRONLY, ...)` then fails with a
+  real disk-write error, surfacing through
+  `TxBatch.Commit` and rolling back the SQL transaction.
+  Mock expects Begin + run + verdict + 2x finding INSERTs
+  + Rollback (NO Commit). This is distinct from the
+  pre-existing signer-failure test
+  (`TestSQLStore_AppendEvaluation_WALFsyncFailureRollsBackSQL`).
+- `internal/evaluator/sql_degraded_store_wal_test.go` --
+  new
+  `TestSQLDegradedRunStore_AppendDegradedRun_WALFlushFailureRollsBackSQL`
+  using the same directory-collision pattern. Mock
+  expects Begin + run + verdict INSERTs + Rollback.
+- `docs/rollout.md` Stage 9.1 section -- new "no kill-switch"
+  bullet in "What's new" plus a rewritten
+  "Pre-rollout: confirm WAL signer scope" section that
+  documents BOTH signer wirings (production KMS-backed
+  vs scaffold NoopSigner) and what an operator must do
+  with scaffold-mode partition files before Stage 9.2
+  ships.
+- `docs/runbook.md` "Composition wiring" subsection --
+  added explicit "No kill-switch" paragraph and rewrote
+  the signer description to cover the conditional
+  KMS-backed / NoopSigner choice.
+
+### Iter 2 -- WAL writer REQUIRED at constructors + production composition wired
+
+Closes evaluator iter-1 items 1-5: makes the WAL writer
+a hard prerequisite for every Audit-table INSERT path,
+wires it through production composition, and proves the
+contract with sqlmock + real `wal.Writer` integration
+tests.
+
+- `internal/rule_engine/sql_store.go` --
+  `SQLStoreConfig.WalWriter` is now REQUIRED.
+  `NewSQLStore` errors with
+  `"wal writer is required"` when nil; all
+  `if walBatch != nil` nil-guards dropped from
+  `WithEvaluationLock`, `AppendEvaluation`, and
+  `appendEvaluationInTx`. The Audit-write code path can
+  no longer commit SQL-only.
+- `internal/evaluator/sql_degraded_store.go` -- same
+  for `SQLDegradedRunStoreConfig.WalWriter`. The
+  degraded path (`AppendDegradedRun`) emits one
+  `evaluation_run` + one `evaluation_verdict` frame per
+  call, in canonical order, with the SQL transaction
+  rolling back on WAL fsync failure.
+- `internal/evaluator/production_gate.go` --
+  `ProductionGateConfig.WalWriter` field added,
+  threaded to `NewSQLDegradedRunStore`; nil rejected.
+- `internal/composition/eval_gate.go` --
+  `EvalGateConfig.WalWriter` field added, threaded to
+  BOTH `rule_engine.NewSQLStore` and
+  `evaluator.NewProductionGate`; nil rejected.
+  `TestBuildEvalGate_RejectsNilWalWriter` pins this.
+- `cmd/clean-code-eval-gate/main.go` and
+  `cmd/clean-code-gateway/main.go` -- both binaries
+  read `CLEAN_CODE_AUDIT_WAL_DIR` (default
+  `data/wal/audit`), construct a `wal.NewWriter` with
+  `wal.NoopSigner`, and pass it through
+  `composition.BuildEvalGate`. The KMS-backed signer is
+  deferred to Stage 9.2 (the writer's callback signer
+  contract is incompatible with the current
+  `keys.Manager.Sign(ctx, payload)->(keyID, sig)`
+  shape; adapting requires a 2-phase signing flow in
+  `keys.Manager`).
+- `internal/rule_engine/sql_store_wal_test.go` -- NEW.
+  Integration test using `go-sqlmock` + real
+  `wal.Writer` rooted at `t.TempDir()`. Two functions:
+  - `TestSQLStore_AppendEvaluation_EmitsWALFramesAroundEachInsert`:
+    asserts 4 frames (run + verdict + 2 findings) with
+    correct `Table`, `RowPK`, `Op`, and non-empty
+    `Signature` via `wal.ReadAll`.
+  - `TestSQLStore_AppendEvaluation_WALFsyncFailureRollsBackSQL`:
+    `failingSigner` errors during `StageNew`; sqlmock
+    expects `Begin -> Exec(run INSERT) -> Rollback`,
+    proving the SQL transaction NEVER commits when the
+    WAL signer fails.
+- `internal/evaluator/sql_degraded_store_wal_test.go`
+  -- NEW. Mirror of the rule_engine pair for the
+  degraded path. Asserts the run + verdict frame pair
+  AND the `degraded_reason` + `caller='eval_gate'`
+  embedding in `row_json`.
+- `internal/rule_engine/wal_test_helper_test.go`,
+  `internal/evaluator/wal_test_helper_test.go` -- NEW.
+  `newTestWALWriter(t)` helper used by all SQLStore
+  tests; constructs a `NoopSigner`-backed writer rooted
+  at `t.TempDir()`.
+- `internal/composition/composition_test.go` --
+  `TestBuildEvalGate_RejectsNilWalWriter` added.
+- `internal/evaluator/sql_degraded_store_test.go` --
+  `TestNewSQLDegradedRunStore_RejectsNilWalWriter`
+  added.
+- `docs/runbook.md`, `docs/rollout.md` -- Stage 9.1
+  sections corrected to reflect REQUIRED wiring, the
+  `CLEAN_CODE_AUDIT_WAL_DIR` env var, the NoopSigner
+  scope (KMS-backed signer arrives in 9.2), and the
+  removal of the (incorrect) "SQL-only fallback"
+  rollback path.
+
+### Iter 1 -- per-process WAL writer scoped EXCLUSIVELY to the Audit sub-store
+
+Adds `internal/audit/wal/` -- a signed, fsync-before-SQL-commit
+write-ahead log scoped EXCLUSIVELY to the three Audit tables
+(`evaluation_run`, `evaluation_verdict`, `finding`). Catalog,
+Measurement, Policy, and Refactor writes do NOT route through
+this WAL (architecture Sec 7.10 / tech-spec Sec 4.13).
+
+What landed:
+
+- `internal/audit/wal/types.go` -- `AuditFrame{frame_id, table,
+  op, row_pk, row_json, written_at, signing_key_id, signature}`,
+  closed-set `Table` / `Op` enums, `Validate()`, canonical
+  `SigningPayload()` (`audit-wal-v1\n` domain prefix +
+  unsigned-frame JSON), sentinel errors.
+- `internal/audit/wal/signer.go` -- `Signer` interface with
+  callback semantics (the keyID is hashed INTO the canonical
+  bytes BEFORE signing, so signature recomputation succeeds for
+  any production signer that returns a non-zero key id).
+  `NoopSigner` + `NoopVerify` SHA-256 stand-in for tests.
+- `internal/audit/wal/writer.go` -- `Writer` (concurrent-safe,
+  per-partition mutex serialises append+fsync), `WriterConfig`,
+  `NewWriter`, `NewFrame` (with write-time size cap matching
+  the reader's `MaxFrameSize`), `NewTxBatch` (per-tx single-use
+  staging batch), `TxBatch{Stage, StageNew, Commit, Cancel,
+  Len}`, `flush`, `encodeFrames`, `appendAndSync`. The
+  syncFile / syncDir seams are package-level vars so tests can
+  inject ENOSPC-style failures and assert the honest
+  four-state atomicity contract.
+- `internal/audit/wal/read.go` -- `ReadPartition`, `ReadAll`,
+  `isPartitionFile`, `readFrames`, `MaxFrameSize` (1 MiB),
+  `ErrTrailingPartialFrame`, `ErrFrameSizeExceeded`.
+  Trailing-partial preserves prior partitions' complete frames;
+  oversized lines surface as the dangerous sentinel BEFORE the
+  benign partial-frame check so a huge unterminated tail
+  cannot masquerade as a benign crash artifact.
+- `internal/audit/wal/writer_test.go` -- ~30 unit tests
+  covering dep validation, frame validation sweep, signer
+  round-trip with non-nil keyID, stage/commit happy path,
+  cancel-no-disk, finalised-twice, four-state atomicity matrix
+  (validation failure / WAL fsync failure / SQL commit failure
+  / happy path), concurrent commits, partition naming,
+  RoundTrip preserves bytes, encodeFrames newline-delimited,
+  NoopSigner empty-payload reject, KeyID-in-payload non-nil,
+  AppendAndSync sync-failure leaves bytes, TxBatch.Commit
+  sync-failure rollback, trailing-partial frame preservation,
+  ReadAll preserves across partial tail, FrameSizeExceeded,
+  OversizedUnterminatedTail, NewFrame rejects oversized
+  RowJSON, NewFrame accepts large-but-under-cap, encodeFrames
+  rejects oversized hand-crafted frame.
+
+Audit-writer wiring (Stage 9.1 audit-write call sites only):
+
+- `internal/rule_engine/wal_rows.go` + `wal_rows_test.go` --
+  snake_case, column-keyed JSON shapers
+  (`walEvaluationRunRowJSON`, `walEvaluationVerdictRowJSON`,
+  `walFindingRowJSON`) so the Stage 9.2 reconciler can replay
+  via the same INSERT statements. `scope_id` nullable on
+  evaluation_run, NOT NULL on finding (rejected if zero
+  UUID), `degraded_reason` empty -> JSON null (mirrors
+  `NULLIF($5, '')`), `metric_sample_ids` always JSON array
+  (never null) to match `$9::jsonb` cast.
+- `internal/rule_engine/sql_store.go` -- `SQLStore` gains
+  optional `walWriter *wal.Writer` + `WalWriter` config
+  field. `WithEvaluationLock` allocates a per-tx batch via
+  `walWriter.NewTxBatch()`, passes it through `txStore`,
+  and calls `batch.Commit(ctx)` AFTER `fn` returns
+  successfully but BEFORE `tx.Commit()`. The direct
+  `AppendEvaluation` path mirrors the same lifecycle.
+  `appendEvaluationInTx` accepts a nil-safe
+  `*wal.TxBatch`; after each INSERT it stages the
+  corresponding frame.
+- `internal/rule_engine/tx_store.go` -- `txStore` gains
+  `walBatch *wal.TxBatch` and forwards it to
+  `appendEvaluationInTx`.
+- `internal/evaluator/wal_rows.go` + `wal_rows_test.go` --
+  degraded-path row shapers (`walDegradedRunRowJSON` with
+  hard-coded `caller="eval_gate"`, `walDegradedVerdictRowJSON`
+  with required non-empty `degraded_reason`).
+- `internal/evaluator/sql_degraded_store.go` --
+  `SQLDegradedRunStore` gains optional `walWriter`. The
+  degraded-path tx allocates a batch, stages run + verdict
+  frames, calls `batch.Commit(ctx)` immediately before
+  `tx.Commit()`.
+
+Conformance:
+
+- `test/conformance/wal_scope_test.go` -- import-graph linter
+  walks `go list -deps -json` and asserts only the allow-list
+  packages import `internal/audit/wal`: the wal package
+  itself, evaluator, rule_engine, composition, the two
+  binaries (`cmd/clean-code-eval-gate`,
+  `cmd/clean-code-gateway`), and test/conformance. A new
+  importer is a brief-level design change, not a PR-level
+  decision.
+
+Honest atomicity contract: the writer writes bytes BEFORE
+fsync, so a successful `write(2)` followed by a failing
+`fsync(2)` leaves the bytes readable on disk. The writer
+does NOT truncate-back -- that pattern is racy against a
+sibling writer that has already appended past the failure
+point. The Stage 9.2 reconciler closes the loop by replaying
+speculative frames idempotently keyed on `(table, row_pk)`.
+Tests `TestAppendAndSync_SyncFailure_LeavesBytesOnDisk` and
+`TestTxBatch_Commit_SyncFailure_TxRollback` pin this
+behaviour against future "fix" attempts.
+
+Baseline build issues fixed in passing (NOT in scope for this
+brief but necessary for `go build ./...` to exit 0):
+
+- `services/clean-code/go.mod`: module name normalised to
+  `github.com/smartpcr/code-intelligence/services/clean-code`
+  (every source file already imports this path; the prior
+  base-branch `forge/services/clean-code` module name didn't
+  match).
+- `services/clean-code/internal/metrics/recipes/pack.go`:
+  replaced 22-line duplicate-decl with 7-line inert stub
+  so `recipe.go` becomes the canonical declaration site.
+- `services/clean-code/internal/aggregator/system_tier.go`
+  + `services/clean-code/test/e2e/code-intelligence-CLEAN-CODE/cross_repo_aggregator_system_tier_metric_composer_steps.go`:
+  import path fixes to match the normalised module name.
 
 ## Stage 7.2 -- System tier metric composer
 

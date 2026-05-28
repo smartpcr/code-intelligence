@@ -35,31 +35,36 @@ package ast
 //     file header of parser_treesitter_c.go for the scope
 //     split rationale and merge story).
 //   - stage-4.1-csharptreesitterparser-implementation owns
-//     parser_treesitter_csharp.go; will add
-//     NewTreeSitterCSharpParser() to this registration list.
+//     parser_treesitter_csharp.go; this stage now ships a
+//     `NewTreeSitterCSharpParser()` STUB analogous to the C
+//     stub (see iter-9 fix), which the sibling stage will
+//     replace in place.
 //   - stage-5.1-rusttreesitterparser-implementation owns
 //     parser_treesitter_rust.go; will add
 //     NewTreeSitterRustParser() to this registration list.
 //   - stage-6.1-powershellparser-subprocess-implementation
 //     owns the PowerShell scanner/subprocess parser.
 //
-// This file registers TypeScript, Python, Go, and a C
-// placeholder. The C registration is INTENTIONAL even though
-// the walker is a stub: keeping the public symbol
-// `NewTreeSitterCParser` reachable from this list (a) gives
-// the dispatcher a stable `.c` / `.h` route so projects with
-// C sources don't emit `ast.dispatch.skip{reason="no_parser"}`
-// noise while waiting for the sibling C/C++ stage to merge,
-// and (b) reconciles the ground-truth Target Files list with
-// the actual code -- iter 6 / iter 7 evaluator items 1, 2, 3
-// all flagged the absence of this registration. C++, C#, Rust,
-// PowerShell stay unregistered here until their sibling stages
-// merge their real implementations.
+// This file registers TypeScript, Python, Go, and stubs for
+// C and C#. The C / C# stub registrations are INTENTIONAL even
+// though the walkers are placeholders: keeping the public
+// symbols `NewTreeSitterCParser` and `NewTreeSitterCSharpParser`
+// reachable from this list (a) gives the dispatcher stable
+// `.c` / `.h` and `.cs` routes so projects with C / C# sources
+// don't emit `ast.dispatch.skip{reason="no_parser"}` noise
+// while waiting for the sibling stages to merge, and (b)
+// reconciles the ground-truth Target Files list with the
+// actual code -- iter 6 / iter 7 evaluator items 1-3 (C) and
+// iter 8 evaluator items 1-2 (C#) all flagged the absence of
+// these registrations. C++, Rust, and PowerShell stay
+// unregistered here until their sibling stages merge their
+// real implementations.
 func defaultParsers() []LanguageParser {
 	return []LanguageParser{
 		NewTreeSitterTypeScriptParser(),
 		NewTreeSitterPythonParser(),
 		NewTreeSitterGoParser(),
 		NewTreeSitterCParser(),
+		NewTreeSitterCSharpParser(),
 	}
 }

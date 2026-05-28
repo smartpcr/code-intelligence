@@ -1,16 +1,17 @@
-module github.com/microsoft/code-intelligence/services/clean-code
+module github.com/smartpcr/code-intelligence/services/clean-code
 
 go 1.25.1
 
 require (
+	github.com/DATA-DOG/go-sqlmock v1.5.0
 	github.com/cucumber/godog v0.15.1
+	github.com/gofrs/uuid v4.3.1+incompatible
 	github.com/lib/pq v1.12.3
 )
 
 require (
 	github.com/cucumber/gherkin/go/v26 v26.2.0 // indirect
 	github.com/cucumber/messages/go/v21 v21.0.1 // indirect
-	github.com/gofrs/uuid v4.3.1+incompatible // indirect
 	github.com/hashicorp/go-immutable-radix v1.3.1 // indirect
 	github.com/hashicorp/go-memdb v1.3.4 // indirect
 	github.com/hashicorp/golang-lru v0.5.4 // indirect

@@ -146,25 +146,142 @@ func TestReconciler_PreservesScopeIDNullable(t *testing.T) {
 // before ANY verdict / finding frame so a corrupted
 // partition that has a finding ahead of its owning run
 // still satisfies the FK constraint on PG.
+//
+// THE LOAD-BEARING PART OF THIS TEST is the on-disk
+// reorder: `stageFrames` writes run -> verdict -> finding
+// in canonical order, which is the same order
+// [wal.ReadAll] returns the frames in. If the reconciler
+// simply iterated `frames` in order, dispatchOrder[0]
+// would be "run" trivially. To prove the phased-replay
+// invariant we re-read the staged frames, REWRITE the
+// partition file with verdict + finding BEFORE run, and
+// only THEN call Run -- dispatchOrder[0] == "run" can
+// only hold because phase 1 picks runs first.
 func TestReconciler_PhasedReplay_RunFramesBeforeVerdictsAndFindings(t *testing.T) {
 	t.Parallel()
 	staged := stageFrames(t, "eval_gate")
+
+	// Re-read every staged frame, then rewrite the
+	// partition in REVERSE (finding -> verdict -> run)
+	// so the on-disk order is the WORST case for FK
+	// ordering. wal.ReadAll preserves on-disk order;
+	// reconciler.Run's phased pass is the ONLY thing
+	// that can recover the run-first dispatch order.
+	frames, err := wal.ReadAll(staged.dir)
+	if err != nil {
+		t.Fatalf("ReadAll staged frames: %v", err)
+	}
+	if len(frames) != 3 {
+		t.Fatalf("ReadAll: got %d frames want 3", len(frames))
+	}
+	// Validate our assumption: stageFrames writes
+	// run -> verdict -> finding in that order.
+	if frames[0].Table != wal.TableEvaluationRun {
+		t.Fatalf("stageFrames precondition: frames[0].Table = %s want %s",
+			frames[0].Table, wal.TableEvaluationRun)
+	}
+	// Reverse the slice so the on-disk order is now
+	// finding -> verdict -> run. A naive "iterate in
+	// file order" reconciler would dispatch the finding
+	// first and immediately hit the FK constraint on PG
+	// (no parent run row yet).
+	reordered := []wal.AuditFrame{frames[2], frames[1], frames[0]}
+	if reordered[0].Table != wal.TableFinding {
+		t.Fatalf("post-reorder: frames[0].Table = %s want %s",
+			reordered[0].Table, wal.TableFinding)
+	}
+	if reordered[2].Table != wal.TableEvaluationRun {
+		t.Fatalf("post-reorder: frames[2].Table = %s want %s",
+			reordered[2].Table, wal.TableEvaluationRun)
+	}
+
+	// Rewrite the single partition file with the
+	// reversed frame order. Group by date so the
+	// rewrite key matches stageFrames' single-day
+	// commit (the staged frames all share one
+	// WrittenAt date because they came from one batch).
+	type group struct {
+		path   string
+		frames []wal.AuditFrame
+	}
+	groups := map[string]*group{}
+	for _, f := range reordered {
+		date := f.WrittenAt.UTC().Format("2006-01-02")
+		path := filepath.Join(staged.dir, date+".wal")
+		g, ok := groups[date]
+		if !ok {
+			g = &group{path: path}
+			groups[date] = g
+		}
+		g.frames = append(g.frames, f)
+	}
+	for _, g := range groups {
+		var buf []byte
+		for _, fr := range g.frames {
+			b, jerr := json.Marshal(fr)
+			if jerr != nil {
+				t.Fatalf("marshal frame: %v", jerr)
+			}
+			buf = append(buf, b...)
+			buf = append(buf, '\n')
+		}
+		if werr := os.WriteFile(g.path, buf, 0o644); werr != nil {
+			t.Fatalf("rewrite partition: %v", werr)
+		}
+	}
+
+	// Re-verify that the on-disk order is indeed
+	// reversed BEFORE we hand control to the
+	// reconciler. This guards against a future
+	// stageFrames refactor that defeats the reorder.
+	postReorder, err := wal.ReadAll(staged.dir)
+	if err != nil {
+		t.Fatalf("ReadAll post-reorder: %v", err)
+	}
+	if len(postReorder) != 3 {
+		t.Fatalf("post-reorder ReadAll: got %d frames want 3", len(postReorder))
+	}
+	if postReorder[0].Table != wal.TableFinding {
+		t.Fatalf("post-reorder disk order: frames[0].Table = %s want %s (reorder failed)",
+			postReorder[0].Table, wal.TableFinding)
+	}
+
 	fake := newFakeReplayer()
 	r, _ := NewReconciler(Config{
 		Dir:      staged.dir,
-		Verifier: NoopSignerVerifier{},
+		Verifier: alwaysValidVerifier{}, // bypass sig check for reordered raw bytes
 		Replayer: fake,
 	})
 	if _, err := r.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	// First dispatch MUST be "run", regardless of WAL
-	// order, because phase 1 picks runs first.
+	// Phase 1 picks runs first regardless of disk
+	// order. Even though the partition reads
+	// finding -> verdict -> run, the dispatcher MUST
+	// call ReplayEvaluationRun BEFORE either of the
+	// downstream replayers -- otherwise an out-of-order
+	// recovery against PG would hit the FK constraint
+	// on evaluation_verdict.evaluation_run_id and
+	// finding.evaluation_run_id.
 	if len(fake.dispatchOrder) != 3 {
 		t.Fatalf("dispatchOrder: got %v want 3 entries", fake.dispatchOrder)
 	}
 	if fake.dispatchOrder[0] != "run" {
-		t.Fatalf("dispatchOrder[0]: got %q want %q", fake.dispatchOrder[0], "run")
+		t.Fatalf("dispatchOrder[0]: got %q want %q (phase-1-runs-first defeated by on-disk reorder)",
+			fake.dispatchOrder[0], "run")
+	}
+	// Phase 2 picks verdict + finding in the order
+	// they appear in the (reordered) post-pass-1
+	// frames slice. The exact order of [1] vs [2] is
+	// not contractually pinned -- the FK protection
+	// only requires that BOTH downstream rows fire
+	// after the run row. Assert both remaining slots
+	// are non-run to keep the assertion future-proof.
+	for i := 1; i < 3; i++ {
+		if fake.dispatchOrder[i] == "run" {
+			t.Fatalf("dispatchOrder[%d]: got %q; phase 1 emitted more than one run-row dispatch",
+				i, fake.dispatchOrder[i])
+		}
 	}
 }
 

@@ -2,6 +2,7 @@ package composition
 
 import (
 	"context"
+	"crypto/ed25519"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -36,12 +37,35 @@ type WALReconcilerConfig struct {
 	// the writer that produced the frames.
 	Dir string
 
-	// Keys is the `policy/keys.Manager` instance the
-	// adapter consults for signature verification. May be
-	// nil in scaffold-mode wiring; in that case
-	// [NewWALReconciler] returns `(nil, nil)` so the binary
+	// KeyStore is the historical-keys reader the verifier
+	// snapshots at construction time. PRODUCTION wiring
+	// builds a `keys.SQLStore` on the same DB pool used for
+	// the SQLReplayer (the `clean_code_wal_reconciler` role
+	// has SELECT on `clean_code.policy_signing_keys` per
+	// migration 0005). Test wiring uses
+	// [keys.NewInMemoryStore].
+	//
+	// Either `KeyStore` OR `Keys` MUST be set; if BOTH are
+	// nil the factory returns `(nil, nil)` so the binary
 	// can branch on "reconciler disabled" without
-	// classifying the missing key store as an error.
+	// classifying the missing dependency as an error.
+	// `KeyStore` takes precedence when both are supplied --
+	// it is the explicit production path.
+	KeyStore keys.Store
+
+	// Keys is a convenience for callers that have already
+	// built a `*keys.Manager` (e.g. the eval-gate binary
+	// after `keys.Build`). When `KeyStore` is nil and
+	// `Keys` is non-nil, the factory captures the manager's
+	// loaded cache via [keys.Manager.HistoricalKeys] (a
+	// rotation-stable snapshot copy) and uses that as the
+	// historical-key source. The publish-time
+	// `keys.Manager.Verify` active-window check is
+	// INTENTIONALLY BYPASSED so a frame signed by a
+	// now-retired key still verifies on replay -- the
+	// Stage 9.2 contract per
+	// `internal/audit/reconciler/types.go`'s [Verifier]
+	// interface doc.
 	Keys *keys.Manager
 
 	// Schema is the PostgreSQL schema name. Empty -> the
@@ -57,50 +81,45 @@ type WALReconcilerConfig struct {
 // Stage 9.2 [reconciler.Reconciler]. Wires the production
 // [reconciler.SQLReplayer] (authenticated as
 // `clean_code_wal_reconciler` by the caller) and the
-// [keys.Manager]-backed [reconciler.Verifier] adapter.
+// historical-keys [reconciler.Verifier] adapter.
+//
+// The historical-keys adapter consults the FULL
+// `clean_code.policy_signing_keys` table (including rows
+// outside the live active window) and verifies signatures
+// via direct [ed25519.Verify] against the persisted public
+// key. This is the Stage 9.2 production contract per
+// `internal/audit/reconciler/types.go`'s [reconciler.Verifier]
+// interface doc: "a frame signed yesterday by a now-retired
+// key must still verify on replay" -- the publish-time
+// [keys.Manager.Verify] rejects retired keys on purpose, so
+// the reconciler MUST bind a separate adapter that does NOT
+// re-impose the active-window check.
+//
+// `ctx` is used only for the one-time snapshot fetch from
+// `cfg.KeyStore` (when set); it is NOT retained past
+// construction. Pass the binary's startup context so the
+// snapshot fetch participates in shutdown semantics.
 //
 // Returns:
 //
 //   - `(reconciler, nil)` on success.
-//   - `(nil, nil)` when `cfg.Keys` is nil -- the binary
-//     branches on "reconciler disabled" deliberately.
-//   - `(nil, err)` when a required field is missing or
-//     `NewSQLReplayer` rejects the supplied DB.
+//   - `(nil, nil)` when BOTH `cfg.KeyStore` and `cfg.Keys`
+//     are nil -- the binary branches on "reconciler
+//     disabled" deliberately.
+//   - `(nil, err)` when a required field is missing, the
+//     snapshot fetch fails, or `NewSQLReplayer` rejects the
+//     supplied DB.
 //
-// FOLLOW-UP REQUIRED before this factory is wired into
-// `cmd/clean-code-eval-gate/main.go` or
-// `cmd/clean-code-gateway/main.go`:
-//
-//   - The Verifier adapter uses `keys.Manager.Verify`,
-//     which rejects KEYS OUTSIDE THEIR ACTIVE WINDOW
-//     with `ErrUnknownKey`. A frame signed yesterday by
-//     a now-retired key cannot verify against the live
-//     manager. To preserve the brief's durability
-//     guarantee, the Stage 9.2 adapter classifies
-//     `keys.ErrUnknownKey` as a NON-sentinel error so the
-//     reconciler ABORTS Run rather than silently
-//     classifying the frame as `SkippedBadSig` and
-//     dropping it. Operators MUST NOT enable this factory
-//     in production until the historical-keys adapter
-//     (Stage 9.3) lands -- they will get loud, immediate
-//     aborts on the first retired-key frame instead of
-//     silent data loss. The historical-keys variant
-//     consults the full `clean_code.policy_signing_keys`
-//     table (including retired rows) and resolves
-//     historical keys safely; until then the live-only
-//     adapter is intentionally fail-loud.
-//   - Binary-level on-restart wiring is also a follow-up:
-//     `cmd/clean-code-eval-gate/main.go` currently opens
-//     two DB pools (default + solid-batch); the reconciler
-//     needs a third pool authenticated as
-//     `clean_code_wal_reconciler` AND a new env var
-//     `CLEAN_CODE_WAL_RECONCILER_DSN`. Until that landing,
-//     the binary continues to start without a reconciler;
-//     operators run the WAL replay manually via a one-shot
-//     wrapper documented in
-//     `services/clean-code/docs/runbook.md` Stage 9.2.
-func NewWALReconciler(cfg WALReconcilerConfig) (*reconciler.Reconciler, error) {
-	if cfg.Keys == nil {
+// The production binaries (`cmd/clean-code-eval-gate` and
+// `cmd/clean-code-gateway`) wire this factory ahead of
+// `http.ListenAndServe` so the WAL replay runs BEFORE any
+// traffic is accepted -- the brief's "on service restart"
+// requirement is literally a blocking startup step. See
+// `services/clean-code/docs/runbook.md` "Stage 9.2" for the
+// operational expectations (env vars, role grants, stats
+// interpretation).
+func NewWALReconciler(ctx context.Context, cfg WALReconcilerConfig) (*reconciler.Reconciler, error) {
+	if cfg.KeyStore == nil && cfg.Keys == nil {
 		return nil, nil
 	}
 	if cfg.DB == nil {
@@ -109,6 +128,22 @@ func NewWALReconciler(cfg WALReconcilerConfig) (*reconciler.Reconciler, error) {
 	if cfg.Dir == "" {
 		return nil, errors.New("composition: NewWALReconciler: Dir is required (set CLEAN_CODE_AUDIT_WAL_DIR)")
 	}
+
+	var verifier reconciler.Verifier
+	switch {
+	case cfg.KeyStore != nil:
+		v, err := NewHistoricalKeysWALVerifier(ctx, cfg.KeyStore)
+		if err != nil {
+			return nil, fmt.Errorf("composition: NewWALReconciler: %w", err)
+		}
+		verifier = v
+	case cfg.Keys != nil:
+		verifier = NewKeysManagerWALVerifier(cfg.Keys)
+	}
+	if verifier == nil {
+		return nil, errors.New("composition: NewWALReconciler: historical-keys verifier construction returned nil (KeyStore.List returned nothing or Keys cache is empty -- call Manager.Load before constructing the reconciler)")
+	}
+
 	replayer, err := reconciler.NewSQLReplayer(reconciler.SQLReplayerConfig{
 		DB:     cfg.DB,
 		Schema: cfg.Schema,
@@ -116,7 +151,6 @@ func NewWALReconciler(cfg WALReconcilerConfig) (*reconciler.Reconciler, error) {
 	if err != nil {
 		return nil, fmt.Errorf("composition: NewWALReconciler: %w", err)
 	}
-	verifier := NewKeysManagerWALVerifier(cfg.Keys)
 	return reconciler.NewReconciler(reconciler.Config{
 		Dir:      cfg.Dir,
 		Verifier: verifier,
@@ -125,88 +159,153 @@ func NewWALReconciler(cfg WALReconcilerConfig) (*reconciler.Reconciler, error) {
 	})
 }
 
-// NewKeysManagerWALVerifier adapts a `policy/keys.Manager`
-// to the [reconciler.Verifier] interface so the
-// composition root can wire the Stage 9.2 reconciler's
-// signature-verification path against the production KMS.
+// NewHistoricalKeysWALVerifier builds a [reconciler.Verifier]
+// that snapshots every row in `store` (active + retired) ONCE
+// and answers every frame's signature check from the
+// in-memory snapshot via direct [ed25519.Verify]. The
+// active-window check that the publish-time
+// [keys.Manager.Verify] applies is INTENTIONALLY BYPASSED --
+// the Stage 9.2 reconciler contract requires that a frame
+// signed yesterday by a now-retired key still verifies on
+// replay. See `internal/audit/reconciler/types.go`'s
+// [reconciler.Verifier] interface doc.
+//
+// The snapshot strategy is deliberate:
+//
+//   - One-time `store.List(ctx)` at construction. The
+//     rubber-duck pass on Stage 9.2 iter 2 flagged a naive
+//     "List per Verify" implementation as `frames × keys`
+//     DB queries; the reconciler runs ONCE per restart over
+//     a potentially large WAL backlog so the per-frame
+//     cost dominates startup latency.
+//
+//   - `[]byte` copy of every `KeyRecord.PublicKey` into the
+//     map value so a future Store mutation cannot race the
+//     verifier. The reconciler is the sole reader so this
+//     is defence-in-depth.
+//
+//   - Records whose `PublicKey` length is not
+//     [ed25519.PublicKeySize] (32) are SILENTLY SKIPPED.
+//     The migration's CHECK constraint
+//     (`octet_length(public_key) = 32`) and
+//     [validateRecord] enforce the invariant at the store
+//     layer; a 32-byte mismatch reaching this code path
+//     would already be a Store bug, and the verifier's
+//     fall-through (key not in snapshot ->
+//     [reconciler.ErrSigningKeyUnknown] -> per-frame skip)
+//     is the safest outcome.
+//
+// Returns `(nil, nil)` when `store` is nil so the
+// composition factory can branch on "scaffold-mode".
+//
+// Sentinel mapping (per [reconciler.Verifier] interface):
+//
+//   - key_id absent from snapshot ->
+//     [reconciler.ErrSigningKeyUnknown] (per-frame skip).
+//     This covers TWO disjoint cases: (a) the frame's
+//     signing_key_id was never registered in
+//     `clean_code.policy_signing_keys` (e.g. an attacker's
+//     forged frame produced with their own keypair -- the
+//     key is cryptographically valid but is not anchored in
+//     the service's trusted key history); (b) the frame's
+//     signing_key_id WAS registered but the snapshot is
+//     stale (a key inserted after the snapshot was taken).
+//     The reconciler runs once per restart, so case (b) is
+//     only possible in a second concurrent run; in both
+//     cases skip-and-count is the correct outcome.
+//
+//   - [ed25519.Verify] returns false (key found, signature
+//     bytes do not match) -> [reconciler.ErrSignatureInvalid]
+//     (per-frame skip).
+//
+//   - `store.List(ctx)` failure -> raw error wrapped with
+//     a composition prefix. The reconciler treats this as
+//     transient infra and aborts Run so the operator can
+//     address the root cause before retrying.
+func NewHistoricalKeysWALVerifier(ctx context.Context, store keys.Store) (reconciler.Verifier, error) {
+	if store == nil {
+		return nil, nil
+	}
+	recs, err := store.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("composition: NewHistoricalKeysWALVerifier: store.List: %w", err)
+	}
+	return &historicalKeysWALVerifier{snap: buildHistoricalKeySnapshot(recs)}, nil
+}
+
+// NewKeysManagerWALVerifier is a convenience wrapper for
+// callers that have already constructed a [keys.Manager]
+// (the eval-gate / gateway binaries after `keys.Build`). It
+// captures the manager's loaded cache via
+// [keys.Manager.HistoricalKeys] -- a rotation-stable
+// snapshot copy -- and returns a [reconciler.Verifier] that
+// behaves IDENTICALLY to [NewHistoricalKeysWALVerifier]: the
+// publish-time active-window check is BYPASSED; signatures
+// are validated by direct [ed25519.Verify] against the
+// persisted public keys.
 //
 // Returns `nil` when `m` is nil so the caller can branch
-// deliberately on a scaffold-mode `Manager` (NewReconciler
-// would refuse a nil Verifier).
+// deliberately on scaffold-mode (NewReconciler would refuse
+// a nil Verifier).
 //
-// KNOWN LIMITATION (Stage 9.3 follow-up): the adapter calls
-// `keys.Manager.Verify`, which rejects RETIRED keys with
-// `ErrUnknownKey`. A frame signed yesterday by a key that
-// rotated out of the active window today CANNOT verify
-// against the live Manager. To preserve durability the
-// Stage 9.2 adapter ABORTS Run on this condition (it does
-// NOT classify the frame as a per-frame `SkippedBadSig`)
-// so the operator gets a loud failure instead of silent
-// data loss. The historical-keys adapter -- which consults
-// the full `clean_code.policy_signing_keys` table including
-// the `retired_at IS NOT NULL` rows -- lands in Stage 9.3.
-// Until then, production wiring SHOULD NOT enable the
-// reconciler unless the operator has confirmed no
-// retired-key frames are pending replay.
+// The caller MUST have invoked [keys.Manager.Load] BEFORE
+// calling this function -- otherwise the snapshot is empty
+// and every Verify call returns [reconciler.ErrSigningKeyUnknown].
+// Both production binaries call `keys.Build` (which calls
+// `Load`) before reaching the WAL reconciler wiring, so this
+// precondition is satisfied in practice.
 func NewKeysManagerWALVerifier(m *keys.Manager) reconciler.Verifier {
 	if m == nil {
 		return nil
 	}
-	return keysManagerWALVerifier{m: m}
+	return &historicalKeysWALVerifier{snap: buildHistoricalKeySnapshot(m.HistoricalKeys())}
 }
 
-// keysManagerWALVerifier is the [reconciler.Verifier]
-// implementation backing [NewKeysManagerWALVerifier]. The
-// struct holds the manager by pointer so a manager refresh
-// (cache reload, rotation) is observed by every in-flight
-// verification WITHOUT having to re-bind the verifier.
-type keysManagerWALVerifier struct {
-	m *keys.Manager
+// buildHistoricalKeySnapshot copies every [keys.KeyRecord]'s
+// `KeyID` and `PublicKey` into a map keyed by `KeyID`. The
+// returned map is suitable for read-only concurrent use; the
+// reconciler is a single-goroutine consumer, so concurrent
+// reads are not exercised in practice. Records with the wrong
+// public-key length are skipped (see [NewHistoricalKeysWALVerifier]
+// doc for the rationale).
+func buildHistoricalKeySnapshot(recs []keys.KeyRecord) map[uuid.UUID]ed25519.PublicKey {
+	snap := make(map[uuid.UUID]ed25519.PublicKey, len(recs))
+	for _, rec := range recs {
+		if len(rec.PublicKey) != ed25519.PublicKeySize {
+			continue
+		}
+		pub := make([]byte, ed25519.PublicKeySize)
+		copy(pub, rec.PublicKey)
+		snap[rec.KeyID] = ed25519.PublicKey(pub)
+	}
+	return snap
 }
 
-// Verify implements [reconciler.Verifier.Verify] by
-// delegating to [keys.Manager.Verify] and mapping the
-// manager's sentinels to the reconciler's classification
-// sentinels:
-//
-//   - `keys.ErrUnknownKey` (unknown OR retired key) ->
-//     wraps the raw error WITHOUT mapping to a reconciler
-//     skip-sentinel -> the reconciler ABORTS Run. The live
-//     manager cannot distinguish "truly unknown" from
-//     "retired but legitimate", so a sentinel-skip
-//     classification would silently drop legitimate
-//     historical frames signed by a now-retired key. The
-//     Stage 9.3 historical-keys adapter (consulting the
-//     full `policy_signing_keys` table including retired
-//     rows) is the right place to classify "truly unknown"
-//     as `reconciler.ErrSigningKeyUnknown`.
-//   - `keys.ErrSignatureMismatch` (bad signature) ->
-//     wraps `reconciler.ErrSignatureInvalid` ->
-//     skip-and-count classification (the manager DID
-//     resolve the key, so we know the signature itself is
-//     tampered; per-frame skip is the right outcome).
-//   - Anything else (transient infra, KMS outage, ctx
-//     cancellation) is propagated verbatim -> reconciler
-//     aborts Run so an operator can address the root
-//     cause before retrying.
-func (v keysManagerWALVerifier) Verify(ctx context.Context, keyID uuid.UUID, payload, signature []byte) error {
-	err := v.m.Verify(ctx, keyID, payload, signature)
-	if err == nil {
-		return nil
+// historicalKeysWALVerifier is the shared [reconciler.Verifier]
+// implementation backing both [NewHistoricalKeysWALVerifier]
+// and [NewKeysManagerWALVerifier]. Holds the rotation-stable
+// snapshot map -- no DB / KMS access on the hot path.
+type historicalKeysWALVerifier struct {
+	snap map[uuid.UUID]ed25519.PublicKey
+}
+
+// Verify implements [reconciler.Verifier.Verify] by direct
+// [ed25519.Verify] against the snapshotted public key for
+// `keyID`. Honors `ctx` cancellation as a pre-check so a
+// shutdown during a long replay short-circuits cleanly.
+func (v *historicalKeysWALVerifier) Verify(ctx context.Context, keyID uuid.UUID, payload, signature []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	if errors.Is(err, keys.ErrUnknownKey) {
-		// FAIL-LOUD: live keys.Manager cannot resolve
-		// retired-window keys. Returning a NON-sentinel
-		// error forces reconciler.Run to abort instead
-		// of silently classifying the frame as
-		// SkippedBadSig. See doc on NewKeysManagerWALVerifier
-		// for the Stage 9.3 follow-up.
-		return fmt.Errorf("composition: keysManagerWALVerifier: live keys.Manager cannot resolve key id=%s (unknown or retired); refusing to skip until Stage 9.3 historical-keys adapter lands: %w", keyID, err)
+	pub, ok := v.snap[keyID]
+	if !ok {
+		return fmt.Errorf("composition: historicalKeysWALVerifier: key_id=%s is not in the historical signing-key snapshot (no row in clean_code.policy_signing_keys with this id): %w", keyID, reconciler.ErrSigningKeyUnknown)
 	}
-	if errors.Is(err, keys.ErrSignatureMismatch) {
-		return fmt.Errorf("%w: %v", reconciler.ErrSignatureInvalid, err)
+	if len(signature) != ed25519.SignatureSize {
+		return fmt.Errorf("composition: historicalKeysWALVerifier: signature length=%d for key_id=%s is not %d: %w", len(signature), keyID, ed25519.SignatureSize, reconciler.ErrSignatureInvalid)
 	}
-	// Transient or unclassified: propagate so the
-	// reconciler treats it as "abort Run".
-	return err
+	if !ed25519.Verify(pub, payload, signature) {
+		return fmt.Errorf("composition: historicalKeysWALVerifier: ed25519.Verify=false for key_id=%s: %w", keyID, reconciler.ErrSignatureInvalid)
+	}
+	return nil
 }

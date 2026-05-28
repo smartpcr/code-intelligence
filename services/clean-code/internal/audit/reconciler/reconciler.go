@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/gofrs/uuid"
 
@@ -366,18 +367,35 @@ func tallyOutcome(stats *Stats, t wal.Table, outcome Outcome) {
 // column on replay. The WAL is the durability source of
 // truth; partial replays would betray the brief's "replay
 // missing rows" guarantee.
+//
+// The second [json.Decoder.Decode] call is a defence
+// against concatenated-row injection. Three outcomes:
+//
+//   - `err == nil` -- another JSON value followed the
+//     expected object; reject with a "trailing JSON" error.
+//   - `errors.Is(err, io.EOF)` -- exactly one object was on
+//     the wire; this is the success path.
+//   - any other error -- malformed bytes followed the
+//     expected object (e.g. an unbalanced brace or a
+//     control character). The PRE-iter-2 implementation
+//     swallowed these errors as success; the evaluator
+//     caught the bug. We now propagate as a malformed-
+//     trailing-content failure so the reconciler aborts on
+//     a frame whose row_json carries garbage after the
+//     well-formed prefix.
 func decodeStrict(data []byte, dst any) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		return err
 	}
-	// Ensure there is no trailing JSON content past the
-	// expected object -- another defence against
-	// concatenated-row injection.
 	var tail json.RawMessage
-	if err := dec.Decode(&tail); err == nil {
+	err := dec.Decode(&tail)
+	if err == nil {
 		return fmt.Errorf("reconciler: decodeStrict: unexpected trailing JSON content")
+	}
+	if !errors.Is(err, io.EOF) {
+		return fmt.Errorf("reconciler: decodeStrict: malformed trailing content after expected object: %w", err)
 	}
 	return nil
 }

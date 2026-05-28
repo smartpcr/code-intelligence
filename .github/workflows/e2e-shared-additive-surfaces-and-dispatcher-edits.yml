@@ -6,8 +6,11 @@ on:
       - feature/memory
       - "ws/code-intelligence-AST-PARSER-FOR-ADDIT/**"
     paths:
+      - "services/agent-memory/migrations/**"
       - "services/agent-memory/internal/repoindexer/ast/**"
       - "services/agent-memory/test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/**"
+      - "services/agent-memory/go.mod"
+      - "services/agent-memory/go.sum"
       - "tests/e2e/phase-1-shared-additive-surfaces/**"
       - ".github/workflows/e2e-shared-additive-surfaces-and-dispatcher-edits.yml"
   push:
@@ -15,6 +18,7 @@ on:
       - feature/memory
       - "ws/code-intelligence-AST-PARSER-FOR-ADDIT/**"
     paths:
+      - "services/agent-memory/migrations/**"
       - "services/agent-memory/internal/repoindexer/ast/**"
       - "services/agent-memory/test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/**"
       - "tests/e2e/phase-1-shared-additive-surfaces/**"

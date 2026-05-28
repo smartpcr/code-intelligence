@@ -1,13 +1,18 @@
 trigger:
   paths:
+    - "services/agent-memory/migrations/**"
     - "services/agent-memory/internal/repoindexer/ast/**"
     - "services/agent-memory/test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/**"
+    - "services/agent-memory/go.mod"
+    - "services/agent-memory/go.sum"
     - "tests/e2e/phase-1-shared-additive-surfaces/**"
 
 pr:
   paths:
+    - "services/agent-memory/migrations/**"
     - "services/agent-memory/internal/repoindexer/ast/**"
     - "services/agent-memory/test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/**"
+
 
 pool:
   vmImage: "ubuntu-latest"

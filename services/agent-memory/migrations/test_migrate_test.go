@@ -189,7 +189,13 @@ func TestUp_appliesEntireStage12_andEveryExpectedObjectExists(t *testing.T) {
 	wantEnums := map[string][]string{
 		// Architecture-level enums (tech-spec §8.7.1).
 		"node_kind":        {"repo", "package", "file", "class", "method", "block"},
-		"edge_kind":        {"contains", "imports", "static_calls", "observed_calls", "extends", "implements", "reads", "writes", "renamed_to"},
+		// `overrides` is appended by migration 0022_edge_kind_overrides.sql
+		// (AST-PARSER-FOR-ADDIT Stage 1.2; architecture §4.4 + §9 R4).
+		// pg_enum.enumsortorder places ALTER TYPE ADD VALUE additions at
+		// the end of the existing closed-set list, so the new label must
+		// appear LAST here -- any other position would mean the
+		// migration silently drifted from "monotonically appended".
+		"edge_kind":        {"contains", "imports", "static_calls", "observed_calls", "extends", "implements", "reads", "writes", "renamed_to", "overrides"},
 		"episode_kind":     {"agent", "feedback", "synthetic_positive"},
 		"outcome":          {"success", "failure", "refused", "degraded", "human_corrected"},
 		"block_kind":       {"entry", "branch", "loop_body", "exception", "exit"},

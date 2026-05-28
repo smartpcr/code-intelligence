@@ -15,8 +15,8 @@ env:
   COMPOSE_FILE: tests/e2e/phase-06-evaluator-mgmt/docker-compose.yml
 
 jobs:
-  e2e-management-write-verbs-and-repo-onboarding:
-    name: "E2E – Management Write Verbs and Repo Onboarding"
+  e2e-http-json-gateway-and-oidc-auth:
+    name: "E2E – HTTP JSON Gateway and OIDC Auth"
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -58,16 +58,12 @@ jobs:
           echo "CLEAN_CODE_RULE_ENGINE_URL=http://localhost:${RULE_ENGINE_PORT}" >> "$GITHUB_ENV"
           echo "CLEAN_CODE_OIDC_ISSUER=http://localhost:${DEX_PORT}" >> "$GITHUB_ENV"
           echo "CLEAN_CODE_OTEL_ENDPOINT=http://localhost:${OTEL_PORT}" >> "$GITHUB_ENV"
-          # OIDC bearer tokens minted by `make tokens`; read the dev-role token.
-          if [ -f tokens/dev.jwt ]; then
-            echo "CLEAN_CODE_OIDC_DEV_TOKEN=$(cat tokens/dev.jwt)" >> "$GITHUB_ENV"
-          fi
 
       - name: Run E2E tests
         working-directory: services/clean-code
         run: |
           go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
-            -run TestE2E_evaluator_surface_and_management_surface_management_write_verbs_and_repo_onboarding
+            -run TestE2E_evaluator_surface_and_management_surface_http_json_gateway_and_oidc_auth
 
       - name: Tear down compose services
         if: always()

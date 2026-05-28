@@ -64,8 +64,9 @@ storyId: "code-intelligence:AST-PARSER-FOR-ADDIT"
 - [ ] Add a package-private helper `mergeLangMeta(out map[string]any, in map[string]any)` in `services/agent-memory/internal/repoindexer/ast/dispatcher.go` that iterates `in`, and only writes a key into `out` when `out` does not already hold it (first-class keys win per C11 / architecture Section 4.4.2). Skip when `in == nil`.
 - [ ] Call `mergeLangMeta(attrs, c.LangMeta)` at the end of `classAttrs` immediately before `mustJSON`.
 - [ ] Call `mergeLangMeta(attrs, m.LangMeta)` at the end of `methodAttrs` immediately before `mustJSON`.
+- [ ] Extend the existing `calls_raw` write in `methodAttrs` (currently `dispatcher.go` lines 865-867, which only serializes `m.Calls`) to merge `m.ReceiverCalls` into the same `calls_raw` slice: replace the `if len(m.Calls) > 0 { out["calls_raw"] = append(... m.Calls ...) }` block with logic that builds a deduped union of `m.Calls` and `m.ReceiverCalls` (using the existing `uniqueStringsInsert` helper) and writes `out["calls_raw"]` only when the union is non-empty. Document in the inline comment that this preserves verbatim call-name strings for both bare-name and receiver-qualified callsites so (a) Pass 2b multimap-collision drops (Stage 1.4) leave a debug breadcrumb, and (b) the future cross-file resolver can re-resolve unresolved receiver calls without re-parsing.
 - [ ] Call `mergeLangMeta(attrs, im.LangMeta)` at the end of `importEdgeAttrs` (or the equivalent helper used for the file -> package edge) immediately before `mustJSON`.
-- [ ] Document in `doc.go` (existing file) the new `LangMeta` carry-through path so future contributors know which writer hooks fold per-language attrs.
+- [ ] Document in `doc.go` (existing file) the new `LangMeta` carry-through path AND the `calls_raw = unique(m.Calls + m.ReceiverCalls)` rule so future contributors know which writer hooks fold per-language attrs and where receiver-qualified verbatims land.
 
 ### Dependencies
 - phase-shared-additive-surfaces-and-dispatcher-edits/stage-additive-parser-go-struct-surfaces
@@ -74,6 +75,8 @@ storyId: "code-intelligence:AST-PARSER-FOR-ADDIT"
 - [ ] Scenario: First-class key wins -- Given a fake parser sets `LangMeta["language"]="bogus"`, When `methodAttrs` runs, Then the persisted `attrs_json["language"]` equals the dispatcher's first-class value (architecture Section 4.4.2 + C11), not `"bogus"`.
 - [ ] Scenario: LangMeta nil is a no-op -- Given a TS / Python parser returns `MethodDecl` with `LangMeta=nil`, When `methodAttrs` runs, Then `attrs_json` is byte-identical to its pre-change output (existing `parser_typescript_test.go` / `parser_python_test.go` assertions on attrs continue to pass).
 - [ ] Scenario: New LangMeta key flows through -- Given a parser sets `MethodDecl.LangMeta = {"receiver":"r","receiver_ptr":true}`, When `methodAttrs` runs, Then `attrs_json["receiver"] == "r"` and `attrs_json["receiver_ptr"] == true`.
+- [ ] Scenario: ReceiverCalls land in calls_raw -- Given a `MethodDecl{Calls:["log_global"], ReceiverCalls:["identify"]}`, When `methodAttrs` runs, Then `attrs_json["calls_raw"]` decodes to a deduped slice containing both `"log_global"` and `"identify"` (Pass 2b drop / cross-file resolver depend on this).
+- [ ] Scenario: ReceiverCalls only (no Calls) still emits calls_raw -- Given a `MethodDecl{Calls:nil, ReceiverCalls:["Bar"]}`, When `methodAttrs` runs, Then `attrs_json["calls_raw"]` decodes to `["Bar"]` (the writer must NOT gate the merged write on `len(m.Calls) > 0`).
 
 ## Stage 1.4: Dispatcher sentinel branch, Pass 2b multimap, Pass 2d overrides
 

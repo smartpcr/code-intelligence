@@ -870,6 +870,7 @@ func classAttrs(language string, c ClassDecl) json.RawMessage {
 	if len(c.Implements) > 0 {
 		m["implements_raw"] = append([]string(nil), c.Implements...)
 	}
+	mergeLangMeta(m, c.LangMeta)
 	return mustJSON(m)
 }
 
@@ -889,6 +890,7 @@ func methodAttrs(language string, m MethodDecl) json.RawMessage {
 	if len(m.Calls) > 0 {
 		out["calls_raw"] = append([]string(nil), m.Calls...)
 	}
+	mergeLangMeta(out, m.LangMeta)
 	return mustJSON(out)
 }
 
@@ -1003,6 +1005,42 @@ func dedupSortedStrings(in []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// mergeLangMeta folds the per-language attrs map `in` into the
+// dispatcher's first-class attrs map `out`. First-class keys
+// always win: when `out` already holds a key, the value in `in`
+// for that key is silently dropped (architecture invariant C11 /
+// Section 4.4.2 -- `LangMeta` is descriptive, not identifying,
+// and the dispatcher's first-class attrs schema is the source of
+// truth for keys like `language`, `decl_kind`, `start_line`,
+// etc.). Presence -- not value -- is what counts: a first-class
+// key whose value is `nil` still wins.
+//
+// `in == nil` is a no-op, so parsers that emit no per-language
+// metadata (the TS/JS/Python baseline) pay nothing and produce
+// byte-identical attrs JSON compared to the pre-helper world.
+//
+// `out` MUST be non-nil; all in-package call sites construct it
+// as a map literal so this is not validated.
+//
+// Values in `in` are shallow-copied (the helper does not clone
+// nested slices/maps). The dispatcher discards the merged map
+// immediately after `mustJSON` so aliasing into `LangMeta` is
+// safe in practice. Parsers MUST keep `LangMeta` values
+// JSON-marshalable (primitives, []string, map[string]any,
+// etc.) -- a non-marshalable value would cause `mustJSON` to
+// fall back to `{}` and erase the first-class attrs too.
+func mergeLangMeta(out map[string]any, in map[string]any) {
+	if in == nil {
+		return
+	}
+	for k, v := range in {
+		if _, exists := out[k]; exists {
+			continue
+		}
+		out[k] = v
+	}
 }
 
 func mustJSON(m map[string]any) json.RawMessage {

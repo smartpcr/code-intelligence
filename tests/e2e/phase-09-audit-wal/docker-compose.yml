@@ -1,0 +1,64 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: clean_code
+      POSTGRES_USER: clean_code_admin
+      POSTGRES_PASSWORD: e2e_test_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clean_code_admin -d clean_code"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  evaluator:
+    image: ${EVALUATOR_IMAGE:-ghcr.io/forge/clean-code-evaluator:latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CLEAN_CODE_PG_URL: postgres://clean_code_evaluator:e2e_test_password@postgres:5432/clean_code?sslmode=disable
+      PG_ROLE: clean_code_evaluator
+
+  rule-engine:
+    image: ${RULE_ENGINE_IMAGE:-ghcr.io/forge/clean-code-rule-engine:latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CLEAN_CODE_PG_URL: postgres://clean_code_solid_batch:e2e_test_password@postgres:5432/clean_code?sslmode=disable
+      PG_ROLE: clean_code_solid_batch
+
+  wal-reconciler:
+    image: ${WAL_RECONCILER_IMAGE:-ghcr.io/forge/clean-code-wal-reconciler:latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CLEAN_CODE_PG_URL: postgres://clean_code_wal_reconciler:e2e_test_password@postgres:5432/clean_code?sslmode=disable
+      PG_ROLE: clean_code_wal_reconciler
+      RECONCILER_MODE: REPLAY-ONLY
+
+  fault-injector:
+    image: ${FAULT_INJECTOR_IMAGE:-ghcr.io/forge/fault-injector:latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    network_mode: "service:postgres"
+    environment:
+      TARGET_SERVICES: evaluator,rule-engine
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.100.0
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+
+volumes:
+  pgdata:

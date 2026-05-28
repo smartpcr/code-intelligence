@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -160,6 +161,9 @@ func (s *refactorTaskState) aRefactorTaskRowExistsWithKindAndRuleID(kind, ruleID
 		if err == nil {
 			break
 		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("querying refactor_task row with task_id=%s: %w", s.taskID, err)
+		}
 		if ctx.Err() != nil {
 			return fmt.Errorf("timed out waiting for refactor_task row with task_id=%s: %w",
 				s.taskID, err)
@@ -259,6 +263,9 @@ func (s *refactorTaskState) refactorTaskEffortHoursIsPopulated() error {
 		`, s.taskID).Scan(&effortHours)
 		if err == nil {
 			break
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("querying refactor_task effort_hours for task_id=%s: %w", s.taskID, err)
 		}
 		if ctx.Err() != nil {
 			return fmt.Errorf("timed out waiting for refactor_task effort_hours: %w", err)

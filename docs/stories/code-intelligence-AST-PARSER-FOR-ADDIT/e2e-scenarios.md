@@ -58,14 +58,20 @@ CLOSED and no operator answer is pending:
 
 | Decision id              | What was asked                                                                                                                                                            | Committed answer (binding for this story)                                                                                                                                                                                                                                          |
 | ---                      | ---                                                                                                                                                                       | ---                                                                                                                                                                                                                                                                                |
-| `phase1-compose-path`    | Should Phase 1 reuse `services/agent-memory/deploy/local/docker-compose.yml`, or create a new `tests/e2e/{phase-slug}/docker-compose.yml`, or symlink to the service-local file? | CREATE NEW. Phase 1 owns a standalone postgres-only compose file at `tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml`. It pulls the same `postgres:16-alpine` image and references the init SQL from `services/agent-memory/deploy/local/postgres/`, but does NOT `include:` the service-local file (avoids cross-tree coupling). Recorded in 0.4 and in Phase 1 Setup. |
+| `phase1-compose-path`    | Should Phase 1 reuse `services/agent-memory/deploy/local/docker-compose.yml`, or create a new `tests/e2e/{phase-slug}/docker-compose.yml`, or symlink to the service-local file? | CREATE NEW. Phase 1 owns a standalone postgres-only compose file at `tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml` whose `postgres` service uses `build: { context: ../../../services/agent-memory/deploy/local/postgres, dockerfile: Dockerfile }` and `image: agent-memory/postgres:16-partman` -- i.e., the SAME `FROM postgres:16` Debian image plus `pg_partman` that the service-local stack produces (the upstream image, build context, and produced tag are defined at `services/agent-memory/deploy/local/postgres/Dockerfile` and `services/agent-memory/deploy/local/docker-compose.yml` lines 22-27). It mounts the init SQL from `services/agent-memory/deploy/local/postgres/init/` to `/docker-entrypoint-initdb.d`, but does NOT `include:` the full service-local compose (avoids dragging in qdrant / otel-collector for a phase that only needs postgres). Recorded in 0.4 and in Phase 1 Setup. |
 | `phase6-ci-install-pwsh` | Should this story add a `pwsh` install step to `.github/workflows/agent-memory-ci.yml`, keep the skip posture, or defer to a follow-up?                                  | KEEP SKIP POSTURE. The hosted runner does not install `pwsh` in v1; `@needs-pwsh` scenarios `t.Skip` per `implementation-plan.md` Stage 6.3 lines 417 and 428. Workflow change is the scope of a separate follow-up story (`code-intelligence:CI-INSTALL-PWSH-FOR-AGENT-MEMORY`), not an open question on this story. Recorded in 0.2 and in Phase 6 Setup. |
 
-These decisions are now part of the doc body and the open-questions
-JSON block is INTENTIONALLY omitted from this iteration's summary.
-If the operator wants to overturn either decision they can do so via
-the wizard against the recorded `Decision id`; otherwise the
-generator will stop surfacing both.
+These decisions are now part of the doc body. The
+open-questions JSON block IS re-emitted in this iteration's
+summary using the SAME `Decision id` slugs so the orchestrator
+wizard can record the operator's confirmation against
+`.forge/memory/workstream-context.md` (a chat-side note alone
+does NOT clear the memory; only a wizard answer does). The
+"recommended choice" in each re-emitted question matches the
+committed decision above. If the operator wants to overturn
+either decision they pick a different choice in the wizard;
+otherwise confirming the recommended choice clears the
+hard-gate iterate condition without changing any doc content.
 
 ### 0.2 Notation conventions
 
@@ -123,7 +129,7 @@ created as part of the Phase 1 / Phase 7 implementation:
 
 | Compose path                                                       | Services started                       | Used by         |
 | ---                                                                | ---                                    | ---             |
-| `tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml`    | `postgres` (with init SQL from `services/agent-memory/deploy/local/postgres/`) | Phase 1 migration probe; Phase 1 dispatcher unit tests do not need postgres but inherit the same compose to keep `make` lines uniform |
+| `tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml`    | `postgres` (the partman-enabled image built from `services/agent-memory/deploy/local/postgres/Dockerfile`, tagged `agent-memory/postgres:16-partman`, with init SQL mounted from `services/agent-memory/deploy/local/postgres/init/`) | Phase 1 migration probe; Phase 1 dispatcher unit tests do not need postgres but inherit the same compose to keep `make` lines uniform |
 | `tests/e2e/phase-7-cross-cutting-validation/docker-compose.yml`    | `postgres`, `qdrant`, `otel-collector` (overlay over the service-local Dockerfiles) | Phase 7 targeted + CGO-off + full-service validation runs |
 
 Connection-string variables resolved by these compose files
@@ -148,7 +154,7 @@ the doc never inlines the underlying DSN.
 ### Setup
 
 - **Type**: compose
-- **Compose file**: `tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml` (NEW artifact this story introduces). Services started: `postgres` only (the postgres image plus init SQL from `services/agent-memory/deploy/local/postgres/`, exposing port 5432 on the runner's loopback). Qdrant and the OTel collector are NOT started; the Phase 1 scenarios only exercise the AST dispatcher (in-process) and the schema migration journal (postgres only).
+- **Compose file**: `tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml` (NEW artifact this story introduces). Services started: `postgres` only -- the partman-enabled image built from `services/agent-memory/deploy/local/postgres/Dockerfile` (`FROM postgres:16` + `postgresql-16-partman`, tagged `agent-memory/postgres:16-partman` to match the service-local stack at `services/agent-memory/deploy/local/docker-compose.yml` line 27), with init SQL mounted from `services/agent-memory/deploy/local/postgres/init/` to `/docker-entrypoint-initdb.d`, exposing port 5432 on the runner's loopback. Qdrant and the OTel collector are NOT started; the Phase 1 scenarios only exercise the AST dispatcher (in-process) and the schema migration journal (postgres only).
 - **Local**: From the repo root, run `docker compose -f tests/e2e/phase-1-shared-additive-surfaces/docker-compose.yml up -d` to start postgres. Export `AGENT_MEMORY_PG_URL` to the env-var convention used by the agent-memory test suite (the value is supplied by the compose file's documented mapping; tests read the env var, never a literal DSN). Then run `go test ./internal/repoindexer/ast -count=1 -run 'TestDispatcher|TestLangMeta|TestErrParserUnavailable|TestMergeLangMeta|TestNormalizeHints|TestPass2bMultimap|TestPass2dOverrides'` for the dispatcher unit-test slice and `go test ./migrations -count=1 -run 'TestMigrator_Up_AppliesAll|TestMigrations_0022_EdgeKindOverrides'` for the migration apply / probe test.
 - **CI runner**: GitHub-hosted `ubuntu-latest` per `.github/workflows/agent-memory-ci.yml` (the existing `integration-stack` job already starts a postgres container with healthchecks). No new runner pool, labels, or hosted image required.
 - **Secrets**: None. The Phase 1 unit + migration tests run against the disposable runner-local postgres started from the compose file. The agent-memory-ci workflow reads `AGENT_MEMORY_PG_URL` / `AGENT_MEMORY_QDRANT_URL` / `AGENT_MEMORY_OTEL_ENDPOINT` as workflow-scoped `env` keys; no KeyVault path and no GitHub environment-scoped secret is referenced because no production credential crosses the boundary.

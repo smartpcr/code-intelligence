@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -115,7 +116,7 @@ func (s *oidcGatewayState) theResponseIncludesWWWAuthenticateBearerHeader() erro
 		return fmt.Errorf("expected WWW-Authenticate header, but it was absent")
 	}
 	// The value must contain "Bearer" (RFC 6750 §3)
-	if wwwAuth != "Bearer" && len(wwwAuth) < 6 {
+	if !strings.Contains(wwwAuth, "Bearer") {
 		return fmt.Errorf("expected WWW-Authenticate to contain 'Bearer', got %q", wwwAuth)
 	}
 	return nil

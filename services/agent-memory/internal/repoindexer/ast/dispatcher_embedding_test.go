@@ -1,3 +1,8 @@
+// Embedding publish-hook tests exercise the full V2 dispatcher
+// emission pipeline (publish-after-contains-edge ordering,
+// per-method/per-block publish, content threading). Un-gated
+// in iter 6 when the canonical dispatcher landed the publisher
+// hook (see dispatcher.go::publish).
 package ast
 
 import (

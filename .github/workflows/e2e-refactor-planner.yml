@@ -44,10 +44,8 @@ jobs:
           echo "CLEAN_CODE_MGMT_URL=http://localhost:${MGMT_PORT}" >> "$GITHUB_ENV"
           echo "CLEAN_CODE_OTEL_ENDPOINT=http://localhost:${OTEL_PORT}" >> "$GITHUB_ENV"
 
-      - name: Bootstrap – migrate and seed
-        run: |
-          make migrate-up CLEAN_CODE_PG_URL="${CLEAN_CODE_PG_URL}"
-          make seed-phase-08 CLEAN_CODE_PG_URL="${CLEAN_CODE_PG_URL}"
+      - name: Bootstrap – migrate
+        run: make migrate-up CLEAN_CODE_PG_URL="${CLEAN_CODE_PG_URL}"
 
       - name: Run E2E tests
         working-directory: services/clean-code

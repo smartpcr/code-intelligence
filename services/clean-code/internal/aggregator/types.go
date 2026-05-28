@@ -203,4 +203,38 @@ type Report struct {
 	// the row count written into `cross_repo_percentile` /
 	// `portfolio_snapshot` (one row per cohort).
 	CohortsAggregated int
+	// SystemTierReposComposed is the number of distinct
+	// (repo_id, sha) inputs the wired
+	// [SystemTierInputSource] yielded this tick that were
+	// passed through the composer. Equal to the count of
+	// system-tier composer invocations per tick. Zero when
+	// the system-tier pipeline is not wired or the source
+	// returned no inputs (e.g. a fresh deployment before any
+	// foundation rows have been ingested).
+	SystemTierReposComposed int
+	// SystemTierSamplesWritten is the total number of
+	// system-tier samples (degraded + non-degraded) emitted by
+	// the composer this tick and submitted to the wired
+	// [SystemTierWriter]. Per architecture Sec 1.4.2 each
+	// composed repo yields at least seven samples (the seven
+	// canonical kinds) plus one per blast-radius / fan-in
+	// per-scope expansion -- the operator MAY infer
+	// "samples per repo" as
+	// SystemTierSamplesWritten / SystemTierReposComposed.
+	SystemTierSamplesWritten int
+	// SystemTierDegradedSamples is the subset of
+	// SystemTierSamplesWritten whose `Degraded` flag was true
+	// (rows carrying `xrepo_edges_unavailable` or
+	// `samples_pending`). The architecture's fail-safe
+	// contract (Sec 3.10 step 4 lines 637-657) requires this
+	// counter be non-zero in embedded mode for the
+	// cross-repo-edge-dependent kinds; a steady-state of
+	// SystemTierDegradedSamples == SystemTierSamplesWritten
+	// for many consecutive ticks is the operator's signal to
+	// investigate ingestion lag (the Insights freshness panel
+	// surfaces this via the matching
+	// `evaluation_verdict.degraded_reason` column per
+	// architecture Sec 3.10 step 4 lines 637-657 and
+	// tech-spec Sec 4.2 lines 325-339).
+	SystemTierDegradedSamples int
 }

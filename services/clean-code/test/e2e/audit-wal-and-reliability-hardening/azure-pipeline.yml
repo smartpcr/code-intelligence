@@ -1,9 +1,8 @@
-trigger: none
-
-pr:
+trigger:
   branches:
     include:
-      - main
+      - feature/clean-code
+      - ws/code-intelligence-CLEAN-CODE/*
   paths:
     include:
       - services/clean-code/**
@@ -12,15 +11,15 @@ pool:
   vmImage: ubuntu-latest
 
 variables:
-  GO_VERSION: "1.25.1"
-  COMPOSE_FILE: services/clean-code/deploy/local/docker-compose.yml
+  GO_VERSION: "1.25"
+  COMPOSE_FILE: tests/e2e/phase-09-audit-wal/docker-compose.yml
 
 stages:
-  - stage: e2e_audit_wal_frame_writer
-    displayName: "E2E – Audit WAL Frame Writer"
+  - stage: e2e_audit_wal_reconciler
+    displayName: "E2E – Audit WAL Reconciler Replay Only"
     jobs:
       - job: run_e2e
-        displayName: "Run godog E2E tests"
+        displayName: "Run godog E2E suite"
         timeoutInMinutes: 20
         steps:
           - task: GoTool@0
@@ -30,27 +29,26 @@ stages:
 
           - script: |
               docker compose -f $(COMPOSE_FILE) up -d --build
+              sleep 10
             displayName: "Start compose services"
-            workingDirectory: $(Build.SourcesDirectory)
 
           - script: |
-              PG_PORT=$(docker compose -f $(COMPOSE_FILE) port postgres 5432 | cut -d: -f2)
-              EVAL_PORT=$(docker compose -f $(COMPOSE_FILE) port evaluator 8080 | cut -d: -f2)
-              OTEL_PORT=$(docker compose -f $(COMPOSE_FILE) port otel-collector 4317 | cut -d: -f2)
-              export CLEAN_CODE_PG_URL="postgres://postgres:postgres@localhost:${PG_PORT}/clean_code?sslmode=disable"
-              export CLEAN_CODE_EVALUATOR_URL="http://localhost:${EVAL_PORT}"
-              export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:${OTEL_PORT}"
-              export CLEAN_CODE_REPO_ROOT="$(Build.SourcesDirectory)/services/clean-code"
               make migrate-up
               make seed-phase-09
-              cd services/clean-code
-              go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
-                -run TestE2E_audit_wal_and_reliability_hardening_audit_wal_frame_writer
-            displayName: "Export compose URLs, bootstrap, and run E2E tests"
-            workingDirectory: $(Build.SourcesDirectory)
+            displayName: "Bootstrap DB (migrate + seed)"
+            workingDirectory: services/clean-code
 
           - script: |
-              docker compose -f $(COMPOSE_FILE) down -v --remove-orphans
-            displayName: "Tear down compose services"
-            workingDirectory: $(Build.SourcesDirectory)
+              cd services/clean-code
+              go test -tags e2e -v -count=1 -timeout 120s \
+                ./test/e2e/code-intelligence-CLEAN-CODE/...
+            displayName: "Run E2E tests"
+            env:
+              CLEAN_CODE_PG_URL: postgres://clean_code_admin:e2e_test_password@localhost:5432/clean_code?sslmode=disable
+              CLEAN_CODE_OTEL_ENDPOINT: http://localhost:4317
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) logs --tail=200
+              docker compose -f $(COMPOSE_FILE) down -v
+            displayName: "Collect logs & tear down"
             condition: always()

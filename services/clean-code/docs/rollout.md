@@ -10,9 +10,14 @@ created via the `0004_roles.up.sql` migration.
 This subsection captures the rollout sequence for the Stage
 8.2 extension to `internal/refactor/`: the `TaskPlanner`
 orchestrator emitting `refactor_plan` and `refactor_task`
-rows. Stage 8.2 does NOT introduce a new binary -- it ships
-inside the existing Refactor Planner process (`cmd/
-clean-code-refactor-planner/main.go`, alongside Stage 8.1).
+rows. Stage 8.2 INTRODUCES the new one-shot K8s Job binary
+`cmd/clean-code-refactor-planner` (NOT a cadence loop -- one
+invocation per `(repo_id, sha)`), which composes the
+Stage 8.1 `refactor.Planner.Plan` pass and the Stage 8.2
+`refactor.TaskPlanner.PlanFromSnapshot` pass into a single
+race-safe two-pass run pinned to one `policy_version_id`.
+See "Step 2: Roll out the binary" below for the env-var
+contract and the two-pass execution flow.
 
 ### What's new
 

@@ -293,8 +293,10 @@ service.
 
 ### Operator handoff -- workstream-context items 1 + 2
 
-Two evaluator items have stood across pair-1 iter 4-9
-and pair-2 iter 1-4. Both are operator-owned by design
+Two evaluator items have stood across every iteration of
+this workstream's pair-1, pair-2, and pair-3 attempts (the
+iter-2 evaluator confirmed "all engineer-actionable issues
+have been addressed"). Both are operator-owned by design
 and remain outside the engineer agent's permitted edit
 surface:
 

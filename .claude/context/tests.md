@@ -11,6 +11,42 @@
 - Some parser paths require CGO and a C compiler because of tree-sitter.
 - Race-detector tests require CGO and are intended for Linux CI.
 
+## AST parser language support matrix
+
+The `services\agent-memory\internal\repoindexer\ast` package
+ships per-language `LanguageParser` implementations selected by
+file extension. Tree-sitter backed parsers require CGO at build
+time; without CGO the dispatcher falls back to lightweight
+stdlib-only scanners where one exists, otherwise the language is
+skipped.
+
+| Language   | Extensions               | CGO=1 backend             | CGO=0 backend     |
+| ---------- | ------------------------ | ------------------------- | ----------------- |
+| TypeScript | `.ts .tsx .js .jsx .mjs .cjs` | tree-sitter (`typescript`/`tsx`) | scanner (`parser_typescript.go`) |
+| Python     | `.py .pyi`               | tree-sitter (`python`)    | scanner (`parser_python.go`) |
+| Go         | `.go`                    | tree-sitter (`golang`)    | (none -- file skipped) |
+
+Notes:
+
+- The Go parser walks the upstream
+  `github.com/smacker/go-tree-sitter/golang` grammar and emits
+  `ClassDecl` for `struct` / `interface` / `type_alias` plus
+  `MethodDecl` for free functions, value-receiver methods,
+  pointer-receiver methods (with the operator-pinned `*`
+  prefix on `QualifiedName` per architecture Section 4.5),
+  and interface method specs. Same-receiver `r.Bar()` calls
+  populate `ReceiverCalls`; same-receiver field touches
+  populate `MemberAccesses` with `IsWrite` set on assignment
+  LHS.
+- Tree-sitter-backed support requires CGO and a C compiler on
+  PATH (`gcc` / `clang` on Linux/macOS; `tdm-gcc` on Windows).
+  `make test-cgo` in `services\agent-memory` exercises this
+  path.
+- Non-CGO scanner support is narrower (TS/Python only). New
+  languages without a non-CGO scanner are CGO-only by design;
+  the dispatcher logs an `ast.dispatch.skip{reason=cgo_required}`
+  event when CGO is unavailable.
+
 ## Common commands
 
 ### agent-memory

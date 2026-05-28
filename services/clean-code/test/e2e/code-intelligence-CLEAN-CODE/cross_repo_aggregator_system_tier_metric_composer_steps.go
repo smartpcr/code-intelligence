@@ -21,8 +21,8 @@ import (
 // file (which cannot call os.LookupEnv directly through a build-tag
 // boundary).
 func lookupEnv(name string) (string, bool) {
-	v := os.Getenv(name)
-	if v == "" {
+	v, ok := os.LookupEnv(name)
+	if !ok || v == "" {
 		return "", false
 	}
 	return v, true

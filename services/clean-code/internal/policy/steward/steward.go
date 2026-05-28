@@ -461,6 +461,15 @@ func validatePublishRequest(req PublishRequest) error {
 		return fmt.Errorf("%w: refactor_weights.freshness_window_seconds=%d must be > 0 when present",
 			ErrInvalidRequest, *req.RefactorWeights.FreshnessWindowSeconds)
 	}
+	// Stage 8.2: `top_n` is optional (zero == no truncation /
+	// the operator did not configure it) but negative values
+	// are a configuration error -- surface them at publish time
+	// so a misconfigured policy never reaches the Refactor
+	// Planner's runtime branch.
+	if req.RefactorWeights.TopN < 0 {
+		return fmt.Errorf("%w: refactor_weights.top_n=%d must be >= 0",
+			ErrInvalidRequest, req.RefactorWeights.TopN)
+	}
 	return nil
 }
 

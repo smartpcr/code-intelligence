@@ -70,15 +70,68 @@
 //     the active-policy hot_spot's `finding_count` (the
 //     architecture Sec 5.5.1 reproducibility invariant).
 //
-//   - **Stage 8.2** -- refactor-plan / refactor-task generation.
-//     A `planner.go` file consumes [Computation] outputs, reads
-//     the top-N hotspots, and writes `refactor_plan` plus
-//     `refactor_task` rows. Adds the canonical `task.kind` enum
-//     (`split_class | extract_method | invert_dependency |
-//     break_cycle | consolidate_duplication`) -- the alias set
-//     `extract_function | introduce_interface | reduce_inheritance |
-//     reduce_coupling | reduce_lcom | reduce_duplication` is
-//     REJECTED.
+//   - **Stage 8.2 (this file set adds)** -- refactor-plan and
+//     refactor-task generation. Ships
+//     [TaskPlanner] / [PlanAndTasksResult] /
+//     [RefactorPlan] / [RefactorTask] / [TaskKind] +
+//     [CanonicalTaskKinds] / [RejectedTaskKindAliases] /
+//     [ValidateTaskKind] / [DefaultTaskKindForRule] AND the
+//     orchestration boundaries [HotSpotReader] (latest-batch
+//     read for `clean_code.hot_spot`), [FindingDetailReader],
+//     and [RefactorPlanTaskWriter] (the latter writes ONE
+//     [RefactorPlan] row + N [RefactorTask] rows in a single
+//     ATOMIC transaction per the rubber-duck Stage 8.2 design
+//     review finding #1).
+//
+//     The [TaskPlanner.Plan] / [TaskPlanner.PlanFromSnapshot]
+//     orchestrator READS the LATEST top-N [HotSpot] batch
+//     written by Stage 8.1 [Planner.Plan] (via
+//     [HotSpotReader.LatestHotSpotsByScore], pinned to the
+//     same `policy_version_id` the Stage 8.1 pass wrote);
+//     it never recomputes hot_spots and never writes
+//     `clean_code.hot_spot`. Stage 8.1 [Planner.Plan]
+//     remains the SOLE writer of the hot_spot table.
+//     For each top-N hot_spot, the planner reads the
+//     qualifying finding details, dedupes by `(scope_id,
+//     rule_id)`, maps each unique rule_id to a canonical
+//     [TaskKind] via [DefaultTaskKindForRule] (with a
+//     configured fallback for unmapped rules), validates
+//     every emitted kind against the canonical enum, and
+//     writes the plan + tasks atomically.
+//
+//     The race-safe two-pass composition root (production
+//     binary `cmd/clean-code-refactor-planner`) calls
+//     [Planner.Plan] then
+//     [TaskPlanner.PlanFromSnapshot](snap = planRes.Snapshot)
+//     so the same `policy_version_id` is pinned across both
+//     passes; a concurrent `policy.activate` between the
+//     two passes cannot produce a torn plan whose hot_spots
+//     were scored by one PV and whose top-N truncation used
+//     another PV's `top_n`.
+//
+//     A hot_spot with NO qualifying findings (metric-only
+//     signal) is STILL listed in
+//     [RefactorPlan.HotspotIDs] but emits ZERO tasks: the
+//     planner refuses to fabricate a synthetic rule_id
+//     (rubber-duck Stage 8.2 design review finding #2 -- a
+//     synthetic rule_id would violate the logical FK to
+//     `rule.rule_id`).
+//
+//     The canonical `task.kind` enum is exactly the
+//     five-value closed set per architecture Sec 5.5.3 line
+//     1274:
+//     `split_class | extract_method | invert_dependency |
+//     break_cycle | consolidate_duplication`.
+//     The iter-3 alias set
+//     `extract_function | introduce_interface |
+//     reduce_inheritance | reduce_coupling | reduce_lcom |
+//     reduce_duplication` is REJECTED by
+//     [ValidateTaskKind] via [ErrRejectedTaskKindAlias];
+//     unknown kinds (typo or future-spec drift) surface
+//     [ErrUnknownTaskKind]. The [SQLRefactorPlanTaskWriter]
+//     runs the validator before opening its transaction so a
+//     buggy custom rule mapper aborts the whole batch rather
+//     than landing a partial row set.
 //
 //   - **Stage 8.3** -- ML effort-model loader and version
 //     pinning. A `effort_model.go` file loads the ML model

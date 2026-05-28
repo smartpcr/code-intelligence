@@ -427,6 +427,170 @@ Boot matrix:
   of boot. On `Run` error the binary aborts so the
   operator can investigate before traffic is served.
 
+## Stage 8.2 -- Refactor plan and task generation
+
+This section captures the operator-facing contract of the
+Stage 8.2 add-ons to `internal/refactor/`: the `TaskPlanner`
+orchestrator that emits `refactor_plan` rows + per-hot_spot
+`refactor_task` rows from the top-N hot_spots at one
+`(repo_id, sha)`.
+
+### Process layout
+
+Stage 8.2 runs inside `cmd/clean-code-refactor-planner/main.go`
+as a one-shot K8s Job (NOT a cadence loop). The operator
+schedules ONE pod per (repo_id, sha) — typically tied to a
+scan completion event — and the binary:
+
+1. Loads `CLEAN_CODE_PG_URL` plus the per-job env vars
+   `CLEAN_CODE_REFACTOR_PLANNER_REPO_ID` (uuid) and
+   `CLEAN_CODE_REFACTOR_PLANNER_SHA`.
+2. Opens a libpq handle (retries up to 30s for slow-starting DBs).
+3. Calls Stage 8.1 `Planner.Plan(ctx, repoID, sha)` — which
+   reads + scores + writes the `clean_code.hot_spot` batch.
+4. Calls Stage 8.2
+   `TaskPlanner.PlanFromSnapshot(ctx, repoID, sha, planRes.Snapshot)`
+   — which READS the latest top-N hot_spot rows (the ones
+   the previous step just wrote) and emits the
+   `refactor_plan` + `refactor_task` rows under one
+   transaction.
+5. Exits 0 on success; non-zero on any unhandled error.
+
+`TaskPlanner` is wired with FOUR dependencies — `PolicyReader`,
+`HotSpotReader` (NEW in iter 2: `WHERE created_at = (SELECT
+MAX(created_at) ...)` latest-batch lookup against
+`clean_code.hot_spot`), `FindingDetailReader` (production:
+`SQLFindingDetailReader` against `clean_code.finding`), and
+`RefactorPlanTaskWriter` (production:
+`SQLRefactorPlanTaskWriter` against
+`refactor_plan` + `refactor_task` in one transaction). The
+DB role `clean_code_refactor_planner` is already granted
+`INSERT, SELECT` on the three target tables (migration
+`0004_roles.up.sql:482-509`) AND now ALSO needs `SELECT` on
+`clean_code.hot_spot` for the new latest-batch read (the
+existing grant set covers this — `hot_spot` SELECT was
+already in scope because Stage 8.1 needed to upsert and read
+it back, but operators should grep their role audit to
+confirm a custom role spec inherits the same row).
+
+**Single-writer assumption:** the latest-batch query uses
+`WHERE created_at = (SELECT MAX(created_at) ...)`. This is
+correct under the architecture's "one
+clean-code-refactor-planner pod per (repo, sha) at a time"
+invariant. If two pods race the same (repo, sha) tuple they
+will both insert hot_spot rows at near-identical timestamps
+and the MAX(created_at) row may end up being a mix of the
+two batches — operators MUST gate the K8s Job spec with a
+`uniqueness key = (repo_id, sha)` constraint
+(architecture Sec 5.5.1).
+
+### Race-safe wiring via `PlanFromSnapshot`
+
+Stage 8.2 deliberately uses
+`TaskPlanner.PlanFromSnapshot(ctx, repoID, sha, snap)` rather
+than `TaskPlanner.Plan`. The standalone `Plan` re-reads the
+active policy, which would race a concurrent
+`policy.activate` between Stage 8.1 and Stage 8.2 — the
+returned policy_version_id could differ from the one stamped
+on every `hot_spot` row just persisted. Passing the Stage 8.1
+`PlanResult.Snapshot` closes the race at the type level.
+
+### Knobs (`policy_version.refactor_weights`)
+
+- `top_n` (Stage 8.2 NEW, optional int) -- maximum number
+  of hot_spots a single `refactor_plan` row covers. Zero
+  means no truncation (plan covers every scored hot_spot);
+  positive truncates to the top-N by composite score
+  DESC; negative is rejected at publish time. The hot_spot
+  table is always written in full (architecture Sec 5.5.1
+  append-only) -- `top_n` only affects plan coverage and
+  emitted tasks.
+- `effort_model_version` -- Stage 8.3 effort-model pin.
+  Stage 8.2 emits `refactor_task.effort_hours = 0.0` as the
+  unestimated placeholder; Stage 8.3 backfills.
+- All Stage 8.1 weights (`alpha`, `beta`, `gamma`,
+  `delta`, `window_days`) flow through to Stage 8.2
+  unchanged: the Stage 8.1 `Planner.Plan` pass uses them
+  to score and persist the `hot_spot` batch; the Stage 8.2
+  `TaskPlanner.PlanFromSnapshot` pass inherits the same
+  `PolicySnapshot` and consults `Weights.TopN` only.
+
+### What the planner writes
+
+For each `cmd/clean-code-refactor-planner` invocation
+(one-shot K8s Job per `(repo_id, sha)`):
+
+1. The Stage 8.1 `refactor.Planner.Plan` pass writes ALL
+   scored hot_spots via `HotSpotWriter`
+   (`clean_code.hot_spot`), in canonical sort order
+   (Score DESC, ScopeID ASC). Stage 8.1 is the SOLE writer
+   of `clean_code.hot_spot`.
+2. The Stage 8.2 `refactor.TaskPlanner.PlanFromSnapshot`
+   pass then READS the LATEST top-N rows back from
+   `clean_code.hot_spot` (via the new `HotSpotReader` →
+   `SQLHotSpotReader.LatestHotSpotsByScore`, pinned by
+   `policy_version_id = $snap.PolicyVersionID`) -- it does
+   NOT recompute scores and does NOT write `hot_spot`.
+3. ONE `refactor_plan` row persists via
+   `RefactorPlanTaskWriter.WriteRefactorPlanAndTasks`
+   (atomic transaction with the tasks below) covering the
+   top-N hot_spots in `hotspot_ids JSONB`. Carries NO
+   `policy_version_id` column -- recover the policy via
+   any referenced hot_spot row.
+4. ZERO OR MORE `refactor_task` rows in the same transaction,
+   one per unique `(scope_id, rule_id)` qualifying finding
+   pair. A hot_spot with NO qualifying findings IS still
+   listed in `plan.hotspot_ids` but emits ZERO tasks (the
+   planner refuses to fabricate a synthetic rule_id).
+
+### `task.kind` canonical enum
+
+The five values per architecture Sec 5.5.3 line 1274:
+
+| kind                       | typical trigger                                    |
+| -------------------------- | -------------------------------------------------- |
+| `split_class`              | SOLID SRP / ISP violation (split class / interface)|
+| `extract_method`           | SOLID OCP / LSP / unmapped rule fallback           |
+| `invert_dependency`        | SOLID DIP / high CBO / high fan_in / high fan_out  |
+| `break_cycle`              | `decoupling.cycle_member` / `decoupling.cycles.*`  |
+| `consolidate_duplication`  | `decoupling.duplication*`                          |
+
+The iter-3 alias set
+`extract_function | introduce_interface |
+reduce_inheritance | reduce_coupling | reduce_lcom |
+reduce_duplication` is REJECTED. A rule pack that emits a
+finding whose rule_id maps to an alias kind (via a custom
+`WithRuleKindMapper`) ABORTS the whole `TaskPlanner.Plan`
+batch with `ErrRejectedTaskKindAlias`; no plan row, no
+task row lands. Operators see the rejection in the
+planner's structured-log error wrap.
+
+### Failure modes / recovery
+
+| symptom                                            | likely cause                                                                   | action                                                                                       |
+| -------------------------------------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| `ErrNoActivePolicy`                                | No `policy_activation` row at planner runtime                                  | Activate a policy via the steward verb; planner is idempotent and will produce on next loop |
+| `ErrInvalidTopN`                                   | Composition root injected a snapshot with `TopN < 0`                           | Republish the policy with a non-negative `top_n`; legitimate publishes are blocked already   |
+| `ErrRejectedTaskKindAlias` / `ErrUnknownTaskKind`  | Custom rule mapper returned a non-canonical kind                               | Inspect the failing rule_id in the error wrap; remove the override or map to a canonical kind|
+| `write plan+tasks: ... transaction rollback`       | Connection drop mid-batch                                                      | Re-run the planner -- the transaction guarantees no orphan plan landed                       |
+
+### Effort-model version recovery
+
+Stage 8.2 emits `effort_hours = 0.0`. To recover the
+effort-model version a task was scored against:
+
+```
+refactor_task.task_id
+  -> refactor_task.plan_id
+  -> refactor_plan.hotspot_ids[0]
+  -> hot_spot.policy_version_id
+  -> policy_version.refactor_weights.effort_model_version
+```
+
+Stage 8.3 will replace the placeholder; the traversal path
+above stays canonical.
+
+
 ## Stage 7.1 -- Cross-Repo Aggregator cadence loop
 
 This section captures the operator-facing contract of the

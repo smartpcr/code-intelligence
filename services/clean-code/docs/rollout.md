@@ -392,6 +392,200 @@ SQL-only fallback path. To roll back:
    Stage 9.2 reconciler will pick up the rerouted
    partition files.
 
+## Stage 8.2: Refactor plan and task generation
+
+This subsection captures the rollout sequence for the Stage
+8.2 extension to `internal/refactor/`: the `TaskPlanner`
+orchestrator emitting `refactor_plan` and `refactor_task`
+rows. Stage 8.2 INTRODUCES the new one-shot K8s Job binary
+`cmd/clean-code-refactor-planner` (NOT a cadence loop -- one
+invocation per `(repo_id, sha)`), which composes the
+Stage 8.1 `refactor.Planner.Plan` pass and the Stage 8.2
+`refactor.TaskPlanner.PlanFromSnapshot` pass into a single
+race-safe two-pass run pinned to one `policy_version_id`.
+See "Step 2: Roll out the binary" below for the env-var
+contract and the two-pass execution flow.
+
+### What's new
+
+1. **`internal/refactor/task_planner.go`** -- the Stage 8.2
+   contract surface: `TaskPlanner`, `RefactorPlan`,
+   `RefactorTask`, `TaskKind` + the closed five-value
+   canonical enum, `FindingDetailReader`,
+   `RefactorPlanTaskWriter`, in-memory + SQL
+   implementations.
+2. **`steward.RefactorWeights.TopN`** -- new optional
+   `int` field with `json:"top_n,omitempty"`. Zero =
+   no truncation; positive = top-N truncation; negative
+   rejected at publish time. Legacy policies (no `top_n`
+   key in the JSONB blob) deserialize to `TopN = 0` and
+   carry the no-truncation semantics, so NO migration
+   step is required for existing rows.
+3. **`refactor_task_kind` ENUM** -- already created by
+   migration `0003_policy_audit_refactor.up.sql:140`
+   during Stage 5.1. Stage 8.2 only EMITS the five values
+   the migration already declares; no new migration step is
+   required.
+
+### Pre-rollout: confirm role grants (no change needed)
+
+The DB role `clean_code_refactor_planner` already has
+`INSERT, SELECT` on `refactor_plan` and `refactor_task` per
+migration `0004_roles.up.sql:482-509`. Stage 8.2 emits
+to those same tables, so NO new role grant is required.
+Verify with:
+
+```sql
+SELECT grantee, table_name, privilege_type
+  FROM information_schema.role_table_grants
+ WHERE table_schema = 'clean_code'
+   AND table_name IN ('refactor_plan', 'refactor_task')
+   AND grantee = 'clean_code_refactor_planner'
+ ORDER BY table_name, privilege_type;
+```
+
+Expect exactly four rows: `(INSERT, refactor_plan)`,
+`(SELECT, refactor_plan)`, `(INSERT, refactor_task)`,
+`(SELECT, refactor_task)`. NO `UPDATE`, NO `DELETE` --
+both tables are append-only.
+
+### Step 1: Republish active policies with `top_n`
+
+Stage 8.2 reads `policy_version.refactor_weights.top_n`. For
+a brand-new deployment, the default is `0` (no truncation)
+and operators may skip this step. For a production tier
+already running Stage 8.1, decide whether plan coverage
+should be truncated:
+
+- Small repos / pilot environments: keep `top_n: 0`. Every
+  scored hot_spot lands in the plan; useful for surfacing
+  the long tail.
+- Large repos / triage-mode: set `top_n: 25` (suggested
+  default). The plan covers the 25 highest-score hot_spots
+  per `(repo_id, sha)`; the long tail still persists in
+  `hot_spot` for future re-planning.
+
+Republish via the steward `policy.publish` + `policy.activate`
+verbs; the migration is signature-stable because `top_n` is
+a JSONB key with `omitempty` (so the legacy-row canonical
+bytes are unchanged when `top_n == 0`).
+
+### Step 2: Roll out the binary
+
+Stage 8.2 ships the NEW `cmd/clean-code-refactor-planner`
+binary, a one-shot Kubernetes Job (NOT a cadence loop) that
+runs ONCE per `(repo_id, sha)` and exits. The operator wires
+it into the existing scan-completion pipeline so a fresh
+scan triggers a fresh refactor pass.
+
+#### Required environment
+
+| env var                                  | required | purpose                                                                                  |
+| ---------------------------------------- | -------- | ---------------------------------------------------------------------------------------- |
+| `CLEAN_CODE_PG_URL`                      | yes      | libpq DSN to the clean_code database. Connects under the `clean_code_refactor_planner` role. |
+| `CLEAN_CODE_REFACTOR_PLANNER_REPO_ID`    | yes      | UUID of the repo to plan. Zero / malformed / missing fail fast at startup.               |
+| `CLEAN_CODE_REFACTOR_PLANNER_SHA`        | yes      | Commit SHA to plan against. Empty / whitespace fail fast at startup.                     |
+| `CLEAN_CODE_DISABLE_REFACTOR_PLANNER`    | no       | Truthy (`1`/`true`/`yes`/`on`) skips both passes and serves `/healthz` only. Default false. Used during staging rollouts that lack the hot_spot / refactor_plan / refactor_task schema. |
+| `PORT`                                   | no       | Health/metrics listener port. Default `8080`.                                            |
+
+The K8s Job spec MUST gate uniqueness on `(repo_id, sha)`
+(single-writer assumption -- see runbook "Single-writer
+assumption"). Two concurrent jobs against the same
+`(repo_id, sha)` could race the
+`WHERE created_at = (SELECT MAX(created_at) ...)` Stage 8.2
+latest-batch lookup and emit a torn plan.
+
+#### Two-pass execution flow
+
+Each invocation of the binary performs TWO passes in order
+(both pinned to the SAME `policy_version_id`):
+
+1. Stage 8.1 `refactor.Planner.Plan(ctx, repo_id, sha)` --
+   reads the active policy + metric_sample + finding rows,
+   scores composite hot_spots, and writes the full
+   `clean_code.hot_spot` batch.
+2. Stage 8.2 `refactor.TaskPlanner.PlanFromSnapshot(ctx,
+   repo_id, sha, planRes.Snapshot)` -- reads the top-N rows
+   back from `clean_code.hot_spot` (latest batch by
+   `created_at`, filtered to the same `policy_version_id`),
+   reads qualifying finding details for those scopes, and
+   writes ONE `refactor_plan` row + N `refactor_task` rows
+   in a SINGLE transaction.
+
+The `PlanFromSnapshot` entrypoint (rather than the
+standalone `TaskPlanner.Plan`) closes the policy-activate
+race the rubber-duck design review surfaced: a concurrent
+`policy.activate` between the two passes cannot produce a
+torn plan whose hot_spots were scored by PV-A and whose
+top-N truncation came from PV-B.
+
+### Step 3: Smoke-test post-rollout
+
+Trigger a planner run against a known (repo_id, sha) and
+verify both tables landed atomically:
+
+```sql
+SELECT plan_id,
+       jsonb_array_length(hotspot_ids) AS coverage,
+       (SELECT count(*)
+          FROM clean_code.refactor_task t
+         WHERE t.plan_id = p.plan_id) AS task_count
+  FROM clean_code.refactor_plan p
+ WHERE p.repo_id = $1 AND p.sha = $2
+ ORDER BY p.created_at DESC
+ LIMIT 1;
+```
+
+Expect:
+
+- `coverage` ≤ `top_n` (or = full hot_spot count when
+  `top_n == 0`).
+- `task_count` ≥ 0 (zero is legal for metric-only signals).
+- The task kinds you SELECT back are members of
+  `('split_class','extract_method','invert_dependency',
+  'break_cycle','consolidate_duplication')` -- the ENUM
+  type itself rejects any other value.
+
+### Rollback
+
+Revert the binary. The Stage 8.2 rows that already landed
+remain (the tables are append-only). To remove them
+operationally, take an audit-tracked retraction via the
+forthcoming `refactor.retract` verb (not in Stage 8.2 --
+Stage 8.4 owns it).
+
+#### Emergency stop -- halt all new plan / task emission
+
+The CORRECT way to immediately halt new plan + task emission
+is one of:
+
+1. **Operator opt-out (recommended).** Set
+   `CLEAN_CODE_DISABLE_REFACTOR_PLANNER=true` on the K8s Job
+   spec and roll forward. The binary skips both Stage 8.1
+   and Stage 8.2 passes, serves `/healthz` only, and exits 0
+   when the Job is terminated. No new hot_spot, refactor_plan,
+   or refactor_task rows land.
+2. **Deactivate the active policy.** Issue `policy.activate`
+   with no active row (or revoke the current activation) so
+   `steward.ActivePolicyVersion` returns `(false, nil)`. The
+   Stage 8.1 pass surfaces `ErrNoActivePolicy`, the binary
+   logs the warning and exits cleanly; Stage 8.2 is skipped.
+3. **Suspend the K8s CronJob / event consumer.** If the
+   binary is triggered by a scan-completion CronJob,
+   suspending the CronJob halts future runs without touching
+   the policy or the binary.
+
+> **DO NOT** rely on setting
+> `policy_version.refactor_weights.top_n = 0` as an
+> emergency stop. Per the documented semantics, `top_n == 0`
+> means "no truncation -- plan covers EVERY scored hot_spot",
+> not "no plan". Republishing with `top_n = 0` would INCREASE
+> the per-(repo, sha) plan / task volume, the opposite of an
+> emergency stop. The valid use of `top_n = 0` is the
+> deliberate "include every hot_spot in the plan" choice
+> documented in Step 1.
+
+
 ## Stage 7.1: Cross-Repo Aggregator cadence loop
 
 This subsection captures the rollout sequence for the

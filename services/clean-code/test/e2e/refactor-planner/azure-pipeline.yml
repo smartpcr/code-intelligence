@@ -13,7 +13,7 @@ pool:
 
 variables:
   GO_VERSION: "1.25.1"
-  COMPOSE_FILE: tests/e2e/phase-08-refactor-planner/docker-compose.yml
+  COMPOSE_FILE: services/clean-code/deploy/local/docker-compose.yml
 
 stages:
   - stage: e2e_composite_hotspot_scoring
@@ -43,7 +43,6 @@ stages:
               export CLEAN_CODE_MGMT_URL="http://localhost:${MGMT_PORT}"
               export CLEAN_CODE_OTEL_ENDPOINT="http://localhost:${OTEL_PORT}"
               make migrate-up
-              make seed-phase-08
               cd services/clean-code
               go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
                 -run TestE2E_refactor_planner_composite_hotspot_scoring

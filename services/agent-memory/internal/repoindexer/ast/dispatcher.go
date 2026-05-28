@@ -67,7 +67,7 @@ func (d *Dispatcher) EmitFile(filename string, src []byte) (EmitResult, error) {
 		return EmitResult{}, fmt.Errorf("no parser registered for extension %q", ext)
 	}
 
-	_, err := p.Parse(filename, src)
+	result, err := p.Parse(filename, src)
 	if err != nil {
 		if errors.Is(err, ErrParserUnavailable) {
 			reason := "unknown"
@@ -85,5 +85,43 @@ func (d *Dispatcher) EmitFile(filename string, src []byte) (EmitResult, error) {
 		return EmitResult{}, err
 	}
 
-	return EmitResult{}, nil
+	var nodeCount, edgeCount int
+
+	// Emit class nodes.
+	for _, c := range result.Classes {
+		if err := d.writer.InsertNode(Node{Kind: "class", Name: c.Name}); err != nil {
+			return EmitResult{}, fmt.Errorf("insert class node %q: %w", c.Name, err)
+		}
+		nodeCount++
+	}
+
+	// Emit method nodes and class→method edges.
+	for _, m := range result.Methods {
+		if err := d.writer.InsertNode(Node{Kind: "method", Name: m.Name}); err != nil {
+			return EmitResult{}, fmt.Errorf("insert method node %q: %w", m.Name, err)
+		}
+		nodeCount++
+
+		if m.ClassName != "" {
+			if err := d.writer.InsertEdge(Edge{Kind: "has_method", Source: m.ClassName, Target: m.Name}); err != nil {
+				return EmitResult{}, fmt.Errorf("insert has_method edge %q→%q: %w", m.ClassName, m.Name, err)
+			}
+			edgeCount++
+		}
+	}
+
+	// Emit import nodes and file→import edges.
+	for _, imp := range result.Imports {
+		if err := d.writer.InsertNode(Node{Kind: "import", Name: imp.Path}); err != nil {
+			return EmitResult{}, fmt.Errorf("insert import node %q: %w", imp.Path, err)
+		}
+		nodeCount++
+
+		if err := d.writer.InsertEdge(Edge{Kind: "imports", Source: filename, Target: imp.Path}); err != nil {
+			return EmitResult{}, fmt.Errorf("insert imports edge %q→%q: %w", filename, imp.Path, err)
+		}
+		edgeCount++
+	}
+
+	return EmitResult{NodeCount: nodeCount, EdgeCount: edgeCount}, nil
 }

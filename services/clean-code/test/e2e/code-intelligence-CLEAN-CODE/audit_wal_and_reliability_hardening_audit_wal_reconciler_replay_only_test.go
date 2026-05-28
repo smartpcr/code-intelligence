@@ -318,7 +318,7 @@ func (s *auditWalReconcilerState) insertIntoTableSucceeds(table string) error {
 func InitializeScenario_audit_wal_and_reliability_hardening_audit_wal_reconciler_replay_only(ctx *godog.ScenarioContext) {
 	pgURL := os.Getenv("CLEAN_CODE_PG_URL")
 	if pgURL == "" {
-		pgURL = "postgres://localhost:5432/clean_code?sslmode=disable"
+		pgURL = "postgres://clean_code_admin:e2e_test_password@localhost:5432/clean_code?sslmode=disable"
 	}
 
 	state := newAuditWalReconcilerState(pgURL)

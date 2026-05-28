@@ -59,7 +59,6 @@ import (
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/defects"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/materialisers"
 )
 
 const (
@@ -454,35 +453,52 @@ func TestDefectsHandler_Malformed_NoScanRunBurned(t *testing.T) {
 // # How the spy is observable when defects has no writer
 //
 // The trick: register the [webhook.ChurnVerbHandler] in the
-// SAME Router as the defects handler, with both backed by
-// the SAME [metric_ingestor.InMemoryMetricSampleWriter].
-// The churn handler IS wired to that writer (its happy path
-// produces records). Hitting the defects verb MUST leave
-// `writer.Records()` empty; hitting the churn verb MUST
-// produce records (positive control). The two assertions
-// together prove:
+// SAME Router as the defects handler. The Stage 4.4 churn
+// pipeline writes to a [churn.InMemoryChurnEventStore]
+// (NOT the legacy metric_sample writer -- see the package
+// doc on `internal/ingest/churn/ingest.go`); we keep a
+// shared [metric_ingestor.InMemoryMetricSampleWriter]
+// spy in scope so a regression that re-introduced a
+// metric_sample writer dep on EITHER verb would land rows
+// in `writer.Records()` and trip the assertion.
+//
+// The positive control is now the churn EVENT store: a
+// churn POST against `churnStore` MUST produce >0 events,
+// otherwise the test's "the router-and-pipeline is alive"
+// claim is vacuous. The negative-assertion spy (`writer`)
+// MUST remain empty after BOTH POSTs:
 //
 //  1. The defects POST does NOT write to the shared writer
-//     (the writer is observable; the test would fail if it
-//     did).
-//  2. The writer IS observable in this Router composition
-//     (a churn POST against the SAME writer does produce
-//     records, so an absence of records after the defects
-//     POST is NOT a vacuous "the spy is broken" pass).
+//     OR the churn store (defects has neither dep).
+//  2. The churn POST DOES write to the churn store (proves
+//     the pipeline is alive) but ALSO does NOT touch the
+//     `metric_sample` writer (Stage 4.4 contract: churn
+//     writes ZERO `metric_sample` rows directly).
 //
-// This is the canonical "positive control" pattern: the
-// negative assertion is only meaningful when the same
-// scaffolding can ALSO demonstrate a positive result.
+// This is the canonical "positive control" pattern adapted
+// for the Stage 4.4 staging-table architecture: the
+// negative assertion remains meaningful because the same
+// router configuration demonstrably exercises the verb
+// pipeline (positive churn-store result) without ever
+// touching the spied metric_sample writer.
 func TestDefectsHandler_NoMetricSampleWriteSidechannel(t *testing.T) {
 	t.Parallel()
 
-	// Build the shared in-memory writer + churn pipeline so
-	// BOTH verbs can be mounted on the same Router.
+	// Negative-assertion spy: the legacy metric_sample
+	// writer. NO verb in this router has a dependency on
+	// it (defects has no writer; the Stage 4.4 churn
+	// pipeline writes to `churnStore` below). A regression
+	// that re-introduced a writer dep on either verb would
+	// surface as len(writer.Records()) > 0.
 	writer := metric_ingestor.NewInMemoryMetricSampleWriter()
-	mat := materialisers.NewMaterialiserWithClock(materialisers.DefaultWindowDays, fixedNow)
-	hyd := churn.NewHydrator(churn.NewAutoMapScopeResolver())
-	sweep := metric_ingestor.NewChurnSweep(mat, hyd, writer)
-	ing := metric_ingestor.NewIngestor(metric_ingestor.NoopFoundationRecipeDispatcher{}, sweep)
+
+	// Positive-control sink: the Stage 4.4 churn staging
+	// store. The churn verb is wired to this; a churn POST
+	// MUST land rows here, otherwise the router-and-verb
+	// pipeline is dead and the negative writer assertion
+	// would be vacuous.
+	churnStore := churn.NewInMemoryChurnEventStore()
+	churnIng := churn.NewIngesterWithClocks(churnStore, fixedNow, uuid.NewV4)
 
 	resolver := webhook.NewStaticSecretResolver(map[string][]byte{
 		defectsTestKeyID: []byte(defectsTestSecret),
@@ -495,7 +511,7 @@ func TestDefectsHandler_NoMetricSampleWriteSidechannel(t *testing.T) {
 		ScanRunRepo: repo,
 		Verbs: []webhook.VerbHandler{
 			webhook.NewDefectsVerbHandler(),
-			webhook.NewChurnVerbHandler(ing),
+			webhook.NewChurnVerbHandlerWithClock(churnIng, fixedNow),
 		},
 	})
 
@@ -511,6 +527,10 @@ func TestDefectsHandler_NoMetricSampleWriteSidechannel(t *testing.T) {
 		t.Fatalf("after defects POST, writer.Records() len = %d; want 0 (tech-spec Sec 4.11 row 4: defects v1 writes ZERO metric_sample rows). Records=%+v",
 			got, writer.Records())
 	}
+	if got := churnStore.Len(); got != 0 {
+		t.Fatalf("after defects POST, churnStore.Len() = %d; want 0 (defects MUST NOT leak into the churn staging table either)",
+			got)
+	}
 	// The scan_run row MUST still exist + be `succeeded`
 	// (the Stage 4.5 store-only contract -- scan_run row
 	// is the ONLY side effect, no metric_sample row).
@@ -522,11 +542,11 @@ func TestDefectsHandler_NoMetricSampleWriteSidechannel(t *testing.T) {
 
 	// --- Positive control: churn POST DOES write rows. --------
 	// If the spy were broken (e.g. a Router refactor stopped
-	// invoking writers), the test above would PASS for the
-	// wrong reason -- "zero records because the writer is
-	// unreachable". The positive control proves the writer
-	// IS reachable from this Router composition; only the
-	// defects path bypasses it.
+	// invoking verbs), the test above would PASS for the
+	// wrong reason -- "zero records because nothing is
+	// reachable". The positive control proves the verb
+	// pipeline IS alive in this Router composition; only the
+	// defects path bypasses ALL persistence writers.
 	churnBody := goodChurnBodyForDefectsSpyTest(t)
 	rr2 := httptest.NewRecorder()
 	router.ServeHTTP(rr2, signedChurnRequest(t, churnBody))
@@ -534,25 +554,19 @@ func TestDefectsHandler_NoMetricSampleWriteSidechannel(t *testing.T) {
 		t.Fatalf("churn POST (positive control) status = %d; want 200; body=%s",
 			rr2.Code, rr2.Body.String())
 	}
-	if got := len(writer.Records()); got == 0 {
-		t.Fatalf("after churn POST (positive control), writer.Records() len = 0; want > 0 (the spy MUST be observable -- if churn produces no rows, the defects negative is vacuous)")
+	if got := churnStore.Len(); got == 0 {
+		t.Fatalf("after churn POST (positive control), churnStore.Len() = 0; want > 0 (the verb pipeline MUST be observable -- if churn produces no staging rows, the defects negative is vacuous)")
 	}
 
-	// Final crosscheck: the writer's record set MUST carry
-	// ONLY the churn-emitted rows. Every record's
-	// ProducerRunID MUST be the churn scan_run, never the
-	// defects scan_run. (Belt-and-braces: if a regression
-	// accidentally fanned a defects-verb call into the
-	// churn writer, the producer_run_id would surface it.)
-	resp2 := decodeRouterResponse(t, rr2.Body)
-	for i, rec := range writer.Records() {
-		if rec.ProducerRunID != resp2.ScanRunID {
-			t.Errorf("writer.Records()[%d].ProducerRunID = %s; want %s (churn scan_run) -- a defects-path leak would show as %s",
-				i, rec.ProducerRunID, resp2.ScanRunID, resp.ScanRunID)
-		}
-		if rec.ProducerRunID == resp.ScanRunID {
-			t.Errorf("writer.Records()[%d].ProducerRunID = %s matches the DEFECTS scan_run; defects path MUST NOT write metric_sample rows",
-				i, rec.ProducerRunID)
-		}
+	// Stage 4.4 cross-check: churn must NEVER write into the
+	// metric_sample writer either (`internal/ingest/churn/
+	// ingest.go` package doc: the verb writes ZERO
+	// metric_sample rows directly; the materialiser is the
+	// sole `modification_count_in_window` writer on a later
+	// pass). If a regression re-introduced a metric_sample
+	// dep on the churn path, this assertion would catch it.
+	if got := len(writer.Records()); got != 0 {
+		t.Fatalf("after churn POST, writer.Records() len = %d; want 0 (Stage 4.4 contract: churn verb writes ZERO metric_sample rows directly -- the materialiser is the sole writer of modification_count_in_window). Records=%+v",
+			got, writer.Records())
 	}
 }

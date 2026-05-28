@@ -171,7 +171,7 @@ func run() int {
 			logger.Error("clean-code-refactor-planner: env validation failed", "err", vErr)
 			exitCode = 1
 		} else {
-			db, dbErr := openAndPingDB(cfg.PostgresURL, "refactor-planner")
+			db, dbErr := openAndPingDB(ctx, cfg.PostgresURL, "refactor-planner")
 			if dbErr != nil {
 				logger.Error("clean-code-refactor-planner: open db", "err", dbErr)
 				exitCode = 1
@@ -260,7 +260,14 @@ func parseBoolEnv(raw string) bool {
 // Postgres is permanently unreachable. Mirrors the
 // aggregator binary's shape so an operator who reads both
 // sees the same retry contract.
-func openAndPingDB(dsn, role string) (*sql.DB, error) {
+//
+// ctx is the signal-cancellation context wired up in [run]; it
+// is threaded into [sql.DB.PingContext] AND used to short-circuit
+// the inter-attempt sleep so a SIGTERM received during DB startup
+// (e.g. a K8s Job hitting its `terminationGracePeriodSeconds`)
+// unblocks the loop promptly instead of burning the full
+// pingAttempts*1s budget.
+func openAndPingDB(ctx context.Context, dsn, role string) (*sql.DB, error) {
 	h, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sql.Open(%s): %w", role, err)
@@ -268,10 +275,19 @@ func openAndPingDB(dsn, role string) (*sql.DB, error) {
 	const pingAttempts = 30
 	var pingErr error
 	for i := 0; i < pingAttempts; i++ {
-		if pingErr = h.Ping(); pingErr == nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			_ = h.Close()
+			return nil, fmt.Errorf("postgres %s ping cancelled: %w", role, ctxErr)
+		}
+		if pingErr = h.PingContext(ctx); pingErr == nil {
 			return h, nil
 		}
-		time.Sleep(time.Second)
+		select {
+		case <-ctx.Done():
+			_ = h.Close()
+			return nil, fmt.Errorf("postgres %s ping cancelled: %w", role, ctx.Err())
+		case <-time.After(time.Second):
+		}
 	}
 	_ = h.Close()
 	return nil, fmt.Errorf("postgres %s not reachable after %d attempts: %w",

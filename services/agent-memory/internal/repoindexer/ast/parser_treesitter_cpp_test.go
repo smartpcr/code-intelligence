@@ -192,7 +192,12 @@ class Derived : public ns::Base, public Container<int> {
 // TestTreeSitterCppParser_NamespaceQualifiedNames covers the
 // container-accumulating walk required by the brief: classes
 // declared inside one or more `namespace` blocks gain a
-// dotted prefix per namespace keyword.
+// dotted prefix per namespace keyword. The test also asserts
+// that each class records the same prefix in
+// `LangMeta["namespace"]` per tech-spec §5.2 line 444
+// ("LangMeta keys: namespace (string), ...") -- a discrete
+// attr separate from the QualifiedName so downstream
+// consumers can route on it without re-parsing.
 func TestTreeSitterCppParser_NamespaceQualifiedNames(t *testing.T) {
 	const src = `
 namespace alpha {
@@ -212,13 +217,29 @@ namespace gamma::delta {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	got := map[string]bool{}
+	byName := map[string]ClassDecl{}
 	for _, c := range res.Classes {
-		got[c.QualifiedName] = true
+		byName[c.QualifiedName] = c
 	}
-	for _, want := range []string{"alpha.Outer", "alpha.beta.Inner", "gamma.delta.Bridge"} {
-		if !got[want] {
-			t.Errorf("missing class %q; got %v", want, classNames(res.Classes))
+	wantNamespace := map[string]string{
+		"alpha.Outer":        "alpha",
+		"alpha.beta.Inner":   "alpha.beta",
+		"gamma.delta.Bridge": "gamma.delta",
+	}
+	for qn, wantNS := range wantNamespace {
+		c, ok := byName[qn]
+		if !ok {
+			t.Errorf("missing class %q; got %v", qn, classNames(res.Classes))
+			continue
+		}
+		if c.LangMeta == nil {
+			t.Errorf("%s.LangMeta should be populated with namespace=%q; got nil", qn, wantNS)
+			continue
+		}
+		gotNS, _ := c.LangMeta["namespace"].(string)
+		if gotNS != wantNS {
+			t.Errorf("%s.LangMeta[namespace]: want %q, got %q (full=%+v)",
+				qn, wantNS, gotNS, c.LangMeta)
 		}
 	}
 }
@@ -228,6 +249,13 @@ namespace gamma::delta {
 // outer's QualifiedName as a dotted prefix -- consistent
 // with the namespace-prefix rule (and with the TS walker's
 // nested-class behaviour the brief tells us to mirror).
+//
+// The test also asserts that nested classes record
+// `LangMeta["namespace"]` as the ENCLOSING NAMESPACE
+// (not the dotted enclosing-class chain): per tech-spec
+// §5.2 the `namespace` LangMeta attr describes the C++
+// namespace, not the qualified parent-name, so a class
+// declared inside `ns::Outer` must record `namespace=="ns"`.
 func TestTreeSitterCppParser_NestedClassInsideClass(t *testing.T) {
 	const src = `
 namespace ns {
@@ -243,18 +271,37 @@ namespace ns {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	got := map[string]string{}
+	byName := map[string]ClassDecl{}
 	for _, c := range res.Classes {
-		got[c.QualifiedName] = c.Kind
+		byName[c.QualifiedName] = c
 	}
-	if got["ns.Outer"] != "class" {
-		t.Errorf("ns.Outer: want class, got %q (full=%v)", got["ns.Outer"], got)
+	if c := byName["ns.Outer"]; c.Kind != "class" {
+		t.Errorf("ns.Outer: want class, got %q (full=%v)", c.Kind, byName)
 	}
-	if got["ns.Outer.Inner"] != "class" {
-		t.Errorf("ns.Outer.Inner: want class, got %q (full=%v)", got["ns.Outer.Inner"], got)
+	if c := byName["ns.Outer.Inner"]; c.Kind != "class" {
+		t.Errorf("ns.Outer.Inner: want class, got %q (full=%v)", c.Kind, byName)
 	}
-	if got["ns.Outer.Tag"] != "struct" {
-		t.Errorf("ns.Outer.Tag: want struct, got %q (full=%v)", got["ns.Outer.Tag"], got)
+	if c := byName["ns.Outer.Tag"]; c.Kind != "struct" {
+		t.Errorf("ns.Outer.Tag: want struct, got %q (full=%v)", c.Kind, byName)
+	}
+	// All three classes live in namespace "ns" -- even the
+	// nested Inner/Tag, since the LangMeta["namespace"]
+	// attr describes the enclosing C++ namespace, not the
+	// dotted chain of enclosing classes.
+	for _, qn := range []string{"ns.Outer", "ns.Outer.Inner", "ns.Outer.Tag"} {
+		c, ok := byName[qn]
+		if !ok {
+			t.Errorf("missing %q", qn)
+			continue
+		}
+		if c.LangMeta == nil {
+			t.Errorf("%s.LangMeta should carry namespace=ns; got nil", qn)
+			continue
+		}
+		if ns, _ := c.LangMeta["namespace"].(string); ns != "ns" {
+			t.Errorf("%s.LangMeta[namespace]: want %q, got %q (full=%+v)",
+				qn, "ns", ns, c.LangMeta)
+		}
 	}
 }
 
@@ -381,6 +428,185 @@ func TestTreeSitterCppParser_LineNumbers(t *testing.T) {
 	if g.EndLine != 6 {
 		t.Errorf("Greeter.EndLine: want 6, got %d", g.EndLine)
 	}
+}
+
+// TestTreeSitterCppParser_PreprocWrappers exercises the
+// `default:` recursive-descent branch in `visit()` and the
+// preproc switch arm in `walkClassBody()`. Header files
+// almost always wrap their contents in include guards
+// (`#ifndef FOO_H` / `#define FOO_H` / ... / `#endif`),
+// and platform code routinely uses `#ifdef WINDOWS` / `#else`
+// to switch between alternate class definitions; neither
+// case can be silently dropped or the dispatcher would
+// produce empty graphs for every header in the repo.
+//
+// tree-sitter-cpp does NOT evaluate the preprocessor -- it
+// parses BOTH branches of an `#ifdef ... #else ... #endif`
+// into the AST, so both class definitions in that case are
+// expected to surface.
+func TestTreeSitterCppParser_PreprocWrappers(t *testing.T) {
+	t.Run("include guard", func(t *testing.T) {
+		const src = `
+#ifndef GUARDED_H
+#define GUARDED_H
+
+class GuardedClass {
+public:
+  void hello();
+};
+
+struct GuardedStruct {
+  int x;
+};
+
+#endif
+`
+		p := NewTreeSitterCppParser()
+		res, err := p.Parse("src/guarded.hpp", []byte(src))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		byName := map[string]ClassDecl{}
+		for _, c := range res.Classes {
+			byName[c.QualifiedName] = c
+		}
+		if c, ok := byName["GuardedClass"]; !ok || c.Kind != "class" {
+			t.Errorf("GuardedClass should surface from inside #ifndef include guard; got %v",
+				classNames(res.Classes))
+		}
+		if c, ok := byName["GuardedStruct"]; !ok || c.Kind != "struct" {
+			t.Errorf("GuardedStruct should surface from inside #ifndef include guard; got %v",
+				classNames(res.Classes))
+		}
+	})
+
+	t.Run("ifdef else both branches", func(t *testing.T) {
+		const src = `
+#ifdef PLATFORM_WINDOWS
+class PlatformImpl {
+public:
+  void winApi();
+};
+#else
+class PlatformImpl {
+public:
+  void posixApi();
+};
+#endif
+
+#ifdef HAS_ALPHA
+class AlphaOnly {};
+#endif
+
+#ifdef HAS_BETA
+class BetaOnly {};
+#else
+class BetaFallback {};
+#endif
+`
+		p := NewTreeSitterCppParser()
+		res, err := p.Parse("src/platform.cpp", []byte(src))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		got := map[string]int{}
+		for _, c := range res.Classes {
+			got[c.QualifiedName]++
+		}
+		// tree-sitter does not evaluate the preprocessor;
+		// both branches of `#ifdef PLATFORM_WINDOWS / #else`
+		// parse and yield the same QualifiedName. The
+		// forward-decl dedupe in handleClass keeps just one
+		// entry (whichever variant wins is fine -- the
+		// dispatcher only needs a single ClassDecl per
+		// QualifiedName).
+		if got["PlatformImpl"] == 0 {
+			t.Errorf("PlatformImpl should surface from at least one branch of #ifdef/#else; got %v",
+				classNames(res.Classes))
+		}
+		if got["AlphaOnly"] == 0 {
+			t.Errorf("AlphaOnly should surface from #ifdef-only block; got %v",
+				classNames(res.Classes))
+		}
+		if got["BetaOnly"] == 0 {
+			t.Errorf("BetaOnly should surface from #ifdef branch; got %v",
+				classNames(res.Classes))
+		}
+		if got["BetaFallback"] == 0 {
+			t.Errorf("BetaFallback should surface from #else branch; got %v",
+				classNames(res.Classes))
+		}
+	})
+
+	t.Run("preproc inside class body", func(t *testing.T) {
+		const src = `
+class Outer {
+public:
+  class AlwaysInner {};
+#ifdef ENABLE_FEATURE
+  class FeatureInner {};
+#endif
+#ifndef DISABLE_OPTIONAL
+  struct OptionalTag {};
+#endif
+};
+`
+		p := NewTreeSitterCppParser()
+		res, err := p.Parse("src/inner.cpp", []byte(src))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		got := map[string]string{}
+		for _, c := range res.Classes {
+			got[c.QualifiedName] = c.Kind
+		}
+		if got["Outer"] != "class" {
+			t.Errorf("Outer: want class, got %q (full=%v)", got["Outer"], got)
+		}
+		if got["Outer.AlwaysInner"] != "class" {
+			t.Errorf("Outer.AlwaysInner: want class, got %q (full=%v)", got["Outer.AlwaysInner"], got)
+		}
+		if got["Outer.FeatureInner"] != "class" {
+			t.Errorf("Outer.FeatureInner should surface from #ifdef inside class body; got %q (full=%v)",
+				got["Outer.FeatureInner"], got)
+		}
+		if got["Outer.OptionalTag"] != "struct" {
+			t.Errorf("Outer.OptionalTag should surface from #ifndef inside class body; got %q (full=%v)",
+				got["Outer.OptionalTag"], got)
+		}
+	})
+
+	t.Run("preproc inside namespace", func(t *testing.T) {
+		const src = `
+namespace ns {
+#ifndef GUARD_H
+#define GUARD_H
+  class Bar {};
+#endif
+}
+`
+		p := NewTreeSitterCppParser()
+		res, err := p.Parse("src/nspreproc.hpp", []byte(src))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		byName := map[string]ClassDecl{}
+		for _, c := range res.Classes {
+			byName[c.QualifiedName] = c
+		}
+		bar, ok := byName["ns.Bar"]
+		if !ok {
+			t.Fatalf("ns.Bar should surface from #ifndef inside namespace body; got %v",
+				classNames(res.Classes))
+		}
+		if bar.LangMeta == nil {
+			t.Fatalf("ns.Bar.LangMeta should be populated with namespace=ns; got nil")
+		}
+		if got, _ := bar.LangMeta["namespace"].(string); got != "ns" {
+			t.Errorf("ns.Bar.LangMeta[namespace]: want %q, got %q (full=%+v)",
+				"ns", got, bar.LangMeta)
+		}
+	})
 }
 
 // classNames is a small helper for error messages -- it

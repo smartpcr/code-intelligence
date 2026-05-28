@@ -114,6 +114,19 @@ const (
 	cppNodeLinkageSpecification      = "linkage_specification"
 	cppNodeIdentifier                = "identifier"
 	cppNodeNamespaceIdentifier       = "namespace_identifier"
+	// Preprocessor wrapper node types. tree-sitter-cpp
+	// emits the same string name whether the node lives
+	// at translation-unit scope or inside a
+	// field_declaration_list (see parser.c
+	// `sym_preproc_*_in_field_declaration_list` aliases ->
+	// the unqualified display name), so a single set of
+	// constants drives both the visit() default-branch
+	// recursion and the walkClassBody preproc dispatch.
+	cppNodePreprocIf      = "preproc_if"
+	cppNodePreprocIfdef   = "preproc_ifdef"
+	cppNodePreprocElse    = "preproc_else"
+	cppNodePreprocElif    = "preproc_elif"
+	cppNodePreprocElifdef = "preproc_elifdef"
 )
 
 type cppWalker struct {
@@ -136,35 +149,55 @@ type cppWalker struct {
 
 // walkTop dispatches the immediate children of a
 // translation_unit. Each child is treated as if it were at
-// the global namespace scope: no `container` prefix, no
-// inherited template parameters.
+// the global namespace scope: no `container` / `namespace`
+// prefix, no inherited template parameters.
 func (w *cppWalker) walkTop(root *sitter.Node) {
 	if w.seenClasses == nil {
 		w.seenClasses = map[string]int{}
 	}
 	for i := uint32(0); i < root.NamedChildCount(); i++ {
-		w.visit(root.NamedChild(int(i)), "", nil)
+		w.visit(root.NamedChild(int(i)), "", "", nil)
 	}
 }
 
 // visit dispatches a node encountered at file / namespace /
 // linkage-specification scope. `container` is the dotted
 // namespace path accumulated so far (the C++ analogue of the
-// TypeScript walker's `outer` argument). `templateParams` is
-// non-nil only when the parent of n was a
-// `template_declaration` -- in that case the params attach
-// to the wrapped class/struct via LangMeta.
-func (w *cppWalker) visit(n *sitter.Node, container string, templateParams []string) {
+// TypeScript walker's `outer` argument). `namespace` is the
+// same path with any inner-class segments removed -- at
+// namespace scope they're identical, but the parameter is
+// threaded separately so the walker can populate
+// `LangMeta["namespace"]` with JUST the namespace prefix
+// when emitting a class (per tech-spec §5.2 "LangMeta keys:
+// namespace (string), ...").  `templateParams` is non-nil
+// only when the parent of n was a `template_declaration` --
+// in that case the params attach to the wrapped class /
+// struct via LangMeta.
+//
+// Unrecognised node types fall through to the `default`
+// branch where we recurse into the named children, mirroring
+// the TypeScript walker's pattern (parser_treesitter.go
+// `visitTopLevel` default branch). That ensures classes
+// nested inside preprocessor wrappers -- `preproc_ifdef` /
+// `preproc_if` / `preproc_else` / `preproc_elif`, the
+// node types tree-sitter-cpp uses for `#ifndef HEADER_H`
+// include guards and `#ifdef PLATFORM_X` conditional
+// compilation blocks -- and inside `declaration` /
+// `attributed_declaration` / `static_assert_declaration`
+// wrappers still surface as `ClassDecl`s, instead of being
+// silently dropped because the walker only knew about the
+// closed set of node types it special-cases.
+func (w *cppWalker) visit(n *sitter.Node, container, namespace string, templateParams []string) {
 	if n == nil {
 		return
 	}
 	switch n.Type() {
 	case cppNodeNamespaceDefinition:
-		w.handleNamespace(n, container)
+		w.handleNamespace(n, container, namespace)
 	case cppNodeClassSpecifier, cppNodeStructSpecifier:
-		w.handleClass(n, container, templateParams)
+		w.handleClass(n, container, namespace, templateParams)
 	case cppNodeTemplateDeclaration:
-		w.handleTemplateDeclaration(n, container)
+		w.handleTemplateDeclaration(n, container, namespace)
 	case cppNodeLinkageSpecification:
 		// `extern "C" { ... }` wraps a declaration_list
 		// whose children should be visited at the enclosing
@@ -173,37 +206,41 @@ func (w *cppWalker) visit(n *sitter.Node, container string, templateParams []str
 		body := cppFindBody(n)
 		if body != nil {
 			for i := uint32(0); i < body.NamedChildCount(); i++ {
-				w.visit(body.NamedChild(int(i)), container, nil)
+				w.visit(body.NamedChild(int(i)), container, namespace, nil)
 			}
 		}
-	case cppNodeDeclaration:
-		// A forward decl (`class Foo;`) lives as a
-		// `class_specifier` / `struct_specifier` inside a
-		// `declaration` wrapper. Descend one level so the
-		// forward decl still produces a ClassDecl (handled
-		// inside handleClass, which dedupes against a later
-		// definition).
+	default:
+		// Generic recursive descent for every other node
+		// type -- includes preproc wrappers
+		// (`preproc_ifdef`, `preproc_if`, `preproc_else`,
+		// `preproc_elif`, `preproc_elifdef`),
+		// `declaration` (which wraps `class Foo;` forward
+		// declarations), `attributed_declaration`, and
+		// anything else the grammar may evolve to wrap a
+		// class/namespace in. The recursive walk is bounded
+		// because the only emission sites are the explicit
+		// switch cases above; an unknown wrapper merely
+		// passes through.
 		for i := uint32(0); i < n.NamedChildCount(); i++ {
-			c := n.NamedChild(int(i))
-			if c.Type() == cppNodeClassSpecifier || c.Type() == cppNodeStructSpecifier {
-				w.handleClass(c, container, templateParams)
-			}
+			w.visit(n.NamedChild(int(i)), container, namespace, templateParams)
 		}
 	}
 }
 
 // handleNamespace extracts the namespace name (one segment
 // per `namespace` keyword, plus any `a::b` nested syntax),
-// extends the dotted `container` path accordingly, and walks
-// the namespace body. Anonymous namespaces (`namespace { }`)
-// are walked with the outer container unchanged -- their
-// members appear at the enclosing scope as far as the
+// extends BOTH the dotted `container` path AND the parallel
+// `namespace` path (they advance together at namespace
+// scope), and walks the namespace body. Anonymous namespaces
+// (`namespace { }`) are walked with both paths unchanged --
+// their members appear at the enclosing scope as far as the
 // QualifiedName is concerned. That trades the (rare)
 // possibility of a name collision with a global declaration
 // against the simpler invariant "every QualifiedName comes
 // from source-visible identifiers".
-func (w *cppWalker) handleNamespace(n *sitter.Node, outer string) {
+func (w *cppWalker) handleNamespace(n *sitter.Node, outer, namespace string) {
 	qualified := outer
+	ns := namespace
 	if nameNode := n.ChildByFieldName("name"); nameNode != nil {
 		// `namespace foo` -> nameNode is a single
 		// namespace_identifier with content "foo".
@@ -212,7 +249,8 @@ func (w *cppWalker) handleNamespace(n *sitter.Node, outer string) {
 		// "a::b". Either way, splitting on `::` and joining
 		// with `.` gives one dotted segment per `namespace`
 		// keyword -- matching the brief's
-		// `QualifiedName=<namespace+"."+name>` rule.
+		// `QualifiedName=<namespace+"."+name>` rule and the
+		// tech-spec §5.2 `LangMeta["namespace"]` key.
 		raw := strings.TrimSpace(nameNode.Content(w.src))
 		for _, seg := range strings.Split(raw, "::") {
 			seg = strings.TrimSpace(seg)
@@ -224,12 +262,17 @@ func (w *cppWalker) handleNamespace(n *sitter.Node, outer string) {
 			} else {
 				qualified = qualified + "." + seg
 			}
+			if ns == "" {
+				ns = seg
+			} else {
+				ns = ns + "." + seg
+			}
 		}
 	}
 	body := cppFindBody(n)
 	if body != nil {
 		for i := uint32(0); i < body.NamedChildCount(); i++ {
-			w.visit(body.NamedChild(int(i)), qualified, nil)
+			w.visit(body.NamedChild(int(i)), qualified, ns, nil)
 		}
 	}
 }
@@ -241,7 +284,11 @@ func (w *cppWalker) handleNamespace(n *sitter.Node, outer string) {
 // stage), another nested template_declaration (e.g.
 // `template<class T> template<class U> ...`), or a function
 // (out of scope here -- visit() simply ignores it).
-func (w *cppWalker) handleTemplateDeclaration(n *sitter.Node, container string) {
+//
+// `template_declaration` does not contribute a namespace
+// segment, so both `container` and `namespace` are forwarded
+// to the wrapped declaration unchanged.
+func (w *cppWalker) handleTemplateDeclaration(n *sitter.Node, container, namespace string) {
 	var params []string
 	for i := uint32(0); i < n.NamedChildCount(); i++ {
 		c := n.NamedChild(int(i))
@@ -255,7 +302,7 @@ func (w *cppWalker) handleTemplateDeclaration(n *sitter.Node, container string) 
 		if c.Type() == cppNodeTemplateParameterList {
 			continue
 		}
-		w.visit(c, container, params)
+		w.visit(c, container, namespace, params)
 	}
 }
 
@@ -264,7 +311,17 @@ func (w *cppWalker) handleTemplateDeclaration(n *sitter.Node, container string) 
 // emitted once but yield to a later full definition that
 // arrives with the same QualifiedName -- the seenClasses
 // dedupe table prefers the entry with a body.
-func (w *cppWalker) handleClass(n *sitter.Node, outer string, templateParams []string) {
+//
+// `outer` is the dotted prefix for the QualifiedName (it
+// includes both namespace path AND any enclosing-class
+// path for nested classes). `namespace` is JUST the
+// namespace prefix -- it stays stable as the walker
+// descends through nested class bodies so that
+// `LangMeta["namespace"]` carries the namespace the class
+// was declared in, not the dotted chain of enclosing
+// classes (tech-spec §5.2 "LangMeta keys: namespace
+// (string), ...").
+func (w *cppWalker) handleClass(n *sitter.Node, outer, namespace string, templateParams []string) {
 	nameNode := n.ChildByFieldName("name")
 	if nameNode == nil {
 		// Anonymous struct/class (e.g. `typedef struct { ...
@@ -318,8 +375,28 @@ func (w *cppWalker) handleClass(n *sitter.Node, outer string, templateParams []s
 		}
 	}
 
-	if len(baseAccess) > 0 || len(templateParams) > 0 {
+	// LangMeta is populated when there is anything per-
+	// language to record: a non-empty namespace prefix, one
+	// or more base-class access entries, or one or more
+	// template parameters. A class with none of these (a
+	// plain top-level `class Foo {};` with no bases and no
+	// `template<>`) leaves the field nil -- the descriptive-
+	// not-identifying invariant (parser.go C12) requires the
+	// field stay nil when there's nothing to say.
+	if namespace != "" || len(baseAccess) > 0 || len(templateParams) > 0 {
 		cls.LangMeta = map[string]any{}
+		if namespace != "" {
+			// Per tech-spec §5.2 line 444 ("LangMeta keys:
+			// namespace (string), ...") the namespace
+			// prefix is also persisted as a discrete
+			// LangMeta value so downstream consumers can
+			// route on it without re-parsing the
+			// QualifiedName -- the brief still requires the
+			// namespace to be in the QualifiedName
+			// (<namespace+"."+name>), so this is an
+			// ADDITIVE attr, not a replacement.
+			cls.LangMeta["namespace"] = namespace
+		}
 		if len(baseAccess) > 0 {
 			cls.LangMeta["base_access"] = baseAccess
 		}
@@ -342,7 +419,7 @@ func (w *cppWalker) handleClass(n *sitter.Node, outer string, templateParams []s
 		// Whether or not we overwrote, fall through to walk
 		// the body so nested classes still surface.
 		if hasBody {
-			w.walkClassBody(body, qualified)
+			w.walkClassBody(body, qualified, namespace)
 		}
 		return
 	}
@@ -350,7 +427,7 @@ func (w *cppWalker) handleClass(n *sitter.Node, outer string, templateParams []s
 	w.classes = append(w.classes, cls)
 
 	if hasBody {
-		w.walkClassBody(body, qualified)
+		w.walkClassBody(body, qualified, namespace)
 	}
 }
 
@@ -359,14 +436,31 @@ func (w *cppWalker) handleClass(n *sitter.Node, outer string, templateParams []s
 // nested classes. Member methods and fields are NOT emitted
 // here -- the C++ methods workstream owns that surface; the
 // brief for this stage is class-only.
-func (w *cppWalker) walkClassBody(body *sitter.Node, qualified string) {
+//
+// `qualified` is the enclosing class's QualifiedName, used
+// as the `outer` prefix for any nested class emitted here.
+// `namespace` is forwarded UNCHANGED -- a nested class
+// lives in the same namespace as its enclosing class, so
+// `LangMeta["namespace"]` should carry the enclosing
+// namespace, not `enclosingClass.qualified`.
+//
+// Preprocessor wrappers inside the class body
+// (`preproc_ifdef`, `preproc_if`, `preproc_else`,
+// `preproc_elif`, `preproc_elifdef`) are descended through
+// so nested classes inside `#ifdef PLATFORM` /
+// `#ifndef GUARD` regions still surface; the grammar uses
+// the same string names for the in-field-declaration-list
+// variants of these nodes (see parser.c
+// `sym_preproc_ifdef_in_field_declaration_list` ->
+// `"preproc_ifdef"`).
+func (w *cppWalker) walkClassBody(body *sitter.Node, qualified, namespace string) {
 	for i := uint32(0); i < body.NamedChildCount(); i++ {
 		member := body.NamedChild(int(i))
 		switch member.Type() {
 		case cppNodeClassSpecifier, cppNodeStructSpecifier:
-			w.handleClass(member, qualified, nil)
+			w.handleClass(member, qualified, namespace, nil)
 		case cppNodeTemplateDeclaration:
-			w.handleTemplateDeclaration(member, qualified)
+			w.handleTemplateDeclaration(member, qualified, namespace)
 		case cppNodeFieldDeclaration:
 			// A nested class declared without inline body
 			// (e.g. `class Inner;`) lives inside a
@@ -376,9 +470,19 @@ func (w *cppWalker) walkClassBody(body *sitter.Node, qualified string) {
 			for j := uint32(0); j < member.NamedChildCount(); j++ {
 				c := member.NamedChild(int(j))
 				if c.Type() == cppNodeClassSpecifier || c.Type() == cppNodeStructSpecifier {
-					w.handleClass(c, qualified, nil)
+					w.handleClass(c, qualified, namespace, nil)
 				}
 			}
+		case cppNodePreprocIf,
+			cppNodePreprocIfdef,
+			cppNodePreprocElse,
+			cppNodePreprocElif,
+			cppNodePreprocElifdef:
+			// Preproc wrapper inside a class body -- the
+			// children are themselves field-declaration-
+			// list-shaped, so we recurse with the same
+			// (qualified, namespace) pair.
+			w.walkClassBody(member, qualified, namespace)
 		}
 	}
 }

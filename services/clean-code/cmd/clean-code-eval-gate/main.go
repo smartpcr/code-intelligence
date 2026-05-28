@@ -34,6 +34,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gofrs/uuid"
@@ -484,7 +485,32 @@ func runWALReconciler(ctx context.Context, signingKeysManager *keys.Manager, wal
 		Dir:      walDir,
 		KeyStore: keyStore,
 		Logger: func(msg string, kv ...any) {
-			log.Printf("clean-code-eval-gate: reconciler: "+msg+" %v", kv)
+			// Render kv as space-separated key=value pairs.
+			// Passing `kv` (a []any) as a single `%v` arg
+			// to log.Printf renders the variadic slice flat
+			// (`[k1 v1 k2 v2]`) instead of paired
+			// (`k1=v1 k2=v2`), which defeats the structured
+			// logging contract the reconciler relies on
+			// (see gateway main.go, which uses
+			// `slog.Any("kv", kv)` for the same purpose).
+			// The eval-gate binary uses the stdlib `log`
+			// package throughout, so rather than introduce
+			// `slog` for this one call site we iterate the
+			// pairs explicitly; an odd-length tail is
+			// rendered with a "(MISSING)" sentinel so the
+			// emitter sees the malformed call instead of
+			// silently dropping the orphan key.
+			var sb strings.Builder
+			sb.WriteString("clean-code-eval-gate: reconciler: ")
+			sb.WriteString(msg)
+			for i := 0; i < len(kv); i += 2 {
+				if i+1 < len(kv) {
+					fmt.Fprintf(&sb, " %v=%v", kv[i], kv[i+1])
+				} else {
+					fmt.Fprintf(&sb, " %v=(MISSING)", kv[i])
+				}
+			}
+			log.Print(sb.String())
 		},
 	})
 	if rerr != nil {

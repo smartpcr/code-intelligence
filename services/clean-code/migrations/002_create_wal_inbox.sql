@@ -68,6 +68,10 @@ BEGIN
                 NOW()
             )
             ON CONFLICT (id) DO NOTHING;
+
+        ELSE
+            RAISE WARNING 'unknown target_table: %', frame.target_table;
+            CONTINUE;  -- skip marking as replayed so the row stays pending
         END IF;
 
         -- Mark frame as replayed.

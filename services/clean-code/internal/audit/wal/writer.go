@@ -15,8 +15,9 @@ import (
 )
 
 // WriterConfig configures a [Writer]. Every required field is
-// validated by [NewWriter]; defaults apply only to the optional
-// `Clock` / `UUIDGen` knobs (tests can pin them).
+// validated by [NewWriter]; defaults apply to the optional
+// `Clock` / `UUIDGen` / `SyncFile` / `SyncDir` knobs (tests
+// can pin them).
 type WriterConfig struct {
 	// Dir is the partition root. Per-day files are written
 	// as `<Dir>/YYYY-MM-DD.wal` (UTC). Required.
@@ -37,6 +38,24 @@ type WriterConfig struct {
 	// when nil. Tests inject a deterministic generator so
 	// `FrameID` assertions are stable.
 	UUIDGen func() (uuid.UUID, error)
+
+	// SyncFile is the per-writer fsync seam. Optional;
+	// defaults to (*os.File).Sync. Each [Writer] captures
+	// its own copy at [NewWriter] time so multiple writers
+	// in parallel tests (each constructed with its own
+	// failure-injecting closure) do NOT race on a shared
+	// global. Prefer this over overriding the package-level
+	// syncFile var.
+	SyncFile func(*os.File) error
+
+	// SyncDir is the per-writer parent-directory fsync
+	// seam. Optional; defaults to opening + Sync()ing the
+	// directory. Same per-writer ownership rationale as
+	// [WriterConfig.SyncFile]. The returned error is
+	// swallowed by [Writer.flush]; the field exists so
+	// tests can assert the dir-sync was attempted on the
+	// first write to a new partition.
+	SyncDir func(string) error
 }
 
 // Writer appends signed [AuditFrame] records to per-partition
@@ -55,6 +74,18 @@ type Writer struct {
 	signer  Signer
 	clock   func() time.Time
 	newUUID func() (uuid.UUID, error)
+
+	// syncFile / syncDir are per-instance fsync seams.
+	// They default to the package-level syncFile / syncDir
+	// vars (which in turn default to the real OS syncs) so
+	// tests that override the package var continue to work
+	// AND tests that want a race-free per-writer seam can
+	// inject via [WriterConfig.SyncFile] /
+	// [WriterConfig.SyncDir]. Captured once in [NewWriter];
+	// never mutated thereafter, so concurrent flushes from
+	// the same writer share a stable function value.
+	syncFile func(*os.File) error
+	syncDir  func(string) error
 
 	mu sync.Mutex
 }
@@ -78,14 +109,32 @@ func NewWriter(cfg WriterConfig) (*Writer, error) {
 	if newUUID == nil {
 		newUUID = uuid.NewV4
 	}
+	// Per-writer fsync seams. When unset, the default
+	// closure indirects through the package-level syncFile
+	// / syncDir vars. This preserves backward compatibility
+	// for existing tests that override those package vars
+	// before constructing a Writer, while NEW tests that
+	// want parallel isolation can supply their own
+	// closures via WriterConfig and avoid the global
+	// entirely.
+	syncF := cfg.SyncFile
+	if syncF == nil {
+		syncF = func(f *os.File) error { return syncFile(f) }
+	}
+	syncD := cfg.SyncDir
+	if syncD == nil {
+		syncD = func(dir string) error { return syncDir(dir) }
+	}
 	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
 		return nil, fmt.Errorf("wal: NewWriter: mkdir %s: %w", cfg.Dir, err)
 	}
 	return &Writer{
-		dir:     cfg.Dir,
-		signer:  cfg.Signer,
-		clock:   clock,
-		newUUID: newUUID,
+		dir:      cfg.Dir,
+		signer:   cfg.Signer,
+		clock:    clock,
+		newUUID:  newUUID,
+		syncFile: syncF,
+		syncDir:  syncD,
 	}, nil
 }
 
@@ -251,7 +300,7 @@ func (w *Writer) flush(ctx context.Context, frames []AuditFrame) error {
 		if _, statErr := os.Stat(fname); errors.Is(statErr, os.ErrNotExist) {
 			isNew = true
 		}
-		if err := appendAndSync(fname, buf, isNew); err != nil {
+		if err := w.appendAndSync(fname, buf, isNew); err != nil {
 			return fmt.Errorf("wal: flush: append+sync %s: %w", fname, err)
 		}
 	}
@@ -288,8 +337,15 @@ func encodeFrames(frames []AuditFrame) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// syncFile is a test seam so unit tests can inject a sync
-// failure and assert the four-state atomicity contract.
+// syncFile is a legacy package-level fsync seam. New code
+// SHOULD inject via [WriterConfig.SyncFile] instead: each
+// [Writer] then carries its own seam, so a test that wraps
+// its own Writer in `t.Parallel()` cannot race a sibling
+// test's override on a shared global. This var is retained
+// only so existing tests that override it (and existing
+// direct callers of the free [appendAndSync] function) keep
+// compiling unchanged.
+//
 // Production callers always go through (*os.File).Sync.
 var syncFile = func(f *os.File) error { return f.Sync() }
 
@@ -303,6 +359,9 @@ var syncFile = func(f *os.File) error { return f.Sync() }
 // fsync should NOT block a frame that already fsynced its own
 // bytes; the writer's contract is best-effort durability for
 // directory metadata and strict durability for frame bytes.
+//
+// Same legacy-seam status as [syncFile]: new code SHOULD
+// inject via [WriterConfig.SyncDir].
 var syncDir = func(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
@@ -353,7 +412,15 @@ var syncDir = func(dir string) error {
 // `isNewPartition` controls whether we issue a best-effort
 // parent-directory fsync after the file's first creation.
 // Subsequent appends do not need to re-sync the parent dir.
-func appendAndSync(path string, data []byte, isNewPartition bool) error {
+//
+// The fsync seams `sf` and `sd` are parameters so each
+// [Writer] can supply its own per-instance hooks (via
+// [WriterConfig.SyncFile] / [WriterConfig.SyncDir]). The
+// public free function [appendAndSync] is retained as a
+// thin wrapper using the package-level syncFile / syncDir
+// vars for backward compatibility with existing direct
+// callers.
+func doAppendAndSync(path string, data []byte, isNewPartition bool, sf func(*os.File) error, sd func(string) error) error {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
@@ -371,7 +438,7 @@ func appendAndSync(path string, data []byte, isNewPartition bool) error {
 	if n != len(data) {
 		return fmt.Errorf("short write: wrote %d of %d bytes", n, len(data))
 	}
-	if err := syncFile(f); err != nil {
+	if err := sf(f); err != nil {
 		return err
 	}
 	closed = true
@@ -384,9 +451,31 @@ func appendAndSync(path string, data []byte, isNewPartition bool) error {
 		// NOT roll back the just-fsynced file -- the
 		// frame bytes are durable; only the directory
 		// entry may be lost on a crash.
-		_ = syncDir(filepath.Dir(path))
+		_ = sd(filepath.Dir(path))
 	}
 	return nil
+}
+
+// appendAndSync is the legacy free-function entry point.
+// It delegates to [doAppendAndSync] using the package-level
+// syncFile / syncDir vars. Kept so existing tests that
+// override those vars (or that call appendAndSync directly,
+// e.g. TestAppendAndSync_SyncFailure_LeavesBytesOnDisk)
+// continue to compile and behave identically. New code that
+// flushes through a [Writer] uses
+// [Writer.appendAndSync] instead so the seam is per-instance.
+func appendAndSync(path string, data []byte, isNewPartition bool) error {
+	return doAppendAndSync(path, data, isNewPartition, syncFile, syncDir)
+}
+
+// appendAndSync (method) is the per-Writer entry point used
+// by [Writer.flush]. It routes through the Writer's own
+// syncFile / syncDir fields so each Writer has its own
+// seam -- two parallel tests that each construct their own
+// Writer with their own failure-injecting closures cannot
+// race on a shared global.
+func (w *Writer) appendAndSync(path string, data []byte, isNewPartition bool) error {
+	return doAppendAndSync(path, data, isNewPartition, w.syncFile, w.syncDir)
 }
 
 // TxBatch stages frames for one SQL transaction. Frames are

@@ -4,6 +4,63 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 10.2 -- Aged mute insights report (iter 3)
+
+Wire-contract + error-mapping correctness pass. Four
+iter-2 evaluator findings addressed; all four are internal
+consistency fixes between the operator-facing docs and the
+Reader / projection code.
+
+### Iter 3 changes
+
+- **`AgedMute.MarshalJSON`** -- NEW custom JSON encoder in
+  `internal/management/insights/aged_mutes.go` that emits the
+  FLAT snake_case wire shape the operator docs have always
+  promised:
+  `{override_id, rule_id, repo_id, scope_kind,
+  scope_signature_glob, reason, actor_id, created_at,
+  age_days}`. The Go struct keeps the nested
+  `Scope OverrideScope` field for ergonomic in-process
+  access, but the wire is flat per the dashboard column-
+  binding contract. Wire shape pinned by three new tests in
+  `aged_mutes_test.go`: `TestAgedMute_MarshalJSON_FlatWireShape`
+  (byte-exact match), `TestAgedMute_MarshalJSON_NoNestedScopeKey`
+  (forbidden keys), and `TestAgedMute_MarshalJSON_RoundTripsThroughReport`
+  (end-to-end through `AgedMutes.Report`). Closes evaluator
+  item 1.
+- **`mode` doc value -- `"latest_dashboard"`, not `"active"`** --
+  `services/clean-code/docs/runbook.md` and `docs/rollout.md`
+  now state the actual `ReadMode` tag the response envelope
+  carries. `Reader.ReadAgedMutes` returns
+  `ReadModeLatestDashboard` (string value `"latest_dashboard"`),
+  matching the existing `mgmt.read.cross_repo` /
+  `mgmt.read.portfolio` envelopes. Closes evaluator item 2.
+- **Nil-store / nil-reader sentinel -> `ErrBackendUnavailable`**
+  -- `Reader.ReadAgedMutes` now maps both
+  `insights.ErrAgedMuteReaderUnavailable` AND
+  `management.ErrAgedMuteOverrideStoreUnavailable` to the
+  package-level `ErrBackendUnavailable` so the HTTP layer
+  emits 503 for ANY composition-root wiring bug, not just a
+  missing `WithAgedMutes(...)` option. Two new tests in
+  `reader_aged_mutes_test.go`:
+  `TestReader_ReadAgedMutes_NilStoreAdapterMapsToBackendUnavailable`
+  (nil `steward.Store` inside the production
+  `OverrideReaderFromStore` adapter) and
+  `TestReader_ReadAgedMutes_NilOverrideReaderMapsToBackendUnavailable`
+  (nil `OverrideReader` passed to `insights.NewAgedMutes`).
+  Closes evaluator item 3.
+- **`reduceAndFilter` docstring** -- step 5 in
+  `aged_mutes.go` now correctly states
+  `(CreatedAt ASC, OverrideID ASC)`; the iter 2 sort change
+  left a stale comment naming the old key. The actual
+  comparator is unchanged. Closes evaluator item 4.
+- **Doc field alignment: `actor` -> `actor_id`** -- both
+  runbook + rollout had documented `"actor"` while the
+  steward source field is `actor_id`. Aligned the wire-shape
+  examples + verb-contract table to `actor_id` (the natural
+  snake-case of `OverrideRecord.ActorID` AND the JSON tag
+  on `steward.Override.ActorID`).
+
 ## Stage 10.2 -- Aged mute insights report (iter 2)
 
 Hardening pass on the iter 1 aged-mute insights report. Four

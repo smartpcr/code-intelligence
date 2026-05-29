@@ -52,6 +52,7 @@ package insights
 
 import (
 	"context"
+	"encoding/json"
 	"sort"
 	"time"
 )
@@ -158,6 +159,30 @@ type OverrideReader interface {
 // when `mute=true` (the only rows that ever appear here), so a
 // renderer can use `Reason` as the primary label without a
 // null check.
+//
+// # JSON wire shape
+//
+// The struct ships its OWN [AgedMute.MarshalJSON] that emits a
+// FLAT, snake_case operator wire shape (no nested `scope`
+// object, no PascalCase keys):
+//
+//	{
+//	  "override_id":           "11111111-...",
+//	  "rule_id":               "solid.srp.lcom4_high",
+//	  "repo_id":               "repo-orders",
+//	  "scope_kind":            "class",
+//	  "scope_signature_glob":  "com.example.Foo",
+//	  "reason":                "legacy",
+//	  "actor_id":              "alice@example.com",
+//	  "created_at":            "2025-09-01T14:22:11Z",
+//	  "age_days":              200
+//	}
+//
+// The wire shape is pinned by `TestAgedMute_MarshalJSON_*`
+// tests in `aged_mutes_test.go` so a future struct refactor
+// cannot silently break the operator dashboard. Internal Go
+// callers continue to read `.Scope.RepoID` etc. via the
+// nested struct field.
 type AgedMute struct {
 	OverrideID string
 	RuleID     string
@@ -166,6 +191,45 @@ type AgedMute struct {
 	ActorID    string
 	CreatedAt  time.Time
 	AgeDays    int
+}
+
+// agedMuteWire is the FLAT operator-facing snake_case wire
+// shape produced by [AgedMute.MarshalJSON]. Keeping it
+// private + named distinctly from [AgedMute] means a future
+// PR that "just adds a field" to AgedMute does NOT silently
+// land on the wire: the wire shape requires an explicit
+// edit here AND a test update in `aged_mutes_test.go`.
+type agedMuteWire struct {
+	OverrideID         string    `json:"override_id"`
+	RuleID             string    `json:"rule_id"`
+	RepoID             string    `json:"repo_id"`
+	ScopeKind          string    `json:"scope_kind"`
+	ScopeSignatureGlob string    `json:"scope_signature_glob"`
+	Reason             string    `json:"reason"`
+	ActorID            string    `json:"actor_id"`
+	CreatedAt          time.Time `json:"created_at"`
+	AgeDays            int       `json:"age_days"`
+}
+
+// MarshalJSON renders the FLAT snake_case operator wire shape
+// pinned by `services/clean-code/docs/runbook.md` and
+// `docs/rollout.md`. Iter 2 evaluator item 1: the Go struct
+// has a nested `Scope` field for ergonomic in-process access
+// but the wire MUST be flat per the operator dashboard
+// contract. We flatten here so the struct definition and the
+// wire shape can evolve independently.
+func (a AgedMute) MarshalJSON() ([]byte, error) {
+	return json.Marshal(agedMuteWire{
+		OverrideID:         a.OverrideID,
+		RuleID:             a.RuleID,
+		RepoID:             a.Scope.RepoID,
+		ScopeKind:          a.Scope.ScopeKind,
+		ScopeSignatureGlob: a.Scope.ScopeSignatureGlob,
+		Reason:             a.Reason,
+		ActorID:            a.ActorID,
+		CreatedAt:          a.CreatedAt,
+		AgeDays:            a.AgeDays,
+	})
 }
 
 // AgedMutes is the Insights-surface projection. It holds the
@@ -309,9 +373,11 @@ func (a *AgedMutes) now() time.Time {
 //     threshold` (inclusive: an exact-boundary row is NOT
 //     aged; mirrors the [Freshness] window inclusive
 //     contract).
-//  5. Sort the remaining winners by (RuleID, Scope.RepoID,
-//     Scope.ScopeKind, Scope.ScopeSignatureGlob) ascending so
-//     the result is deterministic.
+//  5. Sort the remaining winners oldest-first by
+//     (CreatedAt ASC, OverrideID ASC) so the operator
+//     dashboard sees the longest-running mute at the top and
+//     two callers that read the same backend state see byte-
+//     identical JSON. (See [lessAgedMute].)
 //
 // Pure function: no I/O, no clock, no concurrency. Exported
 // internally for the test suite to feed in fixture records.

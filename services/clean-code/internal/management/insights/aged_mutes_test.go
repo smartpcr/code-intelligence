@@ -22,6 +22,7 @@ package insights
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"testing"
@@ -773,4 +774,142 @@ func TestAgedMute_Echo(t *testing.T) {
 				tc.age, got[0].AgeDays, tc.want)
 		}
 	}
+}
+
+// TestAgedMute_MarshalJSON_FlatWireShape pins the OPERATOR-
+// facing JSON wire shape of [AgedMute] (iter 2 evaluator
+// item 1). The struct nests a `Scope OverrideScope` field
+// for ergonomic in-process access, but the wire MUST be
+// flat snake_case per the operator dashboard contract
+// documented in `services/clean-code/docs/runbook.md` and
+// `docs/rollout.md`. This test fails if a future refactor
+// of `AgedMute.MarshalJSON` drops a field, changes a key,
+// or reintroduces the nested `Scope` object.
+func TestAgedMute_MarshalJSON_FlatWireShape(t *testing.T) {
+	t.Parallel()
+	sample := AgedMute{
+		OverrideID: "ov-2025-09-01-001",
+		RuleID:     "decoupling.RP-001",
+		Scope: OverrideScope{
+			RepoID:             "repo-orders",
+			ScopeKind:          "repo",
+			ScopeSignatureGlob: "github.com/acme/svc-orders",
+		},
+		Reason:    "blocked on cross-team alignment",
+		ActorID:   "alice@acme.com",
+		CreatedAt: time.Date(2025, 9, 1, 14, 22, 11, 0, time.UTC),
+		AgeDays:   200,
+	}
+	got, err := json.Marshal(sample)
+	if err != nil {
+		t.Fatalf("json.Marshal(AgedMute) returned err=%v", err)
+	}
+	want := `{` +
+		`"override_id":"ov-2025-09-01-001",` +
+		`"rule_id":"decoupling.RP-001",` +
+		`"repo_id":"repo-orders",` +
+		`"scope_kind":"repo",` +
+		`"scope_signature_glob":"github.com/acme/svc-orders",` +
+		`"reason":"blocked on cross-team alignment",` +
+		`"actor_id":"alice@acme.com",` +
+		`"created_at":"2025-09-01T14:22:11Z",` +
+		`"age_days":200` +
+		`}`
+	if string(got) != want {
+		t.Fatalf("AgedMute JSON wire shape mismatch.\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// TestAgedMute_MarshalJSON_NoNestedScopeKey pins that the
+// wire output does NOT carry a `"Scope"` key (the Go field
+// name) NOR a `"scope"` key (a hypothetical snake-case
+// nested object). Either would silently break the operator
+// dashboard column-binding contract.
+func TestAgedMute_MarshalJSON_NoNestedScopeKey(t *testing.T) {
+	t.Parallel()
+	got, err := json.Marshal(AgedMute{
+		Scope: OverrideScope{RepoID: "r", ScopeKind: "k", ScopeSignatureGlob: "g"},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	for _, forbidden := range []string{`"Scope"`, `"scope"`, `"RuleID"`, `"ActorID"`, `"CreatedAt"`, `"AgeDays"`} {
+		if bytesContains(got, forbidden) {
+			t.Errorf("wire shape leaked %q in %s", forbidden, got)
+		}
+	}
+}
+
+// TestAgedMute_MarshalJSON_RoundTripsThroughReport pins that
+// the JSON wire shape of a real [AgedMutes.Report] result
+// matches the documented flat snake_case shape end-to-end --
+// not just on a synthetic struct literal. Catches a future
+// regression where the reducer accidentally returns a value
+// that bypasses [AgedMute.MarshalJSON] (e.g. wrapping it in
+// a `*AgedMute` pointer with a divergent method set).
+func TestAgedMute_MarshalJSON_RoundTripsThroughReport(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
+	mute := newAt(
+		"decoupling.RP-001",
+		"repo-orders",
+		"repo",
+		"github.com/acme/svc-orders",
+		true,
+		now.Add(-200*24*time.Hour),
+		"ov-2025-09-01-001",
+	)
+	backend := &sliceReader{rows: []OverrideRecord{mute}}
+	am := &AgedMutes{Reader: backend, Clock: fixedClock{now}, Threshold: 90 * 24 * time.Hour}
+	got, err := am.Report(context.Background())
+	if err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len(report)=%d, want 1", len(got))
+	}
+	enc, err := json.Marshal(got[0])
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	for _, mustHave := range []string{
+		`"override_id":"ov-2025-09-01-001"`,
+		`"rule_id":"decoupling.RP-001"`,
+		`"repo_id":"repo-orders"`,
+		`"scope_kind":"repo"`,
+		`"scope_signature_glob":"github.com/acme/svc-orders"`,
+		`"actor_id":"operator-test@example.com"`,
+		`"age_days":200`,
+	} {
+		if !bytesContains(enc, mustHave) {
+			t.Errorf("report JSON missing %q in %s", mustHave, enc)
+		}
+	}
+}
+
+// bytesContains is a tiny stdlib-only substring helper -- the
+// test file already imports stdlib `strings` via... actually
+// it does NOT, and we deliberately keep imports minimal here.
+// Using a literal byte scan keeps the new tests self-contained.
+func bytesContains(haystack []byte, needle string) bool {
+	n := []byte(needle)
+	if len(n) == 0 {
+		return true
+	}
+	if len(n) > len(haystack) {
+		return false
+	}
+	for i := 0; i+len(n) <= len(haystack); i++ {
+		match := true
+		for j := range n {
+			if haystack[i+j] != n[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
 }

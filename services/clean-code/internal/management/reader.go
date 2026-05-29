@@ -905,6 +905,25 @@ func (r *Reader) ReadPortfolio(ctx context.Context, metricKind string) (*Portfol
 // the other Reader methods. The HTTP layer maps this to a
 // 503 Service Unavailable.
 //
+// Iter 2 evaluator item 3: this method ALSO maps the two
+// "wired but unusable" sentinels to [ErrBackendUnavailable]
+// so the operator-facing failure mode is uniform regardless
+// of WHERE the composition-root wiring bug is:
+//
+//   - [insights.ErrAgedMuteReaderUnavailable]: the projection
+//     has a nil [insights.OverrideReader] (e.g. the
+//     composition root passed `nil` to
+//     [insights.NewAgedMutes]).
+//   - [ErrAgedMuteOverrideStoreUnavailable]: the production
+//     [OverrideReaderFromStore] adapter was constructed with
+//     a nil [steward.Store].
+//
+// Both surface as a 503 so the dashboard renders an
+// "unavailable" tile instead of leaking the internal
+// scaffold-mode error string to the operator. The mapping is
+// pinned by `TestReader_ReadAgedMutes_*Unavailable*` tests in
+// `reader_aged_mutes_test.go`.
+//
 // Returns the underlying [insights.OverrideReader] error
 // (verbatim, wrapped to preserve `errors.Is`) when the
 // backend scan fails. Callers SHOULD treat any error other
@@ -925,6 +944,10 @@ func (r *Reader) ReadAgedMutes(ctx context.Context, thresholdDays *int) (*AgedMu
 		time.Duration(effectiveDays)*24*time.Hour,
 	)
 	if err != nil {
+		if errors.Is(err, insights.ErrAgedMuteReaderUnavailable) ||
+			errors.Is(err, ErrAgedMuteOverrideStoreUnavailable) {
+			return nil, ErrBackendUnavailable
+		}
 		return nil, err
 	}
 	if report == nil {

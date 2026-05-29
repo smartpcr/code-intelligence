@@ -62,7 +62,7 @@ this stage -- the report is read-only over the existing
 
 | field | type | source |
 |---|---|---|
-| `mode` | string | repository-resolved mode (echoes `mgmt.read.cross_repo`) |
+| `mode` | string | constant `"latest_dashboard"` (same `ReadMode` tag as `mgmt.read.cross_repo` / `mgmt.read.portfolio`) |
 | `threshold_days` | int | effective threshold (caller's `threshold_days` or 90) |
 | `aged_mutes[].rule_id` | string | `override.rule_id` |
 | `aged_mutes[].scope_kind` | string | `override.scope_filter.scope_kind` |
@@ -72,7 +72,7 @@ this stage -- the report is read-only over the existing
 | `aged_mutes[].created_at` | RFC3339 | `override.created_at` |
 | `aged_mutes[].age_days` | int | `floor((now - created_at) / 24h)` |
 | `aged_mutes[].reason` | string | `override.reason` (free-form, may be empty) |
-| `aged_mutes[].actor` | string | `override.actor_id` |
+| `aged_mutes[].actor_id` | string | `override.actor_id` |
 
 ### Verification checklist
 

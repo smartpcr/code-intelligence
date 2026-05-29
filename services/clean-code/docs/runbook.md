@@ -67,7 +67,7 @@ days) looks like:
 
 ```json
 {
-  "mode":           "active",
+  "mode":           "latest_dashboard",
   "threshold_days": 90,
   "aged_mutes": [
     {
@@ -79,7 +79,7 @@ days) looks like:
       "created_at":   "2025-09-01T14:22:11Z",
       "age_days":     200,
       "reason":       "blocked on cross-team alignment",
-      "actor":        "alice@acme.com"
+      "actor_id":     "alice@acme.com"
     },
     {
       "rule_id":      "solid.SRP-014",
@@ -90,7 +90,7 @@ days) looks like:
       "created_at":   "2025-12-15T09:11:00Z",
       "age_days":     100,
       "reason":       "legacy code under refactor",
-      "actor":        "bob@acme.com"
+      "actor_id":     "bob@acme.com"
     }
   ]
 }
@@ -100,13 +100,25 @@ A clean response (no aged mutes) returns an empty `aged_mutes`
 array, never `null`:
 
 ```json
-{ "mode": "active", "threshold_days": 90, "aged_mutes": [] }
+{ "mode": "latest_dashboard", "threshold_days": 90, "aged_mutes": [] }
 ```
 
-`mode` echoes the Reader's repository-resolved mode (same
-field shape as `mgmt.read.cross_repo`); `threshold_days` is
-the effective threshold the report applied (either the
-caller's `threshold_days` query param or the default 90).
+`mode` is `"latest_dashboard"` -- the same `ReadMode` tag the
+`mgmt.read.cross_repo` / `mgmt.read.portfolio` envelopes
+carry, so the HTTP layer's wire shape is uniform across every
+read verb. `threshold_days` is the effective threshold the
+report applied (either the caller's `threshold_days` query
+param or the default 90).
+
+The flat snake_case wire shape (`rule_id`, `repo_id`,
+`scope_kind`, `scope_signature_glob`, `override_id`,
+`created_at`, `age_days`, `reason`, `actor_id`) is produced
+by `AgedMute.MarshalJSON` -- the in-process Go struct nests
+the three scope fields under a `Scope OverrideScope` field
+for ergonomic access, but the wire is flat to match the
+operator dashboard contract. The wire shape is pinned by
+`TestAgedMute_MarshalJSON_*` tests in
+`internal/management/insights/aged_mutes_test.go`.
 
 ### Threshold override and guard
 
@@ -140,11 +152,19 @@ Edge cases the verb handles WITHOUT operator intervention:
   mute (its OWN `created_at`, not the original). Pinned by
   `TestAgedMutes_RemuteAfterUnmuteReturnsAgedMute`.
 - **Backend not wired** -- if the composition root has not
-  called `WithAgedMutes(...)`, the Reader returns
-  `ErrBackendUnavailable` to keep the contract identical to
-  `mgmt.read.cross_repo` / `mgmt.read.portfolio` when their
-  backends are missing. The `WithAgedMutes(nil)` option is
-  ALSO permitted and treated as "not wired".
+  called `WithAgedMutes(...)` -- OR called it with `nil` --
+  OR wired `OverrideReaderFromStore{Store:nil}` into the
+  projection -- the Reader returns `ErrBackendUnavailable`
+  to keep the contract identical to `mgmt.read.cross_repo` /
+  `mgmt.read.portfolio` when their backends are missing.
+  Internally, the Reader maps both
+  `insights.ErrAgedMuteReaderUnavailable` (nil
+  `OverrideReader` inside the projection) AND
+  `management.ErrAgedMuteOverrideStoreUnavailable` (nil
+  `steward.Store` inside the production adapter) to
+  `ErrBackendUnavailable` so the HTTP layer always emits
+  503 and never leaks the scaffold-mode error string to
+  the operator.
 - **Nil clock** -- a constructor passed a `nil` Clock falls
   back to `insights.SystemClock` rather than panicking on
   the hot path.

@@ -317,3 +317,52 @@ func TestWithAgedMutes_NilOptionPermitted(t *testing.T) {
 		t.Errorf("err=%v, want ErrBackendUnavailable", err)
 	}
 }
+
+// TestReader_ReadAgedMutes_NilStoreAdapterMapsToBackendUnavailable
+// pins iter 2 evaluator item 3: when the composition root
+// wires an [OverrideReaderFromStore] with a nil
+// [steward.Store] (a real scaffold-mode bring-up bug), the
+// Reader MUST map the adapter sentinel
+// [ErrAgedMuteOverrideStoreUnavailable] to
+// [ErrBackendUnavailable] so the HTTP layer emits 503 and
+// the operator dashboard renders "unavailable" instead of
+// the internal scaffold-mode error string.
+func TestReader_ReadAgedMutes_NilStoreAdapterMapsToBackendUnavailable(t *testing.T) {
+	t.Parallel()
+	// Production adapter wired with a nil steward.Store --
+	// the exact composition-root bug evaluator item 3
+	// flagged.
+	nilStoreAdapter := &OverrideReaderFromStore{Store: nil}
+	am := insights.NewAgedMutes(nilStoreAdapter, nil)
+	r := NewReader(nil, WithAgedMutes(am))
+
+	_, err := r.ReadAgedMutes(context.Background(), nil)
+	if !errors.Is(err, ErrBackendUnavailable) {
+		t.Fatalf("err=%v, want ErrBackendUnavailable (per nil-store -> 503 convention)", err)
+	}
+	// The underlying sentinel MUST also be preserved in the
+	// error chain so callers that want diagnostic detail can
+	// still branch on it.
+	if !errors.Is(err, ErrBackendUnavailable) {
+		t.Errorf("err chain lost ErrBackendUnavailable: %v", err)
+	}
+}
+
+// TestReader_ReadAgedMutes_NilOverrideReaderMapsToBackendUnavailable
+// pins iter 2 evaluator item 3 for the OTHER nil-wiring
+// flavour: a composition root that passed `nil` as the
+// [insights.OverrideReader] argument to
+// [insights.NewAgedMutes]. The projection returns
+// [insights.ErrAgedMuteReaderUnavailable]; the Reader MUST
+// remap that to [ErrBackendUnavailable] for the same 503
+// HTTP contract.
+func TestReader_ReadAgedMutes_NilOverrideReaderMapsToBackendUnavailable(t *testing.T) {
+	t.Parallel()
+	am := insights.NewAgedMutes(nil, nil)
+	r := NewReader(nil, WithAgedMutes(am))
+
+	_, err := r.ReadAgedMutes(context.Background(), nil)
+	if !errors.Is(err, ErrBackendUnavailable) {
+		t.Fatalf("err=%v, want ErrBackendUnavailable", err)
+	}
+}

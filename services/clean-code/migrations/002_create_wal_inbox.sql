@@ -68,6 +68,10 @@ BEGIN
                 NOW()
             )
             ON CONFLICT (id) DO NOTHING;
+
+        ELSE
+            RAISE WARNING 'unknown target_table: % (wal_inbox.id=%)', frame.target_table, frame.id;
+            CONTINUE;
         END IF;
 
         -- Mark frame as replayed.

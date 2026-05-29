@@ -107,5 +107,5 @@ jobs:
       - name: Run ML effort-model E2E scenarios
         working-directory: services/clean-code
         run: |
-          go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
+          go test -tags e2e -v -count=1 ./test/e2e/refactor_planner_ml_effort_model/... \
             -run TestRefactorPlannerMLEffortModelLoaderAndVersionPinning

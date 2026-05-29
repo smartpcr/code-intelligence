@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -310,7 +311,7 @@ func (s *cFixtureState) theEmbeddedCFixture() error {
 
 func (s *cFixtureState) emitFileRunsUnderCGOOn() error {
 	result, err := runCFixtureProbe(cFixtureSource)
-	if err == errAstDirMissing {
+	if errors.Is(err, errAstDirMissing) {
 		return godog.ErrPending
 	}
 	if err != nil {

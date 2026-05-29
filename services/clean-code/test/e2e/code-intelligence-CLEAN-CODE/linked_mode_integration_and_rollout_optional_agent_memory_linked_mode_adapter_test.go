@@ -230,6 +230,21 @@ func (s *linkedModeAdapterState) theOutputHasDegradedReasonEqualTo(expected stri
 func InitializeScenario_linked_mode_integration_and_rollout_optional_agent_memory_linked_mode_adapter(ctx *godog.ScenarioContext) {
 	s := &linkedModeAdapterState{}
 
+	// Restore the aggregator's linked-mode configuration after each scenario
+	// so that mutations (e.g. pointing at an unreachable agent-memory URL)
+	// do not leak into subsequent tests sharing the same aggregator instance.
+	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
+		s.ensureAggregatorURL()
+		payload := map[string]interface{}{
+			"linked_mode": false,
+		}
+		_, _, resetErr := s.httpJSON(http.MethodPut, s.aggregatorURL+"/v1/config/linked-mode", payload)
+		if resetErr != nil {
+			return ctx, fmt.Errorf("teardown: failed to reset linked-mode config: %w", resetErr)
+		}
+		return ctx, nil
+	})
+
 	// linked-mode-uses-edges
 	ctx.Step(`^linked mode is enabled with a reachable agent-memory service$`, s.linkedModeEnabledWithReachableAgentMemory)
 	ctx.Step(`^the aggregator composes "([^"]*)"$`, s.theAggregatorComposesMetric)

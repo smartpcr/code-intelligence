@@ -83,10 +83,34 @@ type psRegState struct {
 //
 // Both parsers_cgo.go and parsers_nocgo.go register the PowerShell
 // subprocess parser, so DefaultParsers() includes it regardless of
-// CGO mode. Both scenarios pass under either build mode.
+// CGO mode. However, a single test binary is compiled under exactly
+// one build mode, so the scenario whose mode parameter does NOT match
+// the compiled binary is skipped via godog.ErrPending.
+//
+// Full E2E coverage requires TWO go test invocations:
+//   CGO_ENABLED=1 go test -tags e2e ./...
+//   CGO_ENABLED=0 go test -tags e2e ./...
+// Add a CI matrix entry to ensure both are exercised.
 // ---------------------------------------------------------------------------
 
+// detectedCGOMode infers the build mode from DefaultParsers().
+// CGO=on includes tree-sitter parsers (Language != "powershell");
+// CGO=off only has the PowerShell subprocess parser.
+func detectedCGOMode() string {
+	for _, p := range ast.DefaultParsers() {
+		if p.Language() != "powershell" {
+			return "on"
+		}
+	}
+	return "off"
+}
+
 func (s *psRegState) dispatcherViaDefaultParsers(mode string) error {
+	actual := detectedCGOMode()
+	if mode != actual {
+		return fmt.Errorf("%w: scenario requires CGO=%s but binary was built with CGO=%s",
+			godog.ErrPending, mode, actual)
+	}
 	s.parsers = ast.DefaultParsers()
 	if len(s.parsers) == 0 {
 		return fmt.Errorf("DefaultParsers() returned empty list (expected PowerShell under CGO=%s)", mode)

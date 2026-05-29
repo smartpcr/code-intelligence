@@ -154,7 +154,19 @@ this story's iter-8 evaluator):
   branch, trait impls write `ClassDecl.Implements` not
   `LangMeta["implements"]`, `pendingImpls` dedupes via
   `appendUnique`, and the public factory
-  `NewTreeSitterRustParser` exists).
+  `NewTreeSitterRustParser` exists). The audit-friendly
+  mapping from each disputed invariant to the assertion that
+  guards it (so a reviewer who cannot run CGO can still
+  confirm the contract holds):
+
+  | Invariant (claimed broken in iter-8) | Reality (line in `parser_treesitter_rust.go`)             | Non-CGO guard (`parser_treesitter_rust_contract_test.go`)                                       |
+  |---|---|---|
+  | trait `function_item` (default body) → `trait_default=true` | `handleTrait` dispatches to `appendTraitDefaultMethod`; line 496 sets `m.LangMeta["trait_default"] = true` | `TestRustParserContract_FunctionItemDispatchesToTraitDefault` + `..._TraitDefaultFlagIsSetExactly` |
+  | trait `function_signature_item` (no body) → required, no flag | `handleTrait` dispatches to `appendTraitRequiredMethod`; flag is never written here | `TestRustParserContract_FunctionSignatureDispatchesToRequired`                                  |
+  | trait impls populate `ClassDecl.Implements` (struct field) | `handleImpl` line 426 and `appendClass` line 909 write `c.Implements = appendUnique(...)`; no write to `LangMeta["implements"]` | `TestRustParserContract_ImplementsIsStructFieldNotLangMeta`                                     |
+  | `pendingImpls` dedupes duplicate trait impls | line 431 routes through `appendUnique`; line 426 also | `TestRustParserContract_PendingImplsUsesAppendUnique` + `..._ImplementsAccumulatorAlsoUsesAppendUnique` |
+  | Public surface (`Language()=="rust"`, `Extensions()==[".rs"]`, `NewTreeSitterRustParser`) | string literals and factory function are present | `TestRustParserContract_LanguageAndExtensionsStringLiterals` + `..._NewTreeSitterRustParserExists` |
+  | Anchor doc-block mentions `trait_default` + `Implements` | top-of-file READ FIRST block | `TestRustParserContract_DocBlockMentionsTraitDefaultContract`                                   |
 - The dispatcher's Pass 2d trait-default behaviour is
   exercised via `fakeStaticParser` in
   `dispatcher_pass2bd_test.go` (`TestDispatcher_Rust_*`), which

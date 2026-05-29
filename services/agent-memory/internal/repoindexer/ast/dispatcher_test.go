@@ -94,6 +94,30 @@ func (f *fakeNodeEdgeWriter) edgesOf(kind string) []graphwriter.EdgeInput {
 	return out
 }
 
+// nodeIDBySimpleSig returns the NodeID of the FIRST inserted
+// node whose Kind matches `kind` and whose CanonicalSignature's
+// segment after the final `#` (stripped of any trailing
+// `(...)` parameter signature) equals `simpleSig`. Returns ""
+// when no node matches.
+//
+// Tuple-level edge assertions use this helper to translate
+// from human-readable simple names (`"HelloWorld"`,
+// `"Base.Identify"`) to the dispatcher-assigned NodeID without
+// the test having to predict the global insertion order.
+func (f *fakeNodeEdgeWriter) nodeIDBySimpleSig(kind, simpleSig string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, n := range f.nodes {
+		if n.Kind != kind {
+			continue
+		}
+		if lastSegmentAfterHash(n.CanonicalSignature) == simpleSig {
+			return f.idBySig[n.CanonicalSignature]
+		}
+	}
+	return ""
+}
+
 // stringReadCloser wraps a string as a ReadCloser for test
 // EmitFileEvent.Open functions.
 type stringReadCloser struct {

@@ -64,7 +64,14 @@ type Dispatcher struct {
 	mu        sync.Mutex
 }
 
-// DispatcherOption configures a Dispatcher.
+// Compile-time assertion: Dispatcher must satisfy the
+// repoindexer.ASTEmitter interface so it can be passed as
+// `WorkerOptions.Emitter`.
+var _ repoindexer.ASTEmitter = (*Dispatcher)(nil)
+
+// DispatcherOption configures a Dispatcher at construction
+// time. Options are applied in the order they are passed to
+// NewDispatcher.
 type DispatcherOption func(*Dispatcher)
 
 // WithParsers replaces the default parser set returned by
@@ -132,6 +139,32 @@ func NewDispatcher(writer nodeEdgeWriter, opts ...DispatcherOption) *Dispatcher 
 	for _, opt := range opts {
 		opt(d)
 	}
+}
+
+// NewDispatcher constructs a Dispatcher wired to writer. The
+// default parser set is provided by `defaultParsers()`, which
+// is build-tag-aware: CGO=on uses the tree-sitter grammars
+// (TypeScript / Python / C# / C++) from `parsers_cgo.go`;
+// CGO=off uses the stdlib-only scanners from
+// `parsers_nocgo.go`.
+//
+// Panics on nil writer — the dispatcher cannot operate without
+// a place to send Node / Edge writes, and silently falling
+// back to a no-op would mask a wiring bug.
+func NewDispatcher(writer nodeEdgeWriter, opts ...DispatcherOption) *Dispatcher {
+	if writer == nil {
+		panic("ast: NewDispatcher: nil writer")
+	}
+	d := &Dispatcher{
+		writer:    writer,
+		parsers:   defaultParsers(),
+		logger:    slog.Default(),
+		publisher: noopNodeEmbeddingPublisher{},
+	}
+	for _, opt := range opts {
+		opt(d)
+	}
+	d.extMap = buildExtMap(d.parsers)
 	return d
 }
 
@@ -246,6 +279,90 @@ func (d *Dispatcher) pickParser(relPath string, eventHints []string) LanguagePar
 				return p
 			}
 		}
+		if !dup {
+			bare[s] = append(ids, nodeID)
+		}
+	}
+	out := make(map[string]string, len(bare))
+	for name, ids := range bare {
+		if len(ids) == 1 {
+			out[name] = ids[0]
+		}
+	}
+	return out
+}
+
+// simpleName returns the last `.`-separated segment of a
+// QualifiedName, stripping any operator-pinned receiver-
+// pointer prefix (`*Foo.Bar` → `Bar`).
+func simpleName(qualified string) string {
+	if i := strings.LastIndexByte(qualified, '.'); i >= 0 {
+		return qualified[i+1:]
+	}
+	return strings.TrimPrefix(qualified, "*")
+}
+
+// classSignature mints the canonical signature for a Class /
+// Interface node. The `<relPath>` embed is the cross-file
+// disambiguator (see doc.go "Canonical signature scheme").
+func classSignature(repoURL, relPath, qualifiedName string) string {
+	return repoURL + "::class::" + relPath + "#" + NormalizeSignature(qualifiedName)
+}
+
+// methodSignature mints the canonical signature for a Method
+// or free-function node. Parameter list is whitespace-
+// normalised so a formatter-only commit produces a stable
+// fingerprint (§9.7 / §9.9 mitigation).
+func methodSignature(repoURL, relPath, qualifiedName, params string) string {
+	return repoURL + "::method::" + relPath + "#" +
+		NormalizeSignature(qualifiedName) +
+		"(" + NormalizeSignature(params) + ")"
+}
+
+// blockSignature mints the canonical signature for a Block
+// node. The ordinal is embedded so multiple Blocks of the
+// same kind under one Method get distinct fingerprints.
+func blockSignature(methodSig string, b Block) string {
+	return fmt.Sprintf("%s#block_%d_%s", methodSig, b.Ordinal, b.Kind)
+}
+
+// classAttrs builds the attrs_json for a ClassDecl. The
+// first-class keys (language, decl_kind, start_line, end_line,
+// extends_raw, implements_raw) win over any LangMeta entry
+// with the same name; mergeLangMeta enforces the rule.
+func classAttrs(language string, c ClassDecl) json.RawMessage {
+	m := map[string]any{
+		"language":   language,
+		"decl_kind":  c.Kind,
+		"start_line": c.StartLine,
+		"end_line":   c.EndLine,
+	}
+	if len(c.Extends) > 0 {
+		m["extends_raw"] = append([]string(nil), c.Extends...)
+	}
+	if len(c.Implements) > 0 {
+		m["implements_raw"] = append([]string(nil), c.Implements...)
+	}
+	mergeLangMeta(m, c.LangMeta)
+	return mustJSON(m)
+}
+
+// methodAttrs builds the attrs_json for a MethodDecl. The
+// first-class keys (language, enclosing_class, start_line,
+// end_line, params_raw, calls_raw, modifiers) win over any
+// LangMeta entry with the same name.
+func methodAttrs(language string, m MethodDecl) json.RawMessage {
+	out := map[string]any{
+		"language":   language,
+		"start_line": m.StartLine,
+		"end_line":   m.EndLine,
+		"params_raw": m.ParamSignature,
+	}
+	if m.EnclosingClass != "" {
+		out["enclosing_class"] = m.EnclosingClass
+	}
+	if len(m.Modifiers) > 0 {
+		out["modifiers"] = append([]string(nil), m.Modifiers...)
 	}
 	return nil
 }

@@ -318,3 +318,136 @@ func TestDispatcher_Rust_TraitOverrides_SameFile(t *testing.T) {
 			overrides[0].SrcNodeID, overrides[0].DstNodeID)
 	}
 }
+
+// TestDispatcher_OverloadedMethodsDropStaticCallsByAmbiguity pins
+// the production-dispatcher A5 drop on bare-name overload
+// ambiguity (tech-spec §5.3, doc.go "v1 edge scope"). Two
+// overloaded methods share the same `QualifiedName` (`Foo.Bar`)
+// but distinct `ParamSignature` values, so the dispatcher
+// inserts two distinct method nodes. A third method (`Foo.Caller`)
+// calls bare-name `Bar`. The bare-name resolver MUST drop
+// the call because `simpleName("Bar")` resolves to two distinct
+// NodeIDs — exactly the false-positive class the iter-6 bug
+// allowed.
+//
+// Pre-fix: the dispatcher kept `methodNodeID[QName] -> NodeID`
+// as a SINGLE map and overwrote on overload, so
+// `buildCalleeIndex` saw only ONE entry for `Bar` and emitted a
+// false `static_calls` edge to the LAST-inserted overload.
+// The fix converts methodNodeID to a multimap and tracks
+// per-method NodeIDs through `methodNodeIDs []string`; this
+// test would have failed (1 edge, not 0) under the broken
+// dispatcher.
+func TestDispatcher_OverloadedMethodsDropStaticCallsByAmbiguity(t *testing.T) {
+	fw := newFakeWriter()
+	parser := fakeStaticParser{
+		lang:       "csharp",
+		extensions: []string{".cs"},
+		result: ParseResult{
+			Classes: []ClassDecl{
+				{QualifiedName: "Foo", Kind: "class"},
+			},
+			Methods: []MethodDecl{
+				// Overload #1 — Foo.Bar(int).
+				{
+					QualifiedName:  "Foo.Bar",
+					EnclosingClass: "Foo",
+					ParamSignature: "int x",
+				},
+				// Overload #2 — Foo.Bar(string).
+				{
+					QualifiedName:  "Foo.Bar",
+					EnclosingClass: "Foo",
+					ParamSignature: "string x",
+				},
+				// Caller — bare-name `Bar(...)` invocation.
+				{
+					QualifiedName:  "Foo.Caller",
+					EnclosingClass: "Foo",
+					Calls:          []string{"Bar"},
+				},
+			},
+		},
+	}
+	d := NewDispatcher(fw, WithParsers(parser))
+	if _, err := d.EmitFile(context.Background(), makeEvent("src/Foo.cs", "// fake")); err != nil {
+		t.Fatalf("EmitFile: %v", err)
+	}
+
+	// Sanity: each overload gets its own method node despite
+	// sharing QualifiedName. Pre-fix this was 3 nodes too —
+	// the bug was in resolution, not insertion — but pinning
+	// node count here doubles as a regression check for the
+	// multimap migration.
+	if n := len(fw.nodesOf("method")); n != 3 {
+		t.Fatalf("method nodes = %d; want 3 (Bar(int), Bar(string), Caller); nodes=%+v",
+			n, fw.nodesOf("method"))
+	}
+
+	// A5: bare-name `Bar` resolves to {node-1, node-2} → drop.
+	// Pre-fix: 1 false edge from Caller (node-3) to the last
+	// inserted Bar (node-2).
+	if calls := fw.edgesOf("static_calls"); len(calls) != 0 {
+		t.Errorf("static_calls edges = %d; want 0 (A5 drop on overloaded bare-name); edges=%+v",
+			len(calls), calls)
+	}
+}
+
+// TestDispatcher_OverloadedTraitMethodsDropOverrides pins the
+// Pass 2d A5 drop when a trait declares two overloaded default
+// methods with the same simple name. An impl method whose
+// LangMeta["trait"] names that trait would otherwise pick one
+// of the two overloads at random; the dispatcher MUST drop the
+// `overrides` edge instead (consistent with `static_calls`
+// ambiguity drops).
+func TestDispatcher_OverloadedTraitMethodsDropOverrides(t *testing.T) {
+	fw := newFakeWriter()
+	parser := fakeStaticParser{
+		lang:       "rust",
+		extensions: []string{".rs"},
+		result: ParseResult{
+			Classes: []ClassDecl{
+				{QualifiedName: "Greeter", Kind: "trait"},
+				{QualifiedName: "MyType", Kind: "struct"},
+			},
+			Methods: []MethodDecl{
+				// Trait default #1.
+				{
+					QualifiedName:  "Greeter.greet",
+					EnclosingClass: "Greeter",
+					ParamSignature: "&self",
+				},
+				// Trait default #2 — same simple+qualified
+				// name, different param signature. Rust
+				// disallows this in real grammar but the
+				// drop rule is a defensive guard for any
+				// future trait-overload language.
+				{
+					QualifiedName:  "Greeter.greet",
+					EnclosingClass: "Greeter",
+					ParamSignature: "&self, prefix: &str",
+				},
+				// Impl method — should resolve to one of the
+				// two overloads, but MUST drop instead.
+				{
+					QualifiedName:  "MyType.greet",
+					EnclosingClass: "MyType",
+					LangMeta:       map[string]any{"trait": "Greeter"},
+				},
+			},
+		},
+	}
+	d := NewDispatcher(fw, WithParsers(parser))
+	if _, err := d.EmitFile(context.Background(), makeEvent("src/lib.rs", "// fake")); err != nil {
+		t.Fatalf("EmitFile: %v", err)
+	}
+
+	if n := len(fw.nodesOf("method")); n != 3 {
+		t.Fatalf("method nodes = %d; want 3", n)
+	}
+	// Pass 2d: Greeter.greet multimap has 2 entries → drop.
+	if overrides := fw.edgesOf("overrides"); len(overrides) != 0 {
+		t.Errorf("overrides edges = %d; want 0 (A5 drop on overloaded trait default); edges=%+v",
+			len(overrides), overrides)
+	}
+}

@@ -16,6 +16,18 @@ package ast
 // selected when the binary is built with `CGO_ENABLED=1`; see
 // doc.go "Parser implementations" for the full story on which
 // path is canonical when.
+//
+// Additional languages registered ONLY on the CGO-on path:
+//
+//   - C# (`.cs`, `.csx`) -- the C# parser
+//     (parser_treesitter_csharp.go) rides the tree-sitter-c-sharp
+//     grammar via CGO and has no scanner-backed fallback in v1.
+//     A `.cs` file ingested on the CGO=off toolchain falls
+//     through the dispatcher's "no parser registered for
+//     extension" branch, which surfaces a structured log and
+//     a non-fatal skip; the file simply does not contribute
+//     nodes / edges to the graph for that build. Adding a
+//     scanner-backed C# parser is tracked as a follow-up.
 func defaultParsers() []LanguageParser {
 	return []LanguageParser{
 		NewTypeScriptParser(),

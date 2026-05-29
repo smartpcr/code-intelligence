@@ -3,8 +3,17 @@
 package ast
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"sort"
+	"strings"
 	"testing"
+
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/repoindexer"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
 )
 
 // Tests for the Rust tree-sitter parser. Gated on `//go:build
@@ -890,29 +899,25 @@ pub struct Foo;
 	}
 }
 
+
 // TestRustFixture_EmitsExpectedNodeAndEdgeSet is the
 // implementation-plan §5.3 line 360-362 acceptance test for
 // the Rust tree-sitter parser. The fixture is the canonical
 // trait+impl+free-function+use shape called out by the
 // workstream brief.
 //
-// Iter-3 STRUCTURAL pivot (evaluator items 3 + 4 demanded
-// "production-emitted graph records, not a test-local
-// mini-dispatcher"): this test now drives the REAL
-// production `Dispatcher.EmitFile` body in dispatcher.go
-// (no longer a stub — implements Pass 0/1a/1b/2a/2b/2d) via
-// a recording `NodeEdgeWriter` and asserts on the Node /
-// Edge records that the dispatcher itself wrote. The
-// previous iter-2 test-local `runRustStage53Pipeline`
-// helper has been deleted; assertions now run through the
-// SAME `NewDispatcher(...).EmitFile(...)` surface that
-// production callers use.
-//
-// Pattern mirrors `TestTypeScriptFixture_EmitsExpectedNodeAndEdgeSet`
-// (parser_typescript_test.go:32, gated
-// `//go:build canonical_dispatcher`) in spirit while using
-// the production-current 3-arg `NewDispatcher(parsers,
-// writer, logger)` signature at dispatcher.go:50.
+// Iter-4 STRUCTURAL pivot (evaluator items 2 + 3 demanded
+// canonical-API graph emission with `Symbols=["Display"]` on
+// the actual production-emitted imports edge, not a parser-
+// level reparse): this test now drives the canonical
+// `NewDispatcher(writer, opts...).EmitFile(ctx, event)`
+// surface that `cmd/repoindexer/main.go` uses in production.
+// The recording `rustStage53Writer` satisfies the canonical
+// `NodeEdgeWriter` interface (graphwriter.NodeInput /
+// graphwriter.EdgeInput shape), and the assertions inspect
+// the captured `EdgeInput.AttrsJSON` for the `symbols` key
+// — proving that production code (not a test-local
+// mini-pipeline) emits the documented graph shape.
 //
 // Asserts:
 //
@@ -922,15 +927,9 @@ pub struct Foo;
 //   - 1 package node (std::fmt)
 //   - 1 implements edge   (GreeterImpl -> Greeter)
 //   - 1 static_calls edge (GreeterImpl.greet -> format_greeting)
-//   - 1 imports edge      (src/lib.rs -> std::fmt)
+//   - 1 imports edge      (file -> std::fmt with
+//     attrs_json.symbols == ["Display"])
 //   - 1 overrides edge    (GreeterImpl.greet -> Greeter.greet)
-//
-// Parser-level Imports defense-in-depth is kept at the end
-// of the test so a regression that strips Symbols=[Display]
-// from the Import record (which the dispatcher folds into
-// the imports edge attrs_json) is caught even if the
-// dispatcher silently drops the symbols slice when
-// projecting the Import into an edge.
 func TestRustFixture_EmitsExpectedNodeAndEdgeSet(t *testing.T) {
 	// Fixture matches the Stage 5.3 workstream brief
 	// verbatim: trait/struct lack ``pub`` so a regression
@@ -958,19 +957,18 @@ pub fn format_greeting(name: &str) -> String {
 }
 `
 	fw := newRustStage53Writer()
-	d := NewDispatcher([]Parser{NewTreeSitterRustParser()}, fw, nil)
-	emitRes, err := d.EmitFile(filename, []byte(src))
+	d := NewDispatcher(fw, WithParsers(NewTreeSitterRustParser()))
+	emitRes, err := d.EmitFile(context.Background(), makeRustEvent(filename, src))
 	if err != nil {
 		t.Fatalf("Dispatcher.EmitFile(%q) error = %v; want nil", filename, err)
 	}
 
-	// EmitResult counters must match what the writer recorded
-	// (sanity check on the dispatcher's internal accounting).
-	if emitRes.NodeCount != len(fw.nodes) {
-		t.Errorf("EmitResult.NodeCount = %d; want %d (writer recorded)", emitRes.NodeCount, len(fw.nodes))
-	}
-	if emitRes.EdgeCount != len(fw.edges) {
-		t.Errorf("EmitResult.EdgeCount = %d; want %d (writer recorded)", emitRes.EdgeCount, len(fw.edges))
+	// EmitResult.TouchedNodes must mirror what the writer
+	// recorded (sanity check on the dispatcher's internal
+	// accounting).
+	if len(emitRes.TouchedNodes) != len(fw.nodes) {
+		t.Errorf("EmitResult.TouchedNodes len = %d; want %d (writer recorded)",
+			len(emitRes.TouchedNodes), len(fw.nodes))
 	}
 
 	// ----- Node assertions -----
@@ -981,11 +979,11 @@ pub fn format_greeting(name: &str) -> String {
 	}
 	gotClassNames := make([]string, 0, len(classNodes))
 	for _, n := range classNodes {
-		gotClassNames = append(gotClassNames, n.Name)
+		gotClassNames = append(gotClassNames, qnFromClassSig(n.CanonicalSignature))
 	}
 	sort.Strings(gotClassNames)
 	if !rustStringSlicesEqual(gotClassNames, []string{"Greeter", "GreeterImpl"}) {
-		t.Errorf("class node names = %v; want [Greeter GreeterImpl]", gotClassNames)
+		t.Errorf("class node QNs = %v; want [Greeter GreeterImpl]", gotClassNames)
 	}
 
 	methodNodes := rustStage53NodesByKind(fw.nodes, "method")
@@ -994,11 +992,11 @@ pub fn format_greeting(name: &str) -> String {
 	}
 	gotMethodNames := make([]string, 0, len(methodNodes))
 	for _, n := range methodNodes {
-		gotMethodNames = append(gotMethodNames, n.Name)
+		gotMethodNames = append(gotMethodNames, qnFromMethodSig(n.CanonicalSignature))
 	}
 	sort.Strings(gotMethodNames)
 	if !rustStringSlicesEqual(gotMethodNames, []string{"Greeter.greet", "GreeterImpl.greet", "format_greeting"}) {
-		t.Errorf("method node names = %v; want [Greeter.greet GreeterImpl.greet format_greeting] (sorted)",
+		t.Errorf("method node QNs = %v; want [Greeter.greet GreeterImpl.greet format_greeting] (sorted)",
 			gotMethodNames)
 	}
 
@@ -1006,9 +1004,9 @@ pub fn format_greeting(name: &str) -> String {
 	if got := len(packageNodes); got != 1 {
 		t.Fatalf("package nodes = %d; want 1; got=%v", got, packageNodes)
 	}
-	if packageNodes[0].Name != "std::fmt" {
-		t.Errorf("package node name = %q; want %q (Module from `use std::fmt::Display;`)",
-			packageNodes[0].Name, "std::fmt")
+	if mod := moduleFromPackageSig(packageNodes[0].CanonicalSignature); mod != "std::fmt" {
+		t.Errorf("package node module = %q; want %q (Module from `use std::fmt::Display;`)",
+			mod, "std::fmt")
 	}
 
 	// ----- Edge assertions -----
@@ -1017,9 +1015,13 @@ pub fn format_greeting(name: &str) -> String {
 	if got := len(implEdges); got != 1 {
 		t.Fatalf("implements edges = %d; want exactly 1; got=%v", got, implEdges)
 	}
-	if implEdges[0].Source != "GreeterImpl" || implEdges[0].Target != "Greeter" {
-		t.Errorf("implements edge = %+v; want {Source:GreeterImpl Target:Greeter} (impl Greeter for GreeterImpl)",
-			implEdges[0])
+	if sig := fw.sigForNodeID(implEdges[0].SrcNodeID); qnFromClassSig(sig) != "GreeterImpl" {
+		t.Errorf("implements edge source QN = %q; want %q",
+			qnFromClassSig(sig), "GreeterImpl")
+	}
+	if sig := fw.sigForNodeID(implEdges[0].DstNodeID); qnFromClassSig(sig) != "Greeter" {
+		t.Errorf("implements edge target QN = %q; want %q",
+			qnFromClassSig(sig), "Greeter")
 	}
 
 	callEdges := rustStage53EdgesByKind(fw.edges, "static_calls")
@@ -1027,18 +1029,39 @@ pub fn format_greeting(name: &str) -> String {
 		t.Fatalf("static_calls edges = %d; want exactly 1 (only GreeterImpl.greet -> format_greeting is unambiguously locally resolvable); got=%v",
 			got, callEdges)
 	}
-	if callEdges[0].Source != "GreeterImpl.greet" || callEdges[0].Target != "format_greeting" {
-		t.Errorf("static_calls edge = %+v; want {Source:GreeterImpl.greet Target:format_greeting}",
-			callEdges[0])
+	if sig := fw.sigForNodeID(callEdges[0].SrcNodeID); qnFromMethodSig(sig) != "GreeterImpl.greet" {
+		t.Errorf("static_calls edge source QN = %q; want %q",
+			qnFromMethodSig(sig), "GreeterImpl.greet")
+	}
+	if sig := fw.sigForNodeID(callEdges[0].DstNodeID); qnFromMethodSig(sig) != "format_greeting" {
+		t.Errorf("static_calls edge target QN = %q; want %q",
+			qnFromMethodSig(sig), "format_greeting")
 	}
 
 	importEdges := rustStage53EdgesByKind(fw.edges, "imports")
 	if got := len(importEdges); got != 1 {
 		t.Fatalf("imports edges = %d; want exactly 1; got=%v", got, importEdges)
 	}
-	if importEdges[0].Source != filename || importEdges[0].Target != "std::fmt" {
-		t.Errorf("imports edge = %+v; want {Source:%s Target:std::fmt}",
-			importEdges[0], filename)
+	if importEdges[0].SrcNodeID != testFileNodeID {
+		t.Errorf("imports edge source NodeID = %q; want %q (file node id)",
+			importEdges[0].SrcNodeID, testFileNodeID)
+	}
+	if sig := fw.sigForNodeID(importEdges[0].DstNodeID); moduleFromPackageSig(sig) != "std::fmt" {
+		t.Errorf("imports edge target module = %q; want %q (Module from `use std::fmt::Display;`)",
+			moduleFromPackageSig(sig), "std::fmt")
+	}
+	// Stage 5.3 brief: `Symbols=["Display"]` MUST land on
+	// the production-emitted imports edge. Iter-4 stitches
+	// the parser-level Import.Symbols into the
+	// `EdgeInput.AttrsJSON` under the `symbols` key.
+	gotSymbols, ok := edgeSymbolsFromAttrs(t, importEdges[0].AttrsJSON)
+	if !ok {
+		t.Fatalf("imports edge attrs_json = %s; missing `symbols` key (Stage 5.3 brief requires Symbols=[\"Display\"] on the imports edge)",
+			string(importEdges[0].AttrsJSON))
+	}
+	if !rustStringSlicesEqual(gotSymbols, []string{"Display"}) {
+		t.Errorf("imports edge attrs_json.symbols = %v; want [Display] (Stage 5.3 brief requires Symbols=[\"Display\"] on the imports edge; attrs_json=%s)",
+			gotSymbols, string(importEdges[0].AttrsJSON))
 	}
 
 	overrideEdges := rustStage53EdgesByKind(fw.edges, "overrides")
@@ -1046,9 +1069,13 @@ pub fn format_greeting(name: &str) -> String {
 		t.Fatalf("overrides edges = %d; want exactly 1 (Pass 2d: impl method -> trait-default method, same file); got=%v",
 			got, overrideEdges)
 	}
-	if overrideEdges[0].Source != "GreeterImpl.greet" || overrideEdges[0].Target != "Greeter.greet" {
-		t.Errorf("overrides edge = %+v; want {Source:GreeterImpl.greet Target:Greeter.greet}",
-			overrideEdges[0])
+	if sig := fw.sigForNodeID(overrideEdges[0].SrcNodeID); qnFromMethodSig(sig) != "GreeterImpl.greet" {
+		t.Errorf("overrides edge source QN = %q; want %q",
+			qnFromMethodSig(sig), "GreeterImpl.greet")
+	}
+	if sig := fw.sigForNodeID(overrideEdges[0].DstNodeID); qnFromMethodSig(sig) != "Greeter.greet" {
+		t.Errorf("overrides edge target QN = %q; want %q",
+			qnFromMethodSig(sig), "Greeter.greet")
 	}
 
 	// ----- Total-count guards (catch spurious extra Node/Edge kinds) -----
@@ -1066,33 +1093,6 @@ pub fn format_greeting(name: &str) -> String {
 		t.Errorf("total edges = %d; want 4 (1 implements + 1 static_calls + 1 imports + 1 overrides); got=%v",
 			got, fw.edges)
 	}
-
-	// ----- Parser-level Imports defense-in-depth -----
-	// The dispatcher's imports edge target is `imp.Module`
-	// (target = "std::fmt") but `Symbols=["Display"]` is
-	// carried on the parser-level Import record for the
-	// future imports-edge `attrs_json` integration. A
-	// regression that stripped the Symbols slice would not
-	// be caught by the writer-emitted edge alone, so we
-	// re-parse here and pin the parser-level invariant.
-	parserRes, err := NewTreeSitterRustParser().Parse(filename, []byte(src))
-	if err != nil {
-		t.Fatalf("parser.Parse for defense-in-depth: %v", err)
-	}
-	if got := len(parserRes.Imports); got != 1 {
-		t.Fatalf("ParseResult.Imports len = %d; want 1 (std::fmt::Display)", got)
-	}
-	imp := parserRes.Imports[0]
-	if imp.Module != "std::fmt" {
-		t.Errorf("ParseResult.Imports[0].Module = %q; want %q", imp.Module, "std::fmt")
-	}
-	if !rustStringSlicesEqual(imp.Symbols, []string{"Display"}) {
-		t.Errorf("ParseResult.Imports[0].Symbols = %v; want [Display] (brief requires Symbols=[\"Display\"] on the imports edge)",
-			imp.Symbols)
-	}
-	if imp.Alias != "" {
-		t.Errorf("ParseResult.Imports[0].Alias = %q; want empty (no `as` clause in the fixture)", imp.Alias)
-	}
 }
 
 // TestRustFixture_OverridesEdgeFromImplToTraitDefault pins
@@ -1100,19 +1100,15 @@ pub fn format_greeting(name: &str) -> String {
 // edge is emitted from the impl method to the trait-default
 // trait method on the same file.
 //
-// Iter-3 STRUCTURAL pivot: drives the REAL production
-// dispatcher (no test-local mini-pipeline) so the override
-// edge count assertion provably reflects what the
-// production `Dispatcher.EmitFile` body emits to a
-// `NodeEdgeWriter`. Parser-level LangMeta defense-in-depth
-// is kept at the end so a regression in EITHER the parser
-// walker's `LangMeta["trait"/"trait_default"]` writes OR
-// the dispatcher's Pass 2d resolver lights up here.
+// Iter-4 STRUCTURAL pivot: drives the canonical
+// `NewDispatcher(writer, opts...).EmitFile(ctx, event)`
+// surface so the override edge count assertion provably
+// reflects what production code emits. Parser-level
+// LangMeta defense-in-depth is kept at the end so a
+// regression in EITHER the parser walker's
+// `LangMeta["trait"/"trait_default"]` writes OR the
+// dispatcher's Pass 2d resolver lights up here.
 func TestRustFixture_OverridesEdgeFromImplToTraitDefault(t *testing.T) {
-	// Fixture matches the Stage 5.3 workstream brief
-	// verbatim: trait/struct lack ``pub`` so a regression
-	// that silently drops non-public items is caught here
-	// (iter-1 rubber-duck finding #1).
 	const filename = "src/lib.rs"
 	const src = `use std::fmt::Display;
 
@@ -1135,8 +1131,8 @@ pub fn format_greeting(name: &str) -> String {
 }
 `
 	fw := newRustStage53Writer()
-	d := NewDispatcher([]Parser{NewTreeSitterRustParser()}, fw, nil)
-	if _, err := d.EmitFile(filename, []byte(src)); err != nil {
+	d := NewDispatcher(fw, WithParsers(NewTreeSitterRustParser()))
+	if _, err := d.EmitFile(context.Background(), makeRustEvent(filename, src)); err != nil {
 		t.Fatalf("Dispatcher.EmitFile: %v", err)
 	}
 
@@ -1145,9 +1141,13 @@ pub fn format_greeting(name: &str) -> String {
 		t.Fatalf("overrides edges = %d; want exactly 1 (impl-plan §5.3:363); got=%v",
 			got, overrides)
 	}
-	if overrides[0].Source != "GreeterImpl.greet" || overrides[0].Target != "Greeter.greet" {
-		t.Errorf("overrides edge endpoints = %+v; want {Source:GreeterImpl.greet Target:Greeter.greet}",
-			overrides[0])
+	if sig := fw.sigForNodeID(overrides[0].SrcNodeID); qnFromMethodSig(sig) != "GreeterImpl.greet" {
+		t.Errorf("overrides edge source QN = %q; want %q",
+			qnFromMethodSig(sig), "GreeterImpl.greet")
+	}
+	if sig := fw.sigForNodeID(overrides[0].DstNodeID); qnFromMethodSig(sig) != "Greeter.greet" {
+		t.Errorf("overrides edge target QN = %q; want %q",
+			qnFromMethodSig(sig), "Greeter.greet")
 	}
 
 	// ----- Parser-level LangMeta defense-in-depth -----
@@ -1214,13 +1214,13 @@ pub fn format_greeting(name: &str) -> String {
 // Pass 2d methodNodeID lookup misses and MUST drop the
 // override silently.
 //
-// Iter-3 STRUCTURAL pivot: drives the REAL production
-// dispatcher (no test-local mini-pipeline) so the zero-
-// count assertion provably reflects production silent-drop
-// behaviour, not a test-local replica of it. Adds matching
-// zero-count guards for `implements` (cross-file trait
-// target → no edge) and `static_calls` (`String::from(name)`
-// rightmost-segment "from" has no local callee → no edge).
+// Iter-4 STRUCTURAL pivot: drives the canonical
+// `NewDispatcher(writer, opts...).EmitFile(ctx, event)`
+// surface so the zero-count assertion provably reflects
+// production silent-drop behaviour. Adds matching zero-count
+// guards for `implements` (cross-file trait target → no edge)
+// and `static_calls` (`String::from(name)` rightmost-segment
+// "from" has no local callee → no edge).
 func TestRustFixture_OverridesCrossFileMissIsSilent(t *testing.T) {
 	// `struct GreeterImpl;` is intentionally NOT prefixed
 	// with `pub` so the test matches the Stage 5.3 brief
@@ -1236,8 +1236,8 @@ impl Greeter for GreeterImpl {
 }
 `
 	fw := newRustStage53Writer()
-	d := NewDispatcher([]Parser{NewTreeSitterRustParser()}, fw, nil)
-	if _, err := d.EmitFile(filename, []byte(src)); err != nil {
+	d := NewDispatcher(fw, WithParsers(NewTreeSitterRustParser()))
+	if _, err := d.EmitFile(context.Background(), makeRustEvent(filename, src)); err != nil {
 		t.Fatalf("Dispatcher.EmitFile: %v", err)
 	}
 
@@ -1268,12 +1268,12 @@ impl Greeter for GreeterImpl {
 
 	// Node counts: only local items minted.
 	classNodes := rustStage53NodesByKind(fw.nodes, "class")
-	if got := len(classNodes); got != 1 || classNodes[0].Name != "GreeterImpl" {
+	if got := len(classNodes); got != 1 || qnFromClassSig(classNodes[0].CanonicalSignature) != "GreeterImpl" {
 		t.Fatalf("class nodes = %v; want exactly [{class GreeterImpl}] (cross-file trait MUST NOT be minted)",
 			classNodes)
 	}
 	methodNodes := rustStage53NodesByKind(fw.nodes, "method")
-	if got := len(methodNodes); got != 1 || methodNodes[0].Name != "GreeterImpl.greet" {
+	if got := len(methodNodes); got != 1 || qnFromMethodSig(methodNodes[0].CanonicalSignature) != "GreeterImpl.greet" {
 		t.Fatalf("method nodes = %v; want exactly [{method GreeterImpl.greet}] (cross-file trait method MUST NOT be minted)",
 			methodNodes)
 	}
@@ -1282,9 +1282,6 @@ impl Greeter for GreeterImpl {
 	// The cross-file fixture has NO `use`, NO local trait,
 	// NO local callee match — so the COMPLETE graph is
 	// exactly 2 nodes (1 class + 1 method) and 0 edges.
-	// A regression that emitted an unexpected kind (e.g. a
-	// phantom imports/extends/overrides edge, or minted the
-	// cross-file trait as a node) lights up here.
 	if got := len(fw.nodes); got != 2 {
 		t.Errorf("total nodes = %d; want 2 (1 class + 1 method); got=%v", got, fw.nodes)
 	}
@@ -1311,7 +1308,6 @@ impl Greeter for GreeterImpl {
 		t.Errorf("GreeterImpl.greet.LangMeta[trait] = %v; want \"Greeter\" (cross-file resolver needs this key even when same-file Pass 2d misses)",
 			implGreet.LangMeta)
 	}
-	// Defense-in-depth: no phantom trait method minted.
 	if _, ok := byMethod["Greeter.greet"]; ok {
 		t.Errorf("phantom trait method Greeter.greet was minted; got %v",
 			rustMethodQNs(parserRes.Methods))
@@ -1325,46 +1321,92 @@ impl Greeter for GreeterImpl {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 5.3 test-local fake writer
+// Stage 5.3 test-local fake writer + event helper
 // ---------------------------------------------------------------------------
 //
-// `rustStage53Writer` is a recording `NodeEdgeWriter` (the
-// dispatcher's writer-side surface at dispatcher.go:17). It
-// captures every (Kind, Name) tuple `InsertNode` receives and
-// every (Kind, Source, Target) tuple `InsertEdge` receives so
-// the Stage 5.3 tests can assert on the production-emitted
-// graph records.
+// `rustStage53Writer` satisfies the canonical `NodeEdgeWriter`
+// interface (dispatcher.go:33) by accepting `graphwriter.NodeInput`
+// and `graphwriter.EdgeInput` values and returning synthetic
+// NodeRecord / EdgeRecord values. The captured inputs let the
+// Stage 5.3 tests assert on the production-emitted graph records
+// (canonical signatures, attrs JSON, NodeID linkage) without a
+// real PostgreSQL writer in play.
 //
-// Iter-2's `runRustStage53Pipeline` mini-dispatcher has been
-// DELETED — the production `Dispatcher.EmitFile` body in
-// dispatcher.go is no longer a stub (Pass 0/1a/1b/2a/2b/2d
-// land in this iter), so a test-local replica is both
-// unnecessary and (per evaluator iter-2 items 3 + 4)
-// counter-productive: it would let the test pass even if the
-// production dispatcher continued to discard ParseResult.
+// The synthesised NodeIDs are sequential (`node-0`, `node-1`,
+// …) so edge endpoints can be reverse-mapped to their parent
+// canonical signatures via `sigForNodeID`.
+
+const (
+	testRepoURL    = "repo://test"
+	testSHA        = "sha-test"
+	testFileNodeID = "file-node-id"
+	testRepoNodeID = "repo-node-id"
+)
+
 type rustStage53Writer struct {
-	nodes []Node
-	edges []Edge
+	nodes     []graphwriter.NodeInput
+	edges     []graphwriter.EdgeInput
+	nodeIDs   []string
+	sigByID   map[string]string
+	seq       int
 }
 
 func newRustStage53Writer() *rustStage53Writer {
-	return &rustStage53Writer{}
+	return &rustStage53Writer{sigByID: map[string]string{}}
 }
 
-func (w *rustStage53Writer) InsertNode(n Node) error {
-	w.nodes = append(w.nodes, n)
-	return nil
+func (w *rustStage53Writer) InsertNode(_ context.Context, in graphwriter.NodeInput) (graphwriter.NodeRecord, error) {
+	id := fmt.Sprintf("node-%d", w.seq)
+	w.seq++
+	w.nodes = append(w.nodes, in)
+	w.nodeIDs = append(w.nodeIDs, id)
+	w.sigByID[id] = in.CanonicalSignature
+	return graphwriter.NodeRecord{NodeID: id, Inserted: true}, nil
 }
 
-func (w *rustStage53Writer) InsertEdge(e Edge) error {
-	w.edges = append(w.edges, e)
-	return nil
+func (w *rustStage53Writer) InsertEdge(_ context.Context, in graphwriter.EdgeInput) (graphwriter.EdgeRecord, error) {
+	w.edges = append(w.edges, in)
+	return graphwriter.EdgeRecord{Inserted: true}, nil
+}
+
+// sigForNodeID returns the canonical signature of the Node the
+// writer minted with the given synthetic NodeID. Empty string when
+// the NodeID is unknown (e.g. an edge endpoint that points at the
+// supplied FileNodeID, which the writer never minted).
+func (w *rustStage53Writer) sigForNodeID(id string) string {
+	if id == "" {
+		return ""
+	}
+	if sig, ok := w.sigByID[id]; ok {
+		return sig
+	}
+	return ""
+}
+
+// makeRustEvent builds a `repoindexer.EmitFileEvent` whose Open
+// closure yields a fresh reader over `src` on each call (per the
+// EmitFileEvent contract: "Each call returns a new reader at
+// offset 0 so the emitter can perform multiple passes").
+func makeRustEvent(filename, src string) repoindexer.EmitFileEvent {
+	var rid fingerprint.RepoID
+	copy(rid[:], []byte("test-repo-id-16x"))
+	return repoindexer.EmitFileEvent{
+		RepoID:     rid,
+		RepoURL:    testRepoURL,
+		SHA:        testSHA,
+		FileNodeID: testFileNodeID,
+		RepoNodeID: testRepoNodeID,
+		RelPath:    filename,
+		Open: func() (repoindexer.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader(src)), nil
+		},
+	}
 }
 
 // rustStage53NodesByKind returns the subset of nodes
 // matching the given Kind, preserving emission order.
-func rustStage53NodesByKind(nodes []Node, kind string) []Node {
-	var out []Node
+func rustStage53NodesByKind(nodes []graphwriter.NodeInput, kind string) []graphwriter.NodeInput {
+	var out []graphwriter.NodeInput
 	for _, n := range nodes {
 		if n.Kind == kind {
 			out = append(out, n)
@@ -1375,12 +1417,85 @@ func rustStage53NodesByKind(nodes []Node, kind string) []Node {
 
 // rustStage53EdgesByKind returns the subset of edges
 // matching the given Kind, preserving emission order.
-func rustStage53EdgesByKind(edges []Edge, kind string) []Edge {
-	var out []Edge
+func rustStage53EdgesByKind(edges []graphwriter.EdgeInput, kind string) []graphwriter.EdgeInput {
+	var out []graphwriter.EdgeInput
 	for _, e := range edges {
 		if e.Kind == kind {
 			out = append(out, e)
 		}
 	}
 	return out
+}
+
+// qnFromClassSig extracts the QualifiedName from a class
+// canonical signature of the form
+// `<RepoURL>::class::<RelPath>#<QualifiedName>`.
+func qnFromClassSig(sig string) string {
+	if i := strings.LastIndex(sig, "#"); i >= 0 {
+		return sig[i+1:]
+	}
+	return ""
+}
+
+// qnFromMethodSig extracts the QualifiedName from a method
+// canonical signature of the form
+// `<RepoURL>::method::<RelPath>#<QualifiedName>(<ParamSig>)`.
+// Strips the `(<ParamSig>)` suffix so callers can match on the
+// dotted name alone (e.g. `Foo.bar`).
+func qnFromMethodSig(sig string) string {
+	if i := strings.LastIndex(sig, "#"); i >= 0 {
+		s := sig[i+1:]
+		if p := strings.Index(s, "("); p >= 0 {
+			return s[:p]
+		}
+		return s
+	}
+	return ""
+}
+
+// moduleFromPackageSig extracts the Module from a package
+// canonical signature of the form
+// `<RepoURL>::package::<Module>`. Module may itself contain `::`
+// (e.g. `std::fmt`), so we anchor on the first `::package::`
+// separator.
+func moduleFromPackageSig(sig string) string {
+	const sep = "::package::"
+	if i := strings.Index(sig, sep); i >= 0 {
+		return sig[i+len(sep):]
+	}
+	return ""
+}
+
+// edgeSymbolsFromAttrs unmarshals an edge's AttrsJSON and pulls
+// the `symbols` key (a []string). Returns (slice, true) when the
+// key is present; (nil, false) otherwise. Stage 5.3 brief
+// requires this key to be populated on the Rust imports edge so
+// downstream consumers can see which specific names a `use`
+// declaration pulled in.
+func edgeSymbolsFromAttrs(t *testing.T, raw json.RawMessage) ([]string, bool) {
+	t.Helper()
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var bag map[string]any
+	if err := json.Unmarshal(raw, &bag); err != nil {
+		t.Fatalf("edge attrs_json unmarshal: %v (raw=%s)", err, string(raw))
+	}
+	v, ok := bag["symbols"]
+	if !ok {
+		return nil, false
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		t.Fatalf("edge attrs_json.symbols is %T, want []any (raw=%s)", v, string(raw))
+	}
+	out := make([]string, 0, len(arr))
+	for _, x := range arr {
+		s, ok := x.(string)
+		if !ok {
+			t.Fatalf("edge attrs_json.symbols entry is %T, want string (raw=%s)", x, string(raw))
+		}
+		out = append(out, s)
+	}
+	return out, true
 }

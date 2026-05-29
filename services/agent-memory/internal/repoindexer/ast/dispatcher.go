@@ -410,7 +410,7 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 			CanonicalSignature: pkgSig,
 			ParentNodeID:       ev.RepoNodeID,
 			FromSHA:            ev.SHA,
-			AttrsJSON:          packageAttrsJSON(imp),
+			AttrsJSON:          packageAttrsJSON(imp, p.Language()),
 		})
 		if perr != nil {
 			return repoindexer.EmitResult{TouchedNodes: touched}, perr
@@ -831,9 +831,15 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 }
 
 // packageAttrsJSON serialises the attrs that belong on a `package`
-// Node ΓÇö keyed by Module alone, so per-import symbol/alias detail
+// Node — keyed by Module alone, so per-import symbol/alias detail
 // is intentionally excluded (those live on the `imports` edge).
-func packageAttrsJSON(imp Import) json.RawMessage {
+// The `language` parameter is the producing parser's Language()
+// string; it is tagged on the package node so downstream filters
+// (and the per-language dispatcher tests, e.g.
+// `TestCFixture_EmitFile_EmitsExpectedNodesAndEdges`) can pin the
+// language that minted the package without re-deriving it from
+// the file path.
+func packageAttrsJSON(imp Import, language string) json.RawMessage {
 	attrs := map[string]any{}
 	if imp.Module != "" {
 		attrs["module"] = imp.Module
@@ -846,6 +852,9 @@ func packageAttrsJSON(imp Import) json.RawMessage {
 	// untagged) remain distinguishable for downstream filtering
 	// (test: `TestDispatcher_EmitsImportsEdgesForExternalModules`).
 	attrs["source"] = "external"
+	if language != "" {
+		attrs["language"] = language
+	}
 	if len(attrs) == 0 {
 		return json.RawMessage(`{}`)
 	}

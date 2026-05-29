@@ -47,7 +47,7 @@ func (p *rustParser) Parse(filename string, src []byte) (ParseResult, error) {
 			name := child.ChildByFieldName("name")
 			if name != nil {
 				traitName := name.Content(src)
-				pr.Classes = append(pr.Classes, ClassDecl{Name: traitName})
+				pr.Classes = append(pr.Classes, ClassDecl{QualifiedName: traitName})
 				body := child.ChildByFieldName("body")
 				if body != nil {
 					tsExtractTraitMethods(body, traitName, &pr, src)
@@ -57,7 +57,7 @@ func (p *rustParser) Parse(filename string, src []byte) (ParseResult, error) {
 		case "struct_item":
 			name := child.ChildByFieldName("name")
 			if name != nil {
-				pr.Classes = append(pr.Classes, ClassDecl{Name: name.Content(src)})
+				pr.Classes = append(pr.Classes, ClassDecl{QualifiedName: name.Content(src)})
 			}
 
 		case "impl_item":
@@ -87,8 +87,8 @@ func tsExtractTraitMethods(body *sitter.Node, traitName string, pr *ParseResult,
 			name := child.ChildByFieldName("name")
 			if name != nil {
 				pr.Methods = append(pr.Methods, MethodDecl{
-					Name:      name.Content(src),
-					ClassName: traitName,
+					QualifiedName:  name.Content(src),
+					EnclosingClass: traitName,
 				})
 			}
 		}
@@ -112,9 +112,9 @@ func tsProcessImplItem(node *sitter.Node, pr *ParseResult, src []byte) {
 	// For `impl Trait for Struct`, mark the struct as implementing the trait.
 	if traitName != "" && structName != "" {
 		for i, c := range pr.Classes {
-			if c.Name == structName {
+			if c.QualifiedName == structName {
 				if pr.Classes[i].LangMeta == nil {
-					pr.Classes[i].LangMeta = make(map[string]string)
+					pr.Classes[i].LangMeta = make(map[string]any)
 				}
 				pr.Classes[i].LangMeta["implements"] = traitName
 			}
@@ -132,11 +132,11 @@ func tsProcessImplItem(node *sitter.Node, pr *ParseResult, src []byte) {
 			name := child.ChildByFieldName("name")
 			if name != nil {
 				md := MethodDecl{
-					Name:      name.Content(src),
-					ClassName: structName,
+					QualifiedName:  name.Content(src),
+					EnclosingClass: structName,
 				}
 				if traitName != "" {
-					md.LangMeta = map[string]string{"trait": traitName}
+					md.LangMeta = map[string]any{"trait": traitName}
 				}
 				pr.Methods = append(pr.Methods, md)
 			}
@@ -151,14 +151,14 @@ func tsProcessFreeFunction(node *sitter.Node, pr *ParseResult, src []byte) {
 	if name == nil {
 		return
 	}
-	md := MethodDecl{Name: name.Content(src)}
+	md := MethodDecl{QualifiedName: name.Content(src)}
 
 	body := node.ChildByFieldName("body")
 	if body != nil {
 		var calls []string
 		tsFindMethodCalls(body, src, &calls)
 		if len(calls) > 0 {
-			md.LangMeta = map[string]string{"calls": strings.Join(calls, ",")}
+			md.LangMeta = map[string]any{"calls": strings.Join(calls, ",")}
 		}
 	}
 

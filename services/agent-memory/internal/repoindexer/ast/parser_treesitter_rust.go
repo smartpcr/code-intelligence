@@ -638,9 +638,28 @@ func expandRustUseTree(n *sitter.Node, src []byte, prefix string, line int, out 
 		*out = append(*out, imp)
 	case rustNodeUseWildcard:
 		// `foo::*` -- the scope prefix (if any) is on the
-		// path child; if absent we're at top-level wildcard.
+		// path child. The smacker grammar version pinned in
+		// this repo does NOT label the prefix with a `path`
+		// field on the `use_wildcard` node itself (only the
+		// inner scoped_identifier carries `field=path`); so
+		// try the field first for forward-compat, then fall
+		// back to scanning the first named child of the
+		// wildcard which is the prefix identifier.
 		mod := prefix
-		if path := n.ChildByFieldName("path"); path != nil {
+		path := n.ChildByFieldName("path")
+		if path == nil {
+			for i := uint32(0); i < n.NamedChildCount(); i++ {
+				c := n.NamedChild(int(i))
+				if c == nil {
+					continue
+				}
+				if t := c.Type(); t == rustNodeScopedIdentifier || t == rustNodeIdentifier || t == rustNodeTypeIdentifier {
+					path = c
+					break
+				}
+			}
+		}
+		if path != nil {
 			switch path.Type() {
 			case rustNodeScopedIdentifier:
 				full := rustScopedIdentifierString(path, src)
@@ -648,10 +667,6 @@ func expandRustUseTree(n *sitter.Node, src []byte, prefix string, line int, out 
 			case rustNodeIdentifier, rustNodeTypeIdentifier:
 				mod = joinRustScope(prefix, path.Content(src))
 			}
-		} else {
-			// No path field -- the wildcard's siblings carry
-			// the prefix (handled at the scoped_use_list
-			// level below).
 		}
 		*out = append(*out, Import{Module: mod, Symbols: []string{"*"}, Line: line})
 	case rustNodeScopedUseList:

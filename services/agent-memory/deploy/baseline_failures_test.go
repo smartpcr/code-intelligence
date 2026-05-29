@@ -46,7 +46,21 @@ import (
 // When the upstream owner fixes one of these tests, delete
 // the entry here AND the corresponding section in the .md
 // doc.
-var expectedBaselineFailures = map[string][]string{}
+var expectedBaselineFailures = map[string][]string{
+	// No baseline failures remain in this repository. As
+	// of iter-4 of the Go-fixture-test stage the C++
+	// (Methods/Calls/Imports) and C#
+	// (Classes/Methods/Inheritance/Using) walkers landed
+	// in `parser_treesitter_cpp.go` and
+	// `parser_treesitter_csharp.go` as a cross-cutting
+	// baseline-repair authorised by the operator's pinned
+	// answer to the `baseline-package-break` open
+	// question. The previously-waived
+	// `TestCppFixture_EmitsExpectedNodeAndEdgeSet` and
+	// `TestCSharpFixture_EmitsExpectedNodeAndEdgeSet`
+	// tests now PASS, so leaving them registered here
+	// would trip the stale-waiver guard below.
+}
 
 // TestBaselineFailuresAreOnlyDocumentedOnes runs
 // `go test ./...` from the agent-memory module root and

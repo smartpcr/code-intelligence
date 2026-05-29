@@ -145,6 +145,9 @@ type Dispatcher struct {
 // uses the build-tagged `defaultParsers()` set so the production
 // `main.go` wiring inherits the correct parser list automatically.
 func NewDispatcher(w NodeEdgeWriter, opts ...DispatcherOption) *Dispatcher {
+	if w == nil {
+		panic("ast: dispatcher: nil writer")
+	}
 	d := &Dispatcher{writer: w}
 	for _, opt := range opts {
 		if opt != nil {
@@ -219,13 +222,36 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 
 	p, ok := d.extMap[ext]
 	if !ok {
-		if d.logger != nil {
-			d.logger.Info("ast.dispatch.skip",
-				slog.String("file", ev.RelPath),
-				slog.String("reason", "no_parser"),
-			)
+		// Hint-fallback: if the dispatcher was configured with
+		// `WithLanguageHints`, walk the normalized hint list and
+		// pick the first parser whose `Language()` matches a hint.
+		// This is the v1 contract per architecture §4.1 — hints
+		// route ONLY unknown / unmapped extensions; a known
+		// extension always wins (test:
+		// `TestDispatcher_LanguageHintsFallbackForUnknownExtension`).
+		if len(d.languageHints) > 0 {
+			for _, hint := range normalizeHints(d.languageHints) {
+				for _, candidate := range d.parsers {
+					if candidate.Language() == hint {
+						p = candidate
+						ok = true
+						break
+					}
+				}
+				if ok {
+					break
+				}
+			}
 		}
-		return repoindexer.EmitResult{}, nil
+		if !ok {
+			if d.logger != nil {
+				d.logger.Info("ast.dispatch.skip",
+					slog.String("file", ev.RelPath),
+					slog.String("reason", "no_parser"),
+				)
+			}
+			return repoindexer.EmitResult{}, nil
+		}
 	}
 
 	if ev.Open == nil {
@@ -244,7 +270,32 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 		return repoindexer.EmitResult{}, fmt.Errorf("ast: dispatcher: close %s: %w", ev.RelPath, closeErr)
 	}
 
-	result, err := p.Parse(ev.RelPath, src)
+	// Wrap Parse in a recover so a panic inside a parser does NOT
+	// take down the dispatcher (LanguageParser contract on
+	// parser.go: parsers must not panic, but a defensive recover
+	// here turns a regression into a logged skip instead of a
+	// process abort — test:
+	// `TestDispatcher_PanicInParserIsRecovered`).
+	var result ParseResult
+	var parserPanicked bool
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				parserPanicked = true
+				if d.logger != nil {
+					d.logger.Error("ast.parse.panic",
+						slog.String("file", ev.RelPath),
+						slog.String("language", p.Language()),
+						slog.Any("panic", r),
+					)
+				}
+			}
+		}()
+		result, err = p.Parse(ev.RelPath, src)
+	}()
+	if parserPanicked {
+		return repoindexer.EmitResult{}, nil
+	}
 	if err != nil {
 		// Sentinel branch (`ErrParserUnavailable`): the parser is
 		// signalling that a required runtime dependency is
@@ -356,6 +407,16 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 	methodSigToNodeID := make(map[string]string, len(result.Methods))
 	methodDeclsByQN := make(map[string]MethodDecl, len(result.Methods))
 	simpleNameToQNs := make(map[string]map[string]struct{}, len(result.Methods))
+	// receiverIndex is the Go-multimap surface for receiver-qualified
+	// call resolution: a key like `<EnclosingClass>.<simpleName>` maps
+	// to the SET of node IDs that can be reached through it. Dedup is
+	// by node ID (set semantics), so a pointer-receiver method that
+	// registers under both its primary key and a `ReceiverAlias` (the
+	// `Foo.Bar` alias attached to `*Foo.Bar`) only counts once. When
+	// two distinct nodes collide on the same key (a value-receiver
+	// `Foo.Bar` AND a pointer-receiver `*Foo.Bar` aliased to
+	// `Foo.Bar`), Pass 2b drops the edge per the A5 ambiguity rule.
+	receiverIndex := make(map[string]map[string]struct{}, len(result.Methods))
 	registerSimpleName := func(simple, qn string) {
 		set, ok := simpleNameToQNs[simple]
 		if !ok {
@@ -363,6 +424,14 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 			simpleNameToQNs[simple] = set
 		}
 		set[qn] = struct{}{}
+	}
+	registerReceiverKey := func(key, nodeID string) {
+		set, ok := receiverIndex[key]
+		if !ok {
+			set = make(map[string]struct{}, 1)
+			receiverIndex[key] = set
+		}
+		set[nodeID] = struct{}{}
 	}
 	for _, m := range result.Methods {
 		methodSig := fmt.Sprintf("%s::method::%s#%s(%s)", ev.RepoURL, ev.RelPath, m.QualifiedName, m.ParamSignature)
@@ -391,6 +460,18 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 		// Go's pointer-receiver `*Foo.Bar` → `Foo.Bar` alias).
 		for _, alias := range m.ReceiverAliases {
 			methodSigToNodeID[alias] = id
+		}
+		// Register the primary scoped key on the receiverIndex
+		// (e.g. `Foo.Bar` for both `Foo.Bar` and `*Foo.Bar`) plus
+		// every explicit ReceiverAlias. Dedup by node ID lets a
+		// pointer-only method register under both its primary key
+		// and the alias without becoming self-ambiguous.
+		if m.EnclosingClass != "" {
+			primaryKey := m.EnclosingClass + "." + lastDottedSegment(m.QualifiedName)
+			registerReceiverKey(primaryKey, id)
+		}
+		for _, alias := range m.ReceiverAliases {
+			registerReceiverKey(alias, id)
 		}
 	}
 
@@ -467,8 +548,21 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 		if m.EnclosingClass != "" {
 			for _, callee := range m.ReceiverCalls {
 				target := m.EnclosingClass + "." + callee
-				dstID, ok := methodSigToNodeID[target]
-				if !ok {
+				// Drop receiver-qualified edges whose scoped key
+				// resolves to MORE THAN ONE distinct method node
+				// (architecture A5: prefer missing edges over wrong
+				// ones). A single-node set — even one populated by
+				// both a primary key and a ReceiverAlias — still
+				// resolves cleanly because dedup is by node ID.
+				ids := receiverIndex[target]
+				if len(ids) != 1 {
+					continue
+				}
+				var dstID string
+				for nid := range ids {
+					dstID = nid
+				}
+				if dstID == "" {
 					continue
 				}
 				if eerr := insertEdge(graphwriter.EdgeInput{

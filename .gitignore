@@ -62,10 +62,17 @@ services/clean-code/cmd/**/*-darwin
 services/clean-code/cmd/**/*-windows.exe
 services/clean-code/*.exe
 
-# Go workspace files -- the monorepo uses a single module per
-# service rather than a `go.work` file.
-go.work
-go.work.sum
+# Go workspace files -- COMMITTED so the Forge per-iter test
+# gate command `go test ./services/clean-code/test/conformance/...`
+# (invoked from the repo root, not from inside a per-service
+# module directory) can span the multi-module layout. The repo
+# has 3 Go modules (root `github.com/microsoft/clean-code` plus
+# `services/agent-memory` and `services/clean-code`) and a path
+# spec that crosses module boundaries requires `go.work` to
+# resolve. The previous "single module per service" comment
+# pre-dated the from-repo-root gate requirement (Stage 10.3 iter
+# 2 evaluator feedback item 1). `go.work.sum` is also committed
+# per the upstream Go workspace convention.
 
 # ---------------------------------------------------------------
 # Pre-commit / linter caches

@@ -402,10 +402,22 @@ func TestFileWAL_FlusherDrainsOnSignal(t *testing.T) {
 			t.Fatalf("Enqueue %d: %v", i, err)
 		}
 	}
-	// Wait up to 5s for the flusher to drain all 3.
-	deadline := time.Now().Add(5 * time.Second)
+	// Wait up to 30s for the flusher to drain all 3 AND for
+	// the internal depth counter to reach zero. The original
+	// 5s deadline polled ONLY `drained.Load() == 3`, which
+	// flipped true inside the user callback BEFORE the WAL's
+	// internal depth decrement — a race window of a few µs
+	// that the immediate `wal.Depth() != 0` post-condition
+	// would frequently catch under CPU contention (e.g. when
+	// the full repo-wide `go test ./...` gate runs every
+	// package in parallel). Poll BOTH conditions in the same
+	// loop so the deadline covers the full drain, not just the
+	// callback fan-out. Iter-11 fix: drop the flake that the
+	// `deploy/TestBaselineFailuresAreOnlyDocumentedOnes` gate
+	// caught in iters 7 / 10.
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		if drained.Load() == 3 {
+		if drained.Load() == 3 && wal.Depth() == 0 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)

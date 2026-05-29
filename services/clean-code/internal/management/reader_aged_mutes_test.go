@@ -340,11 +340,20 @@ func TestReader_ReadAgedMutes_NilStoreAdapterMapsToBackendUnavailable(t *testing
 	if !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("err=%v, want ErrBackendUnavailable (per nil-store -> 503 convention)", err)
 	}
-	// The underlying sentinel MUST also be preserved in the
-	// error chain so callers that want diagnostic detail can
-	// still branch on it.
-	if !errors.Is(err, ErrBackendUnavailable) {
-		t.Errorf("err chain lost ErrBackendUnavailable: %v", err)
+	// Contract pin: the Reader returns the BARE
+	// [ErrBackendUnavailable] sentinel -- it does NOT wrap
+	// the underlying adapter sentinel into the chain. The
+	// HTTP layer only branches on `errors.Is(err,
+	// ErrBackendUnavailable)` to emit 503; an additional
+	// wrap would force every HTTP-layer caller to also
+	// unwrap the inner sentinel just to render the 503
+	// body. If the contract changes to preserve the
+	// underlying sentinel, assert
+	// `errors.Is(err, ErrAgedMuteOverrideStoreUnavailable)`
+	// here AND update [Reader.ReadAgedMutes] to use
+	// `fmt.Errorf("%w: %w", ...)`.
+	if errors.Is(err, ErrAgedMuteOverrideStoreUnavailable) {
+		t.Errorf("err chain leaked ErrAgedMuteOverrideStoreUnavailable to the HTTP-facing surface: %v", err)
 	}
 }
 

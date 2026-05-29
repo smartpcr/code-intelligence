@@ -4,6 +4,30 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 10.2 -- Aged mute insights report (iter 4)
+
+Single minor cleanup from iter 3's score-94 review (no
+behavioral change). The iter-3
+`TestReader_ReadAgedMutes_NilStoreAdapterMapsToBackendUnavailable`
+test had a comment claiming the underlying adapter sentinel
+was preserved in the error chain, but the assertion just
+repeated the same `errors.Is(err, ErrBackendUnavailable)`
+check -- meaning the diagnostic-chain claim was untested.
+
+### Iter 4 changes
+
+- **`reader_aged_mutes_test.go`** -- converted the misleading
+  block at the end of
+  `TestReader_ReadAgedMutes_NilStoreAdapterMapsToBackendUnavailable`
+  into an explicit CONTRACT PIN: the test now asserts that
+  `errors.Is(err, ErrAgedMuteOverrideStoreUnavailable)`
+  returns FALSE (i.e. the bare `ErrBackendUnavailable`
+  sentinel is what surfaces, with no inner-sentinel leak).
+  The comment now documents WHY the bare sentinel is the
+  contract and what the maintainer should change if the
+  contract evolves to preserve the chain. Closes the iter 3
+  evaluator's single minor finding.
+
 ## Stage 10.2 -- Aged mute insights report (iter 3)
 
 Wire-contract + error-mapping correctness pass. Four

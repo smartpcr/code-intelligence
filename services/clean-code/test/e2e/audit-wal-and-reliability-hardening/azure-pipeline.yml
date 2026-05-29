@@ -15,8 +15,8 @@ variables:
   COMPOSE_FILE: tests/e2e/phase-09-audit-wal/docker-compose.yml
 
 stages:
-  - stage: e2e_audit_wal_reconciler
-    displayName: "E2E – Audit WAL Reconciler Replay Only"
+  - stage: e2e_otel_telemetry
+    displayName: "E2E – OTel Telemetry Across All Surfaces"
     jobs:
       - job: run_e2e
         displayName: "Run godog E2E suite"
@@ -46,6 +46,9 @@ stages:
             env:
               CLEAN_CODE_PG_URL: postgres://clean_code_admin:e2e_test_password@localhost:5432/clean_code?sslmode=disable
               CLEAN_CODE_OTEL_ENDPOINT: http://localhost:4317
+              CLEAN_CODE_EVALUATOR_URL: http://localhost:8081
+              CLEAN_CODE_OTEL_QUERY_URL: http://localhost:16686
+              CLEAN_CODE_AGGREGATOR_METRICS_URL: http://localhost:9090/metrics
 
           - script: |
               docker compose -f $(COMPOSE_FILE) logs --tail=200

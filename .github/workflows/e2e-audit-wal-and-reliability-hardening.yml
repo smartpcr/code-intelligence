@@ -19,8 +19,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  e2e-audit-wal-reconciler:
-    name: "Audit WAL Reconciler Replay Only"
+  e2e-otel-telemetry:
+    name: "OTel Telemetry Across All Surfaces"
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -48,6 +48,9 @@ jobs:
         env:
           CLEAN_CODE_PG_URL: postgres://clean_code_admin:e2e_test_password@localhost:5432/clean_code?sslmode=disable
           CLEAN_CODE_OTEL_ENDPOINT: http://localhost:4317
+          CLEAN_CODE_EVALUATOR_URL: http://localhost:8081
+          CLEAN_CODE_OTEL_QUERY_URL: http://localhost:16686
+          CLEAN_CODE_AGGREGATOR_METRICS_URL: http://localhost:9090/metrics
         run: |
           go test -tags e2e -v -count=1 -timeout 120s \
             ./test/e2e/code-intelligence-CLEAN-CODE/...

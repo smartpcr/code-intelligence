@@ -594,6 +594,16 @@ var (
 	ErrNilRuleKindMapper = errors.New(
 		"refactor: WithRuleKindMapper was passed nil")
 
+	// ErrNilEffortEstimator signals that [WithEffortEstimator]
+	// was called with a nil receiver. The Stage 8.3 estimator
+	// is OPTIONAL (default behaviour emits `effort_hours = 0.0`
+	// per Stage 8.2); passing `nil` is therefore unambiguously
+	// a wiring bug -- the caller intended to wire an estimator
+	// but the underlying value was nil. Mirrors the other
+	// [TaskOption] nil sentinels.
+	ErrNilEffortEstimator = errors.New(
+		"refactor: WithEffortEstimator was passed nil")
+
 	// ErrNilIDFactoryOption / ErrNilClockOption signal that a
 	// caller passed `nil` through [WithTaskIDFactory] /
 	// [WithTaskClock]. Distinct from the [ErrNilIDFactory] /
@@ -811,6 +821,14 @@ type TaskPlanner struct {
 	// wired. Stage 9.3 cmd binaries override via
 	// [WithEffortModel] / [NewEffortModelFromConfig].
 	effortModel EffortModel
+
+	// effortEstimator is the optional Stage 8.3 estimator.
+	// Nil = Stage 8.2 byte-identical behaviour (every emitted
+	// task carries `EffortHours = 0.0`). Non-nil = the
+	// estimator's value lands on `task.EffortHours`; an
+	// estimator error aborts the whole batch (no plan or
+	// task row lands). Wired via [WithEffortEstimator].
+	effortEstimator EffortEstimator
 
 	// optErr accumulates errors stashed by the [TaskOption]
 	// setters (nil callbacks) so [NewTaskPlanner] can

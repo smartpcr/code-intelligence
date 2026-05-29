@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/cucumber/godog"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
 // ---------------------------------------------------------------------------
@@ -81,8 +81,22 @@ func (s *crossRepoE2EState) cleanup() {
 		return
 	}
 	ctx := context.Background()
+
+	// Delete cross_repo_percentile rows scoped to test-owned repos only.
+	// histogram_json has shape {"entries": [{"repo_id": "...", ...}, ...]},
+	// so we match rows where any histogram entry references a test repo_id.
+	if len(s.repoIDs) > 0 {
+		_, _ = s.db.ExecContext(ctx, `
+			DELETE FROM clean_code.cross_repo_percentile
+			WHERE metric_kind = 'lcom4' AND scope_kind = 'class'
+			  AND EXISTS (
+			    SELECT 1 FROM jsonb_array_elements(histogram_json->'entries') AS e
+			    WHERE e->>'repo_id' = ANY($1::text[])
+			  )
+		`, pq.Array(s.repoIDs))
+	}
+
 	for _, rid := range s.repoIDs {
-		_, _ = s.db.ExecContext(ctx, `DELETE FROM clean_code.cross_repo_percentile WHERE metric_kind = 'lcom4' AND scope_kind = 'class'`)
 		_, _ = s.db.ExecContext(ctx, `DELETE FROM clean_code.repo_metric_snapshot WHERE repo_id = $1`, rid)
 		_, _ = s.db.ExecContext(ctx, `DELETE FROM clean_code.metric_sample_active WHERE repo_id = $1`, rid)
 		_, _ = s.db.ExecContext(ctx, `DELETE FROM clean_code.metric_sample WHERE repo_id = $1`, rid)

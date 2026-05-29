@@ -1,4 +1,4 @@
-package ast_test
+package e2e
 
 import (
 	"encoding/json"

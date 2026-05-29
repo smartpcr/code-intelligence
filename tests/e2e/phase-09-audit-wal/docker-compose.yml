@@ -4,80 +4,68 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_DB: clean_code
-      POSTGRES_USER: clean_code_admin
-      POSTGRES_PASSWORD: e2e_test_password
+      POSTGRES_USER: cleancode
+      POSTGRES_PASSWORD: cleancode
+      POSTGRES_DB: cleancode
     ports:
       - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U clean_code_admin -d clean_code"]
-      interval: 3s
-      timeout: 5s
+      test: ["CMD-SHELL", "pg_isready -U cleancode"]
+      interval: 5s
+      timeout: 3s
       retries: 10
 
   evaluator:
-    image: ${EVALUATOR_IMAGE:-ghcr.io/forge/clean-code-evaluator:latest}
+    build:
+      context: ../../../
+      dockerfile: Dockerfile
+      args:
+        ROLE: clean_code_evaluator
+    environment:
+      CLEAN_CODE_PG_URL: "postgres://cleancode:cleancode@postgres:5432/cleancode?sslmode=disable"
+      CLEAN_CODE_OTEL_ENDPOINT: "http://otel-collector:4317"
+    ports:
+      - "8090:8090"
     depends_on:
       postgres:
         condition: service_healthy
-      otel-collector:
-        condition: service_started
-    environment:
-      CLEAN_CODE_PG_URL: postgres://clean_code_evaluator:e2e_test_password@postgres:5432/clean_code?sslmode=disable
-      PG_ROLE: clean_code_evaluator
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
-    ports:
-      - "8081:8081"
-      - "9090:9090"
 
   rule-engine:
-    image: ${RULE_ENGINE_IMAGE:-ghcr.io/forge/clean-code-rule-engine:latest}
+    build:
+      context: ../../../
+      dockerfile: Dockerfile
+      args:
+        ROLE: clean_code_solid_batch
+    environment:
+      CLEAN_CODE_PG_URL: "postgres://cleancode:cleancode@postgres:5432/cleancode?sslmode=disable"
+      CLEAN_CODE_OTEL_ENDPOINT: "http://otel-collector:4317"
+    ports:
+      - "8091:8091"
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      CLEAN_CODE_PG_URL: postgres://clean_code_solid_batch:e2e_test_password@postgres:5432/clean_code?sslmode=disable
-      PG_ROLE: clean_code_solid_batch
 
   wal-reconciler:
-    image: ${WAL_RECONCILER_IMAGE:-ghcr.io/forge/clean-code-wal-reconciler:latest}
+    build:
+      context: ../../../
+      dockerfile: Dockerfile
+      args:
+        ROLE: clean_code_wal_reconciler
+    environment:
+      CLEAN_CODE_PG_URL: "postgres://cleancode:cleancode@postgres:5432/cleancode?sslmode=disable"
+      CLEAN_CODE_OTEL_ENDPOINT: "http://otel-collector:4317"
+      WAL_MODE: REPLAY-ONLY
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      CLEAN_CODE_PG_URL: postgres://clean_code_wal_reconciler:e2e_test_password@postgres:5432/clean_code?sslmode=disable
-      PG_ROLE: clean_code_wal_reconciler
-      RECONCILER_MODE: REPLAY-ONLY
 
   fault-injector:
-    image: ${FAULT_INJECTOR_IMAGE:-ghcr.io/forge/fault-injector:latest}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    network_mode: "service:postgres"
-    environment:
-      TARGET_SERVICES: evaluator,rule-engine
+    image: alpine/socat:latest
+    entrypoint: ["sleep", "infinity"]
+    network_mode: "host"
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.100.0
     ports:
       - "4317:4317"
       - "4318:4318"
-    volumes:
-      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
-    command: ["--config", "/etc/otelcol-contrib/config.yaml"]
-
-  jaeger:
-    image: jaegertracing/all-in-one:1.57
-    depends_on:
-      - otel-collector
-    ports:
-      - "16686:16686"
-      - "14250:14250"
-    environment:
-      COLLECTOR_OTLP_ENABLED: "true"
-
-volumes:
-  pgdata:

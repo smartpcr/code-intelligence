@@ -11,8 +11,8 @@ import (
 // available in the current build.
 var ErrParserUnavailable = errors.New("parser unavailable")
 
-// Parser is implemented by each language-specific parser.
-type Parser interface {
+// LanguageParser is implemented by each language-specific parser.
+type LanguageParser interface {
 	Language() string
 	Extensions() []string
 	Parse(filename string, src []byte) (ParseResult, error)
@@ -80,11 +80,11 @@ type Logger interface {
 
 var (
 	mu     sync.RWMutex
-	extMap = map[string]Parser{}
+	extMap = map[string]LanguageParser{}
 )
 
 // RegisterParser adds a parser for each of its declared extensions.
-func RegisterParser(p Parser) {
+func RegisterParser(p LanguageParser) {
 	mu.Lock()
 	defer mu.Unlock()
 	for _, ext := range p.Extensions() {
@@ -94,7 +94,7 @@ func RegisterParser(p Parser) {
 
 // SelectParser returns the registered parser for the given filename's
 // extension, or nil if no parser is registered for that extension.
-func SelectParser(filename string, src []byte) Parser {
+func SelectParser(filename string, src []byte) LanguageParser {
 	ext := filepath.Ext(filename)
 	mu.RLock()
 	defer mu.RUnlock()
@@ -104,6 +104,6 @@ func SelectParser(filename string, src []byte) Parser {
 // DefaultParsers returns the build-appropriate parser list.
 // Under CGO=on this includes all tree-sitter parsers (including Rust).
 // Under CGO=off (parsers_nocgo.go) this returns nil.
-func DefaultParsers() []Parser {
+func DefaultParsers() []LanguageParser {
 	return defaultParsers()
 }

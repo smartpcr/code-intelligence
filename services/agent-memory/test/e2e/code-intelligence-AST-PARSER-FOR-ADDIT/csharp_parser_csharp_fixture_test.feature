@@ -24,7 +24,7 @@ Feature: C# fixture test — node and edge emission
           void Process() { Log(); }
       }
       """
-    When EmitFile runs under CGO on
+    When EmitFile runs under CGO=on
     Then 3 class nodes are emitted
     And 4 method nodes are emitted
     And 1 package node is emitted

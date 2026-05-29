@@ -4,6 +4,7 @@ package ast
 
 import (
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -38,91 +39,281 @@ func TestTreeSitterCSharpParser_LanguageAndExtensions(t *testing.T) {
 	}
 }
 
-// TestTreeSitterCSharpParser_StubParseEmpty asserts that the
-// placeholder Parse() returns an empty ParseResult (no error)
-// for valid C# input. The sibling stage workstream
-// `stage-4.1-csharptreesitterparser-implementation` REPLACES
-// this test in-place with a fixture-driven walker test that
-// asserts emitted Classes / Methods / Imports per the story
-// brief §1 ("C#: classes/interfaces/structs, methods,
-// inheritance/interfaces, using directives"). Until then, this
-// test guards against accidental panics in the stub and pins
-// the empty-return contract so a half-implemented sibling-stage
-// walker doesn't silently regress the result shape.
-func TestTreeSitterCSharpParser_StubParseEmpty(t *testing.T) {
-	const src = `
-using System;
-using System.Collections.Generic;
+// TestCSharpFixture_EmitsExpectedNodeAndEdgeSet pins the
+// Stage 4.3 (C#-fixture-test) acceptance contract for the C#
+// tree-sitter parser. The fixture is a small, deliberately
+// canonical C# file that exercises every grammar surface the
+// workstream brief calls out:
+//
+//   - one `using System;` directive (so the imports field is
+//     exercised and the dispatcher can later materialise the
+//     `file -> System` package edge),
+//   - one file-scoped `namespace Demo;` (C# 10 syntax),
+//   - one interface (`IGreeter`) with a method spec
+//     (`Greet`) — so the parser proves it recognises
+//     `interface_declaration` and emits the method spec
+//     even without a body,
+//   - one base class (`Base`) with an expression-bodied
+//     method (`Identify`) declared in the same file,
+//   - one derived class (`HelloWorld`) that BOTH extends
+//     `Base` and implements `IGreeter` — so the parser's
+//     `base_list` walk separates the class base from the
+//     interface bases and the dispatcher can resolve both
+//     `extends` and `implements` edges against same-file
+//     declarations,
+//   - a regular method (`HelloWorld.Greet`) that issues a
+//     bare-name call to a sibling static method
+//     (`FormatGreeting`) in the same class — so the
+//     parser's Calls list is exercised and the dispatcher
+//     can resolve a same-file `static_calls` edge,
+//   - a private static method (`FormatGreeting`) — so
+//     `static` modifier extraction is exercised, and
+//   - a private field (`prefix`) with an initializer — so
+//     the parser does NOT misclassify field-with-initializer
+//     as a method (the brief pins exactly 4 methods, not 5).
+//
+// This test runs at the PARSER level (//go:build cgo,
+// mirroring TestGoTreeSitterFixture_EmitsExpectedNodeAndEdgeSet
+// in parser_treesitter_go_test.go) rather than at the
+// dispatcher level (//go:build canonical_dispatcher, as used by
+// TestTypeScriptFixture_EmitsExpectedNodeAndEdgeSet and the
+// Python equivalent). The brief's "edge" terminology maps to
+// ParseResult fields the dispatcher consumes:
+//
+//   - "extends edge"       -> ClassDecl.Extends
+//   - "implements edge"    -> ClassDecl.Implements
+//   - "static_calls edge"  -> MethodDecl.Calls (bare-name
+//     entries that the dispatcher's
+//     Pass 2b resolver stitches against
+//     the same-file callee index)
+//   - "imports edge"       -> ParseResult.Imports (the
+//     dispatcher mints the synthetic
+//     package node + `imports` edge in
+//     Pass 1 / 2a)
+//
+// Namespace prefixing (`Demo.IGreeter` vs bare `IGreeter`) is
+// the parser's design choice and not pinned by the brief, so
+// the helpers below match by simple-name / dotted suffix so
+// the test stays meaningful regardless of which convention the
+// walker adopts when the sibling implementation stage lands.
+func TestCSharpFixture_EmitsExpectedNodeAndEdgeSet(t *testing.T) {
+	const src = `using System;
 
-namespace Acme.Widgets
+namespace Demo;
+
+interface IGreeter
 {
-    public interface IWidget
+    string Greet(string name);
+}
+
+class Base
+{
+    public string Identify() => "base";
+}
+
+class HelloWorld : Base, IGreeter
+{
+    public string Greet(string name)
     {
-        int Id { get; }
-        void Run();
+        return FormatGreeting(this.prefix, name);
     }
 
-    public abstract class WidgetBase : IWidget
-    {
-        public abstract int Id { get; }
-        public abstract void Run();
-    }
+    private static string FormatGreeting(string prefix, string name) => prefix + name;
 
-    public sealed class Gadget : WidgetBase
-    {
-        public override int Id => 42;
-
-        public override void Run()
-        {
-            Console.WriteLine($"running {Id}");
-        }
-    }
+    private string prefix = "hi";
 }
 `
-	p := NewTreeSitterCSharpParser()
-	res, err := p.Parse("src/Acme/Widgets/Gadget.cs", []byte(src))
+	parser := NewTreeSitterCSharpParser()
+	if got := parser.Language(); got != "csharp" {
+		t.Fatalf("Language() = %q; want %q", got, "csharp")
+	}
+
+	res, err := parser.Parse("src/Demo/HelloWorld.cs", []byte(src))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if got := len(res.Classes); got != 0 {
-		t.Errorf("stub should return empty Classes; got %d (%+v)", got, res.Classes)
+
+	// ----- Classes / Interfaces -----
+	// The brief pins exactly 3 class/interface nodes:
+	// IGreeter (interface), Base (class), HelloWorld (class).
+	for _, want := range []string{"IGreeter", "Base", "HelloWorld"} {
+		if _, ok := findCSharpClass(res.Classes, want); !ok {
+			t.Errorf("class/interface %q missing from emitted set; got %v",
+				want, csharpClassNames(res.Classes))
+		}
 	}
-	if got := len(res.Methods); got != 0 {
-		t.Errorf("stub should return empty Methods; got %d (%+v)", got, res.Methods)
+	if got := len(res.Classes); got != 3 {
+		t.Errorf("expected 3 class/interface nodes; got %d (%v)",
+			got, csharpClassNames(res.Classes))
 	}
-	if got := len(res.Imports); got != 0 {
-		t.Errorf("stub should return empty Imports; got %d (%+v)", got, res.Imports)
+
+	// Kind assertions: the brief enumerates "3 class/interface
+	// nodes" with IGreeter being an INTERFACE and Base /
+	// HelloWorld being CLASSES. Without these checks a walker
+	// that mis-classifies (e.g. emits IGreeter with Kind="class"
+	// from the C# `interface_declaration` node) would still
+	// satisfy the count + name assertions above. ClassDecl.Kind
+	// is persisted on the node's attrs_json["decl_kind"] and
+	// downstream consumers (graph queries, policy rules) route
+	// on it, so a kind mis-emission is a real silent failure
+	// mode the test must pin.
+	wantKinds := map[string]string{
+		"IGreeter":   "interface",
+		"Base":       "class",
+		"HelloWorld": "class",
+	}
+	for name, wantKind := range wantKinds {
+		c, ok := findCSharpClass(res.Classes, name)
+		if !ok {
+			continue // already reported above
+		}
+		if c.Kind != wantKind {
+			t.Errorf("%s.Kind = %q; want %q (full=%+v)",
+				name, c.Kind, wantKind, c)
+		}
+	}
+
+	// ----- Methods -----
+	// The brief pins exactly 4 method nodes:
+	// IGreeter.Greet (interface method spec, no body),
+	// Base.Identify, HelloWorld.Greet, HelloWorld.FormatGreeting.
+	for _, want := range []string{
+		"IGreeter.Greet",
+		"Base.Identify",
+		"HelloWorld.Greet",
+		"HelloWorld.FormatGreeting",
+	} {
+		if _, ok := findCSharpMethod(res.Methods, want); !ok {
+			t.Errorf("method %q missing; got %v",
+				want, methodNames(res.Methods))
+		}
+	}
+	if got := len(res.Methods); got != 4 {
+		t.Errorf("expected 4 method nodes; got %d (%v)",
+			got, methodNames(res.Methods))
+	}
+
+	// ----- Extends edge (HelloWorld -> Base) -----
+	hello, ok := findCSharpClass(res.Classes, "HelloWorld")
+	if !ok {
+		t.Fatalf("HelloWorld class missing; got %v", csharpClassNames(res.Classes))
+	}
+	if !csharpHasSuffix(hello.Extends, "Base") {
+		t.Errorf("HelloWorld.Extends should contain Base; got %v", hello.Extends)
+	}
+	if got := len(hello.Extends); got != 1 {
+		t.Errorf("expected exactly 1 extends entry on HelloWorld (-> Base); got %d (%v)",
+			got, hello.Extends)
+	}
+
+	// ----- Implements edge (HelloWorld -> IGreeter) -----
+	if !csharpHasSuffix(hello.Implements, "IGreeter") {
+		t.Errorf("HelloWorld.Implements should contain IGreeter; got %v", hello.Implements)
+	}
+	if got := len(hello.Implements); got != 1 {
+		t.Errorf("expected exactly 1 implements entry on HelloWorld (-> IGreeter); got %d (%v)",
+			got, hello.Implements)
+	}
+
+	// ----- static_calls edge (HelloWorld.Greet -> HelloWorld.FormatGreeting) -----
+	greet, ok := findCSharpMethod(res.Methods, "HelloWorld.Greet")
+	if !ok {
+		t.Fatalf("HelloWorld.Greet method missing; got %v", methodNames(res.Methods))
+	}
+	// Bare-name call: the parser emits "FormatGreeting" in
+	// Calls (the bare invocation source the dispatcher's
+	// Pass 2b resolver matches against the same-file callee
+	// index). A future parser revision that pre-qualifies
+	// the call as `HelloWorld.FormatGreeting` is also
+	// accepted, since the dispatcher would resolve either
+	// form to the same Node.
+	if !csharpHasSuffix(greet.Calls, "FormatGreeting") {
+		t.Errorf("HelloWorld.Greet.Calls should contain FormatGreeting; got %v", greet.Calls)
+	}
+	// Cardinality: the brief pins "1 static_calls edge". At
+	// the parser level the dispatcher mints one edge per
+	// resolvable entry in Calls + ReceiverCalls, so the test
+	// must pin BOTH slices to a combined size of 1 to catch
+	// a walker that:
+	//   - emits FormatGreeting twice (e.g. duplicate-walk bug
+	//     in the same invocation_expression node),
+	//   - mis-classifies `this.prefix` (a field read) as a
+	//     receiver-qualified method call and routes it into
+	//     ReceiverCalls,
+	//   - or splits the single call into both Calls and
+	//     ReceiverCalls (double-emission across slices).
+	// Together with the contains-FormatGreeting check above
+	// these assertions pin exactly one resolvable edge.
+	if got := len(greet.Calls); got != 1 {
+		t.Errorf("expected exactly 1 entry in HelloWorld.Greet.Calls (FormatGreeting); got %d (%v)",
+			got, greet.Calls)
+	}
+	if got := len(greet.ReceiverCalls); got != 0 {
+		t.Errorf("expected 0 entries in HelloWorld.Greet.ReceiverCalls (this.prefix is a field access, not a method call); got %d (%v)",
+			got, greet.ReceiverCalls)
+	}
+
+	// ----- Imports edge (file -> System) -----
+	if !containsString(importModules(res.Imports), "System") {
+		t.Errorf("import %q missing; got %v", "System", importModules(res.Imports))
+	}
+	if got := len(res.Imports); got != 1 {
+		t.Errorf("expected exactly 1 import (System); got %d (%v)",
+			got, importModules(res.Imports))
 	}
 }
 
-// TestTreeSitterCSharpParser_StubParseStruct confirms the stub
-// also handles `struct` declarations without error. Once the
-// sibling stage lands the real walker, this test should be
-// extended to assert that struct declarations become
-// ClassDecls and using directives become Imports.
-func TestTreeSitterCSharpParser_StubParseStruct(t *testing.T) {
-	const src = `
-namespace Acme.Geometry
-{
-    public struct Point
-    {
-        public int X;
-        public int Y;
-
-        public Point(int x, int y)
-        {
-            X = x;
-            Y = y;
-        }
-    }
+// findCSharpClass returns the ClassDecl whose QualifiedName
+// equals want OR ends with "." + want (so `IGreeter` matches
+// both `IGreeter` and `Demo.IGreeter`). Namespace prefixing is
+// the walker's design choice; the brief's assertions are
+// written in simple-name form.
+func findCSharpClass(classes []ClassDecl, want string) (ClassDecl, bool) {
+	for _, c := range classes {
+		if c.QualifiedName == want || strings.HasSuffix(c.QualifiedName, "."+want) {
+			return c, true
+		}
+	}
+	return ClassDecl{}, false
 }
-`
-	p := NewTreeSitterCSharpParser()
-	res, err := p.Parse("src/Acme/Geometry/Point.cs", []byte(src))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
+
+// findCSharpMethod returns the MethodDecl whose QualifiedName
+// equals want OR ends with "." + want. `want` is expected to
+// be in `Class.Method` form (e.g. `HelloWorld.Greet`); the
+// suffix match accepts a namespace-qualified emission such as
+// `Demo.HelloWorld.Greet`.
+func findCSharpMethod(methods []MethodDecl, want string) (MethodDecl, bool) {
+	for _, m := range methods {
+		if m.QualifiedName == want || strings.HasSuffix(m.QualifiedName, "."+want) {
+			return m, true
+		}
 	}
-	if got := len(res.Classes); got != 0 {
-		t.Errorf("stub should return empty Classes; got %d", got)
+	return MethodDecl{}, false
+}
+
+// csharpHasSuffix reports whether s contains an element that
+// equals want or ends with "." + want. Used to assert
+// extends / implements / Calls entries tolerantly of any
+// namespace prefix the walker may attach.
+func csharpHasSuffix(s []string, want string) bool {
+	for _, v := range s {
+		if v == want || strings.HasSuffix(v, "."+want) {
+			return true
+		}
 	}
+	return false
+}
+
+// csharpClassNames returns just the QualifiedName slice for a
+// slice of ClassDecls. Named with the `csharp` prefix so it
+// does not collide with sibling helpers under //go:build cgo
+// (parser_treesitter_cpp_test.go::classNames,
+// parser_treesitter_go_test.go::goClassNames).
+func csharpClassNames(cs []ClassDecl) []string {
+	out := make([]string, 0, len(cs))
+	for _, c := range cs {
+		out = append(out, c.QualifiedName)
+	}
+	sort.Strings(out)
+	return out
 }

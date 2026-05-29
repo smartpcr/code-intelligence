@@ -269,6 +269,15 @@ func (s *PGExternalScanRunStore) qualifyScanRun() string {
 	return pq.QuoteIdentifier(s.schema) + "." + pq.QuoteIdentifier(pgScanRunRunTable)
 }
 
+// qualifyCommit returns `"<schema>"."commit"`. Used by the
+// iter-8 `commit.scan_status` UPSERT inside
+// [FinalizeExternalScanRun] to honour the architecture
+// Sec 1.5.1 sole-writer invariant via the same schema-
+// qualified path the scan_run UPDATE uses.
+func (s *PGExternalScanRunStore) qualifyCommit() string {
+	return pq.QuoteIdentifier(s.schema) + "." + pq.QuoteIdentifier("commit")
+}
+
 // OpenExternalScanRun INSERTs a `scan_run` row for an
 // external-ingest verb. The INSERT uses `ON CONFLICT (verb,
 // payload_hash) DO NOTHING RETURNING scan_run_id` against the
@@ -444,11 +453,54 @@ func (s *PGExternalScanRunStore) LookupExternalScanRunByPayloadHash(ctx context.
 // predicate -- a second call affects 0 rows and surfaces as
 // [ErrConcurrentFinalize].
 //
-// The function ONLY updates scan_run.status / ended_at; it
-// does NOT touch commit.scan_status because the external-
-// ingest kinds do not couple to that lifecycle (external_per_row
-// has no per-run SHA at all; external_single's commit
-// coupling lands when the per-verb materialiser ships).
+// # commit.scan_status coupling (iter 8)
+//
+// When BOTH of the following hold inside the same
+// transaction as the scan_run UPDATE:
+//
+//   - the terminal `status` is [ScanRunStatusSucceeded], AND
+//   - the scan_run row is `kind=external_single`,
+//     `sha_binding=single`, `to_sha IS NOT NULL`
+//
+// this function ALSO UPSERTs `clean_code.commit` for
+// `(repo_id, to_sha)` to `scan_status='scanned'`. This
+// closes the gap the cross-repo happy-path e2e
+// (`test/e2e/cross_repo_happy_path/`) previously bridged
+// with a test-side SQL shim and is the precondition for
+// `eval.gate(repo_id, sha)` to escape the
+// `samples_pending` degraded-reason path.
+//
+// The flip is INTENTIONALLY scoped to (external_single +
+// succeeded + to_sha-not-null) so:
+//
+//   - `external_per_row` runs (which carry no per-run SHA)
+//     are unaffected -- the per-row SHA flip is a separate
+//     pipeline that lands when that verb's materialiser
+//     ships;
+//   - `failed` runs do NOT mark commits as scanned (a
+//     half-completed scan must NOT advance the commit
+//     state machine);
+//   - runs that somehow finalize without a `to_sha` are
+//     left alone (the OpenExternalScanRun validator
+//     enforces `to_sha != ""` for `single`-binding runs,
+//     so this is defence-in-depth).
+//
+// The commit UPSERT carries `committed_at = endedAt` for
+// the INSERT path -- when the upstream Repo Indexer has
+// not yet processed this SHA, we materialise a synthetic
+// commit row so the e2e read path observes a `scanned`
+// row. On CONFLICT we leave `committed_at` alone (the
+// previously-persisted upstream value wins) and only
+// update `scan_status`. Architecture Sec 1.5.1 row 1
+// pins "Metric Ingestor is the sole writer of
+// commit.scan_status", so this UPSERT respects the
+// sole-writer invariant.
+//
+// On any error in either statement the transaction is
+// rolled back and the function returns the wrapped error
+// -- the all-or-nothing contract means a partial finalize
+// (e.g. scan_run flipped but commit unchanged) is never
+// observable to a sibling reader.
 func (s *PGExternalScanRunStore) FinalizeExternalScanRun(ctx context.Context, scanRunID uuid.UUID, status ScanRunStatus, endedAt time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -465,13 +517,25 @@ func (s *PGExternalScanRunStore) FinalizeExternalScanRun(ctx context.Context, sc
 	if endedAt.IsZero() {
 		return errors.New("metric_ingestor: PGExternalScanRunStore.FinalizeExternalScanRun: endedAt is the zero time")
 	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("metric_ingestor: PGExternalScanRunStore.FinalizeExternalScanRun BeginTx (%s): %w", scanRunID, err)
+	}
+	defer func() {
+		// Safe even after a successful Commit; documented
+		// no-op per database/sql/sql.go (Tx.Rollback returns
+		// ErrTxDone which we intentionally drop).
+		_ = tx.Rollback()
+	}()
+
 	stmt := fmt.Sprintf(
 		`UPDATE %s
 		    SET status = $2, ended_at = $3
 		  WHERE scan_run_id = $1 AND status = 'running'`,
 		s.qualifyScanRun(),
 	)
-	res, err := s.db.ExecContext(ctx, stmt, scanRunID, string(status), endedAt.UTC())
+	res, err := tx.ExecContext(ctx, stmt, scanRunID, string(status), endedAt.UTC())
 	if err != nil {
 		return fmt.Errorf("metric_ingestor: PGExternalScanRunStore UPDATE scan_run.status (%s): %w", scanRunID, err)
 	}
@@ -481,6 +545,55 @@ func (s *PGExternalScanRunStore) FinalizeExternalScanRun(ctx context.Context, sc
 	}
 	if affected != 1 {
 		return fmt.Errorf("%w: scan_run_id=%s rowsAffected=%d (want 1)", ErrConcurrentFinalize, scanRunID, affected)
+	}
+
+	// iter 8 -- coupled commit.scan_status flip for the
+	// (external_single, succeeded, to_sha-not-null) shape.
+	// SELECT-after-UPDATE inside the same transaction so
+	// the predicate observes the same row state the UPDATE
+	// just wrote against (FOR UPDATE not needed; the
+	// scan_run row is single-writer per status='running'
+	// guard, so a concurrent UPDATE cannot race here).
+	if status == ScanRunStatusSucceeded {
+		var (
+			kind       string
+			shaBinding string
+			toSHA      sql.NullString
+			repoID     uuid.UUID
+		)
+		selectScanRunSQL := fmt.Sprintf(
+			`SELECT kind, sha_binding, to_sha, repo_id
+			   FROM %s
+			  WHERE scan_run_id = $1`,
+			s.qualifyScanRun(),
+		)
+		switch err := tx.QueryRowContext(ctx, selectScanRunSQL, scanRunID).Scan(&kind, &shaBinding, &toSHA, &repoID); {
+		case errors.Is(err, sql.ErrNoRows):
+			// The UPDATE above succeeded with affected=1
+			// but the row is now gone? That is a hard
+			// invariant violation; surface it as a
+			// distinct wrapped error rather than silently
+			// skipping the commit flip.
+			return fmt.Errorf("metric_ingestor: PGExternalScanRunStore.FinalizeExternalScanRun: scan_run %s vanished between UPDATE and SELECT (data-integrity bug)", scanRunID)
+		case err != nil:
+			return fmt.Errorf("metric_ingestor: PGExternalScanRunStore.FinalizeExternalScanRun SELECT scan_run shape (%s): %w", scanRunID, err)
+		}
+		if kind == ScanRunKindExternalSingle && shaBinding == SHABindingSingle && toSHA.Valid && toSHA.String != "" {
+			commitSQL := fmt.Sprintf(
+				`INSERT INTO %s (repo_id, sha, committed_at, scan_status)
+				 VALUES ($1, $2, $3, 'scanned')
+				 ON CONFLICT (repo_id, sha) DO UPDATE
+				   SET scan_status = 'scanned'`,
+				s.qualifyCommit(),
+			)
+			if _, err := tx.ExecContext(ctx, commitSQL, repoID, toSHA.String, endedAt.UTC()); err != nil {
+				return fmt.Errorf("metric_ingestor: PGExternalScanRunStore.FinalizeExternalScanRun UPSERT commit.scan_status (scan_run=%s repo=%s sha=%s): %w", scanRunID, repoID, toSHA.String, err)
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("metric_ingestor: PGExternalScanRunStore.FinalizeExternalScanRun Commit (%s): %w", scanRunID, err)
 	}
 	return nil
 }

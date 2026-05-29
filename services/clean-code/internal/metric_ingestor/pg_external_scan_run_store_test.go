@@ -182,6 +182,14 @@ func TestPGExternalScanRunStore_OpenExternalScanRun_BadKind_NoDBRoundTrip(t *tes
 // pins the UPDATE path: the store transitions the row from
 // 'running' to 'succeeded' and the rows-affected check
 // accepts exactly 1.
+//
+// As of iter 8, the finalize is wrapped in a transaction and
+// (on success) reads the scan_run shape to decide whether to
+// also UPSERT `clean_code.commit.scan_status='scanned'`.
+// This HappyPath case uses a NON-`external_single` kind
+// ("retract") so the commit-flip branch is skipped and the
+// test focuses on the scan_run flip + commit-skip path. A
+// dedicated test below exercises the commit-flip branch.
 func TestPGExternalScanRunStore_FinalizeExternalScanRun_HappyPath(t *testing.T) {
 	t.Parallel()
 	_, mock, store, cleanup := newPGExternalStoreFixture(t)
@@ -190,11 +198,89 @@ func TestPGExternalScanRunStore_FinalizeExternalScanRun_HappyPath(t *testing.T) 
 	scanRunID, _ := uuid.NewV4()
 	ended := pgExternalStoreTestNow().Add(time.Second)
 
+	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE "clean_code_test"."scan_run"`)).
 		WithArgs(scanRunID, "succeeded", ended.UTC()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// status=succeeded -> finalize reads the scan_run shape
+	// to decide whether to also UPSERT the commit row. We
+	// return kind="retract" (NOT external_single) so the
+	// commit-flip branch is intentionally skipped.
+	repoIDForShape, _ := uuid.NewV4()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT kind, sha_binding, to_sha, repo_id`)).
+		WithArgs(scanRunID).
+		WillReturnRows(sqlmock.NewRows([]string{"kind", "sha_binding", "to_sha", "repo_id"}).
+			AddRow("retract", "single", nil, repoIDForShape))
+	mock.ExpectCommit()
 
 	if err := store.FinalizeExternalScanRun(context.Background(), scanRunID, metric_ingestor.ScanRunStatusSucceeded, ended); err != nil {
+		t.Errorf("FinalizeExternalScanRun: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestPGExternalScanRunStore_FinalizeExternalScanRun_ExternalSingle_FlipsCommitScanStatus
+// pins the iter-8 coupling: an external_single + succeeded +
+// to_sha-valid run UPSERTs `clean_code.commit.scan_status='scanned'`
+// inside the SAME transaction as the scan_run flip. Closes
+// the gap the cross-repo happy-path e2e previously bridged
+// with a test-side SQL shim.
+func TestPGExternalScanRunStore_FinalizeExternalScanRun_ExternalSingle_FlipsCommitScanStatus(t *testing.T) {
+	t.Parallel()
+	_, mock, store, cleanup := newPGExternalStoreFixture(t)
+	defer cleanup()
+
+	scanRunID, _ := uuid.NewV4()
+	repoID, _ := uuid.NewV4()
+	ended := pgExternalStoreTestNow().Add(time.Second)
+	toSHA := "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE "clean_code_test"."scan_run"`)).
+		WithArgs(scanRunID, "succeeded", ended.UTC()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT kind, sha_binding, to_sha, repo_id`)).
+		WithArgs(scanRunID).
+		WillReturnRows(sqlmock.NewRows([]string{"kind", "sha_binding", "to_sha", "repo_id"}).
+			AddRow("external_single", "single", toSHA, repoID))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO "clean_code_test"."commit"`)).
+		WithArgs(repoID, toSHA, ended.UTC()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := store.FinalizeExternalScanRun(context.Background(), scanRunID, metric_ingestor.ScanRunStatusSucceeded, ended); err != nil {
+		t.Errorf("FinalizeExternalScanRun: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestPGExternalScanRunStore_FinalizeExternalScanRun_Failed_DoesNotFlipCommit
+// pins the safety scoping of the iter-8 commit-flip: a
+// `failed` finalize MUST NOT advance commit.scan_status,
+// even for an external_single+single+to_sha row. A
+// half-complete scan must not be observable to readers as
+// `scanned`.
+func TestPGExternalScanRunStore_FinalizeExternalScanRun_Failed_DoesNotFlipCommit(t *testing.T) {
+	t.Parallel()
+	_, mock, store, cleanup := newPGExternalStoreFixture(t)
+	defer cleanup()
+
+	scanRunID, _ := uuid.NewV4()
+	ended := pgExternalStoreTestNow().Add(time.Second)
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE "clean_code_test"."scan_run"`)).
+		WithArgs(scanRunID, "failed", ended.UTC()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// NO SELECT/UPSERT expectations -- finalize must skip
+	// the commit-flip branch entirely when status != succeeded.
+	mock.ExpectCommit()
+
+	if err := store.FinalizeExternalScanRun(context.Background(), scanRunID, metric_ingestor.ScanRunStatusFailed, ended); err != nil {
 		t.Errorf("FinalizeExternalScanRun: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -214,8 +300,13 @@ func TestPGExternalScanRunStore_FinalizeExternalScanRun_ZeroRowsAffected_Returns
 	scanRunID, _ := uuid.NewV4()
 	ended := pgExternalStoreTestNow().Add(time.Second)
 
+	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE "clean_code_test"."scan_run"`)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	// rowsAffected=0 -> finalize returns ErrConcurrentFinalize
+	// before SELECT; the deferred Rollback fires on the
+	// surrounding transaction.
+	mock.ExpectRollback()
 
 	err := store.FinalizeExternalScanRun(context.Background(), scanRunID, metric_ingestor.ScanRunStatusSucceeded, ended)
 	if err == nil {

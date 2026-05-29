@@ -280,9 +280,6 @@ type crossRepoState struct {
 	// stale-path stale-row UPDATE captures every repo's row.
 	repoIDs []string
 	shas    []string
-	// realScanRunIDs is the scan_run_id Phase A's webhook
-	// POST returned for repo i; index-aligned with repoIDs.
-	realScanRunIDs []string
 
 	// Aggregator-tick correlation (iter 6).
 	// `preTickMaxBuiltAt` is the snapshot of
@@ -593,47 +590,28 @@ func (s *crossRepoState) registerThreeRepos() error {
 // -----------------------------------------------------------------
 // Step: coverage uploads land + scan runs reach scanned state.
 //
-// Iter 7 split: this function now narrates the REAL ingest
-// pipeline. Two production gaps remain that no shipped composer
-// fills (`commit.scan_status` flip; file->package coverage
-// rollup) -- those are extracted into
-// `production_gap_shims_test.go` (see file header there for
-// citations + the operator-pin Open Question). `coverageLanded`
-// calls into the shims by name so the gap surface is visible at
-// the function level rather than buried inside this body.
+// Iter 8: this step now drives ONLY the real Metric Ingestor
+// pipeline. The two production gaps the iter-2..iter-7 test
+// shims bridged are now shipped in production code:
 //
-//   Phase A -- REAL coverage webhook POST (per repo).
-//     POSTs an HMAC-signed Cobertura XML body to the Metric
-//     Ingestor's `/v1/ingest/coverage` verb. The Router
-//     auto-opens a `scan_run(kind='external_single',
-//     sha_binding='single', status='running')` row, the
-//     coverage handler hydrates + writes file-level
-//     `metric_sample` rows, and the Router finalises the
-//     scan_run to `succeeded`. We assert HTTP 2xx, capture
-//     the returned `scan_run_id`, then verify
-//     `scan_run.status='succeeded'` AND at least one
-//     file-level `metric_sample` row landed for that scan_run.
+//   - `commit.scan_status='scanned'` flip on the
+//     external_single+succeeded+to_sha-valid path is wired
+//     inside [metric_ingestor.PGExternalScanRunStore.FinalizeExternalScanRun]
+//     (single transaction with the scan_run UPDATE).
+//   - File -> package coverage rollup is wired inside
+//     [metric_ingestor.CoverageSweep.Run] via the iter-8
+//     [metric_ingestor.WithCoveragePackageRollupResolver]
+//     option (cardinality-weighted SUM(covered)/SUM(valid),
+//     same WriteBatch + same scope_binding seam the file
+//     rows use).
 //
-//     Phase A is MANDATORY (iter-5; iter-3 evaluator item 1).
-//     The three webhook env vars are `requireEnv`'d in
-//     `newState` so the scenario `t.Skipf`s when any is
-//     unset rather than silently substituting SQL bridges
-//     for the real Metric Ingestor pipeline. When the
-//     scenario actually runs, a Phase A failure is fatal --
-//     a configured webhook that won't accept a signed body
-//     is a deployment regression worth surfacing immediately.
-//
-//   Phase B -- Production-gap shims.
-//     Two narrowly-scoped supplements live in
-//     `production_gap_shims_test.go`. They do NOT fabricate
-//     metric values: the package-coverage shim DERIVES the
-//     package value by AVG-ing the file-level rows the real
-//     Cobertura parser landed in Phase A. The only thing the
-//     shims fabricate is the missing scope dimension
-//     (file -> package) and the missing commit.scan_status
-//     flip -- both of which are documented production gaps
-//     with explicit "out of scope, lands in a later
-//     workstream" inline comments in the production code.
+// The previously-extracted `production_gap_shims_test.go`
+// has been DELETED. `coverageLanded` is now a single-phase
+// real-pipeline step: POST per repo, assert scan_run reaches
+// `succeeded`, and trust the production CoverageSweep
+// rollup + the FinalizeExternalScanRun commit-flip to
+// supply the (commit.scan_status, package-scope metric_sample)
+// rows the downstream aggregator + freshness reads require.
 // -----------------------------------------------------------------
 
 func (s *crossRepoState) coverageLanded() error {
@@ -643,40 +621,21 @@ func (s *crossRepoState) coverageLanded() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	s.realScanRunIDs = make([]string, len(s.repoIDs))
-
-	// Phase A -- real webhook POST per repo (MANDATORY in
-	// iter 5 per iter-3 evaluator item 1). The three webhook
-	// env vars are `requireEnv`'d in `newState`, so reaching
-	// this code at all means the scenario WILL exercise the
-	// real `/v1/ingest/coverage` Metric Ingestor path. A
-	// failure here is hard.
+	// Real webhook POST per repo (MANDATORY in iter 5 per
+	// iter-3 evaluator item 1). The three webhook env vars
+	// are `requireEnv`'d in `newState`, so reaching this
+	// code at all means the scenario WILL exercise the real
+	// `/v1/ingest/coverage` Metric Ingestor path. A failure
+	// here is hard.
+	scanRunIDs := make([]string, len(s.repoIDs))
 	for i, repoID := range s.repoIDs {
 		scanRunID, err := s.postCoverageWebhook(ctx, i, repoID, s.shas[i])
 		if err != nil {
-			return fmt.Errorf("Phase A real coverage POST (repo %d/3): %w", i+1, err)
+			return fmt.Errorf("real coverage POST (repo %d/3): %w", i+1, err)
 		}
-		s.realScanRunIDs[i] = scanRunID
+		scanRunIDs[i] = scanRunID
 	}
-	s.t.Logf("Phase A complete: drove real /v1/ingest/coverage webhook for all %d repos; scan_runs=%v", len(s.repoIDs), s.realScanRunIDs)
-
-	// Phase B -- production-gap shims (see
-	// `production_gap_shims_test.go` for the full rationale,
-	// production-code line refs, and the operator-pin Open
-	// Question). Each method is intentionally named for what
-	// gap it fills so the call site reads as a structural
-	// admission rather than buried SQL.
-	for i, repoID := range s.repoIDs {
-		sha := s.shas[i]
-		scanRunID := s.realScanRunIDs[i]
-
-		if err := s.applyExternalCommitScanStatusShim(ctx, repoID, sha); err != nil {
-			return fmt.Errorf("Phase B gap-1 shim (repo %d/3): %w", i+1, err)
-		}
-		if err := s.derivePackageCoverageFromIngestedFileSamples(ctx, i, repoID, sha, scanRunID); err != nil {
-			return fmt.Errorf("Phase B gap-2 shim (repo %d/3): %w", i+1, err)
-		}
-	}
+	s.t.Logf("coverage POST complete: drove real /v1/ingest/coverage webhook for all %d repos; scan_runs=%v", len(s.repoIDs), scanRunIDs)
 	return nil
 }
 

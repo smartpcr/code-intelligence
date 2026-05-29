@@ -129,7 +129,22 @@ func BuildIngestRouter(ingestorDB *sql.DB, cfg IngestRouterConfig, logger *slog.
 		return nil, fmt.Errorf("coverage.NewPGScopeResolver: %w", err)
 	}
 	covHydrator := coverage.NewHydrator(covResolver).WithSkipLogger(logger)
-	covSweep := metric_ingestor.NewCoverageSweep(covHydrator, sampleWriter).
+	// iter 8: wire the canonical [PGScopeBindingResolver]
+	// into the [CoverageSweep] so each coverage upload also
+	// emits the (package, coverage_line_ratio|coverage_branch_ratio)
+	// rollup rows via the same writer + scope_binding seam
+	// the file rows use. Closes the file -> package gap
+	// the cross-repo happy-path e2e previously bridged with
+	// a test-side SQL shim.
+	covPackageRollupResolver, err := metric_ingestor.NewPGScopeBindingResolver(ingestorDB)
+	if err != nil {
+		return nil, fmt.Errorf("NewPGScopeBindingResolver(coverage_package_rollup): %w", err)
+	}
+	covSweep := metric_ingestor.NewCoverageSweep(
+		covHydrator,
+		sampleWriter,
+		metric_ingestor.WithCoveragePackageRollupResolver(covPackageRollupResolver),
+	).
 		EnsureCoverageSkipLoggerAttached(logger)
 
 	ing := metric_ingestor.NewIngestor(metric_ingestor.NoopFoundationRecipeDispatcher{}, churnSweep).

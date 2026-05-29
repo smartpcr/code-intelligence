@@ -14,16 +14,6 @@ import (
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/repoindexer/ast"
 )
 
-// requireEnv skips the test when a required env var is unset.
-func requireEnv(t *testing.T, name string) string {
-	t.Helper()
-	v, ok := os.LookupEnv(name)
-	if !ok || v == "" {
-		t.Skipf("required env var %s is not set — skipping", name)
-	}
-	return v
-}
-
 // moduleRoot returns the services/agent-memory directory.
 func moduleRoot() (string, error) {
 	_, thisFile, _, ok := runtime.Caller(0)

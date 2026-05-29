@@ -1,0 +1,61 @@
+trigger:
+  branches:
+    include:
+      - feature/clean-code
+      - ws/code-intelligence-CLEAN-CODE/*
+  paths:
+    include:
+      - test/e2e/code-intelligence-CLEAN-CODE/*
+      - tests/e2e/phase-09-audit-wal/*
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  GO_VERSION: "1.22"
+  COMPOSE_FILE: tests/e2e/phase-09-audit-wal/docker-compose.yml
+
+stages:
+  - stage: E2E_AuditWalAndReliabilityHardening
+    displayName: "E2E – Audit WAL & Reliability Hardening"
+    jobs:
+      - job: run_e2e
+        displayName: "Run E2E tests"
+        timeoutInMinutes: 30
+        steps:
+          - task: GoTool@0
+            inputs:
+              version: $(GO_VERSION)
+            displayName: "Install Go $(GO_VERSION)"
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) up -d --build
+              echo "Waiting for services to be ready..."
+              sleep 15
+            displayName: "Start compose services"
+
+          - script: |
+              make migrate-up
+              make seed-phase-09
+            displayName: "Bootstrap DB (migrate + seed)"
+
+          - script: |
+              cd test/e2e/code-intelligence-CLEAN-CODE
+              go test -tags e2e -v -timeout 300s ./...
+            displayName: "Run godog E2E suite"
+            env:
+              # No external secrets — DSN/OTEL provided by compose (Secrets: none).
+              CLEAN_CODE_PG_URL: "postgres://cleancode:cleancode@localhost:5432/cleancode?sslmode=disable"
+              CLEAN_CODE_OTEL_ENDPOINT: "http://localhost:4317"
+              EVALUATOR_URL: http://localhost:8090
+              RULE_ENGINE_URL: http://localhost:8091
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) logs --no-color > $(Build.ArtifactStagingDirectory)/compose-logs.txt 2>&1
+              docker compose -f $(COMPOSE_FILE) down -v
+            displayName: "Collect logs & tear down"
+            condition: always()
+
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: e2e-audit-wal-logs
+            condition: always()

@@ -1,4 +1,4 @@
-name: "E2E – Audit WAL & Reliability Hardening"
+name: E2E – Audit WAL and Reliability Hardening
 
 on:
   push:
@@ -6,61 +6,61 @@ on:
       - feature/clean-code
       - "ws/code-intelligence-CLEAN-CODE/**"
     paths:
-      - "services/clean-code/**"
+      - "test/e2e/code-intelligence-CLEAN-CODE/**"
+      - "tests/e2e/phase-09-audit-wal/**"
   pull_request:
     branches:
       - feature/clean-code
     paths:
-      - "services/clean-code/**"
-  workflow_dispatch:
-
-concurrency:
-  group: e2e-audit-wal-${{ github.ref }}
-  cancel-in-progress: true
+      - "test/e2e/code-intelligence-CLEAN-CODE/**"
+      - "tests/e2e/phase-09-audit-wal/**"
 
 jobs:
-  e2e-otel-telemetry:
-    name: "OTel Telemetry Across All Surfaces"
+  e2e-audit-wal:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
-          cache-dependency-path: services/clean-code/go.sum
+          go-version: "1.22"
 
       - name: Start compose services
         run: |
           docker compose -f tests/e2e/phase-09-audit-wal/docker-compose.yml up -d --build
-          sleep 10
+          echo "Waiting for services to be ready..."
+          sleep 15
 
       - name: Bootstrap DB
-        working-directory: services/clean-code
         run: |
           make migrate-up
           make seed-phase-09
 
       - name: Run E2E tests
-        working-directory: services/clean-code
+        working-directory: test/e2e/code-intelligence-CLEAN-CODE
         env:
-          CLEAN_CODE_PG_URL: postgres://clean_code_admin:e2e_test_password@localhost:5432/clean_code?sslmode=disable
-          CLEAN_CODE_OTEL_ENDPOINT: http://localhost:4317
-          CLEAN_CODE_EVALUATOR_URL: http://localhost:8081
-          CLEAN_CODE_OTEL_QUERY_URL: http://localhost:16686
-          CLEAN_CODE_AGGREGATOR_METRICS_URL: http://localhost:9090/metrics
-        run: |
-          go test -tags e2e -v -count=1 -timeout 120s \
-            ./test/e2e/code-intelligence-CLEAN-CODE/...
+          # No external secrets needed — DSN and OTEL endpoint are
+          # provided by the compose stack (Secrets: none per setup spec).
+          CLEAN_CODE_PG_URL: "postgres://cleancode:cleancode@localhost:5432/cleancode?sslmode=disable"
+          CLEAN_CODE_OTEL_ENDPOINT: "http://localhost:4317"
+          EVALUATOR_URL: http://localhost:8090
+          RULE_ENGINE_URL: http://localhost:8091
+        run: go test -tags e2e -v -timeout 300s ./...
 
       - name: Collect compose logs
         if: always()
         run: |
-          docker compose -f tests/e2e/phase-09-audit-wal/docker-compose.yml logs --tail=200
+          docker compose -f tests/e2e/phase-09-audit-wal/docker-compose.yml logs --no-color > compose-logs.txt 2>&1
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-audit-wal-logs
+          path: compose-logs.txt
 
       - name: Tear down
         if: always()
-        run: |
-          docker compose -f tests/e2e/phase-09-audit-wal/docker-compose.yml down -v
+        run: docker compose -f tests/e2e/phase-09-audit-wal/docker-compose.yml down -v

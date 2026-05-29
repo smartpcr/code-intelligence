@@ -1544,6 +1544,55 @@ surfaces can be joined for downstream operator dashboards. In
 (Section 8.2). No other component takes a hard dependency on
 agent-memory.
 
+**Stage 10.1 linked-mode adapter (`internal/linked/`).** The
+optional client that wraps the agent-memory cross-repo edge
+service lives in `services/clean-code/internal/linked/`. It
+exposes an `HTTPClient` (one GET per `(repo_id, sha)` to
+`<agent-memory-endpoint>/v1/cross-repo/edges?repo_id=&sha=`)
+returning an `EdgeSet { xrepo_edges, xrepo_edges_available,
+call_edges, call_edges_available }`. Both availability flags
+are EXPLICIT booleans on the wire so the aggregator can degrade
+`xrepo_dep_depth` and `blast_radius` INDEPENDENTLY (e.g. when
+agent-memory has indexed cross-repo deps but the call graph is
+still building). A missing wire field defaults to `false`
+(unspecified is NEVER treated as "available empty") and the
+JSON decoder is configured with `DisallowUnknownFields` so a
+silent wire-shape drift surfaces as a `linked.ErrMalformedResponse`
+rather than dropping fields silently.
+
+The package also ships an `AggregatorAdapter` that satisfies
+the `aggregator.LinkedEdgeReader` seam wired into the
+Cross-Repo Aggregator (Stage 7.2) via the new
+`aggregator.WithLinkedEdgeReader` option. The adapter is the
+SINGLE place where the TWO-AXIS gate is enforced:
+  1. the global `CLEAN_CODE_ENABLE_LINKED_MODE_ADAPTER`
+     config flag (see `internal/config.EnableLinkedModeAdapter`,
+     with the matching `CLEAN_CODE_LINKED_AGENT_MEMORY_ENDPOINT`
+     base URL); AND
+  2. the per-repo `Repo.mode='linked'` value (flipped via
+     `mgmt.set_mode(repo_id, 'linked')`).
+Both axes default closed; BOTH must be open before an HTTP
+call fires. The aggregator NEVER second-guesses the adapter's
+`Applicable` verdict, so the gating logic is intentionally NOT
+duplicated.
+
+**Fail-safe contract.** On any non-cancellation error from the
+adapter (HTTP 5xx, malformed JSON, network failure, 404
+mapped to `linked.ErrEdgesUnavailable`, or a mode-store read
+failure that does not wrap a ctx error), `tickSystemTier`
+LOGS + leaves the affected input in its embedded shape so the
+composer naturally degrades the row with
+`xrepo_edges_unavailable`. The `Report.LinkedEdgeFetchFailures`
+counter is bumped so operators can correlate degradation rate
+with agent-memory uptime via the Prometheus exporter.
+`context.Canceled` / `context.DeadlineExceeded` from the
+adapter ALWAYS abort the tick -- operator cancel signals are
+authoritative and MUST NOT be silently swallowed as a
+"degrade in place". The adapter applies a per-request HTTP
+timeout (`CLEAN_CODE_LINKED_ADAPTER_TIMEOUT`, default 5s) on
+top of the caller's `ctx` so a slow agent-memory response is
+bounded even when the caller passed an undecorated context.
+
 ---
 
 ## 9. Public-contract summary

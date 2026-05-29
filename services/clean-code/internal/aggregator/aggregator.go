@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"time"
 
@@ -52,6 +53,91 @@ type Aggregator struct {
 	composer       *SystemTierComposer
 	sysSource      SystemTierInputSource
 	sysWriter      SystemTierWriter
+
+	// linkedReader is the optional Stage 8.7 / Stage 10.1
+	// linked-mode adapter hook. When non-nil and the
+	// system-tier pass is wired, [tickSystemTier] consults
+	// the reader per [SystemTierInput] to optionally overlay
+	// cross-repo + call-graph edges fetched from the
+	// agent-memory linked-mode endpoint. Default nil keeps
+	// the embedded-only pipeline unchanged so existing
+	// foundation-only deployments are byte-identical to the
+	// pre-Stage-10.1 behaviour.
+	//
+	// Errors from the reader are split TWO WAYS by
+	// [tickSystemTier]:
+	//   - context cancellation / deadline -> abort tick
+	//   - any other error -> log + leave the affected input
+	//     in embedded shape so the composer naturally
+	//     degrades the row with `xrepo_edges_unavailable`
+	//     (architecture Sec 3.10 step 4 fail-safe contract).
+	linkedReader LinkedEdgeReader
+	linkedLogger *slog.Logger
+}
+
+// LinkedEdgeReader is the optional seam by which the
+// aggregator resolves cross-repo and call-graph edges per
+// `(repo_id, sha)` for the system-tier composer. Production
+// callers wire the `internal/linked` package's
+// `AggregatorAdapter` here; tests substitute fakes via the
+// in-package helpers (see `system_tier_linked_test.go`).
+//
+// # Two-axis gating
+//
+// The reader is the SINGLE place where the linked-mode
+// gating logic lives: it is responsible for honouring BOTH
+//   1. the global `EnableLinkedModeAdapter` config flag and
+//   2. the per-repo `repo.mode = 'linked'` setting (flipped
+//      via `mgmt.set_mode`).
+//
+// When EITHER gate is closed the reader returns
+// `{Applicable: false}` and the aggregator leaves the input
+// in its embedded shape (composer degrades the row). The
+// aggregator NEVER second-guesses the reader; the two-axis
+// logic is intentionally NOT duplicated here.
+//
+// # Failure modes
+//
+// Implementations distinguish FATAL errors (e.g. the
+// management repo-mode catalog read failed) from REMOTE
+// errors (e.g. the agent-memory HTTP fetch failed) only
+// implicitly through `errors.Is` sentinels. The aggregator's
+// [tickSystemTier] uses [errors.Is] against
+// `context.Canceled` / `context.DeadlineExceeded` to decide
+// "abort tick" vs "log + degrade in place"; every other
+// error class is treated as remote/degrade.
+type LinkedEdgeReader interface {
+	ResolveLinkedEdges(ctx context.Context, repoID uuid.UUID, sha string) (LinkedEdges, error)
+}
+
+// LinkedEdges is the value the [LinkedEdgeReader] returns.
+// Carries per-EDGE-FAMILY availability flags so the composer
+// can degrade `xrepo_dep_depth` and `blast_radius`
+// independently (e.g. when agent-memory has indexed cross-
+// repo deps but the call graph is still building). An
+// `Applicable=false` value is a no-op; the aggregator leaves
+// the input unchanged.
+type LinkedEdges struct {
+	// Applicable is true when the reader successfully
+	// resolved edges (or "explicitly empty" edges) for this
+	// repo. False when either gating axis is closed (global
+	// flag off OR repo mode != linked).
+	Applicable bool
+	// XRepoEdges populated when Applicable AND the reader
+	// fetched cross-repo edges. May be empty.
+	XRepoEdges []XRepoEdge
+	// XRepoEdgesAvailable signals agent-memory reported a
+	// successful cross-repo index for the pair. The
+	// aggregator sets `SystemTierInput.XRepoEdgesAvailable`
+	// from this flag VERBATIM; the composer reads the
+	// SystemTierInput flag to decide whether to degrade.
+	XRepoEdgesAvailable bool
+	// CallEdges populated when Applicable AND the reader
+	// fetched call-graph edges.
+	CallEdges []CallEdge
+	// CallEdgesAvailable signals agent-memory reported a
+	// successful call-graph index for the pair.
+	CallEdgesAvailable bool
 }
 
 // AggregatorOption configures an [Aggregator].
@@ -107,6 +193,36 @@ func WithSystemTier(composer *SystemTierComposer, source SystemTierInputSource, 
 		a.composer = composer
 		a.sysSource = source
 		a.sysWriter = writer
+	}
+}
+
+// WithLinkedEdgeReader wires the optional Stage 10.1
+// linked-mode adapter into the aggregator. When set, every
+// system-tier tick consults the reader per [SystemTierInput]
+// to optionally overlay cross-repo + call-graph edges fetched
+// from the agent-memory linked-mode endpoint (architecture
+// Sec 8.7).
+//
+// The reader is the single owner of the two-axis gating logic
+// (global `EnableLinkedModeAdapter` config flag AND per-repo
+// `repo.mode = 'linked'`); the aggregator NEVER second-
+// guesses the reader's `Applicable` verdict.
+//
+// Panics at startup when `reader == nil` so a wiring bug
+// surfaces in the composition-root unit test rather than at
+// first tick.
+//
+// `logger` is optional; when nil, remote agent-memory failures
+// are still degraded in place but no log line fires for the
+// per-input failure path (operators relying on log-based alerts
+// SHOULD pass a non-nil logger).
+func WithLinkedEdgeReader(reader LinkedEdgeReader, logger *slog.Logger) AggregatorOption {
+	if reader == nil {
+		panic("aggregator: WithLinkedEdgeReader: reader is nil")
+	}
+	return func(a *Aggregator) {
+		a.linkedReader = reader
+		a.linkedLogger = logger
 	}
 }
 
@@ -460,6 +576,9 @@ func (a *Aggregator) tickSystemTier(ctx context.Context, report *Report) error {
 	// radius / fan-in expansion bound).
 	allSamples := make([]SystemTierSample, 0, len(inputs)*10)
 	for i := range inputs {
+		if err := a.applyLinkedEdges(ctx, &inputs[i], report); err != nil {
+			return err
+		}
 		out, err := a.composer.Compose(ctx, inputs[i])
 		if err != nil {
 			return fmt.Errorf("aggregator: compose system-tier (repo_id=%s, sha=%s): %w", inputs[i].RepoID, inputs[i].SHA, err)
@@ -480,5 +599,81 @@ func (a *Aggregator) tickSystemTier(ctx context.Context, report *Report) error {
 	if err := a.sysWriter.WriteSystemTierSamples(ctx, allSamples); err != nil {
 		return fmt.Errorf("aggregator: write system-tier samples: %w", err)
 	}
+	return nil
+}
+
+// applyLinkedEdges consults the optional [LinkedEdgeReader]
+// for the supplied input and overlays the resolved edges +
+// availability flags + Mode in place. Updates the Report's
+// linked-mode counters in place.
+//
+// Error split (architecture Sec 3.10 step 4 fail-safe):
+//
+//   - context.Canceled / context.DeadlineExceeded -> aborts
+//     the tick by returning the error verbatim. The aggregator
+//     loop honours operator-requested cancellation regardless
+//     of the linked-mode wiring.
+//
+//   - any other error -> LOGGED and SWALLOWED: the input is
+//     left in its embedded shape (Mode=embedded,
+//     XRepoEdgesAvailable=false, CallEdgesAvailable=false) so
+//     the downstream composer naturally degrades the row with
+//     `xrepo_edges_unavailable`. The Report counter
+//     [Report.LinkedEdgeFetchFailures] is incremented so
+//     operators can correlate degradation rate with
+//     agent-memory uptime via the Prometheus exporter.
+//
+// Mode-store errors surfaced by the [LinkedEdgeReader]
+// implementation are propagated via this remote-error path
+// (matching the [LinkedEdgeReader] doc contract) UNLESS they
+// are wrapped ctx errors -- the implementation is responsible
+// for choosing the right error class.
+//
+// When the reader is not wired this is a no-op.
+func (a *Aggregator) applyLinkedEdges(ctx context.Context, in *SystemTierInput, report *Report) error {
+	if a.linkedReader == nil {
+		return nil
+	}
+	report.LinkedEdgeReaderInvocations++
+	edges, err := a.linkedReader.ResolveLinkedEdges(ctx, in.RepoID, in.SHA)
+	if err != nil {
+		// Honour caller cancellation / deadline exceeded
+		// even when the linked reader wraps them; both
+		// errors.Is and the live ctx.Err() are consulted so
+		// a transport that loses the sentinel cannot
+		// silently downgrade a cancel to a degrade.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			if ctx.Err() != nil {
+				return fmt.Errorf("aggregator: linked edge resolution cancelled (repo_id=%s, sha=%s): %w", in.RepoID, in.SHA, ctx.Err())
+			}
+			return fmt.Errorf("aggregator: linked edge resolution cancelled (repo_id=%s, sha=%s): %w", in.RepoID, in.SHA, err)
+		}
+		// Remote agent-memory failure -- log + leave the
+		// input in embedded shape so the composer degrades
+		// the row. This is the architecture's fail-safe
+		// path; surfacing the error here would block every
+		// system-tier tick on a single agent-memory outage.
+		report.LinkedEdgeFetchFailures++
+		if a.linkedLogger != nil {
+			a.linkedLogger.WarnContext(ctx, "aggregator: linked edge fetch failed; degrading in place",
+				"repo_id", in.RepoID.String(),
+				"sha", in.SHA,
+				"err", err.Error(),
+			)
+		}
+		return nil
+	}
+	if !edges.Applicable {
+		// Reader signalled "either gate closed for this
+		// repo" -- nothing to do. The input keeps its
+		// embedded-shape defaults.
+		return nil
+	}
+	in.Mode = SystemTierModeLinked
+	in.XRepoEdges = edges.XRepoEdges
+	in.XRepoEdgesAvailable = edges.XRepoEdgesAvailable
+	in.CallEdges = edges.CallEdges
+	in.CallEdgesAvailable = edges.CallEdgesAvailable
+	report.LinkedEdgeReaderApplied++
 	return nil
 }

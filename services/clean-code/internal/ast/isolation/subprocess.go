@@ -131,8 +131,20 @@ type WorkerFactory func(language string, cfg SubprocessConfig) (Worker, error)
 // while honouring the [ModeCoordinator] drain contract. The
 // pool's invariants:
 //
-//   - One [Worker] per language (created lazily on first
-//     [Parse] for that language).
+//   - One long-lived [Worker] per language (created lazily on
+//     first [Parse] for that language and cached for the
+//     lifetime of the pool). The default [ExecWorker]
+//     implementation spawns a FRESH child process per parse;
+//     a long-running worker that reuses a child across parses
+//     can be substituted via [RegisterFactory] without
+//     touching the pool's admission / drain contract. The
+//     ephemeral-child default is deliberate: a parser crash
+//     or OOM cannot corrupt the next parse's state, which is
+//     the Stage 9.3 brief's strongest crash-isolation
+//     guarantee. A long-lived child process variant is a
+//     future workstream (perf optimisation; tracked as a
+//     follow-up because it adds a child-restart state machine
+//     the current contract does not need).
 //   - All [Parse] calls go through [ModeCoordinator.BeginScan]
 //     so a `mgmt.set_mode` flip drains in-flight parses for
 //     the targeted repo.

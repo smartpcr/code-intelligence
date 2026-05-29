@@ -177,7 +177,7 @@ func run() int {
 				exitCode = 1
 			} else {
 				defer db.Close()
-				planRes, taskRes, pErr := runPlanner(ctx, db, logger, repoID, sha)
+				planRes, taskRes, pErr := runPlanner(ctx, cfg, db, logger, repoID, sha)
 				if pErr != nil {
 					if errors.Is(pErr, context.Canceled) ||
 						errors.Is(pErr, context.DeadlineExceeded) {
@@ -411,6 +411,7 @@ func executeTwoPassPlan(
 // pinned by `TestExecuteTwoPassPlan_*` cases.
 func runPlanner(
 	ctx context.Context,
+	cfg config.Config,
 	db *sql.DB,
 	logger *slog.Logger,
 	repoID uuid.UUID,
@@ -447,11 +448,30 @@ func runPlanner(
 
 	// Stage 8.2 wiring. Note PlanFromSnapshot pins the SAME
 	// policy_version_id as the hot_spot batch we just wrote.
+	// Stage 9.3: select the EffortModel from operator-pinned
+	// envs so refactor_task.effort_hours carries a real
+	// estimate rather than the legacy 0.0 placeholder.
+	effortModel, err := refactor.NewEffortModelFromConfig(refactor.EffortModelConfig{
+		Source:         cfg.RefactorEffortSource,
+		MLModelURI:     cfg.MLModelURI,
+		MLModelVersion: cfg.MLModelVersion,
+	})
+	if err != nil {
+		return refactor.PlanResult{}, refactor.PlanAndTasksResult{},
+			fmt.Errorf("refactor.NewEffortModelFromConfig: %w", err)
+	}
+	logger.Info("clean-code-refactor-planner: effort model wired",
+		"source", cfg.RefactorEffortSource,
+		"ml_model_uri_set", cfg.MLModelURI != "",
+		"ml_model_version_set", cfg.MLModelVersion != "",
+	)
+
 	taskPlanner, err := refactor.NewTaskPlanner(
 		policy,
 		refactor.NewSQLHotSpotReader(db),
 		refactor.NewSQLFindingDetailReader(db),
 		refactor.NewSQLRefactorPlanTaskWriter(db),
+		refactor.WithEffortModel(effortModel),
 	)
 	if err != nil {
 		return refactor.PlanResult{}, refactor.PlanAndTasksResult{},

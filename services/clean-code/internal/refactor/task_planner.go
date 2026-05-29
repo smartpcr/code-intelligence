@@ -716,6 +716,31 @@ func WithTaskDescriptionFunc(fn func(task RefactorTask, hs HotSpot, snap PolicyS
 	}
 }
 
+// WithEffortModel overrides the [EffortModel] the [TaskPlanner]
+// invokes per task to stamp `refactor_task.effort_hours`. The
+// default is [ZeroEffortModel] (preserving the Stage 8.2
+// "unestimated" placeholder semantics: every task carries
+// EffortHours=0.0). Stage 9.3 wires a real [EffortModel]
+// (heuristic or ML-backed via [NewEffortModelFromConfig])
+// from the cmd binary's composition root so the
+// `clean_code.refactor_task.effort_hours` column gets a real
+// estimate.
+//
+// A nil model is rejected eagerly (the [TaskOption] returns
+// [ErrNilEffortModel] via [NewTaskPlanner]'s aggregated
+// option-error check) so a misconfigured composition root
+// fails at construction time rather than panicking on the
+// first [TaskPlanner.Plan] call.
+func WithEffortModel(em EffortModel) TaskOption {
+	return func(tp *TaskPlanner) {
+		if em == nil {
+			tp.optErr = errors.Join(tp.optErr, ErrNilEffortModel)
+			return
+		}
+		tp.effortModel = em
+	}
+}
+
 // -----------------------------------------------------------------------------
 // TaskPlanner -- the Stage 8.2 orchestrator
 // -----------------------------------------------------------------------------
@@ -779,6 +804,13 @@ type TaskPlanner struct {
 	defaultKind    TaskKind
 	summaryFn      func(plan RefactorPlan, tasks []RefactorTask, snap PolicySnapshot) string
 	descriptionFn  func(task RefactorTask, hs HotSpot, snap PolicySnapshot) string
+	// effortModel populates `refactor_task.effort_hours` per
+	// emitted task. Defaults to [ZeroEffortModel] so the
+	// historical Stage 8.2 "unestimated" placeholder
+	// semantics are preserved when [WithEffortModel] is not
+	// wired. Stage 9.3 cmd binaries override via
+	// [WithEffortModel] / [NewEffortModelFromConfig].
+	effortModel EffortModel
 
 	// optErr accumulates errors stashed by the [TaskOption]
 	// setters (nil callbacks) so [NewTaskPlanner] can
@@ -834,6 +866,7 @@ func NewTaskPlanner(
 		defaultKind:    TaskKindExtractMethod,
 		summaryFn:      defaultSummaryMD,
 		descriptionFn:  defaultTaskDescriptionMD,
+		effortModel:    ZeroEffortModel{},
 	}
 	for _, opt := range opts {
 		opt(tp)
@@ -861,6 +894,9 @@ func NewTaskPlanner(
 	}
 	if tp.descriptionFn == nil {
 		return nil, ErrNilTaskDescriptionFunc
+	}
+	if tp.effortModel == nil {
+		return nil, ErrNilEffortModel
 	}
 	// Validate default kind eagerly per rubber-duck finding
 	// #11 (catch bad wiring at construction, not at first
@@ -1078,14 +1114,29 @@ func (tp *TaskPlanner) PlanFromSnapshot(
 					ErrIDFactoryReturnedNil, ruleID)
 			}
 			task := RefactorTask{
-				TaskID:      taskID,
-				PlanID:      planID,
-				ScopeID:     hs.ScopeID,
-				Kind:        kind,
-				EffortHours: 0.0, // Stage 8.3 ML model populates
-				RuleID:      ruleID,
-				CreatedAt:   createdAt,
+				TaskID:    taskID,
+				PlanID:    planID,
+				ScopeID:   hs.ScopeID,
+				Kind:      kind,
+				RuleID:    ruleID,
+				CreatedAt: createdAt,
 			}
+			// Stage 9.3: the EffortModel populates
+			// effort_hours. ZeroEffortModel preserves the
+			// Stage 8.2 placeholder semantics
+			// (EffortHours=0.0) when no estimator is wired;
+			// a wired model (heuristic or ML) returns a real
+			// estimate. Errors abort the WHOLE batch -- the
+			// atomic plan + tasks write contract must not
+			// land a row whose effort_hours is bogus.
+			effort, effortErr := tp.effortModel.Estimate(task, hs, snap)
+			if effortErr != nil {
+				return PlanAndTasksResult{}, fmt.Errorf(
+					"refactor.TaskPlanner.Plan: effort estimate for "+
+						"rule_id=%q scope_id=%s: %w",
+					ruleID, hs.ScopeID, effortErr)
+			}
+			task.EffortHours = effort
 			task.DescriptionMD = tp.descriptionFn(task, hs, snap)
 			tasks = append(tasks, task)
 		}

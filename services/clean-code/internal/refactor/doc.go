@@ -133,15 +133,29 @@
 //     buggy custom rule mapper aborts the whole batch rather
 //     than landing a partial row set.
 //
-//   - **Stage 8.3** -- ML effort-model loader and version
-//     pinning. A `effort_model.go` file loads the ML model
-//     artefact named by the operator pin
-//     `refactor-effort-source` (architecture Sec 1.6) and
-//     stamps `refactor_task.effort_hours`. The model version is
+//   - **Stage 8.3 / Stage 9.3** -- ML effort-model loader and
+//     version pinning. [effort_model.go] declares the
+//     [EffortModel] interface and three concrete
+//     implementations -- [ZeroEffortModel] (preserves the
+//     Stage 8.2 "unestimated" placeholder), [HeuristicEffortModel]
+//     (deterministic per-kind+score formula, no external
+//     artefact), and [MLEffortModel] (v0 hash-based estimator
+//     that loads the artefact named by [config.EnvMLModelURI]
+//     and pins its version against [config.EnvMLModelVersion]).
+//     [NewEffortModelFromConfig] selects the implementation
+//     from the operator pin `refactor-effort-source`
+//     (architecture Sec 1.6). The Stage 9.3 [TaskPlanner]
+//     invokes the configured model per task to stamp
+//     `refactor_task.effort_hours`; a non-nil estimate error
+//     aborts the WHOLE atomic plan + tasks write so a row
+//     never lands with a bogus value. The model version is
 //     pinned in `policy_version.refactor_weights.effort_model_version`
 //     and reproducibility is preserved by traversing
 //     `refactor_task -> refactor_plan -> hot_spot.policy_version_id ->
-//     policy_version.refactor_weights.effort_model_version`.
+//     policy_version.refactor_weights.effort_model_version`;
+//     [MLEffortModel.Estimate] returns
+//     [ErrMLModelVersionMismatch] when the loaded artefact's
+//     version diverges from the policy snapshot's pin.
 //
 // # Composite hotspot score (architecture Sec 3.9 lines 602-613)
 //

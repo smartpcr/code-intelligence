@@ -70,8 +70,24 @@ func (c ExecConfig) resolve() (ExecConfig, error) {
 // RLIMIT_AS (Unix); on Windows the cap is recorded but not
 // enforced at the OS layer.
 //
-// One ExecWorker = one language. The pool is responsible for
-// the registry of (language -> worker).
+// One ExecWorker = one language. The [Pool] holds the
+// (language -> ExecWorker) registry for the lifetime of the
+// process; the ExecWorker is long-lived but the CHILD process
+// it spawns is ephemeral (one per [Execute]). This shape
+// gives the Stage 9.3 brief's strongest crash-isolation
+// guarantee: a parser crash, segfault, or OOM cannot corrupt
+// the next parse's state because the next parse runs in a
+// fresh child with a fresh address space. The performance
+// cost is one `exec.CommandContext` startup per parse; the
+// metric-ingestor amortises this by batching many parses
+// inside a single [ModeCoordinator.BeginScan] window so the
+// admission/drain accounting reflects one scan rather than
+// one-per-file (see [Pool.ParseInScan]). A long-lived
+// per-language child process variant that reuses a single
+// `exec.Cmd` across many parses is a future perf workstream;
+// it would substitute a new [Worker] implementation via
+// [Pool.RegisterFactory] without changing the pool's
+// admission contract.
 type ExecWorker struct {
 	language string
 	cfg      SubprocessConfig

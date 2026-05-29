@@ -1,18 +1,199 @@
-//go:build e2e
-
+// Root-module test file. Originally an `//go:build e2e`-tagged
+// godog scenario suite; the build tag was REMOVED in iter-4 so
+// the package always compiles, giving the Forge per-iter
+// `go test ./...` gate at least one package to discover from
+// the worktree root. A package-level [TestMain] proxy below
+// shells out to the real test suite inside
+// `services/clean-code/`. The original godog scenario
+// `TestE2E_repo_indexer_..._sweep_loop` remains intact below
+// for the CI lane that explicitly opts into the e2e suite via
+// env variables -- but in proxy mode the [TestMain] short-
+// circuits before `m.Run()` so the original test never fires
+// during gate runs.
 package e2e
 
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"flag"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cucumber/godog"
 	_ "github.com/lib/pq"
 )
+
+// envGateProxyNested is the recursion-guard sentinel set on
+// the INNER `go test ./...` invocation. When [TestMain] sees
+// this env var it skips the proxy logic and runs [m.Run]
+// directly so the inner test process behaves like a normal
+// `go test` of the root package (the existing e2e scenario
+// will then `t.Skip` because no PG env vars are set, which is
+// the desired no-op behaviour).
+const envGateProxyNested = "CLEAN_CODE_GATE_PROXY_NESTED"
+
+// cleanCodeModuleRelPath is the path FROM the worktree root TO
+// the inner Go module that owns the real Clean Code service
+// code. The proxy shells `go test ./...` here.
+const cleanCodeModuleRelPath = "services/clean-code"
+
+// TestMain is a proxy that delegates `go test ./...` runs from
+// the WORKTREE ROOT (this `go.mod` covers only this file) to
+// the inner `services/clean-code` module which holds every
+// real production package + test. Forge's per-iter test gate
+// runs `go test ./... -run '<regex>'` from the worktree root;
+// before this proxy the gate failed with `matched no packages`
+// because the root module had only one e2e-tagged file.
+//
+// Behaviour summary:
+//
+//   - When env `CLEAN_CODE_GATE_PROXY_NESTED=1` is set, skip
+//     the proxy and run [m.Run] (the recursion-guard path; lets
+//     the inner shell-out behave like a normal test invocation
+//     and prevents an infinite shell-out loop).
+//
+//   - Otherwise, locate the worktree root by walking up for
+//     `.git` (file OR directory; submodule and worktree shapes
+//     both qualify), then exec `go test ./...` in
+//     `services/clean-code` forwarding `-run`, `-v`,
+//     `-timeout`, `-cpu`, `-short` from the outer flag set and
+//     ALWAYS force inner `-count=1` so the inner cache cannot
+//     mask a regression. The recursion-guard env var is set on
+//     the inner process. Exit code of the inner process is
+//     propagated faithfully so the outer `go test` reports the
+//     same pass/fail signal.
+//
+// What is NOT forwarded:
+//
+//   - `-race`: a `go test` BUILD flag handled by the toolchain
+//     wrapper, NOT a runtime flag on the test binary, so it is
+//     not always visible via `flag.Lookup("test.race")` on
+//     every Go build. If a gate requires race detection, set
+//     `GOFLAGS=-race` in the gate environment so it applies to
+//     the inner build too.
+//
+//   - `-count` (other than the forced `-count=1`): forcing
+//     `-count=1` is the cache-bypass guarantee. Outer
+//     `-count=N` with N>1 would multiply inner test work
+//     against the gate's budget; the gate's design assumes
+//     `-count=1` semantics.
+//
+// `flag.Parse` is called defensively at the top in case a
+// future runtime defers parsing past `TestMain` entry.
+//
+// Note that even in proxy mode the test binary IS compiled and
+// must therefore satisfy the build gate: every import in this
+// file (and every other tracked test file in the root package)
+// must resolve.
+func TestMain(m *testing.M) {
+	if os.Getenv(envGateProxyNested) == "1" {
+		os.Exit(m.Run())
+	}
+	if !flag.Parsed() {
+		flag.Parse()
+	}
+
+	root, err := findWorktreeRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "clean-code gate proxy: locate worktree root: %v\n", err)
+		os.Exit(1)
+	}
+	innerDir := filepath.Join(root, cleanCodeModuleRelPath)
+	if st, statErr := os.Stat(innerDir); statErr != nil || !st.IsDir() {
+		fmt.Fprintf(os.Stderr, "clean-code gate proxy: inner module dir %q not found: %v\n", innerDir, statErr)
+		os.Exit(1)
+	}
+
+	args := buildProxyArgs()
+	cmd := exec.Command("go", args...)
+	cmd.Dir = innerDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), envGateProxyNested+"=1")
+
+	runErr := cmd.Run()
+	if runErr == nil {
+		os.Exit(0)
+	}
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		os.Exit(exitErr.ExitCode())
+	}
+	fmt.Fprintf(os.Stderr, "clean-code gate proxy: inner `go test ./...` failed to launch: %v\n", runErr)
+	os.Exit(1)
+}
+
+// findWorktreeRoot walks UP from the current working directory
+// until it finds an entry named `.git`. The entry may be a
+// directory (regular checkout) OR a file (submodule / linked
+// worktree shape); both are accepted. Returns the directory
+// that CONTAINS the `.git` entry. The gate is expected to run
+// with cwd == worktree root so the first iteration usually
+// succeeds; the walk-up is belt-and-braces for an operator
+// invocation from a subdir.
+func findWorktreeRoot() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("os.Getwd: %w", err)
+	}
+	for {
+		if _, statErr := os.Stat(filepath.Join(dir, ".git")); statErr == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("no .git entry found walking up from cwd")
+		}
+		dir = parent
+	}
+}
+
+// buildProxyArgs assembles the `go test ./... ...` argv for
+// the inner `go test` invocation. Forwards the test flags the
+// gate cares about and ALWAYS appends `-count=1` so the inner
+// test cache cannot mask a regression.
+func buildProxyArgs() []string {
+	args := []string{"test", "./..."}
+
+	if v := flag.Lookup("test.run"); v != nil && v.Value.String() != "" {
+		args = append(args, "-run", v.Value.String())
+	}
+	if v := flag.Lookup("test.timeout"); v != nil && v.Value.String() != "" && v.Value.String() != "0s" {
+		args = append(args, "-timeout", v.Value.String())
+	}
+	if v := flag.Lookup("test.cpu"); v != nil && v.Value.String() != "" {
+		args = append(args, "-cpu", v.Value.String())
+	}
+	if hasFlag("test.v") {
+		args = append(args, "-v")
+	}
+	if hasFlag("test.short") {
+		args = append(args, "-short")
+	}
+	args = append(args, "-count=1")
+	if strings.TrimSpace(strings.Join(args, "")) == "" {
+		args = []string{"test", "./...", "-count=1"}
+	}
+	return args
+}
+
+// hasFlag returns true when the named bool test flag exists
+// and is set to "true". Used for `-v` / `-short` which are
+// boolean flags whose mere presence on the outer command line
+// implies the inner side should also see them.
+func hasFlag(name string) bool {
+	v := flag.Lookup(name)
+	if v == nil {
+		return false
+	}
+	return v.Value.String() == "true"
+}
 
 // requireEnvSweep returns the value of the named environment variable,
 // calling t.Skip when unset or empty.  Each *_test.go file in the e2e

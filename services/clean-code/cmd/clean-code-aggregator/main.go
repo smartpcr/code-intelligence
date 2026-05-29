@@ -77,6 +77,8 @@ import (
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/aggregator"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/config"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/linked"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
 )
 
 func main() {
@@ -315,9 +317,33 @@ func buildAggregatorLoop(cfg config.Config, db *sql.DB, logger *slog.Logger) (*a
 	if err != nil {
 		return nil, fmt.Errorf("buildAggregatorLoop: NewPGSystemTierWriter: %w", err)
 	}
-	agg, err := aggregator.NewAggregator(source, writer,
+	opts := []aggregator.AggregatorOption{
 		aggregator.WithSystemTier(composer, sysSource, sysWriter),
-	)
+	}
+	// Stage 10.1 optional linked-mode adapter (architecture
+	// Sec 8.7). Wired only when the operator opts in via the
+	// global config flag AND supplies the agent-memory
+	// endpoint -- the config.Validate interlock guarantees the
+	// pair is consistent. When unwired the aggregator runs in
+	// pure embedded mode and the composer degrades
+	// xrepo_dep_depth / blast_radius with
+	// `xrepo_edges_unavailable` (architecture Sec 3.10 step 4).
+	if cfg.EnableLinkedModeAdapter {
+		client, err := linked.NewHTTPClient(cfg.LinkedAgentMemoryEndpoint,
+			linked.WithTimeout(cfg.LinkedAdapterTimeout),
+			linked.WithLogger(logger),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("buildAggregatorLoop: linked.NewHTTPClient: %w", err)
+		}
+		modeReader, err := management.NewPGRepoStore(db)
+		if err != nil {
+			return nil, fmt.Errorf("buildAggregatorLoop: management.NewPGRepoStore (for linked adapter): %w", err)
+		}
+		adapter := linked.NewAggregatorAdapter(client, modeReader, true, logger)
+		opts = append(opts, aggregator.WithLinkedEdgeReader(adapter, logger))
+	}
+	agg, err := aggregator.NewAggregator(source, writer, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("buildAggregatorLoop: NewAggregator: %w", err)
 	}

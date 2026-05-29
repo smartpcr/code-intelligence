@@ -237,4 +237,32 @@ type Report struct {
 	// architecture Sec 3.10 step 4 lines 637-657 and
 	// tech-spec Sec 4.2 lines 325-339).
 	SystemTierDegradedSamples int
+	// LinkedEdgeReaderInvocations is the number of inputs
+	// the [LinkedEdgeReader] (Stage 10.1 linked-mode
+	// adapter) was consulted for this tick. Zero when the
+	// reader is not wired. The aggregator increments this
+	// EVEN WHEN the reader short-circuits to
+	// `Applicable=false` so operators can see the gating
+	// behaviour ("invoked 10 times, applied 0 times" =
+	// "global flag enabled but every repo still embedded").
+	LinkedEdgeReaderInvocations int
+	// LinkedEdgeReaderApplied is the count of inputs where
+	// the [LinkedEdgeReader] returned `Applicable=true` and
+	// the aggregator overlaid the linked-mode edges. Zero
+	// when the reader is not wired OR every repo is still
+	// at `mode='embedded'`. Per the architecture Sec 8.7
+	// rollout pattern, this counter ratchets up as
+	// operators flip repos to `mode='linked'` via
+	// `mgmt.set_mode`.
+	LinkedEdgeReaderApplied int
+	// LinkedEdgeFetchFailures is the count of inputs whose
+	// linked-mode edge fetch failed with a non-cancellation
+	// error this tick (network failure, 5xx, 404, malformed
+	// JSON). The aggregator's fail-safe contract degrades
+	// the affected row with `xrepo_edges_unavailable`
+	// instead of aborting the tick (matches architecture
+	// Sec 3.10 step 4). A steady non-zero rate is the
+	// operator's signal that the agent-memory linked-mode
+	// endpoint is unhealthy.
+	LinkedEdgeFetchFailures int
 }

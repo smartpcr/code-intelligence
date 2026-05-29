@@ -1114,6 +1114,30 @@ so the iteration's `go build ./...` exits 0:
 
 ## Stage 8.3 -- ML effort-model loader and version pinning
 
+> **Historical note (post-PR #148 -- API renamed; entry kept as
+> originally landed for audit trail).** The names used throughout
+> this entry describe the Stage 8.3 surface as it was first merged.
+> The canonical operator-facing API was subsequently renamed:
+>
+> - `EnvRefactorEffortModelURI` (constant)
+>   → `EnvMLModelURI` (env var `CLEAN_CODE_ML_MODEL_URI`)
+> - `Config.RefactorEffortModelURI` (field)
+>   → `Config.MLModelURI`
+> - `refactor.LoadFromConfig(cfg)` (startup-time loader called
+>   from `cmd/clean-code-refactor-planner/main.go:run()`)
+>   → `refactor.NewEffortModelFromConfig(cfg)` (per-request loader
+>   invoked inside `runPlanner` / `runHTTPMode`; the startup-time
+>   block was removed).
+> - `ErrEffortModelURIRequired` (sentinel)
+>   → `refactor.ErrMLModelURIMissing`.
+>
+> The current names live in
+> `services/clean-code/docs/runbook.md:139-153` and
+> `services/clean-code/internal/config/config.go:158-164,456-462`.
+> Anything below that names the old identifiers refers to the
+> Stage 8.3 landing snapshot ONLY; do not treat the old names as
+> the live API.
+
 New `internal/refactor/effort_model.go` package surface plus
 composition wiring through `cmd/clean-code-refactor-planner/main.go`
 that loads an external ML effort-model artefact named by the

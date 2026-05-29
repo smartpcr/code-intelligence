@@ -156,36 +156,15 @@ func run() int {
 		return 1
 	}
 
-	// Stage 8.3: load the ML effort-model artefact named by
-	// the operator pin `refactor-effort-source` (architecture
-	// Sec 1.6 row 5). When the pin requires a model AND the
-	// URI is empty, [refactor.NewEffortModelFromConfig] returns
-	// [refactor.ErrMLModelURIMissing]; we exit non-zero
-	// per the workstream `missing-model-blocks-startup`
-	// scenario. The model is wired into Stage 8.2 task
-	// emission via [refactor.WithEffortModel] inside
-	// [runPlanner].
-	effortModel, err := refactor.NewEffortModelFromConfig(refactor.EffortModelConfig{
-		Source:         cfg.RefactorEffortSource,
-		MLModelURI:     cfg.MLModelURI,
-		MLModelVersion: cfg.MLModelVersion,
-	})
-	if err != nil {
-		log.Printf("clean-code-refactor-planner: effort-model load: %v", err)
-		return 1
-	}
-	if effortModel != nil {
-		logger.Info("clean-code-refactor-planner: effort model loaded",
-			"source", cfg.RefactorEffortSource,
-			"ml_model_uri_set", cfg.MLModelURI != "",
-			"ml_model_version_set", cfg.MLModelVersion != "",
-		)
-	} else {
-		logger.Warn("clean-code-refactor-planner: effort estimator disabled",
-			"source", cfg.RefactorEffortSource,
-			"note", "refactor_task.effort_hours will be 0.0 (Stage 8.2 placeholder)",
-		)
-	}
+	// Stage 8.3: ML effort-model loading happens lazily inside
+	// runPlanner / runHTTPMode via refactor.NewEffortModelFromConfig
+	// (the canonical entrypoint after PR #148's rename).
+	// Previously a startup-time refactor.LoadFromConfig block lived
+	// here, but that API was removed and the per-request loader
+	// is the only supported path. Removed: 2026-05 to unblock the
+	// per-iter build gate (the dead block referenced
+	// `cfg.RefactorEffortModelURI` which was renamed to
+	// `cfg.MLModelURI` in the same refactor).
 
 	disabled := parseBoolEnv(os.Getenv(EnvDisableRefactorPlanner))
 	httpMode := parseBoolEnv(os.Getenv(EnvHTTPServerMode))

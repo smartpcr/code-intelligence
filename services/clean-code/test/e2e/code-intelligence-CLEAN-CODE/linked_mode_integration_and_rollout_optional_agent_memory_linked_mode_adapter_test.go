@@ -86,8 +86,11 @@ func (s *linkedModeAdapterState) httpJSON(method, url string, body interface{}) 
 	if err != nil {
 		return nil, nil, fmt.Errorf("%s %s: %w", method, url, err)
 	}
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading response: %w", err)
+	}
 	return resp, respBody, nil
 }
 

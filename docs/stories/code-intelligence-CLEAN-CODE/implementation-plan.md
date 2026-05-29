@@ -905,6 +905,8 @@ Total: 4 A + 12 M + 0 D = 16 paths
 
 That 16-path set IS the realized Stage 10.1 file surface enumerated above. There is no list of 41 specific paths anywhere in the planning artefacts or workstream brief that this branch could "align to" -- the 41 is a count, not a list. Treat the per-stage manifest in this section as the authoritative scope for review.
 
+**Operator escalation pending (iter-10).** The iter-9 evaluator review explicitly tied its remaining "iterate" verdict to "this evaluator turn's explicit instruction to score against the 41-file ground-truth list", which is operator-supplied tooling state that the engineer agent cannot read or modify. Per the convergence-detector rule ("Three consecutive iters of the same checkbox flipping back to `[ ]` ... raise it as an Open Question for operator clarification, or ask the operator to pin a decision"), this item has now flipped FOUR consecutive iters (6/7/8/9) and is escalated via the structured open-question `manifest-vs-per-stage-scope` emitted at the end of iter-10's response. No further in-doc edits will be made on this item until the operator pins a decision.
+
 ### Dependencies
 - phase-cross-repo-aggregator/stage-system-tier-metric-composer
 

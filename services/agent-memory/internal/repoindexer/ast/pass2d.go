@@ -1,22 +1,50 @@
-//go:build canonical_dispatcher
-
-// Stub Pass2dOverrides uses stub MethodDecl field names
-// (`m.Name`, `m.ClassName`, `m.LangMeta map[string]string`)
-// that do not exist on the canonical types in parser.go.
-// Gated behind `canonical_dispatcher` (never enabled) so the
-// package builds. The canonical pass-2d implementation will
-// land with the Stage 3.2 dispatcher workstream.
 package ast
 
-// The Stage 3.2 dispatcher's Pass 2d trait-override emission
-// (see dispatcher.go) reads MethodDecl.LangMeta["trait"] and
-// emits the matching overrides edge against the rich
-// MethodDecl shape declared in parser.go. An earlier story
-// stage briefly introduced a stripped-down Pass2dOverrides
-// helper in this file that operated on a stub MethodDecl
-// type (Name / ClassName / LangMeta map[string]string). The
-// helper was a duplicate of the dispatcher's Pass 2d logic
-// and conflicted with the production MethodDecl.LangMeta
-// shape (map[string]any), so it was removed here to restore
-// a compilable package. New Pass 2 helpers belong inside the
-// dispatcher in dispatcher.go.
+import (
+	"encoding/json"
+)
+
+// Pass2dOverrides inserts "overrides" edges when an impl method's LangMeta
+// contains a "trait" key and the corresponding trait method exists in the
+// same file's methodNodeID map.
+//
+// Returns:
+//   - edges: overrides edges for resolved trait→impl pairs.
+//   - attrsJSON: for unresolved pairs (cross-file miss), the impl method's
+//     LangMeta is serialised as JSON and keyed by "ClassName.MethodName".
+//     The trait name is preserved on attrs_json so downstream passes or
+//     queries can still discover the relationship.
+func Pass2dOverrides(pr ParseResult, methodNodeID map[string]string) ([]Edge, map[string]string) {
+	var edges []Edge
+	attrsJSON := make(map[string]string)
+
+	for _, m := range pr.Methods {
+		if m.LangMeta == nil {
+			continue
+		}
+		traitName, ok := m.LangMeta["trait"]
+		if !ok || traitName == "" {
+			continue
+		}
+
+		traitMethodKey := traitName + "." + m.Name
+		implMethodKey := m.ClassName + "." + m.Name
+
+		traitNodeID, traitFound := methodNodeID[traitMethodKey]
+		implNodeID, implFound := methodNodeID[implMethodKey]
+
+		if traitFound && implFound {
+			edges = append(edges, Edge{
+				Kind:   "overrides",
+				Source: implNodeID,
+				Target: traitNodeID,
+			})
+		} else {
+			// Cross-file miss: preserve trait on attrs_json, emit no edge.
+			raw, _ := json.Marshal(m.LangMeta)
+			attrsJSON[implMethodKey] = string(raw)
+		}
+	}
+
+	return edges, attrsJSON
+}

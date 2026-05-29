@@ -91,7 +91,7 @@ func WithEmbeddingPublisher(p NodeEmbeddingPublisher) DispatcherOption {
 // WithLogger attaches a structured-log sink the dispatcher uses
 // for skip/parse-error events. Nil silently disables logging.
 //
-// The canonical type is `*slog.Logger` — the dispatcher emits
+// The canonical type is `*slog.Logger` ΓÇö the dispatcher emits
 // `Info` for skip events (`ast.dispatch.skip`) and `Error` for
 // real parse failures (`ast.parse.error`), which the
 // `slog.TextHandler` renders as `msg=...` along with structured
@@ -168,7 +168,7 @@ func NewDispatcher(w NodeEdgeWriter, opts ...DispatcherOption) *Dispatcher {
 	return d
 }
 
-// dispatcherParsersForTest exposes the dispatcher's extension→parser
+// dispatcherParsersForTest exposes the dispatcher's extensionΓåÆparser
 // routing map for the cgo-tagged routing tests. Test-only accessor;
 // production callers MUST use `EmitFile`.
 func (d *Dispatcher) dispatcherParsersForTest() map[string]Parser {
@@ -190,7 +190,7 @@ func (d *Dispatcher) dispatcherParsersForTest() map[string]Parser {
 //     Edge per non-relative ParseResult.Import. The imports Edge
 //     carries `attrs_json.symbols` so downstream consumers can see
 //     which specific names were pulled in (e.g. Rust
-//     `use std::fmt::Display` ⇒ `["Display"]`).
+//     `use std::fmt::Display` ΓçÆ `["Display"]`).
 //   - Pass 1a (classes):       one `class` Node per ClassDecl.
 //   - Pass 1b (methods):       one `method` Node per MethodDecl,
 //     plus a simple-name multimap used by Pass 2b's ambiguity-aware
@@ -201,7 +201,7 @@ func (d *Dispatcher) dispatcherParsersForTest() map[string]Parser {
 //     ClassDecl.Extends/Implements entry whose target is in the
 //     file's local class set (cross-file targets are dropped per
 //     architecture A4 silent-drop rule).
-//   - Pass 2b (static_calls):  AMBIGUITY-AWARE — a bare call
+//   - Pass 2b (static_calls):  AMBIGUITY-AWARE ΓÇö a bare call
 //     target is emitted as an edge ONLY when exactly one local
 //     method has a matching simple name. Receiver-qualified
 //     calls are scoped to `<EnclosingClass>.<name>` and emitted
@@ -227,7 +227,7 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 		// the specific repo this file belongs to) over the dispatcher
 		// global hints, and fall back to the global list only when the
 		// per-event slice is empty. This is the v1 contract per
-		// architecture §4.1 — hints route ONLY unknown / unmapped
+		// architecture ┬º4.1 ΓÇö hints route ONLY unknown / unmapped
 		// extensions; a known extension always wins.
 		// Tests: `TestDispatcher_LanguageHintsFallbackForUnknownExtension`,
 		// `TestDispatcher_PerEventLanguageHintsOverrideGlobal`.
@@ -280,7 +280,7 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 	// take down the dispatcher (LanguageParser contract on
 	// parser.go: parsers must not panic, but a defensive recover
 	// here turns a regression into a logged skip instead of a
-	// process abort — test:
+	// process abort ΓÇö test:
 	// `TestDispatcher_PanicInParserIsRecovered`).
 	var result ParseResult
 	var parserPanicked bool
@@ -394,7 +394,7 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 		return perr
 	}
 
-	// Pass 0: imports → package nodes + imports edges
+	// Pass 0: imports ΓåÆ package nodes + imports edges
 	// (skip workspace-relative module specifiers).
 	for _, imp := range result.Imports {
 		if isRelativeImportSpecifier(imp.Module) {
@@ -427,9 +427,9 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 		}
 	}
 
-	// Pass 1a: classes (build local-class set + sig→NodeID map).
+	// Pass 1a: classes (build local-class set + sigΓåÆNodeID map).
 	// Emits one `class` node per ClassDecl PLUS one `contains`
-	// edge `file → class` so the file→class→method→block
+	// edge `file ΓåÆ class` so the fileΓåÆclassΓåÆmethodΓåÆblock
 	// containment chain stays intact (test:
 	// `TestDispatcher_BlockSubdivisionFiresThroughEmitter`,
 	// `TestPythonFixture_EmitsExpectedNodeAndEdgeSet`,
@@ -519,7 +519,7 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 		registerSimpleName(lastDottedSegment(m.QualifiedName), m.QualifiedName)
 		// Register receiver aliases ONLY in the scoped QN map
 		// (avoids creating artificial bare-name ambiguity for
-		// Go's pointer-receiver `*Foo.Bar` → `Foo.Bar` alias).
+		// Go's pointer-receiver `*Foo.Bar` ΓåÆ `Foo.Bar` alias).
 		for _, alias := range m.ReceiverAliases {
 			methodSigToNodeID[alias] = id
 		}
@@ -535,7 +535,7 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 		for _, alias := range m.ReceiverAliases {
 			registerReceiverKey(alias, id)
 		}
-		// Emit the parent→method `contains` edge using the
+		// Emit the parentΓåÆmethod `contains` edge using the
 		// SAME parentID resolution that was used for the
 		// node insert (so a method whose declared
 		// EnclosingClass is missing locally still chains
@@ -551,8 +551,8 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 				return repoindexer.EmitResult{TouchedNodes: touched}, eerr
 			}
 		}
-		// Inline publish for the Method node — fires AFTER
-		// the parent→method contains edge so the publisher
+		// Inline publish for the Method node ΓÇö fires AFTER
+		// the parentΓåÆmethod contains edge so the publisher
 		// invariant (`PublishesAfterContainsEdge`) holds.
 		methodContent := m.BodySource
 		signatureOnly := false
@@ -571,9 +571,9 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 			return repoindexer.EmitResult{TouchedNodes: touched}, perr
 		}
 		// Pass 1c (per-method block subdivision): when the
-		// body exceeds the §8.2 logical-line threshold the
+		// body exceeds the ┬º8.2 logical-line threshold the
 		// dispatcher inserts two Block nodes (entry, exit)
-		// as children of the method and emits a method→block
+		// as children of the method and emits a methodΓåÆblock
 		// contains edge per Block. The publisher fires AFTER
 		// each block's contains edge so the publish-after-
 		// contains invariant holds for Blocks as well.
@@ -655,7 +655,7 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 		}
 	}
 
-	// Pass 2b: static_calls — ambiguity-aware bare-name + scoped
+	// Pass 2b: static_calls ΓÇö ambiguity-aware bare-name + scoped
 	// receiver-qualified resolution.
 	for _, m := range result.Methods {
 		srcID, ok := methodSigToNodeID[m.QualifiedName]
@@ -692,8 +692,8 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 				// Drop receiver-qualified edges whose scoped key
 				// resolves to MORE THAN ONE distinct method node
 				// (architecture A5: prefer missing edges over wrong
-				// ones). A single-node set — even one populated by
-				// both a primary key and a ReceiverAlias — still
+				// ones). A single-node set ΓÇö even one populated by
+				// both a primary key and a ReceiverAlias ΓÇö still
 				// resolves cleanly because dedup is by node ID.
 				ids := receiverIndex[target]
 				if len(ids) != 1 {
@@ -720,7 +720,7 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 	}
 
 	// Pass 2c: reads / writes edges from method body member
-	// accesses (architecture §5.3 — "every recognised member
+	// accesses (architecture ┬º5.3 ΓÇö "every recognised member
 	// access becomes a `reads` or `writes` edge from the
 	// enclosing method to its declaring class"). Aggregation is
 	// per (method, isWrite) pair: emit ONE edge per direction
@@ -786,7 +786,7 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 		}
 	}
 
-	// Pass 2d: overrides (impl method → trait-default trait
+	// Pass 2d: overrides (impl method ΓåÆ trait-default trait
 	// method, same file only; cross-file misses silently
 	// dropped per architecture A4).
 	for _, m := range result.Methods {
@@ -823,7 +823,7 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 
 	// Embedding publication for Methods and Blocks already
 	// fired inline (Pass 1b) so each publish lands AFTER its
-	// parent→node `contains` edge per the canonical contract
+	// parentΓåÆnode `contains` edge per the canonical contract
 	// (`TestDispatcher_EmbeddingPublisher_PublishesAfterContainsEdge`).
 	// No trailing publisher loop is needed.
 
@@ -831,7 +831,7 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 }
 
 // packageAttrsJSON serialises the attrs that belong on a `package`
-// Node — keyed by Module alone, so per-import symbol/alias detail
+// Node ΓÇö keyed by Module alone, so per-import symbol/alias detail
 // is intentionally excluded (those live on the `imports` edge).
 func packageAttrsJSON(imp Import) json.RawMessage {
 	attrs := map[string]any{}
@@ -857,9 +857,9 @@ func packageAttrsJSON(imp Import) json.RawMessage {
 }
 
 // importsEdgeAttrsJSON serialises the per-import detail that belongs
-// on an `imports` Edge — `symbols`, `alias`, `is_type_only`, `line`.
+// on an `imports` Edge ΓÇö `symbols`, `alias`, `is_type_only`, `line`.
 // The `symbols` key is what Stage 5.3 requires on the Rust imports
-// edge (e.g. `use std::fmt::Display` ⇒ `["Display"]`).
+// edge (e.g. `use std::fmt::Display` ΓçÆ `["Display"]`).
 func importsEdgeAttrsJSON(imp Import) json.RawMessage {
 	attrs := map[string]any{}
 	if imp.Module != "" {
@@ -954,7 +954,7 @@ func sliceBlockSource(src []byte, b Block) string {
 }
 
 // lastDottedSegment returns the right-most dotted segment of a
-// qualified name (e.g. "Foo.bar" → "bar", "free_fn" → "free_fn").
+// qualified name (e.g. "Foo.bar" ΓåÆ "bar", "free_fn" ΓåÆ "free_fn").
 // Used by Pass 2b's bare-name multimap and Pass 2d's trait-method
 // lookup.
 func lastDottedSegment(qn string) string {
@@ -1006,8 +1006,8 @@ func parseUnavailableReason(msg string) string {
 
 // mergeLangMeta folds a parser-emitted LangMeta map into the
 // dispatcher's first-class attrs map under the architecture C11 /
-// §4.4.2 "first-class key wins on collision" rule. Presence —
-// not value — of a key in `out` is the gate: a first-class attr
+// ┬º4.4.2 "first-class key wins on collision" rule. Presence ΓÇö
+// not value ΓÇö of a key in `out` is the gate: a first-class attr
 // that the dispatcher intentionally set to nil is still treated
 // as "set" and a LangMeta entry for the same key is dropped.
 //
@@ -1105,7 +1105,7 @@ func normalizeHints(in []string) []string {
 // `start_line`, `end_line`), optionally appends the
 // `extends_raw` / `implements_raw` arrays when populated, then
 // folds the parser-supplied `LangMeta` map under the
-// first-class-key-wins rule (§4.4.2).
+// first-class-key-wins rule (┬º4.4.2).
 func classAttrs(language string, c ClassDecl) json.RawMessage {
 	attrs := map[string]any{
 		"language":   language,

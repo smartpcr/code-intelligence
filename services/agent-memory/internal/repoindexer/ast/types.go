@@ -1,13 +1,31 @@
+// Package ast defines the types and interfaces for the AST parser/emitter
+// pipeline used by the repo-indexer subsystem.
 package ast
 
-// The authoritative production parser types (LanguageParser,
-// ParseResult, ClassDecl, MethodDecl, Import) live in parser.go.
-//
-// An earlier story stage briefly introduced a stripped-down
-// duplicate of these types in this file. The duplicates were
-// strict subsets of the parser.go definitions and conflicted
-// with the production parsers (which rely on the richer fields
-// such as Implements, BodySource, MemberAccesses, BodyStartLine,
-// etc.), so they were removed here to restore a compilable
-// package. New shared types belong in parser.go alongside the
-// LanguageParser interface they support.
+// ---------------------------------------------------------------------------
+// Graph types (canonical home — not declared elsewhere in the package)
+// ---------------------------------------------------------------------------
+
+// Node represents an AST-derived graph node.
+type Node struct {
+	Kind string
+	Name string
+}
+
+// Edge represents a directed relationship between two nodes.
+type Edge struct {
+	Kind   string
+	Source string
+	Target string
+}
+
+// EmitResult summarises the output of an EmitFile call.
+type EmitResult struct {
+	NodeCount int
+	EdgeCount int
+}
+
+// Logger receives structured log events from the dispatcher.
+type Logger interface {
+	Log(event string, fields map[string]string)
+}

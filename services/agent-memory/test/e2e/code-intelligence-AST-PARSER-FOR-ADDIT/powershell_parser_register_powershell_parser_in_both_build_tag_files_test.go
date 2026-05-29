@@ -153,8 +153,8 @@ func (s *psRegState) selectedParserLanguageIs(expected string) error {
 func (s *psRegState) hostWithoutPwshOnPath() error {
 	origPath := os.Getenv("PATH")
 	os.Setenv("PATH", "")
+	defer os.Setenv("PATH", origPath)
 	p := ast.NewPowerShellParser()
-	os.Setenv("PATH", origPath)
 
 	s.mockWriter = &psMockWriter{}
 	s.mockLogger = &psMockLogger{}

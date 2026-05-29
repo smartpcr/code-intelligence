@@ -647,8 +647,8 @@ func (s *crossRepoState) coverageLanded() error {
 // the scan_run finalises `succeeded` with at least one
 // file-level metric_sample row landed.
 //
-// Returns the scan_run_id the webhook reports so Phase B can
-// reuse it for the package-level metric_sample row.
+// Returns the scan_run_id the webhook reports for downstream
+// scan_run / metric_sample correlation in the assertion path.
 func (s *crossRepoState) postCoverageWebhook(ctx context.Context, repoIdx int, repoID, sha string) (string, error) {
 	// The hydrator skips files without a pre-existing
 	// scope_binding (cobertura.go:463-468 -- "skip the row and
@@ -656,18 +656,22 @@ func (s *crossRepoState) postCoverageWebhook(ctx context.Context, repoIdx int, r
 	// invent a scope)"). Pre-seed one binding per file path
 	// the Cobertura body will reference.
 	//
-	// Iter 7: hit counts vary per `repoIdx` so the per-file
+	// Per-repo hit counts vary by `repoIdx` so the per-file
 	// line-rates the production Cobertura parser computes are
-	// distinct across the three repos. The Phase B package-
-	// scope shim derives its value by AVG-ing the file-level
-	// `metric_sample.value` rows the parser landed, so distinct
-	// per-repo file rates produce a non-degenerate cross-repo
-	// histogram (p50/p90/p99 are non-equal) without any test-
-	// side fabricated values.
+	// distinct across the three repos. With iter-8's production
+	// `CoverageSweep` rollup wired in, the package-scope
+	// `metric_sample` for each repo is produced by the
+	// cardinality-weighted SUM(LinesCovered)/SUM(LinesValid)
+	// over the file rows the parser landed -- not by a
+	// test-side shim. Both files share denominator=10, so
+	// for this fixture the weighted ratio happens to equal
+	// the per-file AVG; the cross-repo histogram is
+	// non-degenerate (p50/p90/p99 are non-equal) without any
+	// test-side fabricated values:
 	//
-	//   repo 0: file_a hits=2 (0.20), file_b hits=6 (0.60) -> AVG=0.40
-	//   repo 1: file_a hits=4 (0.40), file_b hits=8 (0.80) -> AVG=0.60
-	//   repo 2: file_a hits=6 (0.60), file_b hits=10 (1.00) -> AVG=0.80
+	//   repo 0: file_a covered=2/10, file_b covered=6/10 -> weighted=8/20 =0.40
+	//   repo 1: file_a covered=4/10, file_b covered=8/10 -> weighted=12/20=0.60
+	//   repo 2: file_a covered=6/10, file_b covered=10/10 -> weighted=16/20=0.80
 	files := []coberturaFile{
 		{Path: fmt.Sprintf("pkg%d/file_a.py", repoIdx+1), Hits: 2 + 2*repoIdx, Total: 10},
 		{Path: fmt.Sprintf("pkg%d/file_b.py", repoIdx+1), Hits: 6 + 2*repoIdx, Total: 10},

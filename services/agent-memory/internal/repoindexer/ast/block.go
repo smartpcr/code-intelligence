@@ -1,6 +1,9 @@
 package ast
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // DefaultBlockThreshold is the §8.2 locked-value threshold a
 // Method's normalised-logical-line count must EXCEED before the
@@ -173,4 +176,15 @@ func byteOffsetOfLine(s string, line int) int {
 		}
 	}
 	return len(s)
+}
+
+// blockSignature mints the canonical signature for a Block under
+// the supplied enclosing-method signature. The format
+// `<methodSig>#block_<Ordinal>_<Kind>` is dispatcher-stable and
+// fingerprint-friendly: distinct (Ordinal, Kind) pairs produce
+// distinct strings even when two blocks share the same Kind
+// (e.g. multiple `branch` blocks under one method) — exercised
+// by `block_test.go::TestBlockSignature_IsUniquePerOrdinal`.
+func blockSignature(methodSig string, b Block) string {
+	return fmt.Sprintf("%s#block_%d_%s", methodSig, b.Ordinal, b.Kind)
 }

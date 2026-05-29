@@ -150,3 +150,15 @@ func TestCountLogicalLines_IgnoresBlankAndComments(t *testing.T) {
 		t.Fatalf("CountLogicalLines = %d; want 3", got)
 	}
 }
+
+// methodSignature builds the architecture-pinned method canonical
+// signature (`<repoURL>::method::<relPath>#<QualifiedName>(<params>)`)
+// using `NormalizeSignature` on the params so the produced string
+// is stable across whitespace-only / comment-only formatter
+// reformats. It is defined here (rather than in production code)
+// because the helper exists solely to feed the whitespace
+// stability tests in this file; production callers build the
+// signature inline via the `repoindexer/signatures` package.
+func methodSignature(repoURL, relPath, qual, params string) string {
+	return repoURL + "::method::" + relPath + "#" + qual + "(" + NormalizeSignature(params) + ")"
+}

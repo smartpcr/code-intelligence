@@ -76,19 +76,25 @@ func TestTreeSitterCParser_LanguageAndExtensions(t *testing.T) {
 // TestCSharpFixture_EmitsExpectedNodeAndEdgeSet in
 // parser_treesitter_csharp_test.go). The companion test
 // TestCFixture_EmitFile_EmitsExpectedNodesAndEdges (in
-// parser_treesitter_c_dispatcher_test.go, gated on
-// `//go:build cgo && canonical_dispatcher`) drives the SAME
-// fixture through the dispatcher's EmitFile path and asserts
-// the actual emitted Node/Edge inputs (the brief's "edge"
-// terminology in the dispatcher's native graph-writer
-// vocabulary). The two tests are kept separate so the
-// parser-direct contract is exercised under plain `cgo` (the
-// stock Windows toolchain WITHOUT the canonical_dispatcher
-// tag) and the dispatcher-edge contract is exercised under
-// the full `cgo && canonical_dispatcher` build (where the
-// graphwriter test harness `newFakeWriter`/`makeEvent` is
-// available). The brief's "edge" terminology maps to
-// ParseResult fields the dispatcher consumes:
+// parser_treesitter_c_dispatcher_test.go, gated on plain
+// `//go:build cgo`) drives the SAME fixture through the
+// dispatcher's EmitFile path and asserts the actual emitted
+// Node/Edge inputs (the brief's "edge" terminology in the
+// dispatcher's native graph-writer vocabulary). Both tests
+// share the same `cgo` build tag so the workstream brief's
+// stated validation command (`go test
+// ./internal/repoindexer/ast -count=1` with CGO on) exercises
+// them together in a single run. They are kept in separate
+// files so a regression localises cleanly: a parser-walker
+// drift fails THIS file's parser-direct assertions, a
+// dispatcher-pipeline drift fails the companion's emitted-
+// Node/Edge assertions, never both for unrelated reasons.
+// The companion file carries its own `c`-prefixed test
+// harness (cFakeWriter / cMakeEvent / cAttrString /
+// cMustNodeIDForSig) so it does not depend on the
+// canonical_dispatcher-gated harness in dispatcher_test.go.
+// The brief's "edge" terminology maps to ParseResult fields
+// the dispatcher consumes:
 //
 //   - "contains edge"      -> file-level decl (ClassDecl or
 //     MethodDecl with EnclosingClass=="");

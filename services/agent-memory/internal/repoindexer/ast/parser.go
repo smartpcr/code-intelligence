@@ -28,6 +28,7 @@ type ParseResult struct {
 type ClassDecl struct {
 	QualifiedName string
 	Kind          string
+	Extends       []string
 	Implements    []string
 	StartLine     int
 	EndLine       int
@@ -62,6 +63,11 @@ type MemberAccess struct {
 
 // Import represents an import, include, use, or using directive.
 type Import struct {
-	Path     string
-	LangMeta map[string]any
+	Path       string
+	Module     string
+	Alias      string
+	Symbols    []string
+	Line       int
+	IsTypeOnly bool
+	LangMeta   map[string]any
 }

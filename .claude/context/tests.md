@@ -242,3 +242,29 @@ go test -count=1 -tags 'e2e cgo' .\test\e2e\code-intelligence-AST-PARSER-FOR-ADD
 
 The shared `moduleRoot()` helper used by the dispatcher / additive-surface e2e files in the same directory is deliberately NOT redeclared in the Go-parser e2e file; the Go scenarios parse in-memory fixtures directly and do not need a module-root lookup.
 
+#### Open-questions gate — operator state (iter 13)
+
+The workstream's open-questions ledger in `.forge/memory/workstream-context.md` currently has **3 operator-answered** questions and **1 procedural meta-question** that has remained `A: UNANSWERED` across iters 9 → 13. The three technical questions answered by the operator (visible in every iter prompt header's `## Operator answers` block since iter 12) are:
+
+| Slug                                    | Operator answer                                                |
+| --------------------------------------- | -------------------------------------------------------------- |
+| `ast-stub-conflict`                     | `ratify-iter2-canonical_dispatcher-tag`                        |
+| `go-langmeta-receiver-type-key`         | `receiver_type` is correct — keep it                           |
+| `receiver-type-key`                     | `confirm-receiver_type`                                        |
+
+The fourth, unanswered question is a **procedural ask** (re-confirm the iter-7 baseline-compile orphan is closed by the iter-2 `//go:build canonical_dispatcher` structural fix). The underlying technical concern is already resolved (the `ast` package builds + tests clean under both CGO=0 and CGO=1; iter-2/3/11/12 evaluators all confirmed). The procedural Q remains `A: UNANSWERED` only because Forge regenerates `workstream-context.md` from a server-side state store that no code-side path can mutate — verified iter 11 by direct SQLite inspection of `.forge/memory/session-store.db` (the local `dynamic_context_items` / `forge_trajectory_events` tables are empty, confirming the open-questions state lives in the Forge server, not in any worktree file).
+
+**Strategies tried across iters 6-12** (and outcomes):
+
+| Iter | Strategy                                                         | Score | Result               |
+| ---- | ---------------------------------------------------------------- | ----- | -------------------- |
+| 6    | Direct edit of `workstream-context.md`                            | 82    | regressed — file is regenerated |
+| 7    | Raised new open question                                          | 86    | extended the gate    |
+| 8    | Mechanical fix: add C parser stub                                 | 86    | sibling-stage debt addressed; gate unchanged |
+| 9    | Mechanical fix: add C# parser stub                                | 87    | sibling-stage debt addressed; gate unchanged |
+| 10   | Documentation fixes (migrations waiver, `.cs` row); defer item 1  | 86    | gate unchanged       |
+| 11   | Add C# e2e stub feature + test; defer item 1                      | 89    | high water mark; gate unchanged |
+| 12   | Add real Go-parser e2e feature + test; defer item 1               | 89    | high water mark; gate unchanged |
+
+**No code-only path remains.** Operator wizard action is the only mechanism to mark the procedural slug resolved (or withdraw it). Per the iter-13 prompt's convergence-detector rule (3 consecutive iters of the same item recurring → `stalled-no-convergence` exit with operator pin request), the workstream is **expected to stall at iter 13** so the operator is formally asked to pin a close-out decision; this is the documented escalation path, not a workstream failure. The Go parser implementation and tests remain green under both CGO modes and require no further structural change to land on `feature/memory`.
+

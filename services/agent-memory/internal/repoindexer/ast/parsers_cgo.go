@@ -24,8 +24,8 @@ package ast
 //	tsTreeSitterParser, pyTreeSitterParser,         (existing)
 //	cTreeSitterParser, cppTreeSitterParser,         (C/C++ stage)
 //	csharpTreeSitterParser,                         (C# stage)
-//	goTreeSitterParser,                             (Go stage)
-//	rustTreeSitterParser,                           (this stage)
+//	goTreeSitterParser,                             (this stage)
+//	rustTreeSitterParser,                           (Rust stage)
 //	powershellParser                                (later)
 //
 // Order matters for two reasons:
@@ -65,9 +65,21 @@ package ast
 //     parser_treesitter_csharp.go; on this branch
 //     `NewTreeSitterCSharpParser()` is the STUB (see iter-9
 //     fix), which the sibling stage will replace in place.
+//   - stage-2.1-gotreesitterparser-implementation owns
+//     parser_treesitter_go.go (the full Go walker landed via
+//     PRs #160 [impl] and #165 [e2e] on feature/memory); this
+//     stage (stage-2.2-register-go-parser-in-parsers-cgo-go)
+//     adds `NewTreeSitterGoParser()` to this registration
+//     list so the dispatcher's `.go` route resolves to the
+//     tree-sitter Go parser under //go:build cgo. The CGO=0
+//     counterpart in parsers_nocgo.go deliberately drops Go
+//     per architecture Section 3 / tech-spec Section 4.3 --
+//     no Rust- or Go-style scanner fallback exists for the
+//     stdlib-only path.
 //   - stage-5.1-rusttreesitterparser-implementation owns
-//     parser_treesitter_rust.go; this stage adds
-//     NewTreeSitterRustParser() to this registration list.
+//     parser_treesitter_rust.go; the sibling registration
+//     stage (stage-5.2-register-rust-parser-in-parsers-cgo-
+//     go) added `NewTreeSitterRustParser()` to this list.
 //   - stage-6.1-powershellparser-subprocess-implementation
 //     owns the PowerShell scanner/subprocess parser.
 //

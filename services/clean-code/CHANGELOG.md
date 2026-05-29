@@ -6,6 +6,75 @@ Newest at the top. Stage references map to
 
 ## Stage 9.4 -- OTel telemetry across all surfaces
 
+### Iter-4 hardening (evaluator score 91 -> closure of 2 remaining items)
+
+The iter-3 evaluator score landed at 91 (verdict: iterate) with two
+unresolved items. Both are now structurally closed; the existing
+iter-3 evaluator improvements remain in place.
+
+1. **OTLP composition test now drives REAL production handlers**
+   (`internal/api/otlp_real_handler_composition_test.go` NEW). The
+   iter-3 receiver test
+   (`internal/telemetry/otlp_receiver_test.go::
+   TestIntegration_FakeOTLPReceiver_MiddlewareAnnotatorComposition`)
+   proved the middleware-opened span could be overwritten by a
+   handler-side annotator, but it did so with inline `mux.HandleFunc`
+   stubs that called the annotator directly. The iter-3 evaluator's
+   item #1 caught that the canonical production handlers were never
+   on the call path. The new test wires:
+   - real [`management.MgmtWriter.RegisterRepo`](internal/management/register_repo_verb.go)
+     against a real `InMemoryRepoStore` -- the store mints the
+     `repo_id`, the handler stamps it on the span via
+     `telemetry.AnnotateVerbSpanRepoID` AFTER the store call returns
+     (register_repo_verb.go:241);
+   - real [`management.PolicyWriter.Activate`](internal/management/policy_verbs.go)
+     against a real `*steward.Steward` backed by `keys.Build` with a
+     minted in-memory signing key and a pre-seeded `PolicyVersion`
+     row; the handler stamps the wire-supplied PVID via
+     `telemetry.AnnotateVerbSpanPolicyVersionID` BEFORE calling
+     `steward.Activate` (policy_verbs.go:241);
+   - real [`webhook.Router`](internal/ingest/webhook/router.go)
+     dispatching to a real [`webhook.ChurnVerbHandler`](internal/ingest/webhook/churn_verb.go)
+     against an `InMemoryChurnEventStore`; the router stamps
+     `repo_id` via `telemetry.AnnotateVerbSpanRepoID` AFTER
+     `ExtractMetadata` resolves the body's `RepoID` (router.go:516).
+
+   All three handlers sit behind one `telemetry.NewVerbSpanMiddleware`
+   wrapped mux served by `httptest.NewServer`. The OTel SDK exports
+   over real OTLP/gRPC to a fake `oteltest.FakeOTLPReceiver`; the
+   test asserts the captured spans carry the annotator-overwritten
+   values, NOT the middleware's open-time empty-string defaults.
+
+   Iter-3's existing receiver test
+   (`TestIntegration_FakeOTLPReceiver_CapturesAllSurfaceSpans` and
+   `..._MiddlewareAnnotatorComposition`) is unchanged -- the new
+   test is ADDITIVE, layered above the iter-3 middleware-only
+   contract.
+
+2. **`internal/telemetry/oteltest/` NEW** -- a small public test-
+   support package exposing `FakeOTLPReceiver`, `Start`,
+   `WaitForSpans`, `AttrMap`, `SpansByName`, and `SpanNames`. The
+   shared helper is what makes the new `internal/api` composition
+   test possible without duplicating ~70 lines of gRPC receiver +
+   wait-loop + attribute-projection glue from
+   `internal/telemetry/otlp_receiver_test.go`. The existing
+   telemetry receiver test is left untouched (refactor and feature
+   ship separately) so iter-3's evaluator-verified test stays
+   structurally pinned; the new `oteltest` package is consumed only
+   by the new iter-4 composition test for now.
+
+3. **`docs/rollout.md` per-binary rollout sequence adds
+   `clean-code-indexer` as step 6** (closes iter-3 evaluator item
+   #2). The iter-3 rollout sequence listed `clean-code-metric-
+   ingestor`, `clean-code-gateway`, `clean-code-aggregator`,
+   `clean-code-eval-gate`, and `clean-code-refactor-planner` (5
+   steps) but omitted the indexer despite `docs/runbook.md`
+   documenting it under the per-binary collector table. The new
+   step 6 entry references `cmd/clean-code-indexer/main.go:53-76`
+   for the wiring posture and explicitly notes the
+   placeholder-`/metrics` + no-verb-middleware posture so an
+   operator does NOT expect verb spans from the indexer.
+
 ### Iter-3 follow-up (post-iter-4 hardening)
 
 Iter-4 closed the verb-span overwrite gap for the four mgmt

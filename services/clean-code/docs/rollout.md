@@ -71,6 +71,25 @@ Apply the same env-var set to each binary, in order:
    `telemetry: OTel SDK initialised` at boot. The
    `/metrics` endpoint remains a placeholder pending the
    Stage 8.x observable-counter brief.
+6. `clean-code-indexer` -- iter-3 follow-up wires
+   `telemetry.Setup` at boot (mirrors the
+   `clean-code-refactor-planner` composition root pattern
+   at `cmd/clean-code-indexer/main.go:53-76`). The binary
+   does NOT yet host any canonical verb surface so the
+   verb-span middleware is intentionally NOT mounted;
+   future verb additions follow the
+   `clean-code-metric-ingestor` pattern (`telemetry.Setup`
+   + `telemetry.NewVerbSpanMiddleware(rootMux,
+   telemetry.CanonicalMetricIngestorVerbs())`). Set
+   `CLEAN_CODE_OTEL_ENDPOINT` to point at the collector;
+   the indexer will log `telemetry: OTel SDK initialised`
+   at boot. `/metrics` is served as a placeholder mirroring
+   the refactor-planner posture pending the indexer's own
+   observable-counter brief, and `/healthz` is served from
+   the same root mux. This rollout step closes the iter-3
+   evaluator gap (the indexer was previously documented in
+   `runbook.md` but missing from the per-binary rollout
+   sequence).
 
 ### Required env var
 

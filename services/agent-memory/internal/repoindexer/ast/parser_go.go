@@ -5,18 +5,18 @@ import (
 	"strings"
 )
 
-// goTreeSitterParser implements LanguageParser for Go source files.
-// It extracts top-level type declarations, function/method declarations,
-// and import statements.
-type goTreeSitterParser struct{}
+// goRegexpParser implements LanguageParser for Go source files using
+// regular expressions. It extracts top-level type declarations,
+// function/method declarations, and import statements.
+type goRegexpParser struct{}
 
-// NewTreeSitterGoParser returns a Go LanguageParser.
-func NewTreeSitterGoParser() LanguageParser {
-	return &goTreeSitterParser{}
+// NewRegexpGoParser returns a regexp-based Go LanguageParser.
+func NewRegexpGoParser() LanguageParser {
+	return &goRegexpParser{}
 }
 
-func (p *goTreeSitterParser) Language() string   { return "go" }
-func (p *goTreeSitterParser) Extensions() []string { return []string{".go"} }
+func (p *goRegexpParser) Language() string   { return "go" }
+func (p *goRegexpParser) Extensions() []string { return []string{".go"} }
 
 var (
 	// funcRe matches top-level func declarations with optional receivers.
@@ -36,7 +36,7 @@ var (
 	importPathRe = regexp.MustCompile(`"([^"]+)"`)
 )
 
-func (p *goTreeSitterParser) Parse(relPath string, src []byte) (ParseResult, error) {
+func (p *goRegexpParser) Parse(relPath string, src []byte) (ParseResult, error) {
 	code := string(src)
 	var result ParseResult
 

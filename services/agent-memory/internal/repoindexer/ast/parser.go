@@ -1,73 +1,41 @@
-// Package ast provides language-aware AST parsers for the repo-indexer
-// subsystem. Each parser implements the LanguageParser interface and
-// emits ParseResult values that the dispatcher routes to the graph
-// writer.
 package ast
 
-import "errors"
+import (
+	"path/filepath"
+	"sync"
+)
 
-// ErrParserUnavailable is the sentinel error a parser returns when its
-// backing grammar or runtime is not available in the current build.
-var ErrParserUnavailable = errors.New("parser unavailable")
-
-// LanguageParser is implemented by each language-specific parser.
-type LanguageParser interface {
+// Parser can parse source files of a particular language.
+type Parser interface {
 	Language() string
 	Extensions() []string
-	Parse(relPath string, src []byte) (ParseResult, error)
+	Parse(filename string, src []byte) (*ParseResult, error)
 }
 
 // ParseResult holds the output of parsing a single source file.
 type ParseResult struct {
-	Classes []ClassDecl
-	Methods []MethodDecl
-	Imports []Import
+	Language string
 }
 
-// ClassDecl represents a class, struct, interface, trait, or enum.
-type ClassDecl struct {
-	QualifiedName string
-	Kind          string
-	Extends       []string
-	Implements    []string
-	StartLine     int
-	EndLine       int
-	LangMeta      map[string]any
+var (
+	mu     sync.RWMutex
+	extMap = map[string]Parser{}
+)
+
+// RegisterParser adds a parser for each of its declared extensions.
+func RegisterParser(p Parser) {
+	mu.Lock()
+	defer mu.Unlock()
+	for _, ext := range p.Extensions() {
+		extMap[ext] = p
+	}
 }
 
-// MethodDecl describes one method or free-function declaration.
-type MethodDecl struct {
-	QualifiedName   string
-	EnclosingClass  string
-	ParamSignature  string
-	BodySource      string
-	StartLine       int
-	EndLine         int
-	BodyStartLine   int
-	BodyEndLine     int
-	BodyStartByte   int
-	BodyEndByte     int
-	Calls           []string
-	ReceiverCalls   []string
-	MemberAccesses  []MemberAccess
-	Modifiers       []string
-	ReceiverAliases []string
-	LangMeta        map[string]any
-}
-
-// MemberAccess records a receiver-qualified field access.
-type MemberAccess struct {
-	Name    string
-	IsWrite bool
-}
-
-// Import represents an import, include, use, or using directive.
-type Import struct {
-	Path       string
-	Module     string
-	Alias      string
-	Symbols    []string
-	Line       int
-	IsTypeOnly bool
-	LangMeta   map[string]any
+// SelectParser returns the registered parser for the given filename's
+// extension, or nil if no parser is registered for that extension.
+func SelectParser(filename string, src []byte) Parser {
+	ext := filepath.Ext(filename)
+	mu.RLock()
+	defer mu.RUnlock()
+	return extMap[ext]
 }

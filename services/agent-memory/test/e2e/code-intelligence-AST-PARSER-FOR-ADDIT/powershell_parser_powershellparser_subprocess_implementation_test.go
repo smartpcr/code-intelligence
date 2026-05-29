@@ -16,18 +16,8 @@ import (
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/repoindexer/ast"
 )
 
-// requireEnv skips the test when a required env var is unset.
-func requireEnv(t *testing.T, name string) string {
-	t.Helper()
-	v, ok := os.LookupEnv(name)
-	if !ok || v == "" {
-		t.Skipf("required env var %s is not set — skipping", name)
-	}
-	return v
-}
-
-// moduleRoot returns the services/agent-memory directory.
-func moduleRoot() (string, error) {
+// moduleRoot_pwsh returns the services/agent-memory directory.
+func moduleRoot_pwsh() (string, error) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		return "", fmt.Errorf("runtime.Caller failed")
@@ -75,7 +65,7 @@ func (s *powershellParserState) theFileHasNoBuildTags() error {
 }
 
 func (s *powershellParserState) goBuildAstRunsUnderCGO1() error {
-	modRoot, err := moduleRoot()
+	modRoot, err := moduleRoot_pwsh()
 	if err != nil {
 		return fmt.Errorf("cannot locate module root: %w", err)
 	}
@@ -93,7 +83,7 @@ func (s *powershellParserState) goBuildAstRunsUnderCGO1() error {
 }
 
 func (s *powershellParserState) goBuildAstRunsUnderCGO0() error {
-	modRoot, err := moduleRoot()
+	modRoot, err := moduleRoot_pwsh()
 	if err != nil {
 		return fmt.Errorf("cannot locate module root: %w", err)
 	}

@@ -7,6 +7,21 @@ import (
 	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
 )
 
+// methodSignature is a test-only mirror of the canonical-
+// signature scheme documented in doc.go (`<url>::method::
+// <relPath>#<qualifiedName>(<normalisedParams>)`). The
+// canonical implementation lives on the Stage 3.2 dispatcher
+// (gated behind `//go:build canonical_dispatcher`); the
+// scenario-pinning test for whitespace stability needs a
+// local equivalent so it can run independently of the
+// dispatcher landing workstream. Restored as part of the
+// PowerShell register-cgo stage because PR #170's iter 1
+// removed the helper but left two tests still referencing it.
+func methodSignature(repoURL, relPath, qualifiedName, paramsRaw string) string {
+	return repoURL + "::method::" + relPath + "#" + qualifiedName +
+		"(" + NormalizeSignature(paramsRaw) + ")"
+}
+
 // TestNormalizeSignature_StableAcrossFormatters pins the
 // acceptance scenario "whitespace normalisation -- Given the
 // same method reformatted only by adding spaces, When the

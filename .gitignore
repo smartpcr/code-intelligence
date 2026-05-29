@@ -126,3 +126,6 @@ services/clean-code/deploy/local/**/_data/
 # claude
 !.claude/
 !CLAUDE.md
+
+.worktree/
+.forge/

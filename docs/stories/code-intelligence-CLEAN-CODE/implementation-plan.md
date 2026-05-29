@@ -842,7 +842,7 @@ storyId: "code-intelligence:CLEAN-CODE"
 
 ### Realized file surface (this stage ONLY; do not conflate with sibling Stages 10.2/10.3/10.4/10.5)
 
-The branch `ws/code-intelligence-CLEAN-CODE/phase-linked-mode-integration-and-rollout-stage-optional-agent-memory-linked-mode-adapter` MUST land these files (and ONLY these) -- the workstream's ground truth file surface is therefore ~14 paths, NOT the full Phase-10 union of ~40 paths. Reviewers comparing `git diff origin/feature/clean-code...HEAD` must score against THIS list:
+The branch `ws/code-intelligence-CLEAN-CODE/phase-linked-mode-integration-and-rollout-stage-optional-agent-memory-linked-mode-adapter` MUST land these files (and ONLY these) -- the workstream's ground truth file surface is therefore exactly **16 paths** (4 added + 12 modified, 0 deleted), NOT the full Phase-10 union of ~40 paths. Reviewers comparing `git diff origin/feature/clean-code...HEAD` must score against THIS list, which is kept in sync verbatim with the operator-pinned 16-path manifest below (see "Authoritative manifest decision (operator-pinned, iter-14)"):
 
 Production source (services/clean-code):
 
@@ -850,8 +850,10 @@ Production source (services/clean-code):
 - `services/clean-code/internal/linked/doc.go` -- package contract.
 - `services/clean-code/internal/linked/client_test.go` -- coverage required by the implementation step above.
 - `services/clean-code/internal/aggregator/aggregator.go` -- `LinkedEdgeReader` seam, `applyLinkedEdges` three-class error classifier (context-abort, mode-store-abort, remote-degrade), `ErrLinkedModeStore` sentinel.
+- `services/clean-code/internal/aggregator/types.go` -- `LinkedEdgeReader` interface declaration + supporting `LinkedEdgeFetchFailures` counter field on the aggregator type (consumed by `applyLinkedEdges` in `aggregator.go`).
 - `services/clean-code/internal/aggregator/linked_reader_wiring_test.go` -- aggregator-side coverage of the three error classes plus nil/unwired/not-applicable paths.
-- `services/clean-code/internal/config/config.go` -- `EnableLinkedModeAdapter` flag (default `false`) + env override `CLEAN_CODE_ENABLE_LINKED_MODE_ADAPTER`.
+- `services/clean-code/internal/config/config.go` -- `EnableLinkedModeAdapter` flag (default `false`) + env override `CLEAN_CODE_ENABLE_LINKED_MODE_ADAPTER` + endpoint interlock validation.
+- `services/clean-code/internal/config/config_test.go` -- env-binding coverage for the new flag/endpoint pair (default-off, valid enable, invalid combinations -- enabled without endpoint, etc.).
 - `services/clean-code/cmd/clean-code-aggregator/main.go` -- composition wiring (adapter is constructed and registered with the aggregator only when `cfg.EnableLinkedModeAdapter` is true).
 - `services/clean-code/cmd/clean-code-refactor-planner/main.go` -- baseline build-gate fix (orphan `EffortEstimator` field removal carried in from `feature/clean-code`; required for `go build ./...` to succeed from worktree root).
 - `services/clean-code/internal/refactor/task_planner.go` -- same baseline build-gate fix.

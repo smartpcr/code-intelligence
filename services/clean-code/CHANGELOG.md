@@ -6,6 +6,61 @@ Newest at the top. Stage references map to
 
 ## Stage 9.4 -- OTel telemetry across all surfaces
 
+### Iter-3 follow-up (post-iter-4 hardening)
+
+Iter-4 closed the verb-span overwrite gap for the four mgmt
+verbs, the four ingest verbs, and `policy.activate`. Three
+additional gaps surfaced when reviewing the workstream against
+the runbook's "every clean-code-* binary exports OpenTelemetry
+traces" claim and the canonical `policy.*` verb family:
+
+1. **`clean-code-indexer` now wires OTel** (`cmd/clean-code-indexer/main.go`)
+   -- the binary previously served `/healthz` only and had NO
+   `telemetry.Setup` / no `/metrics`, a gap relative to the
+   iter-1 evaluator's "documentation overstates all-binary
+   tracing" item that iter-2 closed for `clean-code-refactor-planner`
+   but NOT for `clean-code-indexer`. The follow-up mirrors the
+   refactor-planner pattern: `telemetry.Setup` at boot with the
+   `lookupEnvOrDefault` UNSET-vs-empty distinction, a deferred
+   shutdown, and a `/metrics` placeholder route so the
+   Prometheus scrape contract holds for the indexer's pod. The
+   binary does not host any canonical verb surface yet, so the
+   verb-span middleware is NOT mounted; runbook explicitly
+   documents the placeholder posture.
+   - New tests `cmd/clean-code-indexer/main_test.go` cover
+     `/healthz`, `/metrics`, and the `lookupEnvOrDefault` UNSET-
+     vs-explicitly-empty contract.
+
+2. **`policy.publish` stamps `policy_version_id` on the verb span
+   (`internal/management/policy_verbs.go::Publish`)** -- the
+   verb CREATES a fresh `policy_version_id` via `steward.Publish`
+   but the iter-4 annotator wiring covered only `policy.activate`
+   (which receives the PVID from the wire). After `pw.steward.Publish`
+   returns successfully, the handler now calls
+   `telemetry.AnnotateVerbSpanPolicyVersionID(r.Context(), pv.PolicyVersionID)`
+   so dashboards can correlate the publish event with the
+   downstream `policy.activate` and `eval.gate` spans bound to
+   the freshly-minted PVID. Mirrors the `register_repo`
+   "verb-creates-the-id" pattern (line 241 of
+   `register_repo_verb.go`).
+
+3. **End-to-end composition test for the middleware + annotator
+   pipeline (`internal/telemetry/otlp_receiver_test.go`)** --
+   adds `TestIntegration_FakeOTLPReceiver_MiddlewareAnnotatorComposition`.
+   The previous tests covered:
+   - the annotator helper in isolation (`attrs_test.go`),
+   - the middleware emitting spans with open-time empty
+     defaults (`TestIntegration_FakeOTLPReceiver_CapturesAllSurfaceSpans`).
+   Nothing previously proved the COMPOSITION: a real handler
+   running INSIDE a middleware-opened span calls the annotator
+   and the OTLP exporter captures the LATER overwritten value.
+   The new test drives a `mgmt.register_repo` handler through
+   `NewVerbSpanMiddleware` and asserts the exported span
+   carries the real `repo_id`; same for `policy.activate` and
+   `policy_version_id`. Regression coverage for the production
+   wiring across `internal/management/*` and
+   `internal/ingest/webhook/router.go`.
+
 ### Iter-4 hardening (Stage 9.4)
 
 Iter-3 closed the five evaluator items but the verb-span

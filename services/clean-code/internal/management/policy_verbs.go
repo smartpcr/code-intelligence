@@ -189,6 +189,17 @@ func (pw *PolicyWriter) Publish(w http.ResponseWriter, r *http.Request) {
 		writeStewardError(w, r, "policy.publish", err)
 		return
 	}
+	// Stage 9.4 iter-3 follow-up: stamp the freshly-minted
+	// `policy_version_id` on the verb span so dashboards can
+	// correlate the publish event with the downstream
+	// `policy.activate` that pins this PVID and the
+	// `eval.gate` spans that evaluate against it. Mirror of
+	// the `policy.activate` annotator call (line 230) and
+	// `register_repo` repo_id annotator pattern (where the
+	// verb CREATES the identifier rather than receives it
+	// from the wire). Safe no-op when no OTel span is in
+	// ctx or when the steward returned a zero UUID.
+	telemetry.AnnotateVerbSpanPolicyVersionID(r.Context(), pv.PolicyVersionID)
 	writeJSON(w, r, "policy.publish", http.StatusOK, pv)
 }
 

@@ -388,6 +388,143 @@ func spanNames(got map[string]*tracepb.Span) []string {
 	return out
 }
 
+// TestIntegration_FakeOTLPReceiver_MiddlewareAnnotatorComposition
+// closes the composition gap the iter-3 unit + isolated middleware
+// tests leave open: nothing currently proves that a handler
+// running INSIDE a middleware-opened verb span can overwrite the
+// open-time `repo_id=""` / `policy_version_id=""` placeholders
+// via [AnnotateVerbSpanRepoID] / [AnnotateVerbSpanPolicyVersionID]
+// AND have the LATER value reach the OTLP exporter.
+//
+// The previous tests cover:
+//
+//   - [TestAnnotateVerbSpanRepoID_OverwritesOpenTimeDefault]
+//     -- helper writes the value when called in isolation.
+//   - [TestIntegration_FakeOTLPReceiver_CapturesAllSurfaceSpans]
+//     -- middleware emits spans with empty-default attrs.
+//
+// Neither proves the COMPOSITION: a real handler runs inside
+// the middleware-opened span, calls the annotator, and the
+// exported span carries the LATER (overwritten) value over the
+// real OTLP gRPC wire. This test does that:
+//
+//  1. Drives a request through [NewVerbSpanMiddleware] +
+//     a real handler that calls [AnnotateVerbSpanRepoID].
+//  2. Drives a second request through the same middleware +
+//     a real handler that calls
+//     [AnnotateVerbSpanPolicyVersionID].
+//  3. Asserts the EXPORTED span carries the real value, not
+//     the open-time empty default.
+//
+// Regression coverage for the production wiring in
+// `internal/management/policy_verbs.go` (Activate, Publish)
+// and `internal/ingest/webhook/router.go` (all 4 ingest verbs).
+func TestIntegration_FakeOTLPReceiver_MiddlewareAnnotatorComposition(t *testing.T) {
+	endpoint, receiver, stop := startFakeOTLPReceiver(t)
+	t.Cleanup(stop)
+
+	prevProvider := otel.GetTracerProvider()
+	t.Cleanup(func() { otel.SetTracerProvider(prevProvider) })
+
+	shutdown, err := Setup(context.Background(), config.Config{
+		OTelEndpoint: endpoint,
+	}, SetupOptions{
+		ServiceName: "clean-code-fake-otlp-composition-test",
+		Insecure:    true,
+		DialTimeout: 3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Setup(%s): %v", endpoint, err)
+	}
+	if shutdown == nil {
+		t.Fatal("Setup returned nil ShutdownFunc")
+	}
+
+	// The pre-generated UUIDs the handlers will pass to the
+	// annotators. The assertion afterwards is that the
+	// exported span attributes match these EXACT strings,
+	// not the open-time empty default the middleware stamps.
+	wantRepoID := uuid.Must(uuid.NewV4())
+	wantPVID := uuid.Must(uuid.NewV4())
+
+	const (
+		mgmtPath       = "/v1/mgmt/register_repo"
+		policyPath     = "/v1/policy/activate"
+		mgmtVerb       = "mgmt.register_repo"
+		policyVerb     = "policy.activate"
+	)
+
+	mux := http.NewServeMux()
+	// mgmt.register_repo handler: simulates the real
+	// register_repo verb's annotator call (see
+	// `internal/management/register_repo_verb.go:241`).
+	mux.HandleFunc(mgmtPath, func(w http.ResponseWriter, r *http.Request) {
+		AnnotateVerbSpanRepoID(r.Context(), wantRepoID.String())
+		w.WriteHeader(http.StatusOK)
+	})
+	// policy.activate handler: simulates the real Activate
+	// handler's PVID annotator call
+	// (`internal/management/policy_verbs.go:230`).
+	mux.HandleFunc(policyPath, func(w http.ResponseWriter, r *http.Request) {
+		AnnotateVerbSpanPolicyVersionID(r.Context(), wantPVID)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	routes := []VerbRoute{
+		{Path: mgmtPath, Verb: mgmtVerb},
+		{Path: policyPath, Verb: policyVerb},
+	}
+	handler := NewVerbSpanMiddleware(mux, routes)
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	for _, p := range []string{mgmtPath, policyPath} {
+		resp, err := srv.Client().Post(srv.URL+p, "application/json",
+			strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatalf("Post(%s): %v", p, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+
+	flushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := shutdown(flushCtx); err != nil {
+		t.Logf("ShutdownFunc returned err (continuing): %v", err)
+	}
+
+	captured := waitForSpans(t, receiver, 2, 5*time.Second)
+	got := map[string]*tracepb.Span{}
+	for _, rs := range captured {
+		for _, ss := range rs.GetScopeSpans() {
+			for _, s := range ss.GetSpans() {
+				got[s.GetName()] = s
+			}
+		}
+	}
+
+	mgmtSpan, ok := got[mgmtVerb]
+	if !ok {
+		t.Fatalf("%s span not received (got %v)", mgmtVerb, spanNames(got))
+	}
+	mgmtAttrs := otlpAttrMap(mgmtSpan.GetAttributes())
+	if got := mgmtAttrs[AttrRepoID]; got != wantRepoID.String() {
+		t.Errorf("middleware-opened %s span: attr %q = %q, want %q (annotator MUST overwrite open-time empty default)",
+			mgmtVerb, AttrRepoID, got, wantRepoID.String())
+	}
+
+	policySpan, ok := got[policyVerb]
+	if !ok {
+		t.Fatalf("%s span not received (got %v)", policyVerb, spanNames(got))
+	}
+	policyAttrs := otlpAttrMap(policySpan.GetAttributes())
+	if got := policyAttrs[AttrPolicyVersionID]; got != wantPVID.String() {
+		t.Errorf("middleware-opened %s span: attr %q = %q, want %q (annotator MUST overwrite open-time empty default)",
+			policyVerb, AttrPolicyVersionID, got, wantPVID.String())
+	}
+}
+
 // otlpAttrMap projects a slice of OTLP common KeyValue
 // pairs into a name->string map for direct equality
 // assertions.
@@ -416,4 +553,3 @@ func otlpAttrMap(kvs []*commonpb.KeyValue) map[string]string {
 	}
 	return out
 }
-

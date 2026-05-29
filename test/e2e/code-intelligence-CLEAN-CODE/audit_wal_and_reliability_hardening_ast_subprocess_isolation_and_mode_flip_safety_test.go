@@ -433,6 +433,16 @@ func (s *astSubprocessState) fetchScan(ctx context.Context, scanID string) (scan
 func InitializeScenario_audit_wal_and_reliability_hardening_ast_subprocess_isolation_and_mode_flip_safety(ctx *godog.ScenarioContext) {
 	s := newAstSubprocessState()
 
+	// Close the database connection after each scenario to avoid leaking
+	// connections across scenarios in CI.
+	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
+		if s.db != nil {
+			s.db.Close()
+			s.db = nil
+		}
+		return ctx, nil
+	})
+
 	// subprocess-oom-returns-error
 	ctx.Step(`^a parser subprocess that allocates beyond its rlimit$`,
 		s.aParserSubprocessThatAllocatesBeyondItsRlimit)

@@ -1,3 +1,11 @@
+//go:build canonical_dispatcher
+
+// Stub Emitter / NewGoParser / NewTypeScriptParser /
+// NewPythonParser declarations duplicate the canonical
+// `LanguageParser`-returning factories in parser_typescript.go
+// and parser_python.go; gated behind `canonical_dispatcher`
+// (never enabled) so the package builds without symbol-
+// collision errors. See types.go for the migration history.
 package ast
 
 // The Stage 3.2 dispatcher (see dispatcher.go) owns the full

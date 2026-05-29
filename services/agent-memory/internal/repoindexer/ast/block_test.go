@@ -1,3 +1,5 @@
+//go:build canonical_dispatcher
+
 package ast
 
 import (

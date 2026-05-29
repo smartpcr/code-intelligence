@@ -1,3 +1,11 @@
+//go:build canonical_dispatcher
+
+// Stub Pass2dOverrides uses stub MethodDecl field names
+// (`m.Name`, `m.ClassName`, `m.LangMeta map[string]string`)
+// that do not exist on the canonical types in parser.go.
+// Gated behind `canonical_dispatcher` (never enabled) so the
+// package builds. The canonical pass-2d implementation will
+// land with the Stage 3.2 dispatcher workstream.
 package ast
 
 // The Stage 3.2 dispatcher's Pass 2d trait-override emission

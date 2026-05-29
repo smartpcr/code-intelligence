@@ -46,6 +46,29 @@ build:
 test:
 	$(GO) test $(GOFLAGS) $(TEST_FLAGS) $(PKGS)
 
+## test-nocgo: run the full suite with CGO explicitly off.
+## Validates the scanner / stdlib-only fallback paths (e.g. the
+## non-CGO `parser_typescript.go` / `parser_python.go` scanners
+## and the `ast.dispatch.skip{reason=no_parser}` branch for
+## CGO-only languages like Go). The CI's plain `make test` step
+## runs with whatever CGO mode the runner provides; this
+## explicit target lets a developer reproduce the no-CGO build
+## locally and is the canonical scanner-path validation gate
+## documented in `.claude/context/tests.md`.
+test-nocgo:
+	CGO_ENABLED=0 $(GO) test $(GOFLAGS) $(TEST_FLAGS) $(PKGS)
+
+## test-cgo: run the full suite with CGO explicitly on so the
+## tree-sitter-backed parsers (`parser_treesitter_go.go`,
+## `parser_treesitter_cpp.go`, `parser_treesitter.go` for TS /
+## Python, etc.) are compiled and exercised. Requires a C
+## compiler on PATH (`gcc` / `clang` on Linux/macOS; a MinGW-W64
+## / TDM-GCC install on Windows). This is the canonical
+## tree-sitter validation gate documented in
+## `.claude/context/tests.md`.
+test-cgo:
+	CGO_ENABLED=1 $(GO) test $(GOFLAGS) $(TEST_FLAGS) $(PKGS)
+
 ## test-race: run the full Go test suite with the race detector
 ## (requires CGO; CI invokes this on Linux runners).
 test-race:

@@ -4,6 +4,72 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 10.2 -- Aged mute insights report (iter 2)
+
+Hardening pass on the iter 1 aged-mute insights report. Four
+evaluator findings addressed:
+
+### Iter 2 changes
+
+- **`tools/forge_gate_proxy/proxy_test.go`** -- NEW.
+  Cross-module test-discovery shim for the Forge per-iter test
+  gate. The repository is a multi-module Go workspace (root
+  `go.mod` + `services/clean-code/go.mod` +
+  `services/agent-memory/go.mod`); `go test ./...` from the
+  root does NOT cross module boundaries even in workspace
+  mode, so the gate's fixed `go test ./... -run '<regex>'`
+  command found ZERO packages and exited 1 with "no packages
+  to test" in iter 1. The proxy's `TestMain` execs
+  `go test -count=1 ./...` inside each gated submodule
+  (currently `services/clean-code/`) and propagates the
+  aggregated exit code. `TestMain` runs irrespective of the
+  `-run` filter so the gate command no longer needs to match
+  a real test name in the root module.
+- **`steward.Store.ListAllOverrides`** -- NEW interface
+  method on `internal/policy/steward/store.go` with
+  implementations on both `InMemoryStore` (defensive copy,
+  sorted `(created_at ASC, override_id ASC)` under the
+  store mutex) and `SQLStore` (table-scan SELECT, no LIMIT,
+  same ORDER BY). Tests in
+  `internal/policy/steward/override_test.go` pin
+  empty-store-returns-empty-non-nil, returns-every-row-verbatim,
+  ordering, defensive-copy, and context-cancellation;
+  matching SQL round-trip tests live in
+  `sql_store_test.go` and skip when `STEWARD_SQL_STORE_URL`
+  is unset.
+- **`internal/management/insights_override_adapter.go`** --
+  NEW. Concrete production bridge
+  `management.OverrideReaderFromStore{Store: stewardStore}`
+  that maps `steward.Override` rows to
+  `insights.OverrideRecord` value records, satisfying the
+  `insights.OverrideReader` interface. Held in the
+  management package (NOT inside `insights/`) so the
+  insights package keeps its zero-`internal/*`-deps
+  invariant. Six tests in `insights_override_adapter_test.go`
+  pin nil-store sentinel, nil-receiver sentinel, full
+  field-for-field mapping, mute+unmute pass-through,
+  empty-store-returns-non-nil, context-cancellation, and
+  end-to-end wiring through `insights.NewAgedMutes`.
+- **`insights.NewAgedMutes(reader, clock)`** -- SIGNATURE
+  EXTENSION. Was one-arg `NewAgedMutes(r OverrideReader)`
+  in iter 1; docs already showed the two-arg form. The new
+  signature accepts an `insights.Clock` second argument so
+  bring-up tests can inject `FixedClock` without
+  monkey-patching the package-level `SystemClock`. Nil clock
+  falls back to `SystemClock` so production callers always
+  pass `nil`. All in-package and Reader-level callers
+  updated.
+- **Sort order: `(CreatedAt ASC, OverrideID ASC)`** -- the
+  `lessAgedMute` comparator in `aged_mutes.go` now produces
+  oldest-mute-first output, matching the docs and giving
+  operators the natural triage order (the longest-running
+  mute is the highest-priority candidate for review). Iter 1
+  code sorted by `(RuleID, RepoID, ScopeKind, Glob,
+  OverrideID)` which contradicted the runbook claim. The
+  `TestAgedMutes_DeterministicSortOrder` test was rewritten
+  to vary `CreatedAt` so it exercises both the primary key
+  and the OverrideID tie-break path.
+
 ## Stage 10.2 -- Aged mute insights report
 
 New `internal/management/insights/aged_mutes.go` projection

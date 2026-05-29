@@ -155,6 +155,23 @@ type Store interface {
 	// row-count limit, so an older matching glob is never
 	// hidden behind a newer non-matching row.
 	LatestMatchingOverride(ctx context.Context, ruleID string, candidate CandidateScope) (Override, bool, error)
+
+	// ListAllOverrides returns every row in `clean_code.override`
+	// across every rule and every scope, ordered
+	// `(created_at ASC, override_id ASC)`. The append-only log
+	// is returned VERBATIM -- the caller (typically the
+	// management aged-mute projection) is responsible for
+	// reducing `(rule_id, scope)` partitions to a latest-row-
+	// wins winner. The Store interface does NOT pre-reduce
+	// because different read seams need different reductions
+	// (latest-mute vs latest-of-each-actor vs full audit
+	// history) and the schema row count is bounded by
+	// `O(rules * scopes * lifecycle_events)` -- small enough
+	// to scan per read in any deployment that uses overrides.
+	//
+	// Returns an empty (non-nil) slice when the table is empty.
+	// Propagates `ctx.Err()` if cancelled mid-scan.
+	ListAllOverrides(ctx context.Context) ([]Override, error)
 }
 
 // InMemoryStore is a process-local [Store] backed by
@@ -469,6 +486,30 @@ func (s *InMemoryStore) LatestMatchingOverride(ctx context.Context, ruleID strin
 
 // Compile-time check that InMemoryStore satisfies Store.
 var _ Store = (*InMemoryStore)(nil)
+
+// ListAllOverrides returns a defensive copy of every row in
+// the in-memory override log, sorted oldest-first by
+// `(CreatedAt ASC, OverrideID ASC)` so the management
+// aged-mute projection sees a deterministic stream regardless
+// of insertion order. The returned slice is detached from the
+// store's internal `overrides` slice so the caller may sort,
+// filter, or extend it without race-condition risk.
+func (s *InMemoryStore) ListAllOverrides(ctx context.Context) ([]Override, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	out := make([]Override, len(s.overrides))
+	copy(out, s.overrides)
+	s.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return uuidCompare(out[i].OverrideID, out[j].OverrideID) < 0
+	})
+	return out, nil
+}
 
 // copyPolicyVersion deep-copies pv so the returned value is
 // safe to mutate without affecting the persisted row.

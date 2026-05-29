@@ -185,19 +185,28 @@ type AgedMutes struct {
 }
 
 // NewAgedMutes wires an [AgedMutes] with the canonical
-// production defaults: 90-day threshold + [SystemClock]. The
-// composition root calls this once and passes the result to
-// the management Reader via [management.WithAgedMutes].
+// production defaults: 90-day threshold + the supplied clock
+// (or [SystemClock] when `clock` is nil). The composition root
+// calls this once and passes the result to the management
+// Reader via [management.WithAgedMutes].
 //
 // A nil `r` is permitted at construction -- the resulting
 // AgedMutes can be wired into a Reader for "feature absent"
 // scaffold-mode bring-ups; calls to [Report] then return
 // [ErrAgedMuteReaderUnavailable] (the HTTP layer maps this to
 // 503 per the management surface convention).
-func NewAgedMutes(r OverrideReader) *AgedMutes {
+//
+// The two-argument form (reader, clock) lets tests inject a
+// [FixedClock] without monkey-patching the package-level
+// SystemClock. Production callers pass `nil` for clock to opt
+// into the default wall-clock.
+func NewAgedMutes(r OverrideReader, clock Clock) *AgedMutes {
+	if clock == nil {
+		clock = SystemClock{}
+	}
 	return &AgedMutes{
 		Reader:    r,
-		Clock:     SystemClock{},
+		Clock:     clock,
 		Threshold: time.Duration(AgedMuteDefaultThresholdDays) * 24 * time.Hour,
 	}
 }
@@ -221,10 +230,11 @@ func (errAgedMuteReader) Error() string {
 var ErrAgedMuteReaderUnavailable error = errAgedMuteReader{}
 
 // Report returns every aged mute under the configured
-// [AgedMutes.Threshold]. The result list is sorted
-// deterministically by (RuleID, Scope.RepoID, Scope.ScopeKind,
-// Scope.ScopeSignatureGlob) ascending so two callers that read
-// the same backend state in succession see byte-identical JSON.
+// [AgedMutes.Threshold]. The result list is sorted oldest-mute-
+// first by `(CreatedAt ASC, OverrideID ASC)` so an operator
+// triaging the dashboard sees the longest-running mutes at the
+// top; two callers that read the same backend state in
+// succession see byte-identical JSON.
 //
 // Returns an empty (non-nil) slice when no override matches.
 // Errors:
@@ -366,28 +376,20 @@ func recordWins(cand, cur OverrideRecord) bool {
 	return false
 }
 
-// lessAgedMute orders two AgedMute entries by the
-// architecture-friendly canonical key
-// (RuleID, Scope.RepoID, Scope.ScopeKind, Scope.ScopeSignatureGlob).
-// The tail tie-breaker is OverrideID so two rows that share the
-// quadruple (which the schema permits: two muted scopes with
-// the same scope_filter triple would only occur if an earlier
-// (mute=true) -> (mute=false) -> (mute=true) sequence somehow
-// reduced to two winners, which it cannot under
-// [reduceAndFilter]'s single-winner-per-group reduction;
-// still, a defensive tie-breaker keeps the sort total).
+// lessAgedMute orders two AgedMute entries oldest-first by
+// `(CreatedAt ASC, OverrideID ASC)`. Operator UX rationale:
+// the aged-mute report is a triage queue; the longest-running
+// mutes are the highest-priority candidates for review, so they
+// sort to the top of the JSON payload. OverrideID (lexicographic
+// UUID/string) is the secondary key so two rows that share an
+// instant (steward emits CreatedAt at the per-row write time, so
+// collisions are extraordinarily rare but possible under clock
+// skew or back-fill scripts) still sort to a total deterministic
+// order -- two callers that read the same backend state in
+// succession see byte-identical JSON.
 func lessAgedMute(a, b AgedMute) bool {
-	if a.RuleID != b.RuleID {
-		return a.RuleID < b.RuleID
-	}
-	if a.Scope.RepoID != b.Scope.RepoID {
-		return a.Scope.RepoID < b.Scope.RepoID
-	}
-	if a.Scope.ScopeKind != b.Scope.ScopeKind {
-		return a.Scope.ScopeKind < b.Scope.ScopeKind
-	}
-	if a.Scope.ScopeSignatureGlob != b.Scope.ScopeSignatureGlob {
-		return a.Scope.ScopeSignatureGlob < b.Scope.ScopeSignatureGlob
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.Before(b.CreatedAt)
 	}
 	return a.OverrideID < b.OverrideID
 }

@@ -39,14 +39,20 @@ this stage -- the report is read-only over the existing
 
 ### Wiring
 
-1. In the binary's composition root, construct the reader
+1. In the binary's composition root, construct the production
    adapter that bridges `policy/steward.Store.ListAllOverrides`
-   to `insights.OverrideReader` (a few lines of value-type
-   mapping -- the `insights` package intentionally has zero
-   `internal/*` deps).
+   to `insights.OverrideReader`. The adapter ships in this
+   stage as
+   `management.OverrideReaderFromStore{Store: stewardStore}`
+   (`internal/management/insights_override_adapter.go`) -- a
+   field-for-field value mapper held out of the `insights`
+   package to preserve its zero-`internal/*`-deps invariant.
 2. Construct the projection with the default 90-day
-   threshold and `SystemClock`:
-   `agedMutes := insights.NewAgedMutes(overrideReaderAdapter, nil)`.
+   threshold and the production system clock by passing
+   `nil` for the clock argument:
+   `agedMutes := insights.NewAgedMutes(overrideAdapter, nil)`.
+   The two-argument constructor lets bring-up tests inject a
+   `FixedClock`; production callers ALWAYS pass `nil`.
 3. Pass `management.WithAgedMutes(agedMutes)` to the
    existing `management.NewReader(...)` call alongside the
    Stage 7.3 `WithInsightsFreshness(...)` option.

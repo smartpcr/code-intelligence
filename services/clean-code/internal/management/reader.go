@@ -514,17 +514,18 @@ func WithInsightsFreshness(f *insights.Freshness) ReaderOption {
 //
 // Composition root callers wire a production [insights.AgedMutes]
 // constructed via [insights.NewAgedMutes] (default 90-day
-// threshold + [insights.SystemClock]). A typical wiring is:
+// threshold; pass nil for the clock to default to
+// [insights.SystemClock]). A typical wiring is:
 //
 //	r := management.NewReader(km,
 //	    management.WithMetricsBackend(pg),
-//	    management.WithAgedMutes(insights.NewAgedMutes(overrideReader)),
+//	    management.WithAgedMutes(insights.NewAgedMutes(overrideReader, nil)),
 //	)
 //
 // The override-reader adapter (which bridges
-// `steward.Store` -> `insights.OverrideReader`) lives in the
-// composition root rather than this package so insights stays
-// free of a steward dependency (see the package doc on
+// `steward.Store` -> `insights.OverrideReader`) lives in this
+// management package (see [OverrideReaderFromStore]) so insights
+// stays free of a steward dependency (see the package doc on
 // [aged_mutes.go]).
 func WithAgedMutes(a *insights.AgedMutes) ReaderOption {
 	return func(r *Reader) { r.agedMutes = a }

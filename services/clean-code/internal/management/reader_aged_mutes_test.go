@@ -49,8 +49,7 @@ func (f *fakeOverrideReader) ListAllOverrides(ctx context.Context) ([]insights.O
 // supplied fake override reader and clock so each test reads
 // as data, not boilerplate.
 func newReaderWithAgedMutes(backend *fakeOverrideReader, now time.Time) *Reader {
-	am := insights.NewAgedMutes(backend)
-	am.Clock = fixedAgedMuteClock{now}
+	am := insights.NewAgedMutes(backend, fixedAgedMuteClock{now})
 	return NewReader(nil, WithAgedMutes(am))
 }
 

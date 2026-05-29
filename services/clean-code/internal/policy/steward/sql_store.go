@@ -518,3 +518,69 @@ func (s *SQLStore) LatestMatchingOverride(ctx context.Context, ruleID string, ca
 
 // Compile-time check that SQLStore satisfies Store.
 var _ Store = (*SQLStore)(nil)
+
+// ListAllOverrides streams every row in `clean_code.override`
+// ordered `(created_at ASC, override_id ASC)`. This is the
+// substrate read for the management aged-mute insights
+// projection -- the projection reduces `(rule_id, scope)`
+// partitions to a latest-row winner and filters by age in Go,
+// so the SQL stays a simple table scan. The table grows as
+// O(operators * mute_events) and is bounded by operator
+// patience; in practice scoped to <10k rows even for a busy
+// deployment, well within a single round-trip.
+//
+// No `LIMIT` -- a bounded LIMIT could hide the oldest mute
+// (the highest-priority triage candidate) behind a wall of
+// newer rows. Operators who want pagination should use the
+// management Reader's threshold knob to narrow the projection
+// instead.
+//
+// The ORDER BY uses the same `(created_at, override_id)` key
+// the insights projection sorts by, so the SQL pre-sorts the
+// scan into the read order even though the projection
+// re-sorts defensively (sorts are stable + already-sorted
+// arrays are O(n) in Go's `sort.Slice`).
+func (s *SQLStore) ListAllOverrides(ctx context.Context) ([]Override, error) {
+	stmt := fmt.Sprintf(
+		`SELECT override_id, rule_id, scope_filter, mute, reason, actor_id, created_at
+		 FROM %s
+		 ORDER BY created_at ASC, override_id ASC`,
+		s.qualify("override"))
+	rows, err := s.db.QueryContext(ctx, stmt)
+	if err != nil {
+		return nil, fmt.Errorf("steward: SQLStore.ListAllOverrides: query: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	// Pre-size the slice modestly to amortise allocs in the
+	// common (~hundreds-of-rows) case; nil-safe append is the
+	// fallback if the table is larger.
+	out := make([]Override, 0, 64)
+	for rows.Next() {
+		var (
+			idStr    string
+			o        Override
+			scopeRaw []byte
+			reasonNS sql.NullString
+		)
+		if err := rows.Scan(&idStr, &o.RuleID, &scopeRaw, &o.Mute, &reasonNS, &o.ActorID, &o.CreatedAt); err != nil {
+			return nil, fmt.Errorf("steward: SQLStore.ListAllOverrides: scan: %w", err)
+		}
+		if err := json.Unmarshal(scopeRaw, &o.ScopeFilter); err != nil {
+			return nil, fmt.Errorf("steward: SQLStore.ListAllOverrides: unmarshal scope_filter: %w", err)
+		}
+		parsed, err := uuid.FromString(idStr)
+		if err != nil {
+			return nil, fmt.Errorf("steward: SQLStore.ListAllOverrides: bad override_id %q: %w", idStr, err)
+		}
+		o.OverrideID = parsed
+		if reasonNS.Valid {
+			o.Reason = reasonNS.String
+		}
+		out = append(out, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("steward: SQLStore.ListAllOverrides: rows: %w", err)
+	}
+	return out, nil
+}

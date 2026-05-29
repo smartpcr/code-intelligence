@@ -182,7 +182,7 @@ func TestAgedMutes_UnmuteRemovesFromReport(t *testing.T) {
 		"11111111-1111-1111-1111-111111111111",
 	)
 	backend := &sliceReader{rows: []OverrideRecord{mute}}
-	am := NewAgedMutes(backend)
+	am := NewAgedMutes(backend, nil)
 	am.Clock = fixedClock{now}
 
 	first, err := am.Report(context.Background())
@@ -434,21 +434,31 @@ func TestAgedMutes_DifferentScopesAreSeparateGroups(t *testing.T) {
 }
 
 // TestAgedMutes_DeterministicSortOrder pins the
-// (RuleID, RepoID, ScopeKind, Glob, OverrideID) sort key so
-// two callers reading the same backend state see byte-
-// identical JSON.
+// (CreatedAt ASC, OverrideID ASC) sort key so two callers
+// reading the same backend state see byte-identical JSON. The
+// fixture deliberately mixes UNIQUE CreatedAt instants AND a
+// CreatedAt-tie (records #2 and #3) so the test exercises both
+// the primary key (oldest first) and the secondary tie-breaker
+// (lexicographically smaller OverrideID first).
 func TestAgedMutes_DeterministicSortOrder(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
+	// Reverse-chronological insertion order on purpose -- the
+	// reducer/sort must not be a no-op pass-through. Two rows at
+	// 100d-ago force a tie-break on OverrideID.
 	muteRules := []OverrideRecord{
-		newAt("solid.srp.lcom4_high", "repo-z", "class", "AAA", true,
-			now.Add(-100*24*time.Hour), "11111111-1111-1111-1111-111111111111"),
-		newAt("solid.dip.cycles", "repo-a", "package", "com.example", true,
-			now.Add(-100*24*time.Hour), "22222222-2222-2222-2222-222222222222"),
-		newAt("solid.srp.lcom4_high", "repo-a", "class", "BBB", true,
+		// newest first in input
+		newAt("solid.srp.lcom4_high", "repo-a", "class", "Newest", true,
+			now.Add(-95*24*time.Hour), "44444444-4444-4444-4444-444444444444"),
+		// 100d ago, larger override id
+		newAt("solid.srp.lcom4_high", "repo-a", "class", "TieLarger", true,
 			now.Add(-100*24*time.Hour), "33333333-3333-3333-3333-333333333333"),
-		newAt("solid.srp.lcom4_high", "repo-a", "class", "AAA", true,
-			now.Add(-100*24*time.Hour), "44444444-4444-4444-4444-444444444444"),
+		// 100d ago, smaller override id (tie-break winner)
+		newAt("solid.dip.cycles", "repo-a", "package", "TieSmaller", true,
+			now.Add(-100*24*time.Hour), "22222222-2222-2222-2222-222222222222"),
+		// oldest at 200d ago -- must surface first
+		newAt("solid.srp.lcom4_high", "repo-z", "class", "Oldest", true,
+			now.Add(-200*24*time.Hour), "11111111-1111-1111-1111-111111111111"),
 	}
 	backend := &sliceReader{rows: muteRules}
 	am := &AgedMutes{Reader: backend, Clock: fixedClock{now}, Threshold: 90 * 24 * time.Hour}
@@ -460,17 +470,18 @@ func TestAgedMutes_DeterministicSortOrder(t *testing.T) {
 	if len(got) != 4 {
 		t.Fatalf("len(report)=%d, want 4", len(got))
 	}
-	wantOrder := []struct{ rule, repo, glob string }{
-		{"solid.dip.cycles", "repo-a", "com.example"},
-		{"solid.srp.lcom4_high", "repo-a", "AAA"},
-		{"solid.srp.lcom4_high", "repo-a", "BBB"},
-		{"solid.srp.lcom4_high", "repo-z", "AAA"},
+	// Expected oldest-first: 200d -> 100d (id22) -> 100d (id33) -> 95d.
+	wantOrder := []struct{ glob, overrideID string }{
+		{"Oldest", "11111111-1111-1111-1111-111111111111"},
+		{"TieSmaller", "22222222-2222-2222-2222-222222222222"},
+		{"TieLarger", "33333333-3333-3333-3333-333333333333"},
+		{"Newest", "44444444-4444-4444-4444-444444444444"},
 	}
 	for i, w := range wantOrder {
-		if got[i].RuleID != w.rule || got[i].Scope.RepoID != w.repo || got[i].Scope.ScopeSignatureGlob != w.glob {
-			t.Errorf("report[%d] = (rule=%q, repo=%q, glob=%q); want (%q, %q, %q)",
-				i, got[i].RuleID, got[i].Scope.RepoID, got[i].Scope.ScopeSignatureGlob,
-				w.rule, w.repo, w.glob)
+		if got[i].Scope.ScopeSignatureGlob != w.glob || got[i].OverrideID != w.overrideID {
+			t.Errorf("report[%d] = (glob=%q, override_id=%q); want (glob=%q, override_id=%q)",
+				i, got[i].Scope.ScopeSignatureGlob, got[i].OverrideID,
+				w.glob, w.overrideID)
 		}
 	}
 }
@@ -488,7 +499,7 @@ func TestAgedMutes_ReportWithThresholdHonorsCustomThreshold(t *testing.T) {
 		"11111111-1111-1111-1111-111111111111",
 	)
 	backend := &sliceReader{rows: []OverrideRecord{mute}}
-	am := NewAgedMutes(backend)
+	am := NewAgedMutes(backend, nil)
 	am.Clock = fixedClock{now}
 
 	defaultReport, err := am.Report(context.Background())
@@ -521,7 +532,7 @@ func TestAgedMutes_NonPositiveThresholdFallsBackToDefault(t *testing.T) {
 		"11111111-1111-1111-1111-111111111111",
 	)
 	backend := &sliceReader{rows: []OverrideRecord{mute}}
-	am := NewAgedMutes(backend)
+	am := NewAgedMutes(backend, nil)
 	am.Clock = fixedClock{now}
 
 	for _, badThreshold := range []time.Duration{0, -time.Hour, -90 * 24 * time.Hour} {
@@ -626,7 +637,7 @@ func TestAgedMutes_ContextCancellationPropagates(t *testing.T) {
 func TestAgedMutes_EmptyBackendReturnsEmptyReport(t *testing.T) {
 	t.Parallel()
 	backend := &sliceReader{rows: nil}
-	am := NewAgedMutes(backend)
+	am := NewAgedMutes(backend, nil)
 	am.Clock = fixedClock{time.Now()}
 
 	got, err := am.Report(context.Background())
@@ -655,7 +666,7 @@ func TestAgedMutes_OnlyUnmuteRowsReturnsEmptyReport(t *testing.T) {
 	)
 	unmute.Reason = ""
 	backend := &sliceReader{rows: []OverrideRecord{unmute}}
-	am := NewAgedMutes(backend)
+	am := NewAgedMutes(backend, nil)
 	am.Clock = fixedClock{now}
 
 	got, err := am.Report(context.Background())
@@ -674,7 +685,7 @@ func TestAgedMutes_OnlyUnmuteRowsReturnsEmptyReport(t *testing.T) {
 func TestNewAgedMutes_WiresProductionDefaults(t *testing.T) {
 	t.Parallel()
 	backend := &sliceReader{}
-	am := NewAgedMutes(backend)
+	am := NewAgedMutes(backend, nil)
 	if am == nil {
 		t.Fatal("NewAgedMutes returned nil")
 	}

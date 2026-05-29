@@ -170,21 +170,39 @@ lands when the verb is mounted by a downstream gateway
 stage):
 
 ```go
-agedMutes := insights.NewAgedMutes(overrideReaderAdapter, nil)
-reader := management.NewReader(
+overrideAdapter := &management.OverrideReaderFromStore{Store: stewardStore}
+agedMutes       := insights.NewAgedMutes(overrideAdapter, nil)
+reader          := management.NewReader(km,
     management.WithMetricsBackend(mb),
     management.WithInsightsFreshness(insights.NewPercentileFreshness()),
     management.WithAgedMutes(agedMutes),
 )
 ```
 
-The `overrideReaderAdapter` is a thin adapter that bridges
-the `policy/steward.Store` `ListAllOverrides` query to the
-`insights.OverrideReader` interface (the insights package
-intentionally has ZERO non-stdlib and ZERO internal-package
-deps -- see `docs/follow-up-workstreams.md` import-isolation
-matrix). The adapter is a few lines of value-type mapping
-and is the only place that knows about both packages.
+The `OverrideReaderFromStore` type
+(`internal/management/insights_override_adapter.go`) is the
+production bridge from `policy/steward.Store` to the
+`insights.OverrideReader` contract. It lives in the
+`management` package rather than inside `insights` because
+the `insights` package is held to a STRICT import-isolation
+invariant: zero non-stdlib AND zero internal-package deps.
+The adapter is a field-for-field value-type mapper -- no
+caching, no retry, no filtering. Its tests
+(`insights_override_adapter_test.go`) round-trip every
+`steward.Override` field plus an end-to-end pin through
+`insights.NewAgedMutes` to catch any contract drift.
+
+The substrate read is
+`steward.Store.ListAllOverrides(ctx) ([]steward.Override,
+error)` -- added in this stage so the projection has a way
+to fetch EVERY row (both `mute=true` and `mute=false`)
+without scope-glob expansion. The SQL implementation is a
+plain table scan ordered `(created_at ASC, override_id ASC)`
+with no `LIMIT` -- a bounded limit could hide the oldest
+mute (the highest-priority triage candidate) behind newer
+rows. The substrate is bounded by `O(operators *
+mute_events)` and well under 10k rows in any realistic
+deployment.
 
 ## Stage 8.3 -- ML effort-model loader (clean-code-refactor-planner)
 

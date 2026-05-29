@@ -386,6 +386,9 @@ func (s *astSubprocessState) bothScansCompleteUnderTheOldModeAndTheNextScanStart
 		return err
 	}
 	resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("post-flip scan start returned HTTP %d for scan %s", resp.StatusCode, postFlipID)
+	}
 
 	// Poll until the post-flip scan has a mode assigned.
 	deadline = time.Now().Add(60 * time.Second)

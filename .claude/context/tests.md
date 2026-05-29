@@ -232,6 +232,64 @@ edges). The orchestrator's validator is expected to run the
 contract test on every iter regardless of CGO availability,
 and the full CGO suite on CI's Linux runner.
 
+## AST parser support matrix (architecture §8.5)
+
+This is the canonical hand-off table referenced by
+`docs\stories\code-intelligence-AST-PARSER-FOR-ADDIT\architecture.md`
+Section 8.5 ("Documentation deliverable"). It is the single
+source of truth for which AST languages are supported under
+which build tag, and which skip-reason the dispatcher emits when
+a language cannot be parsed on the host. The legacy tables
+earlier in this file (the original "AST parser language support
+matrix" and the "AST parser support matrix (Stage 3.2)" table)
+document Stage-3.2 historical state and the per-stage walker
+details; this Section-8.5 table is what consumers should read
+to answer "is language X supported on build configuration Y,
+and if not, what shows up in the logs?".
+
+| Language                | CGO=on (production)             | CGO=off (`make test` portable)  | Notes                                                                                                                                                                                                                                                |
+| ----------------------- | ------------------------------- | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TypeScript / JavaScript | tree-sitter                     | scanner fallback                | Extensions `.ts .tsx .js .jsx .mjs .cjs`. Scanner-backed under CGO=off (no skip).                                                                                                                                                                    |
+| Python                  | tree-sitter                     | scanner fallback                | Extensions `.py .pyi`. Scanner-backed under CGO=off (no skip).                                                                                                                                                                                       |
+| C                       | tree-sitter                     | NOT supported -- files skipped  | Extensions `.c .h`. **Requires CGO.** Under CGO=off `defaultParsers()` does not register the parser; the dispatcher emits `ast.dispatch.skip{reason:"no_parser"}` per file and continues.                                                            |
+| C++                     | tree-sitter                     | NOT supported -- files skipped  | Extensions `.cc .cpp .cxx .c++ .hpp .hh .hxx .h++` (`.h` routes to C per §9 R6). **Requires CGO.** Under CGO=off files are skipped with `ast.dispatch.skip{reason:"no_parser"}`.                                                                     |
+| C#                      | tree-sitter                     | NOT supported -- files skipped  | Extension `.cs`. **Requires CGO.** Under CGO=off files are skipped with `ast.dispatch.skip{reason:"no_parser"}`.                                                                                                                                     |
+| Go                      | tree-sitter                     | NOT supported -- files skipped  | Extension `.go`. **Requires CGO.** Under CGO=off files are skipped with `ast.dispatch.skip{reason:"no_parser"}`.                                                                                                                                     |
+| Rust                    | tree-sitter                     | NOT supported -- files skipped  | Extension `.rs`. **Requires CGO.** Under CGO=off files are skipped with `ast.dispatch.skip{reason:"no_parser"}` (asserted by `TestDefaultParsers_NoCGOOmitsRust` in `parsers_nocgo_rust_test.go`).                                                   |
+| PowerShell              | `pwsh` subprocess (Section 6)   | `pwsh` subprocess (same impl)   | Extensions `.ps1 .psm1 .psd1`. **No CGO dependency** -- registers under both `//go:build cgo` and `//go:build !cgo`. **Requires `pwsh` on PATH** (either build tag); when absent the parser returns `ErrParserUnavailable` and the dispatcher emits `ast.dispatch.skip{reason:"pwsh_not_available"}` per file and continues. |
+
+Skip-reason summary (verbatim structured-log keys per
+architecture §8.3):
+
+- **C / C++ / C# / Go / Rust require CGO.** Under CGO=off
+  builds (the default `make test` portable gate on stock
+  Windows toolchains), these languages have NO parser
+  registered in `defaultParsers()`. The dispatcher's
+  extension lookup misses and it emits
+  `ast.dispatch.skip{reason:"no_parser"}` per file at Info
+  level (same skip key used for any unrecognized extension),
+  then continues draining its queue. To exercise the
+  tree-sitter back-ends locally set `CGO_ENABLED=1` and put a
+  C compiler (gcc / clang / tdm-gcc) on PATH; the canonical
+  exerciser is `make test-cgo` in `services\agent-memory`
+  and CI's `make test-race` step in
+  `.github\workflows\agent-memory-ci.yml`.
+- **PowerShell requires `pwsh` on PATH (either build tag).**
+  The `pwsh`-subprocess parser registers under BOTH
+  `//go:build cgo` and `//go:build !cgo` (it has no
+  compile-time CGO dependency), so PowerShell coverage does
+  not depend on the CGO build tag. It DOES depend on the
+  PowerShell SDK being installed: when `exec.LookPath("pwsh")`
+  fails at parser-construction time, `Parse()` returns
+  `ErrParserUnavailable` (wrapped with `reason=pwsh_not_available`).
+  The dispatcher's sentinel branch (architecture §2.2.1)
+  detects this with `errors.Is` and logs
+  `ast.dispatch.skip{reason:"pwsh_not_available"}` at Info
+  level per file -- it does NOT escalate to `ast.parse.error`
+  and does NOT abort the worker. Genuine pwsh parse failures
+  (and the 10s per-file timeout `defaultPowerShellTimeout`)
+  surface as un-wrapped errors that DO trip `ast.parse.error`.
+
 ## Current local validation caveats
 
 

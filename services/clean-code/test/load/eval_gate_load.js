@@ -37,12 +37,21 @@
 //
 // The 100 repos are encoded as deterministic UUIDs
 // `00000000-0000-0000-0000-{NNN}` where NNN is the
-// zero-padded index. A pre-test setup step
-// (operator-provided -- see README.md for the seed script)
-// registers these repos via `mgmt.register_repo` so the
-// `eval.gate` happy path returns canonical verdicts rather
-// than `repo_not_found` errors that would skew the
-// latency histogram.
+// zero-padded index. These UUIDs are PINNED -- the
+// `mgmt.register_repo` verb cannot be used to seed them
+// because that handler mints `repo_id` server-side via the
+// table's `DEFAULT gen_random_uuid()` column (see
+// `services/clean-code/migrations/0001_catalog_lifecycle.up.sql:149`
+// and `services/clean-code/internal/management/register_repo_verb.go:97-119`,
+// which also runs `DisallowUnknownFields` against the
+// request body -- supplying `repo_id` would 400). The
+// operator therefore pre-seeds these 100 UUIDs (plus the
+// dependent catalog and measurement rows) directly into the
+// `clean_code` schema via the `seed.sql` recipe documented
+// in README.md "Lab fixture pre-seed (direct SQL)". With
+// the rows pinned, the `eval.gate` happy path returns
+// canonical verdicts rather than `repo_not_found` errors
+// that would skew the latency histogram.
 //
 // Each request samples a repo uniformly at random; over
 // 30 min * 50 req/min = 1500 requests, each repo receives

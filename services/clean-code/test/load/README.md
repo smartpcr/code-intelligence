@@ -176,10 +176,42 @@ psql "${CLEAN_CODE_DATABASE_URL}" \
      -f seed.sql
 ```
 
-The SQL is idempotent via `ON CONFLICT DO NOTHING` -- safe to
-re-run on a lab refresh. It pre-seeds six rows per
-`(repo_id, sha)` pair so the `eval.gate` happy path can run
-end-to-end:
+The SQL is idempotent via `ON CONFLICT ... DO NOTHING` on
+every block -- safe to re-run on a lab refresh without
+appending duplicate rows. The two tables whose primary keys
+are not already the natural fixture key get **deterministic
+synthetic UUIDs** so the PK conflict target catches reruns:
+
+  - `clean_code.scan_run.scan_run_id` is pinned to
+    `00000001-0000-0000-0000-{repo_index}` (one scan_run
+    per repo).
+  - `clean_code.metric_sample.sample_id` is derived as
+    `md5('coverage_line_ratio:1:' || repo_id || ':' || sha)::uuid`
+    -- a deterministic UUID-shaped digest over the natural
+    quintuple (metric_kind + metric_version + repo_id + sha;
+    `scope_id` is fully determined by `repo_id` here because
+    the seed binds one repo-scope per repo). `metric_sample`
+    has only `sample_id` as a PK and no natural-key UNIQUE
+    constraint (architecture intentionally allows append-only
+    history under a stable natural key), so a non-deterministic
+    `gen_random_uuid()` default WOULD silently append a new
+    raw sample on each rerun even though `metric_sample_active`
+    stays bounded by its quintuple PK. The `md5(...)::uuid`
+    cast keeps the seed reproducible without requiring the
+    `uuid-ossp` extension (md5 is built into PostgreSQL).
+
+The block-by-block conflict targets:
+
+  - `clean_code.repo` -> `ON CONFLICT (repo_id) DO NOTHING`
+  - `clean_code.commit` -> `ON CONFLICT (repo_id, sha) DO NOTHING`
+  - `clean_code.scan_run` -> `ON CONFLICT (scan_run_id) DO NOTHING`
+  - `clean_code.scope_binding` -> `ON CONFLICT (scope_id) DO NOTHING`
+  - `clean_code.metric_sample` -> `ON CONFLICT (sample_id) DO NOTHING`
+  - `clean_code.metric_sample_active` ->
+    `ON CONFLICT (repo_id, sha, scope_id, metric_kind, metric_version) DO NOTHING`
+
+It pre-seeds six rows per `(repo_id, sha)` pair so the
+`eval.gate` happy path can run end-to-end:
 
   - `clean_code.repo` (100 rows; pinned UUIDs)
   - `clean_code.commit` (5 000 rows; `scan_status='scanned'`
@@ -276,11 +308,25 @@ ON CONFLICT (scope_id) DO NOTHING;
 -- references additional metric_kinds, copy this block and
 -- the matching metric_sample_active block below for each
 -- one (canonical kinds are pinned in tech-spec Sec 4.1.1).
+--
+-- `sample_id` is derived deterministically from the natural
+-- quintuple so re-running this seed hits the PK conflict
+-- target on `sample_id` and DOES NOT append duplicate raw
+-- samples. `metric_sample` has no UNIQUE constraint on
+-- (repo_id, sha, scope_id, metric_kind, metric_version) by
+-- design (architecture allows append-only sample history
+-- under a stable natural key); a non-deterministic UUID
+-- would therefore silently double-write on each rerun.
 INSERT INTO clean_code.metric_sample
     (sample_id, repo_id, sha, scope_id, metric_kind, metric_version,
      value, pack, source, producer_run_id)
 SELECT
-    gen_random_uuid(),
+    md5(
+        'coverage_line_ratio:1:'
+        || ('00000000-0000-0000-0000-' || lpad(i::text, 12, '0'))
+        || ':'
+        || (repeat('0', 28) || lpad(to_hex(i), 6, '0') || lpad(to_hex(j), 6, '0'))
+    )::uuid,
     ('00000000-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid,
     repeat('0', 28) || lpad(to_hex(i), 6, '0') || lpad(to_hex(j), 6, '0'),
     ('00000002-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid,
@@ -292,7 +338,7 @@ SELECT
     ('00000001-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid
 FROM generate_series(0, 99) AS r(i)
 CROSS JOIN generate_series(0, 49) AS s(j)
-ON CONFLICT DO NOTHING;
+ON CONFLICT (sample_id) DO NOTHING;
 
 -- metric_sample_active pointer rows -- the evaluator's
 -- active-row lookup reads through this table, not raw

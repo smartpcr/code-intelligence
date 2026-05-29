@@ -147,6 +147,32 @@ class HelloWorld : Base, IGreeter
 			got, csharpClassNames(res.Classes))
 	}
 
+	// Kind assertions: the brief enumerates "3 class/interface
+	// nodes" with IGreeter being an INTERFACE and Base /
+	// HelloWorld being CLASSES. Without these checks a walker
+	// that mis-classifies (e.g. emits IGreeter with Kind="class"
+	// from the C# `interface_declaration` node) would still
+	// satisfy the count + name assertions above. ClassDecl.Kind
+	// is persisted on the node's attrs_json["decl_kind"] and
+	// downstream consumers (graph queries, policy rules) route
+	// on it, so a kind mis-emission is a real silent failure
+	// mode the test must pin.
+	wantKinds := map[string]string{
+		"IGreeter":   "interface",
+		"Base":       "class",
+		"HelloWorld": "class",
+	}
+	for name, wantKind := range wantKinds {
+		c, ok := findCSharpClass(res.Classes, name)
+		if !ok {
+			continue // already reported above
+		}
+		if c.Kind != wantKind {
+			t.Errorf("%s.Kind = %q; want %q (full=%+v)",
+				name, c.Kind, wantKind, c)
+		}
+	}
+
 	// ----- Methods -----
 	// The brief pins exactly 4 method nodes:
 	// IGreeter.Greet (interface method spec, no body),
@@ -203,6 +229,28 @@ class HelloWorld : Base, IGreeter
 	// form to the same Node.
 	if !csharpHasSuffix(greet.Calls, "FormatGreeting") {
 		t.Errorf("HelloWorld.Greet.Calls should contain FormatGreeting; got %v", greet.Calls)
+	}
+	// Cardinality: the brief pins "1 static_calls edge". At
+	// the parser level the dispatcher mints one edge per
+	// resolvable entry in Calls + ReceiverCalls, so the test
+	// must pin BOTH slices to a combined size of 1 to catch
+	// a walker that:
+	//   - emits FormatGreeting twice (e.g. duplicate-walk bug
+	//     in the same invocation_expression node),
+	//   - mis-classifies `this.prefix` (a field read) as a
+	//     receiver-qualified method call and routes it into
+	//     ReceiverCalls,
+	//   - or splits the single call into both Calls and
+	//     ReceiverCalls (double-emission across slices).
+	// Together with the contains-FormatGreeting check above
+	// these assertions pin exactly one resolvable edge.
+	if got := len(greet.Calls); got != 1 {
+		t.Errorf("expected exactly 1 entry in HelloWorld.Greet.Calls (FormatGreeting); got %d (%v)",
+			got, greet.Calls)
+	}
+	if got := len(greet.ReceiverCalls); got != 0 {
+		t.Errorf("expected 0 entries in HelloWorld.Greet.ReceiverCalls (this.prefix is a field access, not a method call); got %d (%v)",
+			got, greet.ReceiverCalls)
 	}
 
 	// ----- Imports edge (file -> System) -----

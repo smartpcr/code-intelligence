@@ -5,6 +5,236 @@ production-tier environment. The instructions assume Postgres
 14+ is already running and the `clean_code_*` roles have been
 created via the `0004_roles.up.sql` migration.
 
+## Stage 10.5: `embedded` -> `linked` migration playbook
+
+This stage documents the per-repo migration from the default
+`embedded` scan mode (no cross-repo edges; system-tier rows
+that depend on them are stamped
+`degraded=true, degraded_reason='xrepo_edges_unavailable'`)
+to `linked` mode (cross-repo edges sourced from the
+agent-memory linked-mode endpoint, so the
+`xrepo_edges_unavailable` counter drops to zero on the
+forward insert stream). It does NOT duplicate the contracts
+the verbs implement -- those live in the architecture and
+tech-spec documents linked below.
+
+### Canonical references (relative paths from this file)
+
+- Architecture:
+  [`../../../docs/stories/code-intelligence-CLEAN-CODE/architecture.md`](../../../docs/stories/code-intelligence-CLEAN-CODE/architecture.md)
+  -- Sec 1.4.1 rows 1 & 5 (`xrepo_dep_depth` and `blast_radius`
+  carry the degraded stamp in `embedded` mode); Sec 5.1.4
+  (canonical RepoEvent.kind enum including `mode_changed`);
+  Sec 8.2 (closed `degraded_reason` list:
+  `xrepo_edges_unavailable | samples_pending | policy_signature_invalid | percentile_stale`);
+  Sec 8.7 (`linked` mode contract -- aggregator reads edges
+  from agent-memory; on unreachable endpoint the affected
+  rows flip BACK to `degraded_reason='xrepo_edges_unavailable'`).
+- Tech-spec:
+  [`../../../docs/stories/code-intelligence-CLEAN-CODE/tech-spec.md`](../../../docs/stories/code-intelligence-CLEAN-CODE/tech-spec.md)
+  -- Sec 4.2 (system-tier degraded fail-safe -- the aggregator
+  WRITES the row anyway with the degraded stamp; it never
+  silently drops); Sec 8.5 (`mgmt.set_mode` verb in the
+  canonical registry); Sec 9.3 (signing-key context for the
+  related `policy.publish` traffic that runs alongside).
+- Implementation plan:
+  [`../../../docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`](../../../docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md)
+  -- Stage 9.1 line 804 ("`mgmt.set_mode` transitions ...
+  drain in-flight scans for the repo before flipping").
+- E2E scenarios:
+  [`../../../docs/stories/code-intelligence-CLEAN-CODE/e2e-scenarios.md`](../../../docs/stories/code-intelligence-CLEAN-CODE/e2e-scenarios.md)
+  -- `mode-flip-drains-scans` (drain barrier);
+  `linked-mode-unreachable-degrades` (only
+  `xrepo_dep_depth` and `blast_radius` flip back when the
+  endpoint is down; other system-tier rows are unaffected);
+  `xrepo_edges_unavailable degrades aggregates` (Sec 8.2
+  closed-list propagation).
+- Runbook playbook (sibling):
+  [`./runbook.md`](./runbook.md) -- Stage 10.5 operator
+  playbook for the underlying `mgmt.set_mode` verb (and the
+  full Stage 6.2 contract below in this file).
+
+The contract for `mgmt.set_mode` -- request shape, error
+matrix, transactional semantics, drain barrier -- already
+lives in this file under
+"## Stage 6.2: management write verbs and repo onboarding"
+(search for `## Stage 6.2`) and in
+[`./runbook.md`](./runbook.md) under
+"## Stage 6.2 -- `mgmt.register_repo` and `mgmt.set_mode`".
+This Stage 10.5 section is the MIGRATION playbook for the
+flip itself; it does not re-state those contracts.
+
+### Pre-flight checks
+
+Before issuing `mgmt.set_mode(repo_id, 'linked')` against a
+production tenant:
+
+1. **Repo registered.** `mgmt.read.repo(repo_id)` returns the
+   row. If the repo is not yet in the catalogue, register it
+   first via `mgmt.register_repo` (runbook Stage 10.5 #1,
+   then Stage 6.2 for full detail).
+2. **Current mode is `embedded`.** Re-reading `mgmt.read.repo`
+   shows `mode='embedded'`. A `linked` -> `linked`
+   `mgmt.set_mode` is a no-op -- the verb writes neither a
+   new `repo_event(kind='mode_changed')` row nor any
+   `repo.mode` UPDATE (Stage 6.2 idempotency contract). It is
+   safe to call but does NOT trigger the counter shift; if
+   the operator THOUGHT the repo was `embedded` and finds it
+   already `linked`, investigate why the perceived state is
+   stale before any further action.
+3. **Linked-mode endpoint reachable.** The binary's
+   `agent-memory` linked-mode HTTP endpoint (the source the
+   Stage 7.2 aggregator reads cross-repo edges from in
+   `linked` mode -- architecture Sec 8.7) returns 200 to a
+   health probe from the clean-code service node. An
+   unreachable endpoint does NOT block the flip -- but the
+   forward insert stream for `xrepo_dep_depth` and
+   `blast_radius` will flip BACK to
+   `degraded=true, degraded_reason='xrepo_edges_unavailable'`
+   exactly as it did under `embedded` (architecture Sec 8.7
+   `linked-mode-unreachable-degrades` e2e). Other system-tier
+   rows (`arch_debt_ratio`, etc.) are unaffected because they
+   do NOT depend on cross-repo edges. Do not flip until the
+   endpoint is verified green.
+4. **Cross-Repo Aggregator running.** `/readyz` returns 200
+   for the binary that hosts the Stage 7.1 cadence loop
+   (`cmd/clean-code-cross-repo-aggregator` or whichever
+   binary owns the loop in this deployment). The counter
+   shift below assumes one full aggregator tick lands after
+   the flip; if the loop is paused / unhealthy, the counter
+   will not move until it resumes.
+5. **Signing-key cache loaded.** The Stage 5.1 signing-key
+   cache is loaded (`/readyz` reports `signing_key_cache=ok`).
+   `mgmt.set_mode` itself does NOT require a signature, but
+   downstream `policy.publish` / `eval.gate` traffic does and
+   the operator should not flip a repo whose policy lane is
+   already broken.
+6. **No in-flight scan backlog.** `mgmt.set_mode` takes
+   `SELECT mode ... FOR UPDATE` on the repo row and waits for
+   in-flight scans to drain before flipping (implementation
+   plan Stage 9.1 line 804;
+   e2e-scenarios `mode-flip-drains-scans`). Confirm
+   `scan_run(repo_id=<this>, status='running')` count is
+   bounded so the flip does not stall holding the row lock.
+7. **No stale override on a degraded-stamp-derived rule.** If
+   the operator earlier appended `mgmt.override(mute=true)`
+   for a rule that fires off a `degraded_reason='xrepo_edges_unavailable'`
+   row (e.g. an operator silenced a `system.xrepo_dep_depth_high`
+   alert precisely because the row was perma-degraded under
+   `embedded`), schedule an `mgmt.override(mute=false)` for
+   AFTER the counter shift settles, so the rule re-fires on
+   the now-clean signal. The unmute is itself a fresh append
+   to the `override` table (runbook Stage 10.5 #4).
+
+### The flip itself
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     --data '{ "repo_id": "<uuid>", "mode": "linked" }' \
+     https://clean-coded.example.com/v1/mgmt/set_mode
+```
+
+A 200 + `{ "repo_id": "...", "mode": "linked" }` confirms the
+row update AND the `repo_event(kind='mode_changed', payload={mode:'linked'})`
+append in the same transaction. The canonical past-tense
+enum value `mode_changed` is fixed by architecture Sec 5.1.4.
+
+### Expected counter shifts
+
+The KEY observable contract: within ONE full Cross-Repo
+Aggregator tick (Stage 7.1 cadence, default 30 s) of a
+successful flip, the **forward insert stream** for the
+affected metric kinds drops the
+`degraded_reason='xrepo_edges_unavailable'` stamp.
+
+| signal | `embedded` baseline | `linked` after flip + 1 tick | meaning |
+|---|---|---|---|
+| `metric_sample` rows for `metric_kind IN ('xrepo_dep_depth','blast_radius')` for this `repo_id`, `degraded=true`, `degraded_reason='xrepo_edges_unavailable'` | NEW rows appended every aggregator tick | NO new degraded rows are appended; subsequent rows are clean (`degraded=false`, `degraded_reason=NULL`) | architecture Sec 8.7 -- aggregator now sources xrepo edges from agent-memory rather than emitting the degraded fail-safe row |
+| Prometheus / OTel counter `clean_code_metric_sample_degraded_total{reason="xrepo_edges_unavailable",repo_id="<this>"}` | non-zero rate | rate -> 0 | label set matches the architecture Sec 8.2 closed list; the `reason` label value is verbatim from the row's `degraded_reason` column |
+| `repo_event(kind='mode_changed', payload->>'mode'='linked', repo_id=<this>)` | absent | EXACTLY ONE new row, written in the same transaction as the `repo.mode` UPDATE | architecture Sec 5.1.4 canonical RepoEvent enum |
+| `evaluation_verdict.degraded_reason='xrepo_edges_unavailable'` for NEW `eval.gate` calls referencing this repo | non-zero | 0 | gate stops short-circuiting on xrepo-edge unavailability for this repo (other repos' `eval.gate` shifts are independent) |
+| Other system-tier `metric_sample` rows (`arch_debt_ratio`, `change_failure_rate`, etc.) for this repo | unchanged | unchanged | per `linked-mode-unreachable-degrades` e2e, ONLY `xrepo_dep_depth` and `blast_radius` flip on the xrepo edge signal |
+
+The pre-existing `degraded=true` historical rows are NOT
+rewritten. The `metric_sample` table is append-only
+(architecture Sec 5.2.1); only the FORWARD insert stream
+changes. The Insights surface filters by
+`built_at >= now() - freshness_window` (Stage 7.3), so the
+degraded backlog ages out of the live read view within one
+freshness window of the flip.
+
+### Per-repo verification checklist
+
+After the flip + one aggregator tick (default ~30 s):
+
+- [ ] `mgmt.read.repo(<repo_id>)` returns `mode='linked'`.
+- [ ] `SELECT count(*) FROM clean_code.repo_event WHERE
+      repo_id=<this> AND kind='mode_changed' AND
+      payload->>'mode'='linked';` returns the EXPECTED count
+      (exactly +1 vs. the pre-flip count).
+- [ ] `SELECT count(*) FROM clean_code.metric_sample WHERE
+      repo_id=<this> AND metric_kind IN ('xrepo_dep_depth','blast_radius')
+      AND degraded=true AND degraded_reason='xrepo_edges_unavailable'
+      AND created_at > <flip_at>;` returns `0` (no NEW degraded
+      rows since the flip).
+- [ ] The Prometheus counter
+      `clean_code_metric_sample_degraded_total{reason="xrepo_edges_unavailable",repo_id="<this>"}`
+      shows a zero-rate plateau on the post-flip side of the
+      timestamp.
+- [ ] An `eval.gate(repo_id=<this>, sha=<a fresh sha>)` call
+      that previously took the
+      `degraded_reason='xrepo_edges_unavailable'` short-circuit
+      now runs the engine end-to-end (no degraded verdict on
+      the xrepo-edge signal; other degraded reasons --
+      `samples_pending`, `policy_signature_invalid` -- remain
+      possible and unrelated).
+
+### Rollback
+
+`mgmt.set_mode(repo_id, 'embedded')` reverses the flip in a
+single Postgres transaction:
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     --data '{ "repo_id": "<uuid>", "mode": "embedded" }' \
+     https://clean-coded.example.com/v1/mgmt/set_mode
+```
+
+- The row update + the second `repo_event(kind='mode_changed',
+  payload={mode:'embedded'})` append happen in the same
+  transaction (Stage 6.2 contract).
+- The aggregator resumes emitting
+  `degraded=true, degraded_reason='xrepo_edges_unavailable'`
+  rows for `xrepo_dep_depth` and `blast_radius` on the NEXT
+  tick.
+- The intermediate
+  `repo_event(kind='mode_changed', payload={mode:'linked'})`
+  row from the original flip is NOT deleted -- the
+  `repo_event` table is append-only; both events remain as
+  the audit trail of the brief `linked` window.
+
+### Out of scope for Stage 10.5
+
+- **Bulk / tenant-wide migration.** `mgmt.set_mode` is
+  per-repo by contract (architecture Sec 5.2 / tech-spec
+  Sec 8.5). A bulk migration is an operator loop over the
+  tenant's `repo_id`s with a sleep between flips to keep
+  the drain barrier from stalling a single aggregator tick.
+  No bulk verb is shipped or planned.
+- **agent-memory linked-mode endpoint deployment.** Standing
+  up the linked-mode endpoint itself is owned by the
+  agent-memory service. This playbook only documents the
+  clean-code-side flip once that endpoint is live.
+- **Re-scoring historical rows.** Stage 10.5 does NOT
+  back-fill old `degraded=true` rows. Operators who need a
+  clean historical signal call `mgmt.rescan(<repo_id>, <sha>)`
+  per SHA after the flip (runbook Stage 10.5 #5); the new
+  aggregator pass writes fresh rows under the `linked`
+  contract and the `metric_sample_active` view's
+  max-by-`created_at` selection picks them.
+
 ## Stage 10.2: Aged mute insights report
 
 This subsection captures the rollout sequence for the

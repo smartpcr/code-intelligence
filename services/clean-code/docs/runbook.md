@@ -6,6 +6,277 @@ composition root (`cmd/clean-code-metric-ingestor/main.go`,
 which hosts the management + ingest HTTP surfaces; future
 binaries under `cmd/clean-code-*` ship their own routes).
 
+## Stage 10.5 -- Operator playbook (consolidated quick reference)
+
+This section is a consolidated quick-reference index for the
+day-2 operator surface. Each entry is a short procedure plus
+pointers to the **canonical Stage section in this file** (full
+request shape, error matrix, idempotency rules, audit-row
+shape) and the **canonical architecture / tech-spec section**
+(the contract the verb implements). The detailed contracts
+already live in those sections; this index does NOT duplicate
+them.
+
+### Canonical references (relative paths from this file)
+
+- Architecture:
+  [`../../../docs/stories/code-intelligence-CLEAN-CODE/architecture.md`](../../../docs/stories/code-intelligence-CLEAN-CODE/architecture.md)
+- Tech-spec:
+  [`../../../docs/stories/code-intelligence-CLEAN-CODE/tech-spec.md`](../../../docs/stories/code-intelligence-CLEAN-CODE/tech-spec.md)
+- Implementation plan:
+  [`../../../docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`](../../../docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md)
+- E2E scenarios:
+  [`../../../docs/stories/code-intelligence-CLEAN-CODE/e2e-scenarios.md`](../../../docs/stories/code-intelligence-CLEAN-CODE/e2e-scenarios.md)
+- Rollout playbook (sibling):
+  [`./rollout.md`](./rollout.md) -- per-stage rollout sequence,
+  including the Stage 10.5 `embedded` -> `linked` migration.
+- Follow-up workstreams (sibling):
+  [`./follow-up-workstreams.md`](./follow-up-workstreams.md)
+
+Canonical verb namespaces (tech-spec Sec 8.5, e2e-scenarios
+`runbook-references-canonical-verbs`): `mgmt.register_repo`,
+`mgmt.set_mode`, `mgmt.retract_sample`, `mgmt.rescan`,
+`mgmt.override`, `policy.publish`, `policy.activate`,
+`policy.publish_rulepack`, `eval.gate`. No other names are
+canonical -- earlier scratch / draft names from pre-Stage 5.3
+design notes MUST NOT appear in operator-facing prose
+(`runbook-references-canonical-verbs` scenario pins this).
+
+### 1. Register a repo (`mgmt.register_repo`)
+
+When the operator onboards a new repo into the catalogue.
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     --data '{ "repo_url": "https://github.com/acme/svc-orders",
+               "default_branch": "main",
+               "mode": "embedded" }' \
+     https://clean-coded.example.com/v1/mgmt/register_repo
+```
+
+- Idempotent on `repo_url`: re-posting the same URL returns
+  the existing `repo_id` with HTTP 200 and writes no duplicate
+  `repo` row.
+- Appends one `repo_event(kind='registered', payload={mode})`
+  on the FIRST registration only.
+- `mode` (or its alias `modes`) is `embedded` | `linked`;
+  unset defaults to `embedded` per the architecture
+  `ast-mode-default` pin. Use `mgmt.set_mode` -- NOT a second
+  `register_repo` call -- to change the mode of an existing
+  repo.
+
+Canonical detail in this file: "Stage 6.2 -- `mgmt.register_repo`
+and `mgmt.set_mode`" (search for `## Stage 6.2`).
+Architecture: Sec 5.1.4 (RepoEvent.kind enum -- `registered`
+is canonical past-tense); Sec 5.2.1 `repo.repo_url`
+WRITE-ONCE invariant.
+Tech-spec: Sec 8.5 (`mgmt.register_repo` in the canonical
+verb registry).
+
+### 2. Retract a sample (`mgmt.retract_sample`)
+
+When the operator marks a previously-ingested metric sample as
+no-longer-valid (e.g. a bad coverage upload).
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     --data '{ "sample_id": "<uuid>",
+               "reason": "bad coverage upload -- replaced by SHA abc123" }' \
+     https://clean-coded.example.com/v1/mgmt/retract_sample
+```
+
+- Appends a `repo_event(kind='retract_intent', payload={sample_id, reason})`
+  (canonical RepoEvent enum value, Sec 5.1.4) and then a
+  `metric_retraction(retraction_id, sample_id, reason, appended_by, created_at)`
+  row via the `RetractDispatcher`.
+- Idempotent on `sample_id`: a second retract for the same
+  sample returns the existing `retraction_id` with
+  `Inserted=false` and writes NO second `metric_retraction`
+  row. (Stage 5.1.4 audit log -- intent vs. effect -- still
+  appends a second `retract_intent` event per call; only the
+  `metric_retraction` write is suppressed.)
+- The retraction does NOT delete the sample. Downstream
+  consumers (`eval.gate`, Insights) filter via the
+  `clean_code.metric_sample_active` view, which LEFT JOINs
+  through `metric_retraction`.
+
+Canonical detail in this file: "## `mgmt.retract_sample` and
+`mgmt.rescan` (Stage 3.4)".
+Architecture: Sec 5.1.4 (`retract_intent` RepoEvent kind);
+Sec 5.2.1 / Sec 1.5.1 (metric_sample append-only contract).
+
+### 3. Override a rule -- append-only mute (`mgmt.override` with `mute=true`)
+
+When the operator wants to silence a specific rule for a
+specific scope (file, package, repo, etc.) without modifying
+the policy.
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     -H 'X-OIDC-Subject: alice@acme.com' \
+     --data '{ "rule_id": "solid.srp.lcom4_high",
+               "scope_filter": {
+                 "repo_id":              "<repo-uuid>",
+                 "scope_kind":           "class",
+                 "scope_signature_glob": "github.com/acme/svc-orders/internal/orders.OrderService"
+               },
+               "mute":   true,
+               "reason": "legacy code under refactor -- see JIRA-1234" }' \
+     https://clean-coded.example.com/v1/mgmt/override
+```
+
+- Pure append. The `override` table is append-only: no row is
+  ever UPDATEd or DELETEd. A 200 returns
+  `{"override_id":"<uuid>"}`.
+- `reason` is REQUIRED when `mute=true` (the
+  `override_reason_required_when_muted` CHECK constraint from
+  migration 0003).
+- `X-OIDC-Subject` is REQUIRED -- the gateway sets it; the
+  verb stamps the row's `actor_id`.
+- The evaluator (Stage 5.7) resolves the active override by
+  `LatestMatchingOverride`: max `(created_at, override_id)` per
+  `(rule_id, repo_id, scope_kind, scope_signature_glob)`. The
+  most recent row wins; tie-breaks by larger `override_id`.
+- An aged mute (`created_at` older than the default 90-day
+  threshold) surfaces on the Stage 10.2
+  `mgmt.read.insights.aged_mutes` projection.
+
+Canonical detail in this file: "Stage 10.2 -- Aged mute
+insights report" (immediately below) for the read side;
+"## `mgmt.override` (Stage 5.3)" / rollout.md Stage 5.3 for
+the write side.
+Architecture: Sec 5.1.4 (override is NOT a RepoEvent kind --
+it is its own table); Sec 6.5 (Steward verb registry).
+Tech-spec: Sec 8.5 (`mgmt.override` canonical name).
+
+### 4. Unmute a rule -- append `mute=false` (NEVER UPDATE)
+
+When the operator wants to remove an earlier mute. The
+override table is append-only; the unmute is a NEW row, NOT
+an UPDATE / DELETE of the original mute.
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     -H 'X-OIDC-Subject: bob@acme.com' \
+     --data '{ "rule_id": "solid.srp.lcom4_high",
+               "scope_filter": {
+                 "repo_id":              "<repo-uuid>",
+                 "scope_kind":           "class",
+                 "scope_signature_glob": "github.com/acme/svc-orders/internal/orders.OrderService"
+               },
+               "mute":   false,
+               "reason": "refactor landed -- JIRA-1234 closed" }' \
+     https://clean-coded.example.com/v1/mgmt/override
+```
+
+- Same verb, same shape. The `scope_filter` MUST be
+  byte-identical to the mute it cancels -- the evaluator
+  groups by exact-equality on
+  `(rule_id, repo_id, scope_kind, scope_signature_glob)`. A
+  glob-mismatched unmute leaves the original mute in place.
+- The `created_at` of the unmute row MUST be strictly later
+  than the mute it cancels; ties are broken by larger
+  `override_id`.
+- Once appended, the next `mgmt.read.insights.aged_mutes`
+  read drops the
+  `(rule_id, scope_filter)` pair off the report -- the unmute
+  IS the "operator said this rule is no longer muted" signal.
+- `reason` is OPTIONAL when `mute=false` (the
+  `override_reason_required_when_muted` CHECK constraint only
+  binds the `mute=true` arm).
+
+Canonical detail: same as above (Stage 5.3 + Stage 10.2).
+
+### 5. Rescan a SHA (`mgmt.rescan`)
+
+When the operator wants to re-trigger the foundation + system
+tier pipeline for a specific `(repo_id, sha)` -- e.g. after a
+bug fix in a recipe, or to recover from a partial scan.
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     --data '{ "repo_id": "<uuid>",
+               "sha":     "abc1234...",
+               "reason":  "recipe-coverage bugfix re-run" }' \
+     https://clean-coded.example.com/v1/mgmt/rescan
+```
+
+- Opens a fresh `scan_run(kind='rescan', sha_binding='single', repo_id, sha, ...)`
+  and dispatches it through the Metric Ingestor state machine.
+- Idempotent in the same sense as `mgmt.retract_sample`: a
+  concurrent rescan against the same `(repo_id, sha)` resolves
+  to the existing in-flight `scan_run_id` rather than opening
+  a duplicate.
+- Does NOT delete existing `metric_sample` rows for the SHA;
+  the new run appends a fresh `producer_run_id` and the
+  `metric_sample_active` view's max-by-`created_at` selection
+  picks the new sample.
+
+Canonical detail in this file: "## `mgmt.retract_sample` and
+`mgmt.rescan` (Stage 3.4)".
+Architecture: Sec 3.10 (scan_run state machine); Sec 5.2.1
+(`metric_sample` append-only).
+
+### 6. Rotate the signing key
+
+Two distinct signing-key surfaces exist; the rotation
+procedure differs.
+
+**6a. Policy Steward Ed25519 signing key** -- signs
+`policy.publish` rows. Rotation is overlapped: the new key is
+minted but the prior key remains accepted for
+`policy_publish_overlap_min_seconds` (default `86400` = 24h)
+so downstream cache catch up before signature verification
+breaks (tech-spec Sec 8.2 row 6 / Sec 9.3).
+
+Routine rotation:
+
+```go
+// in-process (or via the operator CLI that wraps this call):
+keyID, err := manager.Rotate(ctx)
+```
+
+- The call REFUSES while the most recent key is still inside
+  its `valid_until` cooldown window.
+- The new key publishes immediately; the prior key keeps
+  verifying for the overlap window, then ages out.
+- Every replica re-reads `clean_code.policy_signing_keys` on
+  the `signingKeyCacheRefreshInterval` (5m) so a peer's
+  rotation propagates well before the prior key expires.
+
+Compromise response (tech-spec Sec 9.3):
+
+```go
+keyID, err := manager.ForceRotate(ctx) // bypasses the overlap-window rate-limit
+```
+
+- The bypass is the ONE-AND-ONLY way to mint a successor
+  before the overlap expires; only use it on a confirmed
+  compromise.
+- The operator is expected to follow up with `policy.publish`
+  re-signs of any policy version that was signed under the
+  compromised key.
+
+Canonical detail in this file: "## Policy Steward
+signing-key cache (Stage 5.1)" subsection "Rotation"
+(search for `### Rotation`).
+Tech-spec: Sec 8.2 (overlap window default); Sec 9.3
+(`Policy signing key compromise`).
+Architecture: Sec 6.5 (Steward writer ownership).
+
+**6b. External-ingest HMAC signing key** -- signs the
+`/v1/ingest/{verb}` Router HMAC envelopes. Rotation uses
+`StaticSecretResolver` overlap (`Add(newID, newSecret)` ->
+24h overlap -> `Remove(oldID)`).
+
+Canonical detail in this file: "### Operator rotation
+(signing key)" under Stage 4.1.
+
 ## Stage 10.2 -- Aged mute insights report
 
 This section captures the operator-facing contract of the

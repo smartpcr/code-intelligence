@@ -214,29 +214,11 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 		logger.Debug("ast.dispatch.skip", slog.String("reason", "no_parser"))
 		return repoindexer.EmitResult{}, nil
 	}
-	d.extMap = buildExtMap(d.parsers)
-	return d
-}
 
 	src, err := readEvent(ev)
 	if err != nil {
 		return repoindexer.EmitResult{}, fmt.Errorf("ast: read %s: %w", ev.RelPath, err)
 	}
-	defer func() { _ = rc.Close() }()
-	src, err := io.ReadAll(rc)
-	if err != nil {
-		return repoindexer.EmitResult{}, fmt.Errorf("ast.dispatcher: read %q: %w", ev.RelPath, err)
-	}
-	if _, err := d.safeParse(parser, ev.RelPath, src); err != nil {
-		return repoindexer.EmitResult{}, nil
-	}
-	// Stage 3.2 dispatcher-landing workstream lands the
-	// node/edge emission pipeline that fills TouchedNodes.
-	// The v1 surface returns an empty result so the worker
-	// continues without partial-progress noise.
-	_ = ctx
-	return repoindexer.EmitResult{}, nil
-}
 
 	result, err := safeParse(parser, ev.RelPath, src)
 	if err != nil {
@@ -468,15 +450,6 @@ func (d *Dispatcher) emit(
 			return touched, fmt.Errorf("ast: insert file->class contains: %w", err)
 		}
 	}
-	if len(c.Extends) > 0 {
-		m["extends_raw"] = append([]string(nil), c.Extends...)
-	}
-	if len(c.Implements) > 0 {
-		m["implements_raw"] = append([]string(nil), c.Implements...)
-	}
-	mergeLangMeta(m, c.LangMeta)
-	return mustJSON(m)
-}
 
 	// Pass 1b: insert methods + `contains` (parent->method).
 	for i := range result.Methods {
@@ -803,8 +776,6 @@ func (d *Dispatcher) emit(
 			}
 		}
 	}
-	return slog.Default()
-}
 
 	// Pass 2d: `overrides`. Rust trait default-impl
 	// shadowing emits a typed edge from each impl method

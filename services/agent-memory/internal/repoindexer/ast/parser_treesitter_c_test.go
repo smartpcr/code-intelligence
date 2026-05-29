@@ -72,10 +72,20 @@ func TestTreeSitterCParser_LanguageAndExtensions(t *testing.T) {
 // mirroring TestGoTreeSitterFixture_EmitsExpectedNodeAndEdgeSet
 // in parser_treesitter_go_test.go and
 // TestCSharpFixture_EmitsExpectedNodeAndEdgeSet in
-// parser_treesitter_csharp_test.go) rather than at the
-// dispatcher level (//go:build canonical_dispatcher, as used by
-// TestTypeScriptFixture_EmitsExpectedNodeAndEdgeSet and the
-// Python equivalent). The brief's "edge" terminology maps to
+// parser_treesitter_csharp_test.go). The companion test
+// TestCFixture_EmitFile_EmitsExpectedNodesAndEdges (in
+// parser_treesitter_c_dispatcher_test.go, gated on
+// `//go:build cgo && canonical_dispatcher`) drives the SAME
+// fixture through the dispatcher's EmitFile path and asserts
+// the actual emitted Node/Edge inputs (the brief's "edge"
+// terminology in the dispatcher's native graph-writer
+// vocabulary). The two tests are kept separate so the
+// parser-direct contract is exercised under plain `cgo` (the
+// stock Windows toolchain WITHOUT the canonical_dispatcher
+// tag) and the dispatcher-edge contract is exercised under
+// the full `cgo && canonical_dispatcher` build (where the
+// graphwriter test harness `newFakeWriter`/`makeEvent` is
+// available). The brief's "edge" terminology maps to
 // ParseResult fields the dispatcher consumes:
 //
 //   - "contains edge"      -> file-level decl (ClassDecl or
@@ -93,14 +103,6 @@ func TestTreeSitterCParser_LanguageAndExtensions(t *testing.T) {
 //     `.` or `/`, so the parser's `./`-
 //     prefix on local includes is the
 //     contract that suppresses the edge)
-//
-// The C parser walker is owned by the sibling stage workstream
-// `stage-3.1-ctreesitterparser-implementation`; this test pins
-// the acceptance shape that walker must produce when its
-// branch merges to `feature/memory`. Until that merge lands,
-// running this test against the placeholder Parse() (which
-// returns an empty ParseResult) will report the assertion
-// gaps -- by design, so the operator can see the swap surface.
 func TestCFixture_EmitsExpectedNodeAndEdgeSet(t *testing.T) {
 	const src = `#include <stdio.h>
 #include "local.h"
@@ -125,28 +127,6 @@ int greet(int n) {
 	res, err := parser.Parse("src/hello.c", []byte(src))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
-	}
-
-	// Pre-sibling-merge stub gate. The C walker is owned by
-	// sibling stage workstream
-	// `stage-3.1-ctreesitterparser-implementation` (see the
-	// `Decisions made this iter` note in `.forge/iter-notes.md`
-	// iter 2). Until that branch merges to `feature/memory`,
-	// `parser_treesitter_c.go`'s Parse() returns an empty
-	// ParseResult. The gate skips ONLY when ALL three slices
-	// are empty -- a partial walker regression that emits any
-	// node still trips the assertions below, and any other
-	// `//go:build cgo` test in this package that touches the
-	// C parser (e.g. dispatcher-level cgo tests once dispatcher
-	// landing is restored) would catch a "walker collapsed
-	// entirely" regression loudly. The gate exists so this
-	// acceptance test is not permanently RED while the sibling
-	// stage is still in flight; iter-1 evaluator feedback
-	// item 1 (`TestCFixture is currently a red test against
-	// the branch state`) is addressed by this gate.
-	if len(res.Classes) == 0 && len(res.Methods) == 0 && len(res.Imports) == 0 {
-		t.Skip("c walker not yet merged from sibling stage stage-3.1-ctreesitterparser-implementation; " +
-			"test asserts the post-merge contract -- see fixture and assertions below for the pinned shape")
 	}
 
 	// ----- Classes -----

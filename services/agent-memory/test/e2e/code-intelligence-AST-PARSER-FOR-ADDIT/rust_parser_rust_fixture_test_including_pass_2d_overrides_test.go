@@ -54,6 +54,8 @@ func (w *spyWriter) edgeCounts() map[string]int {
 // ---------------------------------------------------------------------------
 
 type rustFixtureState struct {
+	t *testing.T // stored so steps can call t.Skip when CGO is unavailable
+
 	// Scenario 1: fixture node+edge count via real Dispatcher.EmitFile
 	fixtureSrc string
 	spy        *spyWriter
@@ -83,7 +85,8 @@ func (s *rustFixtureState) emitFileRunsUnderCGOOn() error {
 	_, err := d.EmitFile("fixture.rs", []byte(s.fixtureSrc))
 	if err != nil {
 		if errors.Is(err, ast.ErrParserUnavailable) {
-			return fmt.Errorf("Rust tree-sitter parser requires CGO_ENABLED=1: %w", err)
+			s.t.Skip("Rust tree-sitter parser requires CGO_ENABLED=1 — skipping scenario")
+			return nil // unreachable; t.Skip panics, caught by godog
 		}
 		return err
 	}
@@ -247,7 +250,11 @@ func (s *rustFixtureState) attrsJSONForContainsTrait(implMethod, traitName strin
 // ---------------------------------------------------------------------------
 
 func InitializeScenario_rust_parser_rust_fixture_test_including_pass_2d_overrides(ctx *godog.ScenarioContext) {
-	s := &rustFixtureState{}
+	initScenarioWithT(ctx, nil)
+}
+
+func initScenarioWithT(ctx *godog.ScenarioContext, t *testing.T) {
+	s := &rustFixtureState{t: t}
 
 	// Scenario 1: Rust fixture node + edge count
 	ctx.Given(`^the Rust fixture source:$`, s.theRustFixtureSource)
@@ -290,7 +297,9 @@ func InitializeScenario_rust_parser_rust_fixture_test_including_pass_2d_override
 
 func TestE2E_rust_parser_rust_fixture_test_including_pass_2d_overrides(t *testing.T) {
 	suite := godog.TestSuite{
-		ScenarioInitializer: InitializeScenario_rust_parser_rust_fixture_test_including_pass_2d_overrides,
+		ScenarioInitializer: func(ctx *godog.ScenarioContext) {
+			initScenarioWithT(ctx, t)
+		},
 		Options: &godog.Options{
 			Format:   "pretty",
 			Paths:    []string{"rust_parser_rust_fixture_test_including_pass_2d_overrides.feature"},

@@ -4,11 +4,17 @@ package ast
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/repoindexer"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
 )
 
 // TestGoTreeSitterFixture_EmitsExpectedNodeAndEdgeSet pins
@@ -501,3 +507,421 @@ func hasMemberAccess(accesses []MemberAccess, name string, wantWrite bool) bool 
 	}
 	return false
 }
+
+// TestGoFixture_EmitsExpectedNodeAndEdgeSet is the dispatcher-
+// shape companion to TestGoTreeSitterFixture_EmitsExpectedNodeAndEdgeSet
+// (parser-direct) above. Where the parser-direct test pins the
+// ParseResult shape the Go tree-sitter walker MUST produce, THIS
+// test exercises the full EmitFile pipeline (parser routing →
+// Pass 0 imports → Pass 1a classes → Pass 1b methods → Pass 2b
+// bare-call resolver → Pass 2c reads/writes) against a minimal
+// in-test fake writer and asserts the exact Node/Edge graph the
+// workstream brief calls out:
+//
+//   - 1 class node (Greeter, kind=struct)
+//   - 2 method nodes (*Greeter.Greet, formatGreeting)
+//   - 3 contains edges (file→Greeter, Greeter→*Greeter.Greet,
+//     file→formatGreeting)
+//   - 1 static_calls edge (*Greeter.Greet → formatGreeting)
+//   - 1 imports edge (file → fmt package node)
+//
+// Mirrors TestTypeScriptFixture_EmitsExpectedNodeAndEdgeSet
+// (parser_typescript_test.go) in structure but is gated on
+// `//go:build cgo` ONLY (not `cgo && canonical_dispatcher`) so
+// the workstream brief's stated validation command
+// (`go test ./internal/repoindexer/ast -count=1` with CGO on)
+// exercises the dispatcher-emission Node/Edge assertions in a
+// single run. The minimal helpers below (`goFakeWriter`,
+// `goMakeEvent`, `goAttrString`, `goMustNodeIDForSig`,
+// `goItoa`) are deliberately `go`-prefixed so they do NOT
+// collide with the C-test-local equivalents (`cFakeWriter`
+// etc. in parser_treesitter_c_dispatcher_test.go) nor the
+// canonical_dispatcher-gated equivalents in dispatcher_test.go
+// (`fakeNodeEdgeWriter`, `makeEvent`, `attrString`, etc.) when
+// the `canonical_dispatcher` tag is ALSO set -- all three
+// helper-sets coexist in the same package without symbol
+// collision.
+//
+// Endpoints are resolved by canonical signature (NOT just by
+// count) so a regression that flips edge direction cannot pass
+// vacuously. Negative assertions pin 0 extends / 0 implements /
+// 0 overrides edges so a walker that accidentally copied a
+// C++ / Rust branch is caught. The Pass 2c `reads` edge that
+// the dispatcher emits for the `g.prefix` access in Greet is
+// pinned positively (1 reads edge from *Greeter.Greet → Greeter)
+// so a regression that drops Pass 2c on Go is caught here too.
+func TestGoFixture_EmitsExpectedNodeAndEdgeSet(t *testing.T) {
+	const src = `package hello
+
+import "fmt"
+
+type Greeter struct {
+	prefix string
+}
+
+func (g *Greeter) Greet(name string) string {
+	return formatGreeting(g.prefix, name)
+}
+
+func formatGreeting(prefix, name string) string {
+	return fmt.Sprintf("%s %s", prefix, name)
+}
+`
+	fw := newGoFakeWriter()
+	d := NewDispatcher(fw)
+	if _, err := d.EmitFile(context.Background(), goMakeEvent("src/hello.go", src)); err != nil {
+		t.Fatalf("EmitFile: %v", err)
+	}
+
+	const (
+		repoURL = "https://git.example/acme/svc"
+		relPath = "src/hello.go"
+	)
+
+	// ----- class Nodes -----
+	// Pinned: 1 class Node (Greeter, kind=struct).
+	classes := fw.nodesOf("class")
+	if len(classes) != 1 {
+		t.Fatalf("class nodes = %d; want 1 (Greeter); nodes=%+v",
+			len(classes), classes)
+	}
+	if got := goAttrString(t, classes[0].AttrsJSON, "language"); got != "go" {
+		t.Errorf("class %s attrs.language = %q; want %q",
+			classes[0].CanonicalSignature, got, "go")
+	}
+	if got := goAttrString(t, classes[0].AttrsJSON, "decl_kind"); got != "struct" {
+		t.Errorf("class %s attrs.decl_kind = %q; want %q",
+			classes[0].CanonicalSignature, got, "struct")
+	}
+
+	// ----- method Nodes -----
+	// Pinned: 2 method Nodes (*Greeter.Greet pointer-receiver
+	// method, formatGreeting free function).
+	methods := fw.nodesOf("method")
+	if len(methods) != 2 {
+		t.Fatalf("method nodes = %d; want 2 (*Greeter.Greet, formatGreeting); nodes=%+v",
+			len(methods), methods)
+	}
+	for _, m := range methods {
+		if got := goAttrString(t, m.AttrsJSON, "language"); got != "go" {
+			t.Errorf("method %s attrs.language = %q; want %q",
+				m.CanonicalSignature, got, "go")
+		}
+	}
+
+	// ----- package Nodes -----
+	// Pinned: 1 package Node (fmt external). "fmt" is not
+	// workspace-relative, so isRelativeImportSpecifier MUST
+	// return false and the dispatcher MUST mint the package
+	// node + imports edge.
+	pkgs := fw.nodesOf("package")
+	if len(pkgs) != 1 {
+		t.Fatalf("package nodes = %d; want 1 (fmt); nodes=%+v",
+			len(pkgs), pkgs)
+	}
+	// Pin the package-node attrs that `packageAttrsJSON` in
+	// dispatcher.go actually emits: `module` (the import
+	// specifier) and `source="external"` (every Pass 0 module
+	// is external by construction). `language` is intentionally
+	// NOT asserted -- it is NOT part of packageAttrsJSON's
+	// output today.
+	if got := goAttrString(t, pkgs[0].AttrsJSON, "module"); got != "fmt" {
+		t.Errorf("fmt attrs.module = %q; want %q", got, "fmt")
+	}
+	if got := goAttrString(t, pkgs[0].AttrsJSON, "source"); got != "external" {
+		t.Errorf("fmt attrs.source = %q; want %q", got, "external")
+	}
+
+	// ----- node ids by canonical signature -----
+	// Signatures are built INLINE here (not via shared
+	// classSignature / methodSignature / externalPackageSignature
+	// helpers) so this test does not depend on any other
+	// test-helper file that may or may not be present in the
+	// package. The formats mirror dispatcher.go's `fmt.Sprintf`
+	// calls in Pass 0 / Pass 1a / Pass 1b exactly so a
+	// regression that changes the canonical signature shape is
+	// caught here.
+	greeterClassSig := fmt.Sprintf("%s::class::%s#%s", repoURL, relPath, "Greeter")
+	// Go parser sets ParamSignature to the parens-stripped
+	// parameter list verbatim (see parser_treesitter_go.go
+	// trimParens(p.Content(...))): `(name string)` →
+	// `"name string"`; `(prefix, name string)` →
+	// `"prefix, name string"`.
+	greetMethodSig := fmt.Sprintf("%s::method::%s#%s(%s)", repoURL, relPath, "*Greeter.Greet", "name string")
+	formatMethodSig := fmt.Sprintf("%s::method::%s#%s(%s)", repoURL, relPath, "formatGreeting", "prefix, name string")
+	fmtPkgSig := fmt.Sprintf("%s::package::%s", repoURL, "fmt")
+
+	greeterClassID := goMustNodeIDForSig(t, fw, greeterClassSig)
+	greetMethodID := goMustNodeIDForSig(t, fw, greetMethodSig)
+	formatMethodID := goMustNodeIDForSig(t, fw, formatMethodSig)
+	fmtPkgID := goMustNodeIDForSig(t, fw, fmtPkgSig)
+
+	// ----- contains edges -----
+	// Pinned: 3 contains edges. The pointer-receiver method
+	// *Greeter.Greet's parent is the Greeter class (NOT the
+	// file) because the dispatcher Pass 1b reparents methods
+	// with EnclosingClass to their class node. The free
+	// function formatGreeting has no EnclosingClass so its
+	// parent is the file. Endpoints checked, not just count,
+	// so a regression that mis-parents *Greeter.Greet under
+	// the file (which would still produce 3 contains edges
+	// but with the wrong source on one) is caught.
+	contains := fw.edgesOf("contains")
+	if len(contains) != 3 {
+		t.Fatalf("contains edges = %d; want 3 (file→Greeter, Greeter→*Greeter.Greet, file→formatGreeting); edges=%+v",
+			len(contains), contains)
+	}
+	type containsEdge struct{ src, dst string }
+	want := map[containsEdge]bool{
+		{src: "file-node-id", dst: greeterClassID}: false,
+		{src: greeterClassID, dst: greetMethodID}:  false,
+		{src: "file-node-id", dst: formatMethodID}: false,
+	}
+	for _, e := range contains {
+		key := containsEdge{src: e.SrcNodeID, dst: e.DstNodeID}
+		seen, expected := want[key]
+		if !expected {
+			t.Errorf("contains edge %s → %s: unexpected pair", e.SrcNodeID, e.DstNodeID)
+			continue
+		}
+		if seen {
+			t.Errorf("contains edge %s → %s: duplicate emission", e.SrcNodeID, e.DstNodeID)
+			continue
+		}
+		want[key] = true
+	}
+	for k, hit := range want {
+		if !hit {
+			t.Errorf("contains edge %s → %s: expected but not emitted", k.src, k.dst)
+		}
+	}
+
+	// ----- static_calls edges -----
+	// Pinned: 1 static_calls edge (*Greeter.Greet →
+	// formatGreeting). The Go walker captures `formatGreeting`
+	// as a bare-identifier call in (*Greeter).Greet.Calls;
+	// Pass 2b's simple-name multimap finds exactly one
+	// formatGreeting method node and mints the edge.
+	// Direction MUST be caller → callee.
+	staticCalls := fw.edgesOf("static_calls")
+	if len(staticCalls) != 1 {
+		t.Fatalf("static_calls edges = %d; want 1 (*Greeter.Greet → formatGreeting); edges=%+v",
+			len(staticCalls), staticCalls)
+	}
+	if staticCalls[0].SrcNodeID != greetMethodID || staticCalls[0].DstNodeID != formatMethodID {
+		t.Errorf("static_calls edge = %s → %s; want %s → %s (*Greeter.Greet → formatGreeting)",
+			staticCalls[0].SrcNodeID, staticCalls[0].DstNodeID,
+			greetMethodID, formatMethodID)
+	}
+
+	// ----- imports edges -----
+	// Pinned: 1 imports edge (file → fmt). The fixture has
+	// exactly one `import "fmt"` statement, and "fmt" is not
+	// workspace-relative, so isRelativeImportSpecifier returns
+	// false and the dispatcher mints the edge.
+	imports := fw.edgesOf("imports")
+	if len(imports) != 1 {
+		t.Fatalf("imports edges = %d; want 1 (file → fmt); edges=%+v",
+			len(imports), imports)
+	}
+	if imports[0].SrcNodeID != "file-node-id" || imports[0].DstNodeID != fmtPkgID {
+		t.Errorf("imports edge = %s → %s; want %s → %s (file → fmt)",
+			imports[0].SrcNodeID, imports[0].DstNodeID,
+			"file-node-id", fmtPkgID)
+	}
+
+	// ----- reads edges (Pass 2c) -----
+	// The Go walker records `g.prefix` (a read of the
+	// receiver field) in *Greeter.Greet.MemberAccesses with
+	// IsWrite=false. Pass 2c aggregates per (method, isWrite)
+	// pair into ONE edge: the dispatcher emits exactly one
+	// `reads` edge from *Greeter.Greet to its enclosing
+	// Greeter class. This positive assertion guards against a
+	// regression that drops Pass 2c on Go.
+	reads := fw.edgesOf("reads")
+	if len(reads) != 1 {
+		t.Errorf("reads edges = %d; want 1 (*Greeter.Greet → Greeter for g.prefix); edges=%+v",
+			len(reads), reads)
+	} else if reads[0].SrcNodeID != greetMethodID || reads[0].DstNodeID != greeterClassID {
+		t.Errorf("reads edge = %s → %s; want %s → %s (*Greeter.Greet → Greeter)",
+			reads[0].SrcNodeID, reads[0].DstNodeID,
+			greetMethodID, greeterClassID)
+	}
+
+	// ----- negative edges -----
+	// The Go fixture has no embedding / no interface
+	// implementation / no trait override, so the dispatcher
+	// MUST NOT mint extends / implements / overrides edges.
+	// Greet writes nothing to g.* (it only reads g.prefix),
+	// so the writes edge count MUST be 0 as well.
+	if got := len(fw.edgesOf("extends")); got != 0 {
+		t.Errorf("extends edges = %d; want 0 (no embedding in fixture)", got)
+	}
+	if got := len(fw.edgesOf("implements")); got != 0 {
+		t.Errorf("implements edges = %d; want 0 (no interface impl in fixture)", got)
+	}
+	if got := len(fw.edgesOf("overrides")); got != 0 {
+		t.Errorf("overrides edges = %d; want 0 (no trait override in fixture)", got)
+	}
+	if got := len(fw.edgesOf("writes")); got != 0 {
+		t.Errorf("writes edges = %d; want 0 (Greet only reads g.prefix, no assignment)", got)
+	}
+}
+
+// ----------------------------------------------------------
+// Local test-only helpers for the `//go:build cgo` Go
+// dispatcher test. Names are `go`-prefixed so they coexist
+// with the C-test-local helpers (`cFakeWriter` etc. in
+// parser_treesitter_c_dispatcher_test.go) AND the
+// canonical_dispatcher-gated dispatcher_test.go helpers
+// (`fakeNodeEdgeWriter`, `makeEvent`, `attrString`,
+// `mustNodeIDForSig`, `itoa`) without symbol collision when
+// either / both other tag combinations are set.
+// ----------------------------------------------------------
+
+// goFakeWriter is a minimal NodeEdgeWriter implementation
+// that captures every InsertNode / InsertEdge call so the
+// Go-fixture dispatcher test can assert on the exact emitted
+// graph without a PostgreSQL connection. Mirrors the
+// canonical_dispatcher-gated `fakeNodeEdgeWriter` semantics:
+// idempotent inserts by (kind, canonical_signature) so two
+// calls with the same signature return the same NodeID
+// (matching the real writer's (repo_id, fingerprint) unique
+// key behaviour).
+type goFakeWriter struct {
+	mu      sync.Mutex
+	nodes   []graphwriter.NodeInput
+	edges   []graphwriter.EdgeInput
+	idBySig map[string]string
+}
+
+func newGoFakeWriter() *goFakeWriter {
+	return &goFakeWriter{idBySig: map[string]string{}}
+}
+
+func (f *goFakeWriter) InsertNode(_ context.Context, in graphwriter.NodeInput) (graphwriter.NodeRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if id, dup := f.idBySig[in.CanonicalSignature]; dup {
+		fp, _ := fingerprint.NodeFingerprint(in.RepoID, in.Kind, in.CanonicalSignature, in.FromSHA)
+		return graphwriter.NodeRecord{NodeID: id, Fingerprint: fp, Inserted: false}, nil
+	}
+	id := "node-" + goItoa(len(f.nodes))
+	f.idBySig[in.CanonicalSignature] = id
+	f.nodes = append(f.nodes, in)
+	fp, _ := fingerprint.NodeFingerprint(in.RepoID, in.Kind, in.CanonicalSignature, in.FromSHA)
+	return graphwriter.NodeRecord{NodeID: id, Fingerprint: fp, Inserted: true}, nil
+}
+
+func (f *goFakeWriter) InsertEdge(_ context.Context, in graphwriter.EdgeInput) (graphwriter.EdgeRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.edges = append(f.edges, in)
+	id := "edge-" + goItoa(len(f.edges)-1)
+	return graphwriter.EdgeRecord{EdgeID: id, Inserted: true}, nil
+}
+
+func (f *goFakeWriter) nodesOf(kind string) []graphwriter.NodeInput {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []graphwriter.NodeInput
+	for _, n := range f.nodes {
+		if n.Kind == kind {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+func (f *goFakeWriter) edgesOf(kind string) []graphwriter.EdgeInput {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []graphwriter.EdgeInput
+	for _, e := range f.edges {
+		if e.Kind == kind {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// goStringReadCloser wraps a string as a repoindexer.ReadCloser
+// for in-memory test EmitFileEvent.Open functions.
+type goStringReadCloser struct {
+	r *strings.Reader
+}
+
+func (s *goStringReadCloser) Read(p []byte) (int, error) { return s.r.Read(p) }
+func (s *goStringReadCloser) Close() error               { return nil }
+
+// goMakeEvent constructs an EmitFileEvent backed by an
+// in-memory source string. Mirrors `dispatcher_test.go`'s
+// `makeEvent` so the canonical signature inputs (RepoURL,
+// FileNodeID, SHA) line up with the dispatcher's
+// signature-minting code and the test's inline-built
+// expected-signature computations.
+func goMakeEvent(relPath, src string) repoindexer.EmitFileEvent {
+	return repoindexer.EmitFileEvent{
+		RepoID:     fingerprint.MustParseRepoID("11111111-2222-3333-4444-555555555555"),
+		RepoURL:    "https://git.example/acme/svc",
+		SHA:        "shaABC",
+		FileNodeID: "file-node-id",
+		RelPath:    relPath,
+		Open: func() (repoindexer.ReadCloser, error) {
+			return &goStringReadCloser{r: strings.NewReader(src)}, nil
+		},
+	}
+}
+
+// goAttrString reads a string-valued key from a JSON-encoded
+// attrs blob. Failing assertion via t.Fatalf rather than
+// returning ("", err) so callers stay terse.
+func goAttrString(t *testing.T, raw json.RawMessage, key string) string {
+	t.Helper()
+	if len(raw) == 0 {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("attrs JSON unmarshal: %v (raw=%s)", err, string(raw))
+	}
+	v, ok := m[key]
+	if !ok {
+		return ""
+	}
+	s, ok := v.(string)
+	if !ok {
+		t.Fatalf("attrs[%q] is %T; want string", key, v)
+	}
+	return s
+}
+
+// goMustNodeIDForSig returns the fake writer's NodeID for the
+// given canonical signature, failing the test if no node
+// matches. Used to translate from inline-built canonical
+// signatures to the dispatcher-assigned NodeID so edge
+// endpoint assertions don't depend on insertion order.
+func goMustNodeIDForSig(t *testing.T, fw *goFakeWriter, sig string) string {
+	t.Helper()
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	id, ok := fw.idBySig[sig]
+	if !ok {
+		known := make([]string, 0, len(fw.idBySig))
+		for k := range fw.idBySig {
+			known = append(known, k)
+		}
+		// Simple insertion sort for stable failure messages
+		// (avoids pulling in `sort` just for a test diagnostic).
+		for i := 1; i < len(known); i++ {
+			for j := i; j > 0 && known[j-1] > known[j]; j-- {
+				known[j-1], known[j] = known[j], known[j-1]
+			}
+		}
+		t.Fatalf("no node found with canonical signature %q; known signatures=%v",
+			sig, known)
+	}
+	return id
+}
+
+func goItoa(i int) string { return strconv.Itoa(i) }

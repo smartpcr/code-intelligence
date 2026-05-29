@@ -15,18 +15,18 @@ func NewRegexpGoParser() LanguageParser {
 	return &goRegexpParser{}
 }
 
-func (p *goRegexpParser) Language() string   { return "go" }
+func (p *goRegexpParser) Language() string     { return "go" }
 func (p *goRegexpParser) Extensions() []string { return []string{".go"} }
 
 var (
 	// funcRe matches top-level func declarations with optional receivers.
-	// Groups: 1=receiver block, 2=receiver var, 3=pointer star, 4=receiver type, 5=func name, 6=params
+	// Groups: 1=receiver var, 2=pointer star, 3=receiver type, 4=func name, 5=params
 	funcRe = regexp.MustCompile(`(?m)^func\s+(?:\(\s*(\w+)\s+(\*?)(\w+)\s*\)\s+)?(\w+)\s*\(([^)]*)\)\s*(?:\S[^\{]*)?\{`)
 
 	// typeRe matches type declarations (struct / interface).
 	typeRe = regexp.MustCompile(`(?m)^type\s+(\w+)\s+(struct|interface)\s*\{`)
 
-	// importRe matches single-line imports: import "path"
+	// singleImportRe matches single-line imports: import "path"
 	singleImportRe = regexp.MustCompile(`(?m)^import\s+"([^"]+)"`)
 
 	// importBlockRe matches multi-line import blocks.
@@ -42,11 +42,11 @@ func (p *goRegexpParser) Parse(relPath string, src []byte) (ParseResult, error) 
 
 	// --- imports ---
 	for _, m := range singleImportRe.FindAllStringSubmatch(code, -1) {
-		result.Imports = append(result.Imports, Import{Path: m[1]})
+		result.Imports = append(result.Imports, Import{Module: m[1]})
 	}
 	for _, block := range importBlockRe.FindAllStringSubmatch(code, -1) {
 		for _, pm := range importPathRe.FindAllStringSubmatch(block[1], -1) {
-			result.Imports = append(result.Imports, Import{Path: pm[1]})
+			result.Imports = append(result.Imports, Import{Module: pm[1]})
 		}
 	}
 

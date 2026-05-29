@@ -262,7 +262,6 @@ func (e powershellEnvelope) toParseResult() ParseResult {
 
 	for _, imp := range e.Imports {
 		res.Imports = append(res.Imports, Import{
-			Path:   imp.Module,
 			Module: imp.Module,
 			Line:   imp.Line,
 			LangMeta: map[string]any{

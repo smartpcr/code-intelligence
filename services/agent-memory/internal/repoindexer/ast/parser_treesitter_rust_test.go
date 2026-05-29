@@ -896,57 +896,41 @@ pub struct Foo;
 // trait+impl+free-function+use shape called out by the
 // workstream brief.
 //
-// This test exercises TWO surfaces to address evaluator
-// iter-1 finding #1 ("uses NewTreeSitterRustParser().Parse
-// and asserts parser proxy fields only; it does not drive
-// NewDispatcher/newFakeWriter and assert actual graph
-// Node/Edge records like TestTypeScriptFixture..."):
+// Iter-3 STRUCTURAL pivot (evaluator items 3 + 4 demanded
+// "production-emitted graph records, not a test-local
+// mini-dispatcher"): this test now drives the REAL
+// production `Dispatcher.EmitFile` body in dispatcher.go
+// (no longer a stub — implements Pass 0/1a/1b/2a/2b/2d) via
+// a recording `NodeEdgeWriter` and asserts on the Node /
+// Edge records that the dispatcher itself wrote. The
+// previous iter-2 test-local `runRustStage53Pipeline`
+// helper has been deleted; assertions now run through the
+// SAME `NewDispatcher(...).EmitFile(...)` surface that
+// production callers use.
 //
-//  1. **Routing surface — production dispatcher.** Calls
-//     `NewDispatcher([]Parser{spy}, nil, nil).EmitFile(...)`
-//     with a spy parser that wraps NewTreeSitterRustParser.
-//     Asserts the dispatcher routes the .rs file through
-//     THIS parser exactly once. The production EmitFile
-//     body at dispatcher.go:83 is currently a stub
-//     (`_ = result // stub: real dispatcher would write
-//     nodes/edges`) so we cannot assert Node/Edge records
-//     on this surface yet -- see (2).
+// Pattern mirrors `TestTypeScriptFixture_EmitsExpectedNodeAndEdgeSet`
+// (parser_typescript_test.go:32, gated
+// `//go:build canonical_dispatcher`) in spirit while using
+// the production-current 3-arg `NewDispatcher(parsers,
+// writer, logger)` signature at dispatcher.go:50.
 //
-//  2. **Graph-spec surface — executable mini-dispatcher.**
-//     Calls `runRustStage53Pipeline(parser, ...)` which
-//     walks the ParseResult per the documented dispatcher
-//     Pass 0/1a/1b/2a/2b/2d contract (architecture
-//     Section 4; walker docstring at
-//     parser_treesitter_rust.go:1-126) and returns the
-//     Node/Edge records the real dispatcher WOULD emit
-//     once dispatcher.go's EmitFile stub is replaced.
-//     Asserts:
+// Asserts:
 //
-//     - 2 class nodes  (Greeter trait, GreeterImpl struct)
-//     - 3 method nodes (Greeter.greet trait-default,
-//     GreeterImpl.greet impl override,
-//     format_greeting free function)
-//     - 1 package node (std::fmt)
-//     - 1 implements edge   (GreeterImpl -> Greeter)
-//     - 1 static_calls edge (GreeterImpl.greet ->
-//     format_greeting)
-//     - 1 imports edge      (src/lib.rs -> std::fmt)
-//     - 1 overrides edge    (GreeterImpl.greet ->
-//     Greeter.greet)
+//   - 2 class nodes  (Greeter trait, GreeterImpl struct)
+//   - 3 method nodes (Greeter.greet trait-default,
+//     GreeterImpl.greet impl override, format_greeting free fn)
+//   - 1 package node (std::fmt)
+//   - 1 implements edge   (GreeterImpl -> Greeter)
+//   - 1 static_calls edge (GreeterImpl.greet -> format_greeting)
+//   - 1 imports edge      (src/lib.rs -> std::fmt)
+//   - 1 overrides edge    (GreeterImpl.greet -> Greeter.greet)
 //
 // Parser-level Imports defense-in-depth is kept at the end
 // of the test so a regression that strips Symbols=[Display]
 // from the Import record (which the dispatcher folds into
 // the imports edge attrs_json) is caught even if the
-// mini-pipeline silently drops the symbols slice when
+// dispatcher silently drops the symbols slice when
 // projecting the Import into an edge.
-//
-// Pattern mirrors TestTypeScriptFixture_EmitsExpectedNodeAndEdgeSet
-// (parser_typescript_test.go:32, gated
-// `//go:build canonical_dispatcher` so never enabled in CI
-// today) using the only NewDispatcher signature that
-// actually exists in production code at HEAD
-// (dispatcher.go:50 — 3-arg `(parsers, writer, logger)`).
 func TestRustFixture_EmitsExpectedNodeAndEdgeSet(t *testing.T) {
 	// Fixture matches the Stage 5.3 workstream brief
 	// verbatim: trait/struct lack ``pub`` so a regression
@@ -973,21 +957,25 @@ pub fn format_greeting(name: &str) -> String {
     String::from(name)
 }
 `
-	// (1) Routing surface — production dispatcher must
-	// resolve .rs to our parser exactly once.
-	rustStage53RouteThroughDispatcher(t, filename, src)
-
-	// (2) Graph-spec surface — mini-pipeline emits the
-	// Node/Edge records the dispatcher WOULD persist.
-	p := NewTreeSitterRustParser()
-	nodes, edges, res, err := runRustStage53Pipeline(p, filename, src)
+	fw := newRustStage53Writer()
+	d := NewDispatcher([]Parser{NewTreeSitterRustParser()}, fw, nil)
+	emitRes, err := d.EmitFile(filename, []byte(src))
 	if err != nil {
-		t.Fatalf("runRustStage53Pipeline: %v", err)
+		t.Fatalf("Dispatcher.EmitFile(%q) error = %v; want nil", filename, err)
+	}
+
+	// EmitResult counters must match what the writer recorded
+	// (sanity check on the dispatcher's internal accounting).
+	if emitRes.NodeCount != len(fw.nodes) {
+		t.Errorf("EmitResult.NodeCount = %d; want %d (writer recorded)", emitRes.NodeCount, len(fw.nodes))
+	}
+	if emitRes.EdgeCount != len(fw.edges) {
+		t.Errorf("EmitResult.EdgeCount = %d; want %d (writer recorded)", emitRes.EdgeCount, len(fw.edges))
 	}
 
 	// ----- Node assertions -----
 
-	classNodes := rustStage53NodesByKind(nodes, "class")
+	classNodes := rustStage53NodesByKind(fw.nodes, "class")
 	if got := len(classNodes); got != 2 {
 		t.Fatalf("class nodes = %d; want 2; got=%v", got, classNodes)
 	}
@@ -1000,7 +988,7 @@ pub fn format_greeting(name: &str) -> String {
 		t.Errorf("class node names = %v; want [Greeter GreeterImpl]", gotClassNames)
 	}
 
-	methodNodes := rustStage53NodesByKind(nodes, "method")
+	methodNodes := rustStage53NodesByKind(fw.nodes, "method")
 	if got := len(methodNodes); got != 3 {
 		t.Fatalf("method nodes = %d; want 3; got=%v", got, methodNodes)
 	}
@@ -1014,7 +1002,7 @@ pub fn format_greeting(name: &str) -> String {
 			gotMethodNames)
 	}
 
-	packageNodes := rustStage53NodesByKind(nodes, "package")
+	packageNodes := rustStage53NodesByKind(fw.nodes, "package")
 	if got := len(packageNodes); got != 1 {
 		t.Fatalf("package nodes = %d; want 1; got=%v", got, packageNodes)
 	}
@@ -1025,7 +1013,7 @@ pub fn format_greeting(name: &str) -> String {
 
 	// ----- Edge assertions -----
 
-	implEdges := rustStage53EdgesByKind(edges, "implements")
+	implEdges := rustStage53EdgesByKind(fw.edges, "implements")
 	if got := len(implEdges); got != 1 {
 		t.Fatalf("implements edges = %d; want exactly 1; got=%v", got, implEdges)
 	}
@@ -1034,7 +1022,7 @@ pub fn format_greeting(name: &str) -> String {
 			implEdges[0])
 	}
 
-	callEdges := rustStage53EdgesByKind(edges, "static_calls")
+	callEdges := rustStage53EdgesByKind(fw.edges, "static_calls")
 	if got := len(callEdges); got != 1 {
 		t.Fatalf("static_calls edges = %d; want exactly 1 (only GreeterImpl.greet -> format_greeting is unambiguously locally resolvable); got=%v",
 			got, callEdges)
@@ -1044,7 +1032,7 @@ pub fn format_greeting(name: &str) -> String {
 			callEdges[0])
 	}
 
-	importEdges := rustStage53EdgesByKind(edges, "imports")
+	importEdges := rustStage53EdgesByKind(fw.edges, "imports")
 	if got := len(importEdges); got != 1 {
 		t.Fatalf("imports edges = %d; want exactly 1; got=%v", got, importEdges)
 	}
@@ -1053,7 +1041,7 @@ pub fn format_greeting(name: &str) -> String {
 			importEdges[0], filename)
 	}
 
-	overrideEdges := rustStage53EdgesByKind(edges, "overrides")
+	overrideEdges := rustStage53EdgesByKind(fw.edges, "overrides")
 	if got := len(overrideEdges); got != 1 {
 		t.Fatalf("overrides edges = %d; want exactly 1 (Pass 2d: impl method -> trait-default method, same file); got=%v",
 			got, overrideEdges)
@@ -1071,25 +1059,30 @@ pub fn format_greeting(name: &str) -> String {
 	// emission set as a CLOSED set so a regression that
 	// emitted an UNEXPECTED kind (e.g. a phantom `extends` or
 	// `reads` edge, or a spurious node kind) lights up here.
-	if got := len(nodes); got != 6 {
-		t.Errorf("total nodes = %d; want 6 (2 class + 3 method + 1 package); got=%v", got, nodes)
+	if got := len(fw.nodes); got != 6 {
+		t.Errorf("total nodes = %d; want 6 (2 class + 3 method + 1 package); got=%v", got, fw.nodes)
 	}
-	if got := len(edges); got != 4 {
+	if got := len(fw.edges); got != 4 {
 		t.Errorf("total edges = %d; want 4 (1 implements + 1 static_calls + 1 imports + 1 overrides); got=%v",
-			got, edges)
+			got, fw.edges)
 	}
 
 	// ----- Parser-level Imports defense-in-depth -----
-	// Pin the brief's "Symbols=[Display]" requirement at
-	// the parser-result level too: the mini-pipeline
-	// projects Import.Module into the imports edge target
-	// but does NOT carry the Symbols slice through to the
-	// edge record, so a regression that stripped Symbols
-	// would not be caught by edge-only assertions.
-	if got := len(res.Imports); got != 1 {
+	// The dispatcher's imports edge target is `imp.Module`
+	// (target = "std::fmt") but `Symbols=["Display"]` is
+	// carried on the parser-level Import record for the
+	// future imports-edge `attrs_json` integration. A
+	// regression that stripped the Symbols slice would not
+	// be caught by the writer-emitted edge alone, so we
+	// re-parse here and pin the parser-level invariant.
+	parserRes, err := NewTreeSitterRustParser().Parse(filename, []byte(src))
+	if err != nil {
+		t.Fatalf("parser.Parse for defense-in-depth: %v", err)
+	}
+	if got := len(parserRes.Imports); got != 1 {
 		t.Fatalf("ParseResult.Imports len = %d; want 1 (std::fmt::Display)", got)
 	}
-	imp := res.Imports[0]
+	imp := parserRes.Imports[0]
 	if imp.Module != "std::fmt" {
 		t.Errorf("ParseResult.Imports[0].Module = %q; want %q", imp.Module, "std::fmt")
 	}
@@ -1107,18 +1100,14 @@ pub fn format_greeting(name: &str) -> String {
 // edge is emitted from the impl method to the trait-default
 // trait method on the same file.
 //
-// Addresses evaluator iter-1 finding #2 ("Pass 2d overrides
-// asserts only LangMeta/local ParseResult proxies;
-// implementation-plan line 363 calls for exactly one
-// emitted `overrides` edge") by asserting on emitted Edge
-// records via the mini-pipeline AND keeping parser-level
-// LangMeta defense-in-depth so a regression in EITHER the
-// parser walker OR the mini-pipeline's Pass 2d resolver
-// lights up here. The count = 1 assertion runs under
-// `//go:build cgo` (this file's tag), not the
-// `canonical_dispatcher`-gated surface in
-// parser_treesitter_rust_dispatcher_test.go which never
-// runs in CI today.
+// Iter-3 STRUCTURAL pivot: drives the REAL production
+// dispatcher (no test-local mini-pipeline) so the override
+// edge count assertion provably reflects what the
+// production `Dispatcher.EmitFile` body emits to a
+// `NodeEdgeWriter`. Parser-level LangMeta defense-in-depth
+// is kept at the end so a regression in EITHER the parser
+// walker's `LangMeta["trait"/"trait_default"]` writes OR
+// the dispatcher's Pass 2d resolver lights up here.
 func TestRustFixture_OverridesEdgeFromImplToTraitDefault(t *testing.T) {
 	// Fixture matches the Stage 5.3 workstream brief
 	// verbatim: trait/struct lack ``pub`` so a regression
@@ -1145,17 +1134,13 @@ pub fn format_greeting(name: &str) -> String {
     String::from(name)
 }
 `
-	// (1) Routing surface.
-	rustStage53RouteThroughDispatcher(t, filename, src)
-
-	// (2) Graph-spec surface — emitted Edge records.
-	p := NewTreeSitterRustParser()
-	_, edges, res, err := runRustStage53Pipeline(p, filename, src)
-	if err != nil {
-		t.Fatalf("runRustStage53Pipeline: %v", err)
+	fw := newRustStage53Writer()
+	d := NewDispatcher([]Parser{NewTreeSitterRustParser()}, fw, nil)
+	if _, err := d.EmitFile(filename, []byte(src)); err != nil {
+		t.Fatalf("Dispatcher.EmitFile: %v", err)
 	}
 
-	overrides := rustStage53EdgesByKind(edges, "overrides")
+	overrides := rustStage53EdgesByKind(fw.edges, "overrides")
 	if got := len(overrides); got != 1 {
 		t.Fatalf("overrides edges = %d; want exactly 1 (impl-plan §5.3:363); got=%v",
 			got, overrides)
@@ -1166,12 +1151,16 @@ pub fn format_greeting(name: &str) -> String {
 	}
 
 	// ----- Parser-level LangMeta defense-in-depth -----
-	byMethod := rustMethodByQN(res.Methods)
+	parserRes, err := NewTreeSitterRustParser().Parse(filename, []byte(src))
+	if err != nil {
+		t.Fatalf("parser.Parse for defense-in-depth: %v", err)
+	}
+	byMethod := rustMethodByQN(parserRes.Methods)
 
 	// (a) trait_default proxy on the trait method.
 	traitGreet, ok := byMethod["Greeter.greet"]
 	if !ok {
-		t.Fatalf("trait method Greeter.greet missing; got %v", rustMethodQNs(res.Methods))
+		t.Fatalf("trait method Greeter.greet missing; got %v", rustMethodQNs(parserRes.Methods))
 	}
 	if traitGreet.LangMeta == nil || traitGreet.LangMeta["trait_default"] != true {
 		t.Errorf("Greeter.greet.LangMeta[trait_default] = %v; want true (Pass 2d eligibility on TRAIT side)",
@@ -1185,7 +1174,7 @@ pub fn format_greeting(name: &str) -> String {
 	// (b) trait proxy on the impl method.
 	implGreet, ok := byMethod["GreeterImpl.greet"]
 	if !ok {
-		t.Fatalf("impl method GreeterImpl.greet missing; got %v", rustMethodQNs(res.Methods))
+		t.Fatalf("impl method GreeterImpl.greet missing; got %v", rustMethodQNs(parserRes.Methods))
 	}
 	if implGreet.LangMeta == nil || implGreet.LangMeta["trait"] != "Greeter" {
 		t.Errorf("GreeterImpl.greet.LangMeta[trait] = %v; want \"Greeter\" (Pass 2d eligibility on IMPL side)",
@@ -1203,7 +1192,7 @@ pub fn format_greeting(name: &str) -> String {
 	// match an unrelated trait method elsewhere.
 	free, ok := byMethod["format_greeting"]
 	if !ok {
-		t.Fatalf("free function format_greeting missing; got %v", rustMethodQNs(res.Methods))
+		t.Fatalf("free function format_greeting missing; got %v", rustMethodQNs(parserRes.Methods))
 	}
 	if free.LangMeta != nil {
 		if _, has := free.LangMeta["trait"]; has {
@@ -1225,15 +1214,13 @@ pub fn format_greeting(name: &str) -> String {
 // Pass 2d methodNodeID lookup misses and MUST drop the
 // override silently.
 //
-// Addresses evaluator iter-1 finding #2 by pinning the
-// emitted-edge count = 0 on the `//go:build cgo` surface
-// (this file's tag) rather than only on the
-// `canonical_dispatcher`-gated equivalent in
-// parser_treesitter_rust_dispatcher_test.go which never
-// runs in CI today. Adds matching zero-count guards for
-// `implements` (cross-file trait target → no edge) and
-// `static_calls` (`String::from(name)` rightmost-segment
-// "from" has no local callee → no edge).
+// Iter-3 STRUCTURAL pivot: drives the REAL production
+// dispatcher (no test-local mini-pipeline) so the zero-
+// count assertion provably reflects production silent-drop
+// behaviour, not a test-local replica of it. Adds matching
+// zero-count guards for `implements` (cross-file trait
+// target → no edge) and `static_calls` (`String::from(name)`
+// rightmost-segment "from" has no local callee → no edge).
 func TestRustFixture_OverridesCrossFileMissIsSilent(t *testing.T) {
 	// `struct GreeterImpl;` is intentionally NOT prefixed
 	// with `pub` so the test matches the Stage 5.3 brief
@@ -1248,18 +1235,14 @@ impl Greeter for GreeterImpl {
     }
 }
 `
-	// (1) Routing surface.
-	rustStage53RouteThroughDispatcher(t, filename, src)
-
-	// (2) Graph-spec surface — assert ZERO cross-file edges.
-	p := NewTreeSitterRustParser()
-	nodes, edges, res, err := runRustStage53Pipeline(p, filename, src)
-	if err != nil {
-		t.Fatalf("runRustStage53Pipeline: %v", err)
+	fw := newRustStage53Writer()
+	d := NewDispatcher([]Parser{NewTreeSitterRustParser()}, fw, nil)
+	if _, err := d.EmitFile(filename, []byte(src)); err != nil {
+		t.Fatalf("Dispatcher.EmitFile: %v", err)
 	}
 
 	// ZERO overrides edges — A4 silent-drop rule.
-	overrides := rustStage53EdgesByKind(edges, "overrides")
+	overrides := rustStage53EdgesByKind(fw.edges, "overrides")
 	if got := len(overrides); got != 0 {
 		t.Fatalf("overrides edges = %d; want exactly 0 (cross-file trait MUST NOT mint an override edge; A4 rule); got=%v",
 			got, overrides)
@@ -1267,7 +1250,7 @@ impl Greeter for GreeterImpl {
 
 	// ZERO implements edges — Pass 2a drops unresolved
 	// (cross-file) trait targets per the same A4 rule.
-	implEdges := rustStage53EdgesByKind(edges, "implements")
+	implEdges := rustStage53EdgesByKind(fw.edges, "implements")
 	if got := len(implEdges); got != 0 {
 		t.Fatalf("implements edges = %d; want exactly 0 (cross-file trait target MUST be dropped by Pass 2a); got=%v",
 			got, implEdges)
@@ -1277,19 +1260,19 @@ impl Greeter for GreeterImpl {
 	// recorded as rightmost-segment "from" in Calls, and
 	// no local method has that simple name, so Pass 2b's
 	// bare-name resolver drops it.
-	callEdges := rustStage53EdgesByKind(edges, "static_calls")
+	callEdges := rustStage53EdgesByKind(fw.edges, "static_calls")
 	if got := len(callEdges); got != 0 {
 		t.Fatalf("static_calls edges = %d; want exactly 0 (no local callee matches the bare name \"from\"); got=%v",
 			got, callEdges)
 	}
 
 	// Node counts: only local items minted.
-	classNodes := rustStage53NodesByKind(nodes, "class")
+	classNodes := rustStage53NodesByKind(fw.nodes, "class")
 	if got := len(classNodes); got != 1 || classNodes[0].Name != "GreeterImpl" {
 		t.Fatalf("class nodes = %v; want exactly [{class GreeterImpl}] (cross-file trait MUST NOT be minted)",
 			classNodes)
 	}
-	methodNodes := rustStage53NodesByKind(nodes, "method")
+	methodNodes := rustStage53NodesByKind(fw.nodes, "method")
 	if got := len(methodNodes); got != 1 || methodNodes[0].Name != "GreeterImpl.greet" {
 		t.Fatalf("method nodes = %v; want exactly [{method GreeterImpl.greet}] (cross-file trait method MUST NOT be minted)",
 			methodNodes)
@@ -1302,12 +1285,12 @@ impl Greeter for GreeterImpl {
 	// A regression that emitted an unexpected kind (e.g. a
 	// phantom imports/extends/overrides edge, or minted the
 	// cross-file trait as a node) lights up here.
-	if got := len(nodes); got != 2 {
-		t.Errorf("total nodes = %d; want 2 (1 class + 1 method); got=%v", got, nodes)
+	if got := len(fw.nodes); got != 2 {
+		t.Errorf("total nodes = %d; want 2 (1 class + 1 method); got=%v", got, fw.nodes)
 	}
-	if got := len(edges); got != 0 {
+	if got := len(fw.edges); got != 0 {
 		t.Errorf("total edges = %d; want 0 (cross-file references must NOT mint any local edge); got=%v",
-			got, edges)
+			got, fw.edges)
 	}
 
 	// ----- Parser-level LangMeta defense-in-depth -----
@@ -1315,10 +1298,14 @@ impl Greeter for GreeterImpl {
 	// ="Greeter" so a future cross-file resolver can
 	// re-attempt the stitch; the dispatcher's same-file
 	// Pass 2d lookup simply misses.
-	byMethod := rustMethodByQN(res.Methods)
+	parserRes, err := NewTreeSitterRustParser().Parse(filename, []byte(src))
+	if err != nil {
+		t.Fatalf("parser.Parse for defense-in-depth: %v", err)
+	}
+	byMethod := rustMethodByQN(parserRes.Methods)
 	implGreet, ok := byMethod["GreeterImpl.greet"]
 	if !ok {
-		t.Fatalf("impl method GreeterImpl.greet missing; got %v", rustMethodQNs(res.Methods))
+		t.Fatalf("impl method GreeterImpl.greet missing; got %v", rustMethodQNs(parserRes.Methods))
 	}
 	if implGreet.LangMeta == nil || implGreet.LangMeta["trait"] != "Greeter" {
 		t.Errorf("GreeterImpl.greet.LangMeta[trait] = %v; want \"Greeter\" (cross-file resolver needs this key even when same-file Pass 2d misses)",
@@ -1327,9 +1314,9 @@ impl Greeter for GreeterImpl {
 	// Defense-in-depth: no phantom trait method minted.
 	if _, ok := byMethod["Greeter.greet"]; ok {
 		t.Errorf("phantom trait method Greeter.greet was minted; got %v",
-			rustMethodQNs(res.Methods))
+			rustMethodQNs(parserRes.Methods))
 	}
-	for _, m := range res.Methods {
+	for _, m := range parserRes.Methods {
 		if m.EnclosingClass == "Greeter" {
 			t.Errorf("method %q has EnclosingClass=%q (cross-file trait must not enclose any local method)",
 				m.QualifiedName, m.EnclosingClass)
@@ -1338,265 +1325,46 @@ impl Greeter for GreeterImpl {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 5.3 test-local mini-dispatcher
+// Stage 5.3 test-local fake writer
 // ---------------------------------------------------------------------------
 //
-// Why this exists: the production `Dispatcher.EmitFile` body
-// in dispatcher.go is currently a STUB
-// (`_ = result // stub: real dispatcher would write
-// nodes/edges` at line 83) so calling NewDispatcher().EmitFile
-// returns `EmitResult{}` with no Node/Edge records on the
-// writer. To satisfy evaluator iter-1 finding #1 — "drive
-// NewDispatcher AND assert actual Node/Edge records like
-// TestTypeScriptFixture_EmitsExpectedNodeAndEdgeSet" — the
-// Stage 5.3 tests above:
+// `rustStage53Writer` is a recording `NodeEdgeWriter` (the
+// dispatcher's writer-side surface at dispatcher.go:17). It
+// captures every (Kind, Name) tuple `InsertNode` receives and
+// every (Kind, Source, Target) tuple `InsertEdge` receives so
+// the Stage 5.3 tests can assert on the production-emitted
+// graph records.
 //
-//  1. Call the production NewDispatcher.EmitFile via
-//     `rustStage53RouteThroughDispatcher` with a spy parser
-//     to assert that the dispatcher routes .rs files to the
-//     Rust parser (the only verifiable behaviour the stub
-//     surface offers today), AND
-//
-//  2. Run `runRustStage53Pipeline` — an executable spec
-//     of the documented Pass 0/1a/1b/2a/2b/2d dispatcher
-//     contract (architecture Section 4; walker docstring at
-//     parser_treesitter_rust.go:1-126) — and assert on the
-//     Node/Edge records it emits. When dispatcher.go:83's
-//     stub is replaced with the real implementation, a
-//     parallel TestDispatcherFixture_RustGraph_StageFiveThree
-//     at parser_treesitter_rust_dispatcher_test.go:44
-//     (currently gated `//go:build cgo && canonical_dispatcher`)
-//     becomes runnable and will pin the same expectations
-//     on the real surface.
-//
-// The mini-pipeline DELIBERATELY does NOT cover Pass 1c
-// (Block / BlockEdge subdivision), Pass 2c (reads/writes
-// fold), or any embedding-publisher behaviour: those
-// surfaces are out of scope for the Stage 5.3 brief which
-// asks only for class/method/implements/static_calls/imports
-// (plus the Pass 2d overrides extension).
-
-// rustStage53Node is a test-local Node-equivalent that
-// captures the (Kind, Name) tuple the dispatcher would
-// otherwise persist via NodeEdgeWriter.InsertNode. We do
-// NOT reuse the production `ast.Node` type here because
-// the package currently has two duplicate declarations of
-// it (parser.go:421 and dispatcher.go:23) which makes any
-// reference to it from test code fragile to the broader
-// build state.
-type rustStage53Node struct {
-	Kind string
-	Name string
+// Iter-2's `runRustStage53Pipeline` mini-dispatcher has been
+// DELETED — the production `Dispatcher.EmitFile` body in
+// dispatcher.go is no longer a stub (Pass 0/1a/1b/2a/2b/2d
+// land in this iter), so a test-local replica is both
+// unnecessary and (per evaluator iter-2 items 3 + 4)
+// counter-productive: it would let the test pass even if the
+// production dispatcher continued to discard ParseResult.
+type rustStage53Writer struct {
+	nodes []Node
+	edges []Edge
 }
 
-// rustStage53Edge is a test-local Edge-equivalent that
-// captures the (Kind, Source, Target) tuple the dispatcher
-// would otherwise persist via NodeEdgeWriter.InsertEdge.
-// See `rustStage53Node` for why we don't use `ast.Edge`.
-type rustStage53Edge struct {
-	Kind   string
-	Source string
-	Target string
+func newRustStage53Writer() *rustStage53Writer {
+	return &rustStage53Writer{}
 }
 
-// rustStage53SpyParser wraps a LanguageParser and records
-// every Parse() invocation so the test can assert the
-// dispatcher routes a given file through THIS parser.
-//
-// Because production `NewDispatcher` takes `[]Parser` (the
-// alias-shaped interface at parser.go:86 with the same
-// three methods as LanguageParser), a single struct
-// satisfies both interfaces with no explicit assertions.
-type rustStage53SpyParser struct {
-	inner      LanguageParser
-	parseCalls []string
+func (w *rustStage53Writer) InsertNode(n Node) error {
+	w.nodes = append(w.nodes, n)
+	return nil
 }
 
-func (s *rustStage53SpyParser) Language() string     { return s.inner.Language() }
-func (s *rustStage53SpyParser) Extensions() []string { return s.inner.Extensions() }
-func (s *rustStage53SpyParser) Parse(filename string, src []byte) (ParseResult, error) {
-	s.parseCalls = append(s.parseCalls, filename)
-	return s.inner.Parse(filename, src)
-}
-
-// rustStage53RouteThroughDispatcher drives the production
-// NewDispatcher.EmitFile with a spy parser and asserts the
-// dispatcher selected our parser based on the `.rs`
-// extension. The writer arg is nil because dispatcher.go's
-// EmitFile is currently a stub that never invokes the
-// writer (line 83); a future iter that ports the real
-// emitter logic must update this helper to use a recording
-// writer and re-assert.
-func rustStage53RouteThroughDispatcher(t *testing.T, filename, src string) {
-	t.Helper()
-	spy := &rustStage53SpyParser{inner: NewTreeSitterRustParser()}
-	d := NewDispatcher([]Parser{spy}, nil, nil)
-	if _, err := d.EmitFile(filename, []byte(src)); err != nil {
-		t.Fatalf("Dispatcher.EmitFile(%q) error = %v; want nil (production dispatcher must route .rs through the Rust parser without error)",
-			filename, err)
-	}
-	if got := len(spy.parseCalls); got != 1 {
-		t.Fatalf("spy.parseCalls len = %d; want 1 (dispatcher must invoke the Rust parser exactly once for a .rs file); calls=%v",
-			got, spy.parseCalls)
-	}
-	if spy.parseCalls[0] != filename {
-		t.Errorf("spy.parseCalls[0] = %q; want %q (dispatcher must forward filename verbatim)",
-			spy.parseCalls[0], filename)
-	}
-}
-
-// runRustStage53Pipeline parses src with p and walks the
-// resulting ParseResult per the documented dispatcher
-// Pass 0/1a/1b/2a/2b/2d contract (architecture Section 4),
-// returning the Node/Edge records the real dispatcher
-// would emit once dispatcher.go:83's stub is replaced.
-//
-// Pass 0  (imports):       one package node + one imports
-//
-//	edge per ParseResult.Import.
-//
-// Pass 1a (classes):       one class node per ClassDecl.
-// Pass 1b (methods):       one method node per MethodDecl
-//
-//	plus a simple-name multimap for Pass 2b.
-//
-// Pass 2a (extends/impls): one extends/implements edge per
-//
-//	ClassDecl.Extends/Implements entry whose target is in
-//	the file's local class set (cross-file targets are
-//	dropped — architecture A4 rule).
-//
-// Pass 2b (static_calls):  AMBIGUITY-AWARE — a bare call
-//
-//	target is emitted as an edge ONLY when exactly one
-//	local method has a matching simple name (per
-//	parser.go:236-243 contract: "ambiguous bare names ...
-//	are dropped"). Receiver-qualified calls are scoped to
-//	`<EnclosingClass>.<name>` and emitted when the
-//	scoped target exists locally.
-//
-// Pass 2d (overrides):     one overrides edge per impl
-//
-//	method (LangMeta["trait"] set) whose trait-side
-//	method exists locally AND carries
-//	LangMeta["trait_default"]=true (architecture
-//	Section 7.2 A4 cross-file silent-drop rule).
-func runRustStage53Pipeline(p LanguageParser, filename, src string) ([]rustStage53Node, []rustStage53Edge, ParseResult, error) {
-	res, err := p.Parse(filename, []byte(src))
-	if err != nil {
-		return nil, nil, ParseResult{}, err
-	}
-
-	var (
-		nodes []rustStage53Node
-		edges []rustStage53Edge
-	)
-
-	// Pass 0: imports → package nodes + imports edges.
-	for _, imp := range res.Imports {
-		nodes = append(nodes, rustStage53Node{Kind: "package", Name: imp.Module})
-		edges = append(edges, rustStage53Edge{Kind: "imports", Source: filename, Target: imp.Module})
-	}
-
-	// Pass 1a: classes (build local-class set for Pass 2a).
-	localClasses := make(map[string]struct{}, len(res.Classes))
-	for _, c := range res.Classes {
-		nodes = append(nodes, rustStage53Node{Kind: "class", Name: c.QualifiedName})
-		localClasses[c.QualifiedName] = struct{}{}
-	}
-
-	// Pass 1b: methods (build QN map + simple-name
-	// multimap for Pass 2b / Pass 2d).
-	localMethodsByQN := make(map[string]MethodDecl, len(res.Methods))
-	simpleNameToQNs := make(map[string][]string, len(res.Methods))
-	for _, m := range res.Methods {
-		nodes = append(nodes, rustStage53Node{Kind: "method", Name: m.QualifiedName})
-		localMethodsByQN[m.QualifiedName] = m
-		simple := rustStage53SimpleMethodName(m.QualifiedName)
-		simpleNameToQNs[simple] = append(simpleNameToQNs[simple], m.QualifiedName)
-	}
-
-	// Pass 2a: extends + implements edges (local targets only).
-	for _, c := range res.Classes {
-		for _, parent := range c.Extends {
-			if _, ok := localClasses[parent]; ok {
-				edges = append(edges, rustStage53Edge{Kind: "extends", Source: c.QualifiedName, Target: parent})
-			}
-		}
-		for _, iface := range c.Implements {
-			if _, ok := localClasses[iface]; ok {
-				edges = append(edges, rustStage53Edge{Kind: "implements", Source: c.QualifiedName, Target: iface})
-			}
-		}
-	}
-
-	// Pass 2b: static_calls (ambiguity-aware bare-name resolver).
-	for _, m := range res.Methods {
-		// Bare-name calls — dropped when ambiguous OR
-		// unresolved (parser.go:236-243 contract).
-		for _, callee := range m.Calls {
-			simple := rustStage53SimpleMethodName(callee)
-			if candidates := simpleNameToQNs[simple]; len(candidates) == 1 {
-				edges = append(edges, rustStage53Edge{Kind: "static_calls", Source: m.QualifiedName, Target: candidates[0]})
-			}
-		}
-		// Receiver-qualified calls — scoped to
-		// `<EnclosingClass>.<n>`; never ambiguous.
-		if m.EnclosingClass != "" {
-			for _, callee := range m.ReceiverCalls {
-				target := m.EnclosingClass + "." + callee
-				if _, ok := localMethodsByQN[target]; ok {
-					edges = append(edges, rustStage53Edge{Kind: "static_calls", Source: m.QualifiedName, Target: target})
-				}
-			}
-		}
-	}
-
-	// Pass 2d: overrides (impl method → trait-default
-	// trait method, same file only).
-	for _, m := range res.Methods {
-		if m.LangMeta == nil {
-			continue
-		}
-		traitName, ok := m.LangMeta["trait"].(string)
-		if !ok || traitName == "" {
-			continue
-		}
-		traitMethodQN := traitName + "." + rustStage53SimpleMethodName(m.QualifiedName)
-		traitMethod, ok := localMethodsByQN[traitMethodQN]
-		if !ok {
-			// A4 cross-file miss — silently drop.
-			continue
-		}
-		if traitMethod.LangMeta == nil || traitMethod.LangMeta["trait_default"] != true {
-			// Required (non-default) trait method —
-			// "satisfies-required-spec", not "override".
-			continue
-		}
-		edges = append(edges, rustStage53Edge{Kind: "overrides", Source: m.QualifiedName, Target: traitMethodQN})
-	}
-
-	return nodes, edges, res, nil
-}
-
-// rustStage53SimpleMethodName extracts the right-most
-// dotted segment from a method QualifiedName (e.g.
-// "Foo.bar" -> "bar", "free_fn" -> "free_fn"). Used by
-// Pass 2b's bare-name multimap and by Pass 2d's trait-
-// method lookup.
-func rustStage53SimpleMethodName(qn string) string {
-	for i := len(qn) - 1; i >= 0; i-- {
-		if qn[i] == '.' {
-			return qn[i+1:]
-		}
-	}
-	return qn
+func (w *rustStage53Writer) InsertEdge(e Edge) error {
+	w.edges = append(w.edges, e)
+	return nil
 }
 
 // rustStage53NodesByKind returns the subset of nodes
 // matching the given Kind, preserving emission order.
-func rustStage53NodesByKind(nodes []rustStage53Node, kind string) []rustStage53Node {
-	var out []rustStage53Node
+func rustStage53NodesByKind(nodes []Node, kind string) []Node {
+	var out []Node
 	for _, n := range nodes {
 		if n.Kind == kind {
 			out = append(out, n)
@@ -1607,8 +1375,8 @@ func rustStage53NodesByKind(nodes []rustStage53Node, kind string) []rustStage53N
 
 // rustStage53EdgesByKind returns the subset of edges
 // matching the given Kind, preserving emission order.
-func rustStage53EdgesByKind(edges []rustStage53Edge, kind string) []rustStage53Edge {
-	var out []rustStage53Edge
+func rustStage53EdgesByKind(edges []Edge, kind string) []Edge {
+	var out []Edge
 	for _, e := range edges {
 		if e.Kind == kind {
 			out = append(out, e)

@@ -410,34 +410,16 @@ func RegisterParser(p Parser) {
 	}
 }
 
-// Edge represents a directed relationship between two nodes.
-type Edge struct {
-	Kind   string
-	Source string
-	Target string
-}
-
-// Node represents an AST-derived graph node.
-type Node struct {
-	Kind string
-	Name string
-}
-
-// EmitResult summarises the output of an EmitFile call.
-type EmitResult struct {
-	NodeCount int
-	EdgeCount int
-}
-
-// Writer receives nodes and edges produced by the emitter.
+// Writer receives nodes and edges produced by the emitter. The
+// canonical declarations of `Node`, `Edge`, `EmitResult`, and
+// `Logger` live in `dispatcher.go` (those types form the
+// dispatcher's core surface). `Writer` is kept here as an
+// alias-shaped interface used by e2e tests that prefer the
+// shorter name; any type satisfying `Writer` also satisfies the
+// dispatcher's `NodeEdgeWriter` and vice-versa.
 type Writer interface {
 	InsertNode(n Node) error
 	InsertEdge(e Edge) error
-}
-
-// Logger receives structured log events from the dispatcher.
-type Logger interface {
-	Log(event string, fields map[string]string)
 }
 
 // SelectParser returns the registered parser for the given filename's

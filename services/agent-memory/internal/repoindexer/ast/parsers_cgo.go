@@ -5,8 +5,14 @@ package ast
 // defaultParsers returns the tree-sitter-backed parser set used when
 // CGO is enabled at build time. Under a CGO=off build,
 // parsers_nocgo.go provides an alternative returning nil.
-func defaultParsers() []Parser {
-	return []Parser{
+func defaultParsers() []LanguageParser {
+	return []LanguageParser{
+		NewTreeSitterTypeScriptParser(),
+		NewTreeSitterPythonParser(),
+		NewTreeSitterCParser(),
+		NewTreeSitterCppParser(),
+		NewTreeSitterCSharpParser(),
+		NewTreeSitterGoParser(),
 		NewTreeSitterRustParser(),
 	}
 }

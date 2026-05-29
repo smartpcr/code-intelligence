@@ -24,8 +24,8 @@ package ast
 //	tsTreeSitterParser, pyTreeSitterParser,         (existing)
 //	cTreeSitterParser, cppTreeSitterParser,         (C/C++ stage)
 //	csharpTreeSitterParser,                         (C# stage)
-//	goTreeSitterParser,                             (this stage)
-//	rustTreeSitterParser,                           (later)
+//	goTreeSitterParser,                             (Go stage)
+//	rustTreeSitterParser,                           (this stage)
 //	powershellParser                                (later)
 //
 // Order matters for two reasons:
@@ -66,24 +66,23 @@ package ast
 //     `NewTreeSitterCSharpParser()` is the STUB (see iter-9
 //     fix), which the sibling stage will replace in place.
 //   - stage-5.1-rusttreesitterparser-implementation owns
-//     parser_treesitter_rust.go; will add
+//     parser_treesitter_rust.go; this stage adds
 //     NewTreeSitterRustParser() to this registration list.
 //   - stage-6.1-powershellparser-subprocess-implementation
 //     owns the PowerShell scanner/subprocess parser.
 //
 // This file (post-merge with feature/memory) registers
-// TypeScript, Python, C, C++, C#, and Go. The C# entry is a
-// STUB registration -- INTENTIONAL even though its walker is a
-// placeholder: keeping the public symbol
+// TypeScript, Python, C, C++, C#, Go, and Rust. The C# entry
+// is a STUB registration -- INTENTIONAL even though its
+// walker is a placeholder: keeping the public symbol
 // `NewTreeSitterCSharpParser` reachable from this list (a)
 // gives the dispatcher a stable `.cs` route so projects with
 // C# sources don't emit `ast.dispatch.skip{reason="no_parser"}`
 // noise while waiting for the sibling stage to merge, and (b)
 // reconciles the ground-truth Target Files list with the
 // actual code -- iter 8 evaluator items 1-2 (C#) flagged the
-// absence of this registration. Rust and PowerShell stay
-// unregistered here until their sibling stages merge their
-// real implementations.
+// absence of this registration. PowerShell stays unregistered
+// here until its sibling stage merges the real implementation.
 func defaultParsers() []LanguageParser {
 	return []LanguageParser{
 		NewTreeSitterTypeScriptParser(),
@@ -92,5 +91,6 @@ func defaultParsers() []LanguageParser {
 		NewTreeSitterCppParser(),
 		NewTreeSitterCSharpParser(),
 		NewTreeSitterGoParser(),
+		NewTreeSitterRustParser(),
 	}
 }

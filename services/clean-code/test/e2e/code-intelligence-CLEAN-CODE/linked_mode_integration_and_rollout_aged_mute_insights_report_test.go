@@ -358,6 +358,13 @@ func (s *agedMuteState) theNextAgedMutesReportOmitsTheScopeAndRulePair() error {
 func InitializeScenario_linked_mode_integration_and_rollout_aged_mute_insights_report(ctx *godog.ScenarioContext) {
 	s := &agedMuteState{}
 
+	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
+		if s.db != nil {
+			s.db.Close()
+		}
+		return ctx, nil
+	})
+
 	// aged-mute-listed-not-enforced
 	ctx.Step(`^an override with mute equal to "([^"]*)" and created_at "(\d+)" days ago$`, s.anOverrideWithMuteEqualToAndCreatedAtDaysAgo)
 	ctx.Step(`^the aged-mutes report runs$`, s.theAgedMutesReportRuns)

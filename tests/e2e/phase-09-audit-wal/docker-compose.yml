@@ -62,7 +62,6 @@ services:
   fault-injector:
     image: alpine/socat:latest
     entrypoint: ["sleep", "infinity"]
-    network_mode: "host"
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.100.0

@@ -164,11 +164,12 @@ const DefaultTimeout = 5 * time.Second
 // [context.WithCancel] composition -- whichever fires first
 // wins.
 type HTTPClient struct {
-	endpoint   *url.URL
-	httpClient *http.Client
-	timeout    time.Duration
-	userAgent  string
-	logger     *slog.Logger
+	endpoint       *url.URL
+	httpClient     *http.Client
+	timeout        time.Duration
+	userAgent      string
+	logger         *slog.Logger
+	strictDecoding bool
 }
 
 // Option configures an [HTTPClient].
@@ -214,6 +215,40 @@ func WithUserAgent(ua string) Option {
 func WithLogger(log *slog.Logger) Option {
 	return func(c *HTTPClient) {
 		c.logger = log
+	}
+}
+
+// WithStrictDecoding toggles strict JSON decoding for the
+// agent-memory `/v1/cross-repo/edges` response body.
+// Defaults to FALSE (tolerant).
+//
+// When FALSE -- the production default -- unknown JSON
+// fields in the response are silently ignored so the
+// agent-memory team can ship ADDITIVE wire changes (a
+// `graph_version` tag, per-edge debug metadata, a new
+// availability flag for a future edge family, ...) WITHOUT
+// forcing a coordinated clean-code redeploy. Strict
+// decoding in production would convert any additive wire
+// change into [ErrMalformedResponse] for every linked-mode
+// repo, force-degrading the entire fleet through the
+// embedded path until the operator deploys a refreshed
+// clean-code build -- the exact deploy-coupling the
+// "standalone by default" architecture pin (`doc.go`
+// "No agent-memory dependency in embedded mode") avoids.
+// The wire contract in `doc.go` enumerates the OMITTED-flag
+// semantics (defaults to FALSE -> degrade) but deliberately
+// does NOT pin a closed schema; additive fields are
+// permitted by contract.
+//
+// When TRUE, unknown fields surface as
+// [ErrMalformedResponse]. Use this in CI contract tests and
+// canary deploys where you want wire-shape drift to fail
+// loudly; production deployments MUST leave this at the
+// default false to preserve forward compatibility with the
+// agent-memory team's release cadence.
+func WithStrictDecoding(strict bool) Option {
+	return func(c *HTTPClient) {
+		c.strictDecoding = strict
 	}
 }
 
@@ -314,7 +349,15 @@ func (c *HTTPClient) FetchEdges(ctx context.Context, repoID uuid.UUID, sha strin
 
 	var out EdgeSet
 	dec := json.NewDecoder(io.LimitReader(resp.Body, 64*1024*1024)) // 64 MiB ceiling guards against pathological responses
-	dec.DisallowUnknownFields()
+	if c.strictDecoding {
+		// Opt-in strict mode (CI contract tests / canary).
+		// The default is tolerant so additive wire fields
+		// shipped by the agent-memory team do NOT
+		// force-degrade every linked-mode repo before a
+		// coordinated clean-code redeploy. See
+		// [WithStrictDecoding] for the rationale.
+		dec.DisallowUnknownFields()
+	}
 	if err := dec.Decode(&out); err != nil {
 		return EdgeSet{}, fmt.Errorf("%w: %s (repo_id=%s, sha=%s)",
 			ErrMalformedResponse, err.Error(), repoID, sha)

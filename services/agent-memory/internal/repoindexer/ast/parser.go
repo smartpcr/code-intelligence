@@ -27,21 +27,50 @@ type ParseResult struct {
 
 // ClassDecl represents a class, struct, interface, trait, or enum.
 type ClassDecl struct {
-	Name     string
-	LangMeta map[string]string
+	QualifiedName string
+	Kind          string
+	Extends       []string
+	Implements    []string
+	StartLine     int
+	EndLine       int
+	LangMeta      map[string]any
 }
 
-// MethodDecl represents a method or free function.
+// MethodDecl describes one method or free-function declaration.
 type MethodDecl struct {
-	Name      string
-	ClassName string
-	LangMeta  map[string]string
+	QualifiedName   string
+	EnclosingClass  string
+	ParamSignature  string
+	BodySource      string
+	StartLine       int
+	EndLine         int
+	BodyStartLine   int
+	BodyEndLine     int
+	BodyStartByte   int
+	BodyEndByte     int
+	Calls           []string
+	ReceiverCalls   []string
+	MemberAccesses  []MemberAccess
+	Modifiers       []string
+	ReceiverAliases []string
+	LangMeta        map[string]any
+}
+
+// MemberAccess records a receiver-qualified field access.
+type MemberAccess struct {
+	Name    string
+	IsWrite bool
 }
 
 // Import represents an import, include, use, or using directive.
 type Import struct {
-	Path     string
-	LangMeta map[string]string
+	Path       string
+	Module     string
+	Alias      string
+	Symbols    []string
+	Line       int
+	IsTypeOnly bool
+	LangMeta   map[string]any
 }
 
 // Edge represents a directed relationship between two nodes.

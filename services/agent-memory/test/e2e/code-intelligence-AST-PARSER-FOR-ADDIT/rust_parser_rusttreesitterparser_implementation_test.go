@@ -67,7 +67,11 @@ func (s *rustParserState) goBuildAstRunsFromModule() error {
 	out, err := cmd.CombinedOutput()
 	s.buildOutput = string(out)
 	if err != nil {
-		s.buildExitCode = 1
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			s.buildExitCode = exitErr.ExitCode()
+		} else {
+			s.buildExitCode = 1
+		}
 		return nil
 	}
 	s.buildExitCode = 0

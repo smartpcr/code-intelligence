@@ -50,19 +50,48 @@
 // per-repo policy-cache hit/miss while keeping the test
 // load deterministic.
 //
-// # SHA generation
+// # SHA generation -- BOUNDED, REPRODUCIBLE SET
 //
-// The brief does not pin a SHA-set shape; we generate a
-// unique SHA per request (`sha-${timestamp}-${vu}-${iter}`)
-// so the cache-cold path of the evaluator is exercised
-// (vs reusing one SHA per repo, which would let the
-// per-(repo, sha, policy_version) memoised verdict path
-// short-circuit the predicate evaluation and hide the
-// real SLO cost). This matches the architecture Sec 6.2
-// description of `eval.gate` as "looks up active rules
-// for `policy_version_id`, fetches MetricSample rows for
-// the SHA, evaluates predicates" -- the cache-cold path
-// is the one the SLO is published for.
+// The brief does not pin a SHA-set shape, but the
+// scenario MUST be reproducible against pre-seeded
+// fixture data: `eval.gate` returns a `samples_pending`
+// degraded verdict (architecture Sec 5.3.6, gate_evaluate.go
+// `writeDegraded`) when MetricSample rows are missing for
+// the (repo, sha) pair, and that fast path bypasses
+// predicate evaluation entirely -- i.e. the SLO under
+// measurement would be vacuously met by a server that
+// only ever degraded. The iter-1 evaluator flagged
+// `Date.now()`-based unique SHAs as unseedable; this
+// iter switches to a CLOSED set of SHAs that the
+// fixture seeder enumerates verbatim:
+//
+//   REPO_COUNT (100) repos x SHAS_PER_REPO (50) SHAs
+//   = 5_000 deterministic (repo_id, sha) pairs
+//
+// At the brief's 30 min * 50 req/min = 1500 requests, the
+// scenario hits at most 30% of the pre-seeded pairs and
+// each pair is sampled 0.3 times on average -- well below
+// 1, so the verdict cache (per-(repo, sha, policy_version)
+// memoization) is cache-cold on virtually every request,
+// which is the path the SLO was published for
+// (architecture Sec 6.2: "looks up active rules ...
+// fetches MetricSample rows ... evaluates predicates").
+// The bounded set means the operator's seeder can
+// enumerate exactly the SHAs the scenario will draw from,
+// keeping the test reproducible across runs.
+//
+// SHAs are deterministic SHA1-shaped 40-char hex strings
+// derived from (repo_index, sha_index) so the seeder
+// shipped in README.md (`cmd/seed-load-fixtures`) can
+// generate the SAME 5_000 pairs without sharing state
+// with the k6 process.
+//
+// A separate `degraded === false` check in the per-request
+// evaluator (below) guards against the failure mode where
+// the seeder missed a SHA: a degraded verdict counts as a
+// check failure and trips the `checks{name:eval.gate} rate
+// > 0.99` threshold, so an under-seeded fixture fails the
+// run loudly rather than passing on the fast path.
 //
 // # Operational notes (not enforced here)
 //
@@ -105,16 +134,56 @@ const BASE = __ENV.CLEAN_CODE_GATEWAY_URL || 'http://localhost:8080';
 // threshold below).
 const TOKEN = __ENV.CLEAN_CODE_OIDC_TOKEN || '';
 
-// 100 deterministic repo UUIDs the scenario cycles through.
-// Generated once at script load time (k6 runs the
-// init-context code in every VU) so the per-iteration cost
-// is a single random index lookup, not a UUID construction.
+// 100 deterministic repo UUIDs the scenario cycles
+// through. Generated once at script load time (k6 runs
+// the init-context code in every VU) so the
+// per-iteration cost is a single random index lookup,
+// not a UUID construction.
+//
+// The `0000...{NNN}` UUID shape encodes the repo index in
+// the last 12 hex chars so the seeder (see README.md
+// "Seeding the fixtures") can derive the SAME 100 UUIDs
+// without sharing state with the k6 process.
 const REPO_COUNT = 100;
 const repos = (() => {
   const out = new Array(REPO_COUNT);
   for (let i = 0; i < REPO_COUNT; i++) {
     const nnn = String(i).padStart(12, '0');
     out[i] = `00000000-0000-0000-0000-${nnn}`;
+  }
+  return out;
+})();
+
+// 50 deterministic 40-char hex SHAs per repo -- the
+// CLOSED set that the seeder (see README.md) must
+// pre-register MetricSample rows for. The SHA value is
+// 28 zero-pad + 6-hex repo index + 6-hex sha index = 40
+// lowercase hex chars so it satisfies the gateway's
+// `sha` validator (`internal/api/repo_id.go::isShaShape`
+// -- 40 lowercase hex) without being a real git SHA1.
+// Determinism is what makes the scenario reproducible
+// against pre-seeded fixture data; the (repo, sha) pair
+// the scenario samples must EXIST in MetricSample at
+// run time or `eval.gate` returns the `samples_pending`
+// degraded fast path, which the check assertion below
+// catches.
+const SHAS_PER_REPO = 50;
+const shas = (() => {
+  const out = new Array(REPO_COUNT);
+  for (let i = 0; i < REPO_COUNT; i++) {
+    const repoShas = new Array(SHAS_PER_REPO);
+    for (let j = 0; j < SHAS_PER_REPO; j++) {
+      // Encode (i, j) into the trailing 12 hex chars; pad
+      // the rest with `0` to reach 40 chars total. Two
+      // disjoint repo / sha ranges (i.padStart(6) vs
+      // j.padStart(6)) ensure no two (i, j) collide on
+      // the resulting hex string.
+      const ii = i.toString(16).padStart(6, '0');
+      const jj = j.toString(16).padStart(6, '0');
+      // 40 - 6 - 6 = 28 zero prefix.
+      repoShas[j] = `0000000000000000000000000000${ii}${jj}`;
+    }
+    out[i] = repoShas;
   }
   return out;
 })();
@@ -180,26 +249,34 @@ export const options = {
 
 // evalGate is the per-VU iteration body. Each call:
 //
-//   - picks a repo uniformly at random,
-//   - mints a unique SHA so the verdict cache cannot
-//     short-circuit predicate evaluation,
+//   - picks a (repo, sha) pair uniformly at random from
+//     the CLOSED 5_000-pair fixture set (REPO_COUNT *
+//     SHAS_PER_REPO),
 //   - POSTs to `/v1/eval/gate` (the HTTP gateway pin
 //     `internal/api/router.go::PathPrefix = "/v1/"` +
 //     namespace/verb pattern), and
-//   - asserts the response is HTTP 200 and the JSON
+//   - asserts the response is HTTP 200, the JSON
 //     `verdict` field is one of the canonical
-//     `{pass, warn, block}` values (architecture Sec 5.4.3
-//     line 1237, iter-1 evaluator item 6).
+//     `{pass, warn, block}` values (architecture Sec
+//     5.4.3 line 1237), AND `degraded === false` so the
+//     `samples_pending` fast path (gate_evaluate.go
+//     `writeDegraded`) does not count as a satisfied
+//     check. Without the `degraded === false` guard,
+//     iter-1 evaluator item 3, a run that exercises ONLY
+//     the degraded fast path would vacuously pass the
+//     latency SLO threshold even though no predicate
+//     evaluation occurred -- i.e. the SLO assertion
+//     would not actually measure what tech-spec Sec 8.3
+//     pins.
 //
 // The `tags: {name: 'eval.gate'}` annotation is what
 // makes the per-percentile and per-failure-rate threshold
 // filters match this iteration; do NOT remove it.
 export function evalGate() {
-  const repoId = repos[Math.floor(Math.random() * REPO_COUNT)];
-  // Unique SHA per request so the per-(repo, sha) memoised
-  // verdict cache cannot short-circuit. `__VU` and `__ITER`
-  // are k6-provided per-iteration globals.
-  const sha = `sha-${Date.now()}-${__VU}-${__ITER}`;
+  const repoIdx = Math.floor(Math.random() * REPO_COUNT);
+  const shaIdx = Math.floor(Math.random() * SHAS_PER_REPO);
+  const repoId = repos[repoIdx];
+  const sha = shas[repoIdx][shaIdx];
   const body = JSON.stringify({ repo_id: repoId, sha: sha });
   const params = {
     headers: { 'Content-Type': 'application/json' },
@@ -225,6 +302,26 @@ export function evalGate() {
         }
         const v = parsed && parsed.verdict;
         return v === 'pass' || v === 'warn' || v === 'block';
+      },
+      // `degraded === false` guards the fixture-completeness
+      // contract: when MetricSample rows are missing for the
+      // (repo, sha) pair, eval.gate returns
+      // `degraded: true, degraded_reason: "samples_pending"`
+      // and skips predicate evaluation entirely. The check
+      // failure rolls into the `checks{name:eval.gate} rate
+      // > 0.99` threshold, so an under-seeded fixture fails
+      // the run rather than passing on the fast path.
+      'degraded is false': (r) => {
+        if (r.status !== 200) {
+          return false;
+        }
+        let parsed;
+        try {
+          parsed = r.json();
+        } catch (e) {
+          return false;
+        }
+        return parsed && parsed.degraded === false;
       },
     },
     { name: 'eval.gate' },

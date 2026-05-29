@@ -44,16 +44,32 @@ is incompatible with the short-lived CI sandbox.
    (architecture Sec 6.1). The scenario does not bring up the
    service; the operator is responsible for deploying it via the
    normal `deploy/` Helm chart.
-3. **Pre-registered fixture repos**: the scenario references
-   100 deterministic UUIDs of the form
-   `00000000-0000-0000-0000-{NNN}` where `NNN` is the
-   zero-padded index `000000000000`..`000000000099`. These must
-   exist in the `repo` table with `scan_status='scanned'`
-   AND at least one MetricSample row keyed by the SHAs the
-   scenario will mint, otherwise `eval.gate` returns
-   `repo_not_found` / `metrics_missing` on the fast-failure
-   path and the test PASSES vacuously. See "Seeding the
-   fixtures" below.
+3. **Pre-registered fixture repos AND SHAs (CLOSED set)**: the scenario
+   references a CLOSED set of `100 repos x 50 SHAs = 5_000` deterministic
+   `(repo_id, sha)` pairs derived in the script's init context
+   (`eval_gate_load.js`, `repos` and `shas` constants). The seeder MUST
+   pre-register, for EVERY pair in this closed set:
+     - the `repo` row with `scan_status='scanned'`, and
+     - at least one `MetricSample` row per metric_kind the active policy
+       version references, so `eval.gate` does NOT fall through to the
+       `samples_pending` degraded fast path.
+   The deterministic pair-generation rules (re-implement in the seeder
+   without sharing state with the k6 process):
+     - `repo_id[i] = "00000000-0000-0000-0000-" + zeroPad12(i)` for
+       `i` in `[0, 100)`.
+     - `sha[i][j] = "0" * 28 + hex6(i) + hex6(j)` (40 lowercase-hex
+       chars) for `j` in `[0, 50)`.
+   At the brief's load (`30 min x 50/min = 1500` requests over 5_000
+   pairs), each pair is sampled ~0.3 times in expectation, so the
+   `(repo, sha, policy_version)` verdict cache stays cold on
+   virtually every request -- the cache-cold path is the one
+   tech-spec Sec 8.3 publishes the SLO for. If the seeder misses a
+   pair, `eval.gate` returns `degraded: true,
+   degraded_reason: "samples_pending"` and the
+   `degraded is false` check fails, which rolls into the
+   `checks{name:eval.gate} rate > 0.99` threshold and aborts the
+   run. The previous-iter design used `Date.now()`-derived unique
+   SHAs which were unseedable; the closed set replaces that.
 4. **OIDC bearer token**: an operator-role token with the
    `eval.gate` scope, issued by the cluster's
    identity-provider per architecture Sec 6.1.
@@ -107,23 +123,55 @@ k6 follows its standard exit-code contract:
 
 ## Seeding the fixtures
 
-The 100 fixture repos must exist before the run; otherwise the
-gateway short-circuits with `repo_not_found` and the SLO floor
-is met on the fast-failure path. The clean-code service ships
-a seeder helper (`cmd/seed-load-fixtures`) that the operator
-should run once per lab refresh:
+The 5_000 `(repo_id, sha)` pairs MUST exist before the run;
+otherwise the gateway short-circuits with
+`degraded: true, degraded_reason: "samples_pending"` (the
+`writeDegraded` path in `internal/evaluator/gate_evaluate.go`)
+and the per-iteration `degraded is false` check below trips
+the `checks{name:eval.gate} rate > 0.99` floor and aborts
+the run. The operator should run the seeder helper
+(`cmd/seed-load-fixtures`) once per lab refresh:
 
 ```sh
 cd services/clean-code
 go run ./cmd/seed-load-fixtures \
-  --gateway "${CLEAN_CODE_GATEWAY_URL}" \
-  --token   "${CLEAN_CODE_OIDC_TOKEN}" \
-  --count   100
+  --gateway       "${CLEAN_CODE_GATEWAY_URL}" \
+  --token         "${CLEAN_CODE_OIDC_TOKEN}" \
+  --repos         100 \
+  --shas-per-repo 50
+```
+
+The seeder MUST generate the SAME pairs the scenario draws
+from. Recipe (Bash reference -- the seeder itself can use any
+language as long as it emits identical strings):
+
+```sh
+for i in $(seq 0 99); do
+  repo_id=$(printf "00000000-0000-0000-0000-%012d" "$i")
+  # mgmt.register_repo $repo_id  -- omitted for brevity
+  for j in $(seq 0 49); do
+    sha=$(printf "0000000000000000000000000000%06x%06x" "$i" "$j")
+    # ingest.metrics $repo_id $sha  -- emit MetricSample rows for
+    # every metric_kind the active policy_version references
+  done
+done
 ```
 
 The seeder is itself a separate Stage 10 artifact; if it has
-not yet landed, the operator can fall back to a manual
-`mgmt.register_repo` loop using `curl`.
+not yet landed, the operator can fall back to the manual
+`mgmt.register_repo` + `ingest.metrics` loop above using
+`curl`. Whichever route is used, the pre-run invariant is:
+
+  - Every `repo_id[i]` is in the `repo` table with
+    `scan_status='scanned'`.
+  - Every `(repo_id[i], sha[i][j])` has a complete MetricSample
+    row set, so `samples_ready(repo_id, sha) == true` in
+    `internal/evaluator/sql_readiness.go::SamplesReady`.
+
+Run with `--summary-export` to archive a JSON of the run for
+release-tag review. A successful run reports `checks ........ 100.00%`
+in the summary; anything less than `99.00%` will have exited
+with code 99.
 
 ## Why these thresholds
 
@@ -137,3 +185,9 @@ SLO table; they are belt-and-braces guards that prevent a
 fast-failing server (e.g. 401 in 1 ms) from PASSING the
 percentile thresholds while delivering zero meaningful work.
 Without them the SLO assertion would be a vacuous green.
+
+The `degraded is false` per-request check (inside the
+`checks{name:eval.gate}` floor) addresses the iter-1 evaluator
+finding that a degraded-only run would have vacuously passed
+the latency thresholds without measuring the predicate-eval
+path the SLO is published for.

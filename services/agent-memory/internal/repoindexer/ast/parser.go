@@ -50,141 +50,61 @@ type MethodDecl struct {
 
 // Import represents an import, include, use, or using directive.
 type Import struct {
-	Path     string
-	LangMeta map[string]string
-}
-
-// Edge represents a directed relationship between two nodes.
-type Edge struct {
-	Kind   string
-	Source string
-	Target string
-}
-
-// Node represents an AST-derived graph node.
-type Node struct {
-	Kind string
-	Name string
-}
-
-// EmitResult summarises the output of an EmitFile call.
-type EmitResult struct {
-	NodeCount int
-	EdgeCount int
-}
-
-// Writer receives nodes and edges produced by the emitter.
-type Writer interface {
-	InsertNode(n Node) error
-	InsertEdge(e Edge) error
-}
-
-// Logger receives structured log events from the dispatcher.
-type Logger interface {
-	Log(event string, fields map[string]string)
-}
-
-// ---------------------------------------------------------------------------
-// Dispatcher — routes files to parsers by extension
-// ---------------------------------------------------------------------------
-
-// Dispatcher routes source files to the appropriate parser.
-type Dispatcher struct {
-	parsers map[string]Parser
-	writer  Writer
-	logger  Logger
-}
-
-// DispatcherOption configures a Dispatcher.
-type DispatcherOption func(*Dispatcher)
-
-// WithParser registers a parser for all of its declared extensions.
-func WithParser(p Parser) DispatcherOption {
-	return func(d *Dispatcher) {
-		for _, ext := range p.Extensions() {
-			d.parsers[ext] = p
-		}
-	}
-}
-
-// WithWriter sets the graph writer.
-func WithWriter(w Writer) DispatcherOption {
-	return func(d *Dispatcher) { d.writer = w }
-}
-
-// WithLogger sets the structured logger.
-func WithLogger(l Logger) DispatcherOption {
-	return func(d *Dispatcher) { d.logger = l }
-}
-
-// NewDispatcher creates a Dispatcher with the given options.
-func NewDispatcher(opts ...DispatcherOption) *Dispatcher {
-	d := &Dispatcher{parsers: make(map[string]Parser)}
-	for _, o := range opts {
-		o(d)
-	}
-	return d
-}
-
-// EmitFile parses a single file and emits nodes/edges to the writer.
-func (d *Dispatcher) EmitFile(filename string, src []byte) (EmitResult, error) {
-	ext := ""
-	if idx := strings.LastIndex(filename, "."); idx >= 0 {
-		ext = filename[idx:]
-	}
-
-	p, ok := d.parsers[ext]
-	if !ok {
-		if d.logger != nil {
-			d.logger.Log("ast.dispatch.skip", map[string]string{
-				"file":   filename,
-				"reason": "no_parser",
-			})
-		}
-		return EmitResult{}, nil
-	}
-
-	result, err := p.Parse(filename, src)
-	if err != nil {
-		if errors.Is(err, ErrParserUnavailable) {
-			reason := "unavailable"
-			var ue *UnavailableError
-			if errors.As(err, &ue) {
-				reason = ue.Reason
-			}
-			if d.logger != nil {
-				d.logger.Log("ast.dispatch.skip", map[string]string{
-					"file":   filename,
-					"reason": reason,
-				})
-			}
-			return EmitResult{}, nil
-		}
-		return EmitResult{}, err
-	}
-
-	nodeCount := 0
-	edgeCount := 0
-	if d.writer != nil {
-		for _, c := range result.Classes {
-			if wErr := d.writer.InsertNode(Node{Kind: "class", Name: c.Name}); wErr != nil {
-				return EmitResult{}, fmt.Errorf("InsertNode: %w", wErr)
-			}
-			nodeCount++
-		}
-		for _, m := range result.Methods {
-			if wErr := d.writer.InsertNode(Node{Kind: "method", Name: m.Name}); wErr != nil {
-				return EmitResult{}, fmt.Errorf("InsertNode: %w", wErr)
-			}
-			nodeCount++
-		}
-	}
-
-	return EmitResult{NodeCount: nodeCount, EdgeCount: edgeCount}, nil
+	// Module is the imported module specifier (e.g.
+	// `"./utils"`, `"os"`, `"@scope/pkg"`).
+	Module string
+	// Path is a legacy alias for Module retained for canonical
+	// dispatcher tests and PowerShell parser test fixtures that
+	// were authored when Import exposed both fields. Parsers
+	// SHOULD populate Module; Path may be left empty.
+	Path string
+	// Symbols lists the named symbols imported from Module.
+	// Empty for whole-module imports (`import os`,
+	// `import "./utils"`).
+	Symbols []string
+	// Alias is the local alias for whole-module imports
+	// (`import os as o` -> "o"; `import * as fs from "fs"`
+	// -> "fs"). Empty when no alias was specified.
+	Alias string
+	// Line is the 1-based source line of the import
+	// statement.
+	Line int
+	// IsTypeOnly is true for TS `import type` statements
+	// (and the per-symbol `import { type Foo } from ...`
+	// equivalent). Type-only imports do not produce a
+	// runtime dependency, so consumers may want to weight
+	// them differently in relevance scoring; the dispatcher
+	// records the flag on the `imports` edge attrs but does
+	// NOT skip the edge. Always false for Python.
+	IsTypeOnly bool
+	// LangMeta carries per-language attrs the dispatcher
+	// folds into the `imports` edge `attrs_json` via
+	// `mergeLangMeta` (architecture Section 4.4.2). A nil map
+	// means "no per-language attrs" -- the merge is a no-op
+	// and the existing TS/JS/Python parsers leave it nil, so
+	// dispatcher output for those languages is byte-identical
+	// across this surface.
+	//
+	// LangMeta is DESCRIPTIVE, NOT IDENTIFYING (architecture
+	// invariant C12): two `Import`s that differ ONLY in
+	// `LangMeta` values describe the same dependency edge and
+	// are NOT routed into the import's identity (Module +
+	// Symbols + Alias). Parsers MUST NOT push language-
+	// specific data into those identifying fields.
+	//
+	// Parsers MUST NOT set keys whose names collide with the
+	// dispatcher's first-class import-edge attrs keys (e.g.
+	// `module`, `line`, `symbols`, `alias`, `is_type_only`,
+	// `language`) -- the merge helper's first-class-key-wins
+	// rule silently drops them. Well-known per-language keys
+	// for imports (`dot_import`, `blank_import`, `is_static`,
+	// `cmdlet_verb`, `module_kind`) are catalogued in
+	// architecture Section 4.4.3.
+	LangMeta map[string]any
 }
 
 // ---------------------------------------------------------------------------
-// Global registry
+// Global parser registry (additive E2E surface)
 // ---------------------------------------------------------------------------
 
 var (
@@ -201,6 +121,18 @@ func RegisterParser(p Parser) {
 	}
 }
 
+// Writer receives nodes and edges produced by the emitter. The
+// canonical declarations of `Node`, `Edge`, `EmitResult`, and
+// `Logger` live in `dispatcher.go` (those types form the
+// dispatcher's core surface). `Writer` is kept here as an
+// alias-shaped interface used by e2e tests that prefer the
+// shorter name; any type satisfying `Writer` also satisfies the
+// dispatcher's `NodeEdgeWriter` and vice-versa.
+type Writer interface {
+	InsertNode(n Node) error
+	InsertEdge(e Edge) error
+}
+
 // SelectParser returns the registered parser for the given filename's
 // extension, or nil if no parser is registered for that extension.
 func SelectParser(filename string, src []byte) Parser {
@@ -213,17 +145,4 @@ func SelectParser(filename string, src []byte) Parser {
 // DefaultParsers returns the build-appropriate parser list.
 func DefaultParsers() []Parser {
 	return defaultParsers()
-}
-
-// NewDefaultDispatcher creates a Dispatcher populated with the given
-// parser list plus the provided writer and logger.
-func NewDefaultDispatcher(parsers []Parser, w Writer, l Logger) *Dispatcher {
-	opts := []DispatcherOption{
-		WithWriter(w),
-		WithLogger(l),
-	}
-	for _, p := range parsers {
-		opts = append(opts, WithParser(p))
-	}
-	return NewDispatcher(opts...)
 }

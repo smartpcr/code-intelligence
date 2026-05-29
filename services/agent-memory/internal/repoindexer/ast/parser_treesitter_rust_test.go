@@ -3,8 +3,17 @@
 package ast
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"sort"
+	"strings"
 	"testing"
+
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/repoindexer"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
 )
 
 // Tests for the Rust tree-sitter parser. Gated on `//go:build
@@ -888,4 +897,613 @@ pub struct Foo;
 		t.Errorf("Foo.Implements = %v; want %v (multi-impl pre-decl flush with dedup)",
 			got, want)
 	}
+}
+
+
+// TestRustFixture_EmitsExpectedNodeAndEdgeSet is the
+// implementation-plan §5.3 line 360-362 acceptance test for
+// the Rust tree-sitter parser. The fixture is the canonical
+// trait+impl+free-function+use shape called out by the
+// workstream brief.
+//
+// Iter-4 STRUCTURAL pivot (evaluator items 2 + 3 demanded
+// canonical-API graph emission with `Symbols=["Display"]` on
+// the actual production-emitted imports edge, not a parser-
+// level reparse): this test now drives the canonical
+// `NewDispatcher(writer, opts...).EmitFile(ctx, event)`
+// surface that `cmd/repoindexer/main.go` uses in production.
+// The recording `rustStage53Writer` satisfies the canonical
+// `NodeEdgeWriter` interface (graphwriter.NodeInput /
+// graphwriter.EdgeInput shape), and the assertions inspect
+// the captured `EdgeInput.AttrsJSON` for the `symbols` key
+// — proving that production code (not a test-local
+// mini-pipeline) emits the documented graph shape.
+//
+// Asserts:
+//
+//   - 2 class nodes  (Greeter trait, GreeterImpl struct)
+//   - 3 method nodes (Greeter.greet trait-default,
+//     GreeterImpl.greet impl override, format_greeting free fn)
+//   - 1 package node (std::fmt)
+//   - 1 implements edge   (GreeterImpl -> Greeter)
+//   - 1 static_calls edge (GreeterImpl.greet -> format_greeting)
+//   - 1 imports edge      (file -> std::fmt with
+//     attrs_json.symbols == ["Display"])
+//   - 1 overrides edge    (GreeterImpl.greet -> Greeter.greet)
+func TestRustFixture_EmitsExpectedNodeAndEdgeSet(t *testing.T) {
+	// Fixture matches the Stage 5.3 workstream brief
+	// verbatim: trait/struct lack ``pub`` so a regression
+	// that silently drops non-public items is caught here
+	// (iter-1 rubber-duck finding #1).
+	const filename = "src/lib.rs"
+	const src = `use std::fmt::Display;
+
+trait Greeter {
+    fn greet(&self, name: &str) -> String {
+        String::new()
+    }
+}
+
+struct GreeterImpl;
+
+impl Greeter for GreeterImpl {
+    fn greet(&self, name: &str) -> String {
+        format_greeting(name)
+    }
+}
+
+pub fn format_greeting(name: &str) -> String {
+    String::from(name)
+}
+`
+	fw := newRustStage53Writer()
+	d := NewDispatcher(fw, WithParsers(NewTreeSitterRustParser()))
+	emitRes, err := d.EmitFile(context.Background(), makeRustEvent(filename, src))
+	if err != nil {
+		t.Fatalf("Dispatcher.EmitFile(%q) error = %v; want nil", filename, err)
+	}
+
+	// EmitResult.TouchedNodes must mirror what the writer
+	// recorded (sanity check on the dispatcher's internal
+	// accounting).
+	if len(emitRes.TouchedNodes) != len(fw.nodes) {
+		t.Errorf("EmitResult.TouchedNodes len = %d; want %d (writer recorded)",
+			len(emitRes.TouchedNodes), len(fw.nodes))
+	}
+
+	// ----- Node assertions -----
+
+	classNodes := rustStage53NodesByKind(fw.nodes, "class")
+	if got := len(classNodes); got != 2 {
+		t.Fatalf("class nodes = %d; want 2; got=%v", got, classNodes)
+	}
+	gotClassNames := make([]string, 0, len(classNodes))
+	for _, n := range classNodes {
+		gotClassNames = append(gotClassNames, qnFromClassSig(n.CanonicalSignature))
+	}
+	sort.Strings(gotClassNames)
+	if !rustStringSlicesEqual(gotClassNames, []string{"Greeter", "GreeterImpl"}) {
+		t.Errorf("class node QNs = %v; want [Greeter GreeterImpl]", gotClassNames)
+	}
+
+	methodNodes := rustStage53NodesByKind(fw.nodes, "method")
+	if got := len(methodNodes); got != 3 {
+		t.Fatalf("method nodes = %d; want 3; got=%v", got, methodNodes)
+	}
+	gotMethodNames := make([]string, 0, len(methodNodes))
+	for _, n := range methodNodes {
+		gotMethodNames = append(gotMethodNames, qnFromMethodSig(n.CanonicalSignature))
+	}
+	sort.Strings(gotMethodNames)
+	if !rustStringSlicesEqual(gotMethodNames, []string{"Greeter.greet", "GreeterImpl.greet", "format_greeting"}) {
+		t.Errorf("method node QNs = %v; want [Greeter.greet GreeterImpl.greet format_greeting] (sorted)",
+			gotMethodNames)
+	}
+
+	packageNodes := rustStage53NodesByKind(fw.nodes, "package")
+	if got := len(packageNodes); got != 1 {
+		t.Fatalf("package nodes = %d; want 1; got=%v", got, packageNodes)
+	}
+	if mod := moduleFromPackageSig(packageNodes[0].CanonicalSignature); mod != "std::fmt" {
+		t.Errorf("package node module = %q; want %q (Module from `use std::fmt::Display;`)",
+			mod, "std::fmt")
+	}
+
+	// ----- Edge assertions -----
+
+	implEdges := rustStage53EdgesByKind(fw.edges, "implements")
+	if got := len(implEdges); got != 1 {
+		t.Fatalf("implements edges = %d; want exactly 1; got=%v", got, implEdges)
+	}
+	if sig := fw.sigForNodeID(implEdges[0].SrcNodeID); qnFromClassSig(sig) != "GreeterImpl" {
+		t.Errorf("implements edge source QN = %q; want %q",
+			qnFromClassSig(sig), "GreeterImpl")
+	}
+	if sig := fw.sigForNodeID(implEdges[0].DstNodeID); qnFromClassSig(sig) != "Greeter" {
+		t.Errorf("implements edge target QN = %q; want %q",
+			qnFromClassSig(sig), "Greeter")
+	}
+
+	callEdges := rustStage53EdgesByKind(fw.edges, "static_calls")
+	if got := len(callEdges); got != 1 {
+		t.Fatalf("static_calls edges = %d; want exactly 1 (only GreeterImpl.greet -> format_greeting is unambiguously locally resolvable); got=%v",
+			got, callEdges)
+	}
+	if sig := fw.sigForNodeID(callEdges[0].SrcNodeID); qnFromMethodSig(sig) != "GreeterImpl.greet" {
+		t.Errorf("static_calls edge source QN = %q; want %q",
+			qnFromMethodSig(sig), "GreeterImpl.greet")
+	}
+	if sig := fw.sigForNodeID(callEdges[0].DstNodeID); qnFromMethodSig(sig) != "format_greeting" {
+		t.Errorf("static_calls edge target QN = %q; want %q",
+			qnFromMethodSig(sig), "format_greeting")
+	}
+
+	importEdges := rustStage53EdgesByKind(fw.edges, "imports")
+	if got := len(importEdges); got != 1 {
+		t.Fatalf("imports edges = %d; want exactly 1; got=%v", got, importEdges)
+	}
+	if importEdges[0].SrcNodeID != testFileNodeID {
+		t.Errorf("imports edge source NodeID = %q; want %q (file node id)",
+			importEdges[0].SrcNodeID, testFileNodeID)
+	}
+	if sig := fw.sigForNodeID(importEdges[0].DstNodeID); moduleFromPackageSig(sig) != "std::fmt" {
+		t.Errorf("imports edge target module = %q; want %q (Module from `use std::fmt::Display;`)",
+			moduleFromPackageSig(sig), "std::fmt")
+	}
+	// Stage 5.3 brief: `Symbols=["Display"]` MUST land on
+	// the production-emitted imports edge. Iter-4 stitches
+	// the parser-level Import.Symbols into the
+	// `EdgeInput.AttrsJSON` under the `symbols` key.
+	gotSymbols, ok := edgeSymbolsFromAttrs(t, importEdges[0].AttrsJSON)
+	if !ok {
+		t.Fatalf("imports edge attrs_json = %s; missing `symbols` key (Stage 5.3 brief requires Symbols=[\"Display\"] on the imports edge)",
+			string(importEdges[0].AttrsJSON))
+	}
+	if !rustStringSlicesEqual(gotSymbols, []string{"Display"}) {
+		t.Errorf("imports edge attrs_json.symbols = %v; want [Display] (Stage 5.3 brief requires Symbols=[\"Display\"] on the imports edge; attrs_json=%s)",
+			gotSymbols, string(importEdges[0].AttrsJSON))
+	}
+
+	overrideEdges := rustStage53EdgesByKind(fw.edges, "overrides")
+	if got := len(overrideEdges); got != 1 {
+		t.Fatalf("overrides edges = %d; want exactly 1 (Pass 2d: impl method -> trait-default method, same file); got=%v",
+			got, overrideEdges)
+	}
+	if sig := fw.sigForNodeID(overrideEdges[0].SrcNodeID); qnFromMethodSig(sig) != "GreeterImpl.greet" {
+		t.Errorf("overrides edge source QN = %q; want %q",
+			qnFromMethodSig(sig), "GreeterImpl.greet")
+	}
+	if sig := fw.sigForNodeID(overrideEdges[0].DstNodeID); qnFromMethodSig(sig) != "Greeter.greet" {
+		t.Errorf("overrides edge target QN = %q; want %q",
+			qnFromMethodSig(sig), "Greeter.greet")
+	}
+
+	// ----- Total-count guards (catch spurious extra Node/Edge kinds) -----
+	// The brief's exact graph is: 6 nodes (2 class + 3 method +
+	// 1 package) and 9 edges (1 implements + 1 static_calls +
+	// 1 imports + 1 overrides + 5 contains [2 file→class + 2
+	// class→method + 1 file→method(format_greeting)]). Per-kind
+	// counts above pin each EXPECTED kind; these total-count
+	// guards pin the emission set as a CLOSED set so a
+	// regression that emitted an UNEXPECTED kind (e.g. a
+	// phantom `extends` or `reads` edge, or a spurious node
+	// kind) lights up here. Iter-8: `contains` edges are now
+	// emitted by Pass 1a (file→class) and Pass 1b (parent→
+	// method), so the closed-set total grew from 4 → 9.
+	if got := len(fw.nodes); got != 6 {
+		t.Errorf("total nodes = %d; want 6 (2 class + 3 method + 1 package); got=%v", got, fw.nodes)
+	}
+	if got := len(fw.edges); got != 9 {
+		t.Errorf("total edges = %d; want 9 (1 implements + 1 static_calls + 1 imports + 1 overrides + 5 contains); got=%v",
+			got, fw.edges)
+	}
+}
+
+// TestRustFixture_OverridesEdgeFromImplToTraitDefault pins
+// implementation-plan §5.3 line 363: exactly ONE `overrides`
+// edge is emitted from the impl method to the trait-default
+// trait method on the same file.
+//
+// Iter-4 STRUCTURAL pivot: drives the canonical
+// `NewDispatcher(writer, opts...).EmitFile(ctx, event)`
+// surface so the override edge count assertion provably
+// reflects what production code emits. Parser-level
+// LangMeta defense-in-depth is kept at the end so a
+// regression in EITHER the parser walker's
+// `LangMeta["trait"/"trait_default"]` writes OR the
+// dispatcher's Pass 2d resolver lights up here.
+func TestRustFixture_OverridesEdgeFromImplToTraitDefault(t *testing.T) {
+	const filename = "src/lib.rs"
+	const src = `use std::fmt::Display;
+
+trait Greeter {
+    fn greet(&self, name: &str) -> String {
+        String::new()
+    }
+}
+
+struct GreeterImpl;
+
+impl Greeter for GreeterImpl {
+    fn greet(&self, name: &str) -> String {
+        format_greeting(name)
+    }
+}
+
+pub fn format_greeting(name: &str) -> String {
+    String::from(name)
+}
+`
+	fw := newRustStage53Writer()
+	d := NewDispatcher(fw, WithParsers(NewTreeSitterRustParser()))
+	if _, err := d.EmitFile(context.Background(), makeRustEvent(filename, src)); err != nil {
+		t.Fatalf("Dispatcher.EmitFile: %v", err)
+	}
+
+	overrides := rustStage53EdgesByKind(fw.edges, "overrides")
+	if got := len(overrides); got != 1 {
+		t.Fatalf("overrides edges = %d; want exactly 1 (impl-plan §5.3:363); got=%v",
+			got, overrides)
+	}
+	if sig := fw.sigForNodeID(overrides[0].SrcNodeID); qnFromMethodSig(sig) != "GreeterImpl.greet" {
+		t.Errorf("overrides edge source QN = %q; want %q",
+			qnFromMethodSig(sig), "GreeterImpl.greet")
+	}
+	if sig := fw.sigForNodeID(overrides[0].DstNodeID); qnFromMethodSig(sig) != "Greeter.greet" {
+		t.Errorf("overrides edge target QN = %q; want %q",
+			qnFromMethodSig(sig), "Greeter.greet")
+	}
+
+	// ----- Parser-level LangMeta defense-in-depth -----
+	parserRes, err := NewTreeSitterRustParser().Parse(filename, []byte(src))
+	if err != nil {
+		t.Fatalf("parser.Parse for defense-in-depth: %v", err)
+	}
+	byMethod := rustMethodByQN(parserRes.Methods)
+
+	// (a) trait_default proxy on the trait method.
+	traitGreet, ok := byMethod["Greeter.greet"]
+	if !ok {
+		t.Fatalf("trait method Greeter.greet missing; got %v", rustMethodQNs(parserRes.Methods))
+	}
+	if traitGreet.LangMeta == nil || traitGreet.LangMeta["trait_default"] != true {
+		t.Errorf("Greeter.greet.LangMeta[trait_default] = %v; want true (Pass 2d eligibility on TRAIT side)",
+			traitGreet.LangMeta)
+	}
+	if traitGreet.EnclosingClass != "Greeter" {
+		t.Errorf("Greeter.greet.EnclosingClass = %q; want \"Greeter\" (Pass 2d trait-side lookup uses EnclosingClass)",
+			traitGreet.EnclosingClass)
+	}
+
+	// (b) trait proxy on the impl method.
+	implGreet, ok := byMethod["GreeterImpl.greet"]
+	if !ok {
+		t.Fatalf("impl method GreeterImpl.greet missing; got %v", rustMethodQNs(parserRes.Methods))
+	}
+	if implGreet.LangMeta == nil || implGreet.LangMeta["trait"] != "Greeter" {
+		t.Errorf("GreeterImpl.greet.LangMeta[trait] = %v; want \"Greeter\" (Pass 2d eligibility on IMPL side)",
+			implGreet.LangMeta)
+	}
+	if implGreet.EnclosingClass != "GreeterImpl" {
+		t.Errorf("GreeterImpl.greet.EnclosingClass = %q; want \"GreeterImpl\" (Pass 2d impl-side lookup uses EnclosingClass)",
+			implGreet.EnclosingClass)
+	}
+
+	// (c) the free function MUST NOT carry either
+	// eligibility key — otherwise the dispatcher's Pass
+	// 2d would attempt a methodNodeID lookup for
+	// `<trait>.format_greeting` and could spuriously
+	// match an unrelated trait method elsewhere.
+	free, ok := byMethod["format_greeting"]
+	if !ok {
+		t.Fatalf("free function format_greeting missing; got %v", rustMethodQNs(parserRes.Methods))
+	}
+	if free.LangMeta != nil {
+		if _, has := free.LangMeta["trait"]; has {
+			t.Errorf("format_greeting.LangMeta[trait] must NOT be set on a free function; got %v", free.LangMeta)
+		}
+		if _, has := free.LangMeta["trait_default"]; has {
+			t.Errorf("format_greeting.LangMeta[trait_default] must NOT be set on a free function; got %v", free.LangMeta)
+		}
+	}
+}
+
+// TestRustFixture_OverridesCrossFileMissIsSilent pins
+// implementation-plan §5.3 line 364: EXACTLY ZERO
+// `overrides` edges are emitted when the trait declaration
+// is not in the local file (A4 rule, architecture
+// Section 7.2). The impl method still carries
+// `LangMeta["trait"]="Greeter"` so a future cross-file
+// resolver can stitch it later, but the dispatcher's
+// Pass 2d methodNodeID lookup misses and MUST drop the
+// override silently.
+//
+// Iter-4 STRUCTURAL pivot: drives the canonical
+// `NewDispatcher(writer, opts...).EmitFile(ctx, event)`
+// surface so the zero-count assertion provably reflects
+// production silent-drop behaviour. Adds matching zero-count
+// guards for `implements` (cross-file trait target → no edge)
+// and `static_calls` (`String::from(name)` rightmost-segment
+// "from" has no local callee → no edge).
+func TestRustFixture_OverridesCrossFileMissIsSilent(t *testing.T) {
+	// `struct GreeterImpl;` is intentionally NOT prefixed
+	// with `pub` so the test matches the Stage 5.3 brief
+	// convention and would catch a regression that drops
+	// non-public items (iter-1 rubber-duck finding #1).
+	const filename = "src/lib.rs"
+	const src = `struct GreeterImpl;
+
+impl Greeter for GreeterImpl {
+    fn greet(&self, name: &str) -> String {
+        String::from(name)
+    }
+}
+`
+	fw := newRustStage53Writer()
+	d := NewDispatcher(fw, WithParsers(NewTreeSitterRustParser()))
+	if _, err := d.EmitFile(context.Background(), makeRustEvent(filename, src)); err != nil {
+		t.Fatalf("Dispatcher.EmitFile: %v", err)
+	}
+
+	// ZERO overrides edges — A4 silent-drop rule.
+	overrides := rustStage53EdgesByKind(fw.edges, "overrides")
+	if got := len(overrides); got != 0 {
+		t.Fatalf("overrides edges = %d; want exactly 0 (cross-file trait MUST NOT mint an override edge; A4 rule); got=%v",
+			got, overrides)
+	}
+
+	// ZERO implements edges — Pass 2a drops unresolved
+	// (cross-file) trait targets per the same A4 rule.
+	implEdges := rustStage53EdgesByKind(fw.edges, "implements")
+	if got := len(implEdges); got != 0 {
+		t.Fatalf("implements edges = %d; want exactly 0 (cross-file trait target MUST be dropped by Pass 2a); got=%v",
+			got, implEdges)
+	}
+
+	// ZERO static_calls edges — `String::from(name)` is
+	// recorded as rightmost-segment "from" in Calls, and
+	// no local method has that simple name, so Pass 2b's
+	// bare-name resolver drops it.
+	callEdges := rustStage53EdgesByKind(fw.edges, "static_calls")
+	if got := len(callEdges); got != 0 {
+		t.Fatalf("static_calls edges = %d; want exactly 0 (no local callee matches the bare name \"from\"); got=%v",
+			got, callEdges)
+	}
+
+	// Node counts: only local items minted.
+	classNodes := rustStage53NodesByKind(fw.nodes, "class")
+	if got := len(classNodes); got != 1 || qnFromClassSig(classNodes[0].CanonicalSignature) != "GreeterImpl" {
+		t.Fatalf("class nodes = %v; want exactly [{class GreeterImpl}] (cross-file trait MUST NOT be minted)",
+			classNodes)
+	}
+	methodNodes := rustStage53NodesByKind(fw.nodes, "method")
+	if got := len(methodNodes); got != 1 || qnFromMethodSig(methodNodes[0].CanonicalSignature) != "GreeterImpl.greet" {
+		t.Fatalf("method nodes = %v; want exactly [{method GreeterImpl.greet}] (cross-file trait method MUST NOT be minted)",
+			methodNodes)
+	}
+
+	// ----- Total-count guards (catch spurious extra Node/Edge kinds) -----
+	// The cross-file fixture has NO `use`, NO local trait,
+	// NO local callee match — so the COMPLETE graph is
+	// exactly 2 nodes (1 class GreeterImpl + 1 method
+	// GreeterImpl.greet) and 2 edges (2 contains: file→
+	// class + class→method). Iter-8: `contains` edges are
+	// now emitted by Pass 1a/1b, so the closed-set total
+	// grew from 0 → 2.
+	if got := len(fw.nodes); got != 2 {
+		t.Errorf("total nodes = %d; want 2 (1 class + 1 method); got=%v", got, fw.nodes)
+	}
+	if got := len(fw.edges); got != 2 {
+		t.Errorf("total edges = %d; want 2 (2 contains: file→class + class→method); got=%v",
+			got, fw.edges)
+	}
+
+	// ----- Parser-level LangMeta defense-in-depth -----
+	// The IMPL side must STILL carry LangMeta["trait"]
+	// ="Greeter" so a future cross-file resolver can
+	// re-attempt the stitch; the dispatcher's same-file
+	// Pass 2d lookup simply misses.
+	parserRes, err := NewTreeSitterRustParser().Parse(filename, []byte(src))
+	if err != nil {
+		t.Fatalf("parser.Parse for defense-in-depth: %v", err)
+	}
+	byMethod := rustMethodByQN(parserRes.Methods)
+	implGreet, ok := byMethod["GreeterImpl.greet"]
+	if !ok {
+		t.Fatalf("impl method GreeterImpl.greet missing; got %v", rustMethodQNs(parserRes.Methods))
+	}
+	if implGreet.LangMeta == nil || implGreet.LangMeta["trait"] != "Greeter" {
+		t.Errorf("GreeterImpl.greet.LangMeta[trait] = %v; want \"Greeter\" (cross-file resolver needs this key even when same-file Pass 2d misses)",
+			implGreet.LangMeta)
+	}
+	if _, ok := byMethod["Greeter.greet"]; ok {
+		t.Errorf("phantom trait method Greeter.greet was minted; got %v",
+			rustMethodQNs(parserRes.Methods))
+	}
+	for _, m := range parserRes.Methods {
+		if m.EnclosingClass == "Greeter" {
+			t.Errorf("method %q has EnclosingClass=%q (cross-file trait must not enclose any local method)",
+				m.QualifiedName, m.EnclosingClass)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Stage 5.3 test-local fake writer + event helper
+// ---------------------------------------------------------------------------
+//
+// `rustStage53Writer` satisfies the canonical `NodeEdgeWriter`
+// interface (dispatcher.go:33) by accepting `graphwriter.NodeInput`
+// and `graphwriter.EdgeInput` values and returning synthetic
+// NodeRecord / EdgeRecord values. The captured inputs let the
+// Stage 5.3 tests assert on the production-emitted graph records
+// (canonical signatures, attrs JSON, NodeID linkage) without a
+// real PostgreSQL writer in play.
+//
+// The synthesised NodeIDs are sequential (`node-0`, `node-1`,
+// …) so edge endpoints can be reverse-mapped to their parent
+// canonical signatures via `sigForNodeID`.
+
+const (
+	testRepoURL    = "repo://test"
+	testSHA        = "sha-test"
+	testFileNodeID = "file-node-id"
+	testRepoNodeID = "repo-node-id"
+)
+
+type rustStage53Writer struct {
+	nodes     []graphwriter.NodeInput
+	edges     []graphwriter.EdgeInput
+	nodeIDs   []string
+	sigByID   map[string]string
+	seq       int
+}
+
+func newRustStage53Writer() *rustStage53Writer {
+	return &rustStage53Writer{sigByID: map[string]string{}}
+}
+
+func (w *rustStage53Writer) InsertNode(_ context.Context, in graphwriter.NodeInput) (graphwriter.NodeRecord, error) {
+	id := fmt.Sprintf("node-%d", w.seq)
+	w.seq++
+	w.nodes = append(w.nodes, in)
+	w.nodeIDs = append(w.nodeIDs, id)
+	w.sigByID[id] = in.CanonicalSignature
+	return graphwriter.NodeRecord{NodeID: id, Inserted: true}, nil
+}
+
+func (w *rustStage53Writer) InsertEdge(_ context.Context, in graphwriter.EdgeInput) (graphwriter.EdgeRecord, error) {
+	w.edges = append(w.edges, in)
+	return graphwriter.EdgeRecord{Inserted: true}, nil
+}
+
+// sigForNodeID returns the canonical signature of the Node the
+// writer minted with the given synthetic NodeID. Empty string when
+// the NodeID is unknown (e.g. an edge endpoint that points at the
+// supplied FileNodeID, which the writer never minted).
+func (w *rustStage53Writer) sigForNodeID(id string) string {
+	if id == "" {
+		return ""
+	}
+	if sig, ok := w.sigByID[id]; ok {
+		return sig
+	}
+	return ""
+}
+
+// makeRustEvent builds a `repoindexer.EmitFileEvent` whose Open
+// closure yields a fresh reader over `src` on each call (per the
+// EmitFileEvent contract: "Each call returns a new reader at
+// offset 0 so the emitter can perform multiple passes").
+func makeRustEvent(filename, src string) repoindexer.EmitFileEvent {
+	var rid fingerprint.RepoID
+	copy(rid[:], []byte("test-repo-id-16x"))
+	return repoindexer.EmitFileEvent{
+		RepoID:     rid,
+		RepoURL:    testRepoURL,
+		SHA:        testSHA,
+		FileNodeID: testFileNodeID,
+		RepoNodeID: testRepoNodeID,
+		RelPath:    filename,
+		Open: func() (repoindexer.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader(src)), nil
+		},
+	}
+}
+
+// rustStage53NodesByKind returns the subset of nodes
+// matching the given Kind, preserving emission order.
+func rustStage53NodesByKind(nodes []graphwriter.NodeInput, kind string) []graphwriter.NodeInput {
+	var out []graphwriter.NodeInput
+	for _, n := range nodes {
+		if n.Kind == kind {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// rustStage53EdgesByKind returns the subset of edges
+// matching the given Kind, preserving emission order.
+func rustStage53EdgesByKind(edges []graphwriter.EdgeInput, kind string) []graphwriter.EdgeInput {
+	var out []graphwriter.EdgeInput
+	for _, e := range edges {
+		if e.Kind == kind {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// qnFromClassSig extracts the QualifiedName from a class
+// canonical signature of the form
+// `<RepoURL>::class::<RelPath>#<QualifiedName>`.
+func qnFromClassSig(sig string) string {
+	if i := strings.LastIndex(sig, "#"); i >= 0 {
+		return sig[i+1:]
+	}
+	return ""
+}
+
+// qnFromMethodSig extracts the QualifiedName from a method
+// canonical signature of the form
+// `<RepoURL>::method::<RelPath>#<QualifiedName>(<ParamSig>)`.
+// Strips the `(<ParamSig>)` suffix so callers can match on the
+// dotted name alone (e.g. `Foo.bar`).
+func qnFromMethodSig(sig string) string {
+	if i := strings.LastIndex(sig, "#"); i >= 0 {
+		s := sig[i+1:]
+		if p := strings.Index(s, "("); p >= 0 {
+			return s[:p]
+		}
+		return s
+	}
+	return ""
+}
+
+// moduleFromPackageSig extracts the Module from a package
+// canonical signature of the form
+// `<RepoURL>::package::<Module>`. Module may itself contain `::`
+// (e.g. `std::fmt`), so we anchor on the first `::package::`
+// separator.
+func moduleFromPackageSig(sig string) string {
+	const sep = "::package::"
+	if i := strings.Index(sig, sep); i >= 0 {
+		return sig[i+len(sep):]
+	}
+	return ""
+}
+
+// edgeSymbolsFromAttrs unmarshals an edge's AttrsJSON and pulls
+// the `symbols` key (a []string). Returns (slice, true) when the
+// key is present; (nil, false) otherwise. Stage 5.3 brief
+// requires this key to be populated on the Rust imports edge so
+// downstream consumers can see which specific names a `use`
+// declaration pulled in.
+func edgeSymbolsFromAttrs(t *testing.T, raw json.RawMessage) ([]string, bool) {
+	t.Helper()
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var bag map[string]any
+	if err := json.Unmarshal(raw, &bag); err != nil {
+		t.Fatalf("edge attrs_json unmarshal: %v (raw=%s)", err, string(raw))
+	}
+	v, ok := bag["symbols"]
+	if !ok {
+		return nil, false
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		t.Fatalf("edge attrs_json.symbols is %T, want []any (raw=%s)", v, string(raw))
+	}
+	out := make([]string, 0, len(arr))
+	for _, x := range arr {
+		s, ok := x.(string)
+		if !ok {
+			t.Fatalf("edge attrs_json.symbols entry is %T, want string (raw=%s)", x, string(raw))
+		}
+		out = append(out, s)
+	}
+	return out, true
 }

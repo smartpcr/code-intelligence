@@ -767,9 +767,6 @@ func TestPowerShellEnvelope_ToParseResult_MapsAllFields(t *testing.T) {
 		if got := langMetaString(imp, "module_kind"); got != wantKind {
 			t.Errorf("import %q LangMeta.module_kind = %q; want %q", mod, got, wantKind)
 		}
-		if imp.Path != imp.Module {
-			t.Errorf("import %q Path = %q; want == Module (%q)", mod, imp.Path, imp.Module)
-		}
 	}
 	if got := langMetaString(importsByMod["PSScriptAnalyzer"], "cmdlet_verb"); got != "Invoke" {
 		t.Errorf("PSScriptAnalyzer LangMeta.cmdlet_verb = %q; want %q (command_call carries the verb)", got, "Invoke")
@@ -838,4 +835,14 @@ func langMetaString(imp Import, key string) string {
 	}
 	s, _ := v.(string)
 	return s
+}
+
+// isRelativeImport reports whether a PowerShell import module
+// specifier is a workspace-relative path (dot-source, e.g.
+// `./helpers.ps1` or `../shared/foo.ps1`). The dispatcher's
+// Pass 0 drops relative imports because they map onto in-repo
+// File nodes that a later cross-file resolver workstream will
+// stitch (see ParseResult.Imports docstring at parser.go).
+func isRelativeImport(module string) bool {
+	return strings.HasPrefix(module, "./") || strings.HasPrefix(module, "../")
 }

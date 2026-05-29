@@ -4,6 +4,7 @@ package ast
 
 import (
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -697,16 +698,9 @@ void globalFreeFn() {
 	}
 }
 
-// classNames is a small helper for error messages -- it
-// keeps test failure output readable without bloating each
-// assertion with formatting boilerplate.
-func classNames(in []ClassDecl) []string {
-	out := make([]string, 0, len(in))
-	for _, c := range in {
-		out = append(out, c.QualifiedName)
-	}
-	return out
-}
+// classNames helper lives in parser_powershell_test.go (no
+// build tag) so it is always available; redeclaring it here
+// would duplicate-define under `//go:build cgo`.
 
 // stringSlicesEqualOrdered returns true when a and b contain
 // the same strings in the same order. Used to assert
@@ -831,4 +825,425 @@ func TestDefaultParsers_CBeforeCpp(t *testing.T) {
 	if cIdx >= cppIdx {
 		t.Errorf("defaultParsers() ordering: C at index %d must come BEFORE C++ at index %d (see parsers_cgo.go documented order)", cIdx, cppIdx)
 	}
+}
+
+// TestCppFixture_EmitsExpectedNodeAndEdgeSet pins the
+// Stage 3.5 (Cpp-fixture-test) acceptance contract for the C++
+// tree-sitter parser. The fixture is a small, deliberately
+// canonical C++ file that exercises every grammar surface the
+// workstream brief calls out:
+//
+//   - `#include <string>` -- a system header include (angle-
+//     bracket form). The dispatcher later materialises this as
+//     a synthetic external-package node + a `file -> string`
+//     `imports` edge.
+//   - `#include "base.h"` -- a quoted (relative) header include.
+//     The parser records it as `./base.h` (relative-include
+//     marker per implementation-plan.md Stage 3.2 step 206);
+//     the dispatcher then DROPS it from edge emission per the
+//     relative-include filter (mirrors the C-fixture-test
+//     "relative include dropped" scenario in Stage 3.4).
+//   - `class Base { public: void identify() {} }` -- a single
+//     class containing one in-line method definition. The
+//     parser emits `Base` (ClassDecl) and `Base.identify`
+//     (MethodDecl with EnclosingClass=Base).
+//   - `class Greeter : public Base { ... }` -- a derived class
+//     extending `Base` via a `public` access specifier. The
+//     parser populates `Greeter.Extends=["Base"]` and
+//     `Greeter.LangMeta["base_access"]["Base"]=="public"`.
+//   - `Greeter.greet()` body -- contains TWO call sites:
+//   - `log_global()` -- a bare-name call to a same-file free
+//     function (declared AFTER greet's body, so the parser
+//     cannot rely on declaration order; the dispatcher's
+//     Pass 2a same-file callee index is built before Pass 2b
+//     resolution runs). Lands in
+//     `Greeter.greet.Calls=["log_global"]`.
+//   - `this->identify()` -- a receiver-qualified call. At the
+//     parser level this lands in
+//     `Greeter.greet.ReceiverCalls=["identify"]` (the
+//     dispatcher persists the union of Calls + ReceiverCalls
+//     on `attrs_json["calls_raw"]` for the future cross-file
+//     resolver). The dispatcher's Pass 2b receiver-qualified
+//     resolver then looks for
+//     `methodNodeID["Greeter.identify"]`, MISSES because
+//     `identify` is declared only on `Base` in this fixture
+//     (different class, even though same file), and CORRECTLY
+//     DROPS the edge per A4 ("memory store prefers missing
+//     edges over wrong ones"). The brief therefore pins
+//     "exactly 1 static_calls edge" -- the `log_global` one
+//     survives Pass 2b; the `identify` one is dropped. At the
+//     parser level we enforce the COMPOSITION that produces
+//     that one-edge outcome: Calls has exactly ["log_global"]
+//     (the surviving edge's source) AND ReceiverCalls has
+//     exactly ["identify"] (the dropped edge's verbatim name,
+//     preserved on calls_raw for the future cross-file
+//     resolver).
+//   - `void log_global() {}` -- a free function declared at
+//     file scope, so the parser emits `MethodDecl{
+//     QualifiedName: "log_global", EnclosingClass: ""}`.
+//
+// This test runs at the PARSER level (//go:build cgo,
+// mirroring TestCSharpFixture_EmitsExpectedNodeAndEdgeSet in
+// parser_treesitter_csharp_test.go) rather than at the
+// dispatcher level (//go:build canonical_dispatcher, as used
+// by TestTypeScriptFixture_EmitsExpectedNodeAndEdgeSet). The
+// brief's "edge" terminology maps to ParseResult fields the
+// dispatcher consumes:
+//
+//   - "extends edge"           -> ClassDecl.Extends
+//   - "static_calls edge"      -> MethodDecl.Calls (bare-name
+//     entries the dispatcher's Pass 2a/2b resolver stitches
+//     against the same-file callee index) -- in this fixture
+//     exactly ONE entry, `log_global`, survives Pass 2b.
+//   - "calls_raw" attr         -> persisted from the union of
+//     MethodDecl.Calls + ReceiverCalls (dispatcher-level
+//     concern; the parser supplies the verbatim slices that
+//     fold into the attr). Hard-asserted here on
+//     Greeter.greet.{Calls, ReceiverCalls} -- if either slice
+//     drops an entry, the corresponding calls_raw attr loses
+//     it too.
+//   - "imports edge"           -> ParseResult.Imports (the
+//     dispatcher mints the synthetic package node + the
+//     `imports` edge in Pass 1 / 2a; relative includes are
+//     dropped from edge emission via the `./`-prefix marker
+//     `handleInclude` writes for quoted forms).
+//
+// All subtests assert HARD CONTRACTS. There are no
+// skip-guards: the parser surfaces required by the brief
+// (classes, extends, base_access, methods, calls, imports)
+// are all populated by parser_treesitter_cpp.go and any
+// regression that empties one of those surfaces fails the
+// corresponding subtest loudly.
+func TestCppFixture_EmitsExpectedNodeAndEdgeSet(t *testing.T) {
+	const src = `#include <string>
+#include "base.h"
+
+class Base {
+public:
+    void identify() {}
+};
+
+class Greeter : public Base {
+public:
+    void greet() {
+        this->identify();
+        log_global();
+    }
+};
+
+void log_global() {}
+`
+	parser := NewTreeSitterCppParser()
+	if got := parser.Language(); got != "cpp" {
+		t.Fatalf("Language() = %q; want %q", got, "cpp")
+	}
+
+	res, err := parser.Parse("src/hello.cpp", []byte(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// ----- Classes (supported today) -----
+	// The brief pins exactly 2 class nodes: `Base` and
+	// `Greeter`. Both are declared at file scope with no
+	// enclosing namespace, so the QualifiedName is just the
+	// simple name. Suffix-tolerant lookups guard against a
+	// future walker that adds a synthetic file-scope or
+	// translation-unit prefix.
+	t.Run("class nodes", func(t *testing.T) {
+		for _, want := range []string{"Base", "Greeter"} {
+			if _, ok := findCppFixtureClass(res.Classes, want); !ok {
+				t.Errorf("class %q missing from emitted set; got %v",
+					want, classNames(res.Classes))
+			}
+		}
+		if got := len(res.Classes); got != 2 {
+			t.Errorf("expected 2 class nodes (Base, Greeter); got %d (%v)",
+				got, classNames(res.Classes))
+		}
+		// Kind: both should be `"class"` (not `"struct"`).
+		// A walker that emits `Base` with Kind="struct" from
+		// the C++ `class_specifier` would silently mis-route
+		// the dispatcher's struct-vs-class downstream policy.
+		for _, want := range []string{"Base", "Greeter"} {
+			c, ok := findCppFixtureClass(res.Classes, want)
+			if !ok {
+				continue
+			}
+			if c.Kind != "class" {
+				t.Errorf("%s.Kind = %q; want %q", want, c.Kind, "class")
+			}
+		}
+	})
+
+	// ----- Extends edge (Greeter -> Base) (supported today) -----
+	// `class Greeter : public Base` populates Greeter.Extends
+	// with a single entry, `Base`. The dispatcher's same-file
+	// resolver matches the entry against the Base ClassDecl
+	// and emits one `extends` edge.
+	t.Run("extends edge Greeter to Base", func(t *testing.T) {
+		greeter, ok := findCppFixtureClass(res.Classes, "Greeter")
+		if !ok {
+			t.Fatalf("Greeter class missing; got %v", classNames(res.Classes))
+		}
+		if !cppFixtureHasSuffix(greeter.Extends, "Base") {
+			t.Errorf("Greeter.Extends should contain Base; got %v", greeter.Extends)
+		}
+		if got := len(greeter.Extends); got != 1 {
+			t.Errorf("expected exactly 1 extends entry on Greeter (-> Base); got %d (%v)",
+				got, greeter.Extends)
+		}
+	})
+
+	// ----- LangMeta["base_access"]["Base"] == "public" (supported today) -----
+	// Stage 3.5 implementation-plan step 253 calls out this
+	// attr explicitly. The C++ access specifier (`public` in
+	// `: public Base`) feeds the LangMeta["base_access"] map
+	// per parser_treesitter_cpp.go::collectCppBaseClasses;
+	// downstream consumers (graph queries, policy rules)
+	// route on the access specifier without re-parsing the
+	// raw extends list.
+	t.Run("base_access attrs", func(t *testing.T) {
+		greeter, ok := findCppFixtureClass(res.Classes, "Greeter")
+		if !ok {
+			t.Fatalf("Greeter class missing; got %v", classNames(res.Classes))
+		}
+		if greeter.LangMeta == nil {
+			t.Fatalf("Greeter.LangMeta should be populated with base_access; got nil")
+		}
+		access, ok := greeter.LangMeta["base_access"].(map[string]string)
+		if !ok {
+			t.Fatalf("Greeter.LangMeta[base_access] should be map[string]string; got %T (%+v)",
+				greeter.LangMeta["base_access"], greeter.LangMeta["base_access"])
+		}
+		if access["Base"] != "public" {
+			t.Errorf("base_access[Base]: want %q, got %q (full=%+v)",
+				"public", access["Base"], access)
+		}
+	})
+
+	// ----- Method nodes -----
+	// The brief pins exactly 3 method nodes:
+	//   - `Base.identify`   (in-class method definition,
+	//                        EnclosingClass=Base)
+	//   - `Greeter.greet`   (in-class method definition,
+	//                        EnclosingClass=Greeter)
+	//   - `log_global`      (file-scope free function,
+	//                        EnclosingClass="")
+	//
+	// Hard contract: an empty Methods slice fails the
+	// subtest. A 4th method (e.g. accidentally picking up
+	// the in-class method declaration twice, or routing a
+	// nested local class function through the walker) also
+	// fails. The walker's correctness on the
+	// `field_declaration` (bodyless `void api();` in
+	// `TestTreeSitterCppParser_FunctionLocalClassesSkipped`)
+	// is exercised indirectly here: a walker that emitted
+	// methods for bodyless declarations would inflate the
+	// count and fail the `!= 3` check on this fixture
+	// (which has no bodyless declarations).
+	t.Run("method nodes", func(t *testing.T) {
+		for _, want := range []string{
+			"Base.identify",
+			"Greeter.greet",
+			"log_global",
+		} {
+			if _, ok := findCppFixtureMethod(res.Methods, want); !ok {
+				t.Errorf("method %q missing; got %v",
+					want, methodNames(res.Methods))
+			}
+		}
+		if got := len(res.Methods); got != 3 {
+			t.Errorf("expected exactly 3 method nodes (Base.identify, Greeter.greet, log_global); got %d (%v)",
+				got, methodNames(res.Methods))
+		}
+		// Verify EnclosingClass routing -- this is what the
+		// dispatcher's Pass 1b uses to pick the method's
+		// parent node when wiring the `contains` edge.
+		expectEnclosing := map[string]string{
+			"Base.identify": "Base",
+			"Greeter.greet": "Greeter",
+			"log_global":    "",
+		}
+		for qn, wantEnc := range expectEnclosing {
+			m, ok := findCppFixtureMethod(res.Methods, qn)
+			if !ok {
+				continue
+			}
+			if m.EnclosingClass != wantEnc {
+				t.Errorf("%s.EnclosingClass = %q; want %q", qn, m.EnclosingClass, wantEnc)
+			}
+		}
+	})
+
+	// ----- static_calls slice + receiver-call slice (Pass 2b drop semantics) -----
+	// Greeter.greet's body has TWO call sites:
+	//   - `log_global()`         -> Calls=["log_global"]
+	//   - `this->identify()`     -> ReceiverCalls=["identify"]
+	//
+	// Downstream the dispatcher's Pass 2b receiver-qualified
+	// resolver looks for `methodNodeID["Greeter.identify"]`.
+	// In this fixture `identify` is declared only on `Base`
+	// (a DIFFERENT class even though same file), so the
+	// lookup MISSES and the edge is CORRECTLY DROPPED per
+	// A4 ("memory store prefers missing edges over wrong
+	// ones"). The brief therefore pins exactly 1 surviving
+	// `static_calls` edge: Greeter.greet -> log_global. The
+	// verbatim `identify` name still persists on
+	// `attrs_json["calls_raw"]` (the dispatcher persists
+	// `Calls ∪ ReceiverCalls` there per parser.go
+	// MethodDecl.Calls / ReceiverCalls semantics) so the
+	// future cross-file resolver can stitch it up.
+	//
+	// At the parser level we hard-enforce the COMPOSITION
+	// that produces the one-edge outcome:
+	//   - Calls         == ["log_global"]   (exact, len 1)
+	//   - ReceiverCalls == ["identify"]     (exact, len 1)
+	//
+	// A walker that mis-routed `this->identify()` into
+	// `Calls` (e.g. by greedily extracting "the first
+	// identifier under the function field") would inflate
+	// Calls to ["identify", "log_global"] and the wrong
+	// edge `greet -> identify` would survive Pass 2b --
+	// this subtest catches that regression on the
+	// cardinality check.
+	t.Run("static_calls and receiver calls", func(t *testing.T) {
+		greet, ok := findCppFixtureMethod(res.Methods, "Greeter.greet")
+		if !ok {
+			t.Fatalf("Greeter.greet method missing; got %v", methodNames(res.Methods))
+		}
+		// Bare-name call to log_global -- the one that
+		// survives Pass 2b and becomes the single
+		// static_calls edge per the brief.
+		if !cppFixtureHasSuffix(greet.Calls, "log_global") {
+			t.Errorf("Greeter.greet.Calls should contain log_global; got %v", greet.Calls)
+		}
+		if got := len(greet.Calls); got != 1 {
+			t.Errorf("expected exactly 1 entry in Greeter.greet.Calls (log_global only -- this->identify() must NOT route here, or Pass 2b would emit the wrong edge); got %d (%v)",
+				got, greet.Calls)
+		}
+		// Receiver-qualified call `this->identify()` --
+		// captured for future cross-file resolution (the
+		// dispatcher persists this on attrs_json["calls_raw"]
+		// alongside Calls) but dropped by Pass 2b because
+		// Greeter itself does not declare `identify`.
+		if !cppFixtureHasSuffix(greet.ReceiverCalls, "identify") {
+			t.Errorf("Greeter.greet.ReceiverCalls should contain identify (verbatim name persists on attrs_json[calls_raw] for the future cross-file resolver); got %v",
+				greet.ReceiverCalls)
+		}
+		if got := len(greet.ReceiverCalls); got != 1 {
+			t.Errorf("expected exactly 1 entry in Greeter.greet.ReceiverCalls (identify); got %d (%v)",
+				got, greet.ReceiverCalls)
+		}
+		// Cross-check that the other methods (Base.identify
+		// and log_global) have empty Calls/ReceiverCalls --
+		// their bodies are empty, so any non-empty slice
+		// here would signal walker drift (e.g. accidentally
+		// inheriting calls from a sibling method).
+		for _, qn := range []string{"Base.identify", "log_global"} {
+			m, ok := findCppFixtureMethod(res.Methods, qn)
+			if !ok {
+				continue
+			}
+			if len(m.Calls) != 0 {
+				t.Errorf("%s.Calls should be empty (body is `{}`); got %v", qn, m.Calls)
+			}
+			if len(m.ReceiverCalls) != 0 {
+				t.Errorf("%s.ReceiverCalls should be empty (body is `{}`); got %v", qn, m.ReceiverCalls)
+			}
+		}
+	})
+
+	// ----- Imports -----
+	// The fixture declares two `#include`s:
+	//   - `#include <string>`   -- angle-bracket / system
+	//                              header. The parser records
+	//                              `Module="string"`. The
+	//                              dispatcher materialises
+	//                              this as the one surviving
+	//                              `imports` edge.
+	//   - `#include "base.h"`   -- quoted / local header. Per
+	//                              implementation-plan.md
+	//                              Stage 3.2 step 206
+	//                              ("preproc_include ... \"...\"
+	//                              -> {Module:\"./\"+<path>}")
+	//                              the parser prefixes the
+	//                              module with `./` so the
+	//                              dispatcher's
+	//                              `isRelativeImport` filter
+	//                              drops it before edge
+	//                              emission. The Import record
+	//                              itself still lands in
+	//                              ParseResult.Imports.
+	//
+	// Hard contract: exactly 2 imports, with the exact
+	// Module strings above. A regression that drops the `./`
+	// prefix on the quoted form would silently turn it into
+	// an external-package edge -- catch that here.
+	t.Run("imports", func(t *testing.T) {
+		if got := len(res.Imports); got != 2 {
+			t.Errorf("expected exactly 2 imports (<string>, \"base.h\"); got %d (%v)",
+				got, importModules(res.Imports))
+		}
+		imports := importModules(res.Imports)
+		if !containsString(imports, "string") {
+			t.Errorf("expected system include <string> recorded as Module=\"string\"; got %v", imports)
+		}
+		if !containsString(imports, "./base.h") {
+			t.Errorf("expected quoted include \"base.h\" recorded as Module=\"./base.h\" (relative-include marker per Stage 3.2 step 206); got %v", imports)
+		}
+	})
+}
+
+// findCppFixtureClass returns the ClassDecl whose
+// QualifiedName equals want OR ends with "." + want. The
+// fixture declares classes at file scope (no enclosing
+// namespace), so an exact match is the expected path today;
+// the suffix-tolerant fallback guards against a future walker
+// that adds a synthetic translation-unit or file prefix.
+//
+// Distinct from the file's existing `classNames` helper (a
+// formatter for error messages) and from
+// findCSharpClass / findGoClass in sibling //go:build cgo
+// test files (which embed the language-specific naming
+// convention in the helper name). The `cppFixture` prefix
+// keeps this fixture-specific lookup separable from the
+// other suffix-tolerant helpers in the package -- and from
+// any future repo-wide simple-name lookup that may want a
+// stricter contract.
+func findCppFixtureClass(classes []ClassDecl, want string) (ClassDecl, bool) {
+	for _, c := range classes {
+		if c.QualifiedName == want || strings.HasSuffix(c.QualifiedName, "."+want) {
+			return c, true
+		}
+	}
+	return ClassDecl{}, false
+}
+
+// findCppFixtureMethod returns the MethodDecl whose
+// QualifiedName equals want OR ends with "." + want. `want`
+// is expected to be in `Class.Method` form (e.g.
+// `Greeter.greet`) or a bare free-function name (e.g.
+// `log_global`); the suffix match accepts a future
+// namespace-qualified emission such as `ns.Greeter.greet`.
+func findCppFixtureMethod(methods []MethodDecl, want string) (MethodDecl, bool) {
+	for _, m := range methods {
+		if m.QualifiedName == want || strings.HasSuffix(m.QualifiedName, "."+want) {
+			return m, true
+		}
+	}
+	return MethodDecl{}, false
+}
+
+// cppFixtureHasSuffix reports whether s contains an element
+// that equals want or ends with "." + want. Used to assert
+// extends / Calls / ReceiverCalls entries tolerantly of any
+// namespace prefix the walker may attach.
+func cppFixtureHasSuffix(s []string, want string) bool {
+	for _, v := range s {
+		if v == want || strings.HasSuffix(v, "."+want) {
+			return true
+		}
+	}
+	return false
 }

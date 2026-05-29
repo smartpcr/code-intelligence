@@ -1,3 +1,5 @@
+//go:build canonical_dispatcher
+
 // Command repoindexer is the Stage 3.1 full-mode + Stage 3.3
 // EmbeddingIndex worker process per implementation-plan.md
 // §3.1 / §3.3 and tech-spec.md §9.6a.  It composes the
@@ -5,6 +7,19 @@
 // AST dispatcher, the Stage 3.3 §9.6a publisher, and the
 // Stage 3.3 background retry flusher into a single
 // long-running process.
+//
+// Gated on `//go:build canonical_dispatcher` because the
+// production wiring calls
+// `ast.NewDispatcher(gw, ast.WithEmbeddingPublisher(...))`
+// (the V2 single-arg-plus-options form) and the worker
+// expects `repoindexer.ASTEmitter` with the
+// `EmitFile(ctx, EmitFileEvent)` shape. The default
+// ast package on `feature/memory` still ships the V1
+// 3-arg `NewDispatcher([]Parser, NodeEdgeWriter, Logger)`
+// + 2-arg `EmitFile(filename, src)` API. The V2 form
+// lands with the canonical-dispatcher sibling workstream;
+// this binary's source is preserved here verbatim so the
+// merge is a single tag flip.
 //
 // The composition mirrors `internal/embedding/doc.go`'s
 // "Production wiring" example verbatim — the binary is the

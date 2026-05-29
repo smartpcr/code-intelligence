@@ -28,12 +28,36 @@
 //     populate `LangMeta["base_access"][baseName]=<access>`
 //     and `LangMeta["template_params"]=[...]` for templated
 //     classes.
+//   - Emit `MethodDecl` for every `function_definition` --
+//     in-class inline methods (EnclosingClass=<className>),
+//     out-of-line definitions (`void Foo::bar() {}` ->
+//     EnclosingClass=Foo extracted from the qualified
+//     declarator), and free functions
+//     (EnclosingClass=""). Per-method `Calls` /
+//     `ReceiverCalls` slices are populated from
+//     `call_expression` walks inside the body so the
+//     dispatcher can resolve them into `static_calls` edges
+//     (bare-name) and Pass 2b receiver-qualified edges
+//     (`this->foo()` -> ReceiverCalls). Bodyless method
+//     declarations (`void api();` inside a class) are NOT
+//     emitted here -- they live in `field_declaration` and
+//     are out of scope for this stage.
+//   - Emit `Import` for every `preproc_include` at
+//     translation-unit or namespace scope: system headers
+//     (`#include <string>`) drop the angle brackets and
+//     surface as `Module: "string"`; quoted local headers
+//     (`#include "base.h"`) are normalized with a leading
+//     `./` so the dispatcher's relative-import filter drops
+//     them (`Module: "./base.h"`).
 //
-// Methods, free functions, calls, and includes are out of
-// scope here; sibling stages own them. The walker still
-// returns `ParseResult{Classes, Methods, Imports}` so the
-// dispatcher's two-pass insert protocol is satisfied -- the
-// `Methods` and `Imports` slices are simply empty for now.
+// Function-body walks are LIMITED to call_expression
+// extraction -- they intentionally do NOT recurse through
+// `class_specifier` / `struct_specifier` nodes that may
+// appear inside a function body. Local types are an
+// implementation detail of the body and must not leak as
+// namespace-scope ClassDecls (the existing
+// `TestTreeSitterCppParser_FunctionLocalClassesSkipped`
+// test pins this invariant).
 
 package ast
 
@@ -114,21 +138,26 @@ const (
 	cppNodeLinkageSpecification      = "linkage_specification"
 	cppNodeIdentifier                = "identifier"
 	cppNodeNamespaceIdentifier       = "namespace_identifier"
-	// Function-body-bearing nodes. The walker NEVER
-	// descends into these: function-local classes (e.g.
-	// `void ns::foo() { class Local {}; }`) are
-	// implementation details of the function body and must
-	// NOT surface as `ns.Local` in the top-level class list
-	// alongside namespace-scope classes. This is the
-	// explicit guard against the failure mode the iter-2
-	// evaluator called out: without this, the visit()
-	// default branch would recursively walk every node
-	// type, eventually reaching a function body's
-	// compound_statement and emitting locals with
-	// namespace-only qualified names. The sibling C++
-	// methods workstream owns function-body extraction (and
-	// will surface methods/local classes via its own
-	// MethodDecl pipeline, not via ClassDecl).
+	// Function-body-bearing nodes. The walker handles
+	// `function_definition` by emitting a MethodDecl and
+	// then STOPPING recursion into the body, so any
+	// function-local class declarations (e.g.
+	// `void foo() { class Local {}; }`) do NOT surface as
+	// top-level class entries -- they're an implementation
+	// detail of the function body and would mislead
+	// downstream graph consumers if they appeared as
+	// namespace-scope ClassDecls alongside namespace-
+	// scope classes. `lambda_expression` and bare
+	// `compound_statement` also stop recursion (they're
+	// not in scope for v1 method extraction). Only
+	// `call_expression` lookups via `cppWalkCalls` ever
+	// touch nodes inside a body, and that lookup never
+	// invokes `handleClass`. This is the explicit guard
+	// against the failure mode the iter-2 evaluator called
+	// out: without this, the visit() default branch would
+	// recursively walk every node type, eventually
+	// reaching a function body's compound_statement and
+	// emitting locals with namespace-only qualified names.
 	cppNodeFunctionDefinition = "function_definition"
 	cppNodeLambdaExpression   = "lambda_expression"
 	cppNodeCompoundStatement  = "compound_statement"
@@ -145,6 +174,21 @@ const (
 	cppNodePreprocElse    = "preproc_else"
 	cppNodePreprocElif    = "preproc_elif"
 	cppNodePreprocElifdef = "preproc_elifdef"
+	// Function/call/include nodes added for the Stage 3.5
+	// methods/imports/calls extraction surface.
+	cppNodePreprocInclude      = "preproc_include"
+	cppNodeSystemLibString     = "system_lib_string"
+	cppNodeStringLiteral       = "string_literal"
+	cppNodeFunctionDeclarator  = "function_declarator"
+	cppNodePointerDeclarator   = "pointer_declarator"
+	cppNodeReferenceDeclarator = "reference_declarator"
+	cppNodeParenthesizedDecl   = "parenthesized_declarator"
+	cppNodeFieldIdentifier     = "field_identifier"
+	cppNodeDestructorName      = "destructor_name"
+	cppNodeOperatorName        = "operator_name"
+	cppNodeCallExpression      = "call_expression"
+	cppNodeFieldExpression     = "field_expression"
+	cppNodeThisExpression      = "this"
 )
 
 // cppSeenClass tracks an already-emitted ClassDecl for
@@ -222,13 +266,21 @@ func (w *cppWalker) walkTop(root *sitter.Node) {
 //
 // Body-bearing function nodes (`function_definition`,
 // `lambda_expression`, and bare `compound_statement`) are
-// explicitly STOPPED -- the default recursion would
-// otherwise walk into a function body and emit any local
-// class declarations as if they were namespace-scope
-// classes (a `void ns::foo() { class Inner {}; }` would
-// produce a bogus `ns.Inner` ClassDecl). This is the iter-2
-// evaluator's policy concern; the sibling C++ methods
-// workstream owns function-body extraction.
+// explicitly handled: `function_definition` emits a
+// MethodDecl (via handleFunctionDefinition) and stops
+// recursive descent so local class declarations inside the
+// body do NOT surface as namespace-scope ClassDecls;
+// `lambda_expression` and bare `compound_statement` simply
+// stop the recursion for the same reason (their bodies are
+// not in scope for v1 method extraction). The
+// `TestTreeSitterCppParser_FunctionLocalClassesSkipped`
+// test pins this no-leak invariant.
+//
+// `preproc_include` at translation-unit / namespace scope
+// emits an Import via handleInclude (system headers stripped
+// of angle brackets, quoted headers normalized with a
+// leading `./` so the dispatcher's relative-include filter
+// drops them).
 func (w *cppWalker) visit(n *sitter.Node, container, namespace string, templateParams []string) {
 	if n == nil {
 		return
@@ -251,20 +303,43 @@ func (w *cppWalker) visit(n *sitter.Node, container, namespace string, templateP
 				w.visit(body.NamedChild(int(i)), container, namespace, nil)
 			}
 		}
-	case cppNodeFunctionDefinition,
-		cppNodeLambdaExpression,
+	case cppNodeFunctionDefinition:
+		// Free function (or out-of-line method definition
+		// like `void Foo::bar() {}` -- the qualified
+		// declarator carries the enclosing class name and
+		// `cppExtractMethodIdentifier` recovers it). Emit a
+		// MethodDecl and walk the body for calls. Crucially,
+		// do NOT call `visit` on the body: that would route
+		// any inner `class_specifier` through `handleClass`
+		// and surface local types as namespace-scope
+		// ClassDecls (the failure mode pinned by
+		// `TestTreeSitterCppParser_FunctionLocalClassesSkipped`).
+		// `cppWalkCalls` only inspects `call_expression`
+		// nodes -- local types are silently walked over.
+		w.handleFunctionDefinition(n, "", namespace)
+		return
+	case cppNodeLambdaExpression,
 		cppNodeCompoundStatement:
-		// Policy: do NOT descend into function bodies,
-		// lambda bodies, or bare compound statements.
-		// Anything class-like declared inside a function
-		// body is a local implementation detail; surfacing
-		// it as a namespace-scope `ClassDecl` would mislead
-		// downstream graph consumers. The C++ methods
-		// workstream owns function-body extraction and will
-		// route local types through its own pipeline if
-		// they ever become in-scope. Emitting NOTHING here
-		// is the conservative correct behaviour for the
-		// "classes-only" scope this workstream owns.
+		// Policy: do NOT descend into lambda bodies or bare
+		// compound statements either. Same rationale as
+		// function_definition above -- local class declarations
+		// inside these scopes must not surface as namespace-
+		// scope `ClassDecl`s. Calls inside lambda bodies are
+		// not in scope for v1 (no enclosing MethodDecl yet);
+		// future work can add a `walkCppCalls(lambda.body)`
+		// pass that attributes the calls to the enclosing
+		// method's slice.
+		return
+	case cppNodePreprocInclude:
+		// `#include <string>` or `#include "base.h"` at
+		// namespace / translation-unit scope. The
+		// preprocessor sees these before the C++ parser,
+		// but tree-sitter-cpp surfaces them as
+		// `preproc_include` siblings of the post-preproc
+		// declarations so the AST captures the include
+		// statement's source location for downstream graph
+		// edges.
+		w.handleInclude(n)
 		return
 	default:
 		// Generic recursive descent for every other node
@@ -497,28 +572,64 @@ func (w *cppWalker) handleClass(n *sitter.Node, outer, namespace string, templat
 	}
 }
 
-// walkClassBody walks the field_declaration_list looking for
-// nested class / struct definitions and template-wrapped
-// nested classes. Member methods and fields are NOT emitted
-// here -- the C++ methods workstream owns that surface; the
-// brief for this stage is class-only.
+// walkClassBody walks a class / struct body
+// (`field_declaration_list`) and emits everything this stage
+// owns at the body-internal scope:
+//
+//   - Nested `class_specifier` / `struct_specifier` declarations
+//     (the original v1 responsibility) -- forwarded to
+//     `handleClass` with the enclosing class's QualifiedName as
+//     the `outer` prefix.
+//   - Template-wrapped nested classes
+//     (`template_declaration` -> `class_specifier`) -- routed
+//     through `handleTemplateDeclaration` so the body's
+//     template parameters land on `LangMeta["template_params"]`.
+//   - `field_declaration`-wrapped forward declarations
+//     (`class Inner;`) -- one-level descent so the forward decl
+//     still produces a `ClassDecl` even without an inline body.
+//   - **In-class inline method definitions**
+//     (`function_definition` inside the class body, e.g.
+//     `class Foo { void bar() {} }`) -- emitted via
+//     `handleFunctionDefinition` with the enclosing class's
+//     QualifiedName forwarded as `enclosingClass`. The resulting
+//     MethodDecl carries `EnclosingClass = "<qualified>"` and
+//     `QualifiedName = "<qualified>.<methodName>"`, which is
+//     what dispatcher Pass 1b uses to wire the `contains` edge
+//     from class node to method node, and what Pass 2b's
+//     receiver-qualified `this->foo()` resolver indexes against.
+//   - Header-internal `#include` directives (`preproc_include`
+//     inside a class body -- rare but legal in injection-style
+//     headers) -- surfaced at the file level via
+//     `handleInclude`, identical treatment to a top-level
+//     include.
 //
 // `qualified` is the enclosing class's QualifiedName, used
-// as the `outer` prefix for any nested class emitted here.
-// `namespace` is forwarded UNCHANGED -- a nested class
-// lives in the same namespace as its enclosing class, so
+// as the `outer` prefix for any nested class emitted here AND
+// as the `enclosingClass` arg for inline methods. `namespace`
+// is forwarded UNCHANGED -- a nested class / method lives in
+// the same namespace as its enclosing class, so
 // `LangMeta["namespace"]` should carry the enclosing
 // namespace, not `enclosingClass.qualified`.
 //
 // Preprocessor wrappers inside the class body
 // (`preproc_ifdef`, `preproc_if`, `preproc_else`,
 // `preproc_elif`, `preproc_elifdef`) are descended through
-// so nested classes inside `#ifdef PLATFORM` /
+// so members declared inside `#ifdef PLATFORM` /
 // `#ifndef GUARD` regions still surface; the grammar uses
 // the same string names for the in-field-declaration-list
 // variants of these nodes (see parser.c
 // `sym_preproc_ifdef_in_field_declaration_list` ->
 // `"preproc_ifdef"`).
+//
+// Bodyless member declarations (`field_declaration` of the
+// `void api();` shape, i.e. a method DECLARATION without a
+// body) are intentionally NOT emitted as MethodDecls --
+// `function_definition` is the only path. This keeps
+// in-header forward declarations from inflating the
+// MethodDecl count on translation units that also see the
+// implementation, and is what the
+// `TestTreeSitterCppParser_FunctionLocalClassesSkipped`
+// invariant relies on.
 func (w *cppWalker) walkClassBody(body *sitter.Node, qualified, namespace string) {
 	for i := uint32(0); i < body.NamedChildCount(); i++ {
 		member := body.NamedChild(int(i))
@@ -539,6 +650,19 @@ func (w *cppWalker) walkClassBody(body *sitter.Node, qualified, namespace string
 					w.handleClass(c, qualified, namespace, nil)
 				}
 			}
+		case cppNodeFunctionDefinition:
+			// In-class inline method definition (`class
+			// Foo { void bar() {} }`). The enclosing
+			// class's QualifiedName becomes the method's
+			// EnclosingClass; the method's QualifiedName
+			// is `<EnclosingClass>.<name>`.
+			w.handleFunctionDefinition(member, qualified, namespace)
+		case cppNodePreprocInclude:
+			// A `#include` inside a class body is rare but
+			// legal (header injection patterns). Surface
+			// it at the file level just like a top-level
+			// include.
+			w.handleInclude(member)
 		case cppNodePreprocIf,
 			cppNodePreprocIfdef,
 			cppNodePreprocElse,
@@ -740,4 +864,394 @@ func cppFindBody(n *sitter.Node) *sitter.Node {
 		}
 	}
 	return nil
+}
+
+// handleFunctionDefinition emits a MethodDecl for one
+// `function_definition` node. `enclosingClass` is the
+// QualifiedName of the surrounding class (empty string for
+// free functions at namespace / file scope). `namespace` is
+// the dotted namespace prefix; it is currently unused at the
+// MethodDecl level (kept for future LangMeta["namespace"]
+// attribution) but the parameter is wired so the call sites
+// don't need to special-case "where am I" knowledge.
+//
+// The function handles three shapes:
+//
+//   - Inline method definition (`class Foo { void bar() {} }`):
+//     `enclosingClass="Foo"`; declarator unwraps to a bare
+//     `field_identifier` / `identifier` -> name="bar"; final
+//     QualifiedName="Foo.bar", EnclosingClass="Foo".
+//   - Out-of-line method definition (`void Foo::bar() {}` at
+//     namespace scope): `enclosingClass=""` from the visit()
+//     caller, but the declarator unwraps to a
+//     `qualified_identifier` whose scope reveals "Foo" and
+//     name "bar" -> final EnclosingClass="Foo",
+//     QualifiedName="Foo.bar". This lets the dispatcher
+//     resolve same-file calls against the inline-defined
+//     class.
+//   - Free function (`void log_global() {}`):
+//     `enclosingClass=""` and the declarator unwraps to an
+//     `identifier` -> name="log_global"; final
+//     EnclosingClass="" and QualifiedName="log_global".
+//
+// Body-relative line/byte ranges are recorded so the
+// dispatcher's `SubdivideMethod` can emit Block boundaries
+// in file-relative coordinates (parser.go MethodDecl
+// BodyStartLine / BodyEndLine / BodyStartByte / BodyEndByte
+// docs). The body source is also captured verbatim into
+// `BodySource` so the embedding-publish path has content
+// to vectorise (per dispatcher.go §9.6a publish hook).
+//
+// Calls and ReceiverCalls are populated from
+// `cppWalkCalls(body)`; both lists are deduped in insertion
+// order, matching the contract in parser.go MethodDecl.Calls
+// ("Order is the source order of the first occurrence of
+// each call target; duplicates are removed").
+func (w *cppWalker) handleFunctionDefinition(n *sitter.Node, enclosingClass, namespace string) {
+	_ = namespace // reserved for future LangMeta["namespace"] attribution.
+	if n == nil {
+		return
+	}
+	declRoot := n.ChildByFieldName("declarator")
+	if declRoot == nil {
+		return
+	}
+	extractedClass, methodName := cppExtractMethodIdentifier(declRoot, w.src)
+	if methodName == "" {
+		return
+	}
+	finalEnclosing := enclosingClass
+	if extractedClass != "" {
+		// Out-of-line definition (`void Foo::bar() {}`) --
+		// the declarator's qualifier wins over whatever
+		// scope the visit caller passed in. The caller at
+		// namespace scope passes enclosingClass="", so this
+		// is the only way EnclosingClass gets populated for
+		// out-of-line definitions.
+		finalEnclosing = extractedClass
+	}
+	qn := methodName
+	if finalEnclosing != "" {
+		qn = finalEnclosing + "." + methodName
+	}
+	body := n.ChildByFieldName("body")
+	if body == nil {
+		// Defensive fallback: scan for the first
+		// compound_statement child if the field lookup
+		// misses (grammar variants).
+		for i := uint32(0); i < n.NamedChildCount(); i++ {
+			c := n.NamedChild(int(i))
+			if c.Type() == cppNodeCompoundStatement {
+				body = c
+				break
+			}
+		}
+	}
+	calls, receiverCalls := cppWalkCalls(body, w.src)
+	method := MethodDecl{
+		QualifiedName:  qn,
+		EnclosingClass: finalEnclosing,
+		ParamSignature: cppExtractParamSignature(declRoot, w.src),
+		StartLine:      int(n.StartPoint().Row) + 1,
+		EndLine:        int(n.EndPoint().Row) + 1,
+		Calls:          calls,
+		ReceiverCalls:  receiverCalls,
+	}
+	if body != nil {
+		method.BodyStartLine = int(body.StartPoint().Row) + 1
+		method.BodyEndLine = int(body.EndPoint().Row) + 1
+		method.BodyStartByte = int(body.StartByte())
+		method.BodyEndByte = int(body.EndByte())
+		if method.BodyEndByte > method.BodyStartByte && method.BodyEndByte <= len(w.src) {
+			method.BodySource = string(w.src[method.BodyStartByte:method.BodyEndByte])
+		}
+	}
+	w.methods = append(w.methods, method)
+}
+
+// cppExtractMethodIdentifier walks a declarator subtree and
+// returns (extractedClass, methodName). The walker unwraps
+// the common declarator wrappers (pointer / reference /
+// parenthesized / function_declarator) and then matches the
+// final name-bearing node:
+//
+//   - `identifier` / `field_identifier` -> ("", name)
+//   - `qualified_identifier`            -> (scope, name)
+//   - `destructor_name`                 -> ("", "~name")
+//   - `operator_name`                   -> ("", raw text)
+//
+// Anything else returns ("", "") and the caller skips the
+// declaration. Tree-sitter-cpp wraps the declarator inside a
+// `function_declarator` whose own `declarator` field carries
+// the name-bearing node; the unwrap chain below handles that
+// indirection generically.
+func cppExtractMethodIdentifier(decl *sitter.Node, src []byte) (string, string) {
+	if decl == nil {
+		return "", ""
+	}
+	cur := decl
+	// Unwrap up to a few levels of declarator wrappers. The
+	// bound prevents pathological infinite loops if a future
+	// grammar revision introduces a cycle (it shouldn't, but
+	// the bound is cheap insurance).
+	for i := 0; i < 6; i++ {
+		switch cur.Type() {
+		case cppNodeFunctionDeclarator,
+			cppNodePointerDeclarator,
+			cppNodeReferenceDeclarator,
+			cppNodeParenthesizedDecl:
+			inner := cur.ChildByFieldName("declarator")
+			if inner == nil {
+				return "", ""
+			}
+			cur = inner
+			continue
+		}
+		break
+	}
+	switch cur.Type() {
+	case cppNodeIdentifier, cppNodeFieldIdentifier:
+		return "", strings.TrimSpace(cur.Content(src))
+	case cppNodeQualifiedIdentifier:
+		// `Foo::bar` -> scope="Foo", name="bar".
+		// `ns::Foo::bar` -> scope chain "ns::Foo" -> "ns.Foo".
+		// The `name` child may itself be a
+		// qualified_identifier; recurse via this helper to
+		// flatten the chain.
+		nameNode := cur.ChildByFieldName("name")
+		scopeNode := cur.ChildByFieldName("scope")
+		var scope, name string
+		if nameNode != nil {
+			subScope, subName := cppExtractMethodIdentifier(nameNode, src)
+			if subScope != "" {
+				if scope == "" {
+					scope = subScope
+				} else {
+					scope = scope + "." + subScope
+				}
+			}
+			name = subName
+		}
+		if scopeNode != nil {
+			raw := strings.TrimSpace(scopeNode.Content(src))
+			raw = strings.ReplaceAll(raw, "::", ".")
+			raw = strings.TrimSuffix(raw, ".")
+			if raw != "" {
+				if scope == "" {
+					scope = raw
+				} else {
+					scope = raw + "." + scope
+				}
+			}
+		}
+		return scope, name
+	case cppNodeDestructorName, cppNodeOperatorName:
+		return "", strings.TrimSpace(cur.Content(src))
+	}
+	return "", ""
+}
+
+// cppExtractParamSignature returns the raw parameter list
+// text from a function_declarator (or any declarator wrapping
+// one). The `(...)` wrapping is trimmed so the result
+// matches the existing parsers' convention -- consumers that
+// need the parenthesised form can re-add them.
+func cppExtractParamSignature(decl *sitter.Node, src []byte) string {
+	if decl == nil {
+		return ""
+	}
+	cur := decl
+	for i := 0; i < 6; i++ {
+		if cur.Type() == cppNodeFunctionDeclarator {
+			break
+		}
+		inner := cur.ChildByFieldName("declarator")
+		if inner == nil {
+			return ""
+		}
+		cur = inner
+	}
+	if cur.Type() != cppNodeFunctionDeclarator {
+		return ""
+	}
+	params := cur.ChildByFieldName("parameters")
+	if params == nil {
+		return ""
+	}
+	return trimParens(strings.TrimSpace(params.Content(src)))
+}
+
+// cppWalkCalls visits every `call_expression` descendant of
+// `body` and returns the per-method (Calls, ReceiverCalls)
+// pair the dispatcher consumes for static_calls edge
+// emission. Both slices are deduped in insertion order so
+// `helper(); helper();` produces a single entry per
+// parser.go MethodDecl.Calls / ReceiverCalls semantics.
+//
+// Classification rules:
+//
+//   - `function` field is an `identifier`  -> bare call,
+//     appended to Calls.
+//   - `function` field is a `field_expression` whose
+//     `argument` is the `this` keyword AND whose `field` is
+//     a `field_identifier` / `identifier` -> receiver-
+//     qualified call, the field's text appended to
+//     ReceiverCalls. We accept BOTH `argument.Type() ==
+//     "this"` and `Content(src) == "this"` to be robust
+//     against grammar revisions that re-shape the `this`
+//     expression.
+//
+// All other call shapes (selector-style `obj.foo()`,
+// pointer-arrow on a non-`this` operand, template
+// instantiations of free functions, std-qualified calls
+// like `std::move(x)`) are intentionally NOT routed
+// anywhere -- they're out of scope for this v1 surface and
+// would require cross-file resolution to emit accurate
+// edges.
+//
+// IMPORTANT: bare-call classification ONLY accepts a direct
+// `identifier` as the `function` field. We MUST NOT recurse
+// to find "the first identifier under function", because
+// that would mis-route `this->identify()` (a field_expression
+// whose deepest identifier is `identify`) into the bare-call
+// slice and the dispatcher would emit a wrong edge.
+func cppWalkCalls(body *sitter.Node, src []byte) (calls, receiverCalls []string) {
+	if body == nil {
+		return nil, nil
+	}
+	seenCalls := map[string]struct{}{}
+	seenRecv := map[string]struct{}{}
+	walkChildren(body, func(node *sitter.Node) bool {
+		if node.Type() != cppNodeCallExpression {
+			return true
+		}
+		fn := node.ChildByFieldName("function")
+		if fn == nil {
+			return true
+		}
+		switch fn.Type() {
+		case cppNodeIdentifier:
+			name := strings.TrimSpace(fn.Content(src))
+			if name == "" {
+				return true
+			}
+			if _, dup := seenCalls[name]; dup {
+				return true
+			}
+			seenCalls[name] = struct{}{}
+			calls = append(calls, name)
+		case cppNodeFieldExpression:
+			arg := fn.ChildByFieldName("argument")
+			field := fn.ChildByFieldName("field")
+			if arg == nil || field == nil {
+				return true
+			}
+			// Detect `this` defensively: the upstream
+			// grammar emits a dedicated `this` node type
+			// for the keyword, but a future revision may
+			// wrap it differently -- the content fallback
+			// catches that case without breaking the
+			// existing-shape happy path.
+			if arg.Type() != cppNodeThisExpression &&
+				strings.TrimSpace(arg.Content(src)) != "this" {
+				return true
+			}
+			if field.Type() != cppNodeFieldIdentifier && field.Type() != cppNodeIdentifier {
+				return true
+			}
+			name := strings.TrimSpace(field.Content(src))
+			if name == "" {
+				return true
+			}
+			if _, dup := seenRecv[name]; dup {
+				return true
+			}
+			seenRecv[name] = struct{}{}
+			receiverCalls = append(receiverCalls, name)
+		}
+		return true
+	})
+	return calls, receiverCalls
+}
+
+// handleInclude emits an Import for one `preproc_include`
+// node. The grammar exposes the include path via the `path`
+// field; we fall back to scanning for a `system_lib_string`
+// or `string_literal` child if the field lookup misses
+// (grammar variants).
+//
+// Normalization:
+//
+//   - `system_lib_string` (`<string>`)   -> Module="string"
+//     (angle brackets stripped).
+//   - `string_literal`    (`"base.h"`)   -> Module="./base.h"
+//     (quotes stripped; `./` prepended unless the path is
+//     already relative-marked or absolute). The leading
+//     `./` is the marker the dispatcher's relative-include
+//     filter (`isRelativeImport`) keys on so local headers
+//     don't materialise external-package nodes -- see
+//     implementation-plan.md Stage 3.2 step 206.
+//
+// Includes whose path cannot be decoded (empty or
+// non-string node) are silently dropped: the parser
+// contract requires malformed entries to be omitted rather
+// than surfaced as bogus edges.
+func (w *cppWalker) handleInclude(n *sitter.Node) {
+	if n == nil {
+		return
+	}
+	pathNode := n.ChildByFieldName("path")
+	if pathNode == nil {
+		for i := uint32(0); i < n.NamedChildCount(); i++ {
+			c := n.NamedChild(int(i))
+			if c.Type() == cppNodeSystemLibString || c.Type() == cppNodeStringLiteral {
+				pathNode = c
+				break
+			}
+		}
+	}
+	if pathNode == nil {
+		return
+	}
+	raw := strings.TrimSpace(pathNode.Content(w.src))
+	if raw == "" {
+		return
+	}
+	var module string
+	switch pathNode.Type() {
+	case cppNodeSystemLibString:
+		// `<foo/bar.h>` -> `foo/bar.h`.
+		s := strings.TrimPrefix(raw, "<")
+		s = strings.TrimSuffix(s, ">")
+		module = strings.TrimSpace(s)
+	case cppNodeStringLiteral:
+		// `"foo.h"` -> `./foo.h` (relative-include marker).
+		s := strings.TrimPrefix(raw, "\"")
+		s = strings.TrimSuffix(s, "\"")
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return
+		}
+		switch {
+		case strings.HasPrefix(s, "./"),
+			strings.HasPrefix(s, "../"),
+			strings.HasPrefix(s, "/"):
+			module = s
+		default:
+			module = "./" + s
+		}
+	default:
+		// Unknown path child shape -- preserve the raw
+		// captured text so the dispatcher at least logs a
+		// meaningful module name rather than dropping the
+		// include silently.
+		module = raw
+	}
+	if module == "" {
+		return
+	}
+	w.imports = append(w.imports, Import{
+		Module: module,
+		Line:   int(n.StartPoint().Row) + 1,
+	})
 }

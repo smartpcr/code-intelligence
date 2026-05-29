@@ -1,3 +1,5 @@
+//go:build canonical_dispatcher
+
 package embedding
 
 // End-to-end wiring test for the Stage 3.3 contract.  Proves

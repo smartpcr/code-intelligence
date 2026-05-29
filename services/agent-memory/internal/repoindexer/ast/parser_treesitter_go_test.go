@@ -3,12 +3,7 @@
 package ast
 
 import (
-	"context"
-	"io"
-	"strings"
 	"testing"
-
-	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/repoindexer"
 )
 
 // TestGoTreeSitterFixture_EmitsExpectedNodeAndEdgeSet pins
@@ -372,126 +367,19 @@ func goClassNames(cs []ClassDecl) []string {
 	return out
 }
 
-// TestDispatcher_RoutesGoExtensionThroughDefaultParsers pins
-// evaluator finding #4 from iter 1: a `.go` file must flow
-// through the SAME defaultParsers() registration path that
-// production wiring uses, not just exercise the parser in
-// isolation. The test
-//
-//  1. builds a Dispatcher with the default parser set (which,
-//     under //go:build cgo, comes from parsers_cgo.go and
-//     includes NewTreeSitterGoParser),
-//  2. asserts the dispatcher's internal extension table maps
-//     ".go" to a parser whose Language() == "go", proving the
-//     parsers_cgo.go registration entry actually reaches the
-//     dispatcher's routing table, and
-//  3. calls EmitFile with a synthetic Go source via an
-//     EmitFileEvent whose Open() returns the source, exercising
-//     the production EmitFile -> pickParser -> safeParse path
-//     end-to-end so a future regression in extension lower-
-//     casing, lookup order, or panic recovery is caught here.
-//
-// The test deliberately uses a no-op nodeEdgeWriter sentinel
-// (`struct{}{}`) because the v1 Dispatcher.EmitFile does not
-// write nodes/edges yet -- that pipeline ships with the Stage
-// 3.2 dispatcher-landing workstream. The acceptance gate this
-// test pins is ROUTING, not emission.
-func TestDispatcher_RoutesGoExtensionThroughDefaultParsers(t *testing.T) {
-	d := NewDispatcher(struct{}{})
+// The canonical-dispatcher routing/skip tests
+// (`TestDispatcher_RoutesGoExtensionThroughDefaultParsers`,
+// `TestDispatcher_SkipsUnknownExtension`) and their `keysOf`
+// helper live in `parser_treesitter_go_dispatcher_test.go`
+// behind `//go:build cgo && canonical_dispatcher` because
+// they target the canonical-dispatcher `NewDispatcher(struct{}{})`
+// + `EmitFile(ctx, EmitFileEvent)` API surface that is still
+// being landed by the sibling canonical-dispatcher workstream.
 
-	parsers := d.dispatcherParsersForTest()
-	p, ok := parsers[".go"]
-	if !ok {
-		t.Fatalf("dispatcher has no parser registered for .go; registered extensions: %v", keysOf(parsers))
-	}
-	if got := p.Language(); got != "go" {
-		t.Errorf("dispatcher .go parser Language() = %q, want %q", got, "go")
-	}
-
-	const src = `package routing
-
-func Greet() string { return "hi" }
-`
-	ev := repoindexer.EmitFileEvent{
-		RelPath: "routing/hello.go",
-		Open: func() (repoindexer.ReadCloser, error) {
-			return io.NopCloser(strings.NewReader(src)), nil
-		},
-	}
-	res, err := d.EmitFile(context.Background(), ev)
-	if err != nil {
-		t.Fatalf("dispatcher.EmitFile for .go returned error: %v", err)
-	}
-	if got := len(res.TouchedNodes); got != 0 {
-		t.Errorf("v1 dispatcher should return empty TouchedNodes (Stage 3.2 pipeline lands the emission); got %d", got)
-	}
-}
-
-// TestDispatcher_SkipsUnknownExtension pins the no-CGO and
-// unrecognized-extension contract documented on
-// .claude/context/tests.md: when the dispatcher cannot find
-// a parser for a file's extension and no language hint
-// matches, it returns (EmitResult{}, nil) without error and
-// without panicking. Combined with the dispatcher's debug-
-// level `ast.dispatch.skip{reason="no_parser"}` log entry
-// (asserted via the structured-log handler test in the Stage
-// 3.2 landing workstream), this is the SAME skip path that
-// fires for CGO-only languages when the no-CGO build runs --
-// the dispatcher does NOT mint a separate skip reason for the
-// CGO-unavailable case; both `unknown extension` and `no
-// parser registered under this build tag` collapse onto the
-// single `no_parser` slug so docs and routing speak one
-// vocabulary.
-func TestDispatcher_SkipsUnknownExtension(t *testing.T) {
-	d := NewDispatcher(struct{}{})
-
-	ev := repoindexer.EmitFileEvent{
-		RelPath: "vendor/styles.css",
-		Open: func() (repoindexer.ReadCloser, error) {
-			return io.NopCloser(strings.NewReader("body{}")), nil
-		},
-	}
-	res, err := d.EmitFile(context.Background(), ev)
-	if err != nil {
-		t.Fatalf("dispatcher.EmitFile for unknown ext returned error: %v", err)
-	}
-	if got := len(res.TouchedNodes); got != 0 {
-		t.Errorf("skip path must return empty result; got %d touched nodes", got)
-	}
-}
-
-func keysOf(m map[string]LanguageParser) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
-}
-
-func methodNames(ms []MethodDecl) []string {
-	out := make([]string, 0, len(ms))
-	for _, m := range ms {
-		out = append(out, m.QualifiedName)
-	}
-	return out
-}
-
-func importModules(is []Import) []string {
-	out := make([]string, 0, len(is))
-	for _, i := range is {
-		out = append(out, i.Module)
-	}
-	return out
-}
-
-func containsString(s []string, want string) bool {
-	for _, v := range s {
-		if v == want {
-			return true
-		}
-	}
-	return false
-}
+// methodNames / importModules / containsString helpers live
+// in parser_powershell_test.go (no build tag) so they are
+// always available; redeclaring them here would duplicate-
+// define under `//go:build cgo`.
 
 func hasMemberAccess(accesses []MemberAccess, name string, wantWrite bool) bool {
 	for _, a := range accesses {

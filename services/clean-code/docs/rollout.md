@@ -131,9 +131,17 @@ production tenant:
 ```bash
 curl -X POST \
      -H 'Content-Type: application/json' \
+     -H 'X-OIDC-Subject: alice@acme.com' \
      --data '{ "repo_id": "<uuid>", "mode": "linked" }' \
      https://clean-coded.example.com/v1/mgmt/set_mode
 ```
+
+`X-OIDC-Subject` is REQUIRED -- `mgmt.set_mode` stamps the
+header value into `repo_event.payload.actor` as
+`"operator:<subject>"` and refuses with HTTP 401 on a missing
+or blank header BEFORE the row lock or any persistence
+(runbook Stage 6.2 "Authentication and actor attribution",
+line ~1590).
 
 A 200 + `{ "repo_id": "...", "mode": "linked" }` confirms the
 row update AND the `repo_event(kind='mode_changed', payload={mode:'linked'})`
@@ -198,10 +206,14 @@ single Postgres transaction:
 ```bash
 curl -X POST \
      -H 'Content-Type: application/json' \
+     -H 'X-OIDC-Subject: alice@acme.com' \
      --data '{ "repo_id": "<uuid>", "mode": "embedded" }' \
      https://clean-coded.example.com/v1/mgmt/set_mode
 ```
 
+- `X-OIDC-Subject` is REQUIRED on the rollback call too --
+  same 401 contract as the forward flip (runbook Stage 6.2,
+  line ~1590).
 - The row update + the second `repo_event(kind='mode_changed',
   payload={mode:'embedded'})` append happen in the same
   transaction (Stage 6.2 contract).

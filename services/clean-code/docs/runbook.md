@@ -49,12 +49,19 @@ When the operator onboards a new repo into the catalogue.
 ```bash
 curl -X POST \
      -H 'Content-Type: application/json' \
+     -H 'X-OIDC-Subject: alice@acme.com' \
      --data '{ "repo_url": "https://github.com/acme/svc-orders",
                "default_branch": "main",
                "mode": "embedded" }' \
      https://clean-coded.example.com/v1/mgmt/register_repo
 ```
 
+- `X-OIDC-Subject` is REQUIRED on every call. The gateway sets
+  it from the OIDC-authenticated principal; the verb stamps
+  it into `repo_event.payload.actor` as `"operator:<subject>"`.
+  A missing or blank header returns HTTP 401 BEFORE any
+  persistence happens (Stage 6.2 "Authentication and actor
+  attribution", line ~1590).
 - Idempotent on `repo_url`: re-posting the same URL returns
   the existing `repo_id` with HTTP 200 and writes no duplicate
   `repo` row.
@@ -82,11 +89,18 @@ no-longer-valid (e.g. a bad coverage upload).
 ```bash
 curl -X POST \
      -H 'Content-Type: application/json' \
+     -H 'X-OIDC-Subject: alice@acme.com' \
      --data '{ "sample_id": "<uuid>",
                "reason": "bad coverage upload -- replaced by SHA abc123" }' \
      https://clean-coded.example.com/v1/mgmt/retract_sample
 ```
 
+- `X-OIDC-Subject` is REQUIRED -- the actor is sourced from
+  the header (NOT the body; `DisallowUnknownFields` rejects
+  any caller-supplied `actor` field with 400). A missing or
+  blank header returns HTTP 401 before any persistence
+  happens (Stage 3.4 line ~3162; body sourcing pinned at
+  line ~3021).
 - Appends a `repo_event(kind='retract_intent', payload={sample_id, reason})`
   (canonical RepoEvent enum value, Sec 5.1.4) and then a
   `metric_retraction(retraction_id, sample_id, reason, appended_by, created_at)`
@@ -200,18 +214,29 @@ bug fix in a recipe, or to recover from a partial scan.
 ```bash
 curl -X POST \
      -H 'Content-Type: application/json' \
+     -H 'X-OIDC-Subject: alice@acme.com' \
      --data '{ "repo_id": "<uuid>",
-               "sha":     "abc1234...",
-               "reason":  "recipe-coverage bugfix re-run" }' \
+               "sha":     "abc1234..." }' \
      https://clean-coded.example.com/v1/mgmt/rescan
 ```
 
-- Opens a fresh `scan_run(kind='rescan', sha_binding='single', repo_id, sha, ...)`
-  and dispatches it through the Metric Ingestor state machine.
-- Idempotent in the same sense as `mgmt.retract_sample`: a
-  concurrent rescan against the same `(repo_id, sha)` resolves
-  to the existing in-flight `scan_run_id` rather than opening
-  a duplicate.
+- `X-OIDC-Subject` is REQUIRED (Stage 3.4 line ~3023 +
+  ~3162; the body is the canonical
+  `{"repo_id","sha"}` two-field shape -- `DisallowUnknownFields`
+  rejects any extra field, including a body-supplied `actor`
+  or `reason`).
+- Opens a fresh `scan_run(kind='full', sha_binding='single',
+  status='running', to_sha=<sha>)` row and returns the
+  freshly-minted `scan_run_id`. The foundation-tier state
+  machine drains the row via its standard claim path. NO
+  `repo_event` row is appended -- the canonical RepoEvent
+  enum at architecture Sec 5.1.4 has no `rescan_intent`.
+- **NOT idempotent (by design).** A second rescan for the
+  same `(repo_id, sha)` opens a SECOND `scan_run` row -- an
+  operator clicking "rescan" twice expects two full recipe
+  loops (Stage 3.4 "Rescan flow", lines ~3131-3151). This is
+  the deliberate contrast with `mgmt.retract_sample`, which
+  IS idempotent on `sample_id`.
 - Does NOT delete existing `metric_sample` rows for the SHA;
   the new run appends a fresh `producer_run_id` and the
   `metric_sample_active` view's max-by-`created_at` selection

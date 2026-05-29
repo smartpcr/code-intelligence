@@ -37,7 +37,6 @@ type agedMuteState struct {
 	db         *sql.DB
 	pgURL      string
 	stewardURL string
-	mgmtURL    string
 
 	// aged-mute-listed-not-enforced
 	listedScope  string
@@ -84,18 +83,6 @@ func (s *agedMuteState) ensureStewardURL() {
 	s.stewardURL = os.Getenv("CLEAN_CODE_POLICY_STEWARD_URL")
 	if s.stewardURL == "" {
 		s.stewardURL = "http://localhost:8082"
-	}
-}
-
-func (s *agedMuteState) ensureMgmtURL() {
-	if s.mgmtURL != "" {
-		return
-	}
-	s.mgmtURL = os.Getenv("CLEAN_CODE_MGMT_URL")
-	if s.mgmtURL == "" {
-		s.mgmtURL = s.stewardURL
-		s.ensureStewardURL()
-		s.mgmtURL = s.stewardURL
 	}
 }
 

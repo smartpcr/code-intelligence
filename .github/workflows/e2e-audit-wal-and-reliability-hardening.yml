@@ -1,0 +1,66 @@
+name: E2E – Audit WAL and Reliability Hardening
+
+on:
+  push:
+    branches:
+      - feature/clean-code
+      - "ws/code-intelligence-CLEAN-CODE/**"
+    paths:
+      - "test/e2e/code-intelligence-CLEAN-CODE/**"
+      - "tests/e2e/phase-09-audit-wal/**"
+  pull_request:
+    branches:
+      - feature/clean-code
+    paths:
+      - "test/e2e/code-intelligence-CLEAN-CODE/**"
+      - "tests/e2e/phase-09-audit-wal/**"
+
+jobs:
+  e2e-audit-wal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Start compose services
+        run: |
+          docker compose -f tests/e2e/phase-09-audit-wal/docker-compose.yml up -d --build
+          echo "Waiting for services to be ready..."
+          sleep 15
+
+      - name: Bootstrap DB
+        run: |
+          make migrate-up
+          make seed-phase-09
+
+      - name: Run E2E tests
+        working-directory: test/e2e/code-intelligence-CLEAN-CODE
+        env:
+          # No external secrets needed — DSN and OTEL endpoint are
+          # provided by the compose stack (Secrets: none per setup spec).
+          CLEAN_CODE_PG_URL: "postgres://cleancode:cleancode@localhost:5432/cleancode?sslmode=disable"
+          CLEAN_CODE_OTEL_ENDPOINT: "http://localhost:4317"
+          EVALUATOR_URL: http://localhost:8090
+          RULE_ENGINE_URL: http://localhost:8091
+        run: go test -tags e2e -v -timeout 300s ./...
+
+      - name: Collect compose logs
+        if: always()
+        run: |
+          docker compose -f tests/e2e/phase-09-audit-wal/docker-compose.yml logs --no-color > compose-logs.txt 2>&1
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-audit-wal-logs
+          path: compose-logs.txt
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f tests/e2e/phase-09-audit-wal/docker-compose.yml down -v

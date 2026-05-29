@@ -37,7 +37,19 @@ func mustRepoID(t *testing.T, s string) uuid.UUID {
 // the namespace SOURCE ([uuid.NamespaceURL] vs
 // [uuid.NamespaceDNS]) fails the test loudly. (Addresses
 // evaluator iter-2 #2.)
-const pinnedNamespaceUUID = "5fa5937c-c012-5190-b7bd-0bd48f41de65"
+//
+// PR #111 (Management read verbs) renamed the canonical org
+// in NamespaceURL from "microsoft" to "smartpcr" as part of
+// the upstream repo migration -- a deliberate edit per the
+// commit message. The pinned literal was updated here to the
+// re-derived UUID `2d17cb5e-92a1-5dcb-9df0-10ef6cf2f2ae`
+// (Stage 7.3 test-pin reconciliation). The legacy
+// `microsoft`-org UUID `5fa5937c-c012-5190-b7bd-0bd48f41de65`
+// is intentionally retired; any deployment that had already
+// persisted scope_id rows under the legacy namespace requires
+// a one-time backfill -- the down side of this rename is a
+// Stage 6 operator concern, not a test-side concern.
+const pinnedNamespaceUUID = "2d17cb5e-92a1-5dcb-9df0-10ef6cf2f2ae"
 
 // TestNamespace_Pinned is the golden test the namespace UUID
 // is locked behind. Any future edit to [scope.NamespaceURL] OR

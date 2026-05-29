@@ -24,6 +24,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -103,6 +104,17 @@ const (
 	// makes the operator's intent explicit at config-load
 	// time.
 	DefaultKMSProvider = ""
+	// DefaultLinkedAdapterTimeout is the per-request HTTP
+	// timeout the Stage 10.1 linked-mode adapter applies to
+	// each agent-memory cross-repo-edge fetch (architecture
+	// Sec 8.7). 5s matches the agent-memory team's published
+	// graph-reader p99 SLO (Sec 6.2.3) with ~5x headroom and
+	// is short enough to keep aggregator tick latency
+	// bounded on a single agent-memory outage (the
+	// aggregator degrades the affected row to
+	// `xrepo_edges_unavailable` and moves on rather than
+	// blocking the tick).
+	DefaultLinkedAdapterTimeout = 5 * time.Second
 )
 
 // Default network bind addresses for the empty scaffold. Operators
@@ -133,7 +145,32 @@ const (
 	EnvGateDegradedPolicy           = "CLEAN_CODE_GATE_DEGRADED_POLICY"
 	EnvPolicySigningRequired        = "CLEAN_CODE_POLICY_SIGNING_REQUIRED"
 	EnvRefactorEffortSource         = "CLEAN_CODE_REFACTOR_EFFORT_SOURCE"
-	EnvHTTPAddr                     = "CLEAN_CODE_HTTP_ADDR"
+	// EnvEffortSourceAlias is the compose-shorthand alias for
+	// EnvRefactorEffortSource. PR #148's
+	// `tests/e2e/phase-08-refactor-planner/docker-compose.yml`
+	// uses the short form to stay aligned with `ml-model-uri`
+	// and `ml-model-version` env-var lines. Both the canonical
+	// and alias spellings populate the same Config field; the
+	// canonical name wins if BOTH are set (so an operator who
+	// deliberately sets the canonical pin in one place cannot
+	// be silently overridden by a compose default).
+	EnvEffortSourceAlias = "CLEAN_CODE_EFFORT_SOURCE"
+	// EnvMLModelURI carries the URI of the ML effort-model
+	// artefact the Stage 9.3 refactor-planner loads when the
+	// resolved [EnvRefactorEffortSource] is `ml`. Required in
+	// the ML branch; an empty value with `ml` source fails
+	// fast at planner construction via
+	// [refactor.ErrMLModelURIMissing].
+	EnvMLModelURI = "CLEAN_CODE_ML_MODEL_URI"
+	// EnvMLModelVersion is the semantic version pin the loaded
+	// ML model claims. The planner compares this against
+	// `policy_version.refactor_weights.effort_model_version`
+	// at every estimate; a drift returns
+	// [refactor.ErrMLModelVersionMismatch] and aborts the
+	// atomic plan + tasks write so the architecture Sec 5.5.3
+	// reproducibility invariant survives operator misconfig.
+	EnvMLModelVersion = "CLEAN_CODE_ML_MODEL_VERSION"
+	EnvHTTPAddr       = "CLEAN_CODE_HTTP_ADDR"
 	EnvPrometheusAddr               = "CLEAN_CODE_PROMETHEUS_ADDR"
 	EnvOTelEndpoint                 = "CLEAN_CODE_OTEL_ENDPOINT"
 	// EnvAstScanRoot points at the local on-disk root the
@@ -339,6 +376,41 @@ const (
 	// any other key-id with 401 / HMAC_UNKNOWN_KEY_ID.
 	// Empty when [EnvEnableExternalIngestWebhook] is unset.
 	EnvWebhookSigningKeyID = "CLEAN_CODE_WEBHOOK_SIGNING_KEY_ID" //nolint:gosec // env var name, not a credential
+
+	// EnvEnableLinkedModeAdapter is the explicit operator
+	// opt-in for the Stage 10.1 linked-mode adapter (the
+	// `internal/linked` HTTP client that wraps the
+	// agent-memory cross-repo edge endpoint -- architecture
+	// Sec 8.7). Default false: the aggregator runs in
+	// embedded-only mode and stamps
+	// `degraded_reason='xrepo_edges_unavailable'` for the
+	// cross-repo-edge-dependent rows. Setting this true
+	// REQUIRES [EnvLinkedAgentMemoryEndpoint] to also be
+	// set; the symmetric interlock matches the existing
+	// webhook-opt-in pattern.
+	//
+	// Note that this flag only opens the GLOBAL gate; per-
+	// repo opt-in still requires `mgmt.set_mode(repo_id,
+	// 'linked')`. The adapter consults both axes before
+	// firing an HTTP call.
+	EnvEnableLinkedModeAdapter = "CLEAN_CODE_ENABLE_LINKED_MODE_ADAPTER"
+
+	// EnvLinkedAgentMemoryEndpoint is the agent-memory
+	// cross-repo-edge service base URL (e.g.
+	// `https://agent-memory.internal/`). The
+	// `internal/linked` client appends `/v1/cross-repo/edges`
+	// at request time. MUST be a parseable http(s) URL when
+	// set; empty leaves the linked-mode adapter unwired.
+	// Interlocks with [EnvEnableLinkedModeAdapter].
+	EnvLinkedAgentMemoryEndpoint = "CLEAN_CODE_LINKED_AGENT_MEMORY_ENDPOINT"
+
+	// EnvLinkedAdapterTimeout overrides the linked-mode
+	// adapter's per-request HTTP timeout. Accepts any value
+	// `time.ParseDuration` accepts (`5s`, `750ms`, etc.).
+	// Default [DefaultLinkedAdapterTimeout]. A non-positive
+	// value is rejected with a hard error at config-load
+	// time to surface operator typos before runtime.
+	EnvLinkedAdapterTimeout = "CLEAN_CODE_LINKED_ADAPTER_TIMEOUT"
 )
 
 // MinWebhookHMACSecretBytes is the minimum length (in bytes,
@@ -374,7 +446,29 @@ type Config struct {
 
 	// RefactorEffortSource carries the `refactor-effort-source`
 	// pin. Default: `ML model from historical commits`.
+	// Wire-level env var: [EnvRefactorEffortSource]
+	// (`CLEAN_CODE_REFACTOR_EFFORT_SOURCE`). The compose
+	// shorthand [EnvEffortSourceAlias]
+	// (`CLEAN_CODE_EFFORT_SOURCE`) populates the same field;
+	// the canonical name wins if BOTH are set.
 	RefactorEffortSource string
+
+	// MLModelURI is the URI of the ML effort-model artefact
+	// the Stage 9.3 refactor-planner loads when
+	// [RefactorEffortSource] resolves to `ml`. Wire-level
+	// env var: [EnvMLModelURI] (`CLEAN_CODE_ML_MODEL_URI`).
+	// Required in the ML branch; the planner construction
+	// returns [refactor.ErrMLModelURIMissing] when empty.
+	MLModelURI string
+
+	// MLModelVersion is the semantic version the loaded ML
+	// model claims. Wire-level env var: [EnvMLModelVersion]
+	// (`CLEAN_CODE_ML_MODEL_VERSION`). Required in the ML
+	// branch; the planner compares this at every estimate
+	// against `policy_version.refactor_weights.effort_model_version`
+	// and aborts the atomic plan + tasks write on drift via
+	// [refactor.ErrMLModelVersionMismatch].
+	MLModelVersion string
 
 	// --- Network bind addresses ---
 
@@ -540,6 +634,38 @@ type Config struct {
 	// emits a `ast_files_seen=0` log line per dispatch.
 	// Phase 4 replaces both with the PG-backed AST cache.
 	AstScanRoot string
+
+	// --- Stage 10.1 linked-mode adapter (architecture Sec 8.7) ---
+
+	// EnableLinkedModeAdapter is the explicit operator
+	// opt-in for the `internal/linked` adapter that wraps
+	// the agent-memory cross-repo edge service. Default
+	// false: the aggregator runs in embedded-only mode and
+	// the composer degrades `xrepo_dep_depth` /
+	// `blast_radius` rows with
+	// `xrepo_edges_unavailable`. Setting this true REQUIRES
+	// [LinkedAgentMemoryEndpoint] to also be set. See
+	// [EnvEnableLinkedModeAdapter] for the env-var contract.
+	//
+	// Note this opens only the GLOBAL gate; per-repo opt-in
+	// still requires the per-repo `mode='linked'` setting
+	// (set via `mgmt.set_mode`). The two-axis gating lives
+	// inside the linked package's `AggregatorAdapter`.
+	EnableLinkedModeAdapter bool
+
+	// LinkedAgentMemoryEndpoint is the agent-memory
+	// cross-repo-edge service base URL (e.g.
+	// `https://agent-memory.internal/`). MUST be a
+	// parseable http(s) URL when set. Empty when
+	// [EnableLinkedModeAdapter] is false. See
+	// [EnvLinkedAgentMemoryEndpoint].
+	LinkedAgentMemoryEndpoint string
+
+	// LinkedAdapterTimeout is the per-request HTTP timeout
+	// the linked-mode adapter applies to each agent-memory
+	// fetch. Defaults to [DefaultLinkedAdapterTimeout].
+	// See [EnvLinkedAdapterTimeout].
+	LinkedAdapterTimeout time.Duration
 }
 
 // Defaults returns a Config populated with the canonical
@@ -565,6 +691,7 @@ func Defaults() Config {
 		AggregatorCadence:            DefaultAggregatorCadence,
 		KMSProvider:                  DefaultKMSProvider,
 		KMSMasterKeyHex:              "",
+		LinkedAdapterTimeout:         DefaultLinkedAdapterTimeout,
 	}
 }
 
@@ -713,6 +840,42 @@ func (c Config) Validate() error {
 		return fmt.Errorf("config: %s must be at least %d bytes long (got %d); use a CSPRNG-generated secret such as `head -c 32 /dev/urandom | base64`",
 			EnvWebhookHMACSecret, MinWebhookHMACSecretBytes, len(c.WebhookHMACSecret))
 	}
+	// Stage 10.1 linked-mode adapter interlock: enabling the
+	// adapter requires a parseable http(s) endpoint, and a
+	// non-empty endpoint without the explicit opt-in is
+	// always a misconfiguration (the endpoint is consumed
+	// ONLY by the linked-mode adapter). The symmetric
+	// interlock matches the existing webhook-opt-in
+	// patterns at lines 738-758 above. The per-request
+	// timeout MUST be strictly positive when set; the
+	// loader's [DefaultLinkedAdapterTimeout] preserves a
+	// safe default when the operator omits the env var.
+	endpoint := strings.TrimSpace(c.LinkedAgentMemoryEndpoint)
+	if c.EnableLinkedModeAdapter {
+		if endpoint == "" {
+			return fmt.Errorf("config: %s=true requires %s to be set (the linked-mode adapter has no agent-memory base URL)",
+				EnvEnableLinkedModeAdapter, EnvLinkedAgentMemoryEndpoint)
+		}
+	}
+	if endpoint != "" && !c.EnableLinkedModeAdapter {
+		return fmt.Errorf("config: %s is set but %s is not; the endpoint is consumed only by the linked-mode adapter",
+			EnvLinkedAgentMemoryEndpoint, EnvEnableLinkedModeAdapter)
+	}
+	if endpoint != "" {
+		u, err := url.Parse(endpoint)
+		if err != nil {
+			return fmt.Errorf("config: %s=%q is not a parseable URL: %w", EnvLinkedAgentMemoryEndpoint, endpoint, err)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("config: %s=%q must use http or https scheme (got %q)", EnvLinkedAgentMemoryEndpoint, endpoint, u.Scheme)
+		}
+		if u.Host == "" {
+			return fmt.Errorf("config: %s=%q must include a host", EnvLinkedAgentMemoryEndpoint, endpoint)
+		}
+	}
+	if c.LinkedAdapterTimeout <= 0 {
+		return fmt.Errorf("config: %s=%s must be > 0", EnvLinkedAdapterTimeout, c.LinkedAdapterTimeout)
+	}
 	return nil
 }
 
@@ -726,6 +889,9 @@ func readEnvOverrides() map[string]string {
 		EnvGateDegradedPolicy,
 		EnvPolicySigningRequired,
 		EnvRefactorEffortSource,
+		EnvEffortSourceAlias,
+		EnvMLModelURI,
+		EnvMLModelVersion,
 		EnvHTTPAddr,
 		EnvPrometheusAddr,
 		EnvOTelEndpoint,
@@ -750,6 +916,9 @@ func readEnvOverrides() map[string]string {
 		EnvEnableExternalIngestWebhook,
 		EnvWebhookSigningKeyID,
 		EnvAstScanRoot,
+		EnvEnableLinkedModeAdapter,
+		EnvLinkedAgentMemoryEndpoint,
+		EnvLinkedAdapterTimeout,
 	}
 	out := make(map[string]string, len(keys))
 	for _, k := range keys {
@@ -776,6 +945,22 @@ func applyOverrides(cfg *Config, overrides map[string]string) error {
 			cfg.PolicySigningRequired = v
 		case EnvRefactorEffortSource:
 			cfg.RefactorEffortSource = v
+		case EnvEffortSourceAlias:
+			// Compose-shorthand alias. The canonical
+			// EnvRefactorEffortSource wins if BOTH are
+			// supplied: an operator-set canonical value MUST
+			// NOT be silently overridden by a compose default.
+			// We consult the override MAP directly (not the
+			// cfg field) so the precedence is independent of
+			// the non-deterministic map iteration order AND
+			// independent of the Defaults() pre-seed.
+			if _, hasCanonical := overrides[EnvRefactorEffortSource]; !hasCanonical {
+				cfg.RefactorEffortSource = v
+			}
+		case EnvMLModelURI:
+			cfg.MLModelURI = v
+		case EnvMLModelVersion:
+			cfg.MLModelVersion = v
 		case EnvHTTPAddr:
 			cfg.HTTPAddr = v
 		case EnvPrometheusAddr:
@@ -897,6 +1082,23 @@ func applyOverrides(cfg *Config, overrides map[string]string) error {
 			cfg.WebhookSigningKeyID = v
 		case EnvAstScanRoot:
 			cfg.AstScanRoot = v
+		case EnvEnableLinkedModeAdapter:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "1", "true", "yes", "on":
+				cfg.EnableLinkedModeAdapter = true
+			case "0", "false", "no", "off":
+				cfg.EnableLinkedModeAdapter = false
+			default:
+				return fmt.Errorf("%s=%q: not a boolean (accepted: 1|true|yes|on / 0|false|no|off)", k, v)
+			}
+		case EnvLinkedAgentMemoryEndpoint:
+			cfg.LinkedAgentMemoryEndpoint = v
+		case EnvLinkedAdapterTimeout:
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return fmt.Errorf("%s=%q: %w", k, v, err)
+			}
+			cfg.LinkedAdapterTimeout = d
 		default:
 			return fmt.Errorf("unknown config key %q", k)
 		}

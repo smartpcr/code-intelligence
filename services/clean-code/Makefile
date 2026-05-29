@@ -4,16 +4,6 @@
 
 MIGRATIONS_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))migrations
 
-.PHONY: migrate-up migrate-down
-
-migrate-up:
-	@test -n "$(CLEAN_CODE_PG_URL)" || (echo "ERROR: CLEAN_CODE_PG_URL is not set" && exit 1)
-	psql "$(CLEAN_CODE_PG_URL)" -f "$(MIGRATIONS_DIR)/001_up.sql"
-
-migrate-down:
-	@test -n "$(CLEAN_CODE_PG_URL)" || (echo "ERROR: CLEAN_CODE_PG_URL is not set" && exit 1)
-	psql "$(CLEAN_CODE_PG_URL)" -f "$(MIGRATIONS_DIR)/001_down.sql"
-
 # ---------------------------------------------------------------------------
 # Go service targets
 #
@@ -21,9 +11,7 @@ migrate-down:
 # (`make lint`, `make build`, `make test`, `make test-race`) and by
 # developer workflows that pre-date the schema-migrations refactor
 # (`make vet`, `make tidy`, `make clean`, `make proto`, `make docker-build`,
-# `make compose-up`, `make compose-down`). They were inadvertently dropped
-# when this Makefile was trimmed to schema-only targets; restoring them
-# keeps the CI workflow green.
+# `make compose-up`, `make compose-down`).
 # ---------------------------------------------------------------------------
 
 BIN_DIR             := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))bin
@@ -56,7 +44,15 @@ PROTO_DIR           ?= proto
 PROTO_OUT_DIR       ?= .
 PROTO_FILES         ?= ast/v1/ast.proto
 
+# ---------------------------------------------------------------------------
+# Phase-09 audit-WAL E2E targets
+# ---------------------------------------------------------------------------
+
+PG_URL ?= postgres://clean_code_admin:e2e_test_password@localhost:5432/clean_code?sslmode=disable
+COMPOSE_FILE ?= ../../tests/e2e/phase-09-audit-wal/docker-compose.yml
+
 .PHONY: build test test-cgo test-nocgo test-race lint vet tidy clean proto proto-tools docker-build compose-up compose-down
+.PHONY: migrate-up migrate-down seed-phase-09 test-phase-09
 
 build:
 	$(GO) build -o $(CLEAN_CODED) $(CLEAN_CODE_MAIN_PKG)
@@ -138,3 +134,26 @@ compose-up:
 
 compose-down:
 	$(COMPOSE) down
+
+# ---------------------------------------------------------------------------
+# Schema migration targets
+# ---------------------------------------------------------------------------
+
+migrate-up:
+	@echo "Running migrations against $${CLEAN_CODE_PG_URL:-$(PG_URL)}"
+	psql "$${CLEAN_CODE_PG_URL:-$(PG_URL)}" -v ON_ERROR_STOP=1 -f migrations/001_create_audit_tables.sql
+	psql "$${CLEAN_CODE_PG_URL:-$(PG_URL)}" -v ON_ERROR_STOP=1 -f migrations/002_create_wal_inbox.sql
+	psql "$${CLEAN_CODE_PG_URL:-$(PG_URL)}" -v ON_ERROR_STOP=1 -f migrations/003_create_roles.sql
+	@echo "Migrations complete."
+
+migrate-down:
+	@test -n "$(CLEAN_CODE_PG_URL)" || (echo "ERROR: CLEAN_CODE_PG_URL is not set" && exit 1)
+	psql "$(CLEAN_CODE_PG_URL)" -f "$(MIGRATIONS_DIR)/001_down.sql"
+
+seed-phase-09:
+	@echo "Seeding phase-09 baseline data"
+	psql "$${CLEAN_CODE_PG_URL:-$(PG_URL)}" -v ON_ERROR_STOP=1 -f seeds/phase-09-baseline.sql
+	@echo "Seeding complete."
+
+test-phase-09:
+	go test -tags e2e -v -count=1 -timeout 120s ./test/e2e/code-intelligence-CLEAN-CODE/...

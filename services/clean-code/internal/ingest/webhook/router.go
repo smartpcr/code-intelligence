@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -300,42 +301,10 @@ func NewRouter(cfg RouterConfig) *Router {
 // AFTER [RouterPath]; an empty / unparseable segment returns
 // 404.
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodPost {
-		r.writeError(w, http.StatusMethodNotAllowed,
-			"Router accepts POST only", "METHOD_NOT_ALLOWED", "")
-		return
-	}
-
-	verb, ok := r.parseVerb(req.URL.Path)
+	verb, body, handler, registered, ok := r.serveBeforeAuth(w, req)
 	if !ok {
-		r.writeError(w, http.StatusNotFound,
-			fmt.Sprintf("malformed verb path %q (expected /v1/ingest/{verb})", req.URL.Path),
-			"VERB_NOT_FOUND", "")
 		return
 	}
-
-	req.Body = http.MaxBytesReader(w, req.Body, r.maxBytes)
-	defer func() { _ = req.Body.Close() }()
-	body, err := io.ReadAll(req.Body)
-	if err != nil {
-		var mbe *http.MaxBytesError
-		if errors.As(err, &mbe) {
-			r.writeError(w, http.StatusRequestEntityTooLarge,
-				fmt.Sprintf("body exceeds %d-byte limit", r.maxBytes),
-				"PAYLOAD_TOO_LARGE", verb)
-			return
-		}
-		r.writeError(w, http.StatusBadRequest,
-			fmt.Sprintf("reading body: %v", err), "BAD_REQUEST", verb)
-		return
-	}
-
-	// Verb lookup BEFORE HMAC so we can ask the handler for
-	// its canonical signed material in the next step. The
-	// Router does NOT surface the 404 yet: an unauthenticated
-	// probe to `/v1/ingest/typo` MUST return 401 (HMAC
-	// fails), not 404 (verb taxonomy leaked).
-	handler, registered := r.verbs[verb]
 
 	// Per-verb canonical bytes for HMAC AND payload_hash.
 	// For header-borne verbs (test_balance) the canonical
@@ -409,6 +378,76 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	r.serveAfterAuth(w, req, verb, handler, body, canonical)
+}
+
+// serveBeforeAuth runs the path / method / body-read stages
+// that precede authentication. Returns (verb, body, handler,
+// registered, ok=true) on success. Writes the canonical error
+// response and returns ok=false when the request is rejected
+// (405, 404 path-shape, 413 oversize, 400 body-read).
+//
+// `handler` is non-nil iff `registered=true`. An unregistered
+// verb is preserved (not short-circuited here) so callers can
+// keep the iter-6 ordering invariant: HMAC verification MUST
+// run BEFORE verb-registration is observable to an
+// unauthenticated probe.
+func (r *Router) serveBeforeAuth(w http.ResponseWriter, req *http.Request) (verb string, body []byte, handler VerbHandler, registered bool, ok bool) {
+	if req.Method != http.MethodPost {
+		r.writeError(w, http.StatusMethodNotAllowed,
+			"Router accepts POST only", "METHOD_NOT_ALLOWED", "")
+		return "", nil, nil, false, false
+	}
+
+	parsedVerb, parsedOk := r.parseVerb(req.URL.Path)
+	if !parsedOk {
+		r.writeError(w, http.StatusNotFound,
+			fmt.Sprintf("malformed verb path %q (expected /v1/ingest/{verb})", req.URL.Path),
+			"VERB_NOT_FOUND", "")
+		return "", nil, nil, false, false
+	}
+
+	req.Body = http.MaxBytesReader(w, req.Body, r.maxBytes)
+	defer func() { _ = req.Body.Close() }()
+	readBody, readErr := io.ReadAll(req.Body)
+	if readErr != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(readErr, &mbe) {
+			r.writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("body exceeds %d-byte limit", r.maxBytes),
+				"PAYLOAD_TOO_LARGE", parsedVerb)
+			return "", nil, nil, false, false
+		}
+		r.writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("reading body: %v", readErr), "BAD_REQUEST", parsedVerb)
+		return "", nil, nil, false, false
+	}
+
+	// Verb lookup BEFORE HMAC so the caller can ask the
+	// handler for its canonical signed material in the next
+	// step. The Router's `ServeHTTP` does NOT surface a 404
+	// yet: an unauthenticated probe to `/v1/ingest/typo`
+	// MUST return 401 (HMAC fails), not 404 (verb taxonomy
+	// leaked). [TrustedGatewayHandler] takes a different
+	// path -- it surfaces the 404 immediately because the
+	// gateway itself has already authenticated.
+	h, reg := r.verbs[parsedVerb]
+	return parsedVerb, readBody, h, reg, true
+}
+
+// serveAfterAuth runs the post-authentication pipeline:
+// content-type check, payload_hash computation,
+// ExtractMetadata, idempotency claim, durable scan_run open,
+// verb dispatch, finalize, and the 200 envelope. This is the
+// shared seam between [Router.ServeHTTP] (which runs HMAC
+// auth first) and [Router.TrustedGatewayHandler] (which
+// delegates authentication to an upstream OIDC gateway and
+// skips HMAC).
+//
+// `verb` MUST equal `handler.Verb()`; `canonical` MUST be
+// `handler.CanonicalRequest(req.Header, body)`. The caller
+// is responsible for the upstream auth check.
+func (r *Router) serveAfterAuth(w http.ResponseWriter, req *http.Request, verb string, handler VerbHandler, body, canonical []byte) {
 	// Content-Type check AFTER HMAC AND verb lookup, BEFORE
 	// idempotency claim. See the doc-comment on [Router] for
 	// the ordering rationale.
@@ -641,6 +680,180 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body200)
+}
+
+// HasVerb reports whether `verb` is currently registered with
+// the Router. Used by composition roots (notably the OIDC
+// gateway in `internal/api/`) to decide which slots in the
+// gateway's per-verb mount table to populate without having
+// to depend on the Router's internal map. A nil receiver
+// returns false (defensive; the gateway treats nil router
+// as "no ingest verbs available").
+func (r *Router) HasVerb(verb string) bool {
+	if r == nil {
+		return false
+	}
+	_, ok := r.verbs[verb]
+	return ok
+}
+
+// RegisteredVerbs returns the set of verbs the Router will
+// dispatch, sorted lexicographically for deterministic
+// iteration. Empty / nil receiver returns nil. Intended for
+// the OIDC gateway's wiring partition (`Wiring.MissingVerbs`)
+// and for diagnostic logging at composition.
+func (r *Router) RegisteredVerbs() []string {
+	if r == nil {
+		return nil
+	}
+	out := make([]string, 0, len(r.verbs))
+	for v := range r.verbs {
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// OIDCGatewayTrust is a [witness type] proving the caller
+// has acknowledged the HMAC-bypass contract of
+// [Router.TrustedGatewayHandler]. Constructable ONLY via
+// [NewOIDCGatewayTrust]; the zero value is invalid and
+// causes [Router.TrustedGatewayHandler] to refuse.
+//
+// The witness exists to make accidental misuse a compile-
+// time and runtime obstacle:
+//
+//   - You cannot call `r.TrustedGatewayHandler(verb)` from a
+//     publisher-facing mux without first locating
+//     [NewOIDCGatewayTrust] and passing its result -- which
+//     is the moment a reviewer sees the discipline the API
+//     demands.
+//   - You cannot construct an [OIDCGatewayTrust] via a
+//     composite literal from outside this package because
+//     all fields are unexported, and even the package-local
+//     zero value `OIDCGatewayTrust{}` flips the `valid` bool
+//     to false, which [Router.TrustedGatewayHandler]
+//     explicitly rejects.
+//
+// The witness type intentionally carries no fields the
+// caller needs to fill in -- it is a pure marker that
+// "this call site has been audited as OIDC-gated."
+//
+// [witness type]: https://en.wikipedia.org/wiki/Type_witness
+type OIDCGatewayTrust struct {
+	// valid is set to true by [NewOIDCGatewayTrust] and is
+	// the only way to obtain a [OIDCGatewayTrust] whose
+	// `valid == true`. The zero value is `false`.
+	valid bool
+}
+
+// NewOIDCGatewayTrust returns a constructed [OIDCGatewayTrust]
+// witness suitable for passing to
+// [Router.TrustedGatewayHandler]. The lone caller in
+// production is the api package's composition root
+// (`internal/api/adapters.go`), where every gateway-borne
+// request has already been authenticated by the OIDC bearer-
+// token authenticator before the trusted handler runs.
+//
+// Calling this function from any OTHER package is a code
+// smell -- the production trust boundary is the OIDC
+// gateway, full stop. Tests that exercise gateway behaviour
+// may also construct the witness.
+func NewOIDCGatewayTrust() OIDCGatewayTrust {
+	return OIDCGatewayTrust{valid: true}
+}
+
+// TrustedGatewayHandler returns an [http.Handler] that
+// dispatches `verb` THROUGH this Router's pipeline WITHOUT
+// running HMAC verification. Returns (nil, false) when the
+// verb is not registered on this Router OR when `trust` is
+// the zero value (i.e. the caller did not pass the result
+// of [NewOIDCGatewayTrust]).
+//
+// # Trust boundary
+//
+// The returned handler MUST only be mounted behind a separate
+// authentication boundary that establishes the caller's
+// identity -- the production composition root mounts it
+// inside the OIDC gateway (`internal/api/`), where every
+// inbound request has already been verified against a bearer
+// JWT (`Authenticator.Authenticate`). Mounting it on a
+// public HTTP listener directly is a wiring bug: the handler
+// performs NO authentication of its own.
+//
+// The [OIDCGatewayTrust] witness parameter exists to make
+// that boundary explicit at every call site. A reviewer of
+// `grep -F TrustedGatewayHandler` should immediately see
+// the `NewOIDCGatewayTrust()` (or `OIDCGatewayTrust{}` --
+// rejected at runtime) next to the call. The witness has
+// no side effect beyond gating the function on a non-zero
+// flag; its purpose is to force the discipline.
+//
+// # Why HMAC is skipped
+//
+// The OIDC gateway is the SOLE authentication boundary for
+// gateway-borne callers; requiring HMAC in addition would
+// (a) double-authenticate, and (b) force OIDC callers to
+// carry the deployment's HMAC signing keys -- defeating the
+// purpose of the bearer-token model. The trusted handler
+// runs the rest of the Router's pipeline verbatim
+// (content-type check, ExtractMetadata, idempotency claim,
+// durable scan_run open, verb dispatch, finalize) so the
+// gateway path and the publisher (HMAC) path share the same
+// ingestion semantics.
+//
+// # Verb binding
+//
+// The handler is bound to `verb` at mount time. Callers may
+// hit the gateway at `/v1/ingest/{verb}` -- the handler does
+// NOT re-parse the verb from the URL; it dispatches to the
+// `verb` argument supplied here. This is how the OIDC
+// gateway's per-verb slot table maps a single Router
+// instance to N distinct slots (one per registered verb)
+// without the Router's own path parser running.
+func (r *Router) TrustedGatewayHandler(trust OIDCGatewayTrust, verb string) (http.Handler, bool) {
+	if r == nil {
+		return nil, false
+	}
+	if !trust.valid {
+		// Caller passed the zero-value witness (e.g. a
+		// raw `webhook.OIDCGatewayTrust{}` composite
+		// literal). Refuse -- the discipline says the
+		// caller MUST acknowledge the trust contract via
+		// [NewOIDCGatewayTrust].
+		return nil, false
+	}
+	handler, ok := r.verbs[verb]
+	if !ok {
+		return nil, false
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// POST-only and body-size are still enforced
+		// (matching the publisher path). The URL.Path is
+		// NOT parsed for verb -- we use the bound `verb`.
+		if req.Method != http.MethodPost {
+			r.writeError(w, http.StatusMethodNotAllowed,
+				"Router accepts POST only", "METHOD_NOT_ALLOWED", verb)
+			return
+		}
+		req.Body = http.MaxBytesReader(w, req.Body, r.maxBytes)
+		defer func() { _ = req.Body.Close() }()
+		body, readErr := io.ReadAll(req.Body)
+		if readErr != nil {
+			var mbe *http.MaxBytesError
+			if errors.As(readErr, &mbe) {
+				r.writeError(w, http.StatusRequestEntityTooLarge,
+					fmt.Sprintf("body exceeds %d-byte limit", r.maxBytes),
+					"PAYLOAD_TOO_LARGE", verb)
+				return
+			}
+			r.writeError(w, http.StatusBadRequest,
+				fmt.Sprintf("reading body: %v", readErr), "BAD_REQUEST", verb)
+			return
+		}
+		canonical := handler.CanonicalRequest(req.Header, body)
+		r.serveAfterAuth(w, req, verb, handler, body, canonical)
+	}), true
 }
 
 // parseVerb extracts the verb token from a request path

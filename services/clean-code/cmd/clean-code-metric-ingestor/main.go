@@ -48,6 +48,10 @@ import (
 
 	_ "github.com/lib/pq"
 
+	"github.com/gofrs/uuid"
+
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/isolation"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/config"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/churn"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/coverage"
@@ -66,6 +70,54 @@ import (
 var db *sql.DB
 
 func main() {
+	// Stage 9.3 -- parser child re-entry guard. When this
+	// binary is spawned as a parser child by an
+	// `isolation.ExecWorker` the parent communicates via
+	// the [isolation.ChildEnvVar] env var; we MUST detect
+	// that BEFORE any normal startup (config load, PG
+	// open, mux build) because the child reads its parse
+	// request from stdin and exits, never serving HTTP.
+	// Skipping the guard would have the child re-run the
+	// full server bootstrap, open a duplicate listener on
+	// :PORT, and fail with "address in use" -- a very
+	// confusing breakage with no obvious link to the
+	// parser pool.
+	if isolation.IsChildProcess() {
+		isolation.RegisterChildHandler(
+			isolation.ParserRegistryChildHandler(parser.DefaultRegistry()))
+		isolation.RunChild() // never returns
+		return
+	}
+
+	// Stage 9.3 iter-9 -- SERVICE_ROLE fail-fast dispatch.
+	// PR #148's docker-compose.yml runs the
+	// `clean-code-metric-ingestor` binary with
+	// `SERVICE_ROLE=refactor-planner` to signal the operator
+	// intended a refactor-planner deployment. The
+	// metric-ingestor binary does NOT carry the refactor
+	// planner's two-pass orchestration -- it would silently
+	// serve `/healthz` and never touch `hot_spot` /
+	// `refactor_plan`. The defensive check below refuses to
+	// start in that misconfig and points the operator at the
+	// correct `SERVICE` build arg.
+	//
+	// Recognised SERVICE_ROLE values that this binary CAN
+	// honour:
+	//   - "" (unset)              -- default metric-ingestor
+	//   - "metric-ingestor"       -- explicit canonical
+	//   - "mgmt-surface"          -- this binary mounts
+	//                                /v1/mgmt/* routes too,
+	//                                so a mgmt-surface deploy
+	//                                is valid; the role label
+	//                                surfaces in startup log.
+	//
+	// Anything else (notably "refactor-planner") is rejected
+	// with a clear log + exit 2 so the deploy fails loudly
+	// rather than degrading silently.
+	if err := validateServiceRole(os.Getenv(envServiceRole)); err != nil {
+		log.Fatalf("clean-code-metric-ingestor: SERVICE_ROLE validation failed: %v", err)
+	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -104,7 +156,7 @@ func main() {
 	// `migrations/0004_roles.up.sql:227-260` but NOT INSERT;
 	// the actual seeding is done by the schema-owner
 	// migrations (`0007_seed_foundation_metric_kinds.up.sql`
-	// + `0010_seed_ingested_metric_kind_pass_first_try_ratio.up.sql`).
+	// + `0012_seed_ingested_metric_kind_pass_first_try_ratio.up.sql`).
 	if err := verifyMetricKindCatalog(context.Background(), ingestorDB, metricKindCatalogSchema); err != nil {
 		log.Fatalf("verifyMetricKindCatalog: %v", err)
 	}
@@ -116,6 +168,23 @@ func main() {
 	defer mgmtClose()
 
 	logger := slog.Default()
+
+	// Stage 9.3 iter-3 -- construct the SHARED isolation
+	// primitives BEFORE either route mounting function so the
+	// SAME `*isolation.ModeCoordinator` instance backs both
+	// the `mgmt.set_mode` flip coordinator AND the foundation
+	// scan path's `DirectoryAstFileSource` admission. Sharing
+	// is mandatory: the drain barrier observes `inFlight > 0`
+	// from the per-repo state the scan path increments, so a
+	// per-handler `coord` would let scans start under the old
+	// mode after a flip handler returned. See evaluator
+	// iter-2 items 2/3/4 -- the structural fix is to hoist
+	// the bundle above both mounters and pass it down.
+	iso, err := buildIsolation(mgmtDB)
+	if err != nil {
+		log.Fatalf("buildIsolation: %v", err)
+	}
+	defer iso.Close()
 
 	loop, err := buildSweepLoop(cfg, ingestorDB, logger)
 	if err != nil {
@@ -147,7 +216,7 @@ func main() {
 		mux.ServeHTTP(w, r)
 	})
 
-	if err := mountMgmtRoutes(rootMux, ingestorDB, mgmtDB); err != nil {
+	if err := mountMgmtRoutes(rootMux, ingestorDB, iso); err != nil {
 		// Stage 3.4 verbs are critical to operations
 		// (sample retraction unblocks broken evaluator runs).
 		// Fail fast at boot rather than serving a listener that
@@ -155,7 +224,7 @@ func main() {
 		log.Fatalf("mountMgmtRoutes: %v", err)
 	}
 
-	if err := mountIngestRouter(rootMux, cfg, ingestorDB, logger); err != nil {
+	if err := mountIngestRouter(rootMux, cfg, ingestorDB, logger, iso); err != nil {
 		// Stage 4.1 evaluator iter-2 item #3: the
 		// /v1/ingest/{verb} Router MUST be reachable in the
 		// running service when EnableExternalIngestWebhook
@@ -181,8 +250,79 @@ func main() {
 		"legacy_demo_api", cfg.EnableLegacyDemoAPI,
 		"stale_sweep_enabled", !cfg.DisableStaleSweep,
 		"management_role_handle", mgmtRoleHandleSource(cfg),
+		"service_role", serviceRoleLabel(),
 	)
 	log.Fatal(http.ListenAndServe(":"+port, rootMux))
+}
+
+// envServiceRole is the env var the Dockerfile sets from the
+// `ROLE` build arg. The metric-ingestor binary uses it only as
+// an observability label + a fail-fast misconfig guard; it
+// does NOT change the mounted routes. See [validateServiceRole]
+// for the role-dispatch contract.
+const envServiceRole = "SERVICE_ROLE"
+
+// serviceRoleLabel returns the trimmed SERVICE_ROLE value or
+// "metric-ingestor" when unset, suitable for the startup log
+// line + Prometheus labels (when wired).
+func serviceRoleLabel() string {
+	v := strings.TrimSpace(os.Getenv(envServiceRole))
+	if v == "" {
+		return "metric-ingestor"
+	}
+	return v
+}
+
+// allowedMetricIngestorRoles enumerates the SERVICE_ROLE
+// values this binary can honour. Any other value is a
+// build-arg misconfig and is rejected by [validateServiceRole].
+//
+// "mgmt-surface" is allowed because the metric-ingestor binary
+// already mounts the Stage 3.4 `/v1/mgmt/*` write verbs via
+// [mountMgmtRoutes]; a deploy that wants to expose only those
+// routes still runs THIS binary (route filtering is a future
+// stage).
+//
+// "refactor-planner" is explicitly REJECTED: that role wants
+// the Stage 8.1/8.2 two-pass orchestration which lives in
+// `cmd/clean-code-refactor-planner`. Operators get a clear
+// "use SERVICE=clean-code-refactor-planner" pointer rather
+// than a silently-degraded deploy that never writes to
+// `hot_spot` / `refactor_plan` / `refactor_task`.
+var allowedMetricIngestorRoles = map[string]struct{}{
+	"":                 {},
+	"metric-ingestor":  {},
+	"metric_ingestor":  {},
+	"metricingestor":   {},
+	"mgmt-surface":     {},
+	"mgmt_surface":     {},
+	"mgmtsurface":      {},
+	"management":       {},
+}
+
+// validateServiceRole returns nil when role is empty or one of
+// the recognised values this binary can honour. Returns a
+// descriptive error otherwise; "refactor-planner" gets a
+// dedicated pointer to the correct SERVICE build arg.
+func validateServiceRole(role string) error {
+	trimmed := strings.ToLower(strings.TrimSpace(role))
+	if _, ok := allowedMetricIngestorRoles[trimmed]; ok {
+		return nil
+	}
+	if trimmed == "refactor-planner" || trimmed == "refactor_planner" || trimmed == "refactorplanner" {
+		return fmt.Errorf(
+			"SERVICE_ROLE=%q requires the refactor-planner binary; "+
+				"set SERVICE=clean-code-refactor-planner in your Dockerfile build "+
+				"args (the metric-ingestor binary does NOT carry the Stage 8.1/8.2 "+
+				"two-pass orchestration and would silently no-op on hot_spot / "+
+				"refactor_plan writes)",
+			role)
+	}
+	return fmt.Errorf(
+		"SERVICE_ROLE=%q is not recognised; allowed: \"\", \"metric-ingestor\", "+
+			"\"mgmt-surface\" (use SERVICE=clean-code-refactor-planner for the "+
+			"refactor-planner role)",
+		role)
 }
 
 // metricKindCatalogSchema is the Postgres schema the
@@ -192,7 +332,7 @@ func main() {
 // `clean_code.metric_kind` references in the migrations
 // (`migrations/0001_catalog_lifecycle.up.sql:258`,
 // `0007_seed_foundation_metric_kinds.up.sql`,
-// `0010_seed_ingested_metric_kind_pass_first_try_ratio.up.sql`).
+// `0012_seed_ingested_metric_kind_pass_first_try_ratio.up.sql`).
 // The constant lives here (rather than imported from
 // metric_ingestor) so the wiring file does not depend on
 // internals not part of the package's exported surface.
@@ -434,6 +574,131 @@ func newMetricsHandler(loop *metric_ingestor.StaleScanRunSweepLoop) http.Handler
 	})
 }
 
+// isolationBundle bundles the AST-isolation primitives the Stage
+// 9.3 wiring threads through BOTH `mountMgmtRoutes` (so the
+// `mgmt.set_mode` HTTP handler drains in-flight scans before
+// mutating `clean_code.repo.mode`) AND `mountIngestRouter` (so
+// the foundation scan path's [metric_ingestor.DirectoryAstFileSource]
+// admits the per-commit walk into the SAME coordinator
+// instance the flip drains against).
+//
+// # Why a single shared bundle
+//
+// Stage 9.3 iter-2 evaluator items 2/3/4 fired because the
+// coordinator + pool were constructed INSIDE `mountMgmtRoutes`
+// and never escaped that scope: the flip drained a coordinator
+// whose in-flight set could never become non-zero because no
+// scan path called BeginScan/EndScan on it. The structural fix
+// is to build the primitives at the composition root (this
+// helper) and pass the bundle into BOTH mounters so the
+// per-repo in-flight counter the scan path increments is the
+// same counter the flip waits on.
+//
+// # Component ownership
+//
+//   - [isolation.ModeCoordinator] -- per-repo admission +
+//     drain. Hydrated from [management.PGRepoStore.ReadRepoMode]
+//     via the [isolation.RepoModeReader] seam introduced this
+//     stage.
+//   - [isolation.Pool] -- per-language subprocess pool
+//     registered for every `parser.SupportedLanguages` entry
+//     with [isolation.ExecWorkerFactoryFromConfig]. Production
+//     re-execs THIS binary as the parser child (the
+//     [isolation.IsChildProcess] guard at the top of `main()`
+//     routes the child into [isolation.RunChild]).
+//   - [isolation.MgmtFlipCoordinator] -- the
+//     `management.FlipCoordinator` adapter the
+//     `mgmt.set_mode` HTTP handler delegates to. Wraps the
+//     SAME [isolation.ModeCoordinator] -- one instance,
+//     two callers.
+//   - [management.PGRepoStore] -- the catalog mutator the
+//     flip's `applyFn` invokes. Also the source of truth for
+//     the coordinator's mode hydrator.
+//   - [management.PGRepoEventAppender] -- the `repo_event`
+//     audit writer the management `RegisterRepo` /
+//     `set_mode` paths append to.
+type isolationBundle struct {
+	coord     *isolation.ModeCoordinator
+	pool      *isolation.Pool
+	flipCoord *isolation.MgmtFlipCoordinator
+	repoStore *management.PGRepoStore
+	appender  *management.PGRepoEventAppender
+}
+
+// Close releases pool resources. Safe to call on a zero
+// receiver (nil pool -> no-op) and idempotent.
+func (b *isolationBundle) Close() error {
+	if b == nil || b.pool == nil {
+		return nil
+	}
+	return b.pool.Close()
+}
+
+// buildIsolation constructs the [isolationBundle] for the
+// running binary. The hydrator hook reads
+// `clean_code.repo.mode` lazily on a coordinator miss so the
+// composition root does NOT have to pre-seed every persisted
+// repo at startup; a missing row surfaces as
+// [isolation.ErrModeNotHydrated] (never a silent
+// default-to-embedded that would mask a persisted `linked`
+// row).
+//
+// The subprocess pool re-execs THIS binary as the parser
+// child (the [isolation.IsChildProcess] guard at the top of
+// `main()` routes the child into [isolation.RunChild] with
+// the registry-backed child handler). `os.Executable()`
+// failure is fatal: without an executable path the pool
+// cannot spawn ANY worker, which would silently degrade the
+// brief's crash-isolation contract to in-process
+// goroutine-recovery (Sec 9.2 calls that out as a degraded
+// mode).
+func buildIsolation(mgmtDB *sql.DB) (*isolationBundle, error) {
+	if mgmtDB == nil {
+		return nil, fmt.Errorf("buildIsolation: mgmtDB is nil (mgmt-role handle is required; see CLEAN_CODE_MGMT_PG_URL)")
+	}
+	appender, err := management.NewPGRepoEventAppender(mgmtDB)
+	if err != nil {
+		return nil, fmt.Errorf("NewPGRepoEventAppender: %w", err)
+	}
+	repoStore, err := management.NewPGRepoStore(mgmtDB)
+	if err != nil {
+		return nil, fmt.Errorf("NewPGRepoStore: %w", err)
+	}
+
+	hydrator := func(ctx context.Context, repoID uuid.UUID) (isolation.Mode, error) {
+		mode, readErr := repoStore.ReadRepoMode(ctx, repoID)
+		if readErr != nil {
+			return "", readErr
+		}
+		return isolation.Mode(mode), nil
+	}
+	coord := isolation.NewModeCoordinator(isolation.WithModeHydrator(hydrator))
+
+	hostExe, exeErr := os.Executable()
+	if exeErr != nil {
+		return nil, fmt.Errorf("os.Executable (required for isolation.Pool): %w", exeErr)
+	}
+	pool, err := isolation.NewPool(isolation.SubprocessConfig{}, coord)
+	if err != nil {
+		return nil, fmt.Errorf("isolation.NewPool: %w", err)
+	}
+	for _, lang := range parser.SupportedLanguages {
+		if err := pool.RegisterFactory(lang,
+			isolation.ExecWorkerFactoryFromConfig(hostExe)); err != nil {
+			return nil, fmt.Errorf("isolation.Pool.RegisterFactory(%q): %w", lang, err)
+		}
+	}
+	flipCoord := isolation.NewMgmtFlipCoordinator(coord)
+
+	return &isolationBundle{
+		coord:     coord,
+		pool:      pool,
+		flipCoord: flipCoord,
+		repoStore: repoStore,
+		appender:  appender,
+	}, nil
+}
+
 // mountMgmtRoutes wires the management write verbs (Stage 3.4:
 // `mgmt.retract_sample`, `mgmt.rescan`; Stage 6.2: `mgmt.register_repo`,
 // `mgmt.set_mode`) against production PostgreSQL stores and registers
@@ -447,21 +712,29 @@ func newMetricsHandler(loop *metric_ingestor.StaleScanRunSweepLoop) http.Handler
 //     and `PGRescanScanRunStore` (scan_run INSERT, line 348). The
 //     PGRetractionStore also reads `metric_sample` (granted SELECT to
 //     every clean_code role by line 282).
-//   - mgmtDB carries `clean_code_management` credentials. Used for
-//     `PGRepoEventAppender` (repo_event INSERT, line 313) AND the
-//     Stage 6.2 `PGRepoStore` (repo INSERT/UPDATE per-column grants
-//     in 0004 lines 311-312 + 0006 lines 140-141; repo_event INSERT in
-//     the same transaction). A future production audit can grep these
-//     lines and confirm the binary respects the documented ACL boundary.
+//   - The [isolationBundle]'s `repoStore` / `appender` carry
+//     `clean_code_management` credentials (constructed from `mgmtDB`
+//     in [buildIsolation]). Used for `PGRepoEventAppender`
+//     (repo_event INSERT, line 313) AND the Stage 6.2 `PGRepoStore`
+//     (repo INSERT/UPDATE per-column grants in 0004 lines 311-312 +
+//     0006 lines 140-141; repo_event INSERT in the same transaction).
+//
+// Stage 9.3 iter-3 -- the [isolationBundle]'s coordinator + flip
+// adapter are SHARED with `mountIngestRouter`'s
+// [metric_ingestor.DirectoryAstFileSource] so the
+// `mgmt.set_mode` flip drains the per-repo in-flight scan set
+// the foundation scan path increments. Constructing the
+// bundle inside this function (iter-2 layout) caused the
+// drain to wait on a coordinator the scan path never touched.
 //
 // Any failure surfaces with a wrapped error so the operator log
 // identifies the failing seam by name.
-func mountMgmtRoutes(mux *http.ServeMux, ingestorDB, mgmtDB *sql.DB) error {
+func mountMgmtRoutes(mux *http.ServeMux, ingestorDB *sql.DB, iso *isolationBundle) error {
 	if ingestorDB == nil {
 		return fmt.Errorf("mountMgmtRoutes: ingestorDB is nil")
 	}
-	if mgmtDB == nil {
-		return fmt.Errorf("mountMgmtRoutes: mgmtDB is nil (mgmt-role handle is required; see CLEAN_CODE_MGMT_PG_URL)")
+	if iso == nil {
+		return fmt.Errorf("mountMgmtRoutes: isolationBundle is nil (buildIsolation must run first)")
 	}
 	retractStore, err := metric_ingestor.NewPGRetractionStore(ingestorDB)
 	if err != nil {
@@ -475,24 +748,7 @@ func mountMgmtRoutes(mux *http.ServeMux, ingestorDB, mgmtDB *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("NewPGRescanScanRunStore: %w", err)
 	}
-	appender, err := management.NewPGRepoEventAppender(mgmtDB)
-	if err != nil {
-		return fmt.Errorf("NewPGRepoEventAppender: %w", err)
-	}
-	// Stage 6.2: the PG-backed RepoStore writes the
-	// `clean_code.repo` row AND the matching
-	// `repo_event(kind='registered'|'mode_changed')`
-	// audit row in ONE transaction. It uses the SAME
-	// `mgmtDB` handle as the appender so both writes
-	// run under the `clean_code_management` role's
-	// column-level INSERT/UPDATE grants on
-	// `clean_code.repo` (migrations/0004:311-312 +
-	// 0006:140-141) and INSERT on `clean_code.repo_event`
-	// (0004:313).
-	repoStore, err := management.NewPGRepoStore(mgmtDB)
-	if err != nil {
-		return fmt.Errorf("NewPGRepoStore: %w", err)
-	}
+
 	dispatcher := metric_ingestor.NewRetractDispatcher(retractScanRunStore, retractStore, retractStore)
 	enqueuer := metric_ingestor.NewRescanEnqueuer(rescanStore)
 	writer := management.NewMgmtWriter(
@@ -502,13 +758,19 @@ func mountMgmtRoutes(mux *http.ServeMux, ingestorDB, mgmtDB *sql.DB) error {
 		retractStore,
 		management.AdaptMetricIngestorRetractDispatcher(dispatcher),
 		management.AdaptMetricIngestorRescanEnqueuer(enqueuer),
-		appender,
+		iso.appender,
 		management.WithMgmtWriterLogger(slog.Default()),
 		// Stage 6.2 -- wire the PG-backed RepoStore so the
 		// new `mgmt.register_repo` / `mgmt.set_mode` routes
 		// (mounted below) can actually persist. Without
 		// this option the routes would return 503.
-		management.WithMgmtWriterRepoStore(repoStore),
+		management.WithMgmtWriterRepoStore(iso.repoStore),
+		// Stage 9.3 -- wire the flip coordinator so
+		// `mgmt.set_mode` drains in-flight scans before
+		// flipping (impl-plan line 804). SAME coordinator
+		// instance the scan path admits into; see
+		// [buildIsolation].
+		management.WithMgmtWriterFlipCoordinator(iso.flipCoord),
 	)
 	// Stage 3.4 routes (retain).
 	mux.HandleFunc(management.VerbMgmtRetractSamplePath, writer.RetractSample)
@@ -574,12 +836,15 @@ func mountMgmtRoutes(mux *http.ServeMux, ingestorDB, mgmtDB *sql.DB) error {
 // The Router is mounted at [webhook.RouterPath]
 // (`/v1/ingest/`) on the supplied mux; the verb is parsed
 // from the URL path tail.
-func mountIngestRouter(mux *http.ServeMux, cfg config.Config, ingestorDB *sql.DB, logger *slog.Logger) error {
+func mountIngestRouter(mux *http.ServeMux, cfg config.Config, ingestorDB *sql.DB, logger *slog.Logger, iso *isolationBundle) error {
 	if !cfg.EnableExternalIngestWebhook {
 		return nil
 	}
 	if ingestorDB == nil {
 		return fmt.Errorf("mountIngestRouter: ingestorDB is nil")
+	}
+	if iso == nil {
+		return fmt.Errorf("mountIngestRouter: isolationBundle is nil (buildIsolation must run first)")
 	}
 	if cfg.WebhookSigningKeyID == "" {
 		return fmt.Errorf("mountIngestRouter: %s is empty (loader Validate should have caught this)", config.EnvWebhookSigningKeyID)
@@ -666,10 +931,82 @@ func mountIngestRouter(mux *http.ServeMux, cfg config.Config, ingestorDB *sql.DB
 		return fmt.Errorf("coverage.NewPGScopeResolver: %w", err)
 	}
 	covHydrator := coverage.NewHydrator(covResolver).WithSkipLogger(logger)
-	covSweep := metric_ingestor.NewCoverageSweep(covHydrator, sampleWriter).
+	// iter 8: wire the canonical [metric_ingestor.PGScopeBindingResolver]
+	// into the [metric_ingestor.CoverageSweep] so each
+	// coverage upload also emits the (package,
+	// coverage_line_ratio|coverage_branch_ratio) rollup
+	// rows via the same writer + scope_binding seam the
+	// file rows use. Closes the file -> package gap the
+	// cross-repo happy-path e2e previously bridged with a
+	// test-side SQL shim.
+	covPackageRollupResolver, err := metric_ingestor.NewPGScopeBindingResolver(ingestorDB)
+	if err != nil {
+		return fmt.Errorf("NewPGScopeBindingResolver(coverage_package_rollup): %w", err)
+	}
+	covSweep := metric_ingestor.NewCoverageSweep(
+		covHydrator,
+		sampleWriter,
+		metric_ingestor.WithCoveragePackageRollupResolver(covPackageRollupResolver),
+	).
 		EnsureCoverageSkipLoggerAttached(logger)
 
-	ing := metric_ingestor.NewIngestor(metric_ingestor.NoopFoundationRecipeDispatcher{}, churnSweep).
+	// Stage 9.3 iter-3 -- the foundation recipe dispatcher.
+	// When [config.Config.AstScanRoot] is set, the binary
+	// owns an on-disk per-commit checkout layout and the
+	// production [metric_ingestor.RegistryBackedFoundationDispatcher]
+	// is wired with a [metric_ingestor.DirectoryAstFileSource]
+	// that ROUTES THROUGH the same `iso.coord` /
+	// `iso.pool` `mgmt.set_mode` drains against. The
+	// resulting `Dispatch` call (1) admits the whole walk
+	// into [isolation.ModeCoordinator.BeginScan] for the
+	// scan's repo and (2) routes per-file parses through
+	// [isolation.Pool.ParseInScan] so subprocess crashes
+	// surface as typed errors AND the in-flight counter
+	// the flip drains against tracks one scan, not
+	// one-per-file. When AstScanRoot is empty the binary
+	// falls back to [metric_ingestor.NoopFoundationRecipeDispatcher]
+	// so the deployment still boots without an on-disk
+	// scan root (e.g. a webhook-only metric-ingestor pod).
+	//
+	// The scope resolver is the PG-backed
+	// [metric_ingestor.PGScopeBindingResolver] (shared
+	// `*sql.DB` with the metric_sample writer so both
+	// writes commit against the same connection pool /
+	// role grants).
+	var foundationDispatcher metric_ingestor.FoundationRecipeDispatcher = metric_ingestor.NoopFoundationRecipeDispatcher{Logger: logger}
+	if cfg.AstScanRoot != "" {
+		foundationScopeResolver, err := metric_ingestor.NewPGScopeBindingResolver(ingestorDB)
+		if err != nil {
+			return fmt.Errorf("NewPGScopeBindingResolver(foundation): %w", err)
+		}
+		astSource := &metric_ingestor.DirectoryAstFileSource{
+			Root:        cfg.AstScanRoot,
+			Parsers:     parser.DefaultRegistry(),
+			Logger:      logger,
+			Coordinator: iso.coord,
+			Pool:        iso.pool,
+		}
+		foundationDispatcher = &metric_ingestor.RegistryBackedFoundationDispatcher{
+			Registry: recipes.DefaultRegistry(),
+			AstFiles: astSource,
+			Writer:   sampleWriter,
+			Scopes:   foundationScopeResolver,
+			Logger:   logger,
+		}
+		if logger != nil {
+			logger.Info("wired production foundation dispatcher",
+				"component", "RegistryBackedFoundationDispatcher",
+				"ast_scan_root", cfg.AstScanRoot,
+				"isolation_pool_languages", iso.pool.Languages(),
+			)
+		}
+	} else if logger != nil {
+		logger.Info("foundation dispatcher = noop (CLEAN_CODE_AST_SCAN_ROOT unset)",
+			"component", "NoopFoundationRecipeDispatcher",
+		)
+	}
+
+	ing := metric_ingestor.NewIngestor(foundationDispatcher, churnSweep).
 		WithCoverageSweep(covSweep)
 	coverageHandler := webhook.NewCoverageVerbHandler(ing)
 

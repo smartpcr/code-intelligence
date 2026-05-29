@@ -1,0 +1,72 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: cleancode
+      POSTGRES_PASSWORD: cleancode
+      POSTGRES_DB: cleancode
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cleancode"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  evaluator:
+    build:
+      context: ../../../services/clean-code/
+      dockerfile: Dockerfile
+      args:
+        ROLE: clean_code_evaluator
+    environment:
+      CLEAN_CODE_PG_URL: "postgres://cleancode:cleancode@postgres:5432/cleancode?sslmode=disable"
+      CLEAN_CODE_OTEL_ENDPOINT: "http://otel-collector:4317"
+    ports:
+      - "8090:8090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  rule-engine:
+    build:
+      context: ../../../services/clean-code/
+      dockerfile: Dockerfile
+      args:
+        ROLE: clean_code_solid_batch
+    environment:
+      CLEAN_CODE_PG_URL: "postgres://cleancode:cleancode@postgres:5432/cleancode?sslmode=disable"
+      CLEAN_CODE_OTEL_ENDPOINT: "http://otel-collector:4317"
+    ports:
+      - "8091:8091"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  wal-reconciler:
+    build:
+      context: ../../../services/clean-code/
+      dockerfile: Dockerfile
+      args:
+        ROLE: clean_code_wal_reconciler
+    environment:
+      CLEAN_CODE_PG_URL: "postgres://cleancode:cleancode@postgres:5432/cleancode?sslmode=disable"
+      CLEAN_CODE_OTEL_ENDPOINT: "http://otel-collector:4317"
+      WAL_MODE: REPLAY-ONLY
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  fault-injector:
+    image: alpine/socat:latest
+    entrypoint: ["sleep", "infinity"]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.100.0
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"

@@ -37,6 +37,8 @@ import (
 	"time"
 
 	"github.com/gofrs/uuid"
+
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
 )
 
 // ---- in-memory dispatcher / enqueuer fakes -------------------------------
@@ -544,8 +546,21 @@ func TestMgmtWriter_RetractSample_UnknownSampleSentinelFromDispatcherReturns404(
 	// happen in production if the Measurement sub-store's
 	// view of the sample was deleted between the
 	// management-side resolve and the dispatch call.
+	//
+	// Stage 7.3 iter 3 -- the dispatcher's error MUST wrap
+	// [metric_ingestor.ErrRetractUnknownSample] with `%w` so
+	// the wire-layer's `errors.Is(...)` check at
+	// `mgmt_verbs.go:611` walks the chain and maps to 404.
+	// An earlier version of this test built a plain
+	// `fmt.Errorf("metric_ingestor: sample_id not found in
+	// metric_sample: id=%s", ...)` whose message LOOKED like
+	// the sentinel but was not actually wrapped, so the
+	// sentinel check fell through to the 500 fallback. The
+	// test's name (`...SentinelFromDispatcher...`) makes the
+	// intent unambiguous: it pins the SENTINEL mapping, not
+	// substring matching.
 	w, disp, _, _, _ := newWiredMgmtWriter(t)
-	disp.nextErr = fmt.Errorf("metric_ingestor: sample_id not found in metric_sample: id=%s", fixedSampleID)
+	disp.nextErr = fmt.Errorf("%w: id=%s", metric_ingestor.ErrRetractUnknownSample, fixedSampleID)
 
 	r := httptest.NewRequest(http.MethodPost, VerbMgmtRetractSamplePath, bytes.NewReader(retractBody(t, fixedSampleID, "x")))
 	r.Header.Set(OIDCSubjectHeader, "alice@example.com")

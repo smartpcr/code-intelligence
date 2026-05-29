@@ -5,6 +5,1079 @@ production-tier environment. The instructions assume Postgres
 14+ is already running and the `clean_code_*` roles have been
 created via the `0004_roles.up.sql` migration.
 
+## Stage 10.5: `embedded` -> `linked` migration playbook
+
+This stage documents the per-repo migration from the default
+`embedded` scan mode (no cross-repo edges; system-tier rows
+that depend on them are stamped
+`degraded=true, degraded_reason='xrepo_edges_unavailable'`)
+to `linked` mode (cross-repo edges sourced from the
+agent-memory linked-mode endpoint, so the
+`xrepo_edges_unavailable` counter drops to zero on the
+forward insert stream). It does NOT duplicate the contracts
+the verbs implement -- those live in the architecture and
+tech-spec documents linked below.
+
+### Canonical references (relative paths from this file)
+
+- Architecture:
+  [`../../../docs/stories/code-intelligence-CLEAN-CODE/architecture.md`](../../../docs/stories/code-intelligence-CLEAN-CODE/architecture.md)
+  -- Sec 1.4.1 rows 1 & 5 (`xrepo_dep_depth` and `blast_radius`
+  carry the degraded stamp in `embedded` mode); Sec 5.1.4
+  (canonical RepoEvent.kind enum including `mode_changed`);
+  Sec 8.2 (closed `degraded_reason` list:
+  `xrepo_edges_unavailable | samples_pending | policy_signature_invalid | percentile_stale`);
+  Sec 8.7 (`linked` mode contract -- aggregator reads edges
+  from agent-memory; on unreachable endpoint the affected
+  rows flip BACK to `degraded_reason='xrepo_edges_unavailable'`).
+- Tech-spec:
+  [`../../../docs/stories/code-intelligence-CLEAN-CODE/tech-spec.md`](../../../docs/stories/code-intelligence-CLEAN-CODE/tech-spec.md)
+  -- Sec 4.2 (system-tier degraded fail-safe -- the aggregator
+  WRITES the row anyway with the degraded stamp; it never
+  silently drops); Sec 8.5 (`mgmt.set_mode` verb in the
+  canonical registry); Sec 9.3 (signing-key context for the
+  related `policy.publish` traffic that runs alongside).
+- Implementation plan:
+  [`../../../docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`](../../../docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md)
+  -- Stage 9.1 line 804 ("`mgmt.set_mode` transitions ...
+  drain in-flight scans for the repo before flipping").
+- E2E scenarios:
+  [`../../../docs/stories/code-intelligence-CLEAN-CODE/e2e-scenarios.md`](../../../docs/stories/code-intelligence-CLEAN-CODE/e2e-scenarios.md)
+  -- `mode-flip-drains-scans` (drain barrier);
+  `linked-mode-unreachable-degrades` (only
+  `xrepo_dep_depth` and `blast_radius` flip back when the
+  endpoint is down; other system-tier rows are unaffected);
+  `xrepo_edges_unavailable degrades aggregates` (Sec 8.2
+  closed-list propagation).
+- Runbook playbook (sibling):
+  [`./runbook.md`](./runbook.md) -- Stage 10.5 operator
+  playbook for the underlying `mgmt.set_mode` verb (and the
+  full Stage 6.2 contract below in this file).
+
+The contract for `mgmt.set_mode` -- request shape, error
+matrix, transactional semantics, drain barrier -- already
+lives in this file under
+"## Stage 6.2: management write verbs and repo onboarding"
+(search for `## Stage 6.2`) and in
+[`./runbook.md`](./runbook.md) under
+"## Stage 6.2 -- `mgmt.register_repo` and `mgmt.set_mode`".
+This Stage 10.5 section is the MIGRATION playbook for the
+flip itself; it does not re-state those contracts.
+
+### Pre-flight checks
+
+Before issuing `mgmt.set_mode(repo_id, 'linked')` against a
+production tenant:
+
+1. **Repo registered.** `mgmt.read.repo(repo_id)` returns the
+   row. If the repo is not yet in the catalogue, register it
+   first via `mgmt.register_repo` (runbook Stage 10.5 #1,
+   then Stage 6.2 for full detail).
+2. **Current mode is `embedded`.** Re-reading `mgmt.read.repo`
+   shows `mode='embedded'`. A `linked` -> `linked`
+   `mgmt.set_mode` is a no-op -- the verb writes neither a
+   new `repo_event(kind='mode_changed')` row nor any
+   `repo.mode` UPDATE (Stage 6.2 idempotency contract). It is
+   safe to call but does NOT trigger the counter shift; if
+   the operator THOUGHT the repo was `embedded` and finds it
+   already `linked`, investigate why the perceived state is
+   stale before any further action.
+3. **Linked-mode endpoint reachable.** The binary's
+   `agent-memory` linked-mode HTTP endpoint (the source the
+   Stage 7.2 aggregator reads cross-repo edges from in
+   `linked` mode -- architecture Sec 8.7) returns 200 to a
+   health probe from the clean-code service node. An
+   unreachable endpoint does NOT block the flip -- but the
+   forward insert stream for `xrepo_dep_depth` and
+   `blast_radius` will flip BACK to
+   `degraded=true, degraded_reason='xrepo_edges_unavailable'`
+   exactly as it did under `embedded` (architecture Sec 8.7
+   `linked-mode-unreachable-degrades` e2e). Other system-tier
+   rows (`arch_debt_ratio`, etc.) are unaffected because they
+   do NOT depend on cross-repo edges. Do not flip until the
+   endpoint is verified green.
+4. **Cross-Repo Aggregator running.** `/readyz` returns 200
+   for the binary that hosts the Stage 7.1 cadence loop
+   (`cmd/clean-code-cross-repo-aggregator` or whichever
+   binary owns the loop in this deployment). The counter
+   shift below assumes one full aggregator tick lands after
+   the flip; if the loop is paused / unhealthy, the counter
+   will not move until it resumes.
+5. **Signing-key cache loaded.** The Stage 5.1 signing-key
+   cache is loaded (`/readyz` reports `signing_key_cache=ok`).
+   `mgmt.set_mode` itself does NOT require a signature, but
+   downstream `policy.publish` / `eval.gate` traffic does and
+   the operator should not flip a repo whose policy lane is
+   already broken.
+6. **No in-flight scan backlog.** `mgmt.set_mode` takes
+   `SELECT mode ... FOR UPDATE` on the repo row and waits for
+   in-flight scans to drain before flipping (implementation
+   plan Stage 9.1 line 804;
+   e2e-scenarios `mode-flip-drains-scans`). Confirm
+   `scan_run(repo_id=<this>, status='running')` count is
+   bounded so the flip does not stall holding the row lock.
+7. **No stale override on a degraded-stamp-derived rule.** If
+   the operator earlier appended `mgmt.override(mute=true)`
+   for a rule that fires off a `degraded_reason='xrepo_edges_unavailable'`
+   row (e.g. an operator silenced a `system.xrepo_dep_depth_high`
+   alert precisely because the row was perma-degraded under
+   `embedded`), schedule an `mgmt.override(mute=false)` for
+   AFTER the counter shift settles, so the rule re-fires on
+   the now-clean signal. The unmute is itself a fresh append
+   to the `override` table (runbook Stage 10.5 #4).
+
+### The flip itself
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     -H 'X-OIDC-Subject: alice@acme.com' \
+     --data '{ "repo_id": "<uuid>", "mode": "linked" }' \
+     https://clean-coded.example.com/v1/mgmt/set_mode
+```
+
+`X-OIDC-Subject` is REQUIRED -- `mgmt.set_mode` stamps the
+header value into `repo_event.payload.actor` as
+`"operator:<subject>"` and refuses with HTTP 401 on a missing
+or blank header BEFORE the row lock or any persistence
+(runbook Stage 6.2 "Authentication and actor attribution",
+line ~1590).
+
+A 200 + `{ "repo_id": "...", "mode": "linked" }` confirms the
+row update AND the `repo_event(kind='mode_changed', payload={mode:'linked'})`
+append in the same transaction. The canonical past-tense
+enum value `mode_changed` is fixed by architecture Sec 5.1.4.
+
+### Expected counter shifts
+
+The KEY observable contract: within ONE full Cross-Repo
+Aggregator tick (Stage 7.1 cadence, default 30 s) of a
+successful flip, the **forward insert stream** for the
+affected metric kinds drops the
+`degraded_reason='xrepo_edges_unavailable'` stamp.
+
+| signal | `embedded` baseline | `linked` after flip + 1 tick | meaning |
+|---|---|---|---|
+| `metric_sample` rows for `metric_kind IN ('xrepo_dep_depth','blast_radius')` for this `repo_id`, `degraded=true`, `degraded_reason='xrepo_edges_unavailable'` | NEW rows appended every aggregator tick | NO new degraded rows are appended; subsequent rows are clean (`degraded=false`, `degraded_reason=NULL`) | architecture Sec 8.7 -- aggregator now sources xrepo edges from agent-memory rather than emitting the degraded fail-safe row |
+| Prometheus / OTel counter `clean_code_metric_sample_degraded_total{reason="xrepo_edges_unavailable",repo_id="<this>"}` | non-zero rate | rate -> 0 | label set matches the architecture Sec 8.2 closed list; the `reason` label value is verbatim from the row's `degraded_reason` column |
+| `repo_event(kind='mode_changed', payload->>'mode'='linked', repo_id=<this>)` | absent | EXACTLY ONE new row, written in the same transaction as the `repo.mode` UPDATE | architecture Sec 5.1.4 canonical RepoEvent enum |
+| `evaluation_verdict.degraded_reason='xrepo_edges_unavailable'` for NEW `eval.gate` calls referencing this repo | non-zero | 0 | gate stops short-circuiting on xrepo-edge unavailability for this repo (other repos' `eval.gate` shifts are independent) |
+| Other system-tier `metric_sample` rows (`arch_debt_ratio`, `change_failure_rate`, etc.) for this repo | unchanged | unchanged | per `linked-mode-unreachable-degrades` e2e, ONLY `xrepo_dep_depth` and `blast_radius` flip on the xrepo edge signal |
+
+The pre-existing `degraded=true` historical rows are NOT
+rewritten. The `metric_sample` table is append-only
+(architecture Sec 5.2.1); only the FORWARD insert stream
+changes. The Insights surface filters by
+`built_at >= now() - freshness_window` (Stage 7.3), so the
+degraded backlog ages out of the live read view within one
+freshness window of the flip.
+
+### Per-repo verification checklist
+
+After the flip + one aggregator tick (default ~30 s):
+
+- [ ] `mgmt.read.repo(<repo_id>)` returns `mode='linked'`.
+- [ ] `SELECT count(*) FROM clean_code.repo_event WHERE
+      repo_id=<this> AND kind='mode_changed' AND
+      payload->>'mode'='linked';` returns the EXPECTED count
+      (exactly +1 vs. the pre-flip count).
+- [ ] `SELECT count(*) FROM clean_code.metric_sample WHERE
+      repo_id=<this> AND metric_kind IN ('xrepo_dep_depth','blast_radius')
+      AND degraded=true AND degraded_reason='xrepo_edges_unavailable'
+      AND created_at > <flip_at>;` returns `0` (no NEW degraded
+      rows since the flip).
+- [ ] The Prometheus counter
+      `clean_code_metric_sample_degraded_total{reason="xrepo_edges_unavailable",repo_id="<this>"}`
+      shows a zero-rate plateau on the post-flip side of the
+      timestamp.
+- [ ] An `eval.gate(repo_id=<this>, sha=<a fresh sha>)` call
+      that previously took the
+      `degraded_reason='xrepo_edges_unavailable'` short-circuit
+      now runs the engine end-to-end (no degraded verdict on
+      the xrepo-edge signal; other degraded reasons --
+      `samples_pending`, `policy_signature_invalid` -- remain
+      possible and unrelated).
+
+### Rollback
+
+`mgmt.set_mode(repo_id, 'embedded')` reverses the flip in a
+single Postgres transaction:
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     -H 'X-OIDC-Subject: alice@acme.com' \
+     --data '{ "repo_id": "<uuid>", "mode": "embedded" }' \
+     https://clean-coded.example.com/v1/mgmt/set_mode
+```
+
+- `X-OIDC-Subject` is REQUIRED on the rollback call too --
+  same 401 contract as the forward flip (runbook Stage 6.2,
+  line ~1590).
+- The row update + the second `repo_event(kind='mode_changed',
+  payload={mode:'embedded'})` append happen in the same
+  transaction (Stage 6.2 contract).
+- The aggregator resumes emitting
+  `degraded=true, degraded_reason='xrepo_edges_unavailable'`
+  rows for `xrepo_dep_depth` and `blast_radius` on the NEXT
+  tick.
+- The intermediate
+  `repo_event(kind='mode_changed', payload={mode:'linked'})`
+  row from the original flip is NOT deleted -- the
+  `repo_event` table is append-only; both events remain as
+  the audit trail of the brief `linked` window.
+
+### Out of scope for Stage 10.5
+
+- **Bulk / tenant-wide migration.** `mgmt.set_mode` is
+  per-repo by contract (architecture Sec 5.2 / tech-spec
+  Sec 8.5). A bulk migration is an operator loop over the
+  tenant's `repo_id`s with a sleep between flips to keep
+  the drain barrier from stalling a single aggregator tick.
+  No bulk verb is shipped or planned.
+- **agent-memory linked-mode endpoint deployment.** Standing
+  up the linked-mode endpoint itself is owned by the
+  agent-memory service. This playbook only documents the
+  clean-code-side flip once that endpoint is live.
+- **Re-scoring historical rows.** Stage 10.5 does NOT
+  back-fill old `degraded=true` rows. Operators who need a
+  clean historical signal call `mgmt.rescan(<repo_id>, <sha>)`
+  per SHA after the flip (runbook Stage 10.5 #5); the new
+  aggregator pass writes fresh rows under the `linked`
+  contract and the `metric_sample_active` view's
+  max-by-`created_at` selection picks them.
+
+## Stage 10.2: Aged mute insights report
+
+This subsection captures the rollout sequence for the
+aged-mute Insights report -- the `mgmt.read.insights.aged_mutes`
+projection added in
+`internal/management/insights/aged_mutes.go` and wired into
+`internal/management/reader.go` via
+`WithAgedMutes(*insights.AgedMutes)`. The unit of rollout
+is the binary that hosts the management HTTP surface
+(`cmd/clean-code-metric-ingestor` today, future
+`cmd/clean-code-gateway`); no schema migration ships with
+this stage -- the report is read-only over the existing
+`override` table.
+
+### Pre-flight (no infra change)
+
+1. The Stage 5.3 `mgmt.override` write verb MUST already be
+   live in the target environment -- the report's input is
+   the SAME `override` table that verb appends to. If
+   `mgmt.override` has never been called for a tenant the
+   report returns an empty list, which is the correct
+   answer (nothing to flag).
+2. NO migration runs. The report is a pure read over the
+   existing `override` table; no new column, no new index,
+   no new role.
+3. NO feature flag is required. The Reader option
+   `WithAgedMutes(nil)` is permitted and leaves the verb
+   returning `ErrBackendUnavailable` -- the same
+   "backend not wired" shape as `mgmt.read.cross_repo`
+   when its `MetricsBackend` is missing. Rolling forward
+   without wiring is safe.
+
+### Wiring
+
+1. In the binary's composition root, construct the production
+   adapter that bridges `policy/steward.Store.ListAllOverrides`
+   to `insights.OverrideReader`. The adapter ships in this
+   stage as
+   `management.OverrideReaderFromStore{Store: stewardStore}`
+   (`internal/management/insights_override_adapter.go`) -- a
+   field-for-field value mapper held out of the `insights`
+   package to preserve its zero-`internal/*`-deps invariant.
+2. Construct the projection with the default 90-day
+   threshold and the production system clock by passing
+   `nil` for the clock argument:
+   `agedMutes := insights.NewAgedMutes(overrideAdapter, nil)`.
+   The two-argument constructor lets bring-up tests inject a
+   `FixedClock`; production callers ALWAYS pass `nil`.
+3. Pass `management.WithAgedMutes(agedMutes)` to the
+   existing `management.NewReader(...)` call alongside the
+   Stage 7.3 `WithInsightsFreshness(...)` option.
+4. Deploy. The verb is live as soon as the binary boots.
+
+### Verb contract
+
+| field | type | source |
+|---|---|---|
+| `mode` | string | constant `"latest_dashboard"` (same `ReadMode` tag as `mgmt.read.cross_repo` / `mgmt.read.portfolio`) |
+| `threshold_days` | int | effective threshold (caller's `threshold_days` or 90) |
+| `aged_mutes[].rule_id` | string | `override.rule_id` |
+| `aged_mutes[].scope_kind` | string | `override.scope_filter.scope_kind` |
+| `aged_mutes[].scope_signature_glob` | string | `override.scope_filter.scope_signature_glob` |
+| `aged_mutes[].repo_id` | string | `override.scope_filter.repo_id` |
+| `aged_mutes[].override_id` | string | `override.override_id` |
+| `aged_mutes[].created_at` | RFC3339 | `override.created_at` |
+| `aged_mutes[].age_days` | int | `floor((now - created_at) / 24h)` |
+| `aged_mutes[].reason` | string | `override.reason` (free-form, may be empty) |
+| `aged_mutes[].actor_id` | string | `override.actor_id` |
+
+### Verification checklist
+
+- [ ] `GET /v1/mgmt/read/insights/aged_mutes` (when mounted)
+      returns HTTP 200 with `aged_mutes: []` against an
+      empty `override` table.
+- [ ] Append `override(mute=true)` with
+      `created_at = now() - 100 days`. The next read returns
+      a one-row `aged_mutes` array containing that override.
+- [ ] Append `override(mute=false)` with the SAME
+      `(rule_id, scope_filter)` and a LATER `created_at`.
+      The next read returns `aged_mutes: []` -- the unmute
+      row drops the pair off the report.
+- [ ] Call with `?threshold_days=30` against a 100-day-old
+      and a 20-day-old mute. ONLY the 100-day row surfaces;
+      the 20-day row is filtered out.
+- [ ] Call with `?threshold_days=0`. The default 90-day
+      threshold applies (non-positive override is clamped
+      to default).
+
+### Rollback
+
+The verb is read-only -- rollback is a binary downgrade.
+NO data migration runs forward, so NO down migration runs
+backward. The `override` table is unchanged.
+
+### Out of scope for this stage
+
+- **TTL enforcement.** v1 has NO TTL enforcement in code
+  (iter 1 evaluator item 5). The report is a SURFACE for
+  operators; the rule engine continues to honor every
+  mute regardless of age. A future stage may add an
+  enforcement policy that consumes this projection.
+- **HTTP route mount.** Like `mgmt.read.cross_repo` and
+  `mgmt.read.portfolio`, the Reader method ships here;
+  the HTTP route lands in a downstream gateway stage that
+  owns `Routes()` in `verbs.go`. The Reader method is the
+  contract surface that gateway stage consumes.
+
+## Stage 8.3: ML effort-model loader and version pinning
+
+This subsection captures the rollout sequence for the
+`internal/refactor/effort_model.go` loader -- the
+external-artefact + version-pinning interlock that
+replaces the Stage 8.2 `refactor_task.effort_hours = 0.0`
+placeholder. The unit of rollout is the
+`clean-code-refactor-planner` binary; no schema migration
+is required (the effort-model version is recovered
+transitively through `hot_spot.policy_version_id`, NOT a
+new column on `refactor_plan` / `refactor_task`).
+
+### Required env vars
+
+Set on every `clean-code-refactor-planner` instance:
+
+```
+CLEAN_CODE_REFACTOR_EFFORT_SOURCE="ML model from historical commits"
+CLEAN_CODE_REFACTOR_EFFORT_MODEL_URI="file:///var/lib/clean-code/models/effort-v1.2.0.json"
+```
+
+- `CLEAN_CODE_REFACTOR_EFFORT_SOURCE` -- defaults to the ML
+  pin per architecture Sec 1.6. Setting it explicitly is
+  optional in v0 but recommended so the operator-pin
+  surface is auditable. The other accepted value is
+  `"none"` (opt-out -- planner runs without an
+  estimator; not for production).
+- `CLEAN_CODE_REFACTOR_EFFORT_MODEL_URI` -- REQUIRED when
+  source is the ML pin. v0 accepts local-disk URIs only:
+  bare paths (`/abs/path/model.json`, `C:\path\model.json`,
+  `C:/path/model.json`, `./rel/path.json`); `file://` URIs
+  (`file:///abs/path` on POSIX, `file:///C:/path` on
+  Windows). Schemes other than `file://` are refused at
+  startup.
+
+### Artefact deployment
+
+The JSON artefact MUST be present on disk at the URI BEFORE
+the binary starts. Recommended layout:
+
+```
+/var/lib/clean-code/models/effort-v1.2.0.json     <- this build
+/var/lib/clean-code/models/effort-v1.1.3.json     <- previous build (kept for one rollout cycle)
+```
+
+Use distinct filenames per `version` (the artefact's
+internal pin) so an in-flight rollback can re-point the env
+var without overwriting the new artefact.
+
+Distribute through your existing config / secret
+distribution channel (Ansible / Kubernetes ConfigMap mount
+/ Vault sidecar -- pick whatever the rest of the
+deployment uses). The loader does NOT integrate with
+anything other than the local filesystem in v0.
+
+### Rollout sequence (ZERO-DOWNTIME, version-pinned)
+
+The version-pinning interlock means the model artefact and
+the active policy MUST move together. Roll in this order:
+
+1. **Stage the new model artefact** on every planner host
+   under a NEW filename (do NOT overwrite the old one).
+   Verify with `cat`.
+2. **Publish the new `policy_version`** through
+   `cmd/clean-code-gateway` (Stage 5.2 verbs). The
+   `refactor_weights.effort_model_version` field MUST
+   equal the new artefact's `version` string verbatim.
+   Activate the new `policy_version` via
+   `mgmt.activate_policy` (Stage 5.2). The active
+   activation is what `PolicyReader.ActivePolicyVersion`
+   returns; the planner reads it once per `Plan` call.
+3. **Roll the planner binaries** with the new env var
+   pointing at the new artefact path. As each instance
+   restarts:
+   - On the new instance: load + validate succeeds; the
+     instance starts serving and emits estimates against
+     the new policy. If the active policy still references
+     the OLD model version, `Plan` returns
+     `ErrEffortModelVersionMismatch` and NO `refactor_plan`
+     or `refactor_task` rows are written -- so a misordered
+     rollout (step 3 before step 2) is harmless but stalls
+     planning until corrected.
+   - On the old instances: still loaded with the OLD
+     artefact, they also return `ErrEffortModelVersionMismatch`
+     for the new active policy (same write-nothing safety
+     net). Old instances drain naturally as their
+     deployment slot recycles.
+4. **Remove the old artefact file** after all planner hosts
+   have rolled. Optional -- safe to keep for one cycle in
+   case of rollback.
+
+### Rollback
+
+Two-step rollback (mirror of rollout):
+
+1. Re-activate the previous `policy_version` via
+   `mgmt.activate_policy`.
+2. Roll planner binaries back with the env var pointing at
+   the previous artefact path (which you kept on disk).
+
+NO `refactor_plan` or `refactor_task` rows need to be
+deleted; the rolled-forward rows are valid relative to the
+policy they were emitted under, and the
+`policy_version_id` they reference (via the `hot_spot` row)
+preserves their reproducibility.
+
+### Smoke checks post-rollout
+
+- `clean-code-refactor-planner` process is running on every
+  host (`systemctl status` or pod readiness).
+- Structured log line on startup names the loaded
+  artefact's `version` (level `info`, message
+  `effort_model_loaded`).
+- A single round of planning emits non-zero
+  `refactor_task.effort_hours` values:
+
+  ```sql
+  SELECT plan_id, kind, effort_hours
+  FROM clean_code.refactor_task
+  WHERE created_at > NOW() - INTERVAL '5 minutes'
+  ORDER BY created_at DESC
+  LIMIT 20;
+  ```
+
+  Every `effort_hours` should be `> 0` (or exactly `0`
+  only when the formula legitimately clamps -- e.g.
+  `intercept` set so that
+  `base + score_coef*0 + intercept <= 0` for a particular
+  kind/score combination).
+- No `ErrEffortModelVersionMismatch` lines in the planner
+  logs after step 3 completes.
+
+### Failure-mode checklist
+
+| symptom | cause | remediation |
+|---|---|---|
+| planner exits 1 with `ErrEffortModelURIRequired` | env var unset | set `CLEAN_CODE_REFACTOR_EFFORT_MODEL_URI`. |
+| planner exits 1 with `ErrEffortModelUnsupportedScheme` | URI uses `http://` / `s3://` / etc. | switch to `file://` or a bare path; v0 supports local only. |
+| planner exits 1 with `ErrEffortModelMalformed` | JSON has unknown top-level field or invalid syntax | re-validate the artefact (`jq '.' < artefact.json`); compare keys to the schema in `runbook.md`. |
+| planner exits 1 with `ErrEffortModelMissingKindBase` | `kind_base_hours` lacks one of the five canonical kinds | add the missing kind to the artefact. |
+| every `Plan` call returns `ErrEffortModelVersionMismatch` | active policy's `effort_model_version` != loaded artefact's `Version` | re-activate the matching `policy_version` OR re-deploy planner with the matching artefact. |
+| `effort_hours` always exactly `0` | wired `ZeroEffortEstimator` OR source = `"none"` | check env: `CLEAN_CODE_REFACTOR_EFFORT_SOURCE` must be the ML pin; URI must point at a real artefact. |
+
+## Stage 9.2: Audit WAL Reconciler (replay-only)
+
+This subsection captures the rollout sequence for the
+`internal/audit/reconciler/` package -- the replay-only
+restart sweep that closes the Stage 9.1 durability loop.
+Architecture Sec 7.10 / iter 1 evaluator item 11.
+
+### What's new
+
+1. **`internal/audit/reconciler/` package** -- on service
+   restart, walks `data/wal/audit/`, verifies every
+   frame's signature, and replays MISSING rows into the
+   three Audit tables via
+   `INSERT ... ON CONFLICT (<pk>) DO NOTHING`.
+2. **`composition.NewWALReconciler(ctx, WALReconcilerConfig)`**
+   factory + `composition.NewHistoricalKeysWALVerifier`
+   adapter -- the production wiring point for the
+   reconciler. Returns `(nil, nil)` for scaffold-mode
+   (nil `KeyStore`) so the binary branches on
+   "reconciler disabled" deliberately. The verifier
+   pins a `[]keys.KeyRecord` snapshot from the
+   `clean_code.policy_signing_keys` table at
+   construction time, so RETIRED-but-known keys still
+   verify legitimate historical frames.
+3. **Binary on-restart wiring (this stage)** -- both
+   `cmd/clean-code-eval-gate` and
+   `cmd/clean-code-gateway` now run the reconciler as a
+   BLOCKING startup step BEFORE the HTTP listener
+   accepts traffic. New env var
+   `CLEAN_CODE_WAL_RECONCILER_DSN` is REQUIRED whenever
+   signing keys are configured.
+4. **Four pinned invariants** (architecture Sec 7.10):
+   - NEVER inserts a row whose `(table, row_pk)` already
+     exists.
+   - NEVER deletes a row.
+   - NEVER modifies a non-Audit table.
+   - PRESERVES `evaluation_run.caller` verbatim from the
+     original frame.
+5. **Phased replay** -- pass 1 every `evaluation_run`
+   frame, pass 2 every `evaluation_verdict` + `finding`
+   frame. FK ordering is honoured even on a corrupted
+   partition that has reordered frames.
+
+### What is NOT in Stage 9.2
+
+- **Retention sweep** -- the reconciler does not delete
+  WAL partition files. Disk-capacity planning still
+  rests on the operator (see Stage 9.1 rollout).
+- **Continuous-replay / interval timer** -- the
+  reconciler runs ONCE at startup and exits. A
+  long-lived process repeating the sweep on a cadence
+  is a future enhancement and is out of scope here.
+
+### Pre-rollout: confirm role grants
+
+Verify `clean_code_wal_reconciler` exists with the right
+posture:
+
+```sql
+\du clean_code_wal_reconciler
+-- Expect: the role exists, attribute set is `NOLOGIN` (the
+--         role is assumed via `SET ROLE` after the
+--         CLEAN_CODE_WAL_RECONCILER_DSN's auth user logs in
+--         -- see "DSN connection pattern" below).
+
+SELECT grantee, privilege_type, table_name
+  FROM information_schema.role_table_grants
+ WHERE grantee = 'clean_code_wal_reconciler'
+   AND table_schema = 'clean_code'
+ ORDER BY table_name, privilege_type;
+-- Expect: INSERT, SELECT on each of evaluation_run,
+--         evaluation_verdict, finding. UPDATE and DELETE
+--         MUST be absent. SELECT on
+--         policy_signing_keys must be present (the
+--         historical-keys verifier reads this table at
+--         construction time).
+```
+
+If `UPDATE` or `DELETE` appears for this role on ANY of
+the three Audit tables, STOP -- the role posture is
+broken and the reconciler's "never deletes, never
+modifies a non-Audit table" invariants degrade to
+"depend on the application layer". Re-apply migration
+`0004_roles.up.sql`. If SELECT on
+`clean_code.policy_signing_keys` is missing, re-apply
+migration `0005_policy_signing_keys.up.sql`.
+
+### DSN connection pattern (NOLOGIN + `SET ROLE`)
+
+`clean_code_wal_reconciler` is created as `NOLOGIN` by
+migration `0004_roles.up.sql:191` -- the same posture
+the existing `clean_code_evaluator` and
+`clean_code_solid_batch` roles use. The DSN therefore
+cannot connect AS `clean_code_wal_reconciler`
+directly; instead, the DSN's auth user is a
+deployment-scoped LOGIN role (typically the same
+`clean_code_app` / `clean_code_runtime` login the
+gateway already uses) that has been granted
+membership in `clean_code_wal_reconciler` via
+`GRANT clean_code_wal_reconciler TO <login-role>`,
+and the connection assumes the role via either:
+
+- **`options='-c role=clean_code_wal_reconciler'`** in
+  the libpq connect string -- the cleanest pattern:
+  PostgreSQL issues an implicit `SET ROLE` on
+  connection establishment, so every statement the
+  reconciler runs is attributed to
+  `clean_code_wal_reconciler` in `pg_stat_activity`
+  and PG audit logs without any application-side
+  bookkeeping. This is what the gateway's
+  `runWALReconciler` pool expects.
+- **`SET ROLE clean_code_wal_reconciler`** issued as
+  the first statement on every checked-out
+  connection -- equivalent semantics, but requires
+  the application to remember to do it. The Stage 9.2
+  binary wiring uses the `options=` form so this is
+  not the active pattern.
+
+Operators MUST grant the membership BEFORE the first
+post-9.2 restart:
+
+```sql
+GRANT clean_code_wal_reconciler TO clean_code_app;
+-- (replace `clean_code_app` with whatever LOGIN role
+-- your existing CLEAN_CODE_PG_URL / EVALUATOR_PG_URL
+-- DSNs already authenticate as)
+```
+
+Failing to grant the membership produces a
+`permission denied to set role
+"clean_code_wal_reconciler"` error at reconciler boot
+-- the binary will refuse to start, which is the
+correct fail-loud behaviour.
+
+### Cutover (Stage 9.2 -- blocking on-restart sweep)
+
+1. Confirm the env vars on every replica's start
+   command / systemd unit / Kubernetes Deployment:
+   - `CLEAN_CODE_AUDIT_WAL_DIR` -- the same directory
+     the Stage 9.1 writer is using (default
+     `data/wal/audit`).
+   - `CLEAN_CODE_WAL_RECONCILER_DSN` -- PostgreSQL DSN
+     whose auth user is a LOGIN role that has been
+     granted `clean_code_wal_reconciler` membership,
+     with `options=-c role=clean_code_wal_reconciler`
+     (or equivalent `SET ROLE`) so statements are
+     attributed to the reconciler role. This DSN is
+     REQUIRED whenever the existing signing-key env
+     var `CLEAN_CODE_KMS_PROVIDER` is set (see
+     `cmd/clean-code-eval-gate/main.go:190-214` and
+     `cmd/clean-code-gateway/main.go:230-231` for the
+     production check). If the DSN is absent while
+     `CLEAN_CODE_KMS_PROVIDER` is set, boot is
+     refused.
+2. Restart the affected replica. Watch the boot logs
+   for the reconciler stanza. Expectations:
+   - First the log line indicating reconciler start
+     (`WAL reconciler: starting blocking on-restart
+     sweep ...`).
+   - Then the Stats summary on completion:
+     - `Replayed.Total() = N` where `N` is the count of
+       WAL-on-disk-but-PG-missing rows (usually 0 in a
+       clean shutdown; positive after a fsync-fail
+       incident).
+     - `SkippedExisting.Total() = M` where `M` is the
+       count of WAL-on-disk-AND-PG-present rows
+       (usually the entire WAL contents minus N).
+     - `SkippedBadSig.Total() = 0` -- ANY non-zero
+       value pages on-call.
+     - `SkippedBadShape.Total() = 0` -- ANY non-zero
+       value pages on-call. (Post-signature
+       schema-drift / RowPK-mismatch failures abort
+       `Run` instead -- see step 4.)
+     - `Warnings` empty (or 1 trailing-partial entry if
+       the last partition was mid-write at shutdown).
+3. Wait for the binary to advance past the reconciler
+   stanza into the rest of the boot sequence (rule
+   engine wiring, HTTP listener). If the binary exits
+   instead, see step 4.
+4. **If the binary exits with an error mentioning
+   `decode failed AFTER valid signature`,
+   `ErrRowPKMismatch`, or `KeyStore.List` /
+   snapshot-fetch failures:** STOP. Do NOT retry blindly.
+   The first two indicate writer-side schema drift OR
+   signing-key compromise; quarantine the partition,
+   page on-call, and audit recent Policy Steward
+   key-rotation events. The third indicates the
+   reconciler could not load the historical-keys
+   snapshot (DSN unreachable or role grant missing) --
+   verify `\dp clean_code.policy_signing_keys` shows
+   SELECT for `clean_code_wal_reconciler`. See
+   `docs/runbook.md` Stage 9.2 -> "Operator checklist"
+   for the full triage flow.
+
+### Roll-back
+
+Stage 9.2 is replay-only and additive. There is nothing
+to roll back at the data layer -- the reconciler's
+inserts are no-ops on existing rows, and a botched run
+leaves the WAL bytes durable for retry. To "roll back"
+the rollout itself: unset
+`CLEAN_CODE_WAL_RECONCILER_DSN` AND the signing-key env
+vars on the affected replica. Boot will then skip the
+reconciler (scaffold-mode branch). Any WAL frames
+already on disk remain durable for a future run.
+
+## Stage 9.1: Audit WAL frame writer
+
+This subsection captures the rollout sequence for the
+`internal/audit/wal/` package -- the per-process WAL writer
+scoped EXCLUSIVELY to the three Audit tables
+(`evaluation_run`, `evaluation_verdict`, `finding`).
+Architecture Sec 7.10 / tech-spec Sec 4.13.
+
+### What's new
+
+1. **`internal/audit/wal/` package** -- `Writer`, `TxBatch`,
+   `Signer`, `AuditFrame`, `ReadAll`/`ReadPartition`,
+   `MaxFrameSize = 1<<20`, and the
+   `ErrTrailingPartialFrame` / `ErrFrameSizeExceeded`
+   sentinel taxonomy.
+2. **WAL writer REQUIRED at both audit-write Stores** --
+   `rule_engine.NewSQLStore` and
+   `evaluator.NewSQLDegradedRunStore` BOTH error if
+   `WalWriter` is nil (`internal/rule_engine/sql_store.go`
+   constructor, `internal/evaluator/sql_degraded_store.go`
+   constructor). This is the row+WAL atomicity guard
+   demanded by the brief: there is NO SQL-only fallback
+   for Audit-table writes. The two writers stage WAL
+   frames in a per-tx batch and call `batch.Commit(ctx)`
+   BEFORE `tx.Commit()`; a WAL fsync failure rolls back
+   the SQL transaction.
+3. **Production composition wires the writer** --
+   `cmd/clean-code-eval-gate/main.go` and
+   `cmd/clean-code-gateway/main.go` read
+   `CLEAN_CODE_AUDIT_WAL_DIR` (default `data/wal/audit`)
+   at startup, construct a `wal.Writer`, and pass it to
+   `composition.BuildEvalGate` /
+   `evaluator.NewProductionGate` /
+   `rule_engine.NewSQLStore`. Both
+   `composition.EvalGateConfig` and
+   `evaluator.ProductionGateConfig` REQUIRE the field
+   and error at construction time when it is nil
+   (`TestBuildEvalGate_RejectsNilWalWriter`,
+   `TestSQLDegradedRunStore_RejectsNilWalWriter`).
+4. **Conformance enforcement** -- `test/conformance/wal_scope_test.go`
+   pins the closed allow-list of importers.
+5. **Integration tests prove frame emission** --
+   `internal/rule_engine/sql_store_wal_test.go` and
+   `internal/evaluator/sql_degraded_store_wal_test.go`
+   exercise sqlmock + real `wal.Writer`, asserting the
+   happy-path frame triple, the signer-failure rollback
+   contract, AND the write/fsync-failure rollback contract
+   (`TestSQLStore_AppendEvaluation_WALFlushFailureRollsBackSQL`,
+   `TestSQLDegradedRunStore_AppendDegradedRun_WALFlushFailureRollsBackSQL`).
+6. **Production signer is `policy/keys`-backed when KMS is
+   wired** -- `cmd/clean-code-eval-gate/main.go` and
+   `cmd/clean-code-gateway/main.go` construct the writer's
+   signer via `composition.NewKeysManagerWALSigner(*keys.Manager)`
+   when the signing keys manager is non-nil. The 2-phase
+   callback contract (keyID emitted into the canonical
+   payload BEFORE signing) is satisfied by
+   `keys.Manager.SignActive(ctx, build)`. Frames signed by
+   the KMS path carry a non-zero `signing_key_id` and a
+   real Ed25519 signature verifiable via `keys.Manager.Verify`.
+7. **No kill-switch** -- there is NO `CLEAN_CODE_AUDIT_WAL_DISABLED`
+   env var, NO "audit WAL off" feature flag, and NO SQL-only
+   fallback path for Audit-table writes. Unsetting
+   `CLEAN_CODE_AUDIT_WAL_DIR` does NOT disable the writer; it
+   falls through to the default `data/wal/audit` directory.
+   The two Audit-store constructors error on nil `WalWriter`
+   and the composition root refuses to build the eval-gate
+   without one.
+
+### What is NOT in Stage 9.1
+
+The Stage 9.2 brief covers the **reconciler** (replay of
+speculative frames against PostgreSQL keyed on
+`(table, row_pk)`, signature verification via the policy KMS
+handle, quarantine of unverifiable frames). Stage 9.1 stops
+at the writer; reconciler enablement is deferred.
+
+### Pre-rollout: provision the WAL volume
+
+1. Pick a dedicated mount for `data/wal/audit/` with at least
+   2 GiB free (per-process). The writer creates the
+   directory at startup with mode `0o755` -- the parent
+   must be writable by the binary's user.
+2. Set the env knob (composition root reads it during
+   wiring): `CLEAN_CODE_AUDIT_WAL_DIR=/srv/clean-code/data/wal/audit`.
+3. Mount the volume with `data=ordered` (ext4) or
+   `data_journal=writeback` is NOT sufficient -- the WAL
+   contract depends on `fsync(2)` durability semantics
+   typical of `data=ordered` and `xfs` defaults.
+
+### Pre-rollout: confirm WAL signer scope
+
+Stage 9.1 supports TWO signer wirings, chosen at startup
+based on whether the `policy/keys` signing manager was
+constructed (driven by the binary's KMS/keystore env
+variables -- see `cmd/clean-code-eval-gate/main.go` and
+`cmd/clean-code-gateway/main.go`):
+
+1. **Production (KMS wired)** -- the binary calls
+   `composition.NewKeysManagerWALSigner(*keys.Manager)`
+   which adapts `keys.Manager.SignActive(ctx, build)` to
+   the writer's 2-phase `wal.Signer.SignFrame(ctx, build)`
+   callback contract. The keyID is emitted into the
+   canonical payload BEFORE signing, so the on-disk
+   `signing_key_id` field is bound to the bytes the KMS
+   actually signed. Frames are verifiable via
+   `keys.Manager.Verify(keyID, payload, sig)`. The Stage
+   9.2 reconciler will use this verifier to gate replay
+   eligibility.
+2. **Scaffold (KMS unset)** -- the binary falls back to
+   `wal.NoopSigner{}` (SHA-256 stand-in, zero
+   `signing_key_id`) and emits a loud `WARN` log at
+   startup. This is intended for short-lived dev/test
+   bring-up while KMS provisioning catches up; operators
+   MUST NOT treat scaffold-mode frames as
+   cryptographically authoritative. Audit any
+   scaffold-mode partition files before the Stage 9.2
+   reconciler ships -- they will land in the
+   quarantine queue.
+
+The frame format itself is stable across both wirings
+(`signing_key_id` + `signature` fields are populated in
+both paths), so partition files written under scaffold
+mode remain readable by the production reader and the
+Stage 9.2 reconciler.
+
+### Pre-rollout: confirm role grants
+
+Audit table INSERTs are made by the existing
+`clean_code_evaluator` (degraded path) and
+`clean_code_solid_batch` (happy path) roles. Stage 9.1 does
+NOT add a new role; the WAL writes are local-disk only.
+A future migration may add `clean_code_wal_reconciler` for
+the Stage 9.2 replay path.
+
+### Cutover
+
+1. **Deploy the new binary** with the audit WAL volume
+   mounted and `CLEAN_CODE_AUDIT_WAL_DIR` set.
+   `cmd/clean-code-eval-gate/main.go` and
+   `cmd/clean-code-gateway/main.go` read the env var
+   (default `data/wal/audit` relative to the binary's
+   cwd if unset) and pass the constructed `wal.Writer`
+   into `composition.BuildEvalGate`,
+   `evaluator.NewProductionGate`, and
+   `rule_engine.NewSQLStore`. A misconfigured
+   `WalWriter` causes the binary to fail to start --
+   this is intentional, the row+WAL atomicity guarantee
+   has no SQL-only fallback.
+2. **Tail the WAL volume** for the first 5 minutes of
+   production traffic. Expect at most one partition file
+   per UTC day. Per-frame size is well under the 1 MiB cap
+   for typical finding rows; a `frame_size_exceeded`
+   error in the binary logs indicates a malformed audit
+   row (the SQL transaction will have rolled back, so
+   PostgreSQL is uncorrupted).
+3. **Confirm SQL writes still succeed** -- WAL fsync
+   failures cause the SQL transaction to roll back. If
+   the WAL volume is misconfigured (read-only mount,
+   wrong owner), audit writes will hard-fail with
+   `WAL flush before SQL commit` errors. Roll back the
+   deploy and re-verify the volume.
+
+### Roll-back
+
+Audit-table writes REQUIRE a WAL writer in Stage 9.1 --
+the two store constructors error on nil `WalWriter`,
+and the composition roots refuse to build the eval-gate
+without it. There is NO env-var kill-switch and no
+SQL-only fallback path. To roll back:
+
+1. Re-deploy the prior binary (the one without the
+   WAL-required constructor guard) -- the partition
+   files written by the new build remain readable by
+   the Stage 9.2 reconciler when it ships.
+2. If the WAL volume is genuinely broken (read-only
+   mount, wrong owner) and the prior binary is
+   unavailable, point `CLEAN_CODE_AUDIT_WAL_DIR` at a
+   writable scratch directory to unblock startup; the
+   Stage 9.2 reconciler will pick up the rerouted
+   partition files.
+
+## Stage 8.2: Refactor plan and task generation
+
+This subsection captures the rollout sequence for the Stage
+8.2 extension to `internal/refactor/`: the `TaskPlanner`
+orchestrator emitting `refactor_plan` and `refactor_task`
+rows. Stage 8.2 INTRODUCES the new one-shot K8s Job binary
+`cmd/clean-code-refactor-planner` (NOT a cadence loop -- one
+invocation per `(repo_id, sha)`), which composes the
+Stage 8.1 `refactor.Planner.Plan` pass and the Stage 8.2
+`refactor.TaskPlanner.PlanFromSnapshot` pass into a single
+race-safe two-pass run pinned to one `policy_version_id`.
+See "Step 2: Roll out the binary" below for the env-var
+contract and the two-pass execution flow.
+
+### What's new
+
+1. **`internal/refactor/task_planner.go`** -- the Stage 8.2
+   contract surface: `TaskPlanner`, `RefactorPlan`,
+   `RefactorTask`, `TaskKind` + the closed five-value
+   canonical enum, `FindingDetailReader`,
+   `RefactorPlanTaskWriter`, in-memory + SQL
+   implementations.
+2. **`steward.RefactorWeights.TopN`** -- new optional
+   `int` field with `json:"top_n,omitempty"`. Zero =
+   no truncation; positive = top-N truncation; negative
+   rejected at publish time. Legacy policies (no `top_n`
+   key in the JSONB blob) deserialize to `TopN = 0` and
+   carry the no-truncation semantics, so NO migration
+   step is required for existing rows.
+3. **`refactor_task_kind` ENUM** -- already created by
+   migration `0003_policy_audit_refactor.up.sql:140`
+   during Stage 5.1. Stage 8.2 only EMITS the five values
+   the migration already declares; no new migration step is
+   required.
+
+### Pre-rollout: confirm role grants (no change needed)
+
+The DB role `clean_code_refactor_planner` already has
+`INSERT, SELECT` on `refactor_plan` and `refactor_task` per
+migration `0004_roles.up.sql:482-509`. Stage 8.2 emits
+to those same tables, so NO new role grant is required.
+Verify with:
+
+```sql
+SELECT grantee, table_name, privilege_type
+  FROM information_schema.role_table_grants
+ WHERE table_schema = 'clean_code'
+   AND table_name IN ('refactor_plan', 'refactor_task')
+   AND grantee = 'clean_code_refactor_planner'
+ ORDER BY table_name, privilege_type;
+```
+
+Expect exactly four rows: `(INSERT, refactor_plan)`,
+`(SELECT, refactor_plan)`, `(INSERT, refactor_task)`,
+`(SELECT, refactor_task)`. NO `UPDATE`, NO `DELETE` --
+both tables are append-only.
+
+### Step 1: Republish active policies with `top_n`
+
+Stage 8.2 reads `policy_version.refactor_weights.top_n`. For
+a brand-new deployment, the default is `0` (no truncation)
+and operators may skip this step. For a production tier
+already running Stage 8.1, decide whether plan coverage
+should be truncated:
+
+- Small repos / pilot environments: keep `top_n: 0`. Every
+  scored hot_spot lands in the plan; useful for surfacing
+  the long tail.
+- Large repos / triage-mode: set `top_n: 25` (suggested
+  default). The plan covers the 25 highest-score hot_spots
+  per `(repo_id, sha)`; the long tail still persists in
+  `hot_spot` for future re-planning.
+
+Republish via the steward `policy.publish` + `policy.activate`
+verbs; the migration is signature-stable because `top_n` is
+a JSONB key with `omitempty` (so the legacy-row canonical
+bytes are unchanged when `top_n == 0`).
+
+### Step 2: Roll out the binary
+
+Stage 8.2 ships the NEW `cmd/clean-code-refactor-planner`
+binary, a one-shot Kubernetes Job (NOT a cadence loop) that
+runs ONCE per `(repo_id, sha)` and exits. The operator wires
+it into the existing scan-completion pipeline so a fresh
+scan triggers a fresh refactor pass.
+
+#### Required environment
+
+| env var                                  | required | purpose                                                                                  |
+| ---------------------------------------- | -------- | ---------------------------------------------------------------------------------------- |
+| `CLEAN_CODE_PG_URL`                      | yes      | libpq DSN to the clean_code database. Connects under the `clean_code_refactor_planner` role. |
+| `CLEAN_CODE_REFACTOR_PLANNER_REPO_ID`    | yes      | UUID of the repo to plan. Zero / malformed / missing fail fast at startup.               |
+| `CLEAN_CODE_REFACTOR_PLANNER_SHA`        | yes      | Commit SHA to plan against. Empty / whitespace fail fast at startup.                     |
+| `CLEAN_CODE_DISABLE_REFACTOR_PLANNER`    | no       | Truthy (`1`/`true`/`yes`/`on`) skips both passes and serves `/healthz` only. Default false. Used during staging rollouts that lack the hot_spot / refactor_plan / refactor_task schema. |
+| `PORT`                                   | no       | Health/metrics listener port. Default `8080`.                                            |
+
+The K8s Job spec MUST gate uniqueness on `(repo_id, sha)`
+(single-writer assumption -- see runbook "Single-writer
+assumption"). Two concurrent jobs against the same
+`(repo_id, sha)` could race the
+`WHERE created_at = (SELECT MAX(created_at) ...)` Stage 8.2
+latest-batch lookup and emit a torn plan.
+
+#### Two-pass execution flow
+
+Each invocation of the binary performs TWO passes in order
+(both pinned to the SAME `policy_version_id`):
+
+1. Stage 8.1 `refactor.Planner.Plan(ctx, repo_id, sha)` --
+   reads the active policy + metric_sample + finding rows,
+   scores composite hot_spots, and writes the full
+   `clean_code.hot_spot` batch.
+2. Stage 8.2 `refactor.TaskPlanner.PlanFromSnapshot(ctx,
+   repo_id, sha, planRes.Snapshot)` -- reads the top-N rows
+   back from `clean_code.hot_spot` (latest batch by
+   `created_at`, filtered to the same `policy_version_id`),
+   reads qualifying finding details for those scopes, and
+   writes ONE `refactor_plan` row + N `refactor_task` rows
+   in a SINGLE transaction.
+
+The `PlanFromSnapshot` entrypoint (rather than the
+standalone `TaskPlanner.Plan`) closes the policy-activate
+race the rubber-duck design review surfaced: a concurrent
+`policy.activate` between the two passes cannot produce a
+torn plan whose hot_spots were scored by PV-A and whose
+top-N truncation came from PV-B.
+
+### Step 3: Smoke-test post-rollout
+
+Trigger a planner run against a known (repo_id, sha) and
+verify both tables landed atomically:
+
+```sql
+SELECT plan_id,
+       jsonb_array_length(hotspot_ids) AS coverage,
+       (SELECT count(*)
+          FROM clean_code.refactor_task t
+         WHERE t.plan_id = p.plan_id) AS task_count
+  FROM clean_code.refactor_plan p
+ WHERE p.repo_id = $1 AND p.sha = $2
+ ORDER BY p.created_at DESC
+ LIMIT 1;
+```
+
+Expect:
+
+- `coverage` ≤ `top_n` (or = full hot_spot count when
+  `top_n == 0`).
+- `task_count` ≥ 0 (zero is legal for metric-only signals).
+- The task kinds you SELECT back are members of
+  `('split_class','extract_method','invert_dependency',
+  'break_cycle','consolidate_duplication')` -- the ENUM
+  type itself rejects any other value.
+
+### Rollback
+
+Revert the binary. The Stage 8.2 rows that already landed
+remain (the tables are append-only). To remove them
+operationally, take an audit-tracked retraction via the
+forthcoming `refactor.retract` verb (not in Stage 8.2 --
+Stage 8.4 owns it).
+
+#### Emergency stop -- halt all new plan / task emission
+
+The CORRECT way to immediately halt new plan + task emission
+is one of:
+
+1. **Operator opt-out (recommended).** Set
+   `CLEAN_CODE_DISABLE_REFACTOR_PLANNER=true` on the K8s Job
+   spec and roll forward. The binary skips both Stage 8.1
+   and Stage 8.2 passes, serves `/healthz` only, and exits 0
+   when the Job is terminated. No new hot_spot, refactor_plan,
+   or refactor_task rows land.
+2. **Deactivate the active policy.** Issue `policy.activate`
+   with no active row (or revoke the current activation) so
+   `steward.ActivePolicyVersion` returns `(false, nil)`. The
+   Stage 8.1 pass surfaces `ErrNoActivePolicy`, the binary
+   logs the warning and exits cleanly; Stage 8.2 is skipped.
+3. **Suspend the K8s CronJob / event consumer.** If the
+   binary is triggered by a scan-completion CronJob,
+   suspending the CronJob halts future runs without touching
+   the policy or the binary.
+
+> **DO NOT** rely on setting
+> `policy_version.refactor_weights.top_n = 0` as an
+> emergency stop. Per the documented semantics, `top_n == 0`
+> means "no truncation -- plan covers EVERY scored hot_spot",
+> not "no plan". Republishing with `top_n = 0` would INCREASE
+> the per-(repo, sha) plan / task volume, the opposite of an
+> emergency stop. The valid use of `top_n = 0` is the
+> deliberate "include every hot_spot in the plan" choice
+> documented in Step 1.
+
+
 ## Stage 7.1: Cross-Repo Aggregator cadence loop
 
 This subsection captures the rollout sequence for the
@@ -157,6 +1230,315 @@ snapshot rows: set `CLEAN_CODE_DISABLE_AGGREGATOR=true`,
 restart the binary, and confirm `loop: stopped` appears in
 the structured log. Snapshot rows already in the three
 tables remain (they are append-only history).
+
+## Stage 7.3: Insights percentile freshness banner
+
+This subsection captures the rollout sequence for the
+percentile-freshness banner attached to the Management
+latest-dashboard read verbs `mgmt.read.cross_repo` and
+`mgmt.read.portfolio` (architecture Sec 6.3, tech-spec
+Sec 8.2 `freshness_window_seconds=3600`). Stage 7.3
+introduces NO new binary, NO new env var, NO migration --
+the banner is a behavior-pinning iteration of the existing
+Reader code path in
+`internal/management/insights/freshness.go` +
+`internal/management/reader.go`.
+
+### What's new
+
+1. **`internal/management/insights/freshness.go`** -- new
+   sub-package owning the `Freshness`,
+   `Status`, `Clock`, `SystemClock` types plus the
+   exported `FreshnessWindowSeconds = 3600` constant and
+   the canonical
+   `DegradedReasonPercentileStale = "percentile_stale"`
+   string.
+2. **`management.WithInsightsFreshness(*insights.Freshness)`**
+   Reader option -- the composition-root wire-up. When
+   absent, the Reader auto-defaults to
+   `insights.NewPercentileFreshness()` so a wiring slip
+   cannot silently render stale snapshots as fresh
+   (defence-in-depth contract pinned by
+   `TestReader_ReadCrossRepo_*` /
+   `TestReader_ReadPortfolio_*`).
+3. **`management.WithoutFreshness()`** -- explicit opt-out
+   for unit-test seams and developer-mode replay
+   harnesses. NOT a production runtime knob and NOT a
+   rollback lever; production composition roots MUST NOT
+   call it (see runbook "Auto-default wiring").
+4. **`internal/evaluator` gate-side rejection** --
+   `verdict.IsValidForGate()`,
+   `Gate.writeDegraded`, and
+   `SQLDegradedRunStore.AppendDegradedRun` all return
+   `ErrInvalidGateDegradedReason` when handed
+   `percentile_stale`. This is the canonical realisation
+   of the Stage 6.1 e2e scenario
+   `percentile-stale-not-on-gate`.
+
+### Pre-rollout: confirm aggregator is ticking
+
+The freshness banner is meaningful only when the cross-repo
+aggregator (Stage 7.1) is producing snapshots within the
+3600s window. Confirm BEFORE rolling out a build that
+mounts the Reader:
+
+```sql
+SELECT
+  metric_kind,
+  scope_kind,
+  EXTRACT(EPOCH FROM (now() - MAX(built_at))) AS age_seconds,
+  MAX(built_at) AS latest_built_at
+FROM clean_code.cross_repo_percentile
+GROUP BY metric_kind, scope_kind
+ORDER BY age_seconds DESC;
+```
+
+Every row's `age_seconds` MUST be `< 3600` on a healthy
+cluster. A row with `age_seconds > 3600` means the
+post-rollout read will return
+`degraded_reason='percentile_stale'` -- triage the
+aggregator (Stage 7.1 runbook) BEFORE rolling out the
+reader if the banner would mislead the dashboard.
+
+### Wiring step (composition root)
+
+**State of the read surface today.** The
+`mgmt.read.cross_repo` and `mgmt.read.portfolio` HTTP
+handlers are **not yet mounted in any production binary**
+on this branch. A literal grep confirms it:
+
+```sh
+$ grep -rn 'management.NewReader' services/clean-code/cmd/
+(no production hits -- only test-file constructions and
+ doc comments)
+
+$ grep -rn 'ReadCrossRepo\|ReadPortfolio' services/clean-code/cmd/
+(empty)
+```
+
+Stage 7.3 itself ships ONLY the Reader-side library
+behaviour (the freshness sub-package and the
+`management.Reader` wire-up) plus the eval.gate-side
+rejection carve-out. The HTTP exposure of the read verbs
+(routing, auth, role grants) is a follow-on stage; that
+stage is the one that introduces a live composition
+root. Until then, the canonical wire shape is the one
+pinned by the package tests:
+
+- `internal/management/reader_test.go:609` --
+  `NewReader(nil, WithMetricsBackend(fb), WithInsightsFreshness(fresh))`
+- `internal/management/reader_test.go:716-733` -- the
+  defence-in-depth proof that `NewReader(...)` **without**
+  `WithInsightsFreshness` auto-defaults to
+  `insights.NewPercentileFreshness()`.
+
+**Recommended wire-up when the read-surface stage lands.**
+The follow-on stage should mount the read verbs from a
+**sibling** helper to `mountMgmtRoutes` -- not by
+extending `mountMgmtRoutes` itself, because the latter
+runs under the `clean_code_management` Postgres role (see
+`migrations/0004_roles.up.sql`) and intentionally splits
+its `*sql.DB` handles between the ingestor-role
+write path and the mgmt-role audit log.
+
+The Reader's actual constructor signature (file
+`internal/management/reader.go:514`) is:
+
+```go
+func NewReader(signingKeys *keys.Manager, opts ...ReaderOption) *Reader
+```
+
+-- the first positional argument is the Stage 5.1
+`*keys.Manager`, NOT a `*PGRepoStore`. The
+`MetricsBackend` (Stage 6.3) and `*insights.Freshness`
+(Stage 7.3) are wired via the variadic options.
+`NewPGMetricsBackend` (file
+`internal/management/pg_metrics_backend.go:106`)
+returns `(*PGMetricsBackend, error)` -- two values; the
+error MUST be propagated. The Reader exposes
+domain-level methods `ReadCrossRepo(ctx, metricKind,
+scopeKind) (*CrossRepoResponse, error)` and
+`ReadPortfolio(ctx, metricKind) (*PortfolioResponse, error)`
+-- the read-surface stage owns the thin HTTP handler
+shims that bridge `*http.Request -> Reader.ReadCrossRepo`
+and write the JSON response.
+
+A complete, compile-correct future wire-up sketch:
+
+```go
+// Future file (NOT shipped by Stage 7.3):
+//   cmd/clean-code-mgmt-read/main.go OR a
+//   mountMgmtReadRoutes sibling of mountMgmtRoutes
+//   in cmd/clean-code-metric-ingestor/main.go.
+
+import (
+    "database/sql"
+    "fmt"
+    "net/http"
+
+    "github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
+    "github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
+)
+
+func mountMgmtReadRoutes(
+    mux *http.ServeMux,
+    mgmtDB *sql.DB,
+    km *keys.Manager, // Stage 5.1 signing-key manager
+) error {
+    if mgmtDB == nil {
+        return fmt.Errorf("mountMgmtReadRoutes: mgmtDB is nil")
+    }
+    backend, err := management.NewPGMetricsBackend(mgmtDB)
+    if err != nil {
+        return fmt.Errorf("mountMgmtReadRoutes: backend: %w", err)
+    }
+    reader := management.NewReader(km,
+        management.WithMetricsBackend(backend),
+        // WithInsightsFreshness is OMITTED on purpose --
+        // NewReader auto-defaults to
+        // insights.NewPercentileFreshness() so a wiring
+        // slip cannot silently render stale percentiles
+        // as fresh (see reader.go:521 auto-default
+        // branch).
+    )
+    // The thin HTTP shims that adapt *http.Request to
+    // reader.ReadCrossRepo / reader.ReadPortfolio are
+    // owned by the follow-on read-surface stage. They
+    // are conventionally named handleReadCrossRepo /
+    // handleReadPortfolio and live next to the
+    // existing mgmt_verbs.go handlers. Stage 7.3 does
+    // NOT ship those shims (the Reader exposes only the
+    // domain-level methods today; see
+    // reader.go:745 ReadCrossRepo and
+    // reader.go:792 ReadPortfolio).
+    _ = reader
+    return nil
+}
+```
+
+What Stage 7.3 **DOES** pin verbatim about the
+construction shape (the parts the follow-on stage MUST
+honour to keep the freshness-banner contract intact):
+
+1. `NewReader`'s first positional arg is the signing-key
+   manager (`*keys.Manager`). Tests stub this with
+   `nil`; production wires the Stage 5.1 manager.
+2. `WithMetricsBackend(backend)` wires the metrics
+   backend (Stage 6.3 PG-backed implementation,
+   Stage 6.3 in-memory test fake, or any future
+   `MetricsBackend` implementation).
+3. Omitting `WithInsightsFreshness` is SAFE and
+   PREFERRED in production -- the auto-default at
+   `reader.go:521` wires the canonical 3600s window.
+4. Explicitly passing `WithoutFreshness()` SUPPRESSES
+   the freshness banner. It exists ONLY for unit-test
+   seams; a code review on a production composition
+   root calling `WithoutFreshness()` SHOULD block the
+   merge.
+
+The Reader-construction shape is verified by the
+package tests at `internal/management/reader_test.go:609`
+(`NewReader(nil, WithMetricsBackend(fb), WithInsightsFreshness(fresh))`)
+and `:716-733` (the defence-in-depth proof that
+`NewReader(...)` **without** `WithInsightsFreshness`
+auto-defaults).
+
+To **explicitly** suppress the freshness banner -- which
+should only happen in a unit-test seam, NEVER in a
+production composition root -- the caller MUST opt out
+with `management.WithoutFreshness()`. A code review
+flagged on a production composition root calling
+`WithoutFreshness()` SHOULD block the merge.
+
+### No new environment variables
+
+Stage 7.3 introduces no env vars. The freshness window is
+the package-level constant
+`insights.FreshnessWindowSeconds = 3600`; changing it
+requires a tech-spec amendment (the literal is
+explicitly pinned by `TestFreshnessWindowSecondsLiteral`
+in `freshness_test.go`).
+
+### No Postgres impact
+
+No migration. No new role grant. The banner reads the
+existing `cross_repo_percentile.built_at` and
+`portfolio_snapshot.built_at` columns populated by the
+Stage 7.1 aggregator -- both are non-nullable timestamps
+already covered by the Stage 1.2 catalog migration set.
+
+### Smoke validation
+
+After deploying a build that mounts the Reader with the
+banner wired:
+
+1. `/healthz` returns 200.
+2. Issue a `GET /v1/mgmt/read/cross_repo` for any
+   `(metric_kind, scope_kind)` that the aggregator has
+   composed. Expect `200` and a JSON body whose
+   `"degraded"` field is `false`. `"degraded_reason"`
+   MUST be ABSENT from the body (the field has
+   `omitempty` and the empty string is omitted on the
+   fresh path).
+3. SIMULATE a stale read in a staging environment by
+   temporarily setting
+   `CLEAN_CODE_DISABLE_AGGREGATOR=true` on the
+   aggregator deployment and waiting > 1 hour past the
+   last tick. Re-issue the same `mgmt.read.cross_repo`
+   call. Expect `200` with body
+   `"degraded": true, "degraded_reason":
+   "percentile_stale"`. Restore the aggregator and
+   confirm the next call returns to `degraded=false`
+   WITHOUT a binary restart.
+4. SMOKE the gate-side rejection by attempting to write a
+   degraded run with `degraded_reason="percentile_stale"`:
+
+   ```sql
+   SELECT clean_code.f_assert_gate_can_persist_reason(
+     'percentile_stale'::clean_code.degraded_reason
+   );
+   ```
+
+   If your deployment ships such a probe; otherwise the
+   contract is asserted at the Go layer by the
+   `verdict_test.go` suite which runs as part of
+   `make test`.
+
+### Rollback
+
+The banner is purely additive on the response envelope. To
+roll back the wiring without a code change, redeploy the
+previous build (the banner field is `omitempty` on
+fresh-path JSON, so any consumer that ignores
+`degraded`/`degraded_reason` was already compatible).
+
+If a real defect in the freshness comparison surfaces in
+production:
+
+1. The correct first response is to fix the AGGREGATOR
+   (the most common cause of `percentile_stale` in
+   practice -- see runbook "Operator triage on
+   `percentile_stale`").
+2. ONLY if the comparison itself is mis-classifying fresh
+   rows as stale (a real implementation bug), file a
+   regression and consider a hotfix that pins the wider
+   `time.Duration` window via a custom
+   `WithInsightsFreshness(&insights.Freshness{Window:
+   2*time.Hour, Clock: insights.SystemClock{}})`
+   composition. Do NOT reach for
+   `management.WithoutFreshness()` as the rollback
+   path -- suppressing the signal does not fix the bug
+   and removes the dashboard's only staleness indicator.
+
+### Backout sequence (rare)
+
+If a Stage 7.3 hotfix turns out to be worse than the bug
+it was fixing, revert the change in the composition root
+(restore the previous `WithInsightsFreshness(...)` line)
+and redeploy. The Reader's auto-default contract
+guarantees a fresh-by-default behaviour even with the
+option omitted -- there is no DB cleanup required and the
+existing snapshot rows remain untouched.
 
 ## Stage 6.2: management write verbs and repo onboarding
 
@@ -1086,44 +2468,74 @@ their own zero-findings verdict pair via the
    | `CLEAN_CODE_PERIODIC_SWEEP_CADENCE`  | Sweeper tick interval (Go duration; default is the value in `config.go`) |
    | `CLEAN_CODE_SCAN_TIMEOUT`            | Per-scan timeout passed to `WithStateMachineTimeout`                   |
 
-   Production deploys MUST set BOTH `CLEAN_CODE_PG_URL`
+   Production scan pods MUST set BOTH `CLEAN_CODE_PG_URL`
    and `CLEAN_CODE_AST_SCAN_ROOT`. The composition root
-   (`cmd/clean-coded/main.go:402-448`) is strict about the
-   pairing:
+   (`cmd/clean-code-metric-ingestor/main.go:837-891`)
+   selects the dispatcher based on the pairing:
 
-   - **Both set** → `PGScanRunStore` +
-     `DirectoryAstFileSource` are wired and the sweeper
-     launches.
+   - **Both set** → `RegistryBackedFoundationDispatcher`
+     is wired with a
+     `DirectoryAstFileSource{Coordinator, Pool}` rooted at
+     `CLEAN_CODE_AST_SCAN_ROOT` and threaded with the
+     shared `iso.coord` / `iso.pool` (so mode-flip drains
+     observe the SAME in-flight counter the scan path
+     increments). The sweeper is launched separately by
+     `buildSweepLoop` at `main.go:160`.
    - **`CLEAN_CODE_PG_URL` set, `CLEAN_CODE_AST_SCAN_ROOT`
-     unset** → the process **fails to start** with a
-     non-zero exit and the actionable boot error
-     "CLEAN_CODE_AST_SCAN_ROOT is REQUIRED when
-     CLEAN_CODE_PG_URL is configured" (see
-     `main.go:438-448`). It does NOT silently fall back to
-     `EmptyAstFileSource`; iter-4 made this fail-fast
-     after an evaluator finding that a production process
-     could otherwise start against live PG without ever
-     processing pending commits.
-   - **`CLEAN_CODE_PG_URL` unset** → scaffold mode. The
-     composition root logs `metric ingestor sweep loop
-     NOT STARTED (scaffold mode: CLEAN_CODE_AST_SCAN_ROOT
-     unset)` (`main.go:454-460`), closes `sweepDone`
-     immediately, and does NOT launch the sweeper. The
-     HTTP surface still serves; nothing claims commits.
-     This is dev-loop only.
+     unset** → the foundation dispatcher falls back to
+     `NoopFoundationRecipeDispatcher{Logger: logger}`
+     (`main.go:860`, `:887-890`) and the binary boots
+     normally. Stage 9.3 iter-3 intentionally reverted the
+     iter-4 fail-fast contract so that a webhook-only
+     metric-ingestor pod (one that serves `mgmt.*` and
+     `/v1/ingest/*` without owning the on-disk checkout
+     layout) still starts. A single info log
+     `foundation dispatcher = noop
+     (CLEAN_CODE_AST_SCAN_ROOT unset)` is emitted at
+     startup; operators deploying a SCAN pod (rather than
+     a webhook pod) MUST verify this log line is absent
+     and that `isolation_pool_languages` appears in the
+     `wired production foundation dispatcher` info log
+     instead.
+   - **`CLEAN_CODE_PG_URL` unset** → the binary refuses
+     to start. `cmd/clean-code-metric-ingestor/main.go:102-104`
+     does `log.Fatalf("%s is required", config.EnvPGURL)`
+     before any listener is bound, so there is no
+     `/healthz` to probe and no in-memory fallback. The
+     metric-ingestor binary deliberately does not support
+     a PG-less scaffold mode; operators who want one
+     should fall back to unit tests against
+     `metric_ingestor.NewInMemoryScanRunStore`.
 
 ### Per-rollout verification
 
 After deploying a new build, confirm:
 
 1. `/healthz` returns 200 within 5s of pod-ready.
-2. `/readyz` flips to 200 within 30s. Note: Stage 3.2 does
-   NOT register an `ast_source` ready-check; the AST
-   source availability is enforced inside the state
-   machine's pre-flight (`WithStateMachineSourceProbe`),
-   not on the `/readyz` surface. The only `/readyz` probe
-   registered today is `signing_key_cache` (Policy
-   Steward, Stage 5.1).
+2. **There is NO `/readyz` endpoint on this binary.**
+   `cmd/clean-code-metric-ingestor` mounts only `/healthz`
+   (always), `/metrics` (always), the optional legacy
+   `/v1/ingestor/*` routes when `EnableLegacyDemoAPI=true`,
+   the mgmt verbs (`mgmt.set_mode`, `mgmt.retract_sample`,
+   `mgmt.rescan`, `mgmt.register_repo`) via
+   `mountMgmtRoutes`, and the external-ingest router via
+   `mountIngestRouter` -- nothing registers `/readyz` or
+   calls `AddReadyCheck`. (Code inspection of
+   `cmd/clean-code-metric-ingestor/main.go` finds no
+   references to `readyz`, `AddReadyCheck`,
+   `healthHandler`, or `signing_key_cache`.) The
+   `AstSourceAvailability` / `WithStateMachineSourceProbe`
+   option exists in `internal/metric_ingestor` and is
+   exercised by unit tests, but the metric-ingestor binary
+   does NOT wire it today (`NewStateMachine` is only
+   called from tests). For this rollout, gate on `/healthz`
+   returning 200, then on the startup log lines
+   `wired production foundation dispatcher
+   isolation_pool_languages=[...]` (scan pod) or
+   `foundation dispatcher = noop (CLEAN_CODE_AST_SCAN_ROOT
+   unset)` (webhook pod). A dedicated `/readyz` aggregating
+   PG-ping + signing-key + AST-source probes is a
+   follow-up workstream.
 3. The first sweeper tick (after
    `CLEAN_CODE_PERIODIC_SWEEP_CADENCE`) fires and emits a
    structured log line of the form:

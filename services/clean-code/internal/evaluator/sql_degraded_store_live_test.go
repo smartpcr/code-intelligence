@@ -188,7 +188,7 @@ func TestSQLDegradedRunStore_LiveRoundTrip_SignatureInvalid(t *testing.T) {
 	schema := evaluatorLiveSchema
 	ctx := context.Background()
 
-	store, err := NewSQLDegradedRunStore(SQLDegradedRunStoreConfig{DB: db, Schema: schema})
+	store, err := NewSQLDegradedRunStore(SQLDegradedRunStoreConfig{DB: db, Schema: schema, WalWriter: newTestWALWriter(t)})
 	if err != nil {
 		t.Fatalf("NewSQLDegradedRunStore: %v", err)
 	}
@@ -335,7 +335,7 @@ func TestSQLDegradedRunStore_LiveRoundTrip_SamplesPending(t *testing.T) {
 	schema := evaluatorLiveSchema
 	ctx := context.Background()
 
-	store, err := NewSQLDegradedRunStore(SQLDegradedRunStoreConfig{DB: db, Schema: schema})
+	store, err := NewSQLDegradedRunStore(SQLDegradedRunStoreConfig{DB: db, Schema: schema, WalWriter: newTestWALWriter(t)})
 	if err != nil {
 		t.Fatalf("NewSQLDegradedRunStore: %v", err)
 	}

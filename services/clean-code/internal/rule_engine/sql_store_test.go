@@ -293,7 +293,7 @@ func TestSQLStore_LiveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("steward.NewSQLStoreWithSchema: %v", err)
 	}
-	store, err := NewSQLStore(SQLStoreConfig{DB: db, Schema: schema, Steward: stewardStore})
+	store, err := NewSQLStore(SQLStoreConfig{DB: db, Schema: schema, Steward: stewardStore, WalWriter: newTestWALWriter(t)})
 	if err != nil {
 		t.Fatalf("NewSQLStore: %v", err)
 	}
@@ -443,7 +443,7 @@ func TestSQLStore_ListMetricSamples_FiltersRetracted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("steward.NewSQLStoreWithSchema: %v", err)
 	}
-	store, err := NewSQLStore(SQLStoreConfig{DB: db, Schema: schema, Steward: stewardStore})
+	store, err := NewSQLStore(SQLStoreConfig{DB: db, Schema: schema, Steward: stewardStore, WalWriter: newTestWALWriter(t)})
 	if err != nil {
 		t.Fatalf("NewSQLStore: %v", err)
 	}

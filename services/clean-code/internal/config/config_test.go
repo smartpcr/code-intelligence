@@ -20,6 +20,9 @@ func clearCleanCodeEnv(t *testing.T) {
 		EnvGateDegradedPolicy,
 		EnvPolicySigningRequired,
 		EnvRefactorEffortSource,
+		EnvEffortSourceAlias,
+		EnvMLModelURI,
+		EnvMLModelVersion,
 		EnvHTTPAddr,
 		EnvPrometheusAddr,
 		EnvOTelEndpoint,
@@ -44,6 +47,9 @@ func clearCleanCodeEnv(t *testing.T) {
 		EnvAstScanRoot,
 		EnvAggregatorCadence,
 		EnvDisableAggregator,
+		EnvEnableLinkedModeAdapter,
+		EnvLinkedAgentMemoryEndpoint,
+		EnvLinkedAdapterTimeout,
 	} {
 		t.Setenv(k, "")
 	}
@@ -100,6 +106,95 @@ func TestLoad_NoEnvReturnsDefaults(t *testing.T) {
 	}
 	if cfg.RefactorEffortSource != "ML model from historical commits" {
 		t.Errorf("RefactorEffortSource = %q; want %q", cfg.RefactorEffortSource, "ML model from historical commits")
+	}
+	if cfg.MLModelURI != "" {
+		t.Errorf("MLModelURI = %q; want empty when env unset", cfg.MLModelURI)
+	}
+	if cfg.MLModelVersion != "" {
+		t.Errorf("MLModelVersion = %q; want empty when env unset", cfg.MLModelVersion)
+	}
+}
+
+// TestLoad_MLEffortEnvOverrides verifies the Stage 9.3 ML
+// effort-model env wiring (CLEAN_CODE_ML_MODEL_URI /
+// CLEAN_CODE_ML_MODEL_VERSION) populates the matching Config
+// fields. These fields are consumed by
+// refactor.NewEffortModelFromConfig at refactor-planner
+// composition-root time.
+func TestLoad_MLEffortEnvOverrides(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvMLModelURI, "file:///models/effort_model.onnx")
+	t.Setenv(EnvMLModelVersion, "1.0.0")
+	t.Setenv(EnvPGURL, "postgres://x")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: unexpected error: %v", err)
+	}
+	if cfg.MLModelURI != "file:///models/effort_model.onnx" {
+		t.Errorf("MLModelURI = %q; want file:///models/effort_model.onnx", cfg.MLModelURI)
+	}
+	if cfg.MLModelVersion != "1.0.0" {
+		t.Errorf("MLModelVersion = %q; want 1.0.0", cfg.MLModelVersion)
+	}
+}
+
+// TestLoad_EffortSourceAliasPopulatesField verifies the
+// compose-shorthand CLEAN_CODE_EFFORT_SOURCE populates
+// RefactorEffortSource when the canonical env var is not set
+// (the docker-compose stack at
+// tests/e2e/phase-08-refactor-planner/docker-compose.yml:30
+// uses the short form).
+func TestLoad_EffortSourceAliasPopulatesField(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvEffortSourceAlias, "ml")
+	t.Setenv(EnvPGURL, "postgres://x")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: unexpected error: %v", err)
+	}
+	if cfg.RefactorEffortSource != "ml" {
+		t.Errorf("RefactorEffortSource = %q; want \"ml\" (from alias)", cfg.RefactorEffortSource)
+	}
+}
+
+// TestLoad_CanonicalEffortSourceBeatsAlias verifies the
+// canonical CLEAN_CODE_REFACTOR_EFFORT_SOURCE wins when both
+// it and the alias CLEAN_CODE_EFFORT_SOURCE are set. The
+// operator's explicit canonical pin MUST NOT be silently
+// overridden by a compose default.
+func TestLoad_CanonicalEffortSourceBeatsAlias(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvRefactorEffortSource, "heuristic")
+	t.Setenv(EnvEffortSourceAlias, "ml")
+	t.Setenv(EnvPGURL, "postgres://x")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: unexpected error: %v", err)
+	}
+	if cfg.RefactorEffortSource != "heuristic" {
+		t.Errorf("RefactorEffortSource = %q; want \"heuristic\" (canonical wins over alias)", cfg.RefactorEffortSource)
+	}
+}
+
+// TestLoad_CanonicalEffortSourceAtDefaultValueBeatsAlias is the
+// edge case where the operator explicitly sets the canonical
+// env to the architecture-default string. A naive "if cfg
+// field is at default, accept alias" check would let the alias
+// stomp on the operator's deliberate canonical pin. We instead
+// consult the override map so the canonical's presence (not
+// its value) wins.
+func TestLoad_CanonicalEffortSourceAtDefaultValueBeatsAlias(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvRefactorEffortSource, DefaultRefactorEffortSource)
+	t.Setenv(EnvEffortSourceAlias, "zero")
+	t.Setenv(EnvPGURL, "postgres://x")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: unexpected error: %v", err)
+	}
+	if cfg.RefactorEffortSource != DefaultRefactorEffortSource {
+		t.Errorf("RefactorEffortSource = %q; want %q (canonical at default value still wins over alias)",
+			cfg.RefactorEffortSource, DefaultRefactorEffortSource)
 	}
 }
 
@@ -859,6 +954,182 @@ func TestExternalIngestWebhook_UnsetByDefault(t *testing.T) {
 	}
 	if cfg.WebhookSigningKeyID != "" {
 		t.Errorf("WebhookSigningKeyID: want empty (off-by-default), got %q", cfg.WebhookSigningKeyID)
+	}
+}
+
+// TestLinkedModeAdapter_DefaultsAreOff pins the Stage 10.1
+// "default embedded" architecture pin: omitting every linked-
+// mode env var must leave the adapter unwired AND the per-
+// request timeout at the canonical default. This is the
+// load-bearing guard against accidentally shipping a binary
+// that opens the agent-memory dependency by default.
+func TestLinkedModeAdapter_DefaultsAreOff(t *testing.T) {
+	clearCleanCodeEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.EnableLinkedModeAdapter {
+		t.Errorf("EnableLinkedModeAdapter: want false (off-by-default), got true")
+	}
+	if cfg.LinkedAgentMemoryEndpoint != "" {
+		t.Errorf("LinkedAgentMemoryEndpoint: want empty, got %q", cfg.LinkedAgentMemoryEndpoint)
+	}
+	if cfg.LinkedAdapterTimeout != DefaultLinkedAdapterTimeout {
+		t.Errorf("LinkedAdapterTimeout: want %s, got %s", DefaultLinkedAdapterTimeout, cfg.LinkedAdapterTimeout)
+	}
+}
+
+// TestLinkedModeAdapter_BothVarsSet_RoundTrips pins the happy
+// path: enabling the adapter with a parseable https endpoint
+// produces a valid Config carrying both values verbatim.
+func TestLinkedModeAdapter_BothVarsSet_RoundTrips(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvEnableLinkedModeAdapter, "1")
+	t.Setenv(EnvLinkedAgentMemoryEndpoint, "https://agent-memory.internal/")
+	t.Setenv(EnvLinkedAdapterTimeout, "2s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.EnableLinkedModeAdapter {
+		t.Errorf("EnableLinkedModeAdapter: want true, got false")
+	}
+	if cfg.LinkedAgentMemoryEndpoint != "https://agent-memory.internal/" {
+		t.Errorf("LinkedAgentMemoryEndpoint round-trip mismatch: got %q", cfg.LinkedAgentMemoryEndpoint)
+	}
+	if cfg.LinkedAdapterTimeout != 2*time.Second {
+		t.Errorf("LinkedAdapterTimeout: want 2s, got %s", cfg.LinkedAdapterTimeout)
+	}
+}
+
+// TestLinkedModeAdapter_EnableWithoutEndpoint_Rejected pins
+// the first half of the interlock: enabling the adapter
+// without supplying the endpoint is a deployment
+// misconfiguration that MUST fail loudly at Load (otherwise
+// the aggregator would silently degrade every system-tier
+// row with `xrepo_edges_unavailable` despite the operator's
+// explicit opt-in -- a surprising no-op).
+func TestLinkedModeAdapter_EnableWithoutEndpoint_Rejected(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvEnableLinkedModeAdapter, "1")
+	// EnvLinkedAgentMemoryEndpoint deliberately unset.
+	_, err := Load()
+	if err == nil {
+		t.Fatalf("Load: want error (missing %s), got nil", EnvLinkedAgentMemoryEndpoint)
+	}
+	if !strings.Contains(err.Error(), EnvLinkedAgentMemoryEndpoint) {
+		t.Errorf("error must name %s for operator triage, got: %v", EnvLinkedAgentMemoryEndpoint, err)
+	}
+	if !strings.Contains(err.Error(), EnvEnableLinkedModeAdapter) {
+		t.Errorf("error must name %s, got: %v", EnvEnableLinkedModeAdapter, err)
+	}
+}
+
+// TestLinkedModeAdapter_EndpointWithoutEnable_Rejected pins
+// the symmetric second half: setting the endpoint without
+// the opt-in is always a misconfiguration -- the endpoint is
+// consumed ONLY by the adapter.
+func TestLinkedModeAdapter_EndpointWithoutEnable_Rejected(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvLinkedAgentMemoryEndpoint, "https://agent-memory.internal/")
+	_, err := Load()
+	if err == nil {
+		t.Fatalf("Load: want error (orphan %s), got nil", EnvLinkedAgentMemoryEndpoint)
+	}
+	if !strings.Contains(err.Error(), EnvLinkedAgentMemoryEndpoint) {
+		t.Errorf("error must name %s for operator triage, got: %v", EnvLinkedAgentMemoryEndpoint, err)
+	}
+	if !strings.Contains(err.Error(), EnvEnableLinkedModeAdapter) {
+		t.Errorf("error must name %s, got: %v", EnvEnableLinkedModeAdapter, err)
+	}
+}
+
+// TestLinkedModeAdapter_RejectsBadEndpoint pins the URL
+// shape validation: a missing scheme, an unsupported scheme,
+// or an empty host MUST be rejected at config load so an
+// operator typo surfaces before the adapter fires its first
+// HTTP call. This duplicates the linked.NewHTTPClient guard
+// so config-only callers (e.g. dry-run validation) catch the
+// same problem.
+func TestLinkedModeAdapter_RejectsBadEndpoint(t *testing.T) {
+	cases := []struct {
+		name string
+		ep   string
+	}{
+		{"missing_scheme", "agent-memory.internal/"},
+		{"unsupported_scheme", "ftp://agent-memory.internal/"},
+		{"empty_host", "https:///path"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			clearCleanCodeEnv(t)
+			t.Setenv(EnvEnableLinkedModeAdapter, "1")
+			t.Setenv(EnvLinkedAgentMemoryEndpoint, tc.ep)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load(%q): want error, got nil", tc.ep)
+			}
+			if !strings.Contains(err.Error(), EnvLinkedAgentMemoryEndpoint) {
+				t.Errorf("error must name %s for triage; got: %v", EnvLinkedAgentMemoryEndpoint, err)
+			}
+		})
+	}
+}
+
+// TestLinkedModeAdapter_RejectsNonPositiveTimeout pins the
+// timeout validation: a zero or negative duration is always
+// an operator error (would either burn-loop or never time
+// out).
+func TestLinkedModeAdapter_RejectsNonPositiveTimeout(t *testing.T) {
+	for _, dur := range []string{"0s", "-1s"} {
+		dur := dur
+		t.Run(dur, func(t *testing.T) {
+			clearCleanCodeEnv(t)
+			t.Setenv(EnvEnableLinkedModeAdapter, "1")
+			t.Setenv(EnvLinkedAgentMemoryEndpoint, "https://agent-memory.internal/")
+			t.Setenv(EnvLinkedAdapterTimeout, dur)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load(%q): want error, got nil", dur)
+			}
+			if !strings.Contains(err.Error(), EnvLinkedAdapterTimeout) {
+				t.Errorf("error must name %s; got: %v", EnvLinkedAdapterTimeout, err)
+			}
+		})
+	}
+}
+
+// TestLinkedModeAdapter_RejectsMalformedTimeout pins the
+// time.ParseDuration error path.
+func TestLinkedModeAdapter_RejectsMalformedTimeout(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvEnableLinkedModeAdapter, "1")
+	t.Setenv(EnvLinkedAgentMemoryEndpoint, "https://agent-memory.internal/")
+	t.Setenv(EnvLinkedAdapterTimeout, "not-a-duration")
+	_, err := Load()
+	if err == nil {
+		t.Fatalf("Load: want error for malformed duration, got nil")
+	}
+	if !strings.Contains(err.Error(), EnvLinkedAdapterTimeout) {
+		t.Errorf("error must name %s; got: %v", EnvLinkedAdapterTimeout, err)
+	}
+}
+
+// TestLinkedModeAdapter_RejectsNonBooleanEnable pins the
+// shared boolean-parsing pattern (matches the existing
+// scaffold-webhook test).
+func TestLinkedModeAdapter_RejectsNonBooleanEnable(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvEnableLinkedModeAdapter, "maybe")
+	t.Setenv(EnvLinkedAgentMemoryEndpoint, "https://agent-memory.internal/")
+	_, err := Load()
+	if err == nil {
+		t.Fatalf("Load: want error for non-boolean enable, got nil")
+	}
+	if !strings.Contains(err.Error(), EnvEnableLinkedModeAdapter) {
+		t.Errorf("error must name %s; got: %v", EnvEnableLinkedModeAdapter, err)
 	}
 }
 

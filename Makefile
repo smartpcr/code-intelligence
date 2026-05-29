@@ -4,7 +4,7 @@
 CLEAN_CODE_PG_URL ?= postgres://postgres:postgres@localhost:5432/clean_code?sslmode=disable
 COMPOSE_FILE      := tests/e2e/phase-03-indexer-ingestor/docker-compose.yml
 
-.PHONY: migrate-up seed-fixtures-phase-03 test-phase-03
+.PHONY: migrate-up seed-fixtures-phase-03 seed-phase-08 test-phase-03
 
 ## migrate-up: run SQL migrations against the database
 migrate-up:
@@ -15,6 +15,13 @@ migrate-up:
 seed-fixtures-phase-03:
 	@echo "==> Seeding phase-03 fixtures"
 	psql "$${CLEAN_CODE_PG_URL}" -f tests/e2e/phase-03-indexer-ingestor/fixtures/seed.sql
+
+## seed-phase-08: marker target for the refactor-planner E2E suite.
+## Per-scenario data (hot_spot rows, policy_version with the
+## right effort_model_version pin) is owned by the test harness,
+## so this target only confirms the migrations have run.
+seed-phase-08:
+	@echo "==> phase-08 seed: per-scenario data is owned by the test harness; nothing additional to do"
 
 ## test-phase-03: discover compose ports, bootstrap, and run E2E tests
 test-phase-03:

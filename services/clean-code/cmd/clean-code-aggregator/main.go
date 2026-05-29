@@ -23,13 +23,19 @@
 //
 //   - [openAndPingDB] opens a single libpq handle, fails fast on a
 //     permanently unreachable DB.
-//   - [buildAggregatorLoop] composes the [aggregator.PGSampleSource]
-//     reader, the [aggregator.PGSnapshotWriter] writer, the
-//     [aggregator.Aggregator] orchestrator, and the
-//     [aggregator.Loop] cadence driver. When the operator opts out via
-//     [config.EnvDisableAggregator] the loop is skipped and the binary
-//     serves a /healthz-only listener (matches the metric_ingestor
-//     stale-sweep opt-out pattern).
+//   - [buildAggregatorLoop] composes the foundation pass
+//     ([aggregator.PGSampleSource] reader + [aggregator.PGSnapshotWriter]
+//     writer) AND the system-tier pass
+//     ([aggregator.SystemTierComposer] + [aggregator.PGSystemTierInputSource]
+//     reader + [aggregator.PGSystemTierWriter] writer) through
+//     [aggregator.NewAggregator] + [aggregator.WithSystemTier], and
+//     wraps them in [aggregator.NewLoop] as the cadence driver. The
+//     aggregator is the SOLE writer of `pack='system'` rows per
+//     Phase 1.5 grants -- both the foundation snapshot pass and the
+//     system-tier composition pass run inside one Tick. When the
+//     operator opts out via [config.EnvDisableAggregator] the loop is
+//     skipped and the binary serves a /healthz-only listener (matches
+//     the metric_ingestor stale-sweep opt-out pattern).
 //   - [buildMux] mounts `/healthz` and `/metrics` -- the always-on
 //     surface that lets Kubernetes liveness probes succeed even on an
 //     opted-out deployment.
@@ -71,6 +77,8 @@ import (
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/aggregator"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/config"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/linked"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
 )
 
 func main() {
@@ -249,15 +257,34 @@ func openAndPingDB(dsn, role string) (*sql.DB, error) {
 
 // buildAggregatorLoop composes the Stage 7.1 cadence loop when the
 // operator has not opted out via [config.EnvDisableAggregator]. The
-// loop is composed of three units that the unit tests already pin:
+// loop is composed of six units that the unit tests pin:
 //
 //  1. [aggregator.NewPGSampleSource] -- reads ACTIVE
 //     `metric_sample` rows via the canonical
 //     `metric_sample_active` join + `metric_retraction` anti-join.
 //  2. [aggregator.NewPGSnapshotWriter] -- INSERTs into all three
 //     snapshot tables under one transaction (BEGIN ... COMMIT).
-//  3. [aggregator.NewAggregator] + [aggregator.NewLoop] -- the
+//  3. [aggregator.NewSystemTierComposer] -- pure-function Stage
+//     7.2 composer that writes the SEVEN canonical system-tier
+//     `metric_kind` rows per `(repo_id, sha, scope_id)` per
+//     architecture Sec 1.4.2 + the embedded-mode fail-safe
+//     contract from Sec 3.10 step 4.
+//  4. [aggregator.NewPGSystemTierInputSource] -- per-tick PG
+//     read of `metric_sample_active` + `scope_binding` +
+//     `scan_run` that feeds the composer one
+//     [aggregator.SystemTierInput] per active `(repo_id, sha)`
+//     pair.
+//  5. [aggregator.NewPGSystemTierWriter] -- single-tx writer
+//     that runs the architecture-canonical SKIP-on-active
+//     check then INSERTs into `metric_sample` and
+//     `metric_sample_active` (bare INSERT, no ON CONFLICT)
+//     per Phase 1.5 grants and architecture Sec 5.2.1
+//     lines 1040-1048 (sole writer of `pack='system'`).
+//  6. [aggregator.NewAggregator] + [aggregator.NewLoop] -- the
 //     in-process per-cohort percentile math + the cadence loop.
+//     [aggregator.WithSystemTier] wires the system-tier composer
+//     + source + writer into the same tick; the aggregator runs
+//     foundation-snapshot AND system-tier passes per Tick.
 //
 // Returns (nil, nil) when the operator has opted out; the caller
 // then runs the /healthz-only listener so K8s liveness probes still
@@ -278,7 +305,45 @@ func buildAggregatorLoop(cfg config.Config, db *sql.DB, logger *slog.Logger) (*a
 	if err != nil {
 		return nil, fmt.Errorf("buildAggregatorLoop: NewPGSnapshotWriter: %w", err)
 	}
-	agg, err := aggregator.NewAggregator(source, writer)
+	composer, err := aggregator.NewSystemTierComposer()
+	if err != nil {
+		return nil, fmt.Errorf("buildAggregatorLoop: NewSystemTierComposer: %w", err)
+	}
+	sysSource, err := aggregator.NewPGSystemTierInputSource(db)
+	if err != nil {
+		return nil, fmt.Errorf("buildAggregatorLoop: NewPGSystemTierInputSource: %w", err)
+	}
+	sysWriter, err := aggregator.NewPGSystemTierWriter(db)
+	if err != nil {
+		return nil, fmt.Errorf("buildAggregatorLoop: NewPGSystemTierWriter: %w", err)
+	}
+	opts := []aggregator.AggregatorOption{
+		aggregator.WithSystemTier(composer, sysSource, sysWriter),
+	}
+	// Stage 10.1 optional linked-mode adapter (architecture
+	// Sec 8.7). Wired only when the operator opts in via the
+	// global config flag AND supplies the agent-memory
+	// endpoint -- the config.Validate interlock guarantees the
+	// pair is consistent. When unwired the aggregator runs in
+	// pure embedded mode and the composer degrades
+	// xrepo_dep_depth / blast_radius with
+	// `xrepo_edges_unavailable` (architecture Sec 3.10 step 4).
+	if cfg.EnableLinkedModeAdapter {
+		client, err := linked.NewHTTPClient(cfg.LinkedAgentMemoryEndpoint,
+			linked.WithTimeout(cfg.LinkedAdapterTimeout),
+			linked.WithLogger(logger),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("buildAggregatorLoop: linked.NewHTTPClient: %w", err)
+		}
+		modeReader, err := management.NewPGRepoStore(db)
+		if err != nil {
+			return nil, fmt.Errorf("buildAggregatorLoop: management.NewPGRepoStore (for linked adapter): %w", err)
+		}
+		adapter := linked.NewAggregatorAdapter(client, modeReader, true, logger)
+		opts = append(opts, aggregator.WithLinkedEdgeReader(adapter, logger))
+	}
+	agg, err := aggregator.NewAggregator(source, writer, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("buildAggregatorLoop: NewAggregator: %w", err)
 	}

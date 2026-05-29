@@ -10,6 +10,7 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/lib/pq"
 
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 )
 
@@ -34,6 +35,20 @@ type txStore struct {
 	tx      *sql.Tx
 	schema  string
 	steward *steward.SQLStore
+	// walBatch is the per-tx WAL staging batch allocated by
+	// [SQLStore.WithEvaluationLock]. It is ALWAYS non-nil:
+	// [NewSQLStore] rejects a nil [wal.Writer] (Stage 9.1
+	// iter-1 evaluator item #1) and
+	// [SQLStore.WithEvaluationLock] unconditionally calls
+	// `s.walWriter.NewTxBatch()` before constructing this
+	// struct, so call sites in [appendEvaluationInTx] do
+	// not need a nil guard -- the guard there is a
+	// defence-in-depth assertion against a future refactor
+	// that forgets to wire the batch, not a supported mode.
+	// Every audit INSERT stages a frame onto the batch and
+	// the outer caller flushes (fsyncs) it BEFORE
+	// `tx.Commit()`.
+	walBatch *wal.TxBatch
 }
 
 func (s *txStore) qualify(table string) string {
@@ -170,7 +185,7 @@ func (s *txStore) ListPriorBlockFindings(ctx context.Context, repoID uuid.UUID, 
 }
 
 func (s *txStore) AppendEvaluation(ctx context.Context, run EvaluationRun, verdict EvaluationVerdict, findings []Finding) error {
-	return appendEvaluationInTx(ctx, s.tx, s.schema, run, verdict, findings)
+	return appendEvaluationInTx(ctx, s.tx, s.schema, run, verdict, findings, s.walBatch)
 }
 
 // LookupRecentCanonicalRun implements [Store] for the

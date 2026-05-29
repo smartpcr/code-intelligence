@@ -386,3 +386,40 @@ func (s *PGRepoStore) SetRepoMode(ctx context.Context, req SetRepoModeRequest) (
 
 // Compile-time interface guard.
 var _ RepoStore = (*PGRepoStore)(nil)
+var _ RepoModeReader = (*PGRepoStore)(nil)
+
+// ReadRepoMode implements [RepoModeReader]. Used by the
+// Stage 9.3 `isolation.ModeCoordinator` hydrator hook to
+// lazily populate per-repo mode cache on the first
+// `BeginScan` / `SetMode` for a given repo, so the
+// composition root does NOT have to pre-seed the
+// coordinator with every persisted repo at startup.
+//
+// SQL: `SELECT mode FROM <schema>.repo WHERE repo_id = $1`.
+// No transaction (read-only single-row lookup); no advisory
+// lock (we don't mutate); maps `sql.ErrNoRows` to
+// [ErrRepoStoreUnknownRepo] so the coordinator can return
+// the typed `isolation.ErrModeNotHydrated`.
+//
+// The Management role's column-level SELECT grant covers
+// `mode` -- the role-boundary migration
+// (`migrations/0004_roles.up.sql`) grants SELECT on the
+// repo table without column restrictions for this role.
+func (s *PGRepoStore) ReadRepoMode(ctx context.Context, repoID uuid.UUID) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if repoID == uuid.Nil {
+		return "", ErrRepoStoreZeroRepoID
+	}
+	readSQL := fmt.Sprintf(`SELECT mode FROM %s WHERE repo_id = $1`, s.repoQName)
+	var mode string
+	err := s.db.QueryRowContext(ctx, readSQL, repoID).Scan(&mode)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("%w: repo_id=%s", ErrRepoStoreUnknownRepo, repoID)
+	}
+	if err != nil {
+		return "", fmt.Errorf("management: PGRepoStore.ReadRepoMode (repo_id=%s): %w", repoID, err)
+	}
+	return mode, nil
+}

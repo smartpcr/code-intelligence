@@ -2,6 +2,7 @@ package metric_ingestor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/isolation"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
 )
 
@@ -149,6 +151,37 @@ type DirectoryAstFileSource struct {
 	// scan call summarising files-walked / files-parsed
 	// / skipped-by-detect / errors. MAY be nil.
 	Logger *slog.Logger
+
+	// Coordinator is the Stage 9.3 [isolation.ModeCoordinator]
+	// that bracket-wraps the whole per-commit walk in ONE
+	// BeginScan/EndScan pair so the
+	// `mgmt.set_mode(repo_id, mode)` flip path can drain
+	// the scan before mutating the catalog (impl-plan
+	// line 804). MAY be nil; when nil the source skips
+	// the admission step and runs as it did pre-Stage-9.3
+	// (no drain barrier, no per-repo flip safety).
+	//
+	// When wired, the source ALSO requires the repo to be
+	// hydrated (the coordinator's hydrator hook handles
+	// this lazily); a not-yet-registered repo surfaces as
+	// [isolation.ErrModeNotHydrated] -- the scan does NOT
+	// silently default to embedded.
+	Coordinator *isolation.ModeCoordinator
+
+	// Pool is the Stage 9.3 [isolation.Pool] that routes
+	// per-file parsing through a per-language subprocess
+	// (or in-process fallback) with rlimit-bounded memory
+	// + hard timeout. MAY be nil; when nil per-file
+	// parsing uses the in-process [parser.Registry]
+	// directly (legacy path, no crash isolation).
+	//
+	// When BOTH Pool AND Coordinator are non-nil, parses
+	// route through [isolation.Pool.ParseInScan] using the
+	// scan-admission token so the coordinator's in-flight
+	// counter tracks ONE scan (not one-per-file), preserving
+	// the drain-before-flip contract while delivering
+	// per-file crash isolation.
+	Pool *isolation.Pool
 }
 
 // defaultMaxAstFileBytes is the per-file read cap when
@@ -189,6 +222,30 @@ func (s *DirectoryAstFileSource) Files(ctx context.Context, scanRun ScanRunConte
 	maxBytes := s.MaxFileBytes
 	if maxBytes <= 0 {
 		maxBytes = defaultMaxAstFileBytes
+	}
+
+	// Stage 9.3 -- admit the whole scan into the
+	// [isolation.ModeCoordinator] so a concurrent
+	// `mgmt.set_mode(repo_id, ...)` flip waits for THIS
+	// scan to finish before mutating the catalog. The
+	// per-file Pool.ParseInScan calls below piggy-back on
+	// THIS token so the coordinator's in-flight counter
+	// tracks ONE scan (not one-per-file).
+	//
+	// Optional: when Coordinator is nil the source skips
+	// admission and runs as it did pre-Stage-9.3 (legacy
+	// callers that have not adopted the flip-safety
+	// wiring continue to work). The pre-Stage-9.3 callers
+	// have no drain barrier; this is what the brief
+	// addresses for the production scan path.
+	var scanTok isolation.ScanToken
+	if s.Coordinator != nil {
+		tok, err := s.Coordinator.BeginScan(ctx, scanRun.RepoID)
+		if err != nil {
+			return nil, fmt.Errorf("metric_ingestor: DirectoryAstFileSource.BeginScan(repo_id=%s): %w", scanRun.RepoID, err)
+		}
+		scanTok = tok
+		defer s.Coordinator.EndScan(scanTok)
 	}
 
 	commitRoot := filepath.Join(s.Root, scanRun.RepoID.String(), scanRun.SHA)
@@ -336,9 +393,39 @@ func (s *DirectoryAstFileSource) Files(ctx context.Context, scanRun ScanRunConte
 			filesSkipped++
 			continue
 		}
-		ast, err := registry.Parse(ctx, relPosix, content)
-		if err != nil {
-			return nil, fmt.Errorf("metric_ingestor: DirectoryAstFileSource parse %q: %w", relPosix, err)
+
+		var ast *parser.AstFile
+		if s.Pool != nil && s.Coordinator != nil && scanTok.Active() {
+			// Stage 9.3 -- route through the subprocess
+			// pool using the held scan token so per-file
+			// parses run with crash isolation while the
+			// coordinator's in-flight counter still tracks
+			// ONE scan.
+			lang, _ := parser.DetectLanguage(relPosix, content)
+			res, parseErr := s.Pool.ParseInScan(ctx, scanTok, isolation.ParseRequest{
+				Language: lang,
+				Path:     relPosix,
+				Content:  content,
+			})
+			if parseErr != nil {
+				return nil, fmt.Errorf("metric_ingestor: DirectoryAstFileSource pool-parse %q: %w", relPosix, parseErr)
+			}
+			if len(res.AstFileBytes) > 0 {
+				ast = &parser.AstFile{}
+				if err := json.Unmarshal(res.AstFileBytes, ast); err != nil {
+					return nil, fmt.Errorf("metric_ingestor: DirectoryAstFileSource decode pool result %q: %w", relPosix, err)
+				}
+			}
+		} else {
+			parsed, err := registry.Parse(ctx, relPosix, content)
+			if err != nil {
+				return nil, fmt.Errorf("metric_ingestor: DirectoryAstFileSource parse %q: %w", relPosix, err)
+			}
+			ast = parsed
+		}
+		if ast == nil {
+			filesSkipped++
+			continue
 		}
 		results = append(results, ast)
 		filesParsed++

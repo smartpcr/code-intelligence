@@ -1,0 +1,57 @@
+trigger:
+  branches:
+    include:
+      - feature/clean-code
+      - ws/code-intelligence-CLEAN-CODE/*
+  paths:
+    include:
+      - services/clean-code/**
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  GO_VERSION: "1.25"
+  COMPOSE_FILE: tests/e2e/phase-09-audit-wal/docker-compose.yml
+
+stages:
+  - stage: e2e_otel_telemetry
+    displayName: "E2E – OTel Telemetry Across All Surfaces"
+    jobs:
+      - job: run_e2e
+        displayName: "Run godog E2E suite"
+        timeoutInMinutes: 20
+        steps:
+          - task: GoTool@0
+            inputs:
+              version: $(GO_VERSION)
+            displayName: "Install Go $(GO_VERSION)"
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) up -d --build
+              sleep 10
+            displayName: "Start compose services"
+
+          - script: |
+              make migrate-up
+              make seed-phase-09
+            displayName: "Bootstrap DB (migrate + seed)"
+            workingDirectory: services/clean-code
+
+          - script: |
+              cd services/clean-code
+              go test -tags e2e -v -count=1 -timeout 120s \
+                ./test/e2e/code-intelligence-CLEAN-CODE/...
+            displayName: "Run E2E tests"
+            env:
+              CLEAN_CODE_PG_URL: postgres://clean_code_admin:e2e_test_password@localhost:5432/clean_code?sslmode=disable
+              CLEAN_CODE_OTEL_ENDPOINT: http://localhost:4317
+              CLEAN_CODE_EVALUATOR_URL: http://localhost:8081
+              CLEAN_CODE_OTEL_QUERY_URL: http://localhost:16686
+              CLEAN_CODE_AGGREGATOR_METRICS_URL: http://localhost:9090/metrics
+
+          - script: |
+              docker compose -f $(COMPOSE_FILE) logs --tail=200
+              docker compose -f $(COMPOSE_FILE) down -v
+            displayName: "Collect logs & tear down"
+            condition: always()

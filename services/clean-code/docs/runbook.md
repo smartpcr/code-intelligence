@@ -6,6 +6,1411 @@ composition root (`cmd/clean-code-metric-ingestor/main.go`,
 which hosts the management + ingest HTTP surfaces; future
 binaries under `cmd/clean-code-*` ship their own routes).
 
+## Stage 10.5 -- Operator playbook (consolidated quick reference)
+
+This section is a consolidated quick-reference index for the
+day-2 operator surface. Each entry is a short procedure plus
+pointers to the **canonical Stage section in this file** (full
+request shape, error matrix, idempotency rules, audit-row
+shape) and the **canonical architecture / tech-spec section**
+(the contract the verb implements). The detailed contracts
+already live in those sections; this index does NOT duplicate
+them.
+
+### Canonical references (relative paths from this file)
+
+- Architecture:
+  [`../../../docs/stories/code-intelligence-CLEAN-CODE/architecture.md`](../../../docs/stories/code-intelligence-CLEAN-CODE/architecture.md)
+- Tech-spec:
+  [`../../../docs/stories/code-intelligence-CLEAN-CODE/tech-spec.md`](../../../docs/stories/code-intelligence-CLEAN-CODE/tech-spec.md)
+- Implementation plan:
+  [`../../../docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`](../../../docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md)
+- E2E scenarios:
+  [`../../../docs/stories/code-intelligence-CLEAN-CODE/e2e-scenarios.md`](../../../docs/stories/code-intelligence-CLEAN-CODE/e2e-scenarios.md)
+- Rollout playbook (sibling):
+  [`./rollout.md`](./rollout.md) -- per-stage rollout sequence,
+  including the Stage 10.5 `embedded` -> `linked` migration.
+- Follow-up workstreams (sibling):
+  [`./follow-up-workstreams.md`](./follow-up-workstreams.md)
+
+Canonical verb namespaces (tech-spec Sec 8.5, e2e-scenarios
+`runbook-references-canonical-verbs`): `mgmt.register_repo`,
+`mgmt.set_mode`, `mgmt.retract_sample`, `mgmt.rescan`,
+`mgmt.override`, `policy.publish`, `policy.activate`,
+`policy.publish_rulepack`, `eval.gate`. No other names are
+canonical -- earlier scratch / draft names from pre-Stage 5.3
+design notes MUST NOT appear in operator-facing prose
+(`runbook-references-canonical-verbs` scenario pins this).
+
+### 1. Register a repo (`mgmt.register_repo`)
+
+When the operator onboards a new repo into the catalogue.
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     -H 'X-OIDC-Subject: alice@acme.com' \
+     --data '{ "repo_url": "https://github.com/acme/svc-orders",
+               "default_branch": "main",
+               "mode": "embedded" }' \
+     https://clean-coded.example.com/v1/mgmt/register_repo
+```
+
+- `X-OIDC-Subject` is REQUIRED on every call. The gateway sets
+  it from the OIDC-authenticated principal; the verb stamps
+  it into `repo_event.payload.actor` as `"operator:<subject>"`.
+  A missing or blank header returns HTTP 401 BEFORE any
+  persistence happens (Stage 6.2 "Authentication and actor
+  attribution", line ~1590).
+- Idempotent on `repo_url`: re-posting the same URL returns
+  the existing `repo_id` with HTTP 200 and writes no duplicate
+  `repo` row.
+- Appends one `repo_event(kind='registered', payload={mode})`
+  on the FIRST registration only.
+- `mode` (or its alias `modes`) is `embedded` | `linked`;
+  unset defaults to `embedded` per the architecture
+  `ast-mode-default` pin. Use `mgmt.set_mode` -- NOT a second
+  `register_repo` call -- to change the mode of an existing
+  repo.
+
+Canonical detail in this file: "Stage 6.2 -- `mgmt.register_repo`
+and `mgmt.set_mode`" (search for `## Stage 6.2`).
+Architecture: Sec 5.1.4 (RepoEvent.kind enum -- `registered`
+is canonical past-tense); Sec 5.2.1 `repo.repo_url`
+WRITE-ONCE invariant.
+Tech-spec: Sec 8.5 (`mgmt.register_repo` in the canonical
+verb registry).
+
+### 2. Retract a sample (`mgmt.retract_sample`)
+
+When the operator marks a previously-ingested metric sample as
+no-longer-valid (e.g. a bad coverage upload).
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     -H 'X-OIDC-Subject: alice@acme.com' \
+     --data '{ "sample_id": "<uuid>",
+               "reason": "bad coverage upload -- replaced by SHA abc123" }' \
+     https://clean-coded.example.com/v1/mgmt/retract_sample
+```
+
+- `X-OIDC-Subject` is REQUIRED -- the actor is sourced from
+  the header (NOT the body; `DisallowUnknownFields` rejects
+  any caller-supplied `actor` field with 400). A missing or
+  blank header returns HTTP 401 before any persistence
+  happens (Stage 3.4 line ~3162; body sourcing pinned at
+  line ~3021).
+- Appends a `repo_event(kind='retract_intent', payload={sample_id, reason})`
+  (canonical RepoEvent enum value, Sec 5.1.4) and then a
+  `metric_retraction(retraction_id, sample_id, reason, appended_by, created_at)`
+  row via the `RetractDispatcher`.
+- Idempotent on `sample_id`: a second retract for the same
+  sample returns the existing `retraction_id` with
+  `Inserted=false` and writes NO second `metric_retraction`
+  row. (Stage 5.1.4 audit log -- intent vs. effect -- still
+  appends a second `retract_intent` event per call; only the
+  `metric_retraction` write is suppressed.)
+- The retraction does NOT delete the sample. Downstream
+  consumers (`eval.gate`, Insights) filter via the
+  `clean_code.metric_sample_active` view, which LEFT JOINs
+  through `metric_retraction`.
+
+Canonical detail in this file: "## `mgmt.retract_sample` and
+`mgmt.rescan` (Stage 3.4)".
+Architecture: Sec 5.1.4 (`retract_intent` RepoEvent kind);
+Sec 5.2.1 / Sec 1.5.1 (metric_sample append-only contract).
+
+### 3. Override a rule -- append-only mute (`mgmt.override` with `mute=true`)
+
+When the operator wants to silence a specific rule for a
+specific scope (file, package, repo, etc.) without modifying
+the policy.
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     -H 'X-OIDC-Subject: alice@acme.com' \
+     --data '{ "rule_id": "solid.srp.lcom4_high",
+               "scope_filter": {
+                 "repo_id":              "<repo-uuid>",
+                 "scope_kind":           "class",
+                 "scope_signature_glob": "github.com/acme/svc-orders/internal/orders.OrderService"
+               },
+               "mute":   true,
+               "reason": "legacy code under refactor -- see JIRA-1234" }' \
+     https://clean-coded.example.com/v1/mgmt/override
+```
+
+- Pure append. The `override` table is append-only: no row is
+  ever UPDATEd or DELETEd. A 200 returns
+  `{"override_id":"<uuid>"}`.
+- `reason` is REQUIRED when `mute=true` (the
+  `override_reason_required_when_muted` CHECK constraint from
+  migration 0003).
+- `X-OIDC-Subject` is REQUIRED -- the gateway sets it; the
+  verb stamps the row's `actor_id`.
+- The evaluator (Stage 5.7) resolves the active override by
+  `LatestMatchingOverride`: max `(created_at, override_id)` per
+  `(rule_id, repo_id, scope_kind, scope_signature_glob)`. The
+  most recent row wins; tie-breaks by larger `override_id`.
+- An aged mute (`created_at` older than the default 90-day
+  threshold) surfaces on the Stage 10.2
+  `mgmt.read.insights.aged_mutes` projection.
+
+Canonical detail in this file: "Stage 10.2 -- Aged mute
+insights report" (immediately below) for the read side;
+"## `mgmt.override` (Stage 5.3)" / rollout.md Stage 5.3 for
+the write side.
+Architecture: Sec 5.1.4 (override is NOT a RepoEvent kind --
+it is its own table); Sec 6.5 (Steward verb registry).
+Tech-spec: Sec 8.5 (`mgmt.override` canonical name).
+
+### 4. Unmute a rule -- append `mute=false` (NEVER UPDATE)
+
+When the operator wants to remove an earlier mute. The
+override table is append-only; the unmute is a NEW row, NOT
+an UPDATE / DELETE of the original mute.
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     -H 'X-OIDC-Subject: bob@acme.com' \
+     --data '{ "rule_id": "solid.srp.lcom4_high",
+               "scope_filter": {
+                 "repo_id":              "<repo-uuid>",
+                 "scope_kind":           "class",
+                 "scope_signature_glob": "github.com/acme/svc-orders/internal/orders.OrderService"
+               },
+               "mute":   false,
+               "reason": "refactor landed -- JIRA-1234 closed" }' \
+     https://clean-coded.example.com/v1/mgmt/override
+```
+
+- Same verb, same shape. The `scope_filter` MUST be
+  byte-identical to the mute it cancels -- the evaluator
+  groups by exact-equality on
+  `(rule_id, repo_id, scope_kind, scope_signature_glob)`. A
+  glob-mismatched unmute leaves the original mute in place.
+- The `created_at` of the unmute row MUST be strictly later
+  than the mute it cancels; ties are broken by larger
+  `override_id`.
+- Once appended, the next `mgmt.read.insights.aged_mutes`
+  read drops the
+  `(rule_id, scope_filter)` pair off the report -- the unmute
+  IS the "operator said this rule is no longer muted" signal.
+- `reason` is OPTIONAL when `mute=false` (the
+  `override_reason_required_when_muted` CHECK constraint only
+  binds the `mute=true` arm).
+
+Canonical detail: same as above (Stage 5.3 + Stage 10.2).
+
+### 5. Rescan a SHA (`mgmt.rescan`)
+
+When the operator wants to re-trigger the foundation + system
+tier pipeline for a specific `(repo_id, sha)` -- e.g. after a
+bug fix in a recipe, or to recover from a partial scan.
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     -H 'X-OIDC-Subject: alice@acme.com' \
+     --data '{ "repo_id": "<uuid>",
+               "sha":     "abc1234..." }' \
+     https://clean-coded.example.com/v1/mgmt/rescan
+```
+
+- `X-OIDC-Subject` is REQUIRED (Stage 3.4 line ~3023 +
+  ~3162; the body is the canonical
+  `{"repo_id","sha"}` two-field shape -- `DisallowUnknownFields`
+  rejects any extra field, including a body-supplied `actor`
+  or `reason`).
+- Opens a fresh `scan_run(kind='full', sha_binding='single',
+  status='running', to_sha=<sha>)` row and returns the
+  freshly-minted `scan_run_id`. The foundation-tier state
+  machine drains the row via its standard claim path. NO
+  `repo_event` row is appended -- the canonical RepoEvent
+  enum at architecture Sec 5.1.4 has no `rescan_intent`.
+- **NOT idempotent (by design).** A second rescan for the
+  same `(repo_id, sha)` opens a SECOND `scan_run` row -- an
+  operator clicking "rescan" twice expects two full recipe
+  loops (Stage 3.4 "Rescan flow", lines ~3131-3151). This is
+  the deliberate contrast with `mgmt.retract_sample`, which
+  IS idempotent on `sample_id`.
+- Does NOT delete existing `metric_sample` rows for the SHA;
+  the new run appends a fresh `producer_run_id` and the
+  `metric_sample_active` view's max-by-`created_at` selection
+  picks the new sample.
+
+Canonical detail in this file: "## `mgmt.retract_sample` and
+`mgmt.rescan` (Stage 3.4)".
+Architecture: Sec 3.10 (scan_run state machine); Sec 5.2.1
+(`metric_sample` append-only).
+
+### 6. Rotate the signing key
+
+Two distinct signing-key surfaces exist; the rotation
+procedure differs.
+
+**6a. Policy Steward Ed25519 signing key** -- signs
+`policy.publish` rows. Rotation is overlapped: the new key is
+minted but the prior key remains accepted for
+`policy_publish_overlap_min_seconds` (default `86400` = 24h)
+so downstream cache catch up before signature verification
+breaks (tech-spec Sec 8.2 row 6 / Sec 9.3).
+
+Routine rotation:
+
+```go
+// in-process (or via the operator CLI that wraps this call):
+keyID, err := manager.Rotate(ctx)
+```
+
+- The call REFUSES while the most recent key is still inside
+  its `valid_until` cooldown window.
+- The new key publishes immediately; the prior key keeps
+  verifying for the overlap window, then ages out.
+- Every replica re-reads `clean_code.policy_signing_keys` on
+  the `signingKeyCacheRefreshInterval` (5m) so a peer's
+  rotation propagates well before the prior key expires.
+
+Compromise response (tech-spec Sec 9.3):
+
+```go
+keyID, err := manager.ForceRotate(ctx) // bypasses the overlap-window rate-limit
+```
+
+- The bypass is the ONE-AND-ONLY way to mint a successor
+  before the overlap expires; only use it on a confirmed
+  compromise.
+- The operator is expected to follow up with `policy.publish`
+  re-signs of any policy version that was signed under the
+  compromised key.
+
+Canonical detail in this file: "## Policy Steward
+signing-key cache (Stage 5.1)" subsection "Rotation"
+(search for `### Rotation`).
+Tech-spec: Sec 8.2 (overlap window default); Sec 9.3
+(`Policy signing key compromise`).
+Architecture: Sec 6.5 (Steward writer ownership).
+
+**6b. External-ingest HMAC signing key** -- signs the
+`/v1/ingest/{verb}` Router HMAC envelopes. Rotation uses
+`StaticSecretResolver` overlap (`Add(newID, newSecret)` ->
+24h overlap -> `Remove(oldID)`).
+
+Canonical detail in this file: "### Operator rotation
+(signing key)" under Stage 4.1.
+
+### 7. Change a repo's AST mode (`mgmt.set_mode`)
+
+When the operator switches a repo between `embedded` and
+`linked` AST mode (e.g. during the Stage 10.5 migration).
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     -H 'X-OIDC-Subject: alice@acme.com' \
+     --data '{ "repo_id": "<uuid>",
+               "mode": "linked" }' \
+     https://clean-coded.example.com/v1/mgmt/set_mode
+```
+
+- `X-OIDC-Subject` is REQUIRED.
+- On a real transition: returns HTTP 200 with
+  `{"repo_id":"<uuid>","mode":"linked","previous_mode":"embedded","changed":true}`
+  and appends a `repo_event(kind='mode_changed',
+  payload={mode, previous_mode, actor})`.
+- On a no-op (mode already matches): returns HTTP 200 with
+  `changed:false` and appends NO event -- `mode_changed`
+  records a transition, not a re-assertion.
+- HTTP 404 if `repo_id` is unknown.
+
+Canonical detail in this file: "## Stage 6.2 --
+`mgmt.register_repo` and `mgmt.set_mode`" (search for
+`## Stage 6.2`), subsection "`mgmt.set_mode` semantics".
+Architecture: Sec 5.1.4 (`mode_changed` RepoEvent kind).
+Tech-spec: Sec 8.5 (`mgmt.set_mode` in the canonical
+verb registry).
+See also: `./rollout.md` Stage 10.5 for the
+`embedded` → `linked` migration playbook.
+
+### 8. Publish a policy version (`policy.publish`)
+
+When the operator creates a new signed policy version
+(rule refs, threshold refs, refactor weights).
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     --data '{ "name": "default-v3",
+               "rule_refs": [{"rule_id": "solid.srp.lcom4_high", "version": 1}],
+               "threshold_refs": [],
+               "refactor_weights": {
+                 "alpha": 0.4, "beta": 0.3, "gamma": 0.2, "delta": 0.1,
+                 "effort_model_version": "v1.0",
+                 "window_days": 90
+               } }' \
+     https://clean-coded.example.com/v1/policy/publish
+```
+
+- Append-only: each call creates a NEW `policy_version` row
+  with a fresh `policy_version_id` and an Ed25519 signature.
+- Every `rule_refs` entry MUST reference an existing
+  `(rule_id, version)` pair from a prior
+  `policy.publish_rulepack` call; unknown refs return 400.
+- HTTP 503 if no signing key is active
+  (`ErrNoActiveSigningKey`).
+
+Canonical detail in this file: the "Policy Steward"
+section (search for `### policy.publish body`).
+Architecture: Sec 5.3 (PolicyVersion schema); Sec 6.5
+(Steward writer ownership).
+Tech-spec: Sec 8.5 (`policy.publish` in the canonical
+verb registry).
+
+### 9. Activate a policy (`policy.activate`)
+
+When the operator makes a published policy version the
+active policy for the deployment.
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     --data '{ "policy_version_id": "f4c1...-uuid",
+               "activated_by": "alice@example" }' \
+     https://clean-coded.example.com/v1/policy/activate
+```
+
+- Append-only: a `policy_activation` row is inserted; the
+  latest row wins globally (v1 is single-tenant).
+- The body MUST NOT contain a `scope` field -- rejected
+  with 400 (`DisallowUnknownFields`).
+- HTTP 503 if no signing key is active.
+
+Canonical detail in this file: the "Policy Steward"
+section (search for `### policy.activate body`).
+Architecture: Sec 5.3.4 (single-tenant activation).
+Tech-spec: Sec 8.5 (`policy.activate` in the canonical
+verb registry).
+
+### 10. Register a rule pack (`policy.publish_rulepack`)
+
+When the operator registers a new rule pack (with its rules)
+into the policy catalogue.
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     --data '{ "pack_id": "solid.srp",
+               "version": 1,
+               "display_name": "Single Responsibility",
+               "description_md": "SOLID SRP rulepack.",
+               "rules": [
+                 { "rule_id": "solid.srp.lcom4_high",
+                   "version": 1,
+                   "predicate_dsl": "lcom4 > 0.7",
+                   "severity_default": "block",
+                   "description_md": "High LCOM4." }
+               ] }' \
+     https://clean-coded.example.com/v1/policy/publish_rulepack
+```
+
+- Pack + all rules are appended in a SINGLE transaction;
+  partial packs never persist.
+- Re-publishing the same `(pack_id, version)` returns
+  HTTP 409 (append-only contract).
+- Unsigned -- only `policy.publish` signs.
+- HTTP 503 if no signing key is active.
+
+Canonical detail in this file: the "Policy Steward"
+section (search for `### policy.publish_rulepack body`).
+Architecture: Sec 6.5 (Steward writer ownership).
+Tech-spec: Sec 8.5 (`policy.publish_rulepack` in the
+canonical verb registry).
+
+### 11. Evaluate a gate verdict (`eval.gate`)
+
+When the operator (or CI pipeline) requests a pass / warn /
+block verdict for a `(repo_id, sha)`.
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     --data '{ "repo_id": "<uuid>",
+               "sha": "abc1234..." }' \
+     https://clean-coded.example.com/v1/eval/gate
+```
+
+- Resolves the active `policy_version_id` from the latest
+  `policy_activation` row -- callers MUST NOT supply a
+  `policy_version_id` (rejected with 400; use
+  `/v1/eval/replay` for admin replays).
+- Returns `{ "verdict": "pass"|"warn"|"block",
+  "degraded": false|true, ... }`.
+- HTTP 409 (`ErrNoActivePolicy`) if no policy has been
+  activated yet.
+- NOT idempotent: each call writes a fresh
+  `evaluation_run` + `evaluation_verdict` row.
+
+Canonical detail in this file: "## Stage 6.1 --
+`eval.gate` verb and synchronous SOLID delegation"
+(search for `## Stage 6.1`).
+Architecture: Sec 3.7 (eval.gate sequence); Sec 5.4.2
+(verdict enum).
+Tech-spec: Sec 8.5 (`eval.gate` in the canonical verb
+registry).
+
+## Stage 10.2 -- Aged mute insights report
+
+This section captures the operator-facing contract of the
+aged-mute Insights report attached to the Management read
+surface as `mgmt.read.insights.aged_mutes`. The report is an
+Insights-only projection over the `override` table -- it
+surfaces `override(mute=true)` rows whose `created_at` is
+older than a configurable threshold (default 90 days) so an
+operator can decide whether the mute is still warranted. The
+implementation lives in
+`internal/management/insights/aged_mutes.go` and is wired
+into `internal/management/reader.go` via the
+`WithAgedMutes(*insights.AgedMutes)` option. The production
+constructor is `insights.NewAgedMutes(reader, nil)` (threshold
+= `AgedMuteDefaultThresholdDays = 90` days, clock =
+`insights.SystemClock`).
+
+### What the report does
+
+On EVERY call to `mgmt.read.insights.aged_mutes` (with an
+optional integer `threshold_days` query parameter) the
+Reader:
+
+1. Calls `OverrideReader.ListAllOverrides(ctx)` to fetch the
+   FULL set of `override` rows visible to the management
+   surface (no glob expansion -- the projection groups on
+   the byte-identical `scope_filter`).
+2. Groups rows by `(rule_id, scope_filter.repo_id,
+   scope_filter.scope_kind, scope_filter.scope_signature_glob)`
+   and reduces each group to a single winner using the
+   `Store.LatestMatchingOverride` contract: max
+   `(created_at, override_id)`. Ties on `created_at` are
+   broken by the larger `override_id` so an aged mute and a
+   simultaneous unmute appended at the same wall-clock tick
+   resolve deterministically.
+3. Drops winners whose `mute=false` -- the unmute row IS the
+   "operator said this rule is no longer muted" signal; the
+   aged-mute row drops off the report on the next read.
+4. Filters remaining winners by age: `age > threshold` is
+   AGED (reported); `age <= threshold` is FRESH (omitted).
+   The boundary is strict-greater-than, mirroring the Stage
+   7.3 `Freshness.Window` semantic.
+5. Returns the aged set sorted by `created_at ASC` then
+   `override_id ASC` so the OLDEST mute is first and the
+   sort order is deterministic across reads.
+
+The report is EXCLUSIVELY an Insights surface read -- NO
+enforcement is performed (iter 1 evaluator item 5; v1 has
+NO TTL enforcement in code). Operators unmute by appending
+an `override(mute=false)` row via `mgmt.override`; the aged
+mute drops off the report on the next read because step 3
+above promotes the unmute to the group winner.
+
+### Wire shape on a stale read
+
+A response from `mgmt.read.insights.aged_mutes` against a
+backend with two aged mutes (one at 100 days, one at 200
+days) looks like:
+
+```json
+{
+  "mode":           "latest_dashboard",
+  "threshold_days": 90,
+  "aged_mutes": [
+    {
+      "rule_id":      "decoupling.RP-001",
+      "scope_kind":   "repo",
+      "scope_signature_glob": "github.com/acme/svc-orders",
+      "repo_id":      "repo-orders",
+      "override_id":  "ov-2025-09-01-001",
+      "created_at":   "2025-09-01T14:22:11Z",
+      "age_days":     200,
+      "reason":       "blocked on cross-team alignment",
+      "actor_id":     "alice@acme.com"
+    },
+    {
+      "rule_id":      "solid.SRP-014",
+      "scope_kind":   "repo",
+      "scope_signature_glob": "github.com/acme/svc-billing",
+      "repo_id":      "repo-billing",
+      "override_id":  "ov-2025-12-15-042",
+      "created_at":   "2025-12-15T09:11:00Z",
+      "age_days":     100,
+      "reason":       "legacy code under refactor",
+      "actor_id":     "bob@acme.com"
+    }
+  ]
+}
+```
+
+A clean response (no aged mutes) returns an empty `aged_mutes`
+array, never `null`:
+
+```json
+{ "mode": "latest_dashboard", "threshold_days": 90, "aged_mutes": [] }
+```
+
+`mode` is `"latest_dashboard"` -- the same `ReadMode` tag the
+`mgmt.read.cross_repo` / `mgmt.read.portfolio` envelopes
+carry, so the HTTP layer's wire shape is uniform across every
+read verb. `threshold_days` is the effective threshold the
+report applied (either the caller's `threshold_days` query
+param or the default 90).
+
+The flat snake_case wire shape (`rule_id`, `repo_id`,
+`scope_kind`, `scope_signature_glob`, `override_id`,
+`created_at`, `age_days`, `reason`, `actor_id`) is produced
+by `AgedMute.MarshalJSON` -- the in-process Go struct nests
+the three scope fields under a `Scope OverrideScope` field
+for ergonomic access, but the wire is flat to match the
+operator dashboard contract. The wire shape is pinned by
+`TestAgedMute_MarshalJSON_*` tests in
+`internal/management/insights/aged_mutes_test.go`.
+
+### Threshold override and guard
+
+The default threshold is `AgedMuteDefaultThresholdDays = 90`
+days, applied when `threshold_days` is omitted OR when the
+caller's value is `<= 0`. A non-positive threshold falls
+back to the default rather than silently surfacing EVERY
+mute -- this prevents an operator typo
+(`?threshold_days=0`) from flooding the report. Values
+greater than zero are honored verbatim.
+
+### Boundary semantics
+
+`Report` (and `ReportWithThreshold`) uses a
+strict-greater-than comparison (`age > threshold`) so a
+mute whose age EQUALS the threshold is treated as FRESH;
+one second past flips it to aged. The boundary contract is
+pinned by `TestAgedMutes_BoundaryAtExactThresholdIsNotAged`
+and `TestAgedMutes_OneSecondPastBoundaryIsAged`
+(`internal/management/insights/aged_mutes_test.go`).
+
+Edge cases the verb handles WITHOUT operator intervention:
+
+- **Unmuted pair (mute=true then mute=false)** -- the
+  unmute row wins the group reduction (later `created_at`),
+  step 3 drops it, and the pair NEVER surfaces. Pinned by
+  `TestAgedMutes_UnmuteRemovesFromReport`.
+- **Re-mute after unmute** -- if a third row `mute=true` is
+  appended AFTER the unmute, it becomes the new group
+  winner and is evaluated against the threshold as a fresh
+  mute (its OWN `created_at`, not the original). Pinned by
+  `TestAgedMutes_RemuteAfterUnmuteReturnsAgedMute`.
+- **Backend not wired** -- if the composition root has not
+  called `WithAgedMutes(...)` -- OR called it with `nil` --
+  OR wired `OverrideReaderFromStore{Store:nil}` into the
+  projection -- the Reader returns `ErrBackendUnavailable`
+  to keep the contract identical to `mgmt.read.cross_repo` /
+  `mgmt.read.portfolio` when their backends are missing.
+  Internally, the Reader maps both
+  `insights.ErrAgedMuteReaderUnavailable` (nil
+  `OverrideReader` inside the projection) AND
+  `management.ErrAgedMuteOverrideStoreUnavailable` (nil
+  `steward.Store` inside the production adapter) to
+  `ErrBackendUnavailable` so the HTTP layer always emits
+  503 and never leaks the scaffold-mode error string to
+  the operator.
+- **Nil clock** -- a constructor passed a `nil` Clock falls
+  back to `insights.SystemClock` rather than panicking on
+  the hot path.
+- **Cancelled context** -- propagated verbatim from the
+  underlying `OverrideReader.ListAllOverrides(ctx)`.
+
+### How an operator unmutes an aged rule
+
+There is NO `mgmt.unmute` verb in v1. To clear an aged
+mute, the operator appends a fresh `override(mute=false)`
+row via `mgmt.override` using the SAME `(rule_id,
+scope_filter)` tuple. The next call to
+`mgmt.read.insights.aged_mutes` will reduce the pair and
+the mute drops off the report. The original `mute=true`
+row is NEVER deleted -- the audit trail is preserved by
+construction (architecture Sec 8 -- append-only).
+
+### Composition-root wiring
+
+The constructor wiring is a single line in the management
+binary's composition root (sketch -- the actual wiring
+lands when the verb is mounted by a downstream gateway
+stage):
+
+```go
+overrideAdapter := &management.OverrideReaderFromStore{Store: stewardStore}
+agedMutes       := insights.NewAgedMutes(overrideAdapter, nil)
+reader          := management.NewReader(km,
+    management.WithMetricsBackend(mb),
+    management.WithInsightsFreshness(insights.NewPercentileFreshness()),
+    management.WithAgedMutes(agedMutes),
+)
+```
+
+The `OverrideReaderFromStore` type
+(`internal/management/insights_override_adapter.go`) is the
+production bridge from `policy/steward.Store` to the
+`insights.OverrideReader` contract. It lives in the
+`management` package rather than inside `insights` because
+the `insights` package is held to a STRICT import-isolation
+invariant: zero non-stdlib AND zero internal-package deps.
+The adapter is a field-for-field value-type mapper -- no
+caching, no retry, no filtering. Its tests
+(`insights_override_adapter_test.go`) round-trip every
+`steward.Override` field plus an end-to-end pin through
+`insights.NewAgedMutes` to catch any contract drift.
+
+The substrate read is
+`steward.Store.ListAllOverrides(ctx) ([]steward.Override,
+error)` -- added in this stage so the projection has a way
+to fetch EVERY row (both `mute=true` and `mute=false`)
+without scope-glob expansion. The SQL implementation is a
+plain table scan ordered `(created_at ASC, override_id ASC)`
+with no `LIMIT` -- a bounded limit could hide the oldest
+mute (the highest-priority triage candidate) behind newer
+rows. The substrate is bounded by `O(operators *
+mute_events)` and well under 10k rows in any realistic
+deployment.
+
+## Stage 8.3 -- ML effort-model loader (clean-code-refactor-planner)
+
+The `clean-code-refactor-planner` binary now loads an
+external ML effort-model artefact at startup and stamps a
+per-task hour estimate onto every emitted `refactor_task`,
+replacing the Stage 8.2 `0.0` placeholder.
+
+### Operator pins (env vars)
+
+| env var | required | default | semantics |
+|---|---|---|---|
+| `CLEAN_CODE_REFACTOR_EFFORT_SOURCE` | no | `ML model from historical commits` | operator pin per architecture Sec 1.6. Closed set today: `"ML model from historical commits"` (REQUIRES a model artefact) or `"none"` (opt-out -- planner runs without an estimator and emits `effort_hours = 0.0`). Any other value refuses startup with the `ErrEffortModelSourceUnknown` sentinel. |
+| `CLEAN_CODE_REFACTOR_EFFORT_MODEL_URI` | YES when source = `"ML model from historical commits"` | `""` | local-disk URI of the JSON-on-disk effort-model artefact. Accepted forms: bare local path (`/abs/path/model.json`, `C:\path\model.json`, `C:/path/model.json`, `./rel/path.json`); `file://` URI (`file:///abs/path` on POSIX, `file:///C:/path` on Windows). Schemes other than `file://` are refused. |
+
+### Artefact format
+
+JSON object:
+
+```json
+{
+  "version": "v1.2.0-trained-2026-04-15",
+  "kind_base_hours": {
+    "split_class": 6.0,
+    "extract_method": 1.5,
+    "invert_dependency": 4.0,
+    "break_cycle": 8.0,
+    "consolidate_duplication": 3.0
+  },
+  "score_coef": 0.25,
+  "intercept": 0.0
+}
+```
+
+Strict-schema invariants enforced by `LoadModelFromFile`:
+
+- `version` is non-empty after trim (the load-bearing pin
+  per architecture Sec 5.3.3).
+- Every value in
+  `{split_class, extract_method, invert_dependency, break_cycle, consolidate_duplication}`
+  has a finite, non-negative entry in `kind_base_hours`.
+  Missing entries refuse load with `ErrEffortModelMissingKindBase`.
+- `score_coef`, `intercept`, and every entry in
+  `kind_base_hours` are IEEE-finite (no NaN / no Inf).
+  Otherwise refuse with `ErrEffortModelNonFiniteCoefficient`.
+- Unknown top-level fields refuse load with
+  `ErrEffortModelMalformed` (the decoder uses
+  `json.Decoder.DisallowUnknownFields`).
+
+Per-task formula (deterministic, same input -> bit-identical
+output):
+
+    hours = max(0,
+                kind_base_hours[task.kind]
+              + score_coef * hot_spot.score
+              + intercept)
+
+### Version-pinning chain (architecture Sec 5.3.3)
+
+The effort-model version is NOT duplicated on
+`refactor_plan` or `refactor_task`. Reproducing an
+estimate requires walking:
+
+    refactor_task
+      -> refactor_plan                                    (via refactor_task.plan_id)
+      -> refactor_plan.hotspot_ids[0]
+      -> hot_spot.policy_version_id                       (architecture Sec 5.5.1)
+      -> policy_version.refactor_weights.effort_model_version
+
+The loaded artefact's `version` MUST equal
+`policy_version.refactor_weights.effort_model_version` for
+every active policy snapshot the planner serves.
+`EffortModel.Estimate` returns the
+`ErrEffortModelVersionMismatch` sentinel when the snapshot's
+`Weights.EffortModelVersion` differs from the loaded
+`Version`; the error aborts the WHOLE batch (no plan row,
+no task row lands) rather than silently emitting
+`effort_hours = 0`.
+
+### Startup failure modes
+
+| condition | exit | log surface |
+|---|---|---|
+| `CLEAN_CODE_REFACTOR_EFFORT_SOURCE` set to anything other than the two pins | 1 | `ErrEffortModelSourceUnknown` |
+| source = ML pin AND `CLEAN_CODE_REFACTOR_EFFORT_MODEL_URI=""` | 1 | `ErrEffortModelURIRequired` (names both env vars) |
+| URI uses a scheme other than `file://` or a bare local path | 1 | `ErrEffortModelUnsupportedScheme` |
+| artefact file missing | 1 | wrapped `os.ErrNotExist` |
+| artefact JSON malformed / has unknown top-level fields | 1 | `ErrEffortModelMalformed` |
+| artefact missing a canonical kind base or has non-finite coefficients | 1 | `ErrEffortModelMissingKindBase` / `ErrEffortModelNonFiniteCoefficient` |
+| `version` empty after trim | 1 | `ErrEffortModelVersionEmpty` |
+
+When source = `"none"` and URI is empty, the binary starts
+normally; the composition root emits a `warn` log line
+indicating the estimator is disabled and the planner will
+emit `effort_hours = 0.0` for every task. Production
+deployments should NOT use this path.
+
+### Runtime failure modes (per planner call)
+
+| condition | behaviour |
+|---|---|
+| `EffortModel.Version != snap.Weights.EffortModelVersion` | `Plan` returns `ErrEffortModelVersionMismatch`; NO plan or task rows are written. |
+| `task.Kind` not in `EffortModel.KindBaseHours` (e.g. a custom rule mapper bypassed `ValidateTaskKind`) | `Plan` returns `ErrEffortModelMissingKindBase`; NO plan or task rows are written. |
+| `hot_spot.score` is +/-Inf (defensive; Stage 8.1 never produces this) | `Plan` returns `ErrEffortModelNonFiniteCoefficient`; NO plan or task rows are written. |
+| computed `hours < 0` (e.g. `intercept` set sufficiently negative) | clamped to `0`; estimate is still emitted. |
+
+### Operator playbook
+
+1. **Train / update model.** Publish a new artefact at the
+   URI; bump `version` to a new unique string (e.g.
+   `v1.3.0-trained-2026-06-01`).
+2. **Publish a new policy version** through the Policy
+   Steward with `refactor_weights.effort_model_version` set
+   to the new artefact's `version`.
+3. **Roll the planner.** Deploy `clean-code-refactor-planner`
+   binaries pointing at the new URI. Old planners (still
+   loaded with the previous artefact) will refuse to run
+   the new policy at all (`ErrEffortModelVersionMismatch`);
+   freshly-rolled planners will run the new policy and
+   refuse the old (same sentinel). The blast radius is
+   self-contained: a planner that finds a mismatched
+   snapshot writes NOTHING, so partial-rollout state is
+   never persisted.
+
+### Code locations
+
+- `internal/refactor/effort_model.go` -- loader, validator,
+  estimator, URI resolver, sentinel errors.
+- `internal/refactor/task_planner.go` --
+  `WithEffortEstimator` option + the per-task estimator call
+  inside `PlanFromSnapshot`.
+- `internal/config/config.go` -- `EnvMLModelURI` constant
+  (env var `CLEAN_CODE_ML_MODEL_URI`) and `Config.MLModelURI`
+  field. NOT validated in `Config.Validate()`; the model
+  interlock is binary-local to `clean-code-refactor-planner`.
+  (Renamed from `EnvRefactorEffortModelURI` /
+  `Config.RefactorEffortModelURI` in PR #148.)
+- `cmd/clean-code-refactor-planner/main.go` -- composition
+  root: defers the ML effort-model load to the per-request
+  path inside `runPlanner` / `runHTTPMode`, which call
+  `refactor.NewEffortModelFromConfig(cfg)` and exit non-zero
+  on loader error. (The pre-PR-148 startup-time
+  `refactor.LoadFromConfig(cfg)` block was removed because
+  the canonical loader entrypoint changed; CLI mode now
+  defers the loader failure to first request rather than
+  startup -- acceptable because CLI mode runs exactly one
+  request before exiting.)
+
+## Stage 9.1 -- Audit WAL frame writer
+
+The `internal/audit/wal/` package is the write-ahead log for
+the three Audit tables (`evaluation_run`,
+`evaluation_verdict`, `finding`). Every successful Audit
+INSERT mints a signed `AuditFrame`, fsyncs it to a per-day
+partition file under `data/wal/audit/YYYY-MM-DD.wal`, and
+ONLY THEN commits the SQL transaction (architecture
+Sec 7.10 / tech-spec Sec 4.13). Catalog, Measurement,
+Policy, and Refactor writes DO NOT route through this WAL.
+
+### Disk layout
+
+- Root: `data/wal/audit/` (configured via
+  `wal.WriterConfig.Dir`).
+- Files: `YYYY-MM-DD.wal` (UTC), one per writer-clock day.
+- Format: newline-delimited JSON (one frame per line, max
+  1 MiB per frame).
+- Per-frame fields: `frame_id`, `table`, `op`, `row_pk`,
+  `row_json`, `written_at`, `signing_key_id`, `signature`.
+
+The directory must be writable by the binary's user (the
+writer creates it with `0o755` on first start). Partition
+files are append-only -- the writer NEVER rewrites or
+truncates an existing file.
+
+### Operator checklist
+
+1. **Disk capacity** -- partition files grow without an
+   in-package rotation policy in Stage 9.1. Plan for
+   ~1 KiB per Audit row (one `evaluation_run` + one
+   `evaluation_verdict` + N `finding` rows per
+   evaluation). Sizing: the post-Stage-9.2 reconciler will
+   add a retention sweep; until then operators must
+   monitor disk free space on the WAL volume.
+2. **Fsync failures** -- a write that reaches the kernel
+   but fails `fsync(2)` returns an error to the audit
+   writer; the SQL transaction MUST roll back. The frame
+   bytes MAY be readable on disk (the writer does not
+   truncate after failure -- racy across sibling
+   processes). The Stage 9.2 reconciler treats the readable
+   frame as a "speculative" replay candidate keyed on
+   `(table, row_pk)`. Today (Stage 9.1, no reconciler)
+   operators must accept that a fsync error leaves an
+   un-replayed frame on disk; raise an incident if `df`
+   shows the WAL volume below 5%.
+3. **Signature failures** -- a frame whose
+   `signing_key_id` cannot be resolved to a public key at
+   reconciler time will be quarantined (NOT applied). The
+   policy KMS handle MUST be online when the reconciler
+   runs in Stage 9.2; operators must coordinate KMS
+   maintenance windows with the reconciler's run window.
+4. **Crash recovery** -- a process crash mid-write may
+   leave a partial trailing frame in the current partition
+   file. The reader returns the sentinel
+   `ErrTrailingPartialFrame` AND the complete frames
+   decoded so far; the Stage 9.2 reconciler quarantines
+   the tail bytes and continues from the next clean
+   record. No operator action is required at Stage 9.1.
+
+### Composition wiring
+
+`Wal.Writer` is wired in the composition root of both
+`cmd/clean-code-eval-gate/main.go` and
+`cmd/clean-code-gateway/main.go`, and threaded into the
+two audit-write Stores via
+`rule_engine.SQLStoreConfig.WalWriter` and
+`evaluator.SQLDegradedRunStoreConfig.WalWriter`. **Both
+fields are REQUIRED** -- the two constructors error on
+nil, and the composition-root configs
+(`composition.EvalGateConfig.WalWriter`,
+`evaluator.ProductionGateConfig.WalWriter`) likewise
+error on nil. There is NO SQL-only fallback for Audit
+INSERTs in Stage 9.1.
+
+**No kill-switch.** There is no `CLEAN_CODE_AUDIT_WAL_DISABLED`
+env var, no feature flag, no "audit WAL off" branch. The
+two Audit-store constructors hard-error on a nil writer,
+and unsetting `CLEAN_CODE_AUDIT_WAL_DIR` does NOT disable
+the writer -- it falls through to the default
+`data/wal/audit` directory. If the WAL volume is broken,
+audit writes hard-fail with `WAL flush before SQL commit`
+errors and the entire `evaluation_run` /
+`evaluation_verdict` / `finding` triple is rolled back.
+
+The env var `CLEAN_CODE_AUDIT_WAL_DIR` (default
+`data/wal/audit`) selects the on-disk root. Both binaries
+construct a `wal.NewWriter` with one of two signer
+wirings, chosen at startup:
+
+- **Production (KMS wired)** -- the binary calls
+  `composition.NewKeysManagerWALSigner(*keys.Manager)`
+  to adapt `keys.Manager.SignActive` to the writer's
+  2-phase `wal.Signer.SignFrame` callback. Frames carry a
+  non-zero `signing_key_id` and a real Ed25519 signature
+  verifiable via `keys.Manager.Verify`.
+- **Scaffold (KMS unset)** -- the binary falls back to
+  `wal.NoopSigner{}` (SHA-256 stand-in, zero
+  `signing_key_id`) and logs a loud `WARN` at startup.
+  Intended for short-lived dev/test bring-up only.
+
+Integration tests --
+`internal/rule_engine/sql_store_wal_test.go` and
+`internal/evaluator/sql_degraded_store_wal_test.go` --
+exercise sqlmock + a real `wal.Writer` to prove every
+successful `evaluation_run`, `evaluation_verdict`, and
+`finding` INSERT pairs with a fsynced WAL frame. Both
+tests cover the signer-failure rollback case AND the
+write/fsync-failure rollback case (the per-day partition
+path is pre-created as a directory to force a real disk
+write failure at `os.OpenFile`). Stage 9.2 layers the
+reconciler on top.
+
+## Stage 9.2 -- Audit WAL Reconciler (replay-only)
+
+The `internal/audit/reconciler/` package is the
+replay-only restart sweep that walks `data/wal/audit/`,
+verifies every frame's signature, and re-inserts MISSING
+rows into the three Audit tables. **The reconciler never
+modifies a non-Audit table, never deletes a row, never
+overwrites an existing row, and preserves
+`evaluation_run.caller` verbatim from the original frame.**
+Stage 9.1's WAL writer pairs with this worker to close the
+"WAL frame on disk, SQL row absent" gap caused by a fsync
+error or a process crash between the WAL flush and the SQL
+commit.
+
+### Replay-only contract (architecture Sec 7.10)
+
+1. Every Audit re-insert is issued as
+   `INSERT INTO clean_code.<table> (...) VALUES (...)
+   ON CONFLICT (<pk>) DO NOTHING`. A row whose
+   `(table, row_pk)` already exists in PostgreSQL is
+   classified as `OutcomeSkippedExisting` and left
+   byte-identical.
+2. There is NO `DELETE` / `UPDATE` statement anywhere in
+   `internal/audit/reconciler/`. The package's PG role,
+   `clean_code_wal_reconciler`, has `INSERT, SELECT`
+   granted and `UPDATE, DELETE` revoked at the migration
+   layer (migration `0004_roles.up.sql`). A bug in this
+   package CANNOT escalate to a destructive write.
+3. Only the three Audit tables are referenced; the table
+   names live as package-level constants and the
+   per-frame `replayOne` dispatcher uses an explicit
+   `switch` on `wal.AuditFrame.Table`. A frame whose
+   table is outside the closed set
+   (`evaluation_run` / `evaluation_verdict` / `finding`)
+   surfaces `ErrUnknownTable` and aborts the run --
+   defence-in-depth on top of `wal.AuditFrame.Validate`.
+4. `evaluation_run.caller` is bound verbatim from the
+   parsed frame to the SQL parameter. There is NO
+   substitution branch -- if the original writer recorded
+   `caller='batch_refresh'`, the reconciler replays the
+   row with `caller='batch_refresh'`, regardless of which
+   process started the reconciler.
+
+### Phased replay (FK ordering)
+
+The reconciler walks every frame TWICE per `Run`:
+
+1. **Pass 1** -- every `evaluation_run` frame, in WAL
+   order. By the end of this pass every WAL-known
+   `evaluation_run_id` exists in PostgreSQL.
+2. **Pass 2** -- every `evaluation_verdict` and `finding`
+   frame, in WAL order. The FK constraint
+   `evaluation_verdict.evaluation_run_id ->
+   evaluation_run.evaluation_run_id` (and the matching
+   one on `finding`) is honoured EVEN IF a corrupted
+   partition has reordered frames out of writer-order
+   (which the writer never does, but the partition file
+   is on durable disk and an external corruption pass
+   cannot be ruled out).
+
+### Verifier classification
+
+`reconciler.Verifier` distinguishes three failure modes:
+
+- **Durable-broken (skip + count)** -- the frame's
+  signature did not validate
+  (`reconciler.ErrSignatureInvalid`). The reconciler
+  bumps `Stats.SkippedBadSig` and continues with the next
+  frame. The operator MUST manually quarantine the
+  affected partition bytes (see "Operator checklist"
+  below) -- a counted skip is NOT a self-healing recovery.
+- **Signing key not in trusted snapshot (skip + count)** --
+  the frame's `signing_key_id` is not present in the
+  historical-keys snapshot taken from
+  `clean_code.policy_signing_keys` at reconciler
+  construction time
+  (`reconciler.ErrSigningKeyUnknown`). The reconciler
+  bumps `Stats.SkippedBadSig` and continues. Note that
+  "unknown" here means "not in the trusted snapshot", not
+  "cryptographically unsignable": an attacker who minted
+  a valid Ed25519 keypair can still produce a
+  cryptographically-valid signature, but the historical
+  verifier refuses to trust it.
+- **Transient infrastructure (abort `Run`)** -- any other
+  error from the verifier (DB outage during the initial
+  snapshot fetch, ctx cancellation). The reconciler
+  returns the error from `Run` so an operator can address
+  the root cause before retrying. Silently skipping every
+  frame on a verifier outage would erase the durability
+  guarantee Stage 9.1 set up.
+
+### Stats schema
+
+`reconciler.Run` returns a `Stats` value with per-table
+counters (`Replayed`, `SkippedExisting`, `SkippedBadSig`,
+`SkippedBadShape`) and a `Warnings []string` channel for
+non-fatal signals from `wal.ReadAll`
+(`ErrTrailingPartialFrame`, `ErrFrameSizeExceeded`). The
+post-Stage-9.4 OTel pipeline publishes these as
+Prometheus counters with a `table` label; operators can
+correlate skipped-row counts with disk artifacts.
+
+`SkippedBadShape` covers PRE-signature structural
+failures only -- a frame whose `wal.AuditFrame.Validate`
+or `SigningPayload` rejected it before signature
+verification could even run. POST-signature
+disagreements (decode rejection under
+`DisallowUnknownFields`, `frame.RowPK` disagreeing with
+`row_json.<pk>`) are loud `Run` aborts -- they signal
+writer-side schema drift or a durability-coordinate
+corruption and warrant immediate operator triage rather
+than silent skip.
+
+### Operator checklist
+
+1. **Trailing-partial-frame warning** -- benign for the
+   reconciler (every complete frame preceding it
+   replayed). Quarantine the tail bytes after the run by
+   `cp data/wal/audit/<date>.wal /var/quarantine/`,
+   truncating the original at the last complete-frame
+   newline. Stage 9.4 will surface a Prometheus counter
+   for the warning; until then `grep` the binary's stdout
+   for "ErrTrailingPartialFrame".
+2. **Frame-size-exceeded warning** -- pages an on-call.
+   A single frame > 1 MiB is either a Stage 9.1 writer
+   bug (no in-package check should let one through) or a
+   forged frame. Quarantine the entire partition file
+   and STOP further reconciliation runs until the source
+   is identified.
+3. **`SkippedBadSig > 0`** -- the affected frames carry
+   either a tampered signature, a payload modified
+   after signing, or were signed by a key whose UUID is
+   not present in the historical-keys snapshot taken
+   from `clean_code.policy_signing_keys` at reconciler
+   startup. (Retired-but-known keys ARE in the
+   snapshot and DO verify successfully -- the
+   "unknown key" classification means the UUID is not
+   in the trusted snapshot at all.) The reconciler does
+   NOT replay these. Investigate the partition file by
+   hand: re-parse the JSON, identify the
+   `signing_key_id` and `row_pk`, and decide whether
+   the underlying business event landed in PostgreSQL
+   via a separate path or needs manual entry by a
+   Policy Steward.
+4. **`SkippedBadShape > 0`** -- the affected frames
+   failed `wal.AuditFrame.Validate` or `SigningPayload`
+   BEFORE signature verification. None of these can
+   happen via the Stage 9.1 writer; investigate as a
+   tamper / on-disk corruption signal. (Post-signature
+   schema drift / RowPK mismatch are abort-Run, not
+   counted here.)
+5. **Run returns an error mentioning `decode failed AFTER
+   valid signature` or `ErrRowPKMismatch`** -- the
+   reconciler saw a frame whose `row_json` decoded
+   incorrectly OR whose `RowPK` disagreed with
+   `row_json.<pk>` AFTER the signature verified. This is
+   writer-side schema drift OR a signing-key compromise.
+   STOP further reconciliation runs, page the on-call,
+   quarantine the partition, audit recent Policy Steward
+   key-rotation events, and confirm the writer's audit
+   columns match the current PG schema before retrying.
+6. **Run returns an error mentioning
+   `KeyStore.List` or snapshot construction** -- the
+   historical-keys verifier could not build its
+   trusted snapshot at construction time, typically
+   because the `clean_code_wal_reconciler` role
+   cannot SELECT from `clean_code.policy_signing_keys`
+   (migration `0005_policy_signing_keys.up.sql` grants
+   this) or the
+   PostgreSQL pool is unreachable. The reconciler
+   refuses to operate without a snapshot rather than
+   silently classifying every frame as `SkippedBadSig`.
+   Check the role grants (`\du` in psql, then
+   `\dp clean_code.policy_signing_keys`) and the DSN
+   reachability before restarting.
+7. **Run returns any other error** -- the WAL reconciler
+   did not complete. The most common cause is verifier
+   transient error (KMS unreachable). Verify
+   `policy.keys.list_active` returns the expected key,
+   restart the reconciler. If the error mentions the
+   Replayer (`reconciler: replayOne: ReplayRun ...`),
+   check PostgreSQL connectivity and that the
+   `clean_code_wal_reconciler` role still has
+   `INSERT, SELECT` on the three Audit tables (it has by
+   default; a manual `REVOKE` would break this).
+
+### Composition wiring
+
+The composition factory is
+`composition.NewWALReconciler(ctx, WALReconcilerConfig)`
+returning a `*reconciler.Reconciler`. The factory:
+
+- Requires a `keys.Store` (`KeyStore` field) returning
+  `(nil, nil)` when the store is nil so the binary
+  branches "reconciler disabled" deliberately. The
+  callers in `cmd/clean-code-eval-gate` and
+  `cmd/clean-code-gateway` construct the store via
+  `keys.NewSQLStore(reconcilerDB)`.
+- Requires a non-nil `*sql.DB` authenticated as
+  `clean_code_wal_reconciler` (migration 0004 grants
+  INSERT+SELECT on the three Audit tables; UPDATE /
+  DELETE are revoked service-wide; migration 0005
+  additionally grants SELECT on
+  `clean_code.policy_signing_keys` so the
+  historical-keys verifier can build its snapshot).
+- Requires a non-empty `Dir` -- production wiring threads
+  `CLEAN_CODE_AUDIT_WAL_DIR` (default `data/wal/audit`)
+  through, matching the writer's directory.
+- Constructs the production `reconciler.SQLReplayer` and
+  a `composition.NewHistoricalKeysWALVerifier`-backed
+  Verifier; passes both into `reconciler.NewReconciler`.
+
+A `*keys.Manager` is also accepted via the convenience
+`Keys` field; the factory then takes the snapshot from
+`Manager.HistoricalKeys()` (the manager must have
+called `Load` first, which the production composition
+helpers already do).
+
+The verifier classification matrix:
+
+| Verifier returned | Reconciler classification |
+|---|---|
+| `nil` | replay row |
+| `reconciler.ErrSignatureInvalid` (sig wrong length OR `ed25519.Verify == false`) | SkippedBadSig |
+| `reconciler.ErrSigningKeyUnknown` (UUID not in trusted snapshot) | SkippedBadSig |
+| ctx error | propagated -> abort `Run` |
+| any other error | propagated -> abort `Run` |
+
+### Binary wiring (on-restart blocking step)
+
+Both binaries (`cmd/clean-code-eval-gate/main.go` and
+`cmd/clean-code-gateway/main.go`) run the reconciler as
+a BLOCKING startup step BEFORE the HTTP listener
+accepts traffic, so a missing reconciliation cannot
+serve stale gate decisions or emit unreplayed audit
+frames.
+
+Required env var:
+
+- `CLEAN_CODE_WAL_RECONCILER_DSN` -- PostgreSQL DSN
+  whose auth user is a LOGIN role that has been
+  granted `clean_code_wal_reconciler` membership
+  (which is `NOLOGIN` per migration
+  `0004_roles.up.sql:191`), with
+  `options=-c role=clean_code_wal_reconciler` (or
+  equivalent `SET ROLE`) so every statement is
+  attributed to the reconciler role in
+  `pg_stat_activity` and PG audit logs. See
+  `docs/rollout.md` Stage 9.2 -> "DSN connection
+  pattern (NOLOGIN + SET ROLE)" for the operator
+  flow.
+
+  The reconciler opens its OWN dedicated pool from
+  this DSN; reusing the gateway's evaluator /
+  solid_batch pools is NOT permitted. Note that
+  those roles ALSO carry `INSERT, SELECT` on the
+  three Audit tables (migration
+  `0004_roles.up.sql:455-465` -- the three writers
+  share one append-only path by design) and ALSO
+  carry `SELECT` on `clean_code.policy_signing_keys`
+  (migration `0005_policy_signing_keys.up.sql:169-171`),
+  so the prohibition is NOT a grant-matrix gap.
+  Instead the dedicated DSN exists for three
+  operational reasons:
+
+  1. **Activity attribution.** With
+     `options=-c role=clean_code_wal_reconciler`,
+     reconciler writes show up under a distinct role
+     in `pg_stat_activity` and PG audit logs.
+     Mixing them with evaluator / solid_batch
+     activity would erase the
+     `EvaluationRun.caller='reconciler'` <->
+     PG-role correspondence operators rely on for
+     post-hoc forensics.
+  2. **Future grant tightening.** Keeping the
+     reconciler on a separate role makes it safe to
+     tighten its grants in future migrations
+     (e.g. narrow INSERT to specific columns,
+     restrict by row-level security) without
+     touching the hot-path evaluator / solid_batch
+     grants.
+  3. **Connection budgeting.** The reconciler holds
+     a connection for the entire on-restart sweep.
+     Borrowing from the evaluator / solid_batch
+     pools would steal capacity from the hot
+     serving paths during boot -- precisely when
+     those paths need to come up cleanly. A
+     dedicated pool sized for the one-shot sweep
+     avoids that contention.
+
+Boot matrix:
+
+- `signingKeys == nil` (scaffold mode, no KMS wiring) ->
+  reconciler is skipped; the binary logs
+  "WAL reconciler: skipped (no signing keys configured)"
+  and proceeds. This matches Stage 9.1's writer, which
+  also skips frame signing in scaffold mode.
+- `signingKeys != nil` AND
+  `CLEAN_CODE_WAL_RECONCILER_DSN` UNSET -> boot is
+  REFUSED (`log.Fatalf` in eval-gate, error return in
+  gateway). A silent skip would mean pending WAL
+  frames sit on disk unreplayed forever; that is the
+  exact failure mode Stage 9.2 exists to prevent.
+- `signingKeys != nil` AND DSN SET -> reconciler runs
+  to completion, logs `Stats`, and yields to the rest
+  of boot. On `Run` error the binary aborts so the
+  operator can investigate before traffic is served.
+
+## Stage 8.2 -- Refactor plan and task generation
+
+This section captures the operator-facing contract of the
+Stage 8.2 add-ons to `internal/refactor/`: the `TaskPlanner`
+orchestrator that emits `refactor_plan` rows + per-hot_spot
+`refactor_task` rows from the top-N hot_spots at one
+`(repo_id, sha)`.
+
+### Process layout
+
+Stage 8.2 runs inside `cmd/clean-code-refactor-planner/main.go`
+as a one-shot K8s Job (NOT a cadence loop). The operator
+schedules ONE pod per (repo_id, sha) — typically tied to a
+scan completion event — and the binary:
+
+1. Loads `CLEAN_CODE_PG_URL` plus the per-job env vars
+   `CLEAN_CODE_REFACTOR_PLANNER_REPO_ID` (uuid) and
+   `CLEAN_CODE_REFACTOR_PLANNER_SHA`.
+2. Opens a libpq handle (retries up to 30s for slow-starting DBs).
+3. Calls Stage 8.1 `Planner.Plan(ctx, repoID, sha)` — which
+   reads + scores + writes the `clean_code.hot_spot` batch.
+4. Calls Stage 8.2
+   `TaskPlanner.PlanFromSnapshot(ctx, repoID, sha, planRes.Snapshot)`
+   — which READS the latest top-N hot_spot rows (the ones
+   the previous step just wrote) and emits the
+   `refactor_plan` + `refactor_task` rows under one
+   transaction.
+5. Exits 0 on success; non-zero on any unhandled error.
+
+`TaskPlanner` is wired with FOUR dependencies — `PolicyReader`,
+`HotSpotReader` (NEW in iter 2: `WHERE created_at = (SELECT
+MAX(created_at) ...)` latest-batch lookup against
+`clean_code.hot_spot`), `FindingDetailReader` (production:
+`SQLFindingDetailReader` against `clean_code.finding`), and
+`RefactorPlanTaskWriter` (production:
+`SQLRefactorPlanTaskWriter` against
+`refactor_plan` + `refactor_task` in one transaction). The
+DB role `clean_code_refactor_planner` is already granted
+`INSERT, SELECT` on the three target tables (migration
+`0004_roles.up.sql:482-509`) AND now ALSO needs `SELECT` on
+`clean_code.hot_spot` for the new latest-batch read (the
+existing grant set covers this — `hot_spot` SELECT was
+already in scope because Stage 8.1 needed to upsert and read
+it back, but operators should grep their role audit to
+confirm a custom role spec inherits the same row).
+
+**Single-writer assumption:** the latest-batch query uses
+`WHERE created_at = (SELECT MAX(created_at) ...)`. This is
+correct under the architecture's "one
+clean-code-refactor-planner pod per (repo, sha) at a time"
+invariant. If two pods race the same (repo, sha) tuple they
+will both insert hot_spot rows at near-identical timestamps
+and the MAX(created_at) row may end up being a mix of the
+two batches — operators MUST gate the K8s Job spec with a
+`uniqueness key = (repo_id, sha)` constraint
+(architecture Sec 5.5.1).
+
+### Race-safe wiring via `PlanFromSnapshot`
+
+Stage 8.2 deliberately uses
+`TaskPlanner.PlanFromSnapshot(ctx, repoID, sha, snap)` rather
+than `TaskPlanner.Plan`. The standalone `Plan` re-reads the
+active policy, which would race a concurrent
+`policy.activate` between Stage 8.1 and Stage 8.2 — the
+returned policy_version_id could differ from the one stamped
+on every `hot_spot` row just persisted. Passing the Stage 8.1
+`PlanResult.Snapshot` closes the race at the type level.
+
+### Knobs (`policy_version.refactor_weights`)
+
+- `top_n` (Stage 8.2 NEW, optional int) -- maximum number
+  of hot_spots a single `refactor_plan` row covers. Zero
+  means no truncation (plan covers every scored hot_spot);
+  positive truncates to the top-N by composite score
+  DESC; negative is rejected at publish time. The hot_spot
+  table is always written in full (architecture Sec 5.5.1
+  append-only) -- `top_n` only affects plan coverage and
+  emitted tasks.
+- `effort_model_version` -- Stage 8.3 effort-model pin.
+  Stage 8.2 emits `refactor_task.effort_hours = 0.0` as the
+  unestimated placeholder; Stage 8.3 backfills.
+- All Stage 8.1 weights (`alpha`, `beta`, `gamma`,
+  `delta`, `window_days`) flow through to Stage 8.2
+  unchanged: the Stage 8.1 `Planner.Plan` pass uses them
+  to score and persist the `hot_spot` batch; the Stage 8.2
+  `TaskPlanner.PlanFromSnapshot` pass inherits the same
+  `PolicySnapshot` and consults `Weights.TopN` only.
+
+### What the planner writes
+
+For each `cmd/clean-code-refactor-planner` invocation
+(one-shot K8s Job per `(repo_id, sha)`):
+
+1. The Stage 8.1 `refactor.Planner.Plan` pass writes ALL
+   scored hot_spots via `HotSpotWriter`
+   (`clean_code.hot_spot`), in canonical sort order
+   (Score DESC, ScopeID ASC). Stage 8.1 is the SOLE writer
+   of `clean_code.hot_spot`.
+2. The Stage 8.2 `refactor.TaskPlanner.PlanFromSnapshot`
+   pass then READS the LATEST top-N rows back from
+   `clean_code.hot_spot` (via the new `HotSpotReader` →
+   `SQLHotSpotReader.LatestHotSpotsByScore`, pinned by
+   `policy_version_id = $snap.PolicyVersionID`) -- it does
+   NOT recompute scores and does NOT write `hot_spot`.
+3. ONE `refactor_plan` row persists via
+   `RefactorPlanTaskWriter.WriteRefactorPlanAndTasks`
+   (atomic transaction with the tasks below) covering the
+   top-N hot_spots in `hotspot_ids JSONB`. Carries NO
+   `policy_version_id` column -- recover the policy via
+   any referenced hot_spot row.
+4. ZERO OR MORE `refactor_task` rows in the same transaction,
+   one per unique `(scope_id, rule_id)` qualifying finding
+   pair. A hot_spot with NO qualifying findings IS still
+   listed in `plan.hotspot_ids` but emits ZERO tasks (the
+   planner refuses to fabricate a synthetic rule_id).
+
+### `task.kind` canonical enum
+
+The five values per architecture Sec 5.5.3 line 1274:
+
+| kind                       | typical trigger                                    |
+| -------------------------- | -------------------------------------------------- |
+| `split_class`              | SOLID SRP / ISP violation (split class / interface)|
+| `extract_method`           | SOLID OCP / LSP / unmapped rule fallback           |
+| `invert_dependency`        | SOLID DIP / high CBO / high fan_in / high fan_out  |
+| `break_cycle`              | `decoupling.cycle_member` / `decoupling.cycles.*`  |
+| `consolidate_duplication`  | `decoupling.duplication*`                          |
+
+The iter-3 alias set
+`extract_function | introduce_interface |
+reduce_inheritance | reduce_coupling | reduce_lcom |
+reduce_duplication` is REJECTED. A rule pack that emits a
+finding whose rule_id maps to an alias kind (via a custom
+`WithRuleKindMapper`) ABORTS the whole `TaskPlanner.Plan`
+batch with `ErrRejectedTaskKindAlias`; no plan row, no
+task row lands. Operators see the rejection in the
+planner's structured-log error wrap.
+
+### Failure modes / recovery
+
+| symptom                                            | likely cause                                                                   | action                                                                                       |
+| -------------------------------------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| `ErrNoActivePolicy`                                | No `policy_activation` row at planner runtime                                  | Activate a policy via the steward verb; planner is idempotent and will produce on next loop |
+| `ErrInvalidTopN`                                   | Composition root injected a snapshot with `TopN < 0`                           | Republish the policy with a non-negative `top_n`; legitimate publishes are blocked already   |
+| `ErrRejectedTaskKindAlias` / `ErrUnknownTaskKind`  | Custom rule mapper returned a non-canonical kind                               | Inspect the failing rule_id in the error wrap; remove the override or map to a canonical kind|
+| `write plan+tasks: ... transaction rollback`       | Connection drop mid-batch                                                      | Re-run the planner -- the transaction guarantees no orphan plan landed                       |
+
+### Effort-model version recovery
+
+Stage 8.2 emits `effort_hours = 0.0`. To recover the
+effort-model version a task was scored against:
+
+```
+refactor_task.task_id
+  -> refactor_task.plan_id
+  -> refactor_plan.hotspot_ids[0]
+  -> hot_spot.policy_version_id
+  -> policy_version.refactor_weights.effort_model_version
+```
+
+Stage 8.3 will replace the placeholder; the traversal path
+above stays canonical.
+
+
 ## Stage 7.1 -- Cross-Repo Aggregator cadence loop
 
 This section captures the operator-facing contract of the
@@ -140,6 +1545,186 @@ SELECT grantee, privilege_type
 
 Expected: `clean_code_xrepo_aggregator` has INSERT only;
 no other role has INSERT/UPDATE/DELETE.
+
+## Stage 7.3 -- Insights percentile freshness banner
+
+This section captures the operator-facing contract of the
+percentile-freshness banner attached to the Management
+latest-dashboard read verbs `mgmt.read.cross_repo` and
+`mgmt.read.portfolio` (Stage 6.3). The banner is the
+Insights-surface envelope decoration documented at
+architecture Sec 7.5 / tech-spec Sec 8.2
+`freshness_window_seconds`; the implementation lives in
+`internal/management/insights/freshness.go` and is wired
+into `internal/management/reader.go` via the
+`WithInsightsFreshness(*insights.Freshness)` option. The
+production constructor is
+`insights.NewPercentileFreshness()` (window =
+`FreshnessWindowSeconds = 3600s`, clock = `SystemClock`).
+
+### What the banner does
+
+On EVERY call to `mgmt.read.cross_repo(metric_kind,
+scope_kind)` or `mgmt.read.portfolio(metric_kind)` the
+Reader:
+
+1. Resolves the latest `cross_repo_percentile` (resp.
+   `portfolio_snapshot`) row through the configured
+   `MetricsBackend` (architecture Sec 6.3).
+2. Passes the row's `built_at` to
+   `insights.Freshness.Evaluate(builtAt)`.
+3. If `now() - built_at > 3600s`, stamps the response
+   envelope's `degraded=true` and
+   `degraded_reason="percentile_stale"`. Otherwise the
+   envelope carries `degraded=false` and the
+   `degraded_reason` field is omitted from JSON.
+
+`mgmt.read.portfolio` aggregates the WORST-CASE across the
+fetched rows -- `Degraded=true` iff ANY row's `built_at`
+is stale, and `OldestBuiltAt` echoes the oldest row's
+`built_at` so an operator can attribute the staleness
+verdict to a specific snapshot.
+
+### Wire shape on a stale read
+
+A response from `GET /v1/mgmt/read/cross_repo?metric_kind=
+arch_debt_ratio&scope_kind=repo` against a stale snapshot
+looks like:
+
+```json
+{
+  "row": {
+    "metric_kind":   "arch_debt_ratio",
+    "scope_kind":    "repo",
+    "p50":           0.18,
+    "p90":           0.41,
+    "p99":           0.72,
+    "histogram_json": "{...}",
+    "built_at":      "2026-05-27T17:02:11Z"
+  },
+  "degraded":        true,
+  "degraded_reason": "percentile_stale",
+  "built_at":        "2026-05-27T17:02:11Z"
+}
+```
+
+A FRESH response omits `degraded_reason` and emits
+`"degraded": false`.
+
+### Boundary semantics
+
+`Freshness.Evaluate` uses a strict-greater-than comparison
+(`age > Window`) so a row whose age EQUALS the window is
+treated as FRESH; one second past the window flips it to
+stale. The boundary contract is pinned by
+`TestFreshness_BoundaryAtExactWindowIsFresh` and
+`TestFreshness_OneSecondPastBoundaryIsStale`
+(`internal/management/insights/freshness_test.go`).
+
+Edge cases the verb handles WITHOUT operator intervention:
+
+- **Empty `built_at` (`time.Time{}` zero value)** -- some
+  backends return this when the underlying table is empty.
+  Evaluate treats it as STALE so an unpopulated dashboard
+  cannot silently render as "fresh".
+- **Future `built_at` (writer clock ahead of reader clock)**
+  -- treated as FRESH; the resulting negative age never
+  satisfies `> Window`. The Insights surface does not
+  police clock drift.
+- **Nil `Clock`** -- a `Freshness{Clock: nil}` falls back
+  to `SystemClock` rather than panicking, so a
+  composition-root wiring bug cannot crash the hot read
+  path.
+
+### INSIGHTS-ONLY: NOT a gate signal
+
+`percentile_stale` is the canonical "Insights-only"
+degraded reason. The `eval.gate` verb's degraded-reason
+taxonomy (architecture Sec 8.2) is the closed four-value
+set `{samples_pending, policy_signature_invalid,
+xrepo_edges_unavailable, ast_subprocess_unavailable}`; the
+gate's writer REJECTS `percentile_stale` with the sentinel
+`ErrInvalidGateDegradedReason` BEFORE any SQL is issued
+(`internal/evaluator/verdict.go`,
+`internal/evaluator/gate_evaluate.go:writeDegraded`,
+`internal/evaluator/sql_degraded_store.go`). The carve-out
+is pinned by
+`TestDegradedReason_IsValidForGate_RejectsPercentileStale`,
+`TestGate_writeDegraded_RejectsPercentileStaleReason`, and
+`TestSQLDegradedRunStore_RejectsPercentileStaleReasonBeforeSQL`
+(verdict_test.go) plus the Stage 6.1 e2e scenario
+`percentile-stale-not-on-gate`.
+
+Operational implication: a dashboard showing
+`degraded_reason="percentile_stale"` MUST NOT be treated as
+a block/warn input to a deploy gate. It is a *dashboard
+staleness* signal -- the underlying ACTIVE
+`metric_sample` rows are still consumable by `eval.gate`
+even when the percentile cohort summary has not been
+refreshed within the hour.
+
+### Operator triage on `percentile_stale`
+
+A persistent `degraded_reason="percentile_stale"` typically
+indicates the cross-repo aggregator loop is not ticking.
+Triage steps:
+
+1. Inspect the Stage 7.1 aggregator binary's structured
+   log for the "aggregator loop: Tick succeeded" line.
+   Absence for > 1 hour is the canonical trigger.
+2. Confirm `CLEAN_CODE_DISABLE_AGGREGATOR` is not set to
+   `true` on the aggregator deployment (Stage 7.1).
+3. Confirm exactly ONE aggregator replica is running
+   (Stage 7.1 single-replica invariant).
+4. Query the table directly:
+
+   ```sql
+   SELECT metric_kind, scope_kind, MAX(built_at) AS latest
+     FROM clean_code.cross_repo_percentile
+    GROUP BY metric_kind, scope_kind
+    ORDER BY latest;
+   ```
+
+   The `latest` column lets you attribute the
+   `percentile_stale` verdict to the specific cohort whose
+   `built_at` is oldest -- the same cohort
+   `OldestBuiltAt` echoes for `mgmt.read.portfolio`.
+
+The banner DOES NOT auto-clear: once the aggregator
+resumes ticking, the next snapshot insert advances
+`built_at` and the verb's next read returns
+`degraded=false` without operator intervention.
+
+### Auto-default wiring (defence-in-depth)
+
+A composition root that calls `management.NewReader(...)`
+WITHOUT `WithInsightsFreshness` AUTOMATICALLY receives the
+production-canonical `insights.NewPercentileFreshness()`
+(window = 3600s, clock = `SystemClock`). This auto-default
+exists so a wiring slip cannot silently render a stale
+snapshot as fresh. A composition root that genuinely needs
+to suppress the banner -- e.g. a developer-mode replay
+harness or a unit test seam -- MUST opt out explicitly via
+`management.WithoutFreshness()`.
+
+`WithoutFreshness()` is a DEVELOPER/TEST SEAM, NOT a
+production rollback knob. As of Stage 7.3 there is no
+production composition root that calls
+`management.NewReader(...)` -- a literal grep over
+`services/clean-code/cmd/` confirms this (see the rollout
+guide's "State of the read surface today" subsection).
+When the follow-on read-surface stage lands and introduces
+the first production Reader-wiring binary (a sibling
+helper to the existing
+`cmd/clean-code-metric-ingestor/main.go:mountMgmtRoutes`
+write-verb mount, or a new `cmd/clean-code-mgmt-read/`),
+that binary MUST NOT call `WithoutFreshness()`. A PR that
+adds `WithoutFreshness()` to a production composition
+root MUST be reviewed as a release-blocking change and
+the operator on call MUST be paged before it merges. If
+the banner is firing during an incident, the correct
+response is to fix the aggregator (Stage 7.1 triage
+above), not to suppress the signal.
 
 ## Stage 6.2 -- `mgmt.register_repo` and `mgmt.set_mode`
 
@@ -886,17 +2471,21 @@ ever written. The state alphabet is pinned in
 
 ### Configuration (env vars)
 
-The metric ingestor is wired in `cmd/clean-coded/main.go`
-(`buildMetricIngestor` + the sweeper construction below it)
-and consumes the existing service-wide config knobs -- it
-does NOT introduce a `CLEAN_CODE_METRIC_INGESTOR_*`
-namespace. The relevant env vars are:
+The metric ingestor is wired in
+`cmd/clean-code-metric-ingestor/main.go` (Stage 9.3 iter-3
+hoisted the shared `isolationBundle` at
+`main.go:143-158` and refactored the route mounters --
+`mountMgmtRoutes` at `:190-196` and `mountIngestRouter` at
+`:198-205`). It consumes the existing service-wide config
+knobs -- it does NOT introduce a
+`CLEAN_CODE_METRIC_INGESTOR_*` namespace. The relevant env
+vars are:
 
 | Env var                           | Meaning                                                                                                                                                                                                          | Required when                       |
 | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
-| `CLEAN_CODE_PG_URL`               | PostgreSQL connection URL. The pool MUST be reachable by the `clean_code_metric_ingestor` role. When empty, the composition root falls back to in-memory stores ([`metric_ingestor.NewInMemoryScanRunStore`]).   | always in production                |
-| `CLEAN_CODE_AST_SCAN_ROOT`        | Root directory under which per-repo checkouts live. The composition root reads it as the root of `DirectoryAstFileSource`; if empty the root falls back to `EmptyAstFileSource` (no work to do).                 | always in production                |
-| `CLEAN_CODE_PERIODIC_SWEEP_CADENCE` | The `Sweeper` tick interval (Go duration). Drives `WithSweeperCadence` in `cmd/clean-coded/main.go`. Default value lives in `internal/config/config.go`.                                                       | never (defaulted)                   |
+| `CLEAN_CODE_PG_URL`               | PostgreSQL connection URL. The pool MUST be reachable by the `clean_code_metric_ingestor` role. **Required** -- `cmd/clean-code-metric-ingestor/main.go:102-104` does `log.Fatalf("%s is required", config.EnvPGURL)` when this var is empty, before any listener is bound. There is no in-memory fallback in this binary. (`metric_ingestor.NewInMemoryScanRunStore` exists for unit tests; the production binary does not construct it.) | always (mandatory at boot)          |
+| `CLEAN_CODE_AST_SCAN_ROOT`        | Root directory under which per-repo checkouts live. When set, the composition root wires `RegistryBackedFoundationDispatcher` with a `DirectoryAstFileSource{Coordinator, Pool}` rooted here (see `cmd/clean-code-metric-ingestor/main.go:860-891`). When empty the dispatcher falls back to `NoopFoundationRecipeDispatcher{Logger: logger}` so a webhook-only metric-ingestor pod still boots cleanly. | production scan pods                |
+| `CLEAN_CODE_PERIODIC_SWEEP_CADENCE` | The `Sweeper` tick interval (Go duration). Drives `WithSweeperCadence` in `cmd/clean-code-metric-ingestor/main.go`. Default value lives in `internal/config/config.go`.                                       | never (defaulted)                   |
 | `CLEAN_CODE_SCAN_TIMEOUT`         | Per-scan timeout passed to `WithStateMachineTimeout`. A sweep that exceeds this is aborted and the commit is marked `'failed'` rather than left in `'scanning'` indefinitely.                                    | never (defaulted)                   |
 
 There is intentionally NO `CLEAN_CODE_METRIC_INGESTOR_*`
@@ -907,66 +2496,116 @@ sizing) may introduce a dedicated namespace; until then,
 operators should NOT set fictional env vars expecting
 them to work.
 
-Mode selection (per `cmd/clean-coded/main.go:402-460`):
+Mode selection (per `cmd/clean-code-metric-ingestor/main.go:837-891`):
 
-- **Production**: `CLEAN_CODE_PG_URL` is set AND
+- **Production scan pod**: `CLEAN_CODE_PG_URL` is set AND
   `CLEAN_CODE_AST_SCAN_ROOT` is set. The composition root
-  wires `PGScanRunStore` + `DirectoryAstFileSource` and
-  launches the sweeper.
-- **Fail-fast**: `CLEAN_CODE_PG_URL` is set but
-  `CLEAN_CODE_AST_SCAN_ROOT` is empty. The composition
-  root **refuses to start** and returns an actionable
-  error (`main.go:438-448`): "CLEAN_CODE_AST_SCAN_ROOT is
-  REQUIRED when CLEAN_CODE_PG_URL is configured -- the
-  Metric Ingestor sweep loop is the SOLE driver of
-  `commit.scan_status` transitions...". This is the
-  iter-4 evaluator structural fix: rather than silently
-  letting pending commits accumulate against a live PG
-  instance with no source of AST files, the process
-  exits non-zero so the operator sees the misconfiguration
-  at boot, not 30 minutes of silent backlog later.
-- **Scaffold mode**: `CLEAN_CODE_PG_URL` is empty (which
-  implies in-memory stores). The composition root logs
-  `metric ingestor sweep loop NOT STARTED (scaffold mode:
-  CLEAN_CODE_AST_SCAN_ROOT unset)` (`main.go:454-460`),
-  closes `sweepDone` immediately so shutdown does not
-  block, and the sweeper is **NEVER launched**. The HTTP
-  surface still serves; nothing claims commits. This is
-  acceptable for the dev loop only.
+  wires `PGScanRunStore` and a
+  `RegistryBackedFoundationDispatcher` whose `AstFiles` is a
+  `DirectoryAstFileSource` rooted at the scan root and
+  threaded with the shared `iso.coord` / `iso.pool`
+  (`main.go:866-879`). The same `iso.coord` backs
+  `mgmt.set_mode`'s drain barrier, so a mode flip blocks
+  until in-flight scans for the repo release. The sweeper
+  is launched separately by `buildSweepLoop` (`main.go:160`).
+- **Webhook-only / no-checkout pod**: `CLEAN_CODE_PG_URL`
+  is set but `CLEAN_CODE_AST_SCAN_ROOT` is empty. The
+  composition root does **not** fail-fast (Stage 9.3 iter-3
+  intentionally reverted the iter-4 fail-fast contract so
+  that a webhook-only metric-ingestor pod -- one that
+  serves `mgmt.*` and `/v1/ingest/*` without a local
+  checkout layout -- still boots). Instead the foundation
+  dispatcher falls back to
+  `NoopFoundationRecipeDispatcher{Logger: logger}`
+  (`main.go:860`, `:887-890`) and emits a single info log
+  `foundation dispatcher = noop (CLEAN_CODE_AST_SCAN_ROOT
+  unset)` at startup. Operators deploying a SCAN pod (one
+  expected to claim pending commits) MUST verify the
+  `wired production foundation dispatcher` info log
+  appears with `isolation_pool_languages` populated, NOT
+  the noop log line above.
+- **Scaffold / PG-less mode is NOT supported by this binary**:
+  `cmd/clean-code-metric-ingestor/main.go:102-104` does
+  `log.Fatalf("%s is required", config.EnvPGURL)` when
+  `cfg.PostgresURL == ""`. The process exits before
+  `openMgmtDB`, `buildIsolation`, or `buildSweepLoop` are
+  reached, so there is no `/healthz` listener and no in-memory
+  fallback. `CLEAN_CODE_PG_URL` is mandatory for this binary.
+  (Historical note: the old `cmd/clean-coded/main.go`
+  supported an in-memory scaffold mode; the metric-ingestor
+  binary intentionally does not.) Operators who want a
+  PG-less dev loop should run unit tests against
+  `metric_ingestor.NewInMemoryScanRunStore` rather than
+  starting this binary.
 
-### Source-availability pre-flight (NOT a `/readyz` probe)
+### Source-availability pre-flight (NOT a `/readyz` probe, NOT wired in production today)
 
-The composition root threads an `AstSourceAvailability`
-probe (`metric_ingestor.AstSourceAvailability`, defined in
-`internal/metric_ingestor/availability.go`) into the state
-machine via `WithStateMachineSourceProbe` (see
-`cmd/clean-coded/main.go:917-957`). The directory AST
-source itself implements `HasFilesFor`, so the probe is
-non-nil whenever `CLEAN_CODE_AST_SCAN_ROOT` is set; in
-scaffold mode the probe is nil and the pre-flight is
-disabled. When the probe is wired,
-`StateMachine.ProcessOne` peeks **up to `probeFanout`
-pending commits** (default 16 per
-`state.go:813`) and iterates them in commit-time order,
-claiming the FIRST one whose `HasFilesFor` returns true
-via `ClaimSpecificPendingCommit`
-(`state.go:950-1019`). Every skipped candidate stays in
-`'pending'` (no canonical edge crossed); if NO candidate
-in the fanout is ready, `ProcessOne` returns
-`DidWork=false` with `SkipReason=SourceNotReady` and the
-next tick re-peeks. This keeps the four-state Commit
-diagram intact AND avoids head-of-line blocking when the
-oldest commit's checkout hasn't yet landed on disk.
+The `AstSourceAvailability` interface and
+`WithStateMachineSourceProbe` option are defined in
+`internal/metric_ingestor/availability.go` and
+`internal/metric_ingestor/state.go` respectively. The
+`DirectoryAstFileSource` implements `HasFilesFor`, and the
+state-machine `ProcessOne` honors the probe when wired
+(`internal/metric_ingestor/state.go` — search
+`AstSourceAvailability`): it peeks **up to `probeFanout`
+pending commits** (default 16 per `state.go:813`) and
+iterates them in commit-time order, claiming the FIRST
+one whose `HasFilesFor` returns true via
+`ClaimSpecificPendingCommit` (`state.go:950-1019`).
+Every skipped candidate stays in `'pending'` (no canonical
+edge crossed); if NO candidate in the fanout is ready,
+`ProcessOne` returns `DidWork=false` with
+`SkipReason=SourceNotReady`. This keeps the four-state
+Commit diagram intact AND avoids head-of-line blocking
+when the oldest commit's checkout hasn't yet landed on
+disk.
 
-The probe is plumbed into the state machine, NOT into
-`/readyz`. The composition root currently registers only
-the Policy-Steward signing-key cache ready-check via
-`healthHandler.AddReadyCheck("signing_key_cache", ...)`
-(see `cmd/clean-coded/main.go:526`); there is no
-`AddReadyCheck("ast_source", ...)` call today. Operators
-that want `/readyz` to reflect AST-source readiness should
-treat this as a follow-up workstream, not a Stage 3.2
-deliverable.
+**The metric-ingestor binary does NOT wire this probe
+today.** `cmd/clean-code-metric-ingestor/main.go` does
+not call `NewStateMachine`, `WithStateMachineSourceProbe`,
+or construct an `AstSourceAvailability` value. (Code
+inspection of `cmd/clean-code-metric-ingestor/main.go`
+finds no references to `NewStateMachine`,
+`WithStateMachineSourceProbe`, or `AstSourceAvailability`.)
+The only callers of
+`NewStateMachine` today are unit tests in
+`internal/metric_ingestor/state_test.go`,
+`availability_test.go`, and `sweep_loop_test.go`. The
+foundation-dispatch scan path
+(`RegistryBackedFoundationDispatcher` →
+`DirectoryAstFileSource`) wired at
+`cmd/clean-code-metric-ingestor/main.go:860-891` runs
+WITHOUT a `ProcessOne`/`AstSourceAvailability` gate; it
+parses whatever the commit walker yields. Operators
+that want a pre-flight source-availability gate on the
+scan path should treat it as a follow-up workstream
+(e.g. wire `NewStateMachine` + `WithStateMachineSourceProbe`
+in a Stage 10.x scan-loop integration); the option is
+ready and tested but unused in this binary today.
+
+The probe is also NOT plumbed into `/readyz`, because
+`cmd/clean-code-metric-ingestor` does not expose a
+`/readyz` endpoint at all. `buildMux` at
+`cmd/clean-code-metric-ingestor/main.go:431-438` mounts
+only `/healthz` (always), `/metrics` (always), and the
+optional `/v1/ingestor/process` + `/v1/ingestor/scan-run`
+legacy routes when `EnableLegacyDemoAPI=true`; the
+`/metrics` route is overridden in `main()` at
+`main.go:177-178` to surface the wired sweep-loop's live
+counters. The mgmt verbs (`mgmt.set_mode`,
+`mgmt.retract_sample`, etc.) and the external-ingest
+router (`webhook.RouterPath`) are mounted by
+`mountMgmtRoutes` and `mountIngestRouter` respectively;
+none of them register a `/readyz` or call
+`AddReadyCheck`. (Code inspection of
+`cmd/clean-code-metric-ingestor/main.go` finds no
+references to `readyz`, `AddReadyCheck`, `healthHandler`,
+or `signing_key_cache`.)
+Operators that want `/readyz` on this binary should treat
+it as a follow-up workstream (likely a Stage 10.x readiness
+surface that aggregates a signing-key probe, a PG-ping
+probe, and the AST-source-availability probe described
+above).
 
 ### State-machine invariants
 

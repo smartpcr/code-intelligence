@@ -121,13 +121,40 @@ func TestMgmtRoleHandleSource_LabelsBranchClearly(t *testing.T) {
 	}
 }
 
-// TestMountMgmtRoutes_RejectsNilMgmtDB pins the contract that
-// mountMgmtRoutes refuses to wire the management verbs against a nil
+// TestBuildIsolation_RejectsNilMgmtDB pins the contract that
+// buildIsolation -- the Stage 9.3 iter-3 composition root for the
+// AST isolation primitives -- refuses to construct against a nil
 // management-role handle. Without this guard a future operator who
-// accidentally calls `mountMgmtRoutes(mux, db, nil)` would get a
-// nil-pointer panic at first request time; this surface fails fast at
-// composition time with a wrapped error that names the missing seam.
-func TestMountMgmtRoutes_RejectsNilMgmtDB(t *testing.T) {
+// accidentally called `buildIsolation(nil)` would get a nil-pointer
+// panic the first time a `mgmt.set_mode` flip hydrated a missing
+// repo via `repoStore.ReadRepoMode`; this surface fails fast at
+// composition time with a wrapped error that names the missing
+// env var so operators can find the config knob.
+func TestBuildIsolation_RejectsNilMgmtDB(t *testing.T) {
+	got, gotErr := buildIsolation(nil)
+	if gotErr == nil {
+		if got != nil {
+			_ = got.Close()
+		}
+		t.Fatalf("buildIsolation: want error when mgmtDB is nil, got nil")
+	}
+	if got != nil {
+		t.Errorf("buildIsolation: want nil *isolationBundle on the error path, got non-nil")
+	}
+	for _, want := range []string{"mgmtDB", config.EnvMgmtPGURL} {
+		if !strings.Contains(gotErr.Error(), want) {
+			t.Errorf("buildIsolation error %q: want substring %q", gotErr.Error(), want)
+		}
+	}
+}
+
+// TestMountMgmtRoutes_RejectsNilIso pins the iter-3 invariant
+// that mountMgmtRoutes refuses to wire the management verbs
+// without an [isolationBundle] -- the bundle owns the shared
+// flip coordinator the `mgmt.set_mode` writer drains against,
+// and a nil here would mean the flip path silently fell back
+// to a no-op coordinator that fails to drain in-flight scans.
+func TestMountMgmtRoutes_RejectsNilIso(t *testing.T) {
 	ingestorDB, _, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -137,12 +164,10 @@ func TestMountMgmtRoutes_RejectsNilMgmtDB(t *testing.T) {
 	mux := http.NewServeMux()
 	gotErr := mountMgmtRoutes(mux, ingestorDB, nil)
 	if gotErr == nil {
-		t.Fatalf("mountMgmtRoutes: want error when mgmtDB is nil, got nil")
+		t.Fatalf("mountMgmtRoutes: want error when iso is nil, got nil")
 	}
-	for _, want := range []string{"mgmtDB", config.EnvMgmtPGURL} {
-		if !strings.Contains(gotErr.Error(), want) {
-			t.Errorf("mountMgmtRoutes error %q: want substring %q", gotErr.Error(), want)
-		}
+	if !strings.Contains(gotErr.Error(), "isolationBundle") {
+		t.Errorf("mountMgmtRoutes error %q: want substring %q", gotErr.Error(), "isolationBundle")
 	}
 }
 
@@ -156,8 +181,9 @@ func TestMountMgmtRoutes_RejectsNilIngestorDB(t *testing.T) {
 	}
 	defer mgmtDB.Close()
 
+	iso := testIsolationBundle(t, mgmtDB)
 	mux := http.NewServeMux()
-	gotErr := mountMgmtRoutes(mux, nil, mgmtDB)
+	gotErr := mountMgmtRoutes(mux, nil, iso)
 	if gotErr == nil {
 		t.Fatalf("mountMgmtRoutes: want error when ingestorDB is nil, got nil")
 	}
@@ -192,8 +218,9 @@ func TestMountMgmtRoutes_DistinctHandlesMountsBothVerbs(t *testing.T) {
 		t.Fatalf("sqlmock returned identical pointers; cannot prove role-distinctness")
 	}
 
+	iso := testIsolationBundle(t, mgmtDB)
 	mux := http.NewServeMux()
-	if err := mountMgmtRoutes(mux, ingestorDB, mgmtDB); err != nil {
+	if err := mountMgmtRoutes(mux, ingestorDB, iso); err != nil {
 		t.Fatalf("mountMgmtRoutes: want nil error with both handles, got %v", err)
 	}
 

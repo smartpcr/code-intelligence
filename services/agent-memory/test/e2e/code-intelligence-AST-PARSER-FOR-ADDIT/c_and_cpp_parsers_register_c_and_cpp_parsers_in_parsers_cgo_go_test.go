@@ -28,11 +28,14 @@ import (
 const cAndCppRegProbeSource = `package ast
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
 )
 
 type e2eCCppRegResult struct {
@@ -41,6 +44,14 @@ type e2eCCppRegResult struct {
 }
 
 type e2eCCppRegSpyWriter struct{}
+
+func (e2eCCppRegSpyWriter) InsertNode(_ context.Context, _ graphwriter.NodeInput) (graphwriter.NodeRecord, error) {
+	return graphwriter.NodeRecord{}, nil
+}
+
+func (e2eCCppRegSpyWriter) InsertEdge(_ context.Context, _ graphwriter.EdgeInput) (graphwriter.EdgeRecord, error) {
+	return graphwriter.EdgeRecord{}, nil
+}
 
 func TestE2EProbe_CCppRegistration(t *testing.T) {
 	filename := os.Getenv("E2E_PROBE_FILENAME")

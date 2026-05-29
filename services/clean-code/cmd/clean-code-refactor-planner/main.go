@@ -159,22 +159,26 @@ func run() int {
 	// Stage 8.3: load the ML effort-model artefact named by
 	// the operator pin `refactor-effort-source` (architecture
 	// Sec 1.6 row 5). When the pin requires a model AND the
-	// URI is empty, [refactor.LoadFromConfig] returns
-	// [refactor.ErrEffortModelURIRequired]; we exit non-zero
+	// URI is empty, [refactor.NewEffortModelFromConfig] returns
+	// [refactor.ErrMLModelURIMissing]; we exit non-zero
 	// per the workstream `missing-model-blocks-startup`
 	// scenario. The model is wired into Stage 8.2 task
-	// emission via [refactor.WithEffortEstimator] inside
+	// emission via [refactor.WithEffortModel] inside
 	// [runPlanner].
-	effortModel, err := refactor.LoadFromConfig(cfg)
+	effortModel, err := refactor.NewEffortModelFromConfig(refactor.EffortModelConfig{
+		Source:         cfg.RefactorEffortSource,
+		MLModelURI:     cfg.MLModelURI,
+		MLModelVersion: cfg.MLModelVersion,
+	})
 	if err != nil {
 		log.Printf("clean-code-refactor-planner: effort-model load: %v", err)
 		return 1
 	}
 	if effortModel != nil {
 		logger.Info("clean-code-refactor-planner: effort model loaded",
-			"version", effortModel.Version,
 			"source", cfg.RefactorEffortSource,
-			"uri", cfg.RefactorEffortModelURI,
+			"ml_model_uri_set", cfg.MLModelURI != "",
+			"ml_model_version_set", cfg.MLModelVersion != "",
 		)
 	} else {
 		logger.Warn("clean-code-refactor-planner: effort estimator disabled",
@@ -732,7 +736,6 @@ func runPlannerWithEffortModel(
 	effortModel refactor.EffortModel,
 	repoID uuid.UUID,
 	sha string,
-	effortModel *refactor.EffortModel,
 ) (refactor.PlanResult, refactor.PlanAndTasksResult, error) {
 	_ = cfg // unused after EffortModel construction; kept for future config-driven options.
 	stewardStore, err := steward.NewSQLStore(db)

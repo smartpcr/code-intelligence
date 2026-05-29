@@ -6,6 +6,186 @@ composition root (`cmd/clean-code-metric-ingestor/main.go`,
 which hosts the management + ingest HTTP surfaces; future
 binaries under `cmd/clean-code-*` ship their own routes).
 
+## Stage 10.2 -- Aged mute insights report
+
+This section captures the operator-facing contract of the
+aged-mute Insights report attached to the Management read
+surface as `mgmt.read.insights.aged_mutes`. The report is an
+Insights-only projection over the `override` table -- it
+surfaces `override(mute=true)` rows whose `created_at` is
+older than a configurable threshold (default 90 days) so an
+operator can decide whether the mute is still warranted. The
+implementation lives in
+`internal/management/insights/aged_mutes.go` and is wired
+into `internal/management/reader.go` via the
+`WithAgedMutes(*insights.AgedMutes)` option. The production
+constructor is `insights.NewAgedMutes(reader, nil)` (threshold
+= `AgedMuteDefaultThresholdDays = 90` days, clock =
+`insights.SystemClock`).
+
+### What the report does
+
+On EVERY call to `mgmt.read.insights.aged_mutes` (with an
+optional integer `threshold_days` query parameter) the
+Reader:
+
+1. Calls `OverrideReader.ListAllOverrides(ctx)` to fetch the
+   FULL set of `override` rows visible to the management
+   surface (no glob expansion -- the projection groups on
+   the byte-identical `scope_filter`).
+2. Groups rows by `(rule_id, scope_filter.repo_id,
+   scope_filter.scope_kind, scope_filter.scope_signature_glob)`
+   and reduces each group to a single winner using the
+   `Store.LatestMatchingOverride` contract: max
+   `(created_at, override_id)`. Ties on `created_at` are
+   broken by the larger `override_id` so an aged mute and a
+   simultaneous unmute appended at the same wall-clock tick
+   resolve deterministically.
+3. Drops winners whose `mute=false` -- the unmute row IS the
+   "operator said this rule is no longer muted" signal; the
+   aged-mute row drops off the report on the next read.
+4. Filters remaining winners by age: `age > threshold` is
+   AGED (reported); `age <= threshold` is FRESH (omitted).
+   The boundary is strict-greater-than, mirroring the Stage
+   7.3 `Freshness.Window` semantic.
+5. Returns the aged set sorted by `created_at ASC` then
+   `override_id ASC` so the OLDEST mute is first and the
+   sort order is deterministic across reads.
+
+The report is EXCLUSIVELY an Insights surface read -- NO
+enforcement is performed (iter 1 evaluator item 5; v1 has
+NO TTL enforcement in code). Operators unmute by appending
+an `override(mute=false)` row via `mgmt.override`; the aged
+mute drops off the report on the next read because step 3
+above promotes the unmute to the group winner.
+
+### Wire shape on a stale read
+
+A response from `mgmt.read.insights.aged_mutes` against a
+backend with two aged mutes (one at 100 days, one at 200
+days) looks like:
+
+```json
+{
+  "mode":           "active",
+  "threshold_days": 90,
+  "aged_mutes": [
+    {
+      "rule_id":      "decoupling.RP-001",
+      "scope_kind":   "repo",
+      "scope_signature_glob": "github.com/acme/svc-orders",
+      "repo_id":      "repo-orders",
+      "override_id":  "ov-2025-09-01-001",
+      "created_at":   "2025-09-01T14:22:11Z",
+      "age_days":     200,
+      "reason":       "blocked on cross-team alignment",
+      "actor":        "alice@acme.com"
+    },
+    {
+      "rule_id":      "solid.SRP-014",
+      "scope_kind":   "repo",
+      "scope_signature_glob": "github.com/acme/svc-billing",
+      "repo_id":      "repo-billing",
+      "override_id":  "ov-2025-12-15-042",
+      "created_at":   "2025-12-15T09:11:00Z",
+      "age_days":     100,
+      "reason":       "legacy code under refactor",
+      "actor":        "bob@acme.com"
+    }
+  ]
+}
+```
+
+A clean response (no aged mutes) returns an empty `aged_mutes`
+array, never `null`:
+
+```json
+{ "mode": "active", "threshold_days": 90, "aged_mutes": [] }
+```
+
+`mode` echoes the Reader's repository-resolved mode (same
+field shape as `mgmt.read.cross_repo`); `threshold_days` is
+the effective threshold the report applied (either the
+caller's `threshold_days` query param or the default 90).
+
+### Threshold override and guard
+
+The default threshold is `AgedMuteDefaultThresholdDays = 90`
+days, applied when `threshold_days` is omitted OR when the
+caller's value is `<= 0`. A non-positive threshold falls
+back to the default rather than silently surfacing EVERY
+mute -- this prevents an operator typo
+(`?threshold_days=0`) from flooding the report. Values
+greater than zero are honored verbatim.
+
+### Boundary semantics
+
+`Report` (and `ReportWithThreshold`) uses a
+strict-greater-than comparison (`age > threshold`) so a
+mute whose age EQUALS the threshold is treated as FRESH;
+one second past flips it to aged. The boundary contract is
+pinned by `TestAgedMutes_BoundaryAtExactThresholdIsNotAged`
+and `TestAgedMutes_OneSecondPastBoundaryIsAged`
+(`internal/management/insights/aged_mutes_test.go`).
+
+Edge cases the verb handles WITHOUT operator intervention:
+
+- **Unmuted pair (mute=true then mute=false)** -- the
+  unmute row wins the group reduction (later `created_at`),
+  step 3 drops it, and the pair NEVER surfaces. Pinned by
+  `TestAgedMutes_UnmuteRemovesFromReport`.
+- **Re-mute after unmute** -- if a third row `mute=true` is
+  appended AFTER the unmute, it becomes the new group
+  winner and is evaluated against the threshold as a fresh
+  mute (its OWN `created_at`, not the original). Pinned by
+  `TestAgedMutes_RemuteAfterUnmuteReturnsAgedMute`.
+- **Backend not wired** -- if the composition root has not
+  called `WithAgedMutes(...)`, the Reader returns
+  `ErrBackendUnavailable` to keep the contract identical to
+  `mgmt.read.cross_repo` / `mgmt.read.portfolio` when their
+  backends are missing. The `WithAgedMutes(nil)` option is
+  ALSO permitted and treated as "not wired".
+- **Nil clock** -- a constructor passed a `nil` Clock falls
+  back to `insights.SystemClock` rather than panicking on
+  the hot path.
+- **Cancelled context** -- propagated verbatim from the
+  underlying `OverrideReader.ListAllOverrides(ctx)`.
+
+### How an operator unmutes an aged rule
+
+There is NO `mgmt.unmute` verb in v1. To clear an aged
+mute, the operator appends a fresh `override(mute=false)`
+row via `mgmt.override` using the SAME `(rule_id,
+scope_filter)` tuple. The next call to
+`mgmt.read.insights.aged_mutes` will reduce the pair and
+the mute drops off the report. The original `mute=true`
+row is NEVER deleted -- the audit trail is preserved by
+construction (architecture Sec 8 -- append-only).
+
+### Composition-root wiring
+
+The constructor wiring is a single line in the management
+binary's composition root (sketch -- the actual wiring
+lands when the verb is mounted by a downstream gateway
+stage):
+
+```go
+agedMutes := insights.NewAgedMutes(overrideReaderAdapter, nil)
+reader := management.NewReader(
+    management.WithMetricsBackend(mb),
+    management.WithInsightsFreshness(insights.NewPercentileFreshness()),
+    management.WithAgedMutes(agedMutes),
+)
+```
+
+The `overrideReaderAdapter` is a thin adapter that bridges
+the `policy/steward.Store` `ListAllOverrides` query to the
+`insights.OverrideReader` interface (the insights package
+intentionally has ZERO non-stdlib and ZERO internal-package
+deps -- see `docs/follow-up-workstreams.md` import-isolation
+matrix). The adapter is a few lines of value-type mapping
+and is the only place that knows about both packages.
+
 ## Stage 8.3 -- ML effort-model loader (clean-code-refactor-planner)
 
 The `clean-code-refactor-planner` binary now loads an

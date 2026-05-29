@@ -78,7 +78,10 @@ func TestE2EProbe_CParser(t *testing.T) {
 		})
 	}
 
-	data, _ := json.Marshal(out)
+	data, merr := json.Marshal(out)
+	if merr != nil {
+		t.Fatalf("marshal: %v", merr)
+	}
 	fmt.Printf("PROBE_OUTPUT:%s\n", string(data))
 }
 `
@@ -183,7 +186,10 @@ func TestE2EProbe_DispatcherPass0(t *testing.T) {
 		ImportEdgeCount: importCount,
 		PackageNodes:    pkgSigs,
 	}
-	data, _ := json.Marshal(result)
+	data, merr := json.Marshal(result)
+	if merr != nil {
+		t.Fatalf("marshal: %v", merr)
+	}
 	fmt.Printf("PROBE_OUTPUT:%s\n", string(data))
 }
 `

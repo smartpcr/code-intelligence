@@ -133,6 +133,49 @@ back-ends locally set `CGO_ENABLED=1` and ensure a C compiler
 `.github/workflows/agent-memory-ci.yml` is the canonical
 exerciser of the CGO=1 path.
 
+### Rust parser CGO validation (Stage 5.1)
+
+The Rust parser (`parser_treesitter_rust.go`) is gated on
+`//go:build cgo` because it links against the smacker
+tree-sitter Rust grammar. On hosts WITHOUT a C toolchain (the
+default `make test` gate, the orchestrator validator that ran
+this story's iter-8 evaluator):
+
+- `parser_treesitter_rust_test.go` and
+  `parser_treesitter_rust_dispatcher_test.go` are silently
+  skipped.
+- `parser_treesitter_rust_contract_test.go` (no `//go:build cgo`
+  tag, added in iter 9) DOES run and provides a structural
+  guard: it parses `parser_treesitter_rust.go` via the
+  stdlib `go/parser` and asserts the documented invariants
+  (`function_item` → `appendTraitDefaultMethod`,
+  `function_signature_item` → `appendTraitRequiredMethod`,
+  `LangMeta["trait_default"]=true` is set ONLY on the default
+  branch, trait impls write `ClassDecl.Implements` not
+  `LangMeta["implements"]`, `pendingImpls` dedupes via
+  `appendUnique`, and the public factory
+  `NewTreeSitterRustParser` exists).
+- The dispatcher's Pass 2d trait-default behaviour is
+  exercised via `fakeStaticParser` in
+  `dispatcher_pass2bd_test.go` (`TestDispatcher_Rust_*`), which
+  is non-CGO and runs everywhere.
+
+On hosts WITH a C toolchain on PATH:
+
+```powershell
+Set-Location services\agent-memory
+make test-cgo-rust         # runs Rust-named CGO tests only
+$env:CGO_ENABLED='1'; go test ./internal/repoindexer/ast/... -run Rust -count=1
+```
+
+Both commands exercise the real smacker tree-sitter Rust
+grammar end-to-end against the fixtures in
+`parser_treesitter_rust_test.go` (parser-level) and
+`parser_treesitter_rust_dispatcher_test.go` (writer-level
+edges). The orchestrator's validator is expected to run the
+contract test on every iter regardless of CGO availability,
+and the full CGO suite on CI's Linux runner.
+
 ## Current local validation caveats
 
 

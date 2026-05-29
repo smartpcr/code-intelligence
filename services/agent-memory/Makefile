@@ -34,7 +34,7 @@ PROTO_DIR       ?= proto
 PROTO_PKG_DIR   ?= proto/agent
 PROTO_FILES     ?= agent.proto
 
-.PHONY: all build test test-race lint vet tidy clean help proto proto-tools loadtest-calibration loadtest-calibration-smoke loadtest-gen-artifact
+.PHONY: all build test test-race test-cgo-rust lint vet tidy clean help proto proto-tools loadtest-calibration loadtest-calibration-smoke loadtest-gen-artifact
 
 all: lint build test
 
@@ -50,6 +50,18 @@ test:
 ## (requires CGO; CI invokes this on Linux runners).
 test-race:
 	CGO_ENABLED=1 $(GO) test $(GOFLAGS) -race $(TEST_FLAGS) $(PKGS)
+
+## test-cgo-rust: exercise the Rust tree-sitter parser's CGO-gated
+## tests directly (the smacker rust binding links against a
+## C-compiled grammar). The default `make test` path runs with
+## CGO=0 and silently skips these files; this target is the
+## canonical local exerciser for the Rust parser when a C
+## toolchain (gcc on Linux/macOS, mingw/clang on Windows) is on
+## PATH. The non-CGO contract test
+## (`parser_treesitter_rust_contract_test.go`) still runs under
+## `make test` to guard the same invariants symbolically.
+test-cgo-rust:
+	CGO_ENABLED=1 $(GO) test $(GOFLAGS) $(TEST_FLAGS) -run Rust ./internal/repoindexer/ast/...
 
 ## lint: run golangci-lint over every Go package; fails on any finding.
 lint:

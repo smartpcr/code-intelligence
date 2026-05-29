@@ -2,11 +2,10 @@
 
 // Stub Emitter / NewGoParser / NewTypeScriptParser /
 // NewPythonParser declarations duplicate the canonical
-// `LanguageParser`-returning factories in parser_typescript.go,
-// parser_python.go, and the tree-sitter parser_treesitter_*.go
-// files; gated behind `canonical_dispatcher` (never enabled) so
-// the package builds without symbol-collision errors. See
-// types.go for the migration history.
+// `LanguageParser`-returning factories in parser_typescript.go
+// and parser_python.go; gated behind `canonical_dispatcher`
+// (never enabled) so the package builds without symbol-
+// collision errors. See types.go for the migration history.
 package ast
 
 import (

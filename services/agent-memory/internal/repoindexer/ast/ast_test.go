@@ -1,13 +1,14 @@
 //go:build canonical_dispatcher
 
-// V1-only dispatcher + emitter tests are gated behind
-// `canonical_dispatcher` because they exercise the old
-// `NewDispatcher(opts...)` / `WithParser(...)` / `EmitFile(string, []byte)`
-// surface plus `NewEmitter` / `Pass2dOverrides`, all of which
-// live in the gated V1 stub files (types.go / dispatcher.go /
-// emitter.go / pass2d.go). The Stage 3.2 dispatcher landing
-// workstream will retire these tests in favour of the
-// canonical pinned scenarios in dispatcher_test.go.
+// Stub tests reference stub-only symbols (NewDispatcher with
+// option-only signature, MethodDecl.Name, MethodDecl.ClassName,
+// MethodDecl.ReceiverAliases as map[string]string,
+// Pass2dOverrides) that no longer exist on the canonical
+// types. Gated behind `canonical_dispatcher` (never enabled)
+// so the package builds. The Stage 3.2 dispatcher landing
+// workstream will replace these tests with canonical
+// equivalents that share the makeEvent/fakeNodeEdgeWriter
+// helpers already encoded in dispatcher_test.go.
 package ast
 
 import (

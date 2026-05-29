@@ -1,8 +1,5 @@
-// Block subdivision threshold tests reference the V2
-// `MethodDecl` shape and helpers (`repeatStatementLines`,
-// `itoa`) that the V2 dispatcher tests in dispatcher_test.go
-// also import. Un-gated in iter 6 alongside the rest of the
-// dispatcher test surface.
+//go:build canonical_dispatcher
+
 package ast
 
 import (

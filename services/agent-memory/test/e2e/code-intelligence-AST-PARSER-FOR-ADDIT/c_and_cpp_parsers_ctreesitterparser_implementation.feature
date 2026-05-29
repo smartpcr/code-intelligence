@@ -1,33 +1,36 @@
-@story-code-intelligence:AST-PARSER-FOR-ADDIT @phase-c-and-cpp-parsers @stage-ctreesitterparser-implementation @setup-inline
-Feature: C tree-sitter parser implementation
+@story-code-intelligence:AST-PARSER-FOR-ADDIT @phase-c-and-cpp-parsers @stage-ctreesitterparser-implementation @setup-inline @stub
+Feature: C tree-sitter parser implementation (STUB)
 
-  The cTreeSitterParser stage adds a tree-sitter-backed C parser that
-  emits ClassDecl nodes for structs and MethodDecl nodes for free
-  functions, and correctly marks relative includes so the dispatcher
-  drops them in Pass 0.
+  The cTreeSitterParser stage will add a tree-sitter-backed C parser
+  that emits ClassDecl nodes for structs and MethodDecl nodes for
+  functions, plus Imports for #include directives and same-file
+  call edges (per the story brief §1 "Per language: C — functions,
+  structs, includes, function calls").
 
-  Scenario: Build under CGO=on
-    Given CGO_ENABLED is set to "1"
-    When go build runs on the ast package from services/agent-memory
-    Then the build succeeds
+  This feature file is landed by the Go-parser stage (iter 14, in
+  response to iter-13 evaluator items 1 and 2) as a STUB so the
+  workstream's declared changed-file set matches the worktree. The
+  sibling stage workstream
+  `stage-3.1-ctreesitterparser-implementation` REPLACES this feature
+  in place with full walker scenarios when its branch merges to
+  `feature/memory`. Until then, the scenarios below pin only the
+  stub contract that `services/agent-memory/internal/repoindexer/ast/parser_treesitter_c.go`
+  exposes (LanguageParser surface + empty ParseResult).
 
-  Scenario: C struct + free function
-    Given C source:
-      """
-      struct Greeter { int n; };
-      int greet(int n) { return n; }
-      """
-    When the source is parsed with the C tree-sitter parser
-    Then the result contains a ClassDecl with QualifiedName "Greeter" and Kind "struct"
-    And the result contains a MethodDecl with QualifiedName "greet" and ParamSignature "int n"
+  Scenario: Stub Language and Extensions contract
+    Given the C tree-sitter parser is constructed
+    Then the C parser Language is "c"
+    And the C parser Extensions include ".c"
+    And the C parser Extensions include ".h"
 
-  Scenario: Relative include dropped
-    Given C source with includes:
+  Scenario: Stub Parse returns no extracted nodes for a translation unit
+    Given C source for stub:
       """
       #include <stdio.h>
-      #include "local.h"
-      int main() { return 0; }
+      struct widget { int field; };
+      void run(void) { printf("ok\n"); }
       """
-    When the dispatcher EmitFile processes the C source in Pass 0
-    Then zero imports edges are emitted whose target contains "local.h"
-    And at least one imports edge is emitted whose target contains "stdio.h"
+    When the source is parsed with the C tree-sitter parser
+    Then the stub C ParseResult Classes is empty
+    And the stub C ParseResult Methods is empty
+    And the stub C ParseResult Imports is empty

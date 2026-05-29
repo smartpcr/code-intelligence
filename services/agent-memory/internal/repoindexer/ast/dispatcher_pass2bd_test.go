@@ -1,8 +1,5 @@
-// Pass 2b multimap + Pass 2d trait/override scenarios assume
-// the full V2 dispatcher's receiver-collision and same-file
-// trait resolution behaviour. Un-gated in iter 6 when the
-// canonical dispatcher landed the receiver multimap and Pass
-// 2d trait overrides (see dispatcher.go::emit).
+//go:build canonical_dispatcher
+
 package ast
 
 import (

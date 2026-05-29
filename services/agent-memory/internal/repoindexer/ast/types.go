@@ -8,15 +8,12 @@
 // This file is kept on disk (rather than deleted) to preserve
 // the half-rolled-back Stage 3.1 migration's history; once the
 // Stage 3.2 dispatcher landing workstream lands, the canonical
-// Edge / Node / EmitResult decls will move into a fresh file
-// and this stub can be retired.
+// dispatcher / EmitResult / Edge / Node decls will move into a
+// fresh file and this stub can be retired.
 //
-// The csharpTreeSitterParser workstream (iter 5) introduced
-// this build-tag gate as a structural fix after four iterations
-// of deferral failed to resolve the V1/V2 duplicate-symbol
-// collision that blocked CGO=0 validation; the same pattern was
-// independently adopted by the goTreeSitterParser sibling
-// workstream (commit bd30500 on its branch).
+// See `.forge/iter-notes.md` and the open question
+// `ast-stub-conflict` raised by the goTreeSitterParser
+// workstream for the operator decision that gated this gating.
 package ast
 
 import (

@@ -70,8 +70,8 @@ BEGIN
             ON CONFLICT (id) DO NOTHING;
 
         ELSE
-            RAISE WARNING 'unknown target_table: %', frame.target_table;
-            CONTINUE;  -- skip marking as replayed so the row stays pending
+            RAISE WARNING 'unknown target_table: % (wal_inbox.id=%)', frame.target_table, frame.id;
+            CONTINUE;
         END IF;
 
         -- Mark frame as replayed.

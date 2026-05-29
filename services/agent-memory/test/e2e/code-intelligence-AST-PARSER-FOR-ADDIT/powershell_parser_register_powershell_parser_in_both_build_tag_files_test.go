@@ -12,16 +12,6 @@ import (
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/repoindexer/ast"
 )
 
-// requireEnv skips the test when a required env var is unset.
-func requireEnv(t *testing.T, name string) string {
-	t.Helper()
-	v := os.Getenv(name)
-	if v == "" {
-		t.Skipf("required env var %s is not set", name)
-	}
-	return v
-}
-
 // ---------------------------------------------------------------------------
 // Mock writer — implements ast.Writer, records calls
 // ---------------------------------------------------------------------------

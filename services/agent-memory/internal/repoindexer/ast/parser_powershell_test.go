@@ -11,7 +11,9 @@ package ast
 
 import (
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -66,15 +68,20 @@ func TestPowerShellParser_Interface_Wired(t *testing.T) {
 	}
 }
 
-// TestPowerShellParser_Registered_InBothBuildTags is a smoke
+// TestPowerShellParser_RegisteredInActiveBuild is a smoke
 // test for the parsers_cgo.go / parsers_nocgo.go
 // `defaultParsers()` registration. Whichever build tag is
 // active at compile time, the dispatcher's default parser set
 // MUST contain a parser whose `Language() == "powershell"` so
 // `.ps1` / `.psm1` / `.psd1` files route through this parser.
 // This catches a regression where a future edit drops the
-// `NewPowerShellParser()` entry from one of the two files.
-func TestPowerShellParser_Registered_InBothBuildTags(t *testing.T) {
+// `NewPowerShellParser()` entry from the file selected by the
+// current build tag. Coverage of the OTHER build tag's file
+// in the same test binary lives in the sister test
+// `TestPowerShellParser_RegisteredInBothBuildTagSources`,
+// which reads both source files directly so a one-binary
+// `go test` provably exercises both registration paths.
+func TestPowerShellParser_RegisteredInActiveBuild(t *testing.T) {
 	parsers := defaultParsers()
 	for _, p := range parsers {
 		if p.Language() == "powershell" {
@@ -86,6 +93,53 @@ func TestPowerShellParser_Registered_InBothBuildTags(t *testing.T) {
 		}
 	}
 	t.Errorf("defaultParsers() missing a powershell parser; got %d entries", len(parsers))
+}
+
+// TestPowerShellParser_RegisteredInBothBuildTagSources is the
+// structural complement to `TestPowerShellParser_RegisteredInActiveBuild`.
+// A single compiled test binary can only load one of
+// `parsers_cgo.go` / `parsers_nocgo.go` (the `//go:build cgo`
+// vs `//go:build !cgo` tags are mutually exclusive), so a
+// runtime-only assertion against `defaultParsers()` can NEVER
+// prove both files register `NewPowerShellParser()`. This test
+// closes that gap by reading both source files from the
+// repository tree and verifying each contains the literal
+// `NewPowerShellParser()` call. A regression that drops the
+// entry from EITHER file fails this test on every host,
+// regardless of which build tag the binary was compiled with.
+func TestPowerShellParser_RegisteredInBothBuildTagSources(t *testing.T) {
+	// Resolve a path that works whether the test runs from the
+	// package directory (the normal `go test` working
+	// directory) or from a parent (some IDE runners).
+	candidates := []string{
+		".",                                                 // services/.../ast (default)
+		filepath.Join("internal", "repoindexer", "ast"),     // services/agent-memory
+		filepath.Join("services", "agent-memory",            // repo root
+			"internal", "repoindexer", "ast"),
+	}
+	var astDir string
+	for _, c := range candidates {
+		if _, err := os.Stat(filepath.Join(c, "parsers_cgo.go")); err == nil {
+			astDir = c
+			break
+		}
+	}
+	if astDir == "" {
+		t.Fatalf("cannot locate ast package directory from cwd; tried %v", candidates)
+	}
+	for _, name := range []string{"parsers_cgo.go", "parsers_nocgo.go"} {
+		path := filepath.Join(astDir, name)
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if !strings.Contains(string(src), "NewPowerShellParser()") {
+			t.Errorf("%s does NOT contain literal `NewPowerShellParser()`; "+
+				"PowerShell parser must register under both build tags "+
+				"(architecture.md §6.3 — pwsh subprocess has no CGO dependency)",
+				name)
+		}
+	}
 }
 
 // powershellFixture is the canonical PowerShell file the
@@ -137,11 +191,19 @@ function Format-Hello {
 }
 `
 
-// TestPowerShellFixture_EmitsExpectedNodeAndEdgeSet pins the
-// Stage 6.3 fixture acceptance. We assert directly on
-// `ParseResult` (rather than the full dispatcher node/edge
-// pipeline, which lives behind `//go:build canonical_dispatcher`):
+// TestPowerShellFixture_EmitsExpectedParseResult pins the
+// parser-level shape the embedded extraction script must
+// produce for the canonical fixture. This is a
+// PARSER-LEVEL assertion only (it does NOT exercise the
+// dispatcher's node/edge materialisation pipeline); the
+// dispatcher-level assertions for the same fixture
+// (contains / static_calls / imports edges, dot-source
+// drop) live in `parser_powershell_dispatcher_test.go`
+// behind the `//go:build canonical_dispatcher` tag AND
+// run pwsh-independently via a stub parser so a CI host
+// without `pwsh` still gets full dispatcher coverage.
 //
+// What this test pins:
 //   - Exactly 1 class node `Greeter` with Kind=="class".
 //   - Exactly 3 method nodes: `Greeter.Format`,
 //     `Greeter.Greet`, and `Format-Hello`. The two class
@@ -154,8 +216,12 @@ function Format-Hello {
 //     `LangMeta["module_kind"]` slugs.
 //
 // Gates on `exec.LookPath("pwsh")` so a PowerShell-less host
-// reports a t.Skip instead of failing.
-func TestPowerShellFixture_EmitsExpectedNodeAndEdgeSet(t *testing.T) {
+// reports a t.Skip instead of failing; the embedded script
+// regression coverage on pwsh-less hosts is handled by
+// `TestPowerShellEnvelope_ToParseResult_MapsAllFields`
+// (synthetic envelope -> ParseResult mapping, no pwsh
+// required).
+func TestPowerShellFixture_EmitsExpectedParseResult(t *testing.T) {
 	if _, err := exec.LookPath("pwsh"); err != nil {
 		t.Skip("pwsh not on PATH")
 	}
@@ -284,30 +350,234 @@ function Bar {
 // TestPowerShellParser_Timeout_ReturnsNonSentinelError pins
 // the Stage 6.1 acceptance scenario "pwsh timeout returns
 // error not sentinel". We point `pwshBin` at the real pwsh
-// AND set the per-call timeout to a tiny value; the embedded
-// extraction script sleeps via `Start-Sleep` long enough to
-// blow past the deadline. The returned error MUST NOT wrap
-// `ErrParserUnavailable` so the dispatcher falls through to
+// AND set the per-call timeout to a value so small that the
+// `context.WithTimeout` deadline is GUARANTEED to fire before
+// the subprocess could possibly emit JSON, regardless of how
+// warm pwsh's startup cache is.
+//
+// Determinism: `timeout: 1 * time.Nanosecond` makes the ctx
+// already-expired by the time `exec.CommandContext.Run()` is
+// reached. The runtime detects the cancelled context, kills
+// the subprocess (or never starts it), and `Run()` returns a
+// non-nil error. Our `Parse()` then inspects `ctx.Err()`,
+// finds `context.DeadlineExceeded`, and returns the
+// "subprocess timeout" wrapper — un-wrapped from
+// `ErrParserUnavailable` so `safeParse` routes the failure to
 // `ast.parse.error` instead of the (misleading)
 // `ast.dispatch.skip{reason="pwsh_not_available"}` branch.
 //
+// Replaces the prior 50ms-vs-cold-start approach (iter-2
+// evaluator finding #5: "timing-sensitive and potentially
+// flaky on faster or warmed environments"). The 1ns timeout
+// is deterministic on every host.
+//
 // Skipped if `pwsh` is not on PATH because the test needs to
-// actually launch the subprocess.
+// actually launch the subprocess to reach the timeout branch
+// (the no-pwsh path returns the sentinel before any context
+// work happens).
 func TestPowerShellParser_Timeout_ReturnsNonSentinelError(t *testing.T) {
 	bin, err := exec.LookPath("pwsh")
 	if err != nil {
 		t.Skip("pwsh not on PATH")
 	}
-	// 50 ms is well below pwsh's cold-start time on every
-	// supported host, so the subprocess hits the context
-	// deadline before it ever reaches our extraction script.
-	p := &powershellParser{pwshBin: bin, timeout: 50 * time.Millisecond}
+	p := &powershellParser{pwshBin: bin, timeout: 1 * time.Nanosecond}
 	_, err = p.Parse("foo.ps1", []byte("function Foo {}"))
 	if err == nil {
 		t.Fatal("Parse returned nil error on timeout")
 	}
 	if errors.Is(err, ErrParserUnavailable) {
 		t.Errorf("Parse returned wrapped ErrParserUnavailable on timeout; want plain error so safeParse routes to ast.parse.error")
+	}
+}
+
+// TestPowerShellEnvelope_ToParseResult_MapsAllFields pins
+// the JSON-envelope -> `ParseResult` mapping that the
+// subprocess `Parse()` path relies on. The test runs WITHOUT
+// `pwsh` (so it executes on every CI host) by constructing
+// a synthetic `powershellEnvelope` directly — the same shape
+// the embedded extraction script writes to stdout — and
+// asserting the dispatcher-facing `ParseResult` carries the
+// expected classes / methods / imports with the correct
+// canonical names, enclosing classes, base-type split,
+// module-kind metadata, member-access conversion, and
+// dedup behaviour.
+//
+// This addresses iter-2 evaluator finding #4: "substantive
+// extraction tests all skip when pwsh is unavailable,
+// leaving CI hosts without PowerShell to validate only
+// constructor/sentinel/registration behavior and not [...]
+// JSON mapping". Together with the structural dispatcher
+// tests in `parser_powershell_dispatcher_test.go`, this
+// gives a pwsh-less host full coverage of the
+// pwsh-independent parser surface.
+func TestPowerShellEnvelope_ToParseResult_MapsAllFields(t *testing.T) {
+	env := powershellEnvelope{
+		Types: []psTypeRecord{{
+			Name:      "Greeter",
+			Kind:      "class",
+			BaseTypes: []string{"BaseClass", "IFormatter"},
+			StartLine: 5,
+			EndLine:   12,
+			Methods: []psMethodRecord{{
+				Name:            "Format",
+				Params:          "[string]$name",
+				StartLine:       6,
+				EndLine:         8,
+				BodyStartLine:   6,
+				BodyEndLine:     8,
+				BodyStartOffset: 100,
+				BodyEndOffset:   130,
+				BodyText:        "{ return $name }",
+				Modifiers:       []string{"hidden"},
+				Calls:           []string{"Write-Host", "Write-Host"}, // dedup
+				MemberAccesses:  []psMemberAccessRecord{{Name: "Prefix", IsWrite: false}},
+			}, {
+				Name:            "Greet",
+				Params:          "[string]$name",
+				StartLine:       9,
+				EndLine:         11,
+				BodyStartLine:   9,
+				BodyEndLine:     11,
+				BodyStartOffset: 200,
+				BodyEndOffset:   230,
+				BodyText:        "{ return $this.Format($name) }",
+				ReceiverCalls:   []string{"Format"},
+			}},
+		}},
+		Functions: []psFunctionRecord{{
+			Name:            "Format-Hello",
+			Params:          "[string]$Name",
+			StartLine:       14,
+			EndLine:         16,
+			BodyStartLine:   14,
+			BodyEndLine:     16,
+			BodyStartOffset: 300,
+			BodyEndOffset:   330,
+			BodyText:        "{ return \"hi $Name\" }",
+			Calls:           []string{"Write-Host"},
+		}},
+		Imports: []psImportRecord{{
+			Module:     "Foo",
+			ModuleKind: "Import-Module",
+			Line:       2,
+		}, {
+			Module:     "Bar",
+			ModuleKind: "using_module",
+			Line:       1,
+		}, {
+			Module:     "./helpers.ps1",
+			ModuleKind: "dot_source",
+			Line:       3,
+		}, {
+			Module:     "PSScriptAnalyzer",
+			ModuleKind: "command_call",
+			CmdletVerb: "Invoke",
+			Line:       4,
+		}},
+	}
+
+	res := env.toParseResult()
+
+	// Class.
+	if got, want := len(res.Classes), 1; got != want {
+		t.Fatalf("classes = %d; want %d", got, want)
+	}
+	c := res.Classes[0]
+	if c.QualifiedName != "Greeter" {
+		t.Errorf("class.QualifiedName = %q; want %q", c.QualifiedName, "Greeter")
+	}
+	if c.Kind != "class" {
+		t.Errorf("class.Kind = %q; want %q", c.Kind, "class")
+	}
+	if got, want := strings.Join(c.Extends, ","), "BaseClass"; got != want {
+		t.Errorf("class.Extends = %v; want [%q] (first base type splits to Extends per splitPowerShellBaseTypes)", c.Extends, want)
+	}
+	if got, want := strings.Join(c.Implements, ","), "IFormatter"; got != want {
+		t.Errorf("class.Implements = %v; want [%q] (remaining base types split to Implements)", c.Implements, want)
+	}
+
+	// Methods: 2 class methods + 1 free function = 3.
+	if got, want := len(res.Methods), 3; got != want {
+		t.Fatalf("methods = %d; want %d (%v)", got, want, methodNames(res.Methods))
+	}
+	byName := map[string]MethodDecl{}
+	for _, m := range res.Methods {
+		byName[m.QualifiedName] = m
+	}
+
+	format, ok := byName["Greeter.Format"]
+	if !ok {
+		t.Fatalf("method Greeter.Format missing; got %v", methodNames(res.Methods))
+	}
+	if format.EnclosingClass != "Greeter" {
+		t.Errorf("Greeter.Format.EnclosingClass = %q; want %q", format.EnclosingClass, "Greeter")
+	}
+	if format.ParamSignature != "[string]$name" {
+		t.Errorf("Greeter.Format.ParamSignature = %q; want %q", format.ParamSignature, "[string]$name")
+	}
+	if format.BodySource != " return $name " {
+		t.Errorf("Greeter.Format.BodySource = %q; want %q (outer { } stripped by stripPowerShellBraces)", format.BodySource, " return $name ")
+	}
+	if format.BodyStartByte != 101 || format.BodyEndByte != 128 {
+		t.Errorf("Greeter.Format body offsets = (%d, %d); want (101, 128) — brace-stripping shifts by 1 on each side", format.BodyStartByte, format.BodyEndByte)
+	}
+	// Modifiers preserved.
+	if !containsString(format.Modifiers, "hidden") {
+		t.Errorf("Greeter.Format.Modifiers = %v; want to include \"hidden\"", format.Modifiers)
+	}
+	// dedupeStrings collapsed the duplicate Write-Host call.
+	if got, want := len(format.Calls), 1; got != want {
+		t.Errorf("Greeter.Format.Calls = %v; want exactly 1 entry after dedupe (input had 2x Write-Host)", format.Calls)
+	}
+	if len(format.Calls) > 0 && format.Calls[0] != "Write-Host" {
+		t.Errorf("Greeter.Format.Calls[0] = %q; want %q", format.Calls[0], "Write-Host")
+	}
+	// MemberAccesses converted from psMemberAccessRecord -> MemberAccess.
+	if !containsMemberAccessName(format.MemberAccesses, "Prefix") {
+		t.Errorf("Greeter.Format.MemberAccesses = %v; want to include {Name:\"Prefix\"}", format.MemberAccesses)
+	}
+
+	greet, ok := byName["Greeter.Greet"]
+	if !ok {
+		t.Fatalf("method Greeter.Greet missing; got %v", methodNames(res.Methods))
+	}
+	if !containsString(greet.ReceiverCalls, "Format") {
+		t.Errorf("Greeter.Greet.ReceiverCalls = %v; want to include \"Format\"", greet.ReceiverCalls)
+	}
+
+	free, ok := byName["Format-Hello"]
+	if !ok {
+		t.Fatalf("method Format-Hello missing; got %v", methodNames(res.Methods))
+	}
+	if free.EnclosingClass != "" {
+		t.Errorf("Format-Hello.EnclosingClass = %q; want empty (free function)", free.EnclosingClass)
+	}
+
+	// Imports: 4 entries, LangMeta carries module_kind and cmdlet_verb.
+	if got, want := len(res.Imports), 4; got != want {
+		t.Fatalf("imports = %d; want %d", got, want)
+	}
+	importsByMod := indexImportsByModule(res.Imports)
+	for mod, wantKind := range map[string]string{
+		"Foo":              "Import-Module",
+		"Bar":              "using_module",
+		"./helpers.ps1":    "dot_source",
+		"PSScriptAnalyzer": "command_call",
+	} {
+		imp, ok := importsByMod[mod]
+		if !ok {
+			t.Errorf("import for module %q missing; got modules %v", mod, importModules(res.Imports))
+			continue
+		}
+		if got := langMetaString(imp, "module_kind"); got != wantKind {
+			t.Errorf("import %q LangMeta.module_kind = %q; want %q", mod, got, wantKind)
+		}
+		if imp.Path != imp.Module {
+			t.Errorf("import %q Path = %q; want == Module (%q)", mod, imp.Path, imp.Module)
+		}
+	}
+	if got := langMetaString(importsByMod["PSScriptAnalyzer"], "cmdlet_verb"); got != "Invoke" {
+		t.Errorf("PSScriptAnalyzer LangMeta.cmdlet_verb = %q; want %q (command_call carries the verb)", got, "Invoke")
 	}
 }
 

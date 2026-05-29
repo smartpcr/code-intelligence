@@ -20,7 +20,9 @@ func clearCleanCodeEnv(t *testing.T) {
 		EnvGateDegradedPolicy,
 		EnvPolicySigningRequired,
 		EnvRefactorEffortSource,
-		EnvRefactorEffortModelURI,
+		EnvEffortSourceAlias,
+		EnvMLModelURI,
+		EnvMLModelVersion,
 		EnvHTTPAddr,
 		EnvPrometheusAddr,
 		EnvOTelEndpoint,
@@ -101,6 +103,95 @@ func TestLoad_NoEnvReturnsDefaults(t *testing.T) {
 	}
 	if cfg.RefactorEffortSource != "ML model from historical commits" {
 		t.Errorf("RefactorEffortSource = %q; want %q", cfg.RefactorEffortSource, "ML model from historical commits")
+	}
+	if cfg.MLModelURI != "" {
+		t.Errorf("MLModelURI = %q; want empty when env unset", cfg.MLModelURI)
+	}
+	if cfg.MLModelVersion != "" {
+		t.Errorf("MLModelVersion = %q; want empty when env unset", cfg.MLModelVersion)
+	}
+}
+
+// TestLoad_MLEffortEnvOverrides verifies the Stage 9.3 ML
+// effort-model env wiring (CLEAN_CODE_ML_MODEL_URI /
+// CLEAN_CODE_ML_MODEL_VERSION) populates the matching Config
+// fields. These fields are consumed by
+// refactor.NewEffortModelFromConfig at refactor-planner
+// composition-root time.
+func TestLoad_MLEffortEnvOverrides(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvMLModelURI, "file:///models/effort_model.onnx")
+	t.Setenv(EnvMLModelVersion, "1.0.0")
+	t.Setenv(EnvPGURL, "postgres://x")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: unexpected error: %v", err)
+	}
+	if cfg.MLModelURI != "file:///models/effort_model.onnx" {
+		t.Errorf("MLModelURI = %q; want file:///models/effort_model.onnx", cfg.MLModelURI)
+	}
+	if cfg.MLModelVersion != "1.0.0" {
+		t.Errorf("MLModelVersion = %q; want 1.0.0", cfg.MLModelVersion)
+	}
+}
+
+// TestLoad_EffortSourceAliasPopulatesField verifies the
+// compose-shorthand CLEAN_CODE_EFFORT_SOURCE populates
+// RefactorEffortSource when the canonical env var is not set
+// (the docker-compose stack at
+// tests/e2e/phase-08-refactor-planner/docker-compose.yml:30
+// uses the short form).
+func TestLoad_EffortSourceAliasPopulatesField(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvEffortSourceAlias, "ml")
+	t.Setenv(EnvPGURL, "postgres://x")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: unexpected error: %v", err)
+	}
+	if cfg.RefactorEffortSource != "ml" {
+		t.Errorf("RefactorEffortSource = %q; want \"ml\" (from alias)", cfg.RefactorEffortSource)
+	}
+}
+
+// TestLoad_CanonicalEffortSourceBeatsAlias verifies the
+// canonical CLEAN_CODE_REFACTOR_EFFORT_SOURCE wins when both
+// it and the alias CLEAN_CODE_EFFORT_SOURCE are set. The
+// operator's explicit canonical pin MUST NOT be silently
+// overridden by a compose default.
+func TestLoad_CanonicalEffortSourceBeatsAlias(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvRefactorEffortSource, "heuristic")
+	t.Setenv(EnvEffortSourceAlias, "ml")
+	t.Setenv(EnvPGURL, "postgres://x")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: unexpected error: %v", err)
+	}
+	if cfg.RefactorEffortSource != "heuristic" {
+		t.Errorf("RefactorEffortSource = %q; want \"heuristic\" (canonical wins over alias)", cfg.RefactorEffortSource)
+	}
+}
+
+// TestLoad_CanonicalEffortSourceAtDefaultValueBeatsAlias is the
+// edge case where the operator explicitly sets the canonical
+// env to the architecture-default string. A naive "if cfg
+// field is at default, accept alias" check would let the alias
+// stomp on the operator's deliberate canonical pin. We instead
+// consult the override map so the canonical's presence (not
+// its value) wins.
+func TestLoad_CanonicalEffortSourceAtDefaultValueBeatsAlias(t *testing.T) {
+	clearCleanCodeEnv(t)
+	t.Setenv(EnvRefactorEffortSource, DefaultRefactorEffortSource)
+	t.Setenv(EnvEffortSourceAlias, "zero")
+	t.Setenv(EnvPGURL, "postgres://x")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: unexpected error: %v", err)
+	}
+	if cfg.RefactorEffortSource != DefaultRefactorEffortSource {
+		t.Errorf("RefactorEffortSource = %q; want %q (canonical at default value still wins over alias)",
+			cfg.RefactorEffortSource, DefaultRefactorEffortSource)
 	}
 }
 

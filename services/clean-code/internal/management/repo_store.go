@@ -301,6 +301,31 @@ type RepoStore interface {
 	SetRepoMode(ctx context.Context, req SetRepoModeRequest) (SetRepoModeResult, error)
 }
 
+// RepoModeReader is the narrow read-only seam consumed by
+// the Stage 9.3 [isolation.ModeCoordinator] hydrator hook:
+// the coordinator caches per-repo mode state lazily and
+// calls into a [RepoModeReader] on the first
+// `BeginScan(repoID)` or `SetMode(repoID, ...)` for a
+// previously-unseen repo, so production callers do NOT
+// need to pre-seed the coordinator at startup.
+//
+// Defined as a separate interface (NOT a method on
+// [RepoStore]) so future store implementations can satisfy
+// the reader hook WITHOUT also implementing the full
+// write-side [RepoStore] surface -- the read-only path is
+// load-bearing for the coordinator's correctness but
+// optional for early-bring-up callers that want only the
+// SetRepoMode/RegisterRepo verbs.
+//
+// Returns [ErrRepoStoreUnknownRepo] when the row is not
+// known; the coordinator translates that to
+// [isolation.ErrModeNotHydrated] so the scan caller sees
+// a typed "not registered" error rather than a silent
+// default-to-embedded path.
+type RepoModeReader interface {
+	ReadRepoMode(ctx context.Context, repoID uuid.UUID) (string, error)
+}
+
 // repoStoreRecord is the in-memory shape of one persisted
 // `clean_code.repo` row. The store owns this slice; tests
 // inspect via [InMemoryRepoStore.Rows].
@@ -581,8 +606,37 @@ func (s *InMemoryRepoStore) Count() int {
 	return len(s.rows)
 }
 
+// ReadRepoMode returns the persisted mode for `repoID`.
+// Satisfies [RepoModeReader] -- the narrow interface the
+// Stage 9.3 `isolation.ModeCoordinator` ModeHydrator hook
+// consults to lazily hydrate per-repo mode state on the
+// first `BeginScan` / `SetMode` for a repo. Returns
+// [ErrRepoStoreUnknownRepo] when the row is not known so
+// the hydrator can surface `isolation.ErrModeNotHydrated`
+// to the scan caller (the brief mandates an explicit
+// hydration step rather than defaulting to `embedded`,
+// because a coordinator cold-start defaulting to embedded
+// would mask a persisted `linked` row and silently send
+// the wrong adapter mode to the scan).
+func (s *InMemoryRepoStore) ReadRepoMode(ctx context.Context, repoID uuid.UUID) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if repoID == uuid.Nil {
+		return "", ErrRepoStoreZeroRepoID
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx, ok := s.byRepoID[repoID]
+	if !ok {
+		return "", ErrRepoStoreUnknownRepo
+	}
+	return s.rows[idx].Mode, nil
+}
+
 // Compile-time interface guard.
 var _ RepoStore = (*InMemoryRepoStore)(nil)
+var _ RepoModeReader = (*InMemoryRepoStore)(nil)
 
 // deriveDisplayNameFromURL extracts a friendly label from a
 // repo URL by taking the LAST non-empty path segment and

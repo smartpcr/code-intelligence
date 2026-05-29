@@ -17,11 +17,18 @@ services:
       retries: 10
 
   refactor-planner:
+    # Stage 9.3 iter-9: SERVICE now resolves to the dedicated
+    # `clean-code-refactor-planner` binary (the metric-ingestor
+    # binary refuses to act as the refactor planner -- see
+    # cmd/clean-code-metric-ingestor/main.go validateServiceRole).
+    # The ROLE build arg is kept as an observability label so
+    # operators reading the image manifest see the deployment
+    # intent.
     build:
       context: ../../../services/clean-code
       dockerfile: Dockerfile
       args:
-        SERVICE: clean-code-metric-ingestor
+        SERVICE: clean-code-refactor-planner
         ROLE: refactor-planner
     environment:
       CLEAN_CODE_PG_URL: "postgres://postgres:postgres@postgres:5432/clean_code?sslmode=disable"
@@ -30,6 +37,13 @@ services:
       CLEAN_CODE_EFFORT_SOURCE: "ml"
       CLEAN_CODE_ML_MODEL_URI: "file:///models/effort_model.onnx"
       CLEAN_CODE_ML_MODEL_VERSION: "1.0.0"
+      # Stage 9.3 iter-9: long-running HTTP server mode so the
+      # E2E suite can drive /v1/planner/run requests instead of
+      # restarting the container per scenario. The handler reads
+      # repo_id + sha from the request body; the env-pinned
+      # CLEAN_CODE_REFACTOR_PLANNER_REPO_ID / _SHA are NOT
+      # required in this mode.
+      CLEAN_CODE_REFACTOR_PLANNER_HTTP: "true"
     ports:
       - "8080"
     depends_on:
@@ -65,3 +79,4 @@ services:
     ports:
       - "4317"
       - "8889"
+

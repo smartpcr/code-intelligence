@@ -74,14 +74,17 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -112,6 +115,22 @@ const (
 	// environments that don't have the hot_spot /
 	// refactor_plan / refactor_task schema yet.
 	EnvDisableRefactorPlanner = "CLEAN_CODE_DISABLE_REFACTOR_PLANNER"
+
+	// EnvHTTPServerMode toggles the multi-shot HTTP server
+	// mode. When set to a truthy value the binary does NOT
+	// require [EnvRepoID] / [EnvSHA] at startup and instead
+	// listens for POST /v1/planner/run requests. Each request
+	// supplies its own (repo_id, sha) target in the JSON body
+	// and the handler invokes [executeTwoPassPlan]. The PG
+	// handle + [refactor.EffortModel] are constructed ONCE at
+	// boot and shared across requests so per-request latency
+	// is bounded by Postgres round-trips, not model loading.
+	//
+	// This is the E2E + integration entrypoint: it lets the
+	// docker-compose stack hold a long-running planner that
+	// the test harness can drive without spawning a K8s Job
+	// per scenario.
+	EnvHTTPServerMode = "CLEAN_CODE_REFACTOR_PLANNER_HTTP"
 )
 
 func main() {
@@ -165,14 +184,29 @@ func run() int {
 	}
 
 	disabled := parseBoolEnv(os.Getenv(EnvDisableRefactorPlanner))
+	httpMode := parseBoolEnv(os.Getenv(EnvHTTPServerMode))
 
-	// /healthz listener is ALWAYS on so K8s liveness probes
-	// succeed even on an opted-out deployment. Match the
-	// aggregator + metric_ingestor pattern.
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
+
+	// Wire the cancel chain: SIGTERM / SIGINT -> ctx cancel.
+	ctx, cancel := signal.NotifyContext(context.Background(),
+		syscall.SIGTERM, syscall.SIGINT)
+	defer cancel()
+
+	// HTTP-server mode: long-running, multi-shot. The binary
+	// stays alive serving /v1/planner/run; each request supplies
+	// its own (repo_id, sha) target. This is the E2E +
+	// integration entrypoint.
+	if httpMode && !disabled {
+		return runHTTPMode(ctx, cfg, logger, port)
+	}
+
+	// /healthz listener is ALWAYS on so K8s liveness probes
+	// succeed even on an opted-out deployment. Match the
+	// aggregator + metric_ingestor pattern.
 	srv := &http.Server{
 		Addr:              ":" + port,
 		Handler:           buildMux(),
@@ -181,11 +215,6 @@ func run() int {
 	httpErrCh := make(chan error, 1)
 	go func() { httpErrCh <- srv.ListenAndServe() }()
 	logger.Info("clean-code-refactor-planner: listening", "addr", srv.Addr)
-
-	// Wire the cancel chain: SIGTERM / SIGINT -> ctx cancel.
-	ctx, cancel := signal.NotifyContext(context.Background(),
-		syscall.SIGTERM, syscall.SIGINT)
-	defer cancel()
 
 	exitCode := 0
 	if disabled {
@@ -204,7 +233,7 @@ func run() int {
 				exitCode = 1
 			} else {
 				defer db.Close()
-				planRes, taskRes, pErr := runPlanner(ctx, db, logger, repoID, sha, effortModel)
+				planRes, taskRes, pErr := runPlanner(ctx, cfg, db, logger, repoID, sha)
 				if pErr != nil {
 					if errors.Is(pErr, context.Canceled) ||
 						errors.Is(pErr, context.DeadlineExceeded) {
@@ -261,6 +290,229 @@ func run() int {
 		logger.Warn("clean-code-refactor-planner: http listener did not stop within shutdown timeout")
 	}
 	return exitCode
+}
+
+// runHTTPMode runs the planner as a long-running HTTP server
+// that accepts /v1/planner/run requests. The PG handle +
+// [refactor.EffortModel] are constructed ONCE at boot so
+// per-request latency reflects Postgres round-trips, not model
+// loading / config parsing.
+//
+// Exit codes:
+//
+//   - 0 -- the server returned cleanly (SIGTERM / SIGINT).
+//   - 1 -- a fatal startup error (PG unreachable, ML model
+//     artefact missing, EffortModel construction failed,
+//     listener bind failed).
+//
+// Per-request errors are logged + surfaced in the HTTP response
+// envelope; they do NOT exit the server.
+func runHTTPMode(ctx context.Context, cfg config.Config, logger *slog.Logger, port string) int {
+	db, dbErr := openAndPingDB(ctx, cfg.PostgresURL, "refactor-planner")
+	if dbErr != nil {
+		logger.Error("clean-code-refactor-planner: open db", "err", dbErr)
+		return 1
+	}
+	defer db.Close()
+
+	// The EffortModel is constructed at boot so a missing
+	// artefact (ErrMLModelArtefactInvalid) or a missing pin
+	// (ErrMLModelURIMissing / ErrMLModelVersionMissing) is a
+	// fail-fast at startup -- the operator sees the typed
+	// error in the boot log rather than per-request 500s with
+	// the same message duplicated thousands of times.
+	effortModel, emErr := refactor.NewEffortModelFromConfig(refactor.EffortModelConfig{
+		Source:         cfg.RefactorEffortSource,
+		MLModelURI:     cfg.MLModelURI,
+		MLModelVersion: cfg.MLModelVersion,
+	})
+	if emErr != nil {
+		logger.Error("clean-code-refactor-planner: EffortModel construction failed",
+			"err", emErr,
+			"effort_source", cfg.RefactorEffortSource,
+			"ml_uri_set", cfg.MLModelURI != "",
+			"ml_version_set", cfg.MLModelVersion != "",
+		)
+		return 1
+	}
+	logger.Info("clean-code-refactor-planner: HTTP mode effort model wired",
+		"source", cfg.RefactorEffortSource,
+		"ml_model_uri_set", cfg.MLModelURI != "",
+		"ml_model_version_set", cfg.MLModelVersion != "",
+	)
+
+	handler := &plannerRunHandler{
+		cfg:         cfg,
+		db:          db,
+		logger:      logger,
+		effortModel: effortModel,
+	}
+
+	mux := buildMux()
+	mux.Handle("/v1/planner/run", handler)
+
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	httpErrCh := make(chan error, 1)
+	go func() { httpErrCh <- srv.ListenAndServe() }()
+	logger.Info("clean-code-refactor-planner: HTTP mode listening",
+		"addr", srv.Addr,
+		"endpoint", "/v1/planner/run")
+
+	<-ctx.Done()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("clean-code-refactor-planner: HTTP mode shutdown error", "err", err)
+	}
+	select {
+	case err := <-httpErrCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Warn("clean-code-refactor-planner: HTTP mode listener exited", "err", err)
+			return 1
+		}
+	case <-shutdownCtx.Done():
+	}
+	return 0
+}
+
+// plannerRunHandler implements POST /v1/planner/run. The
+// handler is serialized via plannerMu so two concurrent E2E
+// scenarios can't tear each other's state -- the per-request
+// latency budget is dominated by PG anyway, so the mutex
+// is not a throughput concern.
+type plannerRunHandler struct {
+	cfg         config.Config
+	db          *sql.DB
+	logger      *slog.Logger
+	effortModel refactor.EffortModel
+
+	plannerMu sync.Mutex
+}
+
+type plannerRunRequest struct {
+	RepoID string `json:"repo_id"`
+	SHA    string `json:"sha"`
+}
+
+type plannerRunResponse struct {
+	Status          string `json:"status"`
+	RepoID          string `json:"repo_id"`
+	SHA             string `json:"sha"`
+	PolicyVersionID string `json:"policy_version_id,omitempty"`
+	HotSpotsWritten int    `json:"hot_spots_written,omitempty"`
+	TasksEmitted    int    `json:"tasks_emitted,omitempty"`
+	PlanID          string `json:"plan_id,omitempty"`
+	Reason          string `json:"reason,omitempty"`
+	Error           string `json:"error,omitempty"`
+	ErrorCategory   string `json:"error_category,omitempty"`
+}
+
+func (h *plannerRunHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writePlannerJSON(w, http.StatusMethodNotAllowed, plannerRunResponse{
+			Status: "error",
+			Error:  "method not allowed; use POST",
+		})
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64*1024))
+	if err != nil {
+		writePlannerJSON(w, http.StatusBadRequest, plannerRunResponse{
+			Status: "error",
+			Error:  fmt.Sprintf("read body: %v", err),
+		})
+		return
+	}
+	var req plannerRunRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writePlannerJSON(w, http.StatusBadRequest, plannerRunResponse{
+			Status: "error",
+			Error:  fmt.Sprintf("decode body: %v", err),
+		})
+		return
+	}
+	repoRaw := strings.TrimSpace(req.RepoID)
+	sha := strings.TrimSpace(req.SHA)
+	if repoRaw == "" || sha == "" {
+		writePlannerJSON(w, http.StatusBadRequest, plannerRunResponse{
+			Status: "error",
+			Error:  "repo_id and sha are required",
+		})
+		return
+	}
+	repoID, err := uuid.FromString(repoRaw)
+	if err != nil || repoID == uuid.Nil {
+		writePlannerJSON(w, http.StatusBadRequest, plannerRunResponse{
+			Status: "error",
+			Error:  fmt.Sprintf("repo_id %q is not a valid UUID", repoRaw),
+		})
+		return
+	}
+
+	h.plannerMu.Lock()
+	defer h.plannerMu.Unlock()
+
+	planRes, taskRes, pErr := runPlannerWithEffortModel(
+		r.Context(), h.cfg, h.db, h.logger, h.effortModel, repoID, sha)
+
+	resp := plannerRunResponse{RepoID: repoID.String(), SHA: sha}
+	if pErr != nil {
+		category := classifyPlannerError(pErr)
+		resp.Status = "error"
+		resp.Error = pErr.Error()
+		resp.ErrorCategory = category
+		status := http.StatusInternalServerError
+		if category == "version-mismatch" || category == "ml-model" {
+			status = http.StatusUnprocessableEntity
+		}
+		writePlannerJSON(w, status, resp)
+		return
+	}
+	if taskRes.Plan.PlanID == uuid.Nil {
+		resp.Status = "no-op"
+		resp.Reason = "no active policy"
+		writePlannerJSON(w, http.StatusOK, resp)
+		return
+	}
+	resp.Status = "ok"
+	resp.PolicyVersionID = planRes.PolicyVersionID.String()
+	resp.HotSpotsWritten = len(planRes.HotSpots)
+	resp.TasksEmitted = len(taskRes.Tasks)
+	resp.PlanID = taskRes.Plan.PlanID.String()
+	writePlannerJSON(w, http.StatusOK, resp)
+}
+
+// classifyPlannerError maps a planner-side error to a stable
+// category string the E2E harness can branch on without
+// parsing free-form text. Categories track the architecture
+// Sec 8.3 failure taxonomy.
+func classifyPlannerError(err error) string {
+	switch {
+	case errors.Is(err, refactor.ErrMLModelVersionMismatch):
+		return "version-mismatch"
+	case errors.Is(err, refactor.ErrMLModelURIMissing),
+		errors.Is(err, refactor.ErrMLModelVersionMissing),
+		errors.Is(err, refactor.ErrMLModelArtefactInvalid),
+		errors.Is(err, refactor.ErrUnknownEffortSource),
+		errors.Is(err, refactor.ErrNilEffortModel),
+		errors.Is(err, refactor.ErrInvalidEffortEstimate):
+		return "ml-model"
+	case errors.Is(err, context.Canceled),
+		errors.Is(err, context.DeadlineExceeded):
+		return "cancelled"
+	default:
+		return "internal"
+	}
+}
+
+func writePlannerJSON(w http.ResponseWriter, status int, body plannerRunResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 // parseTargetEnv reads + validates [EnvRepoID] and [EnvSHA].
@@ -427,41 +679,67 @@ func executeTwoPassPlan(
 }
 
 // runPlanner composes Stage 8.1 + Stage 8.2 against the supplied
-// db and invokes the two-pass sequence in order. The Stage 8.2
-// pass uses [refactor.TaskPlanner.PlanFromSnapshot] with the
-// Stage 8.1 [PlanResult.Snapshot] so the two passes pin the
-// SAME `policy_version_id` -- the race-safe wiring the
-// architecture Sec 5.5.1 reproducibility invariant requires.
-//
-// When `effortModel != nil` the Stage 8.3 estimator is wired
-// into the Stage 8.2 TaskPlanner via
-// [refactor.WithEffortEstimator]; emitted
-// `refactor_task.effort_hours` carries the model's estimate.
-// When `effortModel == nil` (operator pin
-// `refactor-effort-source=none`) the Stage 8.2 byte-identical
-// `effort_hours = 0.0` placeholder is preserved.
-//
-// The function is a thin SQL-wiring adapter over
-// [executeTwoPassPlan]; the two-pass orchestration itself is
-// pinned by `TestExecuteTwoPassPlan_*` cases.
+// db and invokes the two-pass sequence in order. Resolves the
+// [refactor.EffortModel] from cfg, then delegates to
+// [runPlannerWithEffortModel] so the HTTP server mode can
+// reuse a single shared model across requests.
 func runPlanner(
 	ctx context.Context,
+	cfg config.Config,
 	db *sql.DB,
 	logger *slog.Logger,
 	repoID uuid.UUID,
 	sha string,
+) (refactor.PlanResult, refactor.PlanAndTasksResult, error) {
+	// Stage 9.3: select the EffortModel from operator-pinned
+	// envs so refactor_task.effort_hours carries a real
+	// estimate rather than the legacy 0.0 placeholder.
+	effortModel, err := refactor.NewEffortModelFromConfig(refactor.EffortModelConfig{
+		Source:         cfg.RefactorEffortSource,
+		MLModelURI:     cfg.MLModelURI,
+		MLModelVersion: cfg.MLModelVersion,
+	})
+	if err != nil {
+		return refactor.PlanResult{}, refactor.PlanAndTasksResult{},
+			fmt.Errorf("refactor.NewEffortModelFromConfig: %w", err)
+	}
+	logger.Info("clean-code-refactor-planner: effort model wired",
+		"source", cfg.RefactorEffortSource,
+		"ml_model_uri_set", cfg.MLModelURI != "",
+		"ml_model_version_set", cfg.MLModelVersion != "",
+	)
+	return runPlannerWithEffortModel(ctx, cfg, db, logger, effortModel, repoID, sha)
+}
+
+// runPlannerWithEffortModel is the wiring core that builds the
+// Stage 8.1 [refactor.Planner] + Stage 8.2 [refactor.TaskPlanner]
+// against the supplied db + pre-constructed [refactor.EffortModel]
+// and invokes the two-pass sequence. The Stage 8.2 pass uses
+// [refactor.TaskPlanner.PlanFromSnapshot] with the Stage 8.1
+// [PlanResult.Snapshot] so the two passes pin the SAME
+// `policy_version_id` -- the race-safe wiring the
+// architecture Sec 5.5.1 reproducibility invariant requires.
+//
+// Split out from [runPlanner] so the HTTP server mode can
+// construct the [refactor.EffortModel] ONCE at boot (so model
+// artefact / version errors fail-fast at startup) and reuse
+// it across multi-shot /v1/planner/run requests.
+func runPlannerWithEffortModel(
+	ctx context.Context,
+	cfg config.Config,
+	db *sql.DB,
+	logger *slog.Logger,
+	effortModel refactor.EffortModel,
+	repoID uuid.UUID,
+	sha string,
 	effortModel *refactor.EffortModel,
 ) (refactor.PlanResult, refactor.PlanAndTasksResult, error) {
+	_ = cfg // unused after EffortModel construction; kept for future config-driven options.
 	stewardStore, err := steward.NewSQLStore(db)
 	if err != nil {
 		return refactor.PlanResult{}, refactor.PlanAndTasksResult{},
 			fmt.Errorf("steward.NewSQLStore: %w", err)
 	}
-	// Signer: nil -- the refactor-planner binary only READS
-	// the active policy_version. It never signs anything. The
-	// steward installs an in-memory verify-only fallback when
-	// Signer is nil; production deployments are validated by
-	// the Stage 5.1 Steward bootstrap test.
 	stew, err := steward.New(steward.Config{Store: stewardStore, Signer: nil})
 	if err != nil {
 		return refactor.PlanResult{}, refactor.PlanAndTasksResult{},
@@ -469,7 +747,6 @@ func runPlanner(
 	}
 	policy := &refactor.StewardPolicyReader{Steward: stew}
 
-	// Stage 8.1 wiring.
 	planner, err := refactor.NewPlanner(
 		policy,
 		refactor.NewSQLMetricSampleReader(db),
@@ -481,20 +758,12 @@ func runPlanner(
 			fmt.Errorf("refactor.NewPlanner: %w", err)
 	}
 
-	// Stage 8.2 wiring. Note PlanFromSnapshot pins the SAME
-	// policy_version_id as the hot_spot batch we just wrote.
-	// Stage 8.3 wires the optional [refactor.EffortEstimator]
-	// when an artefact was loaded.
-	taskOpts := []refactor.TaskOption{}
-	if effortModel != nil {
-		taskOpts = append(taskOpts, refactor.WithEffortEstimator(effortModel))
-	}
 	taskPlanner, err := refactor.NewTaskPlanner(
 		policy,
 		refactor.NewSQLHotSpotReader(db),
 		refactor.NewSQLFindingDetailReader(db),
 		refactor.NewSQLRefactorPlanTaskWriter(db),
-		taskOpts...,
+		refactor.WithEffortModel(effortModel),
 	)
 	if err != nil {
 		return refactor.PlanResult{}, refactor.PlanAndTasksResult{},

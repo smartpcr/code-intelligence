@@ -232,13 +232,14 @@ type RepoEventAppender interface {
 // "verb exists, backing subsystem is down" contract pinned by
 // the Stage 5.1 keys handler).
 type MgmtWriter struct {
-	resolver   SampleResolver
-	dispatcher RetractDispatcher
-	enqueuer   RescanEnqueuer
-	appender   RepoEventAppender
-	repoStore  RepoStore
-	clock      func() time.Time
-	logger     *slog.Logger
+	resolver        SampleResolver
+	dispatcher      RetractDispatcher
+	enqueuer        RescanEnqueuer
+	appender        RepoEventAppender
+	repoStore       RepoStore
+	flipCoordinator FlipCoordinator
+	clock           func() time.Time
+	logger          *slog.Logger
 }
 
 // MgmtWriterOption configures a [MgmtWriter] at construction.
@@ -273,6 +274,28 @@ func WithMgmtWriterClock(now func() time.Time) MgmtWriterOption {
 // composition-root callers.
 func WithMgmtWriterRepoStore(store RepoStore) MgmtWriterOption {
 	return func(w *MgmtWriter) { w.repoStore = store }
+}
+
+// WithMgmtWriterFlipCoordinator wires the Stage 9.3 [FlipCoordinator]
+// so the `mgmt.set_mode` handler drains in-flight scans before
+// mutating the catalog. nil leaves the handler on its legacy
+// direct-store-call path (backward compatible with the
+// pre-Stage-9.3 wiring).
+//
+// Production wiring constructs an
+// `isolation.NewMgmtFlipCoordinator(coord)` and passes it
+// here; the coordinator MUST be the SAME one the scan path
+// uses for [isolation.ModeCoordinator.BeginScan]/EndScan,
+// otherwise the flip would drain a different set of scans
+// than the one actually in flight.
+//
+// The handler's existing 503/400/404/500 mapping is
+// unchanged; the only observable difference when this option
+// is wired is that the call BLOCKS until the coordinator's
+// per-repo `inFlight` reaches zero (the brief's "drain before
+// flip" contract from impl-plan line 804).
+func WithMgmtWriterFlipCoordinator(fc FlipCoordinator) MgmtWriterOption {
+	return func(w *MgmtWriter) { w.flipCoordinator = fc }
 }
 
 // NewMgmtWriter constructs an [MgmtWriter]. Any nil argument

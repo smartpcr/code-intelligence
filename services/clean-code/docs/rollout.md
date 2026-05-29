@@ -2119,44 +2119,74 @@ their own zero-findings verdict pair via the
    | `CLEAN_CODE_PERIODIC_SWEEP_CADENCE`  | Sweeper tick interval (Go duration; default is the value in `config.go`) |
    | `CLEAN_CODE_SCAN_TIMEOUT`            | Per-scan timeout passed to `WithStateMachineTimeout`                   |
 
-   Production deploys MUST set BOTH `CLEAN_CODE_PG_URL`
+   Production scan pods MUST set BOTH `CLEAN_CODE_PG_URL`
    and `CLEAN_CODE_AST_SCAN_ROOT`. The composition root
-   (`cmd/clean-coded/main.go:402-448`) is strict about the
-   pairing:
+   (`cmd/clean-code-metric-ingestor/main.go:837-891`)
+   selects the dispatcher based on the pairing:
 
-   - **Both set** → `PGScanRunStore` +
-     `DirectoryAstFileSource` are wired and the sweeper
-     launches.
+   - **Both set** → `RegistryBackedFoundationDispatcher`
+     is wired with a
+     `DirectoryAstFileSource{Coordinator, Pool}` rooted at
+     `CLEAN_CODE_AST_SCAN_ROOT` and threaded with the
+     shared `iso.coord` / `iso.pool` (so mode-flip drains
+     observe the SAME in-flight counter the scan path
+     increments). The sweeper is launched separately by
+     `buildSweepLoop` at `main.go:160`.
    - **`CLEAN_CODE_PG_URL` set, `CLEAN_CODE_AST_SCAN_ROOT`
-     unset** → the process **fails to start** with a
-     non-zero exit and the actionable boot error
-     "CLEAN_CODE_AST_SCAN_ROOT is REQUIRED when
-     CLEAN_CODE_PG_URL is configured" (see
-     `main.go:438-448`). It does NOT silently fall back to
-     `EmptyAstFileSource`; iter-4 made this fail-fast
-     after an evaluator finding that a production process
-     could otherwise start against live PG without ever
-     processing pending commits.
-   - **`CLEAN_CODE_PG_URL` unset** → scaffold mode. The
-     composition root logs `metric ingestor sweep loop
-     NOT STARTED (scaffold mode: CLEAN_CODE_AST_SCAN_ROOT
-     unset)` (`main.go:454-460`), closes `sweepDone`
-     immediately, and does NOT launch the sweeper. The
-     HTTP surface still serves; nothing claims commits.
-     This is dev-loop only.
+     unset** → the foundation dispatcher falls back to
+     `NoopFoundationRecipeDispatcher{Logger: logger}`
+     (`main.go:860`, `:887-890`) and the binary boots
+     normally. Stage 9.3 iter-3 intentionally reverted the
+     iter-4 fail-fast contract so that a webhook-only
+     metric-ingestor pod (one that serves `mgmt.*` and
+     `/v1/ingest/*` without owning the on-disk checkout
+     layout) still starts. A single info log
+     `foundation dispatcher = noop
+     (CLEAN_CODE_AST_SCAN_ROOT unset)` is emitted at
+     startup; operators deploying a SCAN pod (rather than
+     a webhook pod) MUST verify this log line is absent
+     and that `isolation_pool_languages` appears in the
+     `wired production foundation dispatcher` info log
+     instead.
+   - **`CLEAN_CODE_PG_URL` unset** → the binary refuses
+     to start. `cmd/clean-code-metric-ingestor/main.go:102-104`
+     does `log.Fatalf("%s is required", config.EnvPGURL)`
+     before any listener is bound, so there is no
+     `/healthz` to probe and no in-memory fallback. The
+     metric-ingestor binary deliberately does not support
+     a PG-less scaffold mode; operators who want one
+     should fall back to unit tests against
+     `metric_ingestor.NewInMemoryScanRunStore`.
 
 ### Per-rollout verification
 
 After deploying a new build, confirm:
 
 1. `/healthz` returns 200 within 5s of pod-ready.
-2. `/readyz` flips to 200 within 30s. Note: Stage 3.2 does
-   NOT register an `ast_source` ready-check; the AST
-   source availability is enforced inside the state
-   machine's pre-flight (`WithStateMachineSourceProbe`),
-   not on the `/readyz` surface. The only `/readyz` probe
-   registered today is `signing_key_cache` (Policy
-   Steward, Stage 5.1).
+2. **There is NO `/readyz` endpoint on this binary.**
+   `cmd/clean-code-metric-ingestor` mounts only `/healthz`
+   (always), `/metrics` (always), the optional legacy
+   `/v1/ingestor/*` routes when `EnableLegacyDemoAPI=true`,
+   the mgmt verbs (`mgmt.set_mode`, `mgmt.retract_sample`,
+   `mgmt.rescan`, `mgmt.register_repo`) via
+   `mountMgmtRoutes`, and the external-ingest router via
+   `mountIngestRouter` -- nothing registers `/readyz` or
+   calls `AddReadyCheck`. (Code inspection of
+   `cmd/clean-code-metric-ingestor/main.go` finds no
+   references to `readyz`, `AddReadyCheck`,
+   `healthHandler`, or `signing_key_cache`.) The
+   `AstSourceAvailability` / `WithStateMachineSourceProbe`
+   option exists in `internal/metric_ingestor` and is
+   exercised by unit tests, but the metric-ingestor binary
+   does NOT wire it today (`NewStateMachine` is only
+   called from tests). For this rollout, gate on `/healthz`
+   returning 200, then on the startup log lines
+   `wired production foundation dispatcher
+   isolation_pool_languages=[...]` (scan pod) or
+   `foundation dispatcher = noop (CLEAN_CODE_AST_SCAN_ROOT
+   unset)` (webhook pod). A dedicated `/readyz` aggregating
+   PG-ping + signing-key + AST-source probes is a
+   follow-up workstream.
 3. The first sweeper tick (after
    `CLEAN_CODE_PERIODIC_SWEEP_CADENCE`) fires and emits a
    structured log line of the form:

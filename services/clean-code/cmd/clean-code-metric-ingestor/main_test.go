@@ -318,7 +318,7 @@ func TestMountIngestRouter_Disabled_NoMountNoError(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.EnableExternalIngestWebhook = false
 
-	if err := mountIngestRouter(mux, cfg, nil, nil); err != nil {
+	if err := mountIngestRouter(mux, cfg, nil, nil, nil); err != nil {
 		t.Fatalf("mountIngestRouter (disabled): want nil error, got %v", err)
 	}
 
@@ -343,7 +343,7 @@ func TestMountIngestRouter_EnabledNilDB_ReturnsError(t *testing.T) {
 	cfg.WebhookHMACSecret = strings.Repeat("k", 32)
 	cfg.WebhookSigningKeyID = "key-test-01"
 
-	err := mountIngestRouter(mux, cfg, nil, nil)
+	err := mountIngestRouter(mux, cfg, nil, nil, nil)
 	if err == nil {
 		t.Fatalf("mountIngestRouter: want non-nil error for nil DB, got nil")
 	}
@@ -371,7 +371,7 @@ func TestMountIngestRouter_EnabledEmptySigningKeyID_ReturnsError(t *testing.T) {
 	cfg.WebhookHMACSecret = strings.Repeat("k", 32)
 	cfg.WebhookSigningKeyID = "" // hand-built misconfiguration
 
-	err = mountIngestRouter(mux, cfg, db, nil)
+	err = mountIngestRouter(mux, cfg, db, nil, testIsolationBundle(t, db))
 	if err == nil {
 		t.Fatalf("mountIngestRouter: want non-nil error for empty signing_key_id, got nil")
 	}
@@ -395,7 +395,7 @@ func TestMountIngestRouter_EnabledEmptyHMACSecret_ReturnsError(t *testing.T) {
 	cfg.WebhookHMACSecret = "" // hand-built misconfiguration
 	cfg.WebhookSigningKeyID = "key-test-01"
 
-	err = mountIngestRouter(mux, cfg, db, nil)
+	err = mountIngestRouter(mux, cfg, db, nil, testIsolationBundle(t, db))
 	if err == nil {
 		t.Fatalf("mountIngestRouter: want non-nil error for empty HMAC secret, got nil")
 	}
@@ -424,7 +424,7 @@ func TestMountIngestRouter_Enabled_MountsRouterAtCanonicalPath(t *testing.T) {
 	cfg.WebhookHMACSecret = strings.Repeat("k", 32)
 	cfg.WebhookSigningKeyID = "key-test-01"
 
-	if err := mountIngestRouter(mux, cfg, db, nil); err != nil {
+	if err := mountIngestRouter(mux, cfg, db, nil, testIsolationBundle(t, db)); err != nil {
 		t.Fatalf("mountIngestRouter: %v", err)
 	}
 
@@ -580,7 +580,7 @@ func TestMountIngestRouter_Disabled_RouterNotReachableEvenWithSecrets(t *testing
 	cfg.WebhookHMACSecret = strings.Repeat("k", 32)
 	cfg.WebhookSigningKeyID = "key-test-01"
 
-	if err := mountIngestRouter(mux, cfg, db, nil); err != nil {
+	if err := mountIngestRouter(mux, cfg, db, nil, testIsolationBundle(t, db)); err != nil {
 		t.Fatalf("mountIngestRouter (disabled with secrets present): %v", err)
 	}
 
@@ -638,7 +638,7 @@ func TestMountIngestRouter_Enabled_MountsDefectsVerb(t *testing.T) {
 	cfg.WebhookHMACSecret = testSecret
 	cfg.WebhookSigningKeyID = testKeyID
 
-	if err := mountIngestRouter(mux, cfg, db, nil); err != nil {
+	if err := mountIngestRouter(mux, cfg, db, nil, testIsolationBundle(t, db)); err != nil {
 		t.Fatalf("mountIngestRouter: %v", err)
 	}
 
@@ -714,7 +714,7 @@ func TestMountIngestRouter_Enabled_DefectsVerb_NotFoundIfTypoed(t *testing.T) {
 	cfg.WebhookHMACSecret = testSecret
 	cfg.WebhookSigningKeyID = testKeyID
 
-	if err := mountIngestRouter(mux, cfg, db, nil); err != nil {
+	if err := mountIngestRouter(mux, cfg, db, nil, testIsolationBundle(t, db)); err != nil {
 		t.Fatalf("mountIngestRouter: %v", err)
 	}
 
@@ -794,7 +794,7 @@ func TestMountIngestRouter_Enabled_MalformedVerbPath(t *testing.T) {
 	cfg.WebhookHMACSecret = testSecret
 	cfg.WebhookSigningKeyID = testKeyID
 
-	if err := mountIngestRouter(mux, cfg, db, nil); err != nil {
+	if err := mountIngestRouter(mux, cfg, db, nil, testIsolationBundle(t, db)); err != nil {
 		t.Fatalf("mountIngestRouter: %v", err)
 	}
 

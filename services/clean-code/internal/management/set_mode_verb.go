@@ -27,6 +27,7 @@ package management
 // seen?" query.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -144,11 +145,7 @@ func (w *MgmtWriter) SetMode(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := w.repoStore.SetRepoMode(r.Context(), SetRepoModeRequest{
-		RepoID: repoID,
-		Mode:   mode,
-		Actor:  actor,
-	})
+	res, err := w.setRepoMode(r.Context(), repoID, mode, actor)
 	if err != nil {
 		writeRepoStoreError(rw, r, "mgmt.set_mode", err, w.logger)
 		return
@@ -162,6 +159,7 @@ func (w *MgmtWriter) SetMode(rw http.ResponseWriter, r *http.Request) {
 			"previous_mode", res.PreviousMode,
 			"changed", res.Changed,
 			"actor", actor,
+			"drain_coordinated", w.flipCoordinator != nil,
 		)
 	}
 
@@ -171,6 +169,65 @@ func (w *MgmtWriter) SetMode(rw http.ResponseWriter, r *http.Request) {
 		PreviousMode: res.PreviousMode,
 		Changed:      res.Changed,
 	})
+}
+
+// setRepoMode performs the catalog mutation, optionally
+// routed through the [FlipCoordinator] so in-flight scans for
+// `repoID` drain BEFORE the catalog UPDATE runs.
+//
+// When `w.flipCoordinator == nil` (the pre-Stage-9.3 wiring)
+// the call falls straight through to
+// `w.repoStore.SetRepoMode(...)` -- backward compatible.
+//
+// When wired, the coordinator's `SetMode` blocks until drain
+// completes, then invokes the supplied `applyFn` (which calls
+// the same `w.repoStore.SetRepoMode(...)`). The store's result
+// is captured via closure because the [FlipCoordinator]
+// interface returns only `(previous, changed)` strings -- the
+// handler's response body needs the full
+// [SetRepoModeResult] (rubber-duck iter-2 finding #5: the
+// store IS the source of truth; the coordinator's tuple is
+// coordination metadata, not the wire shape).
+//
+// applyFn errors are propagated verbatim so the existing
+// error-class mapping in [writeRepoStoreError] continues to
+// fire ([ErrRepoStoreUnknownRepo] -> 404, etc.). A wrapped
+// `isolation.ErrModeFlipApplyFailed` is `errors.Is`-traversed
+// down to the inner store error by [writeRepoStoreError].
+func (w *MgmtWriter) setRepoMode(ctx context.Context, repoID uuid.UUID, mode, actor string) (SetRepoModeResult, error) {
+	if w.flipCoordinator == nil {
+		return w.repoStore.SetRepoMode(ctx, SetRepoModeRequest{
+			RepoID: repoID,
+			Mode:   mode,
+			Actor:  actor,
+		})
+	}
+
+	// Capture the authoritative store result via closure;
+	// applyFn returns only an error so the coordinator's
+	// flip-lock release path stays untouched.
+	var captured SetRepoModeResult
+	var storeErr error
+	applyFn := func(applyCtx context.Context) error {
+		captured, storeErr = w.repoStore.SetRepoMode(applyCtx, SetRepoModeRequest{
+			RepoID: repoID,
+			Mode:   mode,
+			Actor:  actor,
+		})
+		return storeErr
+	}
+
+	_, _, err := w.flipCoordinator.SetMode(ctx, repoID, mode, applyFn)
+	if err != nil {
+		// Prefer the store error if applyFn ran and failed
+		// (e.g. unknown repo); fall back to the coordinator
+		// error (drain cancelled, hydrator failure).
+		if storeErr != nil {
+			return SetRepoModeResult{}, storeErr
+		}
+		return SetRepoModeResult{}, err
+	}
+	return captured, nil
 }
 
 // writeRepoStoreError maps a [RepoStore] error to the matching

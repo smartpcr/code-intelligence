@@ -133,35 +133,32 @@ const (
 	EnvGateDegradedPolicy           = "CLEAN_CODE_GATE_DEGRADED_POLICY"
 	EnvPolicySigningRequired        = "CLEAN_CODE_POLICY_SIGNING_REQUIRED"
 	EnvRefactorEffortSource         = "CLEAN_CODE_REFACTOR_EFFORT_SOURCE"
-	// EnvRefactorEffortModelURI is the operator-facing env
-	// var pointing at the Stage 8.3 ML effort-model artefact
-	// on disk. Accepted forms (parsed by
-	// `refactor.LoadFromConfig` -> `resolveModelPath`):
-	//
-	//   - A bare local path: `/abs/path/model.json` (POSIX),
-	//     `C:\path\model.json` (Windows).
-	//   - A `file://` URI: `file:///abs/path` (POSIX),
-	//     `file:///C:/path` (Windows).
-	//
-	// Other schemes (`http://`, `s3://`, ...) are REJECTED in
-	// v0; the operator may rotate to a remote-fetch scheme
-	// only after a future Stage opens the closed set.
-	//
-	// Empty is permitted ONLY when [EnvRefactorEffortSource]
-	// is `"none"` (the explicit opt-out). When the source
-	// pin requires a model AND this var is empty, the
-	// `clean-code-refactor-planner` binary REFUSES to start
-	// (architecture Sec 1.6 + workstream brief
-	// `missing-model-blocks-startup` scenario).
-	//
-	// The interlock is enforced INSIDE the planner binary
-	// (`cmd/clean-code-refactor-planner/main.go` ->
-	// `refactor.LoadFromConfig`) rather than in
-	// `Config.Validate` so other binaries (eval-gate,
-	// aggregator, ...) that share the `config` package are
-	// not forced to set the var.
-	EnvRefactorEffortModelURI       = "CLEAN_CODE_REFACTOR_EFFORT_MODEL_URI"
-	EnvHTTPAddr                     = "CLEAN_CODE_HTTP_ADDR"
+	// EnvEffortSourceAlias is the compose-shorthand alias for
+	// EnvRefactorEffortSource. PR #148's
+	// `tests/e2e/phase-08-refactor-planner/docker-compose.yml`
+	// uses the short form to stay aligned with `ml-model-uri`
+	// and `ml-model-version` env-var lines. Both the canonical
+	// and alias spellings populate the same Config field; the
+	// canonical name wins if BOTH are set (so an operator who
+	// deliberately sets the canonical pin in one place cannot
+	// be silently overridden by a compose default).
+	EnvEffortSourceAlias = "CLEAN_CODE_EFFORT_SOURCE"
+	// EnvMLModelURI carries the URI of the ML effort-model
+	// artefact the Stage 9.3 refactor-planner loads when the
+	// resolved [EnvRefactorEffortSource] is `ml`. Required in
+	// the ML branch; an empty value with `ml` source fails
+	// fast at planner construction via
+	// [refactor.ErrMLModelURIMissing].
+	EnvMLModelURI = "CLEAN_CODE_ML_MODEL_URI"
+	// EnvMLModelVersion is the semantic version pin the loaded
+	// ML model claims. The planner compares this against
+	// `policy_version.refactor_weights.effort_model_version`
+	// at every estimate; a drift returns
+	// [refactor.ErrMLModelVersionMismatch] and aborts the
+	// atomic plan + tasks write so the architecture Sec 5.5.3
+	// reproducibility invariant survives operator misconfig.
+	EnvMLModelVersion = "CLEAN_CODE_ML_MODEL_VERSION"
+	EnvHTTPAddr       = "CLEAN_CODE_HTTP_ADDR"
 	EnvPrometheusAddr               = "CLEAN_CODE_PROMETHEUS_ADDR"
 	EnvOTelEndpoint                 = "CLEAN_CODE_OTEL_ENDPOINT"
 	// EnvAstScanRoot points at the local on-disk root the
@@ -402,20 +399,29 @@ type Config struct {
 
 	// RefactorEffortSource carries the `refactor-effort-source`
 	// pin. Default: `ML model from historical commits`.
+	// Wire-level env var: [EnvRefactorEffortSource]
+	// (`CLEAN_CODE_REFACTOR_EFFORT_SOURCE`). The compose
+	// shorthand [EnvEffortSourceAlias]
+	// (`CLEAN_CODE_EFFORT_SOURCE`) populates the same field;
+	// the canonical name wins if BOTH are set.
 	RefactorEffortSource string
 
-	// RefactorEffortModelURI carries the [EnvRefactorEffortModelURI]
-	// pin -- the on-disk URI of the Stage 8.3 ML effort-model
-	// artefact. Consumed by the refactor-planner binary's
-	// composition root via `refactor.LoadFromConfig`. Empty
-	// in scaffold deploys (and in all binaries other than
-	// the refactor-planner); the planner binary refuses to
-	// start when the var is empty AND
-	// [RefactorEffortSource] requires a model. The interlock
-	// is enforced INSIDE the planner binary, NOT inside
-	// [Config.Validate], so other binaries can leave the
-	// var unset.
-	RefactorEffortModelURI string
+	// MLModelURI is the URI of the ML effort-model artefact
+	// the Stage 9.3 refactor-planner loads when
+	// [RefactorEffortSource] resolves to `ml`. Wire-level
+	// env var: [EnvMLModelURI] (`CLEAN_CODE_ML_MODEL_URI`).
+	// Required in the ML branch; the planner construction
+	// returns [refactor.ErrMLModelURIMissing] when empty.
+	MLModelURI string
+
+	// MLModelVersion is the semantic version the loaded ML
+	// model claims. Wire-level env var: [EnvMLModelVersion]
+	// (`CLEAN_CODE_ML_MODEL_VERSION`). Required in the ML
+	// branch; the planner compares this at every estimate
+	// against `policy_version.refactor_weights.effort_model_version`
+	// and aborts the atomic plan + tasks write on drift via
+	// [refactor.ErrMLModelVersionMismatch].
+	MLModelVersion string
 
 	// --- Network bind addresses ---
 
@@ -767,7 +773,9 @@ func readEnvOverrides() map[string]string {
 		EnvGateDegradedPolicy,
 		EnvPolicySigningRequired,
 		EnvRefactorEffortSource,
-		EnvRefactorEffortModelURI,
+		EnvEffortSourceAlias,
+		EnvMLModelURI,
+		EnvMLModelVersion,
 		EnvHTTPAddr,
 		EnvPrometheusAddr,
 		EnvOTelEndpoint,
@@ -818,8 +826,22 @@ func applyOverrides(cfg *Config, overrides map[string]string) error {
 			cfg.PolicySigningRequired = v
 		case EnvRefactorEffortSource:
 			cfg.RefactorEffortSource = v
-		case EnvRefactorEffortModelURI:
-			cfg.RefactorEffortModelURI = v
+		case EnvEffortSourceAlias:
+			// Compose-shorthand alias. The canonical
+			// EnvRefactorEffortSource wins if BOTH are
+			// supplied: an operator-set canonical value MUST
+			// NOT be silently overridden by a compose default.
+			// We consult the override MAP directly (not the
+			// cfg field) so the precedence is independent of
+			// the non-deterministic map iteration order AND
+			// independent of the Defaults() pre-seed.
+			if _, hasCanonical := overrides[EnvRefactorEffortSource]; !hasCanonical {
+				cfg.RefactorEffortSource = v
+			}
+		case EnvMLModelURI:
+			cfg.MLModelURI = v
+		case EnvMLModelVersion:
+			cfg.MLModelVersion = v
 		case EnvHTTPAddr:
 			cfg.HTTPAddr = v
 		case EnvPrometheusAddr:

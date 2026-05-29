@@ -43,11 +43,7 @@ type otelTelemetryState struct {
 	metricsBody string
 }
 
-func newOtelTelemetryState() *otelTelemetryState {
-	evaluatorURL := os.Getenv("CLEAN_CODE_EVALUATOR_URL")
-	if evaluatorURL == "" {
-		evaluatorURL = "http://localhost:8081"
-	}
+func newOtelTelemetryState(evaluatorURL string) *otelTelemetryState {
 	otelQueryURL := os.Getenv("CLEAN_CODE_OTEL_QUERY_URL")
 	if otelQueryURL == "" {
 		otelQueryURL = "http://localhost:16686"
@@ -302,8 +298,11 @@ func (s *otelTelemetryState) metricExistsWithExpectedBucketLabels(metricName str
 // Scenario initializer & test entrypoint
 // ---------------------------------------------------------------------------
 
+// evaluatorURL is set by the test entrypoint after the env-var guard passes.
+var evaluatorURL string
+
 func InitializeScenario_audit_wal_and_reliability_hardening_otel_telemetry_across_all_surfaces(ctx *godog.ScenarioContext) {
-	state := newOtelTelemetryState()
+	state := newOtelTelemetryState(evaluatorURL)
 
 	// Scenario: gate-span-carries-verdict-tag
 	ctx.Step(`^"([^"]*)" returning "([^"]*)"$`, state.evalGateReturning)
@@ -317,7 +316,7 @@ func InitializeScenario_audit_wal_and_reliability_hardening_otel_telemetry_acros
 }
 
 func TestE2E_audit_wal_and_reliability_hardening_otel_telemetry_across_all_surfaces(t *testing.T) {
-	requireEnv(t, "CLEAN_CODE_OTEL_ENDPOINT")
+	evaluatorURL = requireEnv(t, "CLEAN_CODE_EVALUATOR_URL")
 
 	suite := godog.TestSuite{
 		ScenarioInitializer: InitializeScenario_audit_wal_and_reliability_hardening_otel_telemetry_across_all_surfaces,

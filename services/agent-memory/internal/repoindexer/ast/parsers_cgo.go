@@ -81,20 +81,29 @@ package ast
 //     stage (stage-5.2-register-rust-parser-in-parsers-cgo-
 //     go) added `NewTreeSitterRustParser()` to this list.
 //   - stage-6.1-powershellparser-subprocess-implementation
-//     owns the PowerShell scanner/subprocess parser.
+//     owns the PowerShell subprocess parser
+//     (parser_powershell.go); registered under BOTH build
+//     tags because the `pwsh`-subprocess approach has no
+//     compile-time CGO dependency. See parser_powershell.go
+//     doc and architecture.md Section 6.3.
 //
 // This file (post-merge with feature/memory) registers
-// TypeScript, Python, C, C++, C#, Go, and Rust. The C# entry
-// is a STUB registration -- INTENTIONAL even though its
-// walker is a placeholder: keeping the public symbol
-// `NewTreeSitterCSharpParser` reachable from this list (a)
-// gives the dispatcher a stable `.cs` route so projects with
-// C# sources don't emit `ast.dispatch.skip{reason="no_parser"}`
-// noise while waiting for the sibling stage to merge, and (b)
-// reconciles the ground-truth Target Files list with the
-// actual code -- iter 8 evaluator items 1-2 (C#) flagged the
-// absence of this registration. PowerShell stays unregistered
-// here until its sibling stage merges the real implementation.
+// TypeScript, Python, C, C++, C#, Go, Rust, and PowerShell.
+// The C# entry is a STUB registration -- INTENTIONAL even
+// though its walker is a placeholder: keeping the public
+// symbol `NewTreeSitterCSharpParser` reachable from this list
+// (a) gives the dispatcher a stable `.cs` route so projects
+// with C# sources don't emit
+// `ast.dispatch.skip{reason="no_parser"}` noise while waiting
+// for the sibling stage to merge, and (b) reconciles the
+// ground-truth Target Files list with the actual code -- iter
+// 8 evaluator items 1-2 (C#) flagged the absence of this
+// registration. PowerShell is registered HERE and in
+// parsers_nocgo.go because its subprocess implementation does
+// not depend on CGO; at runtime, missing `pwsh` on PATH is
+// handled by the parser's `ErrParserUnavailable` sentinel and
+// the dispatcher's
+// `ast.dispatch.skip{reason="pwsh_not_available"}` branch.
 func defaultParsers() []LanguageParser {
 	return []LanguageParser{
 		NewTreeSitterTypeScriptParser(),
@@ -104,5 +113,6 @@ func defaultParsers() []LanguageParser {
 		NewTreeSitterCSharpParser(),
 		NewTreeSitterGoParser(),
 		NewTreeSitterRustParser(),
+		NewPowerShellParser(),
 	}
 }

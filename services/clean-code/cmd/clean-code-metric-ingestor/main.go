@@ -89,6 +89,35 @@ func main() {
 		return
 	}
 
+	// Stage 9.3 iter-9 -- SERVICE_ROLE fail-fast dispatch.
+	// PR #148's docker-compose.yml runs the
+	// `clean-code-metric-ingestor` binary with
+	// `SERVICE_ROLE=refactor-planner` to signal the operator
+	// intended a refactor-planner deployment. The
+	// metric-ingestor binary does NOT carry the refactor
+	// planner's two-pass orchestration -- it would silently
+	// serve `/healthz` and never touch `hot_spot` /
+	// `refactor_plan`. The defensive check below refuses to
+	// start in that misconfig and points the operator at the
+	// correct `SERVICE` build arg.
+	//
+	// Recognised SERVICE_ROLE values that this binary CAN
+	// honour:
+	//   - "" (unset)              -- default metric-ingestor
+	//   - "metric-ingestor"       -- explicit canonical
+	//   - "mgmt-surface"          -- this binary mounts
+	//                                /v1/mgmt/* routes too,
+	//                                so a mgmt-surface deploy
+	//                                is valid; the role label
+	//                                surfaces in startup log.
+	//
+	// Anything else (notably "refactor-planner") is rejected
+	// with a clear log + exit 2 so the deploy fails loudly
+	// rather than degrading silently.
+	if err := validateServiceRole(os.Getenv(envServiceRole)); err != nil {
+		log.Fatalf("clean-code-metric-ingestor: SERVICE_ROLE validation failed: %v", err)
+	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -221,8 +250,79 @@ func main() {
 		"legacy_demo_api", cfg.EnableLegacyDemoAPI,
 		"stale_sweep_enabled", !cfg.DisableStaleSweep,
 		"management_role_handle", mgmtRoleHandleSource(cfg),
+		"service_role", serviceRoleLabel(),
 	)
 	log.Fatal(http.ListenAndServe(":"+port, rootMux))
+}
+
+// envServiceRole is the env var the Dockerfile sets from the
+// `ROLE` build arg. The metric-ingestor binary uses it only as
+// an observability label + a fail-fast misconfig guard; it
+// does NOT change the mounted routes. See [validateServiceRole]
+// for the role-dispatch contract.
+const envServiceRole = "SERVICE_ROLE"
+
+// serviceRoleLabel returns the trimmed SERVICE_ROLE value or
+// "metric-ingestor" when unset, suitable for the startup log
+// line + Prometheus labels (when wired).
+func serviceRoleLabel() string {
+	v := strings.TrimSpace(os.Getenv(envServiceRole))
+	if v == "" {
+		return "metric-ingestor"
+	}
+	return v
+}
+
+// allowedMetricIngestorRoles enumerates the SERVICE_ROLE
+// values this binary can honour. Any other value is a
+// build-arg misconfig and is rejected by [validateServiceRole].
+//
+// "mgmt-surface" is allowed because the metric-ingestor binary
+// already mounts the Stage 3.4 `/v1/mgmt/*` write verbs via
+// [mountMgmtRoutes]; a deploy that wants to expose only those
+// routes still runs THIS binary (route filtering is a future
+// stage).
+//
+// "refactor-planner" is explicitly REJECTED: that role wants
+// the Stage 8.1/8.2 two-pass orchestration which lives in
+// `cmd/clean-code-refactor-planner`. Operators get a clear
+// "use SERVICE=clean-code-refactor-planner" pointer rather
+// than a silently-degraded deploy that never writes to
+// `hot_spot` / `refactor_plan` / `refactor_task`.
+var allowedMetricIngestorRoles = map[string]struct{}{
+	"":                 {},
+	"metric-ingestor":  {},
+	"metric_ingestor":  {},
+	"metricingestor":   {},
+	"mgmt-surface":     {},
+	"mgmt_surface":     {},
+	"mgmtsurface":      {},
+	"management":       {},
+}
+
+// validateServiceRole returns nil when role is empty or one of
+// the recognised values this binary can honour. Returns a
+// descriptive error otherwise; "refactor-planner" gets a
+// dedicated pointer to the correct SERVICE build arg.
+func validateServiceRole(role string) error {
+	trimmed := strings.ToLower(strings.TrimSpace(role))
+	if _, ok := allowedMetricIngestorRoles[trimmed]; ok {
+		return nil
+	}
+	if trimmed == "refactor-planner" || trimmed == "refactor_planner" || trimmed == "refactorplanner" {
+		return fmt.Errorf(
+			"SERVICE_ROLE=%q requires the refactor-planner binary; "+
+				"set SERVICE=clean-code-refactor-planner in your Dockerfile build "+
+				"args (the metric-ingestor binary does NOT carry the Stage 8.1/8.2 "+
+				"two-pass orchestration and would silently no-op on hot_spot / "+
+				"refactor_plan writes)",
+			role)
+	}
+	return fmt.Errorf(
+		"SERVICE_ROLE=%q is not recognised; allowed: \"\", \"metric-ingestor\", "+
+			"\"mgmt-surface\" (use SERVICE=clean-code-refactor-planner for the "+
+			"refactor-planner role)",
+		role)
 }
 
 // metricKindCatalogSchema is the Postgres schema the

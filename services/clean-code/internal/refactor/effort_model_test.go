@@ -19,6 +19,9 @@ import (
 	"context"
 	"errors"
 	"math"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -26,6 +29,29 @@ import (
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 )
+
+// mkArtefactFile writes a deterministic non-empty fake model
+// artefact to a temp dir and returns its `file://` URI. The
+// loader-validated MLEffortModel constructor needs a real
+// path; this helper keeps the unit tests hermetic without
+// stamping a fixture into the repo.
+func mkArtefactFile(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "x.onnx")
+	if err := os.WriteFile(path, []byte("test-artefact-bytes-v1"), 0o644); err != nil {
+		t.Fatalf("write artefact: %v", err)
+	}
+	// Build a portable file:// URI; on Windows the path
+	// looks like C:\Users\... and needs forward-slash +
+	// leading slash before the drive letter.
+	u := url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
+	if len(path) >= 2 && path[1] == ':' {
+		// Windows drive letter: file:///C:/...
+		u.Path = "/" + filepath.ToSlash(path)
+	}
+	return u.String()
+}
 
 func TestResolveEffortSource_Vocabulary(t *testing.T) {
 	cases := []struct {
@@ -144,6 +170,7 @@ func TestHeuristicEffortModel_RejectsBadKind(t *testing.T) {
 }
 
 func TestNewMLEffortModel_ValidatesInputs(t *testing.T) {
+	uri := mkArtefactFile(t)
 	t.Run("missing URI", func(t *testing.T) {
 		_, err := NewMLEffortModel("", "v1.0")
 		if !errors.Is(err, ErrMLModelURIMissing) {
@@ -151,7 +178,7 @@ func TestNewMLEffortModel_ValidatesInputs(t *testing.T) {
 		}
 	})
 	t.Run("missing version", func(t *testing.T) {
-		_, err := NewMLEffortModel("file:///x.onnx", "")
+		_, err := NewMLEffortModel(uri, "")
 		if !errors.Is(err, ErrMLModelVersionMissing) {
 			t.Fatalf("NewMLEffortModel: want ErrMLModelVersionMissing, got %v", err)
 		}
@@ -163,21 +190,58 @@ func TestNewMLEffortModel_ValidatesInputs(t *testing.T) {
 		}
 	})
 	t.Run("valid pair trims whitespace", func(t *testing.T) {
-		em, err := NewMLEffortModel("  file:///x.onnx  ", "  v1.0  ")
+		em, err := NewMLEffortModel("  "+uri+"  ", "  v1.0  ")
 		if err != nil {
 			t.Fatalf("NewMLEffortModel: unexpected error: %v", err)
 		}
-		if em.ModelURI != "file:///x.onnx" {
-			t.Errorf("ModelURI = %q, want %q (trimmed)", em.ModelURI, "file:///x.onnx")
+		if em.ModelURI != uri {
+			t.Errorf("ModelURI = %q, want %q (trimmed)", em.ModelURI, uri)
 		}
 		if em.ModelVersion != "v1.0" {
 			t.Errorf("ModelVersion = %q, want %q (trimmed)", em.ModelVersion, "v1.0")
+		}
+		if em.ArtefactBytes <= 0 {
+			t.Errorf("ArtefactBytes = %d, want > 0 (loader read the artefact)",
+				em.ArtefactBytes)
+		}
+	})
+	t.Run("missing file rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		ghost := "file:///" + filepath.ToSlash(filepath.Join(dir, "does-not-exist.onnx"))
+		_, err := NewMLEffortModel(ghost, "v1.0")
+		if !errors.Is(err, ErrMLModelArtefactInvalid) {
+			t.Fatalf("NewMLEffortModel(missing file): want ErrMLModelArtefactInvalid, got %v", err)
+		}
+	})
+	t.Run("empty file rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		empty := filepath.Join(dir, "empty.onnx")
+		if err := os.WriteFile(empty, nil, 0o644); err != nil {
+			t.Fatalf("write empty file: %v", err)
+		}
+		uri := "file:///" + filepath.ToSlash(empty)
+		_, err := NewMLEffortModel(uri, "v1.0")
+		if !errors.Is(err, ErrMLModelArtefactInvalid) {
+			t.Fatalf("NewMLEffortModel(empty file): want ErrMLModelArtefactInvalid, got %v", err)
+		}
+	})
+	t.Run("unsupported scheme rejected", func(t *testing.T) {
+		_, err := NewMLEffortModel("http://example.com/x.onnx", "v1.0")
+		if !errors.Is(err, ErrMLModelArtefactInvalid) {
+			t.Fatalf("NewMLEffortModel(http): want ErrMLModelArtefactInvalid, got %v", err)
+		}
+	})
+	t.Run("missing scheme rejected", func(t *testing.T) {
+		_, err := NewMLEffortModel("/tmp/x.onnx", "v1.0")
+		if !errors.Is(err, ErrMLModelArtefactInvalid) {
+			t.Fatalf("NewMLEffortModel(no scheme): want ErrMLModelArtefactInvalid, got %v", err)
 		}
 	})
 }
 
 func TestMLEffortModel_Estimate_VersionPinning(t *testing.T) {
-	em, err := NewMLEffortModel("file:///x.onnx", "v1.0")
+	uri := mkArtefactFile(t)
+	em, err := NewMLEffortModel(uri, "v1.0")
 	if err != nil {
 		t.Fatalf("NewMLEffortModel: %v", err)
 	}
@@ -236,13 +300,52 @@ func TestMLEffortModel_Estimate_VersionPinning(t *testing.T) {
 }
 
 func TestMLEffortModel_RejectsBadKind(t *testing.T) {
-	em, _ := NewMLEffortModel("file:///x.onnx", "v1.0")
+	uri := mkArtefactFile(t)
+	em, _ := NewMLEffortModel(uri, "v1.0")
 	task := RefactorTask{Kind: TaskKind("introduce_interface")}
 	hs := mkHotSpot(t, 5.0)
 	snap := mkSnapshot(t, "v1.0")
 	_, err := em.Estimate(task, hs, snap)
 	if !errors.Is(err, ErrRejectedTaskKindAlias) {
 		t.Errorf("MLEffortModel.Estimate: want ErrRejectedTaskKindAlias, got %v", err)
+	}
+}
+
+// TestMLEffortModel_ArtefactDigestAffectsEstimate confirms
+// the loaded artefact bytes are folded into the estimator's
+// hash: two MLEffortModel instances pinned to the same
+// version but loaded from DIFFERENT artefact files MUST NOT
+// produce identical estimates for the same (task, hs)
+// triple. This pins the architecture Sec 8.3 reproducibility
+// guarantee: swapping the artefact in place changes the
+// estimate even when the version string is unchanged.
+func TestMLEffortModel_ArtefactDigestAffectsEstimate(t *testing.T) {
+	dir := t.TempDir()
+	pathA := filepath.Join(dir, "a.onnx")
+	pathB := filepath.Join(dir, "b.onnx")
+	if err := os.WriteFile(pathA, []byte("artefact-A"), 0o644); err != nil {
+		t.Fatalf("write A: %v", err)
+	}
+	if err := os.WriteFile(pathB, []byte("artefact-B-different-bytes"), 0o644); err != nil {
+		t.Fatalf("write B: %v", err)
+	}
+	uriA := "file:///" + filepath.ToSlash(pathA)
+	uriB := "file:///" + filepath.ToSlash(pathB)
+	emA, err := NewMLEffortModel(uriA, "v1.0")
+	if err != nil {
+		t.Fatalf("NewMLEffortModel(A): %v", err)
+	}
+	emB, err := NewMLEffortModel(uriB, "v1.0")
+	if err != nil {
+		t.Fatalf("NewMLEffortModel(B): %v", err)
+	}
+	task := mkTask(t, TaskKindSplitClass)
+	hs := mkHotSpot(t, 5.0)
+	snap := mkSnapshot(t, "v1.0")
+	a, _ := emA.Estimate(task, hs, snap)
+	b, _ := emB.Estimate(task, hs, snap)
+	if a == b {
+		t.Errorf("artefact digest not folded into estimate: A=%v B=%v", a, b)
 	}
 }
 
@@ -268,6 +371,8 @@ func TestNewEffortModelFromConfig_Dispatch(t *testing.T) {
 	})
 
 	t.Run("ml source requires URI", func(t *testing.T) {
+		uri := mkArtefactFile(t)
+		_ = uri // unused for missing-URI case
 		_, err := NewEffortModelFromConfig(EffortModelConfig{
 			Source:         "ml",
 			MLModelVersion: "v1.0",
@@ -278,9 +383,10 @@ func TestNewEffortModelFromConfig_Dispatch(t *testing.T) {
 	})
 
 	t.Run("ml source requires version", func(t *testing.T) {
+		uri := mkArtefactFile(t)
 		_, err := NewEffortModelFromConfig(EffortModelConfig{
 			Source:     "ml",
-			MLModelURI: "file:///x.onnx",
+			MLModelURI: uri,
 		})
 		if !errors.Is(err, ErrMLModelVersionMissing) {
 			t.Fatalf("want ErrMLModelVersionMissing, got %v", err)
@@ -288,9 +394,10 @@ func TestNewEffortModelFromConfig_Dispatch(t *testing.T) {
 	})
 
 	t.Run("ml source with both pins succeeds", func(t *testing.T) {
+		uri := mkArtefactFile(t)
 		em, err := NewEffortModelFromConfig(EffortModelConfig{
 			Source:         "ml",
-			MLModelURI:     "file:///x.onnx",
+			MLModelURI:     uri,
 			MLModelVersion: "v1.0",
 		})
 		if err != nil {
@@ -300,15 +407,16 @@ func TestNewEffortModelFromConfig_Dispatch(t *testing.T) {
 		if !ok {
 			t.Fatalf("want *MLEffortModel, got %T", em)
 		}
-		if m.ModelURI != "file:///x.onnx" || m.ModelVersion != "v1.0" {
+		if m.ModelURI != uri || m.ModelVersion != "v1.0" {
 			t.Errorf("MLEffortModel fields wrong: %+v", m)
 		}
 	})
 
 	t.Run("architecture canonical pin → ml", func(t *testing.T) {
+		uri := mkArtefactFile(t)
 		em, err := NewEffortModelFromConfig(EffortModelConfig{
 			Source:         "ML model from historical commits",
-			MLModelURI:     "file:///x.onnx",
+			MLModelURI:     uri,
 			MLModelVersion: "v1.0",
 		})
 		if err != nil {
@@ -316,6 +424,17 @@ func TestNewEffortModelFromConfig_Dispatch(t *testing.T) {
 		}
 		if _, ok := em.(*MLEffortModel); !ok {
 			t.Errorf("want *MLEffortModel for architecture canonical pin, got %T", em)
+		}
+	})
+
+	t.Run("ml source with bad artefact path is rejected", func(t *testing.T) {
+		_, err := NewEffortModelFromConfig(EffortModelConfig{
+			Source:         "ml",
+			MLModelURI:     "file:///nonexistent/path/x.onnx",
+			MLModelVersion: "v1.0",
+		})
+		if !errors.Is(err, ErrMLModelArtefactInvalid) {
+			t.Fatalf("want ErrMLModelArtefactInvalid, got %v", err)
 		}
 	})
 

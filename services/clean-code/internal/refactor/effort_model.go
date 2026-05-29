@@ -50,6 +50,9 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -246,6 +249,23 @@ type MLEffortModel struct {
 	// at estimate time). Non-empty -- [NewMLEffortModel]
 	// rejects an empty version with [ErrMLModelVersionMissing].
 	ModelVersion string
+
+	// ArtefactBytes is the size of the loaded artefact (the
+	// file pointed at by a `file://` URI). Zero for non-file
+	// URIs that fall through the loader's `noop` branch
+	// (test fixtures). The size is folded into [Estimate]'s
+	// hash so two MLEffortModel instances pinned to the same
+	// version but loaded from different artefact bytes do not
+	// silently collapse to the same estimate.
+	ArtefactBytes int64
+
+	// artefactDigest is the FNV-1a 64-bit hash of the loaded
+	// artefact contents. Folded into [Estimate] so the
+	// estimator's output reflects the loaded model bytes;
+	// swapping the artefact in place between deploys changes
+	// the estimate (a real reproducibility guarantee, not
+	// just a version-string check).
+	artefactDigest uint64
 }
 
 // MaxMLHours bounds the v0 ML estimator's output to the same
@@ -253,21 +273,140 @@ type MLEffortModel struct {
 // effort-source choices. Documented so tests can rely on it.
 const MaxMLHours = MaxHeuristicHours
 
+// MLArtefactLoader resolves an `MLEffortModel.ModelURI` to
+// the artefact's raw bytes. Pluggable so a future Stage 10.x
+// can swap in an ONNX-runtime loader without changing
+// [NewMLEffortModel] or any caller. The default
+// [defaultMLArtefactLoader] handles `file://` URIs by opening
+// the local filesystem path; everything else returns
+// (nil, [ErrMLModelArtefactInvalid]).
+type MLArtefactLoader func(uri string) ([]byte, error)
+
 // NewMLEffortModel validates the URI + version pair and
 // returns a ready-to-use estimator. Returns
 // [ErrMLModelURIMissing] when uri is empty,
-// [ErrMLModelVersionMissing] when version is empty.
+// [ErrMLModelVersionMissing] when version is empty,
+// [ErrMLModelArtefactInvalid] when the URI points at a
+// missing / empty / unsupported artefact.
 func NewMLEffortModel(uri, version string) (*MLEffortModel, error) {
-	if strings.TrimSpace(uri) == "" {
+	return newMLEffortModelWithLoader(uri, version, defaultMLArtefactLoader)
+}
+
+// newMLEffortModelWithLoader is the testable variant of
+// [NewMLEffortModel] that accepts a loader override. The
+// production constructor always uses [defaultMLArtefactLoader].
+func newMLEffortModelWithLoader(uri, version string, loader MLArtefactLoader) (*MLEffortModel, error) {
+	trimmedURI := strings.TrimSpace(uri)
+	trimmedVersion := strings.TrimSpace(version)
+	if trimmedURI == "" {
 		return nil, ErrMLModelURIMissing
 	}
-	if strings.TrimSpace(version) == "" {
+	if trimmedVersion == "" {
 		return nil, ErrMLModelVersionMissing
 	}
+	if loader == nil {
+		loader = defaultMLArtefactLoader
+	}
+	payload, err := loader(trimmedURI)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrMLModelArtefactInvalid, err)
+	}
+	if len(payload) == 0 {
+		return nil, fmt.Errorf("%w: artefact is empty at %q",
+			ErrMLModelArtefactInvalid, trimmedURI)
+	}
+	digest := fnv.New64a()
+	_, _ = digest.Write(payload)
 	return &MLEffortModel{
-		ModelURI:     strings.TrimSpace(uri),
-		ModelVersion: strings.TrimSpace(version),
+		ModelURI:       trimmedURI,
+		ModelVersion:   trimmedVersion,
+		ArtefactBytes:  int64(len(payload)),
+		artefactDigest: digest.Sum64(),
 	}, nil
+}
+
+// defaultMLArtefactLoader resolves `file://` URIs to the
+// referenced file's contents. The loader is intentionally
+// minimal: it does NOT attempt to interpret ONNX / TF model
+// bytes; it only proves the artefact exists, is non-empty,
+// and is reachable from the running process. A future
+// Stage 10.x can replace this with a full ONNX-runtime
+// loader without changing the [MLEffortModel] interface.
+//
+// Returns ([]byte, nil) on success; (nil, error) for:
+//
+//   - URIs whose scheme is not `file`.
+//   - file:// URIs whose path is unreadable / missing.
+//   - file:// URIs that resolve to a directory.
+//   - file:// URIs whose target file is empty.
+//
+// The size cap (16 MiB) prevents a misconfigured URI from
+// reading a multi-GiB file into the planner's address space.
+const mlArtefactMaxBytes = 16 * 1024 * 1024
+
+func defaultMLArtefactLoader(uri string) ([]byte, error) {
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		return nil, fmt.Errorf("parse uri %q: %w", uri, err)
+	}
+	switch parsed.Scheme {
+	case "file":
+		return loadFileURIArtefact(parsed)
+	case "":
+		return nil, fmt.Errorf(
+			"uri %q has no scheme; supported schemes: file://",
+			uri)
+	default:
+		return nil, fmt.Errorf(
+			"uri scheme %q unsupported; supported: file:// (Stage 10.x will extend to https/s3)",
+			parsed.Scheme)
+	}
+}
+
+// loadFileURIArtefact resolves a `file://` URL to local-disk
+// bytes. Per RFC 8089 the host part is optional and (when
+// present) MUST be `localhost`; we accept both
+// `file:///path/to/x` and `file://localhost/path/to/x` as
+// equivalent. Anything else (e.g. `file://example.com/x`) is
+// rejected because a network fetch is not what the operator
+// asked for.
+func loadFileURIArtefact(parsed *url.URL) ([]byte, error) {
+	if parsed.Host != "" && parsed.Host != "localhost" {
+		return nil, fmt.Errorf(
+			"file:// URI with remote host %q is unsupported (Stage 10.x: use https://)",
+			parsed.Host)
+	}
+	path := parsed.Path
+	if path == "" {
+		return nil, fmt.Errorf("file:// URI has empty path: %q", parsed.String())
+	}
+	// On Windows, file:///C:/x.onnx parses with Path=/C:/x.onnx.
+	// The leading slash before the drive letter is an artefact
+	// of the URI spec; strip it so os.Stat resolves correctly.
+	if len(path) >= 3 && path[0] == '/' && path[2] == ':' {
+		path = path[1:]
+	}
+	clean := filepath.FromSlash(path)
+	info, err := os.Stat(clean)
+	if err != nil {
+		return nil, fmt.Errorf("stat %q: %w", clean, err)
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("artefact path %q is a directory", clean)
+	}
+	if info.Size() == 0 {
+		return nil, fmt.Errorf("artefact file %q is empty", clean)
+	}
+	if info.Size() > mlArtefactMaxBytes {
+		return nil, fmt.Errorf(
+			"artefact file %q is %d bytes; max accepted is %d bytes",
+			clean, info.Size(), mlArtefactMaxBytes)
+	}
+	payload, err := os.ReadFile(clean)
+	if err != nil {
+		return nil, fmt.Errorf("read %q: %w", clean, err)
+	}
+	return payload, nil
 }
 
 // Estimate implements [EffortModel]. Returns
@@ -291,11 +430,17 @@ func (m *MLEffortModel) Estimate(task RefactorTask, hs HotSpot, snap PolicySnaps
 			ErrMLModelVersionMismatch, m.ModelVersion, policyVersion)
 	}
 	// v0 deterministic estimator: FNV-1a hash of the
-	// (model_version, scope_id, rule_id, kind, score)
-	// reduced to [0, MaxMLHours]. Stable across runs --
-	// reproducibility under audit is preserved.
+	// (model_version, artefact_digest, scope_id, rule_id,
+	// kind, score) reduced to [0, MaxMLHours]. Stable across
+	// runs -- reproducibility under audit is preserved.
+	// Folding `artefactDigest` makes the estimate reflect
+	// the loaded artefact bytes, not just the version pin:
+	// swapping the file in place between deploys changes
+	// the output even when the version string is unchanged.
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(m.ModelVersion))
+	_, _ = h.Write([]byte{0})
+	_, _ = fmt.Fprintf(h, "%016x", m.artefactDigest)
 	_, _ = h.Write([]byte{0})
 	_, _ = h.Write(task.ScopeID.Bytes())
 	_, _ = h.Write([]byte{0})
@@ -483,6 +628,18 @@ var (
 	ErrMLModelVersionMismatch = errors.New(
 		"refactor: ML model version does not match " +
 			"policy_version.refactor_weights.effort_model_version")
+
+	// ErrMLModelArtefactInvalid signals that the
+	// [MLArtefactLoader] could not resolve the operator's
+	// URI to a usable artefact. The cmd binary fails fast on
+	// this error: a `file://` URI pointing at a missing /
+	// empty / oversized file MUST NOT silently degrade to a
+	// no-op estimator. The error message names the exact
+	// path / scheme the loader rejected so an SRE can fix
+	// the deploy without code-spelunking.
+	ErrMLModelArtefactInvalid = errors.New(
+		"refactor: ML model artefact is invalid (missing, empty, " +
+			"unreadable, oversized, or unsupported URI scheme)")
 
 	// ErrInvalidEffortEstimate signals an estimator returned
 	// NaN, ±Inf, or a negative value. Aborts the batch so a

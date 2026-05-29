@@ -58,3 +58,54 @@ jobs:
       - name: Tear down compose services
         if: always()
         run: docker compose -f ${{ env.COMPOSE_FILE }} down -v --remove-orphans
+
+  e2e-refactor-planner-ml-effort-model:
+    name: "E2E – Refactor Planner ML Effort Model"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: clean_code
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: services/clean-code/go.sum
+
+      - name: Export PG DSN
+        run: |
+          echo "CLEAN_CODE_PG_URL=postgres://postgres:postgres@localhost:5432/clean_code?sslmode=disable" >> "$GITHUB_ENV"
+
+      - name: Bootstrap – migrate and seed
+        run: |
+          make migrate-up CLEAN_CODE_PG_URL="${CLEAN_CODE_PG_URL}"
+          make seed-phase-08 CLEAN_CODE_PG_URL="${CLEAN_CODE_PG_URL}" || true
+
+      - name: Build planner binary
+        working-directory: services/clean-code
+        run: |
+          go build -o /tmp/clean-code-refactor-planner ./cmd/clean-code-refactor-planner
+          echo "CLEAN_CODE_PLANNER_BIN=/tmp/clean-code-refactor-planner" >> "$GITHUB_ENV"
+          echo "CLEAN_CODE_ML_ARTEFACT_PATH=${GITHUB_WORKSPACE}/services/clean-code/cmd/clean-code-refactor-planner/effort_model.onnx" >> "$GITHUB_ENV"
+
+      - name: Run ML effort-model E2E scenarios
+        working-directory: services/clean-code
+        run: |
+          go test -tags e2e -v -count=1 ./test/e2e/code-intelligence-CLEAN-CODE/... \
+            -run TestRefactorPlannerMLEffortModelLoaderAndVersionPinning

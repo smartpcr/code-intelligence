@@ -1,10 +1,24 @@
-# Stage 10.4 -- Cross repo end to end happy path
-#
-# The canonical scenario set now lives at
-# services/clean-code/test/e2e/cross_repo_happy_path/cross_repo_happy_path.feature
-# per the iter-1 evaluator feedback (item 1: the required
-# deliverable path was missing).
-#
-# This .feature file is retained as an empty marker only;
-# the iter-1 _test.go next to it has been reduced to a
-# tombstone so godog will not pick up the scenarios below.
+@story-code-intelligence:CLEAN-CODE @phase-linked-mode-integration-and-rollout @stage-cross-repo-end-to-end-happy-path @setup-inline
+Feature: Cross repo end to end happy path
+
+  End-to-end validation that the full cross-repo pipeline — repo
+  registration, coverage upload, aggregator tick, management read,
+  and evaluator gate — produces correct percentile data and
+  canonical verdicts when data is fresh, and correctly flags
+  staleness when the freshness window expires.
+
+  Background:
+    Given three registered repos with coverage uploads
+    And one aggregator tick has completed
+
+  Scenario: cross-repo-e2e-fresh
+    When the e2e script asserts on the read paths
+    Then the cross_repo response has populated percentile columns
+    And the cross_repo response has degraded equal to false
+    And eval.gate returns a canonical verdict
+
+  Scenario: cross-repo-e2e-stale
+    Given the fake clock is advanced past freshness_window_seconds
+    When the e2e script asserts on the read paths
+    Then mgmt.read.cross_repo carries percentile_stale
+    And eval.gate never emits percentile_stale

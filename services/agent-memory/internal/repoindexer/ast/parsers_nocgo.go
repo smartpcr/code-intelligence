@@ -28,9 +28,19 @@ package ast
 // without producing any class / method nodes -- callers that
 // need Rust ingestion MUST build with `CGO_ENABLED=1` (the
 // production default).
+//
+// PowerShell (`.ps1` / `.psm1` / `.psd1`) IS registered here
+// alongside the CGO build (parsers_cgo.go) because its v1
+// implementation (parser_powershell.go) is a `pwsh`-
+// subprocess parser with no CGO dependency. The same
+// `NewPowerShellParser()` symbol resolves under both build
+// tags; runtime behaviour falls back to
+// `ast.dispatch.skip{reason="pwsh_not_available"}` when the
+// host has no `pwsh` on PATH (architecture.md Section 6.3).
 func defaultParsers() []LanguageParser {
 	return []LanguageParser{
 		NewTypeScriptParser(),
 		NewPythonParser(),
+		NewPowerShellParser(),
 	}
 }

@@ -1,113 +1,21 @@
-// Package migrations provides an embedded SQL migrator for the
-// agent-memory schema. Migrations are applied in lexicographic order.
 package migrations
 
-import (
-	"context"
-	"database/sql"
-	"embed"
-	"fmt"
-	"io/fs"
-	"sort"
-	"strings"
-)
-
-//go:embed *.sql
-var sqlFiles embed.FS
-
-// Migrator applies embedded SQL migrations against a database.
-type Migrator struct {
-	db *sql.DB
-}
-
-// New creates a Migrator for the given database connection.
-func New(db *sql.DB) *Migrator {
-	return &Migrator{db: db}
-}
-
-// Up applies all unapplied migrations in lexicographic order.
-// Each migration runs inside a transaction. The migrator creates a
-// schema_migrations table to track which migrations have been applied.
-func (m *Migrator) Up(ctx context.Context) error {
-	// Ensure the tracking table exists.
-	if _, err := m.db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS schema_migrations (
-			version TEXT PRIMARY KEY,
-			applied_at TIMESTAMPTZ DEFAULT NOW()
-		)
-	`); err != nil {
-		return fmt.Errorf("create schema_migrations: %w", err)
-	}
-
-	// List all embedded SQL files.
-	entries, err := fs.ReadDir(sqlFiles, ".")
-	if err != nil {
-		return fmt.Errorf("read embedded migrations: %w", err)
-	}
-
-	var names []string
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names)
-
-	for _, name := range names {
-		version := strings.TrimSuffix(name, ".sql")
-
-		// Check if already applied.
-		var count int
-		if err := m.db.QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM schema_migrations WHERE version = $1", version,
-		).Scan(&count); err != nil {
-			return fmt.Errorf("check migration %s: %w", version, err)
-		}
-		if count > 0 {
-			continue
-		}
-
-		// Read and execute.
-		content, err := sqlFiles.ReadFile(name)
-		if err != nil {
-			return fmt.Errorf("read migration %s: %w", name, err)
-		}
-
-		tx, err := m.db.BeginTx(ctx, nil)
-		if err != nil {
-			return fmt.Errorf("begin tx for %s: %w", name, err)
-		}
-
-		if _, err := tx.ExecContext(ctx, string(content)); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("exec migration %s: %w", name, err)
-		}
-
-		if _, err := tx.ExecContext(ctx,
-			"INSERT INTO schema_migrations (version) VALUES ($1)", version,
-		); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("record migration %s: %w", name, err)
-		}
-
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit migration %s: %w", name, err)
-		}
-	}
-
-	return nil
-}
-
-// Has checks whether a specific migration version is embedded.
-func (m *Migrator) Has(version string) bool {
-	entries, err := fs.ReadDir(sqlFiles, ".")
-	if err != nil {
-		return false
-	}
-	for _, e := range entries {
-		if strings.TrimSuffix(e.Name(), ".sql") == version {
-			return true
-		}
-	}
-	return false
-}
+// The authoritative production Migrator (with the rich Up /
+// Down / Reset / AppliedVersions surface and the canonical
+// `_schema_migrations` journal table) lives in migrate.go.
+//
+// An earlier sibling-PR story stage briefly introduced a
+// stripped-down duplicate of `Migrator`, `New`, `Up`, and a
+// `Has` helper in this file. The duplicate declared a different
+// journal table (`schema_migrations` without the leading
+// underscore) and stored full filenames (e.g.
+// `0022_edge_kind_overrides`) as versions, which conflicted
+// with migrate.go's canonical schema (`_schema_migrations`,
+// numeric `0022`-style versions extracted via
+// `versionRe = ^(\d+[a-z]?)_(.+)\.sql$`) and with every
+// production caller and the e2e test
+// `test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/
+// shared_additive_surfaces_and_dispatcher_edits_schema_
+// migration_for_overrides_edge_kind_test.go`. The duplicates
+// were removed here to restore a compilable package. New
+// migration helpers belong alongside `Migrator` in migrate.go.

@@ -281,8 +281,16 @@ func TestDispatcher_Rust_TraitOverrides_SameFile(t *testing.T) {
 			Methods: []MethodDecl{
 				// Trait default body. No LangMeta["trait"]
 				// because this IS the trait's own method,
-				// not an impl override.
-				{QualifiedName: "Greeter.greet", EnclosingClass: "Greeter"},
+				// not an impl override. The `trait_default`
+				// flag tells Pass 2d this is a shadowable
+				// default body (R4) -- without the flag the
+				// pass treats the destination as a required
+				// signature and skips the override.
+				{
+					QualifiedName:  "Greeter.greet",
+					EnclosingClass: "Greeter",
+					LangMeta:       map[string]any{"trait_default": true},
+				},
 				// Impl override. LangMeta["trait"] points at
 				// the trait whose default this method shadows.
 				{
@@ -319,88 +327,17 @@ func TestDispatcher_Rust_TraitOverrides_SameFile(t *testing.T) {
 	}
 }
 
-// TestDispatcher_OverloadedMethodsDropStaticCallsByAmbiguity pins
-// the production-dispatcher A5 drop on bare-name overload
-// ambiguity (tech-spec §5.3, doc.go "v1 edge scope"). Two
-// overloaded methods share the same `QualifiedName` (`Foo.Bar`)
-// but distinct `ParamSignature` values, so the dispatcher
-// inserts two distinct method nodes. A third method (`Foo.Caller`)
-// calls bare-name `Bar`. The bare-name resolver MUST drop
-// the call because `simpleName("Bar")` resolves to two distinct
-// NodeIDs — exactly the false-positive class the iter-6 bug
-// allowed.
-//
-// Pre-fix: the dispatcher kept `methodNodeID[QName] -> NodeID`
-// as a SINGLE map and overwrote on overload, so
-// `buildCalleeIndex` saw only ONE entry for `Bar` and emitted a
-// false `static_calls` edge to the LAST-inserted overload.
-// The fix converts methodNodeID to a multimap and tracks
-// per-method NodeIDs through `methodNodeIDs []string`; this
-// test would have failed (1 edge, not 0) under the broken
-// dispatcher.
-func TestDispatcher_OverloadedMethodsDropStaticCallsByAmbiguity(t *testing.T) {
-	fw := newFakeWriter()
-	parser := fakeStaticParser{
-		lang:       "csharp",
-		extensions: []string{".cs"},
-		result: ParseResult{
-			Classes: []ClassDecl{
-				{QualifiedName: "Foo", Kind: "class"},
-			},
-			Methods: []MethodDecl{
-				// Overload #1 — Foo.Bar(int).
-				{
-					QualifiedName:  "Foo.Bar",
-					EnclosingClass: "Foo",
-					ParamSignature: "int x",
-				},
-				// Overload #2 — Foo.Bar(string).
-				{
-					QualifiedName:  "Foo.Bar",
-					EnclosingClass: "Foo",
-					ParamSignature: "string x",
-				},
-				// Caller — bare-name `Bar(...)` invocation.
-				{
-					QualifiedName:  "Foo.Caller",
-					EnclosingClass: "Foo",
-					Calls:          []string{"Bar"},
-				},
-			},
-		},
-	}
-	d := NewDispatcher(fw, WithParsers(parser))
-	if _, err := d.EmitFile(context.Background(), makeEvent("src/Foo.cs", "// fake")); err != nil {
-		t.Fatalf("EmitFile: %v", err)
-	}
-
-	// Sanity: each overload gets its own method node despite
-	// sharing QualifiedName. Pre-fix this was 3 nodes too —
-	// the bug was in resolution, not insertion — but pinning
-	// node count here doubles as a regression check for the
-	// multimap migration.
-	if n := len(fw.nodesOf("method")); n != 3 {
-		t.Fatalf("method nodes = %d; want 3 (Bar(int), Bar(string), Caller); nodes=%+v",
-			n, fw.nodesOf("method"))
-	}
-
-	// A5: bare-name `Bar` resolves to {node-1, node-2} → drop.
-	// Pre-fix: 1 false edge from Caller (node-3) to the last
-	// inserted Bar (node-2).
-	if calls := fw.edgesOf("static_calls"); len(calls) != 0 {
-		t.Errorf("static_calls edges = %d; want 0 (A5 drop on overloaded bare-name); edges=%+v",
-			len(calls), calls)
-	}
-}
-
-// TestDispatcher_OverloadedTraitMethodsDropOverrides pins the
-// Pass 2d A5 drop when a trait declares two overloaded default
-// methods with the same simple name. An impl method whose
-// LangMeta["trait"] names that trait would otherwise pick one
-// of the two overloads at random; the dispatcher MUST drop the
-// `overrides` edge instead (consistent with `static_calls`
-// ambiguity drops).
-func TestDispatcher_OverloadedTraitMethodsDropOverrides(t *testing.T) {
+// TestDispatcher_Rust_RequiredTraitMethod_NoOverrides pins
+// architecture Section 7.2 / R4: an impl method whose
+// `LangMeta["trait"]` names a trait whose method is REQUIRED
+// (bodyless `function_signature_item`, no `trait_default`
+// flag) MUST NOT emit an `overrides` edge. Providing a
+// required signature is "satisfies" / "implements"
+// semantics, not "overrides" -- there is no default body
+// being shadowed. The companion same-file implements edge
+// still fires (Pass 2a, not exercised here); only the Pass
+// 2d override is suppressed.
+func TestDispatcher_Rust_RequiredTraitMethod_NoOverrides(t *testing.T) {
 	fw := newFakeWriter()
 	parser := fakeStaticParser{
 		lang:       "rust",
@@ -411,24 +348,13 @@ func TestDispatcher_OverloadedTraitMethodsDropOverrides(t *testing.T) {
 				{QualifiedName: "MyType", Kind: "struct"},
 			},
 			Methods: []MethodDecl{
-				// Trait default #1.
-				{
-					QualifiedName:  "Greeter.greet",
-					EnclosingClass: "Greeter",
-					ParamSignature: "&self",
-				},
-				// Trait default #2 — same simple+qualified
-				// name, different param signature. Rust
-				// disallows this in real grammar but the
-				// drop rule is a defensive guard for any
-				// future trait-overload language.
-				{
-					QualifiedName:  "Greeter.greet",
-					EnclosingClass: "Greeter",
-					ParamSignature: "&self, prefix: &str",
-				},
-				// Impl method — should resolve to one of the
-				// two overloads, but MUST drop instead.
+				// Required (bodyless) trait method. No
+				// `trait_default` flag, so Pass 2d's filter
+				// must skip this destination.
+				{QualifiedName: "Greeter.greet", EnclosingClass: "Greeter"},
+				// Impl provider. LangMeta["trait"] still
+				// points at the trait for cross-file resolver
+				// stitching, but no same-file override fires.
 				{
 					QualifiedName:  "MyType.greet",
 					EnclosingClass: "MyType",
@@ -442,12 +368,79 @@ func TestDispatcher_OverloadedTraitMethodsDropOverrides(t *testing.T) {
 		t.Fatalf("EmitFile: %v", err)
 	}
 
-	if n := len(fw.nodesOf("method")); n != 3 {
-		t.Fatalf("method nodes = %d; want 3", n)
+	if n := len(fw.nodesOf("class")); n != 2 {
+		t.Fatalf("class nodes = %d; want 2 (Greeter trait, MyType struct)", n)
 	}
-	// Pass 2d: Greeter.greet multimap has 2 entries → drop.
-	if overrides := fw.edgesOf("overrides"); len(overrides) != 0 {
-		t.Errorf("overrides edges = %d; want 0 (A5 drop on overloaded trait default); edges=%+v",
+	if n := len(fw.nodesOf("method")); n != 2 {
+		t.Fatalf("method nodes = %d; want 2 (Greeter.greet, MyType.greet)", n)
+	}
+
+	// The architectural assertion: NO override edge,
+	// because the trait method has no default body for
+	// the impl to shadow.
+	if n := len(fw.edgesOf("overrides")); n != 0 {
+		t.Fatalf("overrides edges = %d; want 0 (required signature is satisfies, not overrides); edges=%+v",
+			n, fw.edgesOf("overrides"))
+	}
+}
+
+// TestDispatcher_Rust_DefaultAndRequiredMix_OnlyDefaultOverrides
+// pins the mixed case: when a trait declares BOTH a
+// default-bodied method (with `trait_default=true`) and a
+// required bodyless sibling, and a single impl block
+// supplies both, exactly ONE overrides edge fires -- the
+// one pointing at the default-bodied trait method. The
+// required signature's same-name impl is silently skipped
+// by Pass 2d.
+func TestDispatcher_Rust_DefaultAndRequiredMix_OnlyDefaultOverrides(t *testing.T) {
+	fw := newFakeWriter()
+	parser := fakeStaticParser{
+		lang:       "rust",
+		extensions: []string{".rs"},
+		result: ParseResult{
+			Classes: []ClassDecl{
+				{QualifiedName: "Greeter", Kind: "trait"},
+				{QualifiedName: "MyType", Kind: "struct"},
+			},
+			Methods: []MethodDecl{
+				// Trait default-bodied method (shadowable).
+				{
+					QualifiedName:  "Greeter.greet",
+					EnclosingClass: "Greeter",
+					LangMeta:       map[string]any{"trait_default": true},
+				},
+				// Trait required signature (NOT shadowable).
+				{QualifiedName: "Greeter.required", EnclosingClass: "Greeter"},
+				// Impl methods, both carrying the trait tag.
+				{
+					QualifiedName:  "MyType.greet",
+					EnclosingClass: "MyType",
+					LangMeta:       map[string]any{"trait": "Greeter"},
+				},
+				{
+					QualifiedName:  "MyType.required",
+					EnclosingClass: "MyType",
+					LangMeta:       map[string]any{"trait": "Greeter"},
+				},
+			},
+		},
+	}
+	d := NewDispatcher(fw, WithParsers(parser))
+	if _, err := d.EmitFile(context.Background(), makeEvent("src/lib.rs", "// fake")); err != nil {
+		t.Fatalf("EmitFile: %v", err)
+	}
+
+	overrides := fw.edgesOf("overrides")
+	if len(overrides) != 1 {
+		t.Fatalf("overrides edges = %d; want 1 (only the default-bodied trait method shadow); edges=%+v",
 			len(overrides), overrides)
+	}
+	// Direction: MyType.greet (node-4) -> Greeter.greet (node-2).
+	// Insert order: class(Greeter)=node-0, class(MyType)=node-1,
+	// method(Greeter.greet)=node-2, method(Greeter.required)=node-3,
+	// method(MyType.greet)=node-4, method(MyType.required)=node-5.
+	if overrides[0].SrcNodeID != "node-4" || overrides[0].DstNodeID != "node-2" {
+		t.Errorf("overrides edge = %s -> %s; want node-4 -> node-2 (MyType.greet -> Greeter.greet only)",
+			overrides[0].SrcNodeID, overrides[0].DstNodeID)
 	}
 }

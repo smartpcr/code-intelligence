@@ -1,0 +1,41 @@
+// go.work pins the multi-module layout for the
+// `code-intelligence` repo so a single command rooted at
+// the repo root can build, vet, and test packages that
+// live under sibling Go modules:
+//
+//   - .                          (legacy `github.com/microsoft/clean-code`
+//                                 module retained for godog feature files)
+//   - services/clean-code        (Stage 10.3 owns; all new conformance
+//                                 tests + recipes + DSL canon live here)
+//   - services/agent-memory      (sibling service module)
+//
+// Without this workspace pin, a command like
+//
+//   go test ./services/clean-code/test/conformance/...
+//
+// invoked from the repo root fails with
+//
+//   directory prefix services\clean-code\test\conformance
+//   does not contain main module or its selected dependencies
+//
+// because each `services/*` directory is its own module
+// and the repo root's go.mod (`github.com/microsoft/clean-code`)
+// does not enclose them. The Forge per-iter test gate runs
+// from the repo root with the path-spec above; this
+// workspace file is what makes that gate command runnable.
+//
+// The workspace `go 1.25.1` directive matches the highest
+// required toolchain across the modules (services/clean-code
+// pins 1.25.1; services/agent-memory pins 1.25.0; the root
+// module pins 1.22.0 -- the workspace minimum is the max).
+//
+// Adding a new sibling module (e.g. `services/foo`) means
+// appending a `./services/foo` entry to the `use` block
+// below; no other repo-wide wiring is needed.
+go 1.25.1
+
+use (
+	.
+	./services/agent-memory
+	./services/clean-code
+)

@@ -17,17 +17,17 @@ package ast
 // doc.go "Parser implementations" for the full story on which
 // path is canonical when.
 //
-// Additional languages registered ONLY on the CGO-on path:
-//
-//   - C# (`.cs`, `.csx`) -- the C# parser
-//     (parser_treesitter_csharp.go) rides the tree-sitter-c-sharp
-//     grammar via CGO and has no scanner-backed fallback in v1.
-//     A `.cs` file ingested on the CGO=off toolchain falls
-//     through the dispatcher's "no parser registered for
-//     extension" branch, which surfaces a structured log and
-//     a non-fatal skip; the file simply does not contribute
-//     nodes / edges to the graph for that build. Adding a
-//     scanner-backed C# parser is tracked as a follow-up.
+// Language coverage note: Rust (.rs) is intentionally
+// CGO-only. The v1 Rust parser
+// (parser_treesitter_rust.go) rides the tree-sitter Rust
+// grammar; no stdlib-only scanner fallback exists because
+// Rust's surface (lifetimes, generics, macro invocations,
+// pattern-matching) is too far from what a regex-line
+// scanner can reliably handle. Files with `.rs` extensions
+// in a CGO=0 binary therefore fall through the dispatcher
+// without producing any class / method nodes -- callers that
+// need Rust ingestion MUST build with `CGO_ENABLED=1` (the
+// production default).
 func defaultParsers() []LanguageParser {
 	return []LanguageParser{
 		NewTypeScriptParser(),

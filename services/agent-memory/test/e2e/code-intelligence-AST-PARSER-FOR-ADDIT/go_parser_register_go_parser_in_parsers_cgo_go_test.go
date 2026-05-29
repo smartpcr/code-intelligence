@@ -1,0 +1,464 @@
+//go:build e2e
+
+package e2e
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+
+	"github.com/cucumber/godog"
+)
+
+// ---------------------------------------------------------------------------
+// Probe (CGO=on) — a _test.go injected at runtime into
+// internal/repoindexer/ast/ that constructs a Dispatcher from the
+// unexported defaultParsers() and checks whether the extension map
+// routes the given filename. This exercises the REAL
+// defaultParsers() → NewDispatcher → extMap path that parsers_cgo.go
+// provides when CGO_ENABLED=1.
+//
+// The probe accepts E2E_PROBE_FILENAME via env var.
+// ---------------------------------------------------------------------------
+
+const goRegProbeSource = `package ast
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+type e2eGoRegResult struct {
+	Language string ` + "`" + `json:"language"` + "`" + `
+	Found    bool   ` + "`" + `json:"found"` + "`" + `
+}
+
+func TestE2EProbe_GoRegistration(t *testing.T) {
+	filename := os.Getenv("E2E_PROBE_FILENAME")
+	if filename == "" {
+		t.Skip("E2E_PROBE_FILENAME not set")
+	}
+
+	// Exercise the real defaultParsers() and NewDispatcher path.
+	parsers := defaultParsers()
+	d := NewDispatcher(parsers, nil, nil)
+	ext := filepath.Ext(filename)
+	p, found := d.extMap[ext]
+
+	out := e2eGoRegResult{Found: found}
+	if found {
+		out.Language = p.Language()
+	}
+
+	data, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	fmt.Printf("PROBE_OUTPUT:%s\n", string(data))
+}
+`
+
+// ---------------------------------------------------------------------------
+// Probe (CGO=off) — a _test.go injected at runtime into
+// internal/repoindexer/ast/ and compiled with CGO_ENABLED=0 so
+// that parsers_nocgo.go provides defaultParsers(). The probe
+// converts the []LanguageParser return to []Parser (the interfaces
+// are structurally identical), constructs a real Dispatcher, calls
+// EmitFile, and reports the skip-log / node-edge counts.
+// ---------------------------------------------------------------------------
+
+const goRegProbeNoCGOSource = `package ast
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"testing"
+)
+
+type e2eNocgoLog struct {
+	entries []LogEntry
+}
+
+func (l *e2eNocgoLog) Log(msg string, attrs map[string]string) {
+	l.entries = append(l.entries, LogEntry{Message: msg, Attrs: attrs})
+}
+
+type e2eNocgoWriter struct {
+	nodeCount int
+	edgeCount int
+}
+
+func (w *e2eNocgoWriter) InsertNode(n Node) error { w.nodeCount++; return nil }
+func (w *e2eNocgoWriter) InsertEdge(e Edge) error { w.edgeCount++; return nil }
+
+type e2eGoRegNocgoResult struct {
+	SkipLogged bool   ` + "`" + `json:"skip_logged"` + "`" + `
+	Reason     string ` + "`" + `json:"reason"` + "`" + `
+	NodeCount  int    ` + "`" + `json:"node_count"` + "`" + `
+	EdgeCount  int    ` + "`" + `json:"edge_count"` + "`" + `
+}
+
+func TestE2EProbe_GoRegistrationNoCGO(t *testing.T) {
+	filename := os.Getenv("E2E_PROBE_FILENAME")
+	if filename == "" {
+		t.Skip("E2E_PROBE_FILENAME not set")
+	}
+
+	// Exercise the REAL defaultParsers() from parsers_nocgo.go.
+	// Under CGO=0, defaultParsers() returns []LanguageParser;
+	// convert element-by-element (both interfaces share the same
+	// method set, so every concrete type satisfies Parser too).
+	lps := defaultParsers()
+	parsers := make([]Parser, len(lps))
+	for i, lp := range lps {
+		parsers[i] = lp
+	}
+
+	w := &e2eNocgoWriter{}
+	l := &e2eNocgoLog{}
+	d := NewDispatcher(parsers, w, l)
+
+	d.EmitFile(filename, []byte("package main\n"))
+
+	out := e2eGoRegNocgoResult{
+		NodeCount: w.nodeCount,
+		EdgeCount: w.edgeCount,
+	}
+	for _, e := range l.entries {
+		if e.Message == "ast.dispatch.skip" {
+			out.SkipLogged = true
+			out.Reason = e.Attrs["reason"]
+		}
+	}
+
+	data, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	fmt.Printf("PROBE_OUTPUT:%s\n", string(data))
+}
+`
+
+// ---------------------------------------------------------------------------
+// Local mirror types for JSON deserialization of probe output
+// ---------------------------------------------------------------------------
+
+type goRegProbeOutput struct {
+	Language string `json:"language"`
+	Found    bool   `json:"found"`
+}
+
+type goRegNocgoProbeOutput struct {
+	SkipLogged bool   `json:"skip_logged"`
+	Reason     string `json:"reason"`
+	NodeCount  int    `json:"node_count"`
+	EdgeCount  int    `json:"edge_count"`
+}
+
+// ---------------------------------------------------------------------------
+// moduleRoot_goReg locates the Go module root (directory containing
+// go.mod) by walking up from this source file's location.
+// ---------------------------------------------------------------------------
+
+func moduleRoot_goReg() (string, error) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		return "", fmt.Errorf("runtime.Caller failed")
+	}
+	dir := filepath.Dir(thisFile)
+	// test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT -> 3 levels up to module root
+	for i := 0; i < 3; i++ {
+		dir = filepath.Dir(dir)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err != nil {
+		return "", fmt.Errorf("go.mod not found at %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
+// ---------------------------------------------------------------------------
+// runGoRegProbe writes the probe _test.go into the ast package,
+// runs it with CGO_ENABLED=1, and returns the parsed JSON result.
+// ---------------------------------------------------------------------------
+
+func runGoRegProbe(filename string) (*goRegProbeOutput, error) {
+	modRoot, err := moduleRoot_goReg()
+	if err != nil {
+		return nil, err
+	}
+
+	astDir := filepath.Join(modRoot, "internal", "repoindexer", "ast")
+	pid := os.Getpid()
+
+	probeFile := filepath.Join(astDir, fmt.Sprintf("e2e_probe_go_reg_%d_test.go", pid))
+	if err := os.WriteFile(probeFile, []byte(goRegProbeSource), 0644); err != nil {
+		return nil, fmt.Errorf("write probe: %w", err)
+	}
+	defer os.Remove(probeFile)
+
+	env := append(os.Environ(),
+		"CGO_ENABLED=1",
+		"E2E_PROBE_FILENAME="+filename,
+	)
+
+	cmd := exec.Command("go", "test",
+		"-run", "TestE2EProbe_GoRegistration",
+		"-v", "-count=1",
+		"./internal/repoindexer/ast/",
+	)
+	cmd.Dir = modRoot
+	cmd.Env = env
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("probe failed: %v\noutput:\n%s", err, string(output))
+	}
+
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "PROBE_OUTPUT:") {
+			raw := strings.TrimPrefix(line, "PROBE_OUTPUT:")
+			var out goRegProbeOutput
+			if err := json.Unmarshal([]byte(raw), &out); err != nil {
+				return nil, fmt.Errorf("parse JSON: %w\nraw: %s", err, raw)
+			}
+			return &out, nil
+		}
+	}
+	return nil, fmt.Errorf("PROBE_OUTPUT marker not found in output:\n%s", string(output))
+}
+
+// ---------------------------------------------------------------------------
+// runGoRegProbeNoCGO writes the nocgo probe _test.go into the ast
+// package, runs it with CGO_ENABLED=0 so that parsers_nocgo.go
+// provides defaultParsers(), and returns the parsed JSON result.
+// This exercises the REAL CGO=off code path instead of simulating
+// it with nil parsers.
+// ---------------------------------------------------------------------------
+
+func runGoRegProbeNoCGO(filename string) (*goRegNocgoProbeOutput, error) {
+	modRoot, err := moduleRoot_goReg()
+	if err != nil {
+		return nil, err
+	}
+
+	astDir := filepath.Join(modRoot, "internal", "repoindexer", "ast")
+	pid := os.Getpid()
+
+	probeFile := filepath.Join(astDir, fmt.Sprintf("e2e_probe_go_reg_nocgo_%d_test.go", pid))
+	if err := os.WriteFile(probeFile, []byte(goRegProbeNoCGOSource), 0644); err != nil {
+		return nil, fmt.Errorf("write nocgo probe: %w", err)
+	}
+	defer os.Remove(probeFile)
+
+	env := append(os.Environ(),
+		"CGO_ENABLED=0",
+		"E2E_PROBE_FILENAME="+filename,
+	)
+
+	cmd := exec.Command("go", "test",
+		"-run", "TestE2EProbe_GoRegistrationNoCGO",
+		"-v", "-count=1",
+		"./internal/repoindexer/ast/",
+	)
+	cmd.Dir = modRoot
+	cmd.Env = env
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("nocgo probe failed: %v\noutput:\n%s", err, string(output))
+	}
+
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "PROBE_OUTPUT:") {
+			raw := strings.TrimPrefix(line, "PROBE_OUTPUT:")
+			var out goRegNocgoProbeOutput
+			if err := json.Unmarshal([]byte(raw), &out); err != nil {
+				return nil, fmt.Errorf("parse nocgo JSON: %w\nraw: %s", err, raw)
+			}
+			return &out, nil
+		}
+	}
+	return nil, fmt.Errorf("PROBE_OUTPUT marker not found in nocgo probe output:\n%s", string(output))
+}
+
+// ---------------------------------------------------------------------------
+// Scenario state for stage 2.2: register-go-parser-in-parsers-cgo-go
+// ---------------------------------------------------------------------------
+
+type goRegState struct {
+	// Scenario 1: CGO=on routing (probe result)
+	probeResult *goRegProbeOutput
+
+	// Scenario 2: CGO=off EmitFile (nocgo probe result)
+	nocgoResult *goRegNocgoProbeOutput
+}
+
+// ---------------------------------------------------------------------------
+// Given: the dispatcher constructed with defaultParsers under CGO=on
+//
+// This is a precondition marker. The actual defaultParsers() exercise
+// happens in the When step via the probe subprocess (which constructs
+// a Dispatcher from defaultParsers() inside the ast package where the
+// unexported function is accessible).
+// ---------------------------------------------------------------------------
+
+func (s *goRegState) theDispatcherConstructedWithDefaultParsersUnderCGOOn() error {
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Given: the dispatcher constructed with defaultParsers under CGO=off
+//
+// Precondition marker. The actual defaultParsers() exercise happens
+// in the When step via the nocgo probe subprocess compiled with
+// CGO_ENABLED=0, which causes parsers_nocgo.go to supply
+// defaultParsers() — exercising the real CGO=off code path.
+// ---------------------------------------------------------------------------
+
+func (s *goRegState) theDispatcherConstructedWithDefaultParsersUnderCGOOff() error {
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// When: selectParser runs for "<filename>"
+//
+// Uses the probe subprocess to exercise defaultParsers() →
+// NewDispatcher → extMap lookup inside the ast package with
+// CGO_ENABLED=1.
+// ---------------------------------------------------------------------------
+
+func (s *goRegState) selectParserRunsFor(filename string) error {
+	result, err := runGoRegProbe(filename)
+	if err != nil {
+		return fmt.Errorf("selectParser probe for %q failed: %w", filename, err)
+	}
+	if !result.Found {
+		return fmt.Errorf("selectParser(%q) returned nil — extension not registered in defaultParsers()", filename)
+	}
+	s.probeResult = result
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// When: EmitFile processes a "<ext>" file
+//
+// Uses the nocgo probe subprocess compiled with CGO_ENABLED=0 to
+// exercise the real parsers_nocgo.go defaultParsers() →
+// NewDispatcher → EmitFile path. The probe reports skip-log events
+// and node/edge counts.
+// ---------------------------------------------------------------------------
+
+func (s *goRegState) emitFileProcessesAFile(ext string) error {
+	filename := "bar" + ext
+	result, err := runGoRegProbeNoCGO(filename)
+	if err != nil {
+		return fmt.Errorf("nocgo EmitFile probe for %q failed: %w", filename, err)
+	}
+	s.nocgoResult = result
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Then: the returned parser Language is "<expected>"
+// ---------------------------------------------------------------------------
+
+func (s *goRegState) theReturnedParserLanguageIs(expected string) error {
+	if s.probeResult == nil {
+		return fmt.Errorf("no probe result — the When step did not run")
+	}
+	if s.probeResult.Language != expected {
+		return fmt.Errorf("Language() = %q, want %q", s.probeResult.Language, expected)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Then: the structured log emits ast.dispatch.skip with reason "<reason>"
+// ---------------------------------------------------------------------------
+
+func (s *goRegState) theStructuredLogEmitsSkipWithReason(reason string) error {
+	if s.nocgoResult == nil {
+		return fmt.Errorf("no nocgo probe result — the When step did not run")
+	}
+	if !s.nocgoResult.SkipLogged {
+		return fmt.Errorf("no ast.dispatch.skip log entry found in nocgo probe output")
+	}
+	if s.nocgoResult.Reason != reason {
+		return fmt.Errorf("ast.dispatch.skip reason = %q, want %q", s.nocgoResult.Reason, reason)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Then: no Node or Edge is inserted
+// ---------------------------------------------------------------------------
+
+func (s *goRegState) noNodeOrEdgeIsInserted() error {
+	if s.nocgoResult == nil {
+		return fmt.Errorf("no nocgo probe result — the When step did not run")
+	}
+	if s.nocgoResult.NodeCount != 0 {
+		return fmt.Errorf("expected 0 node inserts, got %d", s.nocgoResult.NodeCount)
+	}
+	if s.nocgoResult.EdgeCount != 0 {
+		return fmt.Errorf("expected 0 edge inserts, got %d", s.nocgoResult.EdgeCount)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// requireEnv is a package-local helper that skips the test when a
+// required environment variable is unset.
+// ---------------------------------------------------------------------------
+
+func requireEnv_go_parser_register(t *testing.T, name string) string {
+	t.Helper()
+	v := os.Getenv(name)
+	if v == "" {
+		t.Skipf("required env var %s is not set", name)
+	}
+	return v
+}
+
+// ---------------------------------------------------------------------------
+// Godog wiring
+// ---------------------------------------------------------------------------
+
+func InitializeScenario_go_parser_register_go_parser_in_parsers_cgo_go(ctx *godog.ScenarioContext) {
+	s := &goRegState{}
+
+	// Scenario 1: CGO=on routing
+	ctx.Given(`^the dispatcher constructed with defaultParsers under CGO=on$`, s.theDispatcherConstructedWithDefaultParsersUnderCGOOn)
+	ctx.When(`^selectParser runs for "([^"]*)"$`, s.selectParserRunsFor)
+	ctx.Then(`^the returned parser Language is "([^"]*)"$`, s.theReturnedParserLanguageIs)
+
+	// Scenario 2: CGO=off EmitFile
+	ctx.Given(`^the dispatcher constructed with defaultParsers under CGO=off$`, s.theDispatcherConstructedWithDefaultParsersUnderCGOOff)
+	ctx.When(`^EmitFile processes a "([^"]*)" file$`, s.emitFileProcessesAFile)
+	ctx.Then(`^the structured log emits ast\.dispatch\.skip with reason "([^"]*)"$`, s.theStructuredLogEmitsSkipWithReason)
+	ctx.Then(`^no Node or Edge is inserted$`, s.noNodeOrEdgeIsInserted)
+}
+
+func TestE2E_go_parser_register_go_parser_in_parsers_cgo_go(t *testing.T) {
+	suite := godog.TestSuite{
+		ScenarioInitializer: InitializeScenario_go_parser_register_go_parser_in_parsers_cgo_go,
+		Options: &godog.Options{
+			Format:   "pretty",
+			Paths:    []string{"go_parser_register_go_parser_in_parsers_cgo_go.feature"},
+			TestingT: t,
+		},
+	}
+
+	if suite.Run() != 0 {
+		t.Fatal("non-zero status returned, failed to run feature tests")
+	}
+}

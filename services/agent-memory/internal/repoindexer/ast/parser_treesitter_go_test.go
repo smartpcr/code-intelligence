@@ -648,15 +648,43 @@ func formatGreeting(prefix, name string) string {
 	}
 
 	// ----- node ids by canonical signature -----
-	// Signatures are built INLINE here (not via shared
-	// classSignature / methodSignature / externalPackageSignature
-	// helpers) so this test does not depend on any other
-	// test-helper file that may or may not be present in the
-	// package. The formats mirror dispatcher.go's `fmt.Sprintf`
-	// calls in Pass 0 / Pass 1a / Pass 1b exactly so a
-	// regression that changes the canonical signature shape is
-	// caught here.
-	greeterClassSig := fmt.Sprintf("%s::class::%s#%s", repoURL, relPath, "Greeter")
+	// The class and external-package signatures use the shared
+	// `classSignature` / `externalPackageSignature` helpers from
+	// `signature_helpers_test.go`, which compiles unconditionally
+	// (no build tag) into this package and matches dispatcher.go
+	// byte-for-byte (class: ~line 440, external package: ~line
+	// 403). Using the helpers means a single formula change in
+	// dispatcher.go only has to be chased in one place, not
+	// every per-language dispatcher test.
+	//
+	// The method signatures, however, are deliberately built
+	// INLINE rather than via the shared `methodSignature` helper
+	// in `whitespace_test.go`. There is a known normalization
+	// gap: parser.go:202's doc comment claims the dispatcher
+	// runs `m.ParamSignature` through `NormalizeSignature`
+	// before embedding it, but dispatcher.go:499 actually uses
+	// the raw `m.ParamSignature` verbatim:
+	//
+	//   methodSig := fmt.Sprintf("%s::method::%s#%s(%s)",
+	//       ev.RepoURL, ev.RelPath, m.QualifiedName, m.ParamSignature)
+	//
+	// The shared `methodSignature` helper follows the DOC (it
+	// applies `NormalizeSignature` to params), so calling it
+	// here with `"prefix, name string"` would produce
+	// `(prefix,name string)` (comma-adjacent space stripped by
+	// `stripWhitespaceAroundPunctuation`), which diverges from
+	// what the dispatcher actually emits today
+	// (`(prefix, name string)`). Using the helper would make
+	// this test fail until the dispatcher is corrected to match
+	// its own doc.
+	//
+	// When the dispatcher is fixed to normalize per parser.go's
+	// stated contract, these inline formulas WILL start failing
+	// -- that's by design. At that point, replace both
+	// `greetMethodSig` / `formatMethodSig` with
+	// `methodSignature(repoURL, relPath, qualName, params)` and
+	// the test will pass against the corrected dispatcher.
+	greeterClassSig := classSignature(repoURL, relPath, "Greeter")
 	// Go parser sets ParamSignature to the parens-stripped
 	// parameter list verbatim (see parser_treesitter_go.go
 	// trimParens(p.Content(...))): `(name string)` →
@@ -664,7 +692,7 @@ func formatGreeting(prefix, name string) string {
 	// `"prefix, name string"`.
 	greetMethodSig := fmt.Sprintf("%s::method::%s#%s(%s)", repoURL, relPath, "*Greeter.Greet", "name string")
 	formatMethodSig := fmt.Sprintf("%s::method::%s#%s(%s)", repoURL, relPath, "formatGreeting", "prefix, name string")
-	fmtPkgSig := fmt.Sprintf("%s::package::%s", repoURL, "fmt")
+	fmtPkgSig := externalPackageSignature(repoURL, "fmt")
 
 	greeterClassID := goMustNodeIDForSig(t, fw, greeterClassSig)
 	greetMethodID := goMustNodeIDForSig(t, fw, greetMethodSig)
@@ -1089,7 +1117,19 @@ func (g *Greeter) SetPrefix(name string) {
 		repoURL = "https://git.example/acme/svc"
 		relPath = "src/hello.go"
 	)
-	greeterClassSig := fmt.Sprintf("%s::class::%s#%s", repoURL, relPath, "Greeter")
+	// Class signature uses the shared `classSignature` helper
+	// (byte-exact mirror of dispatcher.go ~line 440). The
+	// method signature is built inline for the same
+	// normalization-gap reason documented in
+	// TestGoFixture_EmitsExpectedNodeAndEdgeSet: parser.go:202's
+	// doc says the dispatcher normalizes `m.ParamSignature`,
+	// but dispatcher.go:499 uses it raw. The shared
+	// `methodSignature` helper follows the doc, so it would
+	// produce a different string than the dispatcher actually
+	// emits today. When the dispatcher is fixed to match its
+	// own doc, replace the inline `fmt.Sprintf` below with
+	// `methodSignature(repoURL, relPath, "*Greeter.SetPrefix", "name string")`.
+	greeterClassSig := classSignature(repoURL, relPath, "Greeter")
 	setPrefixMethodSig := fmt.Sprintf("%s::method::%s#%s(%s)", repoURL, relPath, "*Greeter.SetPrefix", "name string")
 	greeterClassID := goMustNodeIDForSig(t, fw, greeterClassSig)
 	setPrefixMethodID := goMustNodeIDForSig(t, fw, setPrefixMethodSig)

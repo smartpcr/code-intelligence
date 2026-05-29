@@ -8,8 +8,21 @@ import (
 
 	"github.com/gofrs/uuid"
 
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/coverage"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
+
+// ErrCoveragePackageRollupResolverMismatch is returned by
+// [CoverageSweep.Run] when the optional
+// [CoverageSweep.packageScopeResolver] returns a different
+// number of scope_ids than the package-rollup batch
+// requested. This is a [FoundationScopeResolver] contract
+// violation -- the interface doc pins the return slice
+// length to the input batch length -- and surfaces as a
+// distinct sentinel so an operator can tell "resolver
+// dropped rows" apart from "package rollup itself failed".
+var ErrCoveragePackageRollupResolverMismatch = errors.New("metric_ingestor: CoverageSweep package-rollup: scope resolver returned a slice of the wrong length (FoundationScopeResolver contract violation)")
 
 // ErrCoverageSHAMismatch is returned by [CoverageSweep.Run]
 // when the parent [ScanRunContext.SHA] disagrees with the
@@ -131,20 +144,99 @@ type CoverageSweep struct {
 	// time-ordered PK strategy ChurnSweep uses). Tests
 	// inject a deterministic generator.
 	newUUID func() (uuid.UUID, error)
+	// packageScopeResolver is OPTIONAL. When non-nil,
+	// [CoverageSweep.Run] computes a per-package weighted
+	// rollup of the same payload and APPENDS one
+	// [MetricSampleRecord] per (package, metric_kind)
+	// cohort to the file-level slice BEFORE the single
+	// atomic [MetricSampleWriter.WriteBatch] call. When
+	// nil, the sweep behaves exactly as it did before iter
+	// 8 (file-scope rows only) -- existing tests that
+	// construct CoverageSweep without the option continue
+	// to work.
+	//
+	// Iter 8: this seam closes the file -> package rollup
+	// production gap the cross-repo happy-path e2e
+	// (`test/e2e/cross_repo_happy_path/`) previously
+	// bridged with a test-side SQL shim. The composer is
+	// the production replacement: it derives package values
+	// from the payload's CARDINALITY-WEIGHTED line/branch
+	// counts (NOT an average of per-file ratios), uses the
+	// canonical [BuildCanonicalSignatureForRefURL] /
+	// [storage.ScopeBindingWriter] path to mint package
+	// `scope_binding` rows, and writes the resulting
+	// metric_sample rows via the same writer the file rows
+	// use -- so the rollup inherits the writer's
+	// transaction, ProducerRunID guard, post-finalize
+	// fence and active-row UPSERT semantics for free.
+	//
+	// See [coverage_package_rollup.go] for the pure
+	// grouping/weighting helper and
+	// [FoundationScopeResolver] for the resolver contract.
+	packageScopeResolver FoundationScopeResolver
+}
+
+// CoverageSweepOption configures a [CoverageSweep] built
+// via [NewCoverageSweep]. Iter 8 adds the first option
+// ([WithCoveragePackageRollupResolver]); pre-iter-8 call
+// sites that omit the variadic continue to compile and
+// behave exactly as before.
+type CoverageSweepOption func(*CoverageSweep)
+
+// WithCoveragePackageRollupResolver wires a
+// [FoundationScopeResolver] into the [CoverageSweep] so
+// that every [CoverageSweep.Run] call ALSO emits one
+// [MetricSampleRecord] per (package, metric_kind) cohort
+// alongside the per-file rows. The resolver is called
+// once with a `[]recipes.ScopeRef{Kind: scope.KindPackage,
+// Path: <pkgDir>}` batch; on success the returned
+// `scope_id`s parallel the input and the sweep appends the
+// rollup records to the same [MetricSampleWriter.WriteBatch]
+// call as the file rows.
+//
+// Passing a nil resolver is a NO-OP -- the option leaves
+// the sweep in its file-only mode. Call sites that want to
+// disable the rollup explicitly should simply omit the
+// option.
+//
+// Iter 8 wires this from the composition root
+// (`internal/composition/ingest_router.go` and
+// `cmd/clean-code-metric-ingestor/main.go`) using the
+// existing [PGScopeBindingResolver] -- the same canonical
+// `scope_binding` writer the test_balance and foundation
+// verbs already use -- so the rollup writes go through ONE
+// shared seam, not a coverage-specific composer.
+func WithCoveragePackageRollupResolver(r FoundationScopeResolver) CoverageSweepOption {
+	return func(s *CoverageSweep) {
+		if r != nil {
+			s.packageScopeResolver = r
+		}
+	}
 }
 
 // NewCoverageSweep returns a [CoverageSweep] wired with the
 // provided dependencies. PANICS on any nil argument -- the
 // composition root is the only legitimate caller, and a nil
 // here is always a wiring bug.
-func NewCoverageSweep(h *coverage.Hydrator, w MetricSampleWriter) *CoverageSweep {
-	return newCoverageSweepWithUUID(h, w, uuid.NewV7)
+//
+// Iter 8 adds the variadic `opts` slot for
+// [CoverageSweepOption] values (e.g.
+// [WithCoveragePackageRollupResolver]). The variadic is
+// SOURCE-BACKWARD-COMPATIBLE -- pre-iter-8 callers
+// (`NewCoverageSweep(h, w)`) continue to compile and
+// behave exactly as before. Existing unit tests that
+// construct the sweep without options exercise the
+// file-only path; composition-root callers wire the rollup
+// resolver explicitly.
+func NewCoverageSweep(h *coverage.Hydrator, w MetricSampleWriter, opts ...CoverageSweepOption) *CoverageSweep {
+	return newCoverageSweepWithUUID(h, w, uuid.NewV7, opts...)
 }
 
 func newCoverageSweepWithUUID(
 	h *coverage.Hydrator,
 	w MetricSampleWriter,
 	newUUID func() (uuid.UUID, error),
+	opts ...CoverageSweepOption,
 ) *CoverageSweep {
 	if h == nil {
 		panic("metric_ingestor: NewCoverageSweep received nil *coverage.Hydrator")
@@ -155,11 +247,17 @@ func newCoverageSweepWithUUID(
 	if newUUID == nil {
 		panic("metric_ingestor: newUUID is nil")
 	}
-	return &CoverageSweep{
+	s := &CoverageSweep{
 		hydrator: h,
 		writer:   w,
 		newUUID:  newUUID,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+	return s
 }
 
 // validateCoverageScanRun is the closed-set guard for the
@@ -296,6 +394,34 @@ func (s *CoverageSweep) Run(ctx context.Context, scanRun ScanRunContext, payload
 		records[i] = raw.(MetricSampleRecord)
 	}
 
+	// Iter 8 -- file -> package weighted rollup. Runs ONLY
+	// when the composition root wired a
+	// [FoundationScopeResolver] via
+	// [WithCoveragePackageRollupResolver]; existing call
+	// sites (unit tests, scaffolds) that omit the option
+	// behave exactly as before.
+	//
+	// The rollup is intentionally APPENDED to the file
+	// record slice (one shared [MetricSampleWriter.WriteBatch]
+	// call) so:
+	//
+	//   - both file and package rows share the same
+	//     [MetricSampleRecord.ProducerRunID] (the
+	//     [PGMetricSampleWriter] batch guard enforces this);
+	//   - the writer's post-finalize fence runs ONCE for
+	//     the combined batch;
+	//   - a rollup failure aborts before the file rows
+	//     persist, preserving the all-or-nothing contract
+	//     the file-only path already documents on lines
+	//     223-225.
+	if s.packageScopeResolver != nil && len(payload.Files) > 0 {
+		packageRecords, err := s.buildPackageRollupRecords(ctx, payload, scanRun)
+		if err != nil {
+			return CoverageSweepResult{}, err
+		}
+		records = append(records, packageRecords...)
+	}
+
 	if len(records) > 0 {
 		if err := s.writer.WriteBatch(ctx, records); err != nil {
 			return CoverageSweepResult{}, fmt.Errorf("%w: %v", ErrWriterFailure, err)
@@ -307,6 +433,124 @@ func (s *CoverageSweep) Run(ctx context.Context, scanRun ScanRunContext, payload
 		RowsHydrated:             len(hydrateResult.Rows),
 		SkippedUnboundScopeCount: hydrateResult.SkippedUnboundScopeCount,
 	}, nil
+}
+
+// buildPackageRollupRecords groups the [coverage.Payload]
+// files by package directory, computes the cardinality-
+// weighted line/branch ratio per package via
+// [rollUpCoveragePackages], resolves each package's durable
+// `scope_binding.scope_id` via the wired
+// [FoundationScopeResolver], and shapes the result into a
+// [MetricSampleRecord] slice ready to APPEND to the file
+// records before [MetricSampleWriter.WriteBatch].
+//
+// # Scope resolution
+//
+// The resolver call is the SAME canonical seam the
+// foundation dispatcher and the test_balance writer use --
+// [PGScopeBindingResolver] in production -- so the package
+// `scope_binding` rows land via the same advisory-lock
+// natural-key path that the file rows already rely on.
+// `BuildCanonicalSignatureForRefURL` switches on
+// `ref.Kind == scope.KindPackage` and emits
+// `<repoURL>::pkg::<pkgDir>` via [scope.BuildPackage].
+//
+// # ProducerRunID
+//
+// Every emitted record's ProducerRunID equals
+// `scanRun.ID`, matching the file records' ProducerRunID
+// so the [PGMetricSampleWriter] mixed-batch guard accepts
+// the combined slice.
+//
+// # Empty rollup
+//
+// Returns `(nil, nil)` when [rollUpCoveragePackages]
+// produces zero cohorts (e.g. every file had
+// `LinesValid == 0` AND `BranchesValid == 0`). The caller
+// treats this as a clean no-op append.
+func (s *CoverageSweep) buildPackageRollupRecords(ctx context.Context, payload *coverage.Payload, scanRun ScanRunContext) ([]MetricSampleRecord, error) {
+	rollups := rollUpCoveragePackages(payload)
+	if len(rollups) == 0 {
+		return nil, nil
+	}
+
+	// Build the dedup'd package-ref batch. Two rollup
+	// rows for the same package (line + branch) MUST share
+	// the same scope_id, so we resolve each package
+	// directory ONCE and zip back by package path.
+	pkgIndex := map[string]int{}
+	pkgRefs := make([]recipes.ScopeRef, 0, len(rollups))
+	for i := range rollups {
+		pkg := rollups[i].PackagePath
+		if _, seen := pkgIndex[pkg]; seen {
+			continue
+		}
+		pkgIndex[pkg] = len(pkgRefs)
+		pkgRefs = append(pkgRefs, recipes.ScopeRef{
+			Kind: scope.KindPackage,
+			// Path is the per-package directory the
+			// [BuildCanonicalSignatureForRefURL] dispatch
+			// (canonical_signature.go:165-170) requires
+			// for [scope.KindPackage]; the helper threads
+			// it into [scope.BuildPackage] which renders
+			// `<repoURL>::pkg::<pkgDir>`.
+			Path: pkg,
+			// QualifiedName is unused for package refs
+			// (only file/class/interface/method need
+			// it); the resolver's per-ref validation
+			// skips the non-empty check when
+			// `ref.Kind == scope.KindPackage`.
+			QualifiedName: pkg,
+		})
+	}
+
+	scopeIDs, err := s.packageScopeResolver.ResolveScopeIDs(ctx, payload.RepoID, pkgRefs, payload.SHA)
+	if err != nil {
+		return nil, fmt.Errorf("metric_ingestor: CoverageSweep package-rollup ResolveScopeIDs (repo=%s sha=%s): %w", payload.RepoID, payload.SHA, err)
+	}
+	if len(scopeIDs) != len(pkgRefs) {
+		return nil, fmt.Errorf("%w: requested %d refs, got %d ids", ErrCoveragePackageRollupResolverMismatch, len(pkgRefs), len(scopeIDs))
+	}
+
+	out := make([]MetricSampleRecord, 0, len(rollups))
+	for i := range rollups {
+		row := &rollups[i]
+		idx, ok := pkgIndex[row.PackagePath]
+		if !ok {
+			// Defensive: the package was just inserted
+			// into `pkgIndex` above. A miss here is a
+			// programmer bug, not a runtime condition.
+			return nil, fmt.Errorf("metric_ingestor: CoverageSweep package-rollup: pkg %q missing from index after dedup (programmer bug)", row.PackagePath)
+		}
+		scopeID := scopeIDs[idx]
+		if scopeID == uuid.Nil {
+			return nil, fmt.Errorf("metric_ingestor: CoverageSweep package-rollup: resolver returned the zero UUID for pkg %q (repo=%s sha=%s)", row.PackagePath, payload.RepoID, payload.SHA)
+		}
+		sampleID, err := s.newUUID()
+		if err != nil {
+			return nil, fmt.Errorf("metric_ingestor: CoverageSweep package-rollup: mint sample_id for pkg=%q kind=%s: %w", row.PackagePath, row.MetricKind, err)
+		}
+		out = append(out, MetricSampleRecord{
+			SampleID:      sampleID,
+			RepoID:        payload.RepoID,
+			SHA:           payload.SHA,
+			ScopeID:       scopeID,
+			MetricKind:    row.MetricKind,
+			MetricVersion: coverage.MetricVersion,
+			Pack:          recipes.PackIngested,
+			// SourceDerived flags the row as a derived
+			// rollup rather than a raw ingest -- the
+			// aggregator's read filters do not
+			// distinguish today, but the column makes
+			// the provenance visible to operators
+			// reading metric_sample directly.
+			Source:        recipes.SourceDerived,
+			Value:         row.Value,
+			Attrs:         nil,
+			ProducerRunID: scanRun.ID,
+		})
+	}
+	return out, nil
 }
 
 // EnsureCoverageSkipLoggerAttached wires `logger` into the

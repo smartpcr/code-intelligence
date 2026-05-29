@@ -172,11 +172,10 @@ func (s *agedMuteState) anOverrideWithMuteEqualToAndCreatedAtDaysAgo(muteVal str
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err = s.db.ExecContext(ctx,
-		fmt.Sprintf(
-			`UPDATE mgmt_override
-			 SET created_at = NOW() - INTERVAL '%d days'
-			 WHERE scope = $1 AND rule_id = $2`, days),
-		s.listedScope, s.listedRuleID)
+		`UPDATE mgmt_override
+		 SET created_at = NOW() - ($3 || ' days')::interval
+		 WHERE scope = $1 AND rule_id = $2`,
+		s.listedScope, s.listedRuleID, days)
 	if err != nil {
 		return fmt.Errorf("backdating override row: %w", err)
 	}

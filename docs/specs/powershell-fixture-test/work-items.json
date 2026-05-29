@@ -1,0 +1,108 @@
+{
+  "$schema": "wit/phase-stage-step.v1",
+  "story": "code-intelligence:AST-PARSER-FOR-ADDIT",
+  "parentAnchor": "phase-powershell-parser/stage-powershell-fixture-test",
+  "headStateNotes": {
+    "parserType": "Uppercase PowerShellParser (parser_powershell.go line 7) — lowercase powershellParser referenced by iter-1 test does NOT exist on HEAD (PR #175 reverted by PR #183).",
+    "parseStubBody": "On pwsh present, Parse() returns ParseResult{}, nil — fixture tests would see zero classes/methods/imports until the real subprocess body is restored.",
+    "unavailableErrorFormat": "UnavailableError.Error() returns Reason + ': parser unavailable' (parser.go line 21). The iter-1 test's substring assertion 'reason=pwsh_not_available' (line 44) does NOT match this format and would fail even when prerequisites land.",
+    "shippedTestArtifact": "parser_powershell_test.go at commit cff1320 is forward-looking against the post-PR-#175 shape. Per operator pin (see operatorAnswers below), this is accepted as a Stage 6.3 artifact and NOT a blocker."
+  },
+  "operatorAnswers": {
+    "ps-fixture-test-blocked-on-prod": "Not blocked — accept test as artifact for when prod catches up.",
+    "ps-fixture-test-build-tag": "A — keep parser-level in untagged file (as currently shipped)."
+  },
+  "prerequisites": [
+    "PR #175 (or successor: 'powershellParser subprocess implementation — E2E') restoring the lowercase powershellParser{pwshBin, timeout} struct and the real Parse() subprocess body. STATUS: REVERTED at HEAD (PR #183 wiped to 32-line stub). Blocks Step C1 only; does NOT block Stage 6.3 closure per operator pin.",
+    "Dispatcher canonical merge into feature/memory, resolving duplicate decls and unblocking ast-package compile. STATUS: SEPARATE WORKSTREAM. Blocks Step C1 only.",
+    "ErrParserUnavailable sentinel + UnavailableError{Reason string} — STATUS: PRESENT at parser.go lines 14-22.",
+    "ParseResult{Classes,Methods,Imports} + MethodDecl{QualifiedName,EnclosingClass,ReceiverCalls} + Import{Module,LangMeta} — STATUS: shipped by 'Additive parser.go struct surfaces — E2E' (complete per workstream-context).",
+    "isRelativeImport(string) bool — STATUS: depends on dispatcher canonical merge."
+  ],
+  "phases": [
+    {
+      "id": "phase-powershell-fixture-test",
+      "title": "PowerShell fixture test",
+      "summary": "Stage 6.3 acceptance suite for the powershellParser subprocess parser. Untagged test file, parser-level assertions, pwsh-gated fixture cases skip on PowerShell-less CI. Iter-1 shipped a forward-looking test artifact; current HEAD does not yet satisfy its prerequisites, accepted as artifact per operator pin.",
+      "stages": [
+        {
+          "id": "stage-a-scaffold-and-sentinel",
+          "title": "Scaffold and sentinel coverage (no pwsh required)",
+          "summary": "Create the untagged test file with file-local helpers and the only required test that runs on every CI host regardless of pwsh availability.",
+          "steps": [
+            {
+              "id": "step-a1-scaffold-and-sentinel",
+              "title": "Scaffold untagged test file and add TestPowerShellParser_NoPwsh_ReturnsSentinel",
+              "summary": "Create services/agent-memory/internal/repoindexer/ast/parser_powershell_test.go with no build tags and the file-local helpers classNames, methodNames, containsString, langMetaString, importModules. Add TestPowerShellParser_NoPwsh_ReturnsSentinel that constructs &powershellParser{pwshBin:\"\"} directly, asserts errors.Is(err, ErrParserUnavailable) is true, and uses errors.As to read UnavailableError.Reason == \"pwsh_not_available\" (structural; do NOT substring-match err.Error(), since UnavailableError.Error() returns Reason + \": parser unavailable\" with no \"reason=\" prefix). NOTE: iter-1 commit cff1320 shipped this step's file but with a substring assertion that does NOT match the actual Error() format — see Step C1 for the reconciliation.",
+              "expectedFileChanges": 1,
+              "dependsOn": [],
+              "status": "shipped-with-known-bug"
+            }
+          ]
+        },
+        {
+          "id": "stage-b-fixture-acceptance",
+          "title": "Fixture-driven acceptance (pwsh-gated)",
+          "summary": "Tests that need pwsh on PATH to execute the embedded fixtures end-to-end. Each test opens with exec.LookPath(\"pwsh\") + t.Skip so PowerShell-less CI stays green.",
+          "steps": [
+            {
+              "id": "step-b1-greeter-fixture",
+              "title": "Add TestPowerShellFixture_EmitsExpectedNodeAndEdgeSet",
+              "summary": "Embed the brief's Greeter fixture verbatim (class Greeter { [string] $Prefix; [string] Format([string]$name) { return \"$($this.Prefix) $name\" } [string] Greet([string]$name) { return $this.Format($name) } } function Format-Hello { param([string]$Name) return \"hi $Name\" } Import-Module Foo). Assert: 1 class node (Greeter); 3 method nodes (Greeter.Format, Greeter.Greet, Format-Hello) with EnclosingClass driving file-vs-class contains edges; 1 imports edge to Foo with LangMeta[module_kind]==Import-Module; Greeter.Greet.ReceiverCalls contains \"Format\" (drives Pass 2b static_calls Greeter.Greet -> Greeter.Format via the $this.X(...) extractor) AND does NOT contain \"Format-Hello\" (negative-resolution guard). NOTE: iter-1 commit cff1320 shipped this test; it will not actually pass against HEAD's stub Parse() until the real subprocess body is restored — see Step C1.",
+              "expectedFileChanges": 1,
+              "dependsOn": ["step-a1-scaffold-and-sentinel"],
+              "status": "shipped-waits-on-real-parse-body"
+            },
+            {
+              "id": "step-b2-dot-source",
+              "title": "Add TestPowerShellFixture_DotSourceDropped",
+              "summary": "Per implementation-plan.md Stage 6.3 third bullet. Embed a fixture with `. ./helpers.ps1` dot-source. Assert the parser surfaces it in Imports with Module==\"./helpers.ps1\", LangMeta[module_kind]==\"dot_source\", and isRelativeImport(dot.Module)==true so the dispatcher suppresses the import edge.",
+              "expectedFileChanges": 1,
+              "dependsOn": ["step-a1-scaffold-and-sentinel"],
+              "status": "shipped-waits-on-real-parse-body"
+            }
+          ]
+        },
+        {
+          "id": "stage-c-reconciliation",
+          "title": "Reconciliation after prerequisites land (currently blocked)",
+          "summary": "Future stage that becomes runnable once PR #175 (or successor) is restored AND the dispatcher canonical merge lands. Per operator pin, does NOT block Stage 6.3 closure.",
+          "steps": [
+            {
+              "id": "step-c1-reconcile-test-with-head",
+              "title": "Reconcile shipped test file with HEAD after prerequisites land",
+              "summary": "Edits needed in parser_powershell_test.go once prerequisites land: (1) Sentinel substring -> structural: replace strings.Contains(err.Error(), \"reason=pwsh_not_available\") at line 44 with errors.As(&UnavailableError{}) and assert .Reason == \"pwsh_not_available\". (2) If PR #175 restores lowercase powershellParser, no constructor change needed; if the future shape keeps uppercase PowerShellParser, rewrite the two &powershellParser{...} sites (lines 35, 578) to &PowerShellParser{...} and drop any timeout field reference if absent. (3) If the real subprocess body is NOT restored, replace the Greeter and dot-source fixture tests with a t.Skip that notes the parser is a stub.",
+              "expectedFileChanges": 1,
+              "dependsOn": ["step-a1-scaffold-and-sentinel"],
+              "status": "blocked-on-upstream",
+              "blockedOn": [
+                "PR #175 restoration (or successor 'powershellParser subprocess implementation — E2E')",
+                "Dispatcher canonical merge into feature/memory"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "informationalAlreadyShipped": [
+    "TestPowerShellParser_Interface_Wired (Language/Extensions contract)",
+    "TestPowerShellParser_RegisteredInActiveBuild (build-tag registration smoke)",
+    "TestPowerShellParser_Timeout_ReturnsNonSentinelError (timeout determinism via 1ns deadline — references the non-existent timeout field on HEAD; covered by Step C1)",
+    "TestPowerShellEnvelope_ToParseResult_MapsAllFields (envelope JSON -> ParseResult mapping — references powershellEnvelope which doesn't exist on HEAD; covered by Step C1)"
+  ],
+  "outOfScope": [
+    "Refactor of parser_powershell.go, dispatcher.go, or any production source under services/agent-memory/internal/repoindexer/ast/. THIS WORKSTREAM IS PLAN-ONLY this iteration.",
+    "Editing parser_powershell_test.go to reconcile with HEAD — system prompt forbids modifying source files outside docs/specs/ on a PLAN task; the reconciliation is the Step C1 future deliverable, not this iter's work.",
+    "Dispatcher-vocabulary end-to-end assertions (Node/Edge capture via fakeNodeEdgeWriter) — lives in parser_powershell_dispatcher_test.go under //go:build canonical_dispatcher.",
+    "[Greeter]::Format(...) static-class invocation support — explicitly out of v1 per the brief.",
+    "Repo-wide baseline compile-error fixes (duplicate decls, missing lib/pq / pgx deps, parser_powershell.go full subprocess body) — tracked as separate workstreams. Operator pin: not a blocker."
+  ],
+  "capacityCheck": {
+    "phaseChildren": {"count": 3, "cap": 20},
+    "stageAChildren": {"count": 1, "cap": 20},
+    "stageBChildren": {"count": 2, "cap": 20},
+    "stageCChildren": {"count": 1, "cap": 20},
+    "maxLeafExpectedFileChanges": {"value": 1, "cap": 20}
+  }
+}

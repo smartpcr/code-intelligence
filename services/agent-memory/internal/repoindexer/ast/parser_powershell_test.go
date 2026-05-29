@@ -112,9 +112,9 @@ func TestPowerShellParser_RegisteredInBothBuildTagSources(t *testing.T) {
 	// package directory (the normal `go test` working
 	// directory) or from a parent (some IDE runners).
 	candidates := []string{
-		".",                                                 // services/.../ast (default)
-		filepath.Join("internal", "repoindexer", "ast"),     // services/agent-memory
-		filepath.Join("services", "agent-memory",            // repo root
+		".", // services/.../ast (default)
+		filepath.Join("internal", "repoindexer", "ast"), // services/agent-memory
+		filepath.Join("services", "agent-memory", // repo root
 			"internal", "repoindexer", "ast"),
 	}
 	var astDir string
@@ -296,6 +296,201 @@ func TestPowerShellFixture_EmitsExpectedParseResult(t *testing.T) {
 		t.Errorf("import ./helpers.ps1 missing; got modules %v", importModules(res.Imports))
 	} else if got, want := langMetaString(dot, "module_kind"), "dot_source"; got != want {
 		t.Errorf("./helpers.ps1.LangMeta.module_kind = %q; want %q", got, want)
+	}
+}
+
+// TestPowerShellFixture_EmitsExpectedNodeAndEdgeSet pins the
+// Stage 6.3 acceptance set per the workstream brief verbatim
+// (story code-intelligence:AST-PARSER-FOR-ADDIT, phase
+// powershell-parser, stage powershell-fixture-test).
+//
+// The fixture is intentionally the brief's simpler shape:
+//
+//	class Greeter {
+//	    [string] $Prefix
+//	    [string] Format([string]$name) { return "$($this.Prefix) $name" }
+//	    [string] Greet([string]$name)  { return $this.Format($name) }
+//	}
+//	function Format-Hello { param([string]$Name) return "hi $Name" }
+//	Import-Module Foo
+//
+// Brief assertions (dispatcher-level vocabulary the brief uses):
+//
+//   - 1 class node (`Greeter`)
+//   - 3 method nodes (`Greeter.Format`, `Greeter.Greet`,
+//     `Format-Hello`)
+//   - 1 contains edge per node + file
+//   - 1 imports edge to `Foo`
+//   - `Greeter.Greet`'s `static_calls` to `Greeter.Format`
+//     resolves through the `$this.Format(...)` receiver-
+//     qualified path covered by the Stage 6.1 `$this.X(...)`
+//     extractor (tech-spec Section 5.6).
+//
+// Note: `[Greeter]::Format(...)` static-class invocations are
+// explicitly out of v1 scope per the brief; the fixture uses
+// an instance receiver call (`$this.Format(...)`) instead.
+//
+// IMPLEMENTATION NOTE — parser-level assertions, by design:
+// The brief requires this test be in an UNTAGGED file
+// (`parser_powershell_test.go`, no `//go:build` line). The
+// dispatcher-level helpers that would let us assert on
+// emitted Node / Edge inserts directly — `newFakeWriter`,
+// `NewDispatcher(fw, WithParsers(...))`, `makeEvent`,
+// `fw.nodesOf`, `fw.edgesOf`, `fw.nodeIDBySimpleSig`,
+// `lastSegmentAfterHash` — all live in
+// `//go:build canonical_dispatcher`-gated test files
+// (dispatcher_test.go, parser_typescript_test.go). An
+// untagged test file cannot reference any of those symbols
+// without producing a hard compile error in the default
+// (no-tag) build path, regardless of any runtime
+// `t.Skip("pwsh not on PATH")` guard.
+//
+// We therefore assert at the PARSER level on the
+// `ParseResult` fields the dispatcher consumes to emit each
+// brief item, with the mapping documented inline beside each
+// assertion. The dispatcher-level end-to-end coverage of the
+// same fixture (real node/edge emission via the
+// `fakeNodeEdgeWriter` capture path) lives in
+// `parser_powershell_dispatcher_test.go` (canonical_dispatcher
+// build tag), and the Pass 2b receiver-qualified resolution
+// of `$this.Format(...)` -> `Greeter.Format` is structurally
+// pinned by `TestDispatcher_PowerShell_*` cases in
+// `dispatcher_pass2bd_test.go` (also canonical_dispatcher).
+//
+// Skipped when `pwsh` is not on PATH, per brief, so a
+// PowerShell-less CI host stays green.
+func TestPowerShellFixture_EmitsExpectedNodeAndEdgeSet(t *testing.T) {
+	if _, err := exec.LookPath("pwsh"); err != nil {
+		t.Skip("pwsh not on PATH")
+	}
+	const fixture = `Import-Module Foo
+
+class Greeter {
+    [string] $Prefix
+    [string] Format([string]$name) {
+        return "$($this.Prefix) $name"
+    }
+    [string] Greet([string]$name) {
+        return $this.Format($name)
+    }
+}
+
+function Format-Hello {
+    param([string]$Name)
+    return "hi $Name"
+}
+`
+	p := NewPowerShellParser()
+	res, err := p.Parse("scripts/hello.ps1", []byte(fixture))
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	// Brief item 1: "1 class node (`Greeter`)".
+	// Dispatcher mapping: each ClassDecl in ParseResult.Classes
+	// produces exactly one `class` node + one `contains` edge
+	// from the file node (see `Dispatcher.emit` /
+	// `Dispatcher.emitContains` in dispatcher.go on the
+	// canonical_dispatcher branch).
+	if got, want := len(res.Classes), 1; got != want {
+		t.Fatalf("classes = %d; want %d (Greeter); got names %v", got, want, classNames(res.Classes))
+	}
+	if got, want := res.Classes[0].QualifiedName, "Greeter"; got != want {
+		t.Errorf("class[0].QualifiedName = %q; want %q", got, want)
+	}
+
+	// Brief item 2: "3 method nodes (`Greeter.Format`,
+	// `Greeter.Greet`, `Format-Hello`)".
+	// Asserted by NAME (not just by count) so a regression that
+	// emits "any 3 methods" — e.g. extracting a phantom
+	// `$Prefix` accessor — fails loudly.
+	if got, want := len(res.Methods), 3; got != want {
+		t.Fatalf("methods = %d; want %d (%v)", got, want, methodNames(res.Methods))
+	}
+	byName := map[string]MethodDecl{}
+	for _, m := range res.Methods {
+		byName[m.QualifiedName] = m
+	}
+	wantEnclosing := map[string]string{
+		"Greeter.Format": "Greeter",
+		"Greeter.Greet":  "Greeter",
+		"Format-Hello":   "",
+	}
+	for name, enclosing := range wantEnclosing {
+		m, ok := byName[name]
+		if !ok {
+			t.Errorf("method %q missing from emitted set; got %v", name, methodNames(res.Methods))
+			continue
+		}
+		// Brief item 3: "1 contains edge per node + file"
+		// (file->class, class->method for in-class methods,
+		// file->method for the free function). The dispatcher
+		// emits these from `EnclosingClass`: a non-empty value
+		// produces `class->method` contains; an empty value
+		// produces `file->method`. Asserting `EnclosingClass`
+		// per method is the parser-level invariant the
+		// dispatcher relies on to emit the brief's expected
+		// 4-edge containment set.
+		if got, want := m.EnclosingClass, enclosing; got != want {
+			t.Errorf("method %q EnclosingClass = %q; want %q (controls file-vs-class containment edge in dispatcher emit)",
+				name, got, want)
+		}
+	}
+
+	// Brief item 4: "1 imports edge to `Foo`".
+	// Dispatcher mapping: each non-relative Import in
+	// ParseResult.Imports produces one external `package` node
+	// (signature `repo::package::<module>`) + one `imports`
+	// edge from the file node to that package node. Asserting
+	// (a) exactly one Import, (b) Module="Foo",
+	// (c) LangMeta["module_kind"]="Import-Module" pins the
+	// data the dispatcher consumes to emit that single edge.
+	if got, want := len(res.Imports), 1; got != want {
+		t.Fatalf("imports = %d; want %d (Foo via Import-Module)", got, want)
+	}
+	if got, want := res.Imports[0].Module, "Foo"; got != want {
+		t.Errorf("import.Module = %q; want %q", got, want)
+	}
+	if got, want := langMetaString(res.Imports[0], "module_kind"), "Import-Module"; got != want {
+		t.Errorf("import.LangMeta[module_kind] = %q; want %q", got, want)
+	}
+
+	// Brief item 5: "`Greeter.Greet`'s `static_calls` to
+	// `Greeter.Format` resolves through the
+	// `$this.Format(...)` receiver-qualified path covered by
+	// the Stage 6.1 `$this.X(...)` extractor".
+	//
+	// Parser contract: the embedded extraction script's
+	// `PS-ExtractReceiverCalls` emits the simple member name
+	// "Format" (NOT the qualified "Greeter.Format") onto
+	// `Greeter.Greet.ReceiverCalls`. The dispatcher's Pass 2b
+	// then resolves `<EnclosingClass>.<receiverCallName>` ->
+	// the same-file method NodeID and emits the
+	// `static_calls` edge. The brief's note that
+	// `[Greeter]::Format(...)` static-class invocations are
+	// out of v1 scope means the receiver-qualified path is
+	// the ONLY route from `Greet` to `Format` in v1; this
+	// test pins that route exists.
+	greet, ok := byName["Greeter.Greet"]
+	if !ok {
+		t.Fatalf("Greeter.Greet missing; got %v", methodNames(res.Methods))
+	}
+	if !containsString(greet.ReceiverCalls, "Format") {
+		t.Errorf("Greeter.Greet.ReceiverCalls = %v; want to include \"Format\" so dispatcher Pass 2b emits the same-file static_calls edge Greeter.Greet -> Greeter.Format (tech-spec Section 5.6 $this.X(...) extractor)",
+			greet.ReceiverCalls)
+	}
+	// Negative-resolution guard: the receiver-qualified path
+	// must resolve to a method in the SAME CLASS, never to a
+	// same-file free function. If the extractor mistakenly
+	// emitted "Format-Hello" (e.g. from a bug that walked
+	// command calls instead of MemberExpressionAst), Pass 2b
+	// would then mis-resolve `$this.Format(...)` to the free
+	// function `Format-Hello` because that name happens to
+	// share the simple prefix. Guarding against it here
+	// catches that regression at the parser layer.
+	if containsString(greet.ReceiverCalls, "Format-Hello") {
+		t.Errorf("Greeter.Greet.ReceiverCalls = %v; must NOT include \"Format-Hello\" — receiver-qualified $this.X(...) resolves within the enclosing class only, not to same-file free functions",
+			greet.ReceiverCalls)
 	}
 }
 

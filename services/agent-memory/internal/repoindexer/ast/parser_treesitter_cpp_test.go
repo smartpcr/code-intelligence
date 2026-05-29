@@ -832,3 +832,434 @@ func TestDefaultParsers_CBeforeCpp(t *testing.T) {
 		t.Errorf("defaultParsers() ordering: C at index %d must come BEFORE C++ at index %d (see parsers_cgo.go documented order)", cIdx, cppIdx)
 	}
 }
+
+// TestCppFixture_EmitsExpectedNodeAndEdgeSet pins the Stage
+// 3.5 (Cpp-fixture-test) acceptance contract for the C++
+// tree-sitter parser per
+// docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/
+// implementation-plan.md Stage 3.5. The fixture is the
+// canonical snippet the spec spells out verbatim, exercising
+// the four grammar surfaces the C++ stages must cover:
+//
+//   - two `class_specifier` declarations (`Base`, `Greeter`)
+//     with single-base public inheritance -- so the parser
+//     proves it emits two ClassDecl entries, records
+//     `Greeter.Extends == ["Base"]` (the parser-level input
+//     the dispatcher uses to mint the `extends` edge), and
+//     records `Greeter.LangMeta["base_access"]["Base"] ==
+//     "public"` (the descriptive LangMeta the dispatcher
+//     folds into `attrs_json["base_access"]`),
+//   - three method-bearing declarations (`Base.identify`
+//     inline in the class body, `Greeter.greet` inline in
+//     the class body, and the free function `log_global`) --
+//     so the parser proves it emits three MethodDecls with
+//     the dotted `<EnclosingClass>.<name>` QualifiedName
+//     convention for members and the bare name for free
+//     functions, the latter with `EnclosingClass == ""`
+//     (the parser-level signal the dispatcher uses to mint
+//     the `file -> method` contains edge instead of
+//     `class -> method`),
+//   - one bare-identifier call `log_global()` inside
+//     `Greeter.greet` -- so the parser records it in
+//     `greet.Calls` (the dispatcher's Pass 2b same-file
+//     callee index resolves the bare name to the
+//     `log_global` method node and mints the single
+//     `static_calls` edge the spec pins), and
+//   - one receiver-qualified call `this->identify()` --
+//     so the parser records it in `greet.ReceiverCalls`
+//     (the dispatcher's Pass 2b receiver-qualified path
+//     attempts the lookup against
+//     `methodNodeID["Greeter.identify"]`; because
+//     `identify` is declared only on `Base` (a different
+//     class in the same file), the lookup misses and the
+//     edge is correctly DROPPED per architecture invariant
+//     A4 -- prefer missing edges over wrong ones. The
+//     verbatim callee name "identify" persists on the
+//     dispatcher's `attrs_json["calls_raw"]` for the future
+//     cross-file resolver to retry; the parser-level proxy
+//     for that persistence contract is that ReceiverCalls
+//     captures the bare name verbatim, which is the only
+//     input the dispatcher ever sees).
+//
+// The test exercises the parser DIRECTLY via `parser.Parse`,
+// mirroring TestCFixture_EmitsExpectedNodeAndEdgeSet in
+// parser_treesitter_c_test.go (the C analog the spec calls
+// out as the immediate sibling stage). The dispatcher-level
+// `calls_raw` persistence and the edge-drop on the
+// receiver-qualified miss are exercised by the dispatcher
+// pipeline's own tests (dispatcher_pass2bd_test.go and the
+// canonical_dispatcher-gated EmitFile tests); this file's
+// scope is the parser-level INPUT contract that those
+// dispatcher tests downstream consume. The "edge" and
+// "node" terminology in the spec maps to ParseResult fields
+// the dispatcher reads:
+//
+//   - "contains edge"      -> file-level decl (ClassDecl, or
+//     MethodDecl with EnclosingClass
+//     == ""); the dispatcher mints
+//     one `contains` edge per
+//     file-level decl in Pass 1
+//   - "extends edge"       -> ClassDecl.Extends entry; the
+//     dispatcher mints one `extends`
+//     edge per Extends entry in
+//     Pass 2a after class resolution
+//   - "static_calls edge"  -> MethodDecl.Calls (bare-name
+//     entries that the dispatcher's
+//     Pass 2b resolver stitches
+//     against the same-file callee
+//     index)
+//   - "imports edge"       -> ParseResult.Imports entry with
+//     a non-relative Module
+//     specifier (`isRelativeImport`
+//     drops `./`-prefixed entries)
+//
+// The fixture deliberately puts the `log_global()` call
+// inside `Greeter.greet` BEFORE the `log_global` free
+// function is declared. tree-sitter does not enforce C++
+// name-resolution order, and the dispatcher's same-file
+// callee index is built AFTER the walk completes, so
+// declaration order does not affect static_calls
+// resolution. The spec fixture relies on this property; a
+// regression that started resolving calls during the walk
+// (rather than via the post-walk callee index) would fail
+// this test by failing to resolve `log_global` from
+// `Greeter.greet`.
+func TestCppFixture_EmitsExpectedNodeAndEdgeSet(t *testing.T) {
+	const src = `#include <string>
+#include "base.h"
+
+class Base {
+public:
+  void identify() {}
+};
+
+class Greeter : public Base {
+public:
+  void greet() {
+    this->identify();
+    log_global();
+  }
+};
+
+void log_global() {}
+`
+	parser := NewTreeSitterCppParser()
+	if got := parser.Language(); got != "cpp" {
+		t.Fatalf("Language() = %q; want %q", got, "cpp")
+	}
+
+	res, err := parser.Parse("src/hello.cpp", []byte(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// ----- Classes (2 class nodes: Base, Greeter) -----
+	// The spec pins exactly 2 ClassDecl entries. Both are
+	// `class_specifier` nodes at translation-unit scope.
+	if got := len(res.Classes); got != 2 {
+		t.Errorf("expected exactly 2 class nodes; got %d (%v)",
+			got, classNames(res.Classes))
+	}
+	classByName := map[string]ClassDecl{}
+	for _, c := range res.Classes {
+		classByName[c.QualifiedName] = c
+	}
+	base, ok := classByName["Base"]
+	if !ok {
+		t.Fatalf("class %q missing from emitted set; got %v",
+			"Base", classNames(res.Classes))
+	}
+	if base.Kind != "class" {
+		t.Errorf("Base.Kind = %q; want %q", base.Kind, "class")
+	}
+	if len(base.Extends) != 0 {
+		t.Errorf("Base.Extends should be empty (no base classes); got %v",
+			base.Extends)
+	}
+
+	greeter, ok := classByName["Greeter"]
+	if !ok {
+		t.Fatalf("class %q missing from emitted set; got %v",
+			"Greeter", classNames(res.Classes))
+	}
+	if greeter.Kind != "class" {
+		t.Errorf("Greeter.Kind = %q; want %q", greeter.Kind, "class")
+	}
+
+	// ----- Extends (1 extends edge: Greeter -> Base) -----
+	// The spec pins exactly 1 extends edge. At the parser
+	// level the dispatcher mints one `extends` edge per
+	// ClassDecl.Extends entry; pinning the single-element
+	// slice with the exact base name is the parser-level
+	// equivalent of "1 extends edge (Greeter -> Base)".
+	wantExtends := []string{"Base"}
+	if !stringSlicesEqualOrdered(greeter.Extends, wantExtends) {
+		t.Errorf("Greeter.Extends: want %v, got %v",
+			wantExtends, greeter.Extends)
+	}
+
+	// ----- Methods (3 method nodes) -----
+	// The spec pins exactly 3 MethodDecl entries:
+	// `Base.identify` and `Greeter.greet` (member methods
+	// defined inline in their class bodies, with the dotted
+	// `<EnclosingClass>.<name>` QualifiedName convention)
+	// and `log_global` (a free function with
+	// EnclosingClass == "" -- the parser-level signal the
+	// dispatcher uses to mint a `file -> method` contains
+	// edge instead of `class -> method`).
+	if got := len(res.Methods); got != 3 {
+		t.Errorf("expected exactly 3 method nodes; got %d (%v)",
+			got, methodNames(res.Methods))
+	}
+	methodByName := map[string]MethodDecl{}
+	for _, m := range res.Methods {
+		methodByName[m.QualifiedName] = m
+	}
+	identify, ok := methodByName["Base.identify"]
+	if !ok {
+		t.Fatalf("method %q missing; got %v", "Base.identify",
+			methodNames(res.Methods))
+	}
+	if identify.EnclosingClass != "Base" {
+		t.Errorf("Base.identify.EnclosingClass = %q; want %q",
+			identify.EnclosingClass, "Base")
+	}
+	greet, ok := methodByName["Greeter.greet"]
+	if !ok {
+		t.Fatalf("method %q missing; got %v", "Greeter.greet",
+			methodNames(res.Methods))
+	}
+	if greet.EnclosingClass != "Greeter" {
+		t.Errorf("Greeter.greet.EnclosingClass = %q; want %q",
+			greet.EnclosingClass, "Greeter")
+	}
+	logGlobal, ok := methodByName["log_global"]
+	if !ok {
+		t.Fatalf("method %q missing; got %v", "log_global",
+			methodNames(res.Methods))
+	}
+	if logGlobal.EnclosingClass != "" {
+		t.Errorf("log_global.EnclosingClass = %q; want %q (free function)",
+			logGlobal.EnclosingClass, "")
+	}
+
+	// ----- static_calls edge (Greeter.greet -> log_global) -----
+	// The spec pins exactly 1 static_calls edge. The C++
+	// walker records bare-identifier callees in
+	// `MethodDecl.Calls`; the dispatcher's Pass 2b resolver
+	// then matches each against the same-file callee index
+	// to mint the edge. The fixture has exactly one bare
+	// call inside Greeter.greet (`log_global()`), so
+	// `greet.Calls` must contain exactly that one entry.
+	// `this->identify()` is receiver-qualified and MUST go
+	// to ReceiverCalls (see below), NOT into Calls -- a
+	// walker that mis-routed it into Calls would produce a
+	// second `static_calls` edge (false positive against
+	// `Base.identify` after Pass 2b's free-function
+	// fallback) and break the "exactly 1" pin.
+	if !containsString(greet.Calls, "log_global") {
+		t.Errorf("Greeter.greet.Calls should contain %q; got %v",
+			"log_global", greet.Calls)
+	}
+	if got := len(greet.Calls); got != 1 {
+		t.Errorf("expected exactly 1 entry in Greeter.greet.Calls "+
+			"(only %q is a bare-identifier call; %q is receiver-qualified "+
+			"and belongs in ReceiverCalls); got %d (%v)",
+			"log_global", "this->identify", got, greet.Calls)
+	}
+
+	// ----- Receiver-qualified call captured verbatim -----
+	// `this->identify()` is the receiver-qualified call the
+	// spec uses to exercise the Pass 2b drop-on-miss path.
+	// The parser-level contract is that ReceiverCalls
+	// captures the bare callee name "identify" verbatim --
+	// that is the ONLY input the dispatcher ever sees. The
+	// dispatcher then:
+	//
+	//   1. attempts the lookup at
+	//      `methodNodeID["Greeter.identify"]` (the
+	//      ReceiverCalls entry scoped to the method's
+	//      EnclosingClass),
+	//   2. misses, because `identify` is declared on `Base`
+	//      not `Greeter`, and the spec's A4 invariant
+	//      forbids the dispatcher from walking the class
+	//      hierarchy at this stage (cross-class resolution
+	//      is the future Pass 2c work),
+	//   3. drops the edge but persists the verbatim
+	//      callee name in `attrs_json["calls_raw"]` so the
+	//      future cross-file resolver can retry.
+	//
+	// This test cannot directly assert step 3 (it's a
+	// dispatcher concern -- the `calls_raw` attrs key is
+	// stamped by dispatcher code, not the parser); the
+	// parser-level proxy is that the verbatim "identify"
+	// name reaches ReceiverCalls intact. A walker that
+	// dropped the receiver-qualified call entirely (or
+	// rewrote `this->identify` into something other than
+	// the bare callee name) would BLOCK the dispatcher's
+	// persistence path -- there would be no verbatim name
+	// for calls_raw to carry. Pin both presence and exact
+	// cardinality so a regression that double-emits the
+	// call (e.g. into both Calls and ReceiverCalls) is
+	// also caught.
+	if !containsString(greet.ReceiverCalls, "identify") {
+		t.Errorf("Greeter.greet.ReceiverCalls should contain %q "+
+			"(the bare callee name from `this->identify()`; the "+
+			"dispatcher's Pass 2b drops the edge against "+
+			"methodNodeID[%q] because identify is declared on Base "+
+			"not Greeter, but persists the verbatim name on "+
+			"attrs_json[calls_raw]); got %v",
+			"identify", "Greeter.identify", greet.ReceiverCalls)
+	}
+	if got := len(greet.ReceiverCalls); got != 1 {
+		t.Errorf("expected exactly 1 entry in Greeter.greet.ReceiverCalls "+
+			"(only `this->identify()` is receiver-qualified in the fixture); "+
+			"got %d (%v)", got, greet.ReceiverCalls)
+	}
+
+	// Negative: log_global is a leaf and Base.identify is
+	// an empty body. Pin so a walker that hallucinates
+	// self-references or leaks the parent function's call
+	// set is caught.
+	if got := len(logGlobal.Calls); got != 0 {
+		t.Errorf("expected 0 entries in log_global.Calls (no inner calls); got %d (%v)",
+			got, logGlobal.Calls)
+	}
+	if got := len(identify.Calls); got != 0 {
+		t.Errorf("expected 0 entries in Base.identify.Calls (empty body); got %d (%v)",
+			got, identify.Calls)
+	}
+
+	// ----- imports edge (file -> `string` package; ./base.h dropped) -----
+	// The spec's fixture includes `<string>` (system
+	// include) and `"base.h"` (local include). The
+	// dispatcher's `isRelativeImport` filter drops entries
+	// whose Module starts with `.` or `/`, so the parser
+	// MUST emit the local include with a leading `./`
+	// prefix (mirroring the C parser's contract) so the
+	// dispatcher suppresses it. The system include keeps
+	// its bracketed path verbatim (`string` -- no leading
+	// `.` or `/`), so `isRelativeImport` returns false and
+	// the dispatcher mints exactly one `imports` edge.
+	mods := importModules(res.Imports)
+	if !containsString(mods, "string") {
+		t.Errorf("import %q missing; got %v", "string", mods)
+	}
+	if containsString(mods, "base.h") {
+		t.Errorf("import %q must NOT appear as bare path (would produce "+
+			"an imports edge); the parser must emit it as %q so "+
+			"isRelativeImport drops it. got %v",
+			"base.h", "./base.h", mods)
+	}
+	if !containsString(mods, "./base.h") {
+		t.Errorf("import %q missing (the parser must prefix local includes "+
+			"with `./` so the dispatcher drops them); got %v",
+			"./base.h", mods)
+	}
+
+	// ----- base_access sub-test -----
+	// The spec calls out a sub-test for
+	// `LangMeta["base_access"]={"Base":"public"}` on the
+	// Greeter class node's `attrs_json`. The dispatcher
+	// folds `ClassDecl.LangMeta["base_access"]` straight
+	// into the class node's `attrs_json["base_access"]`
+	// via mergeLangMeta (architecture Section 4.4.2), so
+	// the parser-level assertion on LangMeta is the
+	// upstream of that persisted attr. Kept as a named
+	// sub-test (per spec wording) so failure output makes
+	// the spec mapping obvious.
+	t.Run("base_access metadata", func(t *testing.T) {
+		if greeter.LangMeta == nil {
+			t.Fatalf("Greeter.LangMeta should be populated with base_access; got nil")
+		}
+		access, ok := greeter.LangMeta["base_access"].(map[string]string)
+		if !ok {
+			t.Fatalf("Greeter.LangMeta[base_access] should be map[string]string; got %T (%+v)",
+				greeter.LangMeta["base_access"], greeter.LangMeta["base_access"])
+		}
+		if access["Base"] != "public" {
+			t.Errorf("Greeter.LangMeta[base_access][Base] = %q; want %q "+
+				"(the fixture writes `class Greeter : public Base` -- the "+
+				"explicit `public` keyword must survive into LangMeta and "+
+				"from there into attrs_json on the class node)",
+				access["Base"], "public")
+		}
+	})
+
+	// ----- dedupe sub-test -----
+	// The spec calls out a sub-test for the declaration-
+	// plus-definition dedupe rule: `class Foo { void
+	// bar(); }; void Foo::bar() { log_global(); }` must
+	// produce exactly one `Foo.bar` MethodDecl whose
+	// `Calls` contains `log_global`. The parser's
+	// `qualified_identifier` handling MUST recognise
+	// `Foo::bar` as the out-of-line definition of the
+	// in-class declaration `Foo::bar()` and replace (not
+	// duplicate) the declaration entry -- the same dedupe
+	// contract as the in-file forward-declaration rule
+	// already pinned by TestTreeSitterCppParser_-
+	// ForwardDeclarationDeduped, but extended to the
+	// method-decl-vs-definition case the spec calls out
+	// explicitly here.
+	t.Run("dedupe collapses declaration plus definition", func(t *testing.T) {
+		const dedupeSrc = `
+class Foo {
+public:
+  void bar();
+};
+
+void Foo::bar() {
+  log_global();
+}
+
+void log_global() {}
+`
+		res, err := parser.Parse("src/dedupe.cpp", []byte(dedupeSrc))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+
+		// Cardinality pin: counting by QualifiedName via
+		// methodNames so a walker that emitted both the
+		// declaration entry AND the definition entry (2
+		// `Foo.bar`s) fails here visibly. Map lookup alone
+		// would silently take whichever entry was inserted
+		// last and mask the duplicate.
+		fooBarCount := 0
+		for _, m := range res.Methods {
+			if m.QualifiedName == "Foo.bar" {
+				fooBarCount++
+			}
+		}
+		if fooBarCount != 1 {
+			t.Fatalf("expected exactly 1 Foo.bar method node after "+
+				"declaration+definition dedupe; got %d (%v)",
+				fooBarCount, methodNames(res.Methods))
+		}
+
+		methodByName := map[string]MethodDecl{}
+		for _, m := range res.Methods {
+			methodByName[m.QualifiedName] = m
+		}
+		fooBar := methodByName["Foo.bar"]
+		if fooBar.EnclosingClass != "Foo" {
+			t.Errorf("Foo.bar.EnclosingClass = %q; want %q",
+				fooBar.EnclosingClass, "Foo")
+		}
+		// The dedupe survivor MUST be the definition (the
+		// one carrying the call to log_global), not the
+		// prototype-only declaration. A walker that kept
+		// the declaration and discarded the definition
+		// would leave Calls empty -- the dispatcher would
+		// then mint zero static_calls edges and the spec's
+		// "static_calls edge targets log_global" assertion
+		// would fail at the dispatcher level. Catch it at
+		// the parser level so the failure localises here.
+		if !containsString(fooBar.Calls, "log_global") {
+			t.Errorf("Foo.bar.Calls should contain %q after dedupe "+
+				"(the definition is the dedupe survivor; the "+
+				"declaration carries no body and no calls); got %v",
+				"log_global", fooBar.Calls)
+		}
+	})
+}

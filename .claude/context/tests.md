@@ -226,3 +226,19 @@ Two operator pins govern the canonical contract of this Go-parser stage; both ar
 
 Both pins are operator-confirmed in this iteration; the open-questions hard gate referenced by prior evaluator feedback is now cleared by these answers.
 
+#### Go-parser e2e (iter 12)
+
+The Go-parser stage now ships a real e2e feature + godog test in `services\agent-memory\test\e2e\code-intelligence-AST-PARSER-FOR-ADDIT\`:
+
+- `go_parser_gotreesitterparser_implementation.feature` — 6 scenarios covering the LanguageParser contract, struct + `embeds` LangMeta, interface + embedded interface + method spec, pointer-receiver method (`*Type.method` QualifiedName + `ReceiverAliases` + `receiver_ptr`/`receiver_type` LangMeta), type alias, and grouped imports (alias + dot + blank).
+- `go_parser_gotreesitterparser_implementation_test.go` — godog scenario initializer + `TestE2E_go_parser_gotreesitterparser_implementation` driver, build-tagged `//go:build e2e && cgo` to match the C++/C# e2e file convention.
+
+Unlike the C/C#/C++ e2e files in this directory (which are STUBs landed by this stage on behalf of sibling stages — see the sibling-stage table above), the Go e2e file is the **real** e2e for the implementation owned by this stage. Running it requires both build tags:
+
+```powershell
+$env:CGO_ENABLED='1'
+go test -count=1 -tags 'e2e cgo' .\test\e2e\code-intelligence-AST-PARSER-FOR-ADDIT -run TestE2E_go_parser_gotreesitterparser_implementation
+```
+
+The shared `moduleRoot()` helper used by the dispatcher / additive-surface e2e files in the same directory is deliberately NOT redeclared in the Go-parser e2e file; the Go scenarios parse in-memory fixtures directly and do not need a module-root lookup.
+

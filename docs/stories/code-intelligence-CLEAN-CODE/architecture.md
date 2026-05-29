@@ -1576,22 +1576,47 @@ call fires. The aggregator NEVER second-guesses the adapter's
 `Applicable` verdict, so the gating logic is intentionally NOT
 duplicated.
 
-**Fail-safe contract.** On any non-cancellation error from the
-adapter (HTTP 5xx, malformed JSON, network failure, 404
-mapped to `linked.ErrEdgesUnavailable`, or a mode-store read
-failure that does not wrap a ctx error), `tickSystemTier`
-LOGS + leaves the affected input in its embedded shape so the
-composer naturally degrades the row with
-`xrepo_edges_unavailable`. The `Report.LinkedEdgeFetchFailures`
-counter is bumped so operators can correlate degradation rate
-with agent-memory uptime via the Prometheus exporter.
-`context.Canceled` / `context.DeadlineExceeded` from the
-adapter ALWAYS abort the tick -- operator cancel signals are
-authoritative and MUST NOT be silently swallowed as a
-"degrade in place". The adapter applies a per-request HTTP
-timeout (`CLEAN_CODE_LINKED_ADAPTER_TIMEOUT`, default 5s) on
-top of the caller's `ctx` so a slow agent-memory response is
-bounded even when the caller passed an undecorated context.
+**Fail-safe contract.** The aggregator's `tickSystemTier`
+classifies adapter errors into THREE EXPLICIT CLASSES; the
+classification ORDER is normative because a cancelled tick can
+present as any of the three classes (a transport may wrap a
+ctx error inside a domain-specific error type):
+
+  1. **`context.Canceled` / `context.DeadlineExceeded`** -- ALWAYS
+     ABORT the tick. Operator cancel signals are authoritative
+     and MUST NOT be silently swallowed as a "degrade in place".
+     Checked FIRST.
+
+  2. **Mode-store read failure** -- the per-repo
+     `ReadRepoMode` call into `internal/management` failed
+     (PG outage, role misconfig, migration drift). The adapter
+     wraps such errors with the
+     `aggregator.ErrLinkedModeStore` sentinel via Go 1.20+
+     multi-`%w` chaining; the aggregator's
+     `errors.Is(err, aggregator.ErrLinkedModeStore)` check
+     classifies the error as FATAL and ABORTS the tick.
+     `Report.LinkedEdgeFetchFailures` is NOT incremented on
+     this path -- that counter is reserved for class (3) so
+     the operator-facing signal unambiguously points at
+     agent-memory uptime rather than at a Postgres outage in
+     the management plane. Checked SECOND.
+
+  3. **Remote agent-memory failure** -- the upstream
+     `/v1/cross-repo/edges` call failed (HTTP 5xx, malformed
+     JSON, network failure, 404 mapped to
+     `linked.ErrEdgesUnavailable`). `tickSystemTier` LOGS +
+     leaves the affected input in its embedded shape so the
+     composer naturally degrades the row with
+     `xrepo_edges_unavailable`. The
+     `Report.LinkedEdgeFetchFailures` counter IS incremented
+     so operators can correlate degradation rate with
+     agent-memory uptime via the Prometheus exporter. Falls
+     through after the first two checks.
+
+The adapter applies a per-request HTTP timeout
+(`CLEAN_CODE_LINKED_ADAPTER_TIMEOUT`, default 5s) on top of
+the caller's `ctx` so a slow agent-memory response is bounded
+even when the caller passed an undecorated context.
 
 ---
 

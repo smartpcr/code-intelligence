@@ -136,15 +136,22 @@ deployments should NOT use this path.
 - `internal/refactor/task_planner.go` --
   `WithEffortEstimator` option + the per-task estimator call
   inside `PlanFromSnapshot`.
-- `internal/config/config.go` -- `EnvRefactorEffortModelURI`
-  constant and `Config.RefactorEffortModelURI` field. NOT
-  validated in `Config.Validate()`; the model interlock is
-  binary-local to `clean-code-refactor-planner`.
+- `internal/config/config.go` -- `EnvMLModelURI` constant
+  (env var `CLEAN_CODE_ML_MODEL_URI`) and `Config.MLModelURI`
+  field. NOT validated in `Config.Validate()`; the model
+  interlock is binary-local to `clean-code-refactor-planner`.
+  (Renamed from `EnvRefactorEffortModelURI` /
+  `Config.RefactorEffortModelURI` in PR #148.)
 - `cmd/clean-code-refactor-planner/main.go` -- composition
-  root: calls `refactor.LoadFromConfig(cfg)` immediately
-  after `config.Load()`; exits 1 on loader error; wires
-  `refactor.WithEffortEstimator(model)` only when the
-  loader returned a non-nil model.
+  root: defers the ML effort-model load to the per-request
+  path inside `runPlanner` / `runHTTPMode`, which call
+  `refactor.NewEffortModelFromConfig(cfg)` and exit non-zero
+  on loader error. (The pre-PR-148 startup-time
+  `refactor.LoadFromConfig(cfg)` block was removed because
+  the canonical loader entrypoint changed; CLI mode now
+  defers the loader failure to first request rather than
+  startup -- acceptable because CLI mode runs exactly one
+  request before exiting.)
 
 ## Stage 9.1 -- Audit WAL frame writer
 

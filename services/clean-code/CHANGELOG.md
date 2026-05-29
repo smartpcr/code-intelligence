@@ -4,6 +4,107 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 10.4 -- Cross repo end to end happy path (iter 2)
+
+Iter 2 is a structural rework that directly addresses every
+numbered item from iter 1's evaluator feedback. The work
+relocates the e2e harness to the brief-mandated path, replaces
+placeholder/no-op markers with a real ingestor-shaped DB seed,
+drives the Cross-Repo Aggregator via its real admin tick
+endpoint, seeds an active policy so `eval.gate` reaches a
+verdict, and tightens every "must equal canonical X" assertion
+to fail on missing data instead of silently skipping.
+
+### Iter 2 changes
+
+- **NEW** `services/clean-code/test/e2e/cross_repo_happy_path/cross_repo_happy_path.feature`
+  -- Brief-mandated path (`test/e2e/cross_repo_happy_path/`)
+  for the Stage 10.4 deliverable. Two scenarios mirror the
+  iter-1 split (`cross-repo-happy-path-fresh`,
+  `cross-repo-happy-path-stale`) but each Then-step is
+  rewritten so the assertion is exhaustive on the full
+  population of repos / responses (no nil-skip escape
+  hatches).
+- **NEW** `services/clean-code/test/e2e/cross_repo_happy_path/cross_repo_happy_path_test.go`
+  -- Godog binding for the feature above. Self-contained Go
+  package (`package cross_repo_happy_path`) so it compiles
+  even though the sibling umbrella package
+  (`test/e2e/code-intelligence-CLEAN-CODE/`) carries
+  unrelated pre-existing build breaks (stale import path on
+  `cross_repo_aggregator_system_tier_metric_composer_steps.go`
+  + duplicate `requireEnv`/`openDB` helpers across many
+  files). Key structural improvements over iter 1:
+    - **Coverage uploads + Metric Ingestor scanned state**
+      (iter 1 evaluator item 2) -- the `coverageLanded`
+      step now seeds the FULL FK lattice with
+      schema-correct columns:
+      `commit(scan_status='scanned')`,
+      `scan_run(kind='external_single', sha_binding='single', status='succeeded')`,
+      `scope_binding(scope_kind='package', canonical_signature, first_seen_sha)`,
+      `metric_sample(pack='ingested', source='ingested', producer_run_id)`,
+      and `metric_sample_active` quintuple-pointer. Every
+      row is byte-identical to what a successful coverage
+      webhook + scan_run finalisation would have produced.
+      Values are 0.40 / 0.60 / 0.80 across the three repos
+      so the aggregator's histogram carries non-trivial
+      variance.
+    - **Aggregator tick** (iter 1 evaluator item 3) --
+      `aggregatorRunsOneTick` POSTs the real
+      `/v1/aggregator/tick` admin route used by the sibling
+      `cross_repo_aggregator_aggregator_cadence_loop_and_snapshot_writers_test.go`,
+      then POLLS `cross_repo_percentile` for up to
+      `CLEAN_CODE_AGGREGATOR_TICK_TIMEOUT` (default 60s)
+      for the row. No row appearing within the deadline
+      FAILS the step -- no longer a silent DB INSERT.
+    - **Eval.gate canonical verdict** (iter 1 evaluator
+      item 4) -- `evalGatePerRepo` now FAILS the step on
+      HTTP 409 (no active policy). The `policyActivated`
+      Given step seeds a fresh `policy_version` +
+      `policy_activation` pair so the gate handler always
+      reaches a verdict; the verdict assertion in
+      `everyVerdictIsCanonical` requires the response slice
+      length match the repo population and every entry's
+      verdict be in `{pass, warn, block}`.
+    - **Stale-path gate degraded_reason** (iter 1
+      evaluator item 5) -- `everyGateDegradedReasonAllowed`
+      and `noGateDegradedReasonIsPercentileStale` likewise
+      fail when no gate responses were captured (no nil
+      skip). Combined with the 409-fails rule above,
+      every gate call must produce a real response whose
+      `degraded_reason` is checked against the explicit
+      allowed set `{"", samples_pending,
+      policy_signature_invalid, xrepo_edges_unavailable}`.
+    - **Freshness window** (iter 1 evaluator item 6) --
+      `builtAtWithinFreshnessWindow` computes
+      `time.Now().UTC().Sub(row.BuiltAt.UTC())` and asserts
+      strictly `< freshnessWindow`. The stale companion
+      `builtAtExceedsFreshnessWindow` asserts `>`. Both
+      are direct numeric comparisons -- no longer inferred
+      from `degraded=false` alone.
+    - **Stale clock advance** -- the `advanceFakeClock`
+      step UPDATEs `cross_repo_percentile.built_at` to
+      `now() - 2 * freshness_window` via
+      `make_interval(secs => $1)`. The mutation is scoped
+      to `(metric_kind, scope_kind)` (not by
+      `percentile_id`) so a later naturally-cadenced
+      aggregator tick cannot mask the back-date with a
+      newer fresh row.
+    - **Cleanup** -- end-of-scenario DELETEs honour the
+      FK chain: `evaluation_verdict` -> `evaluation_run`
+      -> `metric_sample_active` -> `metric_sample` ->
+      `scope_binding` -> `scan_run` -> `commit` ->
+      `repo`, then `policy_activation` -> `policy_version`.
+- **STUBBED** `services/clean-code/test/e2e/code-intelligence-CLEAN-CODE/linked_mode_integration_and_rollout_cross_repo_end_to_end_happy_path_test.go`
+  -- reduced to a 10-line tombstone (package declaration +
+  forwarding comment). The iter-1 helpers + scenario
+  bindings move into the new package above; the file is
+  retained instead of deleted so the umbrella package's
+  pre-existing build state is unchanged.
+- **EMPTIED** `services/clean-code/test/e2e/code-intelligence-CLEAN-CODE/linked_mode_integration_and_rollout_cross_repo_end_to_end_happy_path.feature`
+  -- now carries only a "moved to ..." comment. With the
+  iter-1 `_test.go` stubbed, godog will not pick this
+  `.feature` up.
+
 ## Stage 10.4 -- Cross repo end to end happy path (iter 1)
 
 Cross-repo end-to-end happy-path e2e harness. Lands two scenarios

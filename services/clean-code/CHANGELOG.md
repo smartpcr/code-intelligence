@@ -4,6 +4,119 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 10.4 -- Cross repo end to end happy path (iter 1)
+
+Cross-repo end-to-end happy-path e2e harness. Lands two scenarios
+(`cross-repo-e2e-fresh`, `cross-repo-e2e-stale`) under
+`services/clean-code/test/e2e/code-intelligence-CLEAN-CODE/`
+that drive the full operator flow against the canonical wire
+surfaces (`mgmt.register_repo` -> `mgmt.read.cross_repo` ->
+`eval.gate`) plus a DB-level guard on `evaluation_verdict`.
+The harness is `//go:build e2e` and skips when
+`CLEAN_CODE_PG_URL` is unset so the unit-test gate never
+picks it up (mirrors Stage 7.3's
+`cross_repo_aggregator_insights_surface_percentile_freshness_banner`
+pattern). The CHANGELOG entry below is the first time Stage 10.4
+appears in this file; no prior iteration of this stage shipped.
+
+### Iter 1 changes
+
+- **`linked_mode_integration_and_rollout_cross_repo_end_to_end_happy_path.feature`**
+  -- NEW Gherkin feature with two scenarios that together
+  cover both halves of the implementation-plan brief
+  (lines 886-888):
+    1. `cross-repo-e2e-fresh` -- three repos registered via
+       `mgmt.register_repo`; coverage uploads land for each
+       repo at a scanned SHA; the Cross-Repo Aggregator's
+       one-tick output (`clean_code.cross_repo_percentile`
+       at `(coverage_line_ratio, package)`) is written with
+       `built_at = NOW() - 30s`; `mgmt.read.cross_repo`
+       MUST return a single row with `p50`, `p90`, `p99`,
+       and `histogram_json` populated AND
+       `degraded=false` (no `percentile_stale` banner),
+       and `eval.gate(repo_id, sha)` for EACH of the three
+       repos MUST return a verdict in the canonical set
+       `{pass, warn, block}` only (iter 1 evaluator item 6).
+    2. `cross-repo-e2e-stale` -- same setup with the
+       snapshot row's `built_at` advanced backwards past
+       `freshness_window_seconds` (the fake-clock
+       equivalent in this DB-driven harness):
+       `mgmt.read.cross_repo` MUST then carry
+       `degraded=true` AND
+       `degraded_reason='percentile_stale'`, while
+       `eval.gate` `degraded_reason` values MUST be drawn
+       ONLY from `{samples_pending,
+       policy_signature_invalid,
+       xrepo_edges_unavailable}`. The companion DB
+       assertion verifies no `evaluation_verdict` row
+       carries `degraded_reason='percentile_stale'` since
+       scenario start (iter 1 evaluator item 8 regression
+       guard, architecture Sec 8.2 -- `percentile_stale`
+       is INSIGHTS-ONLY).
+
+- **`linked_mode_integration_and_rollout_cross_repo_end_to_end_happy_path_test.go`**
+  -- NEW godog binding with five canonical sets pinned as
+  package-level constants / closed sets so the assertion
+  contracts are visible in one place:
+    - `xrepoHappyMetricKind = "coverage_line_ratio"` and
+      `xrepoHappyScopeKind = "package"` -- the
+      brief-pinned (metric_kind, scope_kind) pair the
+      `mgmt.read.cross_repo` call uses.
+    - `xrepoHappyCanonicalVerdicts = {pass, warn, block}`
+      -- enforced on every `eval.gate` response (closes
+      iter 1 evaluator item 6 verbatim).
+    - `xrepoHappyAllowedGateReasons = {"", samples_pending,
+      policy_signature_invalid, xrepo_edges_unavailable}`
+      -- the gate-allowed `degraded_reason` set;
+      `percentile_stale` is INTENTIONALLY absent.
+    - `xrepoHappyForbiddenGateReason = "percentile_stale"`
+      -- the Insights-only reason that triggers the iter 1
+      evaluator item 8 regression check on `evaluation_verdict`.
+    - Wire paths `xrepoHappyMgmtReadPath
+      = "/v1/mgmt/read.cross_repo"`,
+      `xrepoHappyRegisterPath = "/v1/mgmt/register_repo"`,
+      `xrepoHappyGatePath = "/v1/eval/gate"` -- the
+      canonical mounted paths from
+      `internal/api/router_test.go`,
+      `internal/management/register_repo_verb.go`, and
+      `cmd/clean-code-eval-gate/main.go`. The test does
+      NOT invent a `/api/v1/cross-repo` shape.
+
+- **All helper symbols prefixed `xrepoHappy*`** -- the
+  shared e2e package already carries per-file copies of
+  `requireEnv`, `openDB`, `httpGetJSON`, `httpPostJSON`
+  with a `// one copy per package -- deduplicated at merge`
+  comment in each. Rather than add a fifth duplicate set
+  of those names, this stage uses suffixed locals
+  (`xrepoHappyHTTPDo`, `xrepoHappyNewState`,
+  `xrepoHappyState`, `xrepoHappyCleanup`, ...). The
+  prefixing keeps the file additive when the package
+  finally builds together as one unit.
+
+- **`services/clean-code/CHANGELOG.md`** -- this entry.
+  Per the operator-pinned canonical surface (named in
+  Stage 10.5 brief lines 905, 912 and verified against
+  the existing CHANGELOG header):
+    - schema: `clean_code`
+    - verdict alphabet: `pass | warn | block`
+    - override semantics: append-only, NO `expires_at`
+      column (Stage 10.5 lands the full v1 surface entry;
+      this Stage 10.4 entry stays scoped to the e2e
+      harness it actually shipped).
+
+### Cross-references
+
+- Architecture Sec 8.2 -- "`percentile_stale` is an
+  Insights-only signal; `eval.gate` MUST reject it."
+- Tech-spec Sec 5.2.5 -- `cross_repo_percentile` row
+  shape (`metric_kind`, `scope_kind`, `p50`, `p90`,
+  `p99`, `histogram_json`, `built_at`).
+- Migration 0007 -- seeds `coverage_line_ratio` into
+  `clean_code.metric_kind` (the brief-pinned
+  `metric_kind` for this stage; `coverage_line` /
+  `coverage_branch` aliases were removed in iter 1 of
+  Stage 2, item 4).
+
 ## Stage 10.2 -- Aged mute insights report (iter 4)
 
 Single minor cleanup from iter 3's score-94 review (no

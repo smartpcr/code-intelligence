@@ -282,6 +282,8 @@ alongside Stage 6.1 / 6.2 hardening and are useful but **not** part of
 this stage's WIT — they are out of scope for the Stage 6.3 deliverable
 and do not need to be re-planned or re-shipped.
 
+### 3.4 Removed in iter 6
+
 Iter-6 removed two additional tests that the iter-1 file had carried:
 `TestPowerShellParser_Timeout_ReturnsNonSentinelError` (depended on the
 nonexistent `timeout` field on `PowerShellParser`) and
@@ -292,36 +294,49 @@ HEAD). Both will need to be re-authored if and when PR #175's
 subprocess-and-envelope implementation is restored; until then, their
 absence keeps the test file compileable.
 
-## 4. Prerequisites and current HEAD coverage
+## 4. Prerequisites and current HEAD coverage (iter-6 reconciled)
 
-The Stage 6.3 test artifact targets the post-PR-#175 shape of
-`parser_powershell.go`. The following table records what each target
-surface needs vs. what HEAD has today, so a future picker can tell which
-prerequisite workstream must land first.
+The iter-6 reconciled Stage 6.3 test artifact targets HEAD's actual
+symbol surface, **not** the post-PR-#175 shape that iter-1 forward-assumed.
+Per operator pin `ps-fixture-test-blocked-on-prod` ("Not blocked — accept
+test as artifact for when prod catches up"), the table below records
+what each surface the artifact uses needs and how HEAD supplies it.
 
-| Target surface (used by test) | HEAD status | Workstream that lands it |
+| Target surface (actually used by iter-6 test) | HEAD status | Notes |
 |---|---|---|
-| Lowercase `powershellParser{pwshBin, timeout}` | ❌ Reverted by PR #183; only uppercase `PowerShellParser{pwshBin}` exists | PR #175 restoration (or successor `powershellParser subprocess implementation — E2E`) |
-| `Parse()` body invoking pwsh subprocess and parsing the envelope | ❌ Stub returns `ParseResult{}, nil` on `pwsh` present | Same as above |
-| `ErrParserUnavailable` sentinel | ✅ Present (`parser.go` line 14) | n/a (already on `feature/memory`) |
-| `UnavailableError{Reason string}` with `.Is(target) bool` | ✅ Present (`parser.go` lines 17-22) | n/a |
-| `NewPowerShellParser()` constructor returning a value with `Parse` | ✅ Present but on `PowerShellParser` (uppercase) | n/a for constructor shape; lowercase variant blocked on PR #175 |
-| `ParseResult{Classes, Methods, Imports}` + `MethodDecl{QualifiedName, EnclosingClass, ReceiverCalls}` + `Import{Module, LangMeta}` | Mixed: `ParseResult` itself exists; subfield surfaces depend on `parser.go` additive workstream | `Additive parser.go struct surfaces — E2E` (status: complete per workstream-context dependency list) |
-| `isRelativeImport(string) bool` | Depends on dispatcher canonical merge | `dispatcher canonical merge` workstream |
-| Package `ast` compiles at HEAD | ❌ Pre-existing duplicate decls in `parser.go` / `dispatcher.go` + missing go.mod deps | `dispatcher canonical merge` workstream (out of scope per operator pin) |
+| Uppercase `PowerShellParser{pwshBin string}` (no `timeout` field) | ✅ Present at `parser_powershell.go` line 7 | Iter-6 rewrote iter-1's `&powershellParser{pwshBin,timeout}` → `&PowerShellParser{pwshBin: ""}`; the `timeout` field is not on HEAD. |
+| `Parse()` body returning populated `ParseResult` from a `pwsh` subprocess | ❌ Stub returns `ParseResult{}, nil` when `pwsh` resolves | **Production-gap signal**: the Greeter fixture assertions intentionally fail against the stub. They will start passing automatically once PR #175's 724-line subprocess body is restored — no further test edits required. |
+| `ErrParserUnavailable` sentinel + `UnavailableError{Reason string}` with `.Is(target) bool` | ✅ Present at `parser.go` lines 14–22 | Iter-6 sentinel test uses `errors.Is(err, ErrParserUnavailable)` AND structural `errors.As(err, &ue) && ue.Reason == "pwsh_not_available"` — replaces iter-1's fragile substring check. |
+| `NewPowerShellParser()` constructor | ✅ Present | Used by registration smoke tests under both `parsers_cgo.go` and `parsers_nocgo.go` build tags. |
+| `ClassDecl{Name, LangMeta map[string]string}` | ✅ Present | Iter-6 dropped iter-1's references to `QualifiedName`, `Kind`, `Extends`, `Implements` (none on HEAD). |
+| `MethodDecl{Name, ClassName, LangMeta map[string]string}` | ✅ Present | Iter-6 dropped iter-1's references to `QualifiedName`, `EnclosingClass`, `ReceiverCalls`, `MemberAccesses` (none on HEAD); receiver-call invariant now asserted via `LangMeta["receiver_calls"]` slug. |
+| `Import{Path, LangMeta map[string]string}` | ✅ Present | Iter-6 dropped iter-1's `Import.Module` reference; field is `Import.Path` on HEAD. The dot-source variant test was withdrawn in iter 6 along with the `Import.Module` dependency. |
+| Package `ast` compiles at HEAD | ❌ Pre-existing duplicate `Edge`/`Node`/`EmitResult`/`Logger`/`Dispatcher`/`NewDispatcher`/`Dispatcher.EmitFile` decls across `parser.go` + `dispatcher.go`, missing `lib/pq` / `pgx` / `otel` go.mod deps | **Out of scope per operator pin.** Will be resolved by the separate `dispatcher canonical merge` workstream. Per pin, this stage is **not** blocked on that resolution; the artifact ships as-is and will start running once both that workstream and PR #175 land. |
 
-If any unmet prerequisite is needed for a given step in §3, that step is
-**blocked** and must be parked until the prerequisite workstream lands —
-do NOT inline the missing production code into this stage.
+**Operator-pin consequence (iter 6 onward).** The iter-1 "blocked
+prerequisite" rule has been superseded. Steps in §3 are no longer
+parked waiting on prerequisites; instead, the artifact ships against
+HEAD, and the single production-side gap (stub `Parse()` returning
+empty `ParseResult`) is captured as an *intentional fixture-test
+failure* until the upstream workstreams restore the subprocess body.
+This is documented in §3 Step B1 and §6.5 (operator-pin section).
 
 ## 5. Verification strategy
 
 Stage 6.3 verification has two layers:
 
 1. **Pure-Go layer (Stage A steps).** Runs on every CI host regardless of
-   `pwsh` availability, exercises the sentinel/timeout/envelope-mapping
-   contracts the dispatcher relies on, and catches regressions in the
-   externally-visible interface surface.
+   `pwsh` availability. Exercises only the sentinel + interface contracts
+   the dispatcher relies on — specifically `errors.Is(err, ErrParserUnavailable)`
+   plus structural `errors.As(*UnavailableError).Reason == "pwsh_not_available"`,
+   and the `Language()` / `Extensions()` interface surface. **Does NOT
+   exercise timeout or envelope-mapping contracts** — iter 6 removed
+   `TestPowerShellParser_Timeout_ReturnsNonSentinelError` and
+   `TestPowerShellEnvelope_ToParseResult_MapsAllFields` because their
+   supporting fields/types (`timeout` field, `powershellEnvelope` / `psTypeRecord`
+   / `psMethodRecord` / `psImportRecord` / `MemberAccess` chain) do not exist on
+   HEAD (see §3.4 "Removed in iter 6" and the §1.5 reconciliation table for
+   re-author guidance if PR #175 ever restores those surfaces).
 2. **pwsh-gated layer (Stage B steps).** Runs only on hosts with `pwsh` on
    PATH, exercises end-to-end parse of the brief's fixture, and pins the
    `ParseResult` fields that drive every brief item on the dispatcher side.

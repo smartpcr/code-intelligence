@@ -3,8 +3,10 @@ package ast
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"path/filepath"
 	"strings"
 
@@ -13,12 +15,17 @@ import (
 )
 
 // LogEntry represents a single structured log event captured by the dispatcher.
+// Retained as a public type for legacy code that built records out of dispatcher
+// log calls; the dispatcher itself now emits via `*slog.Logger`.
 type LogEntry struct {
 	Message string
 	Attrs   map[string]string
 }
 
-// Logger receives structured log events from the dispatcher.
+// Logger is the legacy log sink interface that pre-existing e2e fixtures
+// implement. Kept as a named interface so older test wiring continues to
+// satisfy `var _ Logger = ...` checks; the production dispatcher logs via
+// `*slog.Logger` (see `WithLogger`).
 type Logger interface {
 	Log(msg string, attrs map[string]string)
 }
@@ -83,7 +90,13 @@ func WithEmbeddingPublisher(p NodeEmbeddingPublisher) DispatcherOption {
 
 // WithLogger attaches a structured-log sink the dispatcher uses
 // for skip/parse-error events. Nil silently disables logging.
-func WithLogger(l Logger) DispatcherOption {
+//
+// The canonical type is `*slog.Logger` — the dispatcher emits
+// `Info` for skip events (`ast.dispatch.skip`) and `Error` for
+// real parse failures (`ast.parse.error`), which the
+// `slog.TextHandler` renders as `msg=...` along with structured
+// attributes (`reason=...`, `language=...`, `file=...`).
+func WithLogger(l *slog.Logger) DispatcherOption {
 	return func(d *Dispatcher) { d.logger = l }
 }
 
@@ -123,7 +136,7 @@ type Dispatcher struct {
 	extMap          map[string]Parser
 	writer          NodeEdgeWriter
 	embedPub        NodeEmbeddingPublisher
-	logger          Logger
+	logger          *slog.Logger
 	languageHints   []string
 }
 
@@ -207,10 +220,10 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 	p, ok := d.extMap[ext]
 	if !ok {
 		if d.logger != nil {
-			d.logger.Log("ast.dispatch.skip", map[string]string{
-				"file":   ev.RelPath,
-				"reason": "no_parser",
-			})
+			d.logger.Info("ast.dispatch.skip",
+				slog.String("file", ev.RelPath),
+				slog.String("reason", "no_parser"),
+			)
 		}
 		return repoindexer.EmitResult{}, nil
 	}
@@ -233,11 +246,28 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 
 	result, err := p.Parse(ev.RelPath, src)
 	if err != nil {
+		// Sentinel branch (`ErrParserUnavailable`): the parser is
+		// signalling that a required runtime dependency is
+		// missing (e.g. PowerShell parser without `pwsh` on PATH)
+		// and the worker MUST treat the file as a SKIP, not a
+		// failure. Log `ast.dispatch.skip` at INFO with the
+		// extracted `reason=<slug>` and return `(EmitResult{}, nil)`
+		// so the surrounding queue keeps draining.
+		if errors.Is(err, ErrParserUnavailable) {
+			if d.logger != nil {
+				d.logger.Info("ast.dispatch.skip",
+					slog.String("file", ev.RelPath),
+					slog.String("language", p.Language()),
+					slog.String("reason", parseUnavailableReason(err.Error())),
+				)
+			}
+			return repoindexer.EmitResult{}, nil
+		}
 		if d.logger != nil {
-			d.logger.Log("ast.parse.error", map[string]string{
-				"file":  ev.RelPath,
-				"error": err.Error(),
-			})
+			d.logger.Error("ast.parse.error",
+				slog.String("file", ev.RelPath),
+				slog.String("error", err.Error()),
+			)
 		}
 		return repoindexer.EmitResult{}, err
 	}
@@ -580,4 +610,191 @@ func lastDottedSegment(qn string) string {
 // supports dot/up-tree relative imports (`./foo`, `../bar`).
 func isRelativeImportSpecifier(mod string) bool {
 	return strings.HasPrefix(mod, "./") || strings.HasPrefix(mod, "../")
+}
+
+// parseUnavailableReason extracts the `reason=<slug>` token from
+// a wrapped `ErrParserUnavailable` message and returns the slug.
+// Falls back to `"runtime_unavailable"` when the wrapper omitted
+// the reason hint.
+//
+// Tolerant of two wrapper shapes used in tests/production:
+//
+//	"powershell: parser: runtime dependency unavailable (reason=pwsh_not_available)"
+//	"powershell: parser: runtime dependency unavailable"
+//
+// The slug terminates on `)`, whitespace, or end-of-string.
+func parseUnavailableReason(msg string) string {
+	const marker = "reason="
+	idx := strings.Index(msg, marker)
+	if idx < 0 {
+		return "runtime_unavailable"
+	}
+	rest := msg[idx+len(marker):]
+	end := len(rest)
+	for i, r := range rest {
+		if r == ')' || r == ' ' || r == '\t' || r == '\n' {
+			end = i
+			break
+		}
+	}
+	slug := strings.TrimSpace(rest[:end])
+	if slug == "" {
+		return "runtime_unavailable"
+	}
+	return slug
+}
+
+// mergeLangMeta folds a parser-emitted LangMeta map into the
+// dispatcher's first-class attrs map under the architecture C11 /
+// §4.4.2 "first-class key wins on collision" rule. Presence —
+// not value — of a key in `out` is the gate: a first-class attr
+// that the dispatcher intentionally set to nil is still treated
+// as "set" and a LangMeta entry for the same key is dropped.
+//
+// Nil / empty `in` maps are a no-op. Slice / map values pass
+// through by reference; callers that re-use the input map after
+// the merge must defensively clone if they need write isolation.
+func mergeLangMeta(out, in map[string]any) {
+	if len(in) == 0 {
+		return
+	}
+	for k, v := range in {
+		if _, exists := out[k]; exists {
+			continue
+		}
+		out[k] = v
+	}
+}
+
+// hintAliasTable maps the v1 language-hint aliases the
+// `canonical_dispatcher` `TestNormalizeHints_AliasExpansion`
+// table enumerates onto their canonical language ids. Unknown
+// entries (`java`, anything else) pass through unchanged after
+// lower-casing + whitespace trim.
+var hintAliasTable = map[string]string{
+	// TypeScript family
+	"ts":         "typescript",
+	"tsx":        "typescript",
+	"js":         "typescript",
+	"jsx":        "typescript",
+	"mjs":        "typescript",
+	"cjs":        "typescript",
+	"typescript": "typescript",
+	// Python
+	"py":     "python",
+	"pyi":    "python",
+	"python": "python",
+	// C
+	"c": "c",
+	"h": "c",
+	// C++
+	"cc":  "cpp",
+	"cxx": "cpp",
+	"cpp": "cpp",
+	"c++": "cpp",
+	"hpp": "cpp",
+	"hh":  "cpp",
+	"hxx": "cpp",
+	// C#
+	"cs":     "csharp",
+	"csharp": "csharp",
+	"c#":     "csharp",
+	// Go
+	"go":     "go",
+	"golang": "go",
+	// Rust
+	"rs":   "rust",
+	"rust": "rust",
+	// PowerShell
+	"ps":         "powershell",
+	"ps1":        "powershell",
+	"psm1":       "powershell",
+	"psd1":       "powershell",
+	"powershell": "powershell",
+}
+
+// normalizeHints lower-cases, trims, and alias-expands the
+// supplied hint list, dropping empty/whitespace-only entries
+// while preserving input order. Unknown entries pass through
+// (lower-cased + trimmed) so a parser registered under a new
+// language id can be hint-routed without a table update.
+//
+// Returns `nil` for nil / fully-empty input so callers can rely
+// on `len(...) == 0` regardless of empty-vs-nil distinction.
+func normalizeHints(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	var out []string
+	for _, h := range in {
+		trimmed := strings.ToLower(strings.TrimSpace(h))
+		if trimmed == "" {
+			continue
+		}
+		if canonical, ok := hintAliasTable[trimmed]; ok {
+			out = append(out, canonical)
+		} else {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+// classAttrs serialises a class Node's `attrs_json` blob with the
+// mandatory first-class keys (`language`, `decl_kind`,
+// `start_line`, `end_line`), optionally appends the
+// `extends_raw` / `implements_raw` arrays when populated, then
+// folds the parser-supplied `LangMeta` map under the
+// first-class-key-wins rule (§4.4.2).
+func classAttrs(language string, c ClassDecl) json.RawMessage {
+	attrs := map[string]any{
+		"language":   language,
+		"decl_kind":  c.Kind,
+		"start_line": c.StartLine,
+		"end_line":   c.EndLine,
+	}
+	if len(c.Extends) > 0 {
+		attrs["extends_raw"] = c.Extends
+	}
+	if len(c.Implements) > 0 {
+		attrs["implements_raw"] = c.Implements
+	}
+	mergeLangMeta(attrs, c.LangMeta)
+	raw, err := json.Marshal(attrs)
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return raw
+}
+
+// methodAttrs serialises a method Node's `attrs_json` blob with
+// the mandatory first-class keys (`language`, `start_line`,
+// `end_line`, `params_raw`) and optional `calls_raw` /
+// `modifiers` / `enclosing_class` when those parser-supplied
+// slices/fields are populated, then folds `LangMeta` last under
+// the first-class-key-wins rule. Empty optional inputs are
+// omitted so the TS/JS/Python baseline byte-print stays
+// identical to the pre-helper world (rubber-duck #1).
+func methodAttrs(language string, m MethodDecl) json.RawMessage {
+	attrs := map[string]any{
+		"language":   language,
+		"start_line": m.StartLine,
+		"end_line":   m.EndLine,
+		"params_raw": m.ParamSignature,
+	}
+	if len(m.Calls) > 0 {
+		attrs["calls_raw"] = m.Calls
+	}
+	if len(m.Modifiers) > 0 {
+		attrs["modifiers"] = m.Modifiers
+	}
+	if m.EnclosingClass != "" {
+		attrs["enclosing_class"] = m.EnclosingClass
+	}
+	mergeLangMeta(attrs, m.LangMeta)
+	raw, err := json.Marshal(attrs)
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return raw
 }

@@ -347,6 +347,11 @@ type Import struct {
 	// Module is the imported module specifier (e.g.
 	// `"./utils"`, `"os"`, `"@scope/pkg"`).
 	Module string
+	// Path is a legacy alias for Module retained for canonical
+	// dispatcher tests and PowerShell parser test fixtures that
+	// were authored when Import exposed both fields. Parsers
+	// SHOULD populate Module; Path may be left empty.
+	Path string
 	// Symbols lists the named symbols imported from Module.
 	// Empty for whole-module imports (`import os`,
 	// `import "./utils"`).

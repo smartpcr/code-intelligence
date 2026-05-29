@@ -177,9 +177,14 @@ func decodePlannerJSON(raw []byte, out *plannerRunResponseE2E) error {
 // -------------------------------------------------------------------
 
 // seedActivePolicyVersion inserts a fresh policy_version with
-// the given effort_model_version pin and activates it. The
-// previous activation row is closed first so only one row has
-// activated_until IS NULL at any time.
+// the given effort_model_version pin and activates it by
+// appending a fresh `policy_activation` row. Activation in
+// `clean_code.policy_activation` is decided by
+// `MAX(created_at)` (architecture Sec 5.3.4, G5 latest-row-
+// wins) -- the table has NO `activated_until` column and the
+// previous activation row is NOT mutated; the in-body comment
+// at the `INSERT INTO clean_code.policy_activation` site
+// repeats this so the seed reads correctly in isolation.
 //
 // Returns the new policy_version_id so the caller can wire it
 // into the finding + hot_spot rows.

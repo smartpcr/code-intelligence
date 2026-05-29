@@ -116,3 +116,9 @@ func defaultParsers() []LanguageParser {
 		NewPowerShellParser(),
 	}
 }
+
+func init() {
+	for _, p := range defaultParsers() {
+		RegisterParser(p)
+	}
+}

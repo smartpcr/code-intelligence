@@ -342,6 +342,7 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 			CanonicalSignature: sig,
 			ParentNodeID:       ev.FileNodeID,
 			FromSHA:            ev.SHA,
+			AttrsJSON:          classAttrs(p.Language(), c),
 		})
 		if cerr != nil {
 			return repoindexer.EmitResult{TouchedNodes: touched}, cerr
@@ -377,6 +378,7 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 			CanonicalSignature: methodSig,
 			ParentNodeID:       parentID,
 			FromSHA:            ev.SHA,
+			AttrsJSON:          methodAttrs(p.Language(), m),
 		})
 		if merr != nil {
 			return repoindexer.EmitResult{TouchedNodes: touched}, merr

@@ -66,14 +66,6 @@ func (p *goTreeSitterParser) Parse(relPath string, src []byte) (ParseResult, err
 		funcName := m[4] // function name
 		params := m[5]   // parameter list
 
-		if recVar == "" {
-			// free function — recType captured funcName, funcName captured params token
-			// re-parse: funcRe groups shift when no receiver
-			funcName = recType
-			params = m[5]
-			recType = ""
-		}
-
 		md := MethodDecl{
 			LangMeta: make(map[string]any),
 		}

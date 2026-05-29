@@ -249,8 +249,8 @@ and if not, what shows up in the logs?".
 
 | Language                | CGO=on (production)             | CGO=off (`make test` portable)  | Notes                                                                                                                                                                                                                                                |
 | ----------------------- | ------------------------------- | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| TypeScript / JavaScript | tree-sitter                     | scanner fallback                | Extensions `.ts .tsx .js .jsx .mjs .cjs`. Scanner-backed under CGO=off (no skip).                                                                                                                                                                    |
-| Python                  | tree-sitter                     | scanner fallback                | Extensions `.py .pyi`. Scanner-backed under CGO=off (no skip).                                                                                                                                                                                       |
+| TypeScript / JavaScript | NOT supported -- files skipped  | NOT supported -- files skipped  | Extensions `.ts .tsx .js .jsx .mjs .cjs`. The tree-sitter walker (`NewTreeSitterTypeScriptParser` in `parser_treesitter.go`, gated by `//go:build cgo`) and the stdlib scanner fallback (`NewTypeScriptParser` in `parser_typescript.go`, build-tag-agnostic) BOTH exist and are individually unit-tested, but NEITHER is wired into `defaultParsers()` -- see `parsers_cgo.go` (registers only C / C++ / C# / Go / Rust / PowerShell) and `parsers_nocgo.go` (registers only PowerShell). No service-layer `WithParsers(...)` call adds them, so the production `NewDispatcher(fw)` extension lookup misses under both build tags and emits `ast.dispatch.skip{reason:"no_parser"}` per file -- identical behaviour to the CGO-dependent languages under CGO=off. Production wiring is a follow-up; see the `// future` note in `parser_typescript.go::NewTypeScriptParser`. |
+| Python                  | NOT supported -- files skipped  | NOT supported -- files skipped  | Extensions `.py .pyi`. Mirrors TypeScript: tree-sitter walker (`NewTreeSitterPythonParser` in `parser_treesitter.go`, `//go:build cgo`) and scanner fallback (`NewPythonParser` in `parser_python.go`) both exist but neither is registered in `defaultParsers()`. Files are skipped with `ast.dispatch.skip{reason:"no_parser"}` under both build tags.                                                                                                                                                                                                                                                                                                                                                                                              |
 | C                       | tree-sitter                     | NOT supported -- files skipped  | Extensions `.c .h`. **Requires CGO.** Under CGO=off `defaultParsers()` does not register the parser; the dispatcher emits `ast.dispatch.skip{reason:"no_parser"}` per file and continues.                                                            |
 | C++                     | tree-sitter                     | NOT supported -- files skipped  | Extensions `.cc .cpp .cxx .c++ .hpp .hh .hxx .h++` (`.h` routes to C per §9 R6). **Requires CGO.** Under CGO=off files are skipped with `ast.dispatch.skip{reason:"no_parser"}`.                                                                     |
 | C#                      | tree-sitter                     | NOT supported -- files skipped  | Extension `.cs`. **Requires CGO.** Under CGO=off files are skipped with `ast.dispatch.skip{reason:"no_parser"}`.                                                                                                                                     |
@@ -261,6 +261,26 @@ and if not, what shows up in the logs?".
 Skip-reason summary (verbatim structured-log keys per
 architecture §8.3):
 
+- **TypeScript / JavaScript / Python parsers exist but are
+  not wired into `defaultParsers()`.** Both a tree-sitter
+  walker (CGO=on, in `parser_treesitter.go`:
+  `NewTreeSitterTypeScriptParser` / `NewTreeSitterPythonParser`)
+  and a stdlib scanner (CGO=off-safe, in `parser_typescript.go`:
+  `NewTypeScriptParser` and `parser_python.go`:
+  `NewPythonParser`) are implemented and individually
+  fixture-tested, but `parsers_cgo.go::defaultParsers()` and
+  `parsers_nocgo.go::defaultParsers()` register NEITHER, and
+  no service-layer `WithParsers(...)` call adds them (the
+  only `WithParsers(...)` callers in the repo are tests). As
+  a result the production `NewDispatcher(fw)` routes
+  `.ts` / `.tsx` / `.js` / `.jsx` / `.mjs` / `.cjs` /
+  `.py` / `.pyi` files through the `no_parser` skip branch
+  (`ast.dispatch.skip{reason:"no_parser"}` at Info level)
+  under BOTH build tags -- identical behaviour to the
+  CGO-dependent languages under CGO=off. Wiring TS / JS /
+  Python production support is a separate task; see the
+  `// future` note in `parser_typescript.go::NewTypeScriptParser`
+  and the constructor docs in `parser_treesitter.go`.
 - **C / C++ / C# / Go / Rust require CGO.** Under CGO=off
   builds (the default `make test` portable gate on stock
   Windows toolchains), these languages have NO parser

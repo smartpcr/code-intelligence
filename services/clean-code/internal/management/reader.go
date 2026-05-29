@@ -360,6 +360,24 @@ type PortfolioResponse struct {
 	Window         time.Duration  `json:"window"`
 }
 
+// AgedMutesResponse is the `mgmt.read.insights.aged_mutes`
+// envelope. Wraps the [insights.AgedMutes] projection's slice
+// in the canonical [ReadMode] tag so the HTTP layer's wire
+// shape stays uniform with the other latest-dashboard verbs.
+//
+// `ThresholdDays` echoes the threshold the report was computed
+// under (default 90, or the caller-supplied override). A
+// dashboard renders this in the column header so an operator
+// who passed an explicit `threshold_days` argument can confirm
+// the cutoff -- WITHOUT the echo a stale browser tab caching
+// the URL bar's argument could silently render rows under a
+// different threshold than the one the operator typed.
+type AgedMutesResponse struct {
+	Mode          ReadMode            `json:"mode"`
+	AgedMutes     []insights.AgedMute `json:"aged_mutes"`
+	ThresholdDays int                 `json:"threshold_days"`
+}
+
 // -----------------------------------------------------------
 // MetricsBackend -- the single read-side data-source seam.
 // -----------------------------------------------------------
@@ -460,6 +478,7 @@ type Reader struct {
 	metrics                     MetricsBackend
 	freshness                   *insights.Freshness
 	freshnessExplicitlyDisabled bool
+	agedMutes                   *insights.AgedMutes
 }
 
 // ReaderOption configures a [Reader] at construction. Used
@@ -485,6 +504,31 @@ func WithMetricsBackend(b MetricsBackend) ReaderOption {
 // Sec 8.2 `freshness_window_seconds=3600` contract.
 func WithInsightsFreshness(f *insights.Freshness) ReaderOption {
 	return func(r *Reader) { r.freshness = f }
+}
+
+// WithAgedMutes wires `a` as the [Reader]'s [insights.AgedMutes]
+// projection -- the read seam behind `mgmt.read.insights.aged_mutes`
+// (Stage 10.2). nil is permitted -- the verb then returns
+// [ErrBackendUnavailable], mirroring [WithMetricsBackend]'s
+// "unwired -> 503" convention.
+//
+// Composition root callers wire a production [insights.AgedMutes]
+// constructed via [insights.NewAgedMutes] (default 90-day
+// threshold; pass nil for the clock to default to
+// [insights.SystemClock]). A typical wiring is:
+//
+//	r := management.NewReader(km,
+//	    management.WithMetricsBackend(pg),
+//	    management.WithAgedMutes(insights.NewAgedMutes(overrideReader, nil)),
+//	)
+//
+// The override-reader adapter (which bridges
+// `steward.Store` -> `insights.OverrideReader`) lives in this
+// management package (see [OverrideReaderFromStore]) so insights
+// stays free of a steward dependency (see the package doc on
+// [aged_mutes.go]).
+func WithAgedMutes(a *insights.AgedMutes) ReaderOption {
+	return func(r *Reader) { r.agedMutes = a }
 }
 
 // NewReader constructs a Reader. signingKeys MAY be nil for
@@ -830,4 +874,92 @@ func (r *Reader) ReadPortfolio(ctx context.Context, metricKind string) (*Portfol
 		resp.Window = status.Window
 	}
 	return resp, nil
+}
+
+// ReadAgedMutes serves `mgmt.read.insights.aged_mutes(threshold_days?)`
+// (Stage 10.2). Returns every override(mute=true) row whose
+// latest-row-wins reduction per (rule_id, scope_filter) is
+// older than the supplied `thresholdDays`. The report is
+// EXCLUSIVELY a read surface -- no enforcement is performed
+// (iter 1 evaluator item 5 + tech-spec Sec 10A "mute lifecycle"
+// pin: v1 has NO TTL enforcement in code). Operators unmute
+// by appending an `override(mute=false)` row through
+// `mgmt.override`; the aged-mute pair drops off the report on
+// the next call (the canonical
+// `unmute-removes-from-report` scenario).
+//
+// `thresholdDays`:
+//
+//   - nil -- use the default 90-day threshold pinned at
+//     [insights.AgedMuteDefaultThresholdDays].
+//   - non-nil with positive value -- the operator-supplied
+//     override (e.g. `?threshold_days=60`).
+//   - non-nil with zero or negative value -- treated as the
+//     default. Guards against a missing-arg HTTP call
+//     accidentally surfacing every mute (zero-threshold ->
+//     every mute is aged).
+//
+// Returns [ErrBackendUnavailable] when [WithAgedMutes] was
+// not supplied at composition time -- mirrors the
+// "verb mounted, substrate unwired -> 503" convention used by
+// the other Reader methods. The HTTP layer maps this to a
+// 503 Service Unavailable.
+//
+// Iter 2 evaluator item 3: this method ALSO maps the two
+// "wired but unusable" sentinels to [ErrBackendUnavailable]
+// so the operator-facing failure mode is uniform regardless
+// of WHERE the composition-root wiring bug is:
+//
+//   - [insights.ErrAgedMuteReaderUnavailable]: the projection
+//     has a nil [insights.OverrideReader] (e.g. the
+//     composition root passed `nil` to
+//     [insights.NewAgedMutes]).
+//   - [ErrAgedMuteOverrideStoreUnavailable]: the production
+//     [OverrideReaderFromStore] adapter was constructed with
+//     a nil [steward.Store].
+//
+// Both surface as a 503 so the dashboard renders an
+// "unavailable" tile instead of leaking the internal
+// scaffold-mode error string to the operator. The mapping is
+// pinned by `TestReader_ReadAgedMutes_*Unavailable*` tests in
+// `reader_aged_mutes_test.go`.
+//
+// Returns the underlying [insights.OverrideReader] error
+// (verbatim, wrapped to preserve `errors.Is`) when the
+// backend scan fails. Callers SHOULD treat any error other
+// than [ErrBackendUnavailable] as a backend infrastructure
+// fault and surface a 500 -- the report is a best-effort
+// dashboard read; failing closed is preferable to silently
+// rendering an empty report under a backend outage.
+func (r *Reader) ReadAgedMutes(ctx context.Context, thresholdDays *int) (*AgedMutesResponse, error) {
+	if r.agedMutes == nil {
+		return nil, ErrBackendUnavailable
+	}
+	effectiveDays := insights.AgedMuteDefaultThresholdDays
+	if thresholdDays != nil && *thresholdDays > 0 {
+		effectiveDays = *thresholdDays
+	}
+	report, err := r.agedMutes.ReportWithThreshold(
+		ctx,
+		time.Duration(effectiveDays)*24*time.Hour,
+	)
+	if err != nil {
+		if errors.Is(err, insights.ErrAgedMuteReaderUnavailable) ||
+			errors.Is(err, ErrAgedMuteOverrideStoreUnavailable) {
+			return nil, ErrBackendUnavailable
+		}
+		return nil, err
+	}
+	if report == nil {
+		// Defensive: the [insights.AgedMutes] contract
+		// returns a non-nil empty slice, but a future
+		// reader implementation might miss it. JSON `[]`
+		// (not `null`) is the wire shape this verb pins.
+		report = []insights.AgedMute{}
+	}
+	return &AgedMutesResponse{
+		Mode:          ReadModeLatestDashboard,
+		AgedMutes:     report,
+		ThresholdDays: effectiveDays,
+	}, nil
 }

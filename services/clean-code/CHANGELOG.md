@@ -4,6 +4,273 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
+## Stage 10.2 -- Aged mute insights report (iter 4)
+
+Single minor cleanup from iter 3's score-94 review (no
+behavioral change). The iter-3
+`TestReader_ReadAgedMutes_NilStoreAdapterMapsToBackendUnavailable`
+test had a comment claiming the underlying adapter sentinel
+was preserved in the error chain, but the assertion just
+repeated the same `errors.Is(err, ErrBackendUnavailable)`
+check -- meaning the diagnostic-chain claim was untested.
+
+### Iter 4 changes
+
+- **`reader_aged_mutes_test.go`** -- converted the misleading
+  block at the end of
+  `TestReader_ReadAgedMutes_NilStoreAdapterMapsToBackendUnavailable`
+  into an explicit CONTRACT PIN: the test now asserts that
+  `errors.Is(err, ErrAgedMuteOverrideStoreUnavailable)`
+  returns FALSE (i.e. the bare `ErrBackendUnavailable`
+  sentinel is what surfaces, with no inner-sentinel leak).
+  The comment now documents WHY the bare sentinel is the
+  contract and what the maintainer should change if the
+  contract evolves to preserve the chain. Closes the iter 3
+  evaluator's single minor finding.
+
+## Stage 10.2 -- Aged mute insights report (iter 3)
+
+Wire-contract + error-mapping correctness pass. Four
+iter-2 evaluator findings addressed; all four are internal
+consistency fixes between the operator-facing docs and the
+Reader / projection code.
+
+### Iter 3 changes
+
+- **`AgedMute.MarshalJSON`** -- NEW custom JSON encoder in
+  `internal/management/insights/aged_mutes.go` that emits the
+  FLAT snake_case wire shape the operator docs have always
+  promised:
+  `{override_id, rule_id, repo_id, scope_kind,
+  scope_signature_glob, reason, actor_id, created_at,
+  age_days}`. The Go struct keeps the nested
+  `Scope OverrideScope` field for ergonomic in-process
+  access, but the wire is flat per the dashboard column-
+  binding contract. Wire shape pinned by three new tests in
+  `aged_mutes_test.go`: `TestAgedMute_MarshalJSON_FlatWireShape`
+  (byte-exact match), `TestAgedMute_MarshalJSON_NoNestedScopeKey`
+  (forbidden keys), and `TestAgedMute_MarshalJSON_RoundTripsThroughReport`
+  (end-to-end through `AgedMutes.Report`). Closes evaluator
+  item 1.
+- **`mode` doc value -- `"latest_dashboard"`, not `"active"`** --
+  `services/clean-code/docs/runbook.md` and `docs/rollout.md`
+  now state the actual `ReadMode` tag the response envelope
+  carries. `Reader.ReadAgedMutes` returns
+  `ReadModeLatestDashboard` (string value `"latest_dashboard"`),
+  matching the existing `mgmt.read.cross_repo` /
+  `mgmt.read.portfolio` envelopes. Closes evaluator item 2.
+- **Nil-store / nil-reader sentinel -> `ErrBackendUnavailable`**
+  -- `Reader.ReadAgedMutes` now maps both
+  `insights.ErrAgedMuteReaderUnavailable` AND
+  `management.ErrAgedMuteOverrideStoreUnavailable` to the
+  package-level `ErrBackendUnavailable` so the HTTP layer
+  emits 503 for ANY composition-root wiring bug, not just a
+  missing `WithAgedMutes(...)` option. Two new tests in
+  `reader_aged_mutes_test.go`:
+  `TestReader_ReadAgedMutes_NilStoreAdapterMapsToBackendUnavailable`
+  (nil `steward.Store` inside the production
+  `OverrideReaderFromStore` adapter) and
+  `TestReader_ReadAgedMutes_NilOverrideReaderMapsToBackendUnavailable`
+  (nil `OverrideReader` passed to `insights.NewAgedMutes`).
+  Closes evaluator item 3.
+- **`reduceAndFilter` docstring** -- step 5 in
+  `aged_mutes.go` now correctly states
+  `(CreatedAt ASC, OverrideID ASC)`; the iter 2 sort change
+  left a stale comment naming the old key. The actual
+  comparator is unchanged. Closes evaluator item 4.
+- **Doc field alignment: `actor` -> `actor_id`** -- both
+  runbook + rollout had documented `"actor"` while the
+  steward source field is `actor_id`. Aligned the wire-shape
+  examples + verb-contract table to `actor_id` (the natural
+  snake-case of `OverrideRecord.ActorID` AND the JSON tag
+  on `steward.Override.ActorID`).
+
+## Stage 10.2 -- Aged mute insights report (iter 2)
+
+Hardening pass on the iter 1 aged-mute insights report. Four
+evaluator findings addressed:
+
+### Iter 2 changes
+
+- **`tools/forge_gate_proxy/proxy_test.go`** -- NEW.
+  Cross-module test-discovery shim for the Forge per-iter test
+  gate. The repository is a multi-module Go workspace (root
+  `go.mod` + `services/clean-code/go.mod` +
+  `services/agent-memory/go.mod`); `go test ./...` from the
+  root does NOT cross module boundaries even in workspace
+  mode, so the gate's fixed `go test ./... -run '<regex>'`
+  command found ZERO packages and exited 1 with "no packages
+  to test" in iter 1. The proxy's `TestMain` execs
+  `go test -count=1 ./...` inside each gated submodule
+  (currently `services/clean-code/`) and propagates the
+  aggregated exit code. `TestMain` runs irrespective of the
+  `-run` filter so the gate command no longer needs to match
+  a real test name in the root module.
+- **`steward.Store.ListAllOverrides`** -- NEW interface
+  method on `internal/policy/steward/store.go` with
+  implementations on both `InMemoryStore` (defensive copy,
+  sorted `(created_at ASC, override_id ASC)` under the
+  store mutex) and `SQLStore` (table-scan SELECT, no LIMIT,
+  same ORDER BY). Tests in
+  `internal/policy/steward/override_test.go` pin
+  empty-store-returns-empty-non-nil, returns-every-row-verbatim,
+  ordering, defensive-copy, and context-cancellation;
+  matching SQL round-trip tests live in
+  `sql_store_test.go` and skip when `STEWARD_SQL_STORE_URL`
+  is unset.
+- **`internal/management/insights_override_adapter.go`** --
+  NEW. Concrete production bridge
+  `management.OverrideReaderFromStore{Store: stewardStore}`
+  that maps `steward.Override` rows to
+  `insights.OverrideRecord` value records, satisfying the
+  `insights.OverrideReader` interface. Held in the
+  management package (NOT inside `insights/`) so the
+  insights package keeps its zero-`internal/*`-deps
+  invariant. Six tests in `insights_override_adapter_test.go`
+  pin nil-store sentinel, nil-receiver sentinel, full
+  field-for-field mapping, mute+unmute pass-through,
+  empty-store-returns-non-nil, context-cancellation, and
+  end-to-end wiring through `insights.NewAgedMutes`.
+- **`insights.NewAgedMutes(reader, clock)`** -- SIGNATURE
+  EXTENSION. Was one-arg `NewAgedMutes(r OverrideReader)`
+  in iter 1; docs already showed the two-arg form. The new
+  signature accepts an `insights.Clock` second argument so
+  bring-up tests can inject `FixedClock` without
+  monkey-patching the package-level `SystemClock`. Nil clock
+  falls back to `SystemClock` so production callers always
+  pass `nil`. All in-package and Reader-level callers
+  updated.
+- **Sort order: `(CreatedAt ASC, OverrideID ASC)`** -- the
+  `lessAgedMute` comparator in `aged_mutes.go` now produces
+  oldest-mute-first output, matching the docs and giving
+  operators the natural triage order (the longest-running
+  mute is the highest-priority candidate for review). Iter 1
+  code sorted by `(RuleID, RepoID, ScopeKind, Glob,
+  OverrideID)` which contradicted the runbook claim. The
+  `TestAgedMutes_DeterministicSortOrder` test was rewritten
+  to vary `CreatedAt` so it exercises both the primary key
+  and the OverrideID tie-break path.
+
+## Stage 10.2 -- Aged mute insights report
+
+New `internal/management/insights/aged_mutes.go` projection
+plus Reader wiring through `internal/management/reader.go`
+that surfaces `override(mute=true)` rows whose `created_at`
+exceeds a configurable threshold (default 90 days) as the
+`mgmt.read.insights.aged_mutes` verb. The report is
+EXCLUSIVELY an Insights surface read -- NO enforcement is
+performed (iter 1 evaluator item 5; v1 has NO TTL
+enforcement in code). Operators clear an aged mute by
+appending an `override(mute=false)` row via `mgmt.override`;
+the aged-mute row drops off the report on the next read.
+
+### What ships
+
+- `internal/management/insights/aged_mutes.go` -- new file.
+  Defines `OverrideScope`, `OverrideRecord`,
+  `OverrideReader`, `AgedMute`, `AgedMutes`,
+  `NewAgedMutes(...)`, `Report(ctx)`,
+  `ReportWithThreshold(ctx, days)`, the pure
+  `reduceAndFilter` reducer, `recordWins` /
+  `lessAgedMute` helpers, `ErrAgedMuteReaderUnavailable`
+  sentinel, and the `AgedMuteDefaultThresholdDays = 90`
+  constant.
+- `internal/management/insights/aged_mutes_test.go` -- new
+  file. 17 tests covering the two pinned scenarios from
+  the implementation plan (aged-mute-listed-not-enforced
+  and unmute-removes-from-report) plus boundary, tie-break,
+  threshold-override, sort-order, cancellation, nil-clock,
+  nil-reader, and re-mute-after-unmute edge cases.
+- `internal/management/reader.go` -- adds
+  `agedMutes *insights.AgedMutes` field, the
+  `WithAgedMutes(*insights.AgedMutes) ReaderOption`,
+  the `AgedMutesResponse{Mode, AgedMutes, ThresholdDays}`
+  envelope, and the
+  `Reader.ReadAgedMutes(ctx, thresholdDays *int)` method.
+  `WithAgedMutes(nil)` is permitted and yields the same
+  `ErrBackendUnavailable` shape as `mgmt.read.cross_repo`
+  when its backend is unwired.
+- `internal/management/reader_aged_mutes_test.go` -- new
+  file. 7 Reader-level wiring tests covering the unwired,
+  default-threshold-happy-path, unmute-removes-pair,
+  override-threshold-honored,
+  non-positive-threshold-falls-back-to-default, and
+  reader-error-propagation scenarios.
+
+### Architecture invariants pinned by this stage
+
+- **Insights package isolation.** `internal/management/insights`
+  intentionally has ZERO non-stdlib deps and ZERO
+  internal-package deps (see
+  `docs/follow-up-workstreams.md` import-isolation matrix).
+  This stage preserves that invariant by defining
+  `OverrideRecord` / `OverrideScope` as NARROW value types
+  in the insights package rather than importing
+  `steward.Override`. The composition root owns the
+  steward->insights adapter -- the insights package never
+  reaches into `policy/steward` or any other internal
+  package.
+- **Latest-row-wins reduction.** Groups are keyed by the
+  byte-identical `(rule_id, repo_id, scope_kind,
+  scope_signature_glob)` tuple (no glob matching at the
+  projection layer) and the winner per group is
+  `MAX(created_at, override_id)` -- mirroring the
+  `ORDER BY created_at DESC, override_id DESC` contract
+  used by `Store.LatestMatchingOverride`. Ties on
+  `created_at` are broken by the larger `override_id` so
+  an aged mute and a simultaneous unmute appended at the
+  same wall-clock tick resolve deterministically (the
+  unmute wins).
+- **No TTL enforcement.** The rule engine continues to
+  honor every `mute=true` row regardless of age. The
+  Insights surface is the ONLY consumer of the aged-mute
+  projection in v1; a future stage may add a policy that
+  enforces a max mute age, but that is explicitly out of
+  scope for this stage per iter 1 evaluator item 5.
+- **Strict-greater-than boundary.** `age > threshold` is
+  aged; `age == threshold` is fresh. This mirrors the
+  Stage 7.3 `Freshness.Window` semantic so the two
+  Insights surfaces have a single mental model.
+- **Non-positive threshold guard.** `threshold_days <= 0`
+  falls back to the default 90 -- prevents an operator typo
+  (`?threshold_days=0`) from flooding the report with
+  every mute in the system.
+- **Deterministic sort.** Aged mutes return sorted by
+  `created_at ASC` then `override_id ASC` so the oldest
+  mute is first and the order is stable across reads.
+
+### Operator-visible behavior
+
+- `mgmt.read.insights.aged_mutes` returns an envelope with
+  `mode`, `threshold_days`, and `aged_mutes[]`. Empty
+  result is `aged_mutes: []`, never `null`.
+- The optional `threshold_days` query parameter overrides
+  the default 90; values `<= 0` are clamped to 90.
+- Unmute is `mgmt.override(mute=false)` against the SAME
+  `(rule_id, scope_filter)` tuple. The original
+  `mute=true` row is NEVER deleted -- append-only audit
+  trail is preserved per architecture Sec 8.
+
+### Pre-existing build fixes (side-fix, not in target list)
+
+This stage's build gate uncovered two pre-existing breaks
+left over from an `EffortEstimator` -> `EffortModel`
+rename refactor that had not propagated; fixed surgically
+so the iteration's `go build ./...` exits 0:
+
+- `internal/refactor/task_planner.go` -- removed the dead
+  `ErrNilEffortEstimator` sentinel block and the dead
+  `effortEstimator EffortEstimator` field whose type no
+  longer exists.
+- `cmd/clean-code-refactor-planner/main.go` -- replaced
+  the stale `refactor.LoadFromConfig(cfg)` call with
+  `refactor.NewEffortModelFromConfig(refactor.EffortModelConfig{...})`,
+  removed the `effortModel.Version` log field (no longer
+  on the struct), swapped `cfg.RefactorEffortModelURI` for
+  `cfg.MLModelURI`, and removed a duplicate
+  `effortModel *refactor.EffortModel` parameter on
+  `runPlannerWithEffortModel`.
+
 ## Stage 8.3 -- ML effort-model loader and version pinning
 
 New `internal/refactor/effort_model.go` package surface plus

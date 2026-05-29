@@ -17,7 +17,7 @@ services:
 
   evaluator:
     build:
-      context: ../../../
+      context: ../../../services/clean-code/
       dockerfile: Dockerfile
       args:
         ROLE: clean_code_evaluator
@@ -32,7 +32,7 @@ services:
 
   rule-engine:
     build:
-      context: ../../../
+      context: ../../../services/clean-code/
       dockerfile: Dockerfile
       args:
         ROLE: clean_code_solid_batch
@@ -47,7 +47,7 @@ services:
 
   wal-reconciler:
     build:
-      context: ../../../
+      context: ../../../services/clean-code/
       dockerfile: Dockerfile
       args:
         ROLE: clean_code_wal_reconciler

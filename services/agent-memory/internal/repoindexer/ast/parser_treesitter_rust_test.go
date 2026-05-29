@@ -1080,17 +1080,21 @@ pub fn format_greeting(name: &str) -> String {
 
 	// ----- Total-count guards (catch spurious extra Node/Edge kinds) -----
 	// The brief's exact graph is: 6 nodes (2 class + 3 method +
-	// 1 package) and 4 edges (1 implements + 1 static_calls +
-	// 1 imports + 1 overrides). Per-kind counts above pin
-	// each EXPECTED kind; these total-count guards pin the
-	// emission set as a CLOSED set so a regression that
-	// emitted an UNEXPECTED kind (e.g. a phantom `extends` or
-	// `reads` edge, or a spurious node kind) lights up here.
+	// 1 package) and 9 edges (1 implements + 1 static_calls +
+	// 1 imports + 1 overrides + 5 contains [2 file→class + 2
+	// class→method + 1 file→method(format_greeting)]). Per-kind
+	// counts above pin each EXPECTED kind; these total-count
+	// guards pin the emission set as a CLOSED set so a
+	// regression that emitted an UNEXPECTED kind (e.g. a
+	// phantom `extends` or `reads` edge, or a spurious node
+	// kind) lights up here. Iter-8: `contains` edges are now
+	// emitted by Pass 1a (file→class) and Pass 1b (parent→
+	// method), so the closed-set total grew from 4 → 9.
 	if got := len(fw.nodes); got != 6 {
 		t.Errorf("total nodes = %d; want 6 (2 class + 3 method + 1 package); got=%v", got, fw.nodes)
 	}
-	if got := len(fw.edges); got != 4 {
-		t.Errorf("total edges = %d; want 4 (1 implements + 1 static_calls + 1 imports + 1 overrides); got=%v",
+	if got := len(fw.edges); got != 9 {
+		t.Errorf("total edges = %d; want 9 (1 implements + 1 static_calls + 1 imports + 1 overrides + 5 contains); got=%v",
 			got, fw.edges)
 	}
 }
@@ -1281,12 +1285,16 @@ impl Greeter for GreeterImpl {
 	// ----- Total-count guards (catch spurious extra Node/Edge kinds) -----
 	// The cross-file fixture has NO `use`, NO local trait,
 	// NO local callee match — so the COMPLETE graph is
-	// exactly 2 nodes (1 class + 1 method) and 0 edges.
+	// exactly 2 nodes (1 class GreeterImpl + 1 method
+	// GreeterImpl.greet) and 2 edges (2 contains: file→
+	// class + class→method). Iter-8: `contains` edges are
+	// now emitted by Pass 1a/1b, so the closed-set total
+	// grew from 0 → 2.
 	if got := len(fw.nodes); got != 2 {
 		t.Errorf("total nodes = %d; want 2 (1 class + 1 method); got=%v", got, fw.nodes)
 	}
-	if got := len(fw.edges); got != 0 {
-		t.Errorf("total edges = %d; want 0 (cross-file references must NOT mint any local edge); got=%v",
+	if got := len(fw.edges); got != 2 {
+		t.Errorf("total edges = %d; want 2 (2 contains: file→class + class→method); got=%v",
 			got, fw.edges)
 	}
 

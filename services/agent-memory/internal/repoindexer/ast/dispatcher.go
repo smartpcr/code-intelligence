@@ -222,15 +222,21 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 
 	p, ok := d.extMap[ext]
 	if !ok {
-		// Hint-fallback: if the dispatcher was configured with
-		// `WithLanguageHints`, walk the normalized hint list and
-		// pick the first parser whose `Language()` matches a hint.
-		// This is the v1 contract per architecture §4.1 — hints
-		// route ONLY unknown / unmapped extensions; a known
-		// extension always wins (test:
-		// `TestDispatcher_LanguageHintsFallbackForUnknownExtension`).
-		if len(d.languageHints) > 0 {
-			for _, hint := range normalizeHints(d.languageHints) {
+		// Hint-fallback: prefer the per-event `EmitFileEvent.LanguageHints`
+		// (the worker fills these in from `repo.language_hints[]` for
+		// the specific repo this file belongs to) over the dispatcher
+		// global hints, and fall back to the global list only when the
+		// per-event slice is empty. This is the v1 contract per
+		// architecture §4.1 — hints route ONLY unknown / unmapped
+		// extensions; a known extension always wins.
+		// Tests: `TestDispatcher_LanguageHintsFallbackForUnknownExtension`,
+		// `TestDispatcher_PerEventLanguageHintsOverrideGlobal`.
+		hints := ev.LanguageHints
+		if len(hints) == 0 {
+			hints = d.languageHints
+		}
+		if len(hints) > 0 {
+			for _, hint := range normalizeHints(hints) {
 				for _, candidate := range d.parsers {
 					if candidate.Language() == hint {
 						p = candidate
@@ -350,6 +356,44 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 		return eerr
 	}
 
+	// Inline embedding publisher: invoked once per Method or
+	// Block node, IMMEDIATELY after that node's `contains` edge
+	// is committed (rubber-duck #5 / canonical_dispatcher test
+	// `TestDispatcher_EmbeddingPublisher_PublishesAfterContainsEdge`).
+	// Dedup by node ID so an idempotent re-insert of the same
+	// signature does NOT trigger a duplicate publish. The
+	// two-bucket error policy from `embedding.go` is enforced
+	// here: `errors.Is(err, ErrPublishRecordedFailed)` is logged
+	// and swallowed (durable failure already recorded by the
+	// EmbeddingIndex writer; background flusher will retry);
+	// every other non-nil error propagates so the ingest job
+	// fails loudly. The `published` set keeps the inline path
+	// safe from accidental double-publish via repeated calls.
+	published := make(map[string]struct{})
+	publishInsertedNode := func(req NodeEmbedRequest) error {
+		if d.embedPub == nil || req.NodeID == "" {
+			return nil
+		}
+		if _, dup := published[req.NodeID]; dup {
+			return nil
+		}
+		published[req.NodeID] = struct{}{}
+		_, perr := d.embedPub.PublishNodeEmbedding(ctx, req)
+		if perr == nil {
+			return nil
+		}
+		if errors.Is(perr, ErrPublishRecordedFailed) {
+			if d.logger != nil {
+				d.logger.Info("ast.embed.publish.recorded_failed",
+					slog.String("node_id", req.NodeID),
+					slog.String("kind", req.Kind),
+				)
+			}
+			return nil
+		}
+		return perr
+	}
+
 	// Pass 0: imports → package nodes + imports edges
 	// (skip workspace-relative module specifiers).
 	for _, imp := range result.Imports {
@@ -384,6 +428,13 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 	}
 
 	// Pass 1a: classes (build local-class set + sig→NodeID map).
+	// Emits one `class` node per ClassDecl PLUS one `contains`
+	// edge `file → class` so the file→class→method→block
+	// containment chain stays intact (test:
+	// `TestDispatcher_BlockSubdivisionFiresThroughEmitter`,
+	// `TestPythonFixture_EmitsExpectedNodeAndEdgeSet`,
+	// `TestTypeScriptFixture_EmitsExpectedNodeAndEdgeSet`,
+	// `TestPowerShellFixture_DispatcherEmitsExpectedNodesAndEdges`).
 	classSigToNodeID := make(map[string]string, len(result.Classes))
 	for _, c := range result.Classes {
 		sig := fmt.Sprintf("%s::class::%s#%s", ev.RepoURL, ev.RelPath, c.QualifiedName)
@@ -399,6 +450,17 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 			return repoindexer.EmitResult{TouchedNodes: touched}, cerr
 		}
 		classSigToNodeID[c.QualifiedName] = id
+		if id != "" && ev.FileNodeID != "" {
+			if eerr := insertEdge(graphwriter.EdgeInput{
+				RepoID:    ev.RepoID,
+				Kind:      "contains",
+				SrcNodeID: ev.FileNodeID,
+				DstNodeID: id,
+				FromSHA:   ev.SHA,
+			}); eerr != nil {
+				return repoindexer.EmitResult{TouchedNodes: touched}, eerr
+			}
+		}
 	}
 
 	// Pass 1b: methods (build scoped-QN map for receiver-qualified
@@ -472,6 +534,85 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 		}
 		for _, alias := range m.ReceiverAliases {
 			registerReceiverKey(alias, id)
+		}
+		// Emit the parent→method `contains` edge using the
+		// SAME parentID resolution that was used for the
+		// node insert (so a method whose declared
+		// EnclosingClass is missing locally still chains
+		// under the file node, never floats orphaned).
+		if id != "" && parentID != "" {
+			if eerr := insertEdge(graphwriter.EdgeInput{
+				RepoID:    ev.RepoID,
+				Kind:      "contains",
+				SrcNodeID: parentID,
+				DstNodeID: id,
+				FromSHA:   ev.SHA,
+			}); eerr != nil {
+				return repoindexer.EmitResult{TouchedNodes: touched}, eerr
+			}
+		}
+		// Inline publish for the Method node — fires AFTER
+		// the parent→method contains edge so the publisher
+		// invariant (`PublishesAfterContainsEdge`) holds.
+		methodContent := m.BodySource
+		signatureOnly := false
+		if strings.TrimSpace(methodContent) == "" {
+			methodContent = methodSig
+			signatureOnly = true
+		}
+		if perr := publishInsertedNode(NodeEmbedRequest{
+			NodeID:             id,
+			RepoID:             ev.RepoID.String(),
+			Kind:               "method",
+			CanonicalSignature: methodSig,
+			Content:            methodContent,
+			SignatureOnly:      signatureOnly,
+		}); perr != nil {
+			return repoindexer.EmitResult{TouchedNodes: touched}, perr
+		}
+		// Pass 1c (per-method block subdivision): when the
+		// body exceeds the §8.2 logical-line threshold the
+		// dispatcher inserts two Block nodes (entry, exit)
+		// as children of the method and emits a method→block
+		// contains edge per Block. The publisher fires AFTER
+		// each block's contains edge so the publish-after-
+		// contains invariant holds for Blocks as well.
+		blocks := SubdivideMethod(m)
+		for _, b := range blocks {
+			blockSig := blockSignature(methodSig, b)
+			blockContent := sliceBlockSource(src, b)
+			bid, berr := insertNode(graphwriter.NodeInput{
+				RepoID:             ev.RepoID,
+				Kind:               "block",
+				CanonicalSignature: blockSig,
+				ParentNodeID:       id,
+				FromSHA:            ev.SHA,
+				AttrsJSON:          blockAttrs(p.Language(), b),
+			})
+			if berr != nil {
+				return repoindexer.EmitResult{TouchedNodes: touched}, berr
+			}
+			if bid != "" && id != "" {
+				if eerr := insertEdge(graphwriter.EdgeInput{
+					RepoID:    ev.RepoID,
+					Kind:      "contains",
+					SrcNodeID: id,
+					DstNodeID: bid,
+					FromSHA:   ev.SHA,
+				}); eerr != nil {
+					return repoindexer.EmitResult{TouchedNodes: touched}, eerr
+				}
+			}
+			if perr := publishInsertedNode(NodeEmbedRequest{
+				NodeID:             bid,
+				RepoID:             ev.RepoID.String(),
+				Kind:               "block",
+				CanonicalSignature: blockSig,
+				Content:            blockContent,
+				SignatureOnly:      strings.TrimSpace(blockContent) == "",
+			}); perr != nil {
+				return repoindexer.EmitResult{TouchedNodes: touched}, perr
+			}
 		}
 	}
 
@@ -578,6 +719,73 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 		}
 	}
 
+	// Pass 2c: reads / writes edges from method body member
+	// accesses (architecture §5.3 — "every recognised member
+	// access becomes a `reads` or `writes` edge from the
+	// enclosing method to its declaring class"). Aggregation is
+	// per (method, isWrite) pair: emit ONE edge per direction
+	// carrying a `members` attr array listing every distinct
+	// member name accessed in that direction. Source order is
+	// preserved (dedup is first-seen, not lexicographic) so the
+	// emitted attrs are deterministic for replay/golden tests.
+	// Test: `TestDispatcher_EmitsReadsAndWritesEdgesToEnclosingClass`.
+	for _, m := range result.Methods {
+		if m.EnclosingClass == "" || len(m.MemberAccesses) == 0 {
+			continue
+		}
+		classID, ok := classSigToNodeID[m.EnclosingClass]
+		if !ok {
+			continue
+		}
+		srcID, ok := methodSigToNodeID[m.QualifiedName]
+		if !ok {
+			continue
+		}
+		var reads, writes []string
+		seenR := map[string]struct{}{}
+		seenW := map[string]struct{}{}
+		for _, ma := range m.MemberAccesses {
+			if ma.Name == "" {
+				continue
+			}
+			if ma.IsWrite {
+				if _, dup := seenW[ma.Name]; !dup {
+					writes = append(writes, ma.Name)
+					seenW[ma.Name] = struct{}{}
+				}
+			} else {
+				if _, dup := seenR[ma.Name]; !dup {
+					reads = append(reads, ma.Name)
+					seenR[ma.Name] = struct{}{}
+				}
+			}
+		}
+		if len(writes) > 0 {
+			if eerr := insertEdge(graphwriter.EdgeInput{
+				RepoID:    ev.RepoID,
+				Kind:      "writes",
+				SrcNodeID: srcID,
+				DstNodeID: classID,
+				FromSHA:   ev.SHA,
+				AttrsJSON: memberAccessAttrsJSON(writes),
+			}); eerr != nil {
+				return repoindexer.EmitResult{TouchedNodes: touched}, eerr
+			}
+		}
+		if len(reads) > 0 {
+			if eerr := insertEdge(graphwriter.EdgeInput{
+				RepoID:    ev.RepoID,
+				Kind:      "reads",
+				SrcNodeID: srcID,
+				DstNodeID: classID,
+				FromSHA:   ev.SHA,
+				AttrsJSON: memberAccessAttrsJSON(reads),
+			}); eerr != nil {
+				return repoindexer.EmitResult{TouchedNodes: touched}, eerr
+			}
+		}
+	}
+
 	// Pass 2d: overrides (impl method → trait-default trait
 	// method, same file only; cross-file misses silently
 	// dropped per architecture A4).
@@ -613,29 +821,11 @@ func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent)
 		}
 	}
 
-	// Best-effort embedding publication: the publisher attached
-	// via `WithEmbeddingPublisher` is invoked once per touched
-	// Method Node (Class / package Nodes are skipped — Stage 3.3
-	// only embeds methods and blocks). The noop default keeps
-	// this surface inert until the Stage 6.x embedding wiring
-	// lands the real publisher.
-	if d.embedPub != nil {
-		repoIDStr := ev.RepoID.String()
-		for _, tn := range touched {
-			if tn.Kind != "method" && tn.Kind != "block" {
-				continue
-			}
-			req := NodeEmbedRequest{
-				NodeID:             tn.NodeID,
-				RepoID:             repoIDStr,
-				Kind:               tn.Kind,
-				CanonicalSignature: tn.CanonicalSignature,
-				Content:            tn.CanonicalSignature,
-				SignatureOnly:      true,
-			}
-			_, _ = d.embedPub.PublishNodeEmbedding(ctx, req)
-		}
-	}
+	// Embedding publication for Methods and Blocks already
+	// fired inline (Pass 1b) so each publish lands AFTER its
+	// parent→node `contains` edge per the canonical contract
+	// (`TestDispatcher_EmbeddingPublisher_PublishesAfterContainsEdge`).
+	// No trailing publisher loop is needed.
 
 	return repoindexer.EmitResult{TouchedNodes: touched}, nil
 }
@@ -648,6 +838,14 @@ func packageAttrsJSON(imp Import) json.RawMessage {
 	if imp.Module != "" {
 		attrs["module"] = imp.Module
 	}
+	// Pass 0 only walks non-relative imports (relative ones are
+	// skipped in the loop body above), so every package node it
+	// mints represents an EXTERNAL module. Tag the attrs with
+	// `source = "external"` so the worker-emitted first-party
+	// package nodes (which carry `source = "first_party"` or are
+	// untagged) remain distinguishable for downstream filtering
+	// (test: `TestDispatcher_EmitsImportsEdgesForExternalModules`).
+	attrs["source"] = "external"
 	if len(attrs) == 0 {
 		return json.RawMessage(`{}`)
 	}
@@ -687,6 +885,72 @@ func importsEdgeAttrsJSON(imp Import) json.RawMessage {
 		return json.RawMessage(`{}`)
 	}
 	return raw
+}
+
+// memberAccessAttrsJSON wraps a deduped, source-order member-name
+// slice into the canonical `{"members": [...]}` shape expected on
+// the `reads` / `writes` edges emitted by Pass 2c. An empty input
+// is conservatively rendered as `{}` so the edge attrs JSON is
+// never broken (the caller does not emit edges with empty inputs,
+// so this branch is defensive-only).
+func memberAccessAttrsJSON(names []string) json.RawMessage {
+	if len(names) == 0 {
+		return json.RawMessage(`{}`)
+	}
+	raw, err := json.Marshal(map[string]any{"members": names})
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return raw
+}
+
+// blockAttrs serialises the file-relative position metadata that
+// belongs on a `block` Node minted by Pass 1c's subdivision. The
+// discriminator key is `block_kind` (not `kind`) so it never
+// collides with the top-level `kind` graph column. Tests:
+// `TestDispatcher_RecordsFileRelativeBlockBoundariesInAttrs`,
+// `TestDispatcher_BlockSubdivisionFiresThroughEmitter`.
+func blockAttrs(language string, b Block) json.RawMessage {
+	attrs := map[string]any{
+		"block_kind": string(b.Kind),
+		"start_line": b.StartLine,
+		"end_line":   b.EndLine,
+		"start_byte": b.StartByte,
+		"end_byte":   b.EndByte,
+		"ordinal":    b.Ordinal,
+	}
+	if language != "" {
+		attrs["language"] = language
+	}
+	raw, err := json.Marshal(attrs)
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return raw
+}
+
+// sliceBlockSource extracts the source bytes for a Block from the
+// surrounding file buffer. `Block.EndByte` is INCLUSIVE per
+// `block.go`, so the slice upper bound is `EndByte+1`. The
+// function is defensive: out-of-range / inverted offsets yield
+// the empty string so a malformed block never panics the
+// dispatcher.
+func sliceBlockSource(src []byte, b Block) string {
+	if len(src) == 0 {
+		return ""
+	}
+	start := b.StartByte
+	end := b.EndByte + 1
+	if start < 0 {
+		start = 0
+	}
+	if end > len(src) {
+		end = len(src)
+	}
+	if start >= end {
+		return ""
+	}
+	return string(src[start:end])
 }
 
 // lastDottedSegment returns the right-most dotted segment of a

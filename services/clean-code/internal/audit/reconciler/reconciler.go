@@ -10,7 +10,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/audit/wal"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
 )
 
 // Config configures a [Reconciler]. Every required field is

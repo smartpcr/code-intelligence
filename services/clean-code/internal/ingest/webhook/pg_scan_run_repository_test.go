@@ -8,8 +8,8 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/ingest/webhook"
-	"forge/services/clean-code/internal/metric_ingestor"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
 )
 
 // fakePGScanRunOpener captures the

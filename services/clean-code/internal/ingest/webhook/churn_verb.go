@@ -11,7 +11,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/ingest/churn"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/churn"
 )
 
 // ChurnVerbHandler is the [VerbHandler] implementation for

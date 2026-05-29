@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"log/slog"
 
-	"forge/services/clean-code/internal/ingest/churn"
-	"forge/services/clean-code/internal/ingest/coverage"
-	"forge/services/clean-code/internal/ingest/test_balance"
-	"forge/services/clean-code/internal/ingest/webhook"
-	"forge/services/clean-code/internal/metric_ingestor"
-	"forge/services/clean-code/internal/metrics/materialisers"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/churn"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/coverage"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/test_balance"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/materialisers"
 )
 
 // IngestRouterConfig is the input bundle for

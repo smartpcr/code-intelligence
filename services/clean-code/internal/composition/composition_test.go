@@ -12,7 +12,7 @@ import (
 
 	_ "github.com/lib/pq"
 
-	"forge/services/clean-code/internal/evaluator"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/evaluator"
 )
 
 // unmarshalJSON is a small test helper that wraps

@@ -22,7 +22,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/ingest/churn"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/churn"
 )
 
 // fixedScanRunID is the canonical fixture scan_run_id. Pinned

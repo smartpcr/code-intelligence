@@ -10,7 +10,7 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/lib/pq"
 
-	"forge/services/clean-code/internal/audit/wal"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
 )
 
 // SQLDegradedRunStore is the production [DegradedRunStore]

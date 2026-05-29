@@ -10,7 +10,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/aggregator"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/aggregator"
 )
 
 // TestNewLoop_PanicsOnNilAggregator pins the wiring-bug-surface

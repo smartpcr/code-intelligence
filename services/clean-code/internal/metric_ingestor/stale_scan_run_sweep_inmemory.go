@@ -8,7 +8,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/repo_indexer"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/repo_indexer"
 )
 
 // This file teaches [InMemoryScanRunStore] the

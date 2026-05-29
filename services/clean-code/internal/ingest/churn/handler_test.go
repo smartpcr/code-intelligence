@@ -35,10 +35,10 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/ast/scope"
-	"forge/services/clean-code/internal/ingest/churn"
-	"forge/services/clean-code/internal/metrics/materialisers"
-	"forge/services/clean-code/internal/metrics/recipes"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/churn"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/materialisers"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
 
 // scenarioChurnWritesNoMetricSample is the canonical

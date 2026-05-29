@@ -4,8 +4,8 @@ import (
 	"hash/fnv"
 	"sort"
 
-	"forge/services/clean-code/internal/ast/parser"
-	"forge/services/clean-code/internal/ast/scope"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
 )
 
 // duplicationRatioMetricKind is the canonical metric_kind

@@ -11,7 +11,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/evaluator"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/evaluator"
 )
 
 // MaxEvalRequestBodyBytes caps the request body size on

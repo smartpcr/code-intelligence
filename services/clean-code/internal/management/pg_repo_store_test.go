@@ -28,7 +28,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gofrs/uuid"
 
-	management "forge/services/clean-code/internal/management"
+	management "github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
 )
 
 const pgRepoStoreTestSchema = "clean_code_mgmt_test"

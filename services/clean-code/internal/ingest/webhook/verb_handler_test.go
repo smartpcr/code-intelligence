@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"forge/services/clean-code/internal/ingest/webhook"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook"
 )
 
 // TestValidateVerbToken_ClosedSet pins the registration-time

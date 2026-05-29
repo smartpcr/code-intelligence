@@ -167,7 +167,7 @@ func scanFileForCallSites(t *testing.T, path string) []callSite {
 	if err != nil {
 		t.Fatalf("parser.ParseFile(%s): %v", path, err)
 	}
-	webhookImportPath := "forge/services/clean-code/internal/ingest/webhook"
+	webhookImportPath := "github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook"
 	// The default identifier for an unnamed import is the
 	// package's actual name ("webhook"). A named import
 	// (`name "..."`) overrides this.

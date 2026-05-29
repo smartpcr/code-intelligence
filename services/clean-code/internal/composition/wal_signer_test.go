@@ -8,8 +8,8 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/audit/wal"
-	"forge/services/clean-code/internal/policy/keys"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
 )
 
 // TestNewKeysManagerWALSigner_NilManagerReturnsNil pins the

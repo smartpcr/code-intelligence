@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 
-	"forge/services/clean-code/internal/audit/wal"
-	"forge/services/clean-code/internal/evaluator"
-	"forge/services/clean-code/internal/policy/steward"
-	"forge/services/clean-code/internal/rule_engine"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/evaluator"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
 )
 
 // EvalGateConfig is the input bundle for [BuildEvalGate].

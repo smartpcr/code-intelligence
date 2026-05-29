@@ -43,10 +43,10 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/ast/isolation"
-	"forge/services/clean-code/internal/ast/parser"
-	"forge/services/clean-code/internal/metric_ingestor"
-	"forge/services/clean-code/internal/metrics/recipes"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/isolation"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
 )
 
 // slowWorker is an [isolation.Worker] whose Execute blocks

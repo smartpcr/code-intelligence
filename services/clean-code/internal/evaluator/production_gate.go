@@ -9,9 +9,9 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/audit/wal"
-	"forge/services/clean-code/internal/policy/keys"
-	"forge/services/clean-code/internal/policy/steward"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 )
 
 // ProductionGateConfig bundles the dependencies the

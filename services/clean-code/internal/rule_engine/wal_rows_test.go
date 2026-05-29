@@ -8,7 +8,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/policy/steward"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 )
 
 func TestWalEvaluationRunRowJSON_NilScopeRendersAsNull(t *testing.T) {

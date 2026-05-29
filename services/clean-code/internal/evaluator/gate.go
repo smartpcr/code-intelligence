@@ -7,7 +7,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/policy/keys"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
 )
 
 // ErrPolicySignatureInvalid is the canonical sentinel the gate

@@ -7,7 +7,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/policy/steward"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 )
 
 // TestEngine_RunSync_RootCommit_NoPrior_DeltaNew pins the

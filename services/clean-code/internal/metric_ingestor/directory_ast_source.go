@@ -12,8 +12,8 @@ import (
 	"sort"
 	"strings"
 
-	"forge/services/clean-code/internal/ast/isolation"
-	"forge/services/clean-code/internal/ast/parser"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/isolation"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
 )
 
 // ErrDirectoryAstSourceMissingRoot is returned when the

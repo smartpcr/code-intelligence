@@ -9,7 +9,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/aggregator"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/aggregator"
 )
 
 // systemTierTickInput returns a valid embedded-mode

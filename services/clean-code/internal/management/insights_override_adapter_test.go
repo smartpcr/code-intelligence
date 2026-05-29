@@ -8,9 +8,9 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/management"
-	"forge/services/clean-code/internal/management/insights"
-	"forge/services/clean-code/internal/policy/steward"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/management/insights"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 )
 
 // muteOverride returns a deterministic muted [steward.Override]

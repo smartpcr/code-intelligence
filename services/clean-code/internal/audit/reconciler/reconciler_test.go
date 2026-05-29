@@ -12,7 +12,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/audit/wal"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
 )
 
 func TestNewReconciler_RejectsUnwiredDeps(t *testing.T) {

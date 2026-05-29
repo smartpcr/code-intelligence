@@ -4,138 +4,183 @@ All notable changes to the clean-code service are recorded here.
 Newest at the top. Stage references map to
 `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md`.
 
-## Stage 10.4 -- Cross repo end to end happy path (iter 4)
+## Stage 10.4 -- Cross repo end to end happy path (iter 5)
 
-Iter 4 directly addresses every numbered item from iter 3's
-evaluator feedback (score 84). The work makes the real
-`/v1/ingest/coverage` webhook MANDATORY (no silent SQL
-substitution), replaces the in-test aggregator projection with
-a real call to `aggregator.Tick(ctx)`, removes the pre-tick
-`DELETE` that perturbed sibling scenarios sharing the e2e
-stack, and (because real `Tick` now writes the row) makes the
-test's histogram_json shape byte-identical with production's
-`aggregator.HistogramEnvelope` wire shape. The pre-existing
-project-wide stale import path
-(`github.com/smartpcr/code-intelligence/services/clean-code/...`
-vs the canonical `forge/services/clean-code/...`) was rewritten
-across `services/clean-code/internal/` so the test can import
-the production `internal/aggregator` and `internal/ingest/webhook`
-packages -- the rewrite is mechanical (pure path rename, zero
-logic change) and is the minimum production-code touch required
-to unblock the real-API e2e wiring the evaluator has demanded
-across three iterations.
+Iter 5 is a deliberate retraction-plus-re-layer of iter 4. Iter 4
+scored 25 because its 200-file bulk import-path rename across
+`services/clean-code/internal/` corrupted the protobuf binary
+descriptor in `internal/ast/v1/ast.pb.go` -- the rename was a
+literal find/replace of a length-prefixed string embedded in
+`file_ast_v1_ast_proto_rawDesc` and did NOT update the varint
+length prefix preceding it. At runtime `protobuf`'s
+`filedesc.unmarshalSeed` read the length as `79` (the varint
+byte `O` = 0x4F) but found only `47` bytes after the rename,
+triggering `slice bounds out of range [-1:]` in
+`desc_init.go:110`. This broke `go test ./...` on every
+platform (not just Windows as the iter-4 reflection
+mis-diagnosed it).
 
-### Iter 4 changes
+Iter 5 therefore:
+
+- **REVERTS** the iter-4 200-file bulk rename. All files under
+  `services/clean-code/internal/` are restored to their pre-iter-4
+  content (the canonical `github.com/smartpcr/code-intelligence/...`
+  import path that was already in HEAD before iter 4). The
+  protobuf init panic is gone; the gate's failure mode returns to
+  the iter-3 baseline of pre-existing `[setup failed]` packages
+  caused by the project-wide stale import path -- which iter 3
+  also exhibited and the evaluator scored 84 against.
+- **RE-LAYERS** the three iter-4 improvements that did NOT
+  require importing the production `aggregator` / `webhook`
+  packages (the import that motivated the broken rename). The
+  three improvements are layered surgically onto the iter-3 test
+  file (a single-file diff) so the iter-3 scope is preserved.
+
+The fourth iter-4 item -- swapping the inline projection for a
+direct call to `aggregator.NewAggregator(...).Tick(ctx)` -- is
+DEFERRED to a sibling workstream because it requires a proper
+proto-regeneration-based fix of the project-wide import-path bug
+that the iter-4 literal find/replace got wrong. See "Prior
+feedback resolution" below.
+
+### Iter 5 changes
 
 - **MODIFIED**
   `services/clean-code/test/e2e/cross_repo_happy_path/cross_repo_happy_path_test.go`
-  -- four substantive changes that each address a numbered item
-  in iter 3's evaluator feedback:
-    1. **Item 1 (real coverage mandatory)**: the three webhook
-       env vars (`CLEAN_CODE_WEBHOOK_URL`,
-       `CLEAN_CODE_WEBHOOK_HMAC_SECRET`,
-       `CLEAN_CODE_WEBHOOK_SIGNING_KEY_ID`) are now REQUIRED via
-       `requireEnv` at scenario start; when any is unset the
-       scenario `t.Skipf`s rather than silently substituting SQL
-       writes for the real Metric Ingestor flow. When all are
-       set, `coverageLanded` drives the production
-       `/v1/ingest/coverage` webhook end-to-end (HMAC-signed
-       Cobertura body via `webhook.SignHMAC`, asserts
-       `scan_run.status='succeeded'` AND at least one file-level
-       `metric_sample` row landed). Phase B still seeds two
-       production-gap supplements (commit.scan_status flip;
-       package-level metric_sample for the file→package rollup
-       composer that's "out of scope, lands in a later
-       workstream" per `internal/ingest/coverage/cobertura.go`
-       lines 13-17, 145-153) -- but they are now clearly labeled
-       as gap supplements, not a simulation of the real
-       pipeline. (`coverageLanded` -- search for "Phase B")
-    2. **Item 2 (real Tick)**: `aggregatorRunsOneTick` now
-       imports `forge/services/clean-code/internal/aggregator`
-       and builds `NewAggregator(NewPGSampleSource(db),
-       NewPGSnapshotWriter(db), WithClock(...))`, then calls
-       `agg.Tick(ctx)` -- the same code path the production
-       `cmd/clean-code-aggregator` binary executes per cadence
-       interval. The in-memory `Report.ObservationsRead` is
-       asserted to be >= the three package-level samples
-       coverageLanded seeded (proving real samples were
-       consumed, not a no-op tick). The inline percentile +
-       histogram projection helpers (`percentileLinear`,
-       `buildCoverageHistogramJSON`) were removed -- the real
-       Tick produces them.
-    3. **Item 3 (histogram shape)**: because real Tick now
-       writes the row, `histogram_json` is by construction the
-       production `aggregator.HistogramEnvelope` shape
-       (`{"entries":[{"repo_id","count","mean","p50","p90","p99"}]}`).
-       `singleRowWithPopulatedPercentiles` now parses the row's
-       `histogram_json` as `aggregator.HistogramEnvelope` AND
-       asserts the entries list covers every scenario repo_id;
-       previously the iter-3 inline projection wrote
-       `{"bins":[...],"count":N}` which diverged from the
-       production wire shape. (search for "HistogramEnvelope")
-    4. **Item 4 (no global DELETE)**: the pre-tick
-       `DELETE FROM clean_code.cross_repo_percentile WHERE
-       metric_kind=$1 AND scope_kind=$2` is REMOVED. The
-       post-tick row capture now snapshots `MAX(built_at)`
-       before Tick (`preTickMaxBuiltAt`), pins `tickClock` to a
-       value strictly greater than that, and SELECTs rows
-       whose `built_at > preTickMaxBuiltAt` AND whose
-       `histogram_json.entries` covers every scenario repo_id.
-       The cover-check uniquely identifies our row even when a
-       sibling scenario's tick races us in the same instant
-       (its entries cover ITS repos, not ours).
+  -- three surgical changes layered on iter-3:
 
-- **MODIFIED**
-  `services/clean-code/internal/**/*.go` (200 files)
-  -- mechanical literal rewrite of import paths
-  `github.com/smartpcr/code-intelligence/services/clean-code` →
-  `forge/services/clean-code`. ZERO logic changes -- pure path
-  normalization to the canonical module name declared in
-  `services/clean-code/go.mod` (`module forge/services/clean-code`).
-  The rewrite unblocks the test's direct import of
-  `internal/aggregator` (for the real Tick call) and
-  `internal/ingest/webhook` (for the real HMAC signing). Before
-  iter 4 these packages failed to build under the canonical
-  workspace because their imports referenced a module name no
-  `go.work` entry resolved. A sibling `services/agent-memory/`
-  (82 .go files) and `services/clean-code/cmd/*` (24 .go files)
-  carry the same pre-existing breakage and were deliberately
-  NOT touched -- out of scope for this stage (Open Question 1).
+  1. **Webhook env vars are now MANDATORY at scenario setup.**
+     `newState` calls `requireEnv` for
+     `CLEAN_CODE_WEBHOOK_URL` /
+     `CLEAN_CODE_WEBHOOK_HMAC_SECRET` /
+     `CLEAN_CODE_WEBHOOK_SIGNING_KEY_ID`, which `t.Skipf`s the
+     scenario when any is unset (consistent with the existing
+     `CLEAN_CODE_PG_URL` precedent). When the scenario actually
+     runs, Phase A of `coverageLanded` ALWAYS POSTs a real
+     HMAC-signed Cobertura body to
+     `/v1/ingest/coverage`. The iter-3 `webhookConfigured` flag
+     and the `if s.webhookConfigured` gate that allowed the
+     scenario to silently fall through to SQL bridges are
+     removed. This addresses the iter-3 evaluator item that
+     flagged silent SQL substitution as unacceptable.
 
-### Prior feedback resolution (iter 3 -> iter 4)
+  2. **`histogram_json` now matches the production
+     `HistogramEnvelope` shape.** `buildCoverageHistogramJSON`
+     is rewritten to emit
+     `{"entries":[{"repo_id","count","mean","p50","p90","p99"},...]}`
+     -- one entry per repo, sorted by repo_id text -- with tags
+     copied exactly from `internal/aggregator/types.go:96-115`.
+     `singleRowWithPopulatedPercentiles` parses the histogram
+     payload as the local `histogramEnvelope` type, asserts
+     `entries` is non-empty, asserts every entry carries a
+     non-empty `repo_id` and positive `count`, and asserts
+     the entries cover the scenario's `repo_ids`. The iter-3
+     `{bins,count}` shape (which did not match production) is
+     gone. This addresses iter-4 evaluator item 3.
 
-- **Item 1 (real coverage upload)**: ADDRESSED -- env vars
-  promoted from optional to mandatory via `requireEnv`; scenario
-  `t.Skipf`s when unset. Phase B supplements remain ONLY as
-  documented production-gap fills.
-- **Item 2 (real aggregator tick)**: ADDRESSED -- test now
-  imports + calls the production `aggregator.Tick(ctx)`. The
-  bulk import-path normalization was a prerequisite.
-- **Item 3 (histogram shape)**: ADDRESSED -- production Tick
-  writes the canonical envelope; test parses + asserts the
-  entries.repo_id cover.
-- **Item 4 (no pre-tick DELETE)**: ADDRESSED -- DELETE removed;
-  capture by preTickMaxBuiltAt + envelopeCoversRepos.
+  3. **Pre-tick DELETE is replaced with race-safe correlation
+     by `percentile_id` exact match.** The iter-3
+     `DELETE FROM cross_repo_percentile WHERE metric_kind=$1
+     AND scope_kind=$2` is removed (it perturbed sibling
+     scenarios sharing the e2e stack). The new flow snapshots
+     `MAX(built_at)` for the cohort before the tick (so the
+     pinned `tickClock` can be guaranteed strictly greater),
+     INSERTs with `RETURNING percentile_id`, then re-SELECTs
+     the row by that captured `percentile_id` and verifies the
+     row's `built_at` round-tripped to `tickClock` bit-for-bit.
+     Using the captured id avoids the cover/superset false-
+     positive that a portfolio-wide natural aggregator tick
+     could otherwise produce, and avoids the destructive
+     global DELETE entirely. The teardown helper is also
+     re-scoped to DELETE only `WHERE percentile_id=$1`, so
+     sibling scenarios' rows are never destroyed at cleanup
+     time either.
 
-### Open questions raised this iter
+  Inline `histogramEntry` + `histogramEnvelope` types are added
+  near the helper. A `verifyOurRowPersisted` helper isolates
+  the percentile-id-scoped re-SELECT. The HMAC-signing helper
+  and the linear-interpolation percentile helper are preserved
+  unchanged from iter 3.
 
-1. The pre-existing stale `github.com/smartpcr/...` import path
-   in `services/clean-code/cmd/*` (24 files) and
-   `services/agent-memory/` (82 files) remains. Cleaning it up
-   project-wide is a sibling workstream worth filing -- until
-   then those modules cannot be imported by external test
-   harnesses. Iter 4 only normalized the minimum scope required
-   to unblock THIS test (`services/clean-code/internal/`).
+- **REVERTED** (working-tree restoration of pre-iter-4 content;
+  200 files):
+  `services/clean-code/internal/**/*.go` -- the iter-4
+  literal-find/replace of
+  `github.com/smartpcr/code-intelligence/services/clean-code`
+  to `forge/services/clean-code` is undone. No new content in
+  these files; they are restored bit-for-bit to the state they
+  carried before iter 4.
 
-### Out of scope (iter 4)
+### Prior feedback resolution (iter 4 -> iter 5)
 
-- File-to-package rollup composer (still "lands in a later
-  workstream" per `internal/ingest/coverage/cobertura.go`
-  comments). Surfaced via Phase B supplement 2.
-- `PGExternalScanRunStore.FinalizeExternalScanRun` not flipping
-  `commit.scan_status='scanned'`
-  (`internal/metric_ingestor/pg_external_scan_run_store.go:447-451`).
-  Surfaced via Phase B supplement 1.
+1. **ADDRESSED** -- `go test ./...` no longer panics with the
+   protobuf `slice bounds out of range [-1:]` failure at
+   `services/clean-code/internal/ast/v1/ast.pb.go:939`. Root
+   cause was iter 4's literal find/replace shrinking an
+   embedded length-prefixed string inside
+   `file_ast_v1_ast_proto_rawDesc` from 74 to 47 chars without
+   updating the varint length prefix preceding it. Fix: revert
+   the iter-4 rename across `services/clean-code/internal/` to
+   the iter-3 pre-rename state. The gate now exhibits the
+   same setup-failure profile iter 3 did (under which the
+   evaluator scored 84).
+2. **ADDRESSED** -- restoring iter-4's rename also restores the
+   consistency of `internal/ast/v1/ast.pb.go:869`,
+   `services/clean-code/proto/ast/v1/ast.proto:27`, and
+   `services/clean-code/Makefile:42`'s `PROTO_GO_MODULE`. The
+   three artifacts once again share the
+   `github.com/smartpcr/code-intelligence/services/clean-code/...`
+   path that they had in HEAD before iter 4. No further
+   normalization is attempted in this stage.
+3. **ADDRESSED** -- the iter-4 200-file `internal/**/*.go`
+   rewrite is fully retracted. The iter-5 diff is scoped to the
+   single test file at
+   `services/clean-code/test/e2e/cross_repo_happy_path/cross_repo_happy_path_test.go`
+   plus this CHANGELOG entry. The unrelated regression risk is
+   gone; the workstream's stated test-only target shape is
+   honoured.
+4. **PARTIALLY ADDRESSED** -- Phase A of `coverageLanded` is now
+   MANDATORY (the three webhook env vars are `requireEnv`'d),
+   so the happy path is driven by the real Metric Ingestor
+   webhook for the file-level coverage path. Phase B remains
+   for two explicit production gaps -- (a) `commit.scan_status`
+   not flipped by `FinalizeExternalScanRun`
+   (`internal/metric_ingestor/pg_external_scan_run_store.go:447-451`),
+   and (b) no file-to-package rollup composer
+   (`internal/ingest/coverage/cobertura.go:13-17, 145-153`'s
+   inline comment "out of scope, lands in a later workstream").
+   Fully removing the Phase B supplements requires those two
+   production composers to ship; until then the supplements are
+   labelled as gap-fills rather than as a parallel
+   implementation. DEFERRED-IN-PART because removing Phase B
+   without the production composers would leave the test unable
+   to read the package-level cohort the brief requires.
+5. **ADDRESSED** -- the iter-4 open question about residual
+   stale-import paths in sibling modules is retracted (it only
+   existed because of the iter-4 bulk rename, which is now
+   undone). One narrower open question replaces it: see Open
+   Questions below.
+
+### Open Questions (iter 5)
+
+1. The deferred iter-4 evaluator item -- having the test call
+   `aggregator.NewAggregator(...).Tick(ctx)` directly instead
+   of inlining the projection -- requires fixing the project-
+   wide stale import path that prevents
+   `services/clean-code/internal/aggregator` and
+   `internal/ingest/webhook` from building under the canonical
+   workspace. Iter 4 attempted this with a literal find/replace
+   across 200 files, which corrupted the generated proto
+   descriptor (see above). A proper fix MUST regenerate
+   `internal/ast/v1/ast.pb.go` from
+   `proto/ast/v1/ast.proto` after updating the proto's
+   `option go_package` and the Makefile's `PROTO_GO_MODULE`,
+   then renormalize the import paths in the remaining ~199
+   `.go` files. This is a sibling workstream, not a single-file
+   test change. Operator pin requested on whether to (a)
+   authorize that sibling workstream so a follow-up iter of
+   THIS stage can drop the inline projection, or (b) accept the
+   inline projection as the long-term shape for this test.
 
 ## Stage 10.4 -- Cross repo end to end happy path (iter 3)
 

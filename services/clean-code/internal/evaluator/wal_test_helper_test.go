@@ -3,7 +3,7 @@ package evaluator
 import (
 	"testing"
 
-	"forge/services/clean-code/internal/audit/wal"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
 )
 
 // newTestWALWriter returns a fresh [wal.Writer] rooted at

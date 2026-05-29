@@ -1,8 +1,8 @@
 package recipes
 
 import (
-	"forge/services/clean-code/internal/ast/parser"
-	"forge/services/clean-code/internal/ast/scope"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
 )
 
 // cognitiveComplexityMetricKind is the canonical metric_kind

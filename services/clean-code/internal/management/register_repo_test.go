@@ -9,7 +9,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gofrs/uuid"
 
-	"forge/services/clean-code/internal/management"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
 )
 
 var registerRepoTestID = uuid.Must(uuid.FromString("bbbbbbbb-cccc-dddd-eeee-ffff00007777"))

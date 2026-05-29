@@ -72,7 +72,7 @@ import (
 
 	"github.com/lib/pq"
 
-	"forge/services/clean-code/internal/storage"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/storage"
 )
 
 // ErrRepoURLLookupNotFound is returned by

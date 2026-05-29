@@ -47,8 +47,8 @@ package api
 import (
 	"net/http"
 
-	"forge/services/clean-code/internal/management"
-	"forge/services/clean-code/internal/ingest/webhook"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook"
 )
 
 // ProductionWiringDeps bundles the typed sibling-package

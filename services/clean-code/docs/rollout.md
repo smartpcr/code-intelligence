@@ -5,6 +5,113 @@ production-tier environment. The instructions assume Postgres
 14+ is already running and the `clean_code_*` roles have been
 created via the `0004_roles.up.sql` migration.
 
+## Stage 10.2: Aged mute insights report
+
+This subsection captures the rollout sequence for the
+aged-mute Insights report -- the `mgmt.read.insights.aged_mutes`
+projection added in
+`internal/management/insights/aged_mutes.go` and wired into
+`internal/management/reader.go` via
+`WithAgedMutes(*insights.AgedMutes)`. The unit of rollout
+is the binary that hosts the management HTTP surface
+(`cmd/clean-code-metric-ingestor` today, future
+`cmd/clean-code-gateway`); no schema migration ships with
+this stage -- the report is read-only over the existing
+`override` table.
+
+### Pre-flight (no infra change)
+
+1. The Stage 5.3 `mgmt.override` write verb MUST already be
+   live in the target environment -- the report's input is
+   the SAME `override` table that verb appends to. If
+   `mgmt.override` has never been called for a tenant the
+   report returns an empty list, which is the correct
+   answer (nothing to flag).
+2. NO migration runs. The report is a pure read over the
+   existing `override` table; no new column, no new index,
+   no new role.
+3. NO feature flag is required. The Reader option
+   `WithAgedMutes(nil)` is permitted and leaves the verb
+   returning `ErrBackendUnavailable` -- the same
+   "backend not wired" shape as `mgmt.read.cross_repo`
+   when its `MetricsBackend` is missing. Rolling forward
+   without wiring is safe.
+
+### Wiring
+
+1. In the binary's composition root, construct the production
+   adapter that bridges `policy/steward.Store.ListAllOverrides`
+   to `insights.OverrideReader`. The adapter ships in this
+   stage as
+   `management.OverrideReaderFromStore{Store: stewardStore}`
+   (`internal/management/insights_override_adapter.go`) -- a
+   field-for-field value mapper held out of the `insights`
+   package to preserve its zero-`internal/*`-deps invariant.
+2. Construct the projection with the default 90-day
+   threshold and the production system clock by passing
+   `nil` for the clock argument:
+   `agedMutes := insights.NewAgedMutes(overrideAdapter, nil)`.
+   The two-argument constructor lets bring-up tests inject a
+   `FixedClock`; production callers ALWAYS pass `nil`.
+3. Pass `management.WithAgedMutes(agedMutes)` to the
+   existing `management.NewReader(...)` call alongside the
+   Stage 7.3 `WithInsightsFreshness(...)` option.
+4. Deploy. The verb is live as soon as the binary boots.
+
+### Verb contract
+
+| field | type | source |
+|---|---|---|
+| `mode` | string | constant `"latest_dashboard"` (same `ReadMode` tag as `mgmt.read.cross_repo` / `mgmt.read.portfolio`) |
+| `threshold_days` | int | effective threshold (caller's `threshold_days` or 90) |
+| `aged_mutes[].rule_id` | string | `override.rule_id` |
+| `aged_mutes[].scope_kind` | string | `override.scope_filter.scope_kind` |
+| `aged_mutes[].scope_signature_glob` | string | `override.scope_filter.scope_signature_glob` |
+| `aged_mutes[].repo_id` | string | `override.scope_filter.repo_id` |
+| `aged_mutes[].override_id` | string | `override.override_id` |
+| `aged_mutes[].created_at` | RFC3339 | `override.created_at` |
+| `aged_mutes[].age_days` | int | `floor((now - created_at) / 24h)` |
+| `aged_mutes[].reason` | string | `override.reason` (free-form, may be empty) |
+| `aged_mutes[].actor_id` | string | `override.actor_id` |
+
+### Verification checklist
+
+- [ ] `GET /v1/mgmt/read/insights/aged_mutes` (when mounted)
+      returns HTTP 200 with `aged_mutes: []` against an
+      empty `override` table.
+- [ ] Append `override(mute=true)` with
+      `created_at = now() - 100 days`. The next read returns
+      a one-row `aged_mutes` array containing that override.
+- [ ] Append `override(mute=false)` with the SAME
+      `(rule_id, scope_filter)` and a LATER `created_at`.
+      The next read returns `aged_mutes: []` -- the unmute
+      row drops the pair off the report.
+- [ ] Call with `?threshold_days=30` against a 100-day-old
+      and a 20-day-old mute. ONLY the 100-day row surfaces;
+      the 20-day row is filtered out.
+- [ ] Call with `?threshold_days=0`. The default 90-day
+      threshold applies (non-positive override is clamped
+      to default).
+
+### Rollback
+
+The verb is read-only -- rollback is a binary downgrade.
+NO data migration runs forward, so NO down migration runs
+backward. The `override` table is unchanged.
+
+### Out of scope for this stage
+
+- **TTL enforcement.** v1 has NO TTL enforcement in code
+  (iter 1 evaluator item 5). The report is a SURFACE for
+  operators; the rule engine continues to honor every
+  mute regardless of age. A future stage may add an
+  enforcement policy that consumes this projection.
+- **HTTP route mount.** Like `mgmt.read.cross_repo` and
+  `mgmt.read.portfolio`, the Reader method ships here;
+  the HTTP route lands in a downstream gateway stage that
+  owns `Routes()` in `verbs.go`. The Reader method is the
+  contract surface that gateway stage consumes.
+
 ## Stage 8.3: ML effort-model loader and version pinning
 
 This subsection captures the rollout sequence for the

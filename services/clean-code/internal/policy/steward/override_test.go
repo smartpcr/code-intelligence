@@ -764,6 +764,215 @@ func TestSteward_Override_DoesNotShareSigningPathContract(t *testing.T) {
 	}
 }
 
+// ---- ListAllOverrides (Stage 10.2 substrate read) --------------
+
+// TestStore_ListAllOverrides_EmptyStoreReturnsEmptyNonNilSlice
+// pins the JSON-stability contract -- callers (the aged-mute
+// projection) MUST get a non-nil empty slice so the rendered
+// JSON is `[]`, never `null`.
+func TestStore_ListAllOverrides_EmptyStoreReturnsEmptyNonNilSlice(t *testing.T) {
+	t.Parallel()
+	store := NewInMemoryStore()
+	got, err := store.ListAllOverrides(context.Background())
+	if err != nil {
+		t.Fatalf("ListAllOverrides: %v", err)
+	}
+	if got == nil {
+		t.Fatal("got=nil, want non-nil empty slice")
+	}
+	if len(got) != 0 {
+		t.Errorf("len(got)=%d, want 0", len(got))
+	}
+}
+
+// TestStore_ListAllOverrides_ReturnsEveryRowVerbatim pins the
+// "return everything, reduce nothing" contract -- the
+// substrate MUST not pre-filter by mute or by uniqueness.
+// Three rows go in (mute + unmute on the same scope, plus a
+// second scope), three rows come out.
+func TestStore_ListAllOverrides_ReturnsEveryRowVerbatim(t *testing.T) {
+	t.Parallel()
+	store := NewInMemoryStore()
+	base := sampleClockStart()
+	rows := []Override{
+		{
+			OverrideID:  uuid.Must(uuid.FromString("11111111-1111-1111-1111-111111111111")),
+			RuleID:      "solid.srp.lcom4_high",
+			ScopeFilter: ScopeFilter{RepoID: "repo-a", ScopeKind: ScopeKindClass, ScopeSignatureGlob: "com.example.Foo"},
+			Mute:        true,
+			Reason:      "legacy class",
+			ActorID:     "alice",
+			CreatedAt:   base.Add(-100 * 24 * time.Hour),
+		},
+		{
+			OverrideID:  uuid.Must(uuid.FromString("22222222-2222-2222-2222-222222222222")),
+			RuleID:      "solid.srp.lcom4_high",
+			ScopeFilter: ScopeFilter{RepoID: "repo-a", ScopeKind: ScopeKindClass, ScopeSignatureGlob: "com.example.Foo"},
+			Mute:        false,
+			Reason:      "",
+			ActorID:     "bob",
+			CreatedAt:   base.Add(-1 * time.Hour),
+		},
+		{
+			OverrideID:  uuid.Must(uuid.FromString("33333333-3333-3333-3333-333333333333")),
+			RuleID:      "solid.dip.cycles",
+			ScopeFilter: ScopeFilter{RepoID: "repo-a", ScopeKind: ScopeKindPackage, ScopeSignatureGlob: "com.example.legacy"},
+			Mute:        true,
+			Reason:      "cycle in legacy package",
+			ActorID:     "carol",
+			CreatedAt:   base.Add(-50 * 24 * time.Hour),
+		},
+	}
+	for _, r := range rows {
+		if err := store.InsertOverride(context.Background(), r); err != nil {
+			t.Fatalf("InsertOverride: %v", err)
+		}
+	}
+
+	got, err := store.ListAllOverrides(context.Background())
+	if err != nil {
+		t.Fatalf("ListAllOverrides: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("len(got)=%d, want 3 (rows must NOT be pre-reduced or pre-filtered)", len(got))
+	}
+
+	muteCount, unmuteCount := 0, 0
+	for _, r := range got {
+		if r.Mute {
+			muteCount++
+		} else {
+			unmuteCount++
+		}
+	}
+	if muteCount != 2 || unmuteCount != 1 {
+		t.Errorf("mute/unmute counts = %d/%d, want 2/1", muteCount, unmuteCount)
+	}
+}
+
+// TestStore_ListAllOverrides_OrdersByCreatedAtThenOverrideID
+// pins the `(created_at ASC, override_id ASC)` substrate
+// ordering -- mirrors the SQL store's `ORDER BY` clause so the
+// aged-mute projection sees the same row order regardless of
+// whether the test backend is InMemory or Postgres.
+func TestStore_ListAllOverrides_OrdersByCreatedAtThenOverrideID(t *testing.T) {
+	t.Parallel()
+	store := NewInMemoryStore()
+	base := sampleClockStart()
+
+	// Insert in REVERSE chronological order to force the
+	// sort to actually do work (not a no-op pass-through).
+	insertOrder := []Override{
+		// 1d ago, override id 33 -- newest, sorts last
+		{
+			OverrideID:  uuid.Must(uuid.FromString("33333333-3333-3333-3333-333333333333")),
+			RuleID:      "r", ScopeFilter: ScopeFilter{RepoID: "repo", ScopeKind: ScopeKindClass, ScopeSignatureGlob: "*"},
+			Mute: true, Reason: "x", ActorID: "a",
+			CreatedAt: base.Add(-1 * 24 * time.Hour),
+		},
+		// 50d ago, override id 22 -- tie-breaker secondary (larger id)
+		{
+			OverrideID:  uuid.Must(uuid.FromString("22222222-2222-2222-2222-222222222222")),
+			RuleID:      "r", ScopeFilter: ScopeFilter{RepoID: "repo", ScopeKind: ScopeKindClass, ScopeSignatureGlob: "*"},
+			Mute: true, Reason: "x", ActorID: "a",
+			CreatedAt: base.Add(-50 * 24 * time.Hour),
+		},
+		// 50d ago, override id 11 -- tie-breaker secondary (smaller id, wins under ASC)
+		{
+			OverrideID:  uuid.Must(uuid.FromString("11111111-1111-1111-1111-111111111111")),
+			RuleID:      "r", ScopeFilter: ScopeFilter{RepoID: "repo", ScopeKind: ScopeKindClass, ScopeSignatureGlob: "*"},
+			Mute: true, Reason: "x", ActorID: "a",
+			CreatedAt: base.Add(-50 * 24 * time.Hour),
+		},
+		// 100d ago, override id 44 -- oldest, sorts first
+		{
+			OverrideID:  uuid.Must(uuid.FromString("44444444-4444-4444-4444-444444444444")),
+			RuleID:      "r", ScopeFilter: ScopeFilter{RepoID: "repo", ScopeKind: ScopeKindClass, ScopeSignatureGlob: "*"},
+			Mute: true, Reason: "x", ActorID: "a",
+			CreatedAt: base.Add(-100 * 24 * time.Hour),
+		},
+	}
+	for _, r := range insertOrder {
+		if err := store.InsertOverride(context.Background(), r); err != nil {
+			t.Fatalf("InsertOverride: %v", err)
+		}
+	}
+
+	got, err := store.ListAllOverrides(context.Background())
+	if err != nil {
+		t.Fatalf("ListAllOverrides: %v", err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("len(got)=%d, want 4", len(got))
+	}
+
+	wantOrder := []string{
+		"44444444-4444-4444-4444-444444444444", // 100d ago
+		"11111111-1111-1111-1111-111111111111", // 50d ago, smaller id
+		"22222222-2222-2222-2222-222222222222", // 50d ago, larger id
+		"33333333-3333-3333-3333-333333333333", // 1d ago
+	}
+	for i, want := range wantOrder {
+		if got[i].OverrideID.String() != want {
+			t.Errorf("got[%d].OverrideID=%s, want %s", i, got[i].OverrideID, want)
+		}
+	}
+}
+
+// TestStore_ListAllOverrides_ReturnsDefensiveCopy pins the
+// "caller may mutate without race" contract: the returned
+// slice MUST be detached from the store's internal `overrides`
+// slice. Otherwise the aged-mute projection's defensive
+// re-sort would race with concurrent InsertOverride calls.
+func TestStore_ListAllOverrides_ReturnsDefensiveCopy(t *testing.T) {
+	t.Parallel()
+	store := NewInMemoryStore()
+	if err := store.InsertOverride(context.Background(), Override{
+		OverrideID:  uuid.Must(uuid.FromString("11111111-1111-1111-1111-111111111111")),
+		RuleID:      "r",
+		ScopeFilter: ScopeFilter{RepoID: "repo", ScopeKind: ScopeKindClass, ScopeSignatureGlob: "*"},
+		Mute:        true,
+		Reason:      "x",
+		ActorID:     "a",
+		CreatedAt:   sampleClockStart(),
+	}); err != nil {
+		t.Fatalf("InsertOverride: %v", err)
+	}
+
+	got1, err := store.ListAllOverrides(context.Background())
+	if err != nil {
+		t.Fatalf("ListAllOverrides #1: %v", err)
+	}
+	if len(got1) != 1 {
+		t.Fatalf("len(got1)=%d, want 1", len(got1))
+	}
+	// Mutate the caller's copy.
+	got1[0].Reason = "mutated by caller"
+
+	got2, err := store.ListAllOverrides(context.Background())
+	if err != nil {
+		t.Fatalf("ListAllOverrides #2: %v", err)
+	}
+	if got2[0].Reason == "mutated by caller" {
+		t.Fatal("store's internal row was mutated through the caller's slice -- ListAllOverrides did not defensive-copy")
+	}
+}
+
+// TestStore_ListAllOverrides_PropagatesContextCancellation
+// pins that a cancelled context surfaces to the caller --
+// otherwise a long-running projection couldn't unblock on
+// shutdown.
+func TestStore_ListAllOverrides_PropagatesContextCancellation(t *testing.T) {
+	t.Parallel()
+	store := NewInMemoryStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := store.ListAllOverrides(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err=%v, want context.Canceled", err)
+	}
+}
+
 // ---- scope_glob translation pins -------------------------------
 
 // TestScopeGlobToRegex pins the translation rules character-by-

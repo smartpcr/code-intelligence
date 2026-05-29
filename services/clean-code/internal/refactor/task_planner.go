@@ -594,16 +594,6 @@ var (
 	ErrNilRuleKindMapper = errors.New(
 		"refactor: WithRuleKindMapper was passed nil")
 
-	// ErrNilEffortEstimator signals that [WithEffortEstimator]
-	// was called with a nil receiver. The Stage 8.3 estimator
-	// is OPTIONAL (default behaviour emits `effort_hours = 0.0`
-	// per Stage 8.2); passing `nil` is therefore unambiguously
-	// a wiring bug -- the caller intended to wire an estimator
-	// but the underlying value was nil. Mirrors the other
-	// [TaskOption] nil sentinels.
-	ErrNilEffortEstimator = errors.New(
-		"refactor: WithEffortEstimator was passed nil")
-
 	// ErrNilIDFactoryOption / ErrNilClockOption signal that a
 	// caller passed `nil` through [WithTaskIDFactory] /
 	// [WithTaskClock]. Distinct from the [ErrNilIDFactory] /

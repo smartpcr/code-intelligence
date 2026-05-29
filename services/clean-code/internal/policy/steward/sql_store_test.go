@@ -989,3 +989,120 @@ func TestSQLStore_RuleExistsByID(t *testing.T) {
 		t.Error("RuleExistsByID(no.such.rule)=true, want false")
 	}
 }
+
+// TestSQLStore_ListAllOverrides_RoundTripPreservesEveryField
+// pins the Stage 10.2 substrate read at the SQL surface:
+// after inserting two mute + one unmute row the table-scan
+// SELECT MUST return all three rows ordered
+// `(created_at ASC, override_id ASC)` with bit-identical
+// scope_filter JSON, NULL-vs-empty Reason handling, and UTC
+// CreatedAt. This is the only test that pins the SQL
+// implementation of ListAllOverrides; the InMemoryStore test
+// in override_test.go pins the semantics.
+func TestSQLStore_ListAllOverrides_RoundTripPreservesEveryField(t *testing.T) {
+	_, store, ok := openStewardSQLStore(t)
+	if !ok {
+		return
+	}
+	ctx := context.Background()
+	seedSampleRulesInSQL(t, store)
+
+	base := sampleClockStart()
+	rows := []Override{
+		{
+			OverrideID: uuid.Must(uuid.FromString("11111111-1111-1111-1111-111111111111")),
+			RuleID:     "solid.srp.lcom4_high",
+			ScopeFilter: ScopeFilter{
+				RepoID: "repo-a", ScopeKind: ScopeKindClass, ScopeSignatureGlob: "com.example.Foo",
+			},
+			Mute:      true,
+			Reason:    "legacy class",
+			ActorID:   "alice@example.com",
+			CreatedAt: base.Add(-100 * 24 * time.Hour),
+		},
+		{
+			OverrideID: uuid.Must(uuid.FromString("22222222-2222-2222-2222-222222222222")),
+			RuleID:     "solid.srp.lcom4_high",
+			ScopeFilter: ScopeFilter{
+				RepoID: "repo-a", ScopeKind: ScopeKindClass, ScopeSignatureGlob: "com.example.Foo",
+			},
+			Mute:      false,
+			Reason:    "", // unmute -> SQL NULL bind path
+			ActorID:   "bob@example.com",
+			CreatedAt: base.Add(-1 * time.Hour),
+		},
+		{
+			OverrideID: uuid.Must(uuid.FromString("33333333-3333-3333-3333-333333333333")),
+			RuleID:     "solid.srp.lcom4_high",
+			ScopeFilter: ScopeFilter{
+				RepoID: "repo-b", ScopeKind: ScopeKindClass, ScopeSignatureGlob: "com.example.Bar",
+			},
+			Mute:      true,
+			Reason:    "different repo",
+			ActorID:   "carol@example.com",
+			CreatedAt: base.Add(-50 * 24 * time.Hour),
+		},
+	}
+	// Insert in REVERSE order to verify the SQL ORDER BY is
+	// what produces the sort, not the natural-insertion order.
+	for i := len(rows) - 1; i >= 0; i-- {
+		if err := store.InsertOverride(ctx, rows[i]); err != nil {
+			t.Fatalf("InsertOverride[%d]: %v", i, err)
+		}
+	}
+
+	got, err := store.ListAllOverrides(ctx)
+	if err != nil {
+		t.Fatalf("ListAllOverrides: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("len(got)=%d, want 3", len(got))
+	}
+	// Expected order: 100d (id11) -> 50d (id33) -> 1h (id22).
+	wantOrder := []string{
+		"11111111-1111-1111-1111-111111111111",
+		"33333333-3333-3333-3333-333333333333",
+		"22222222-2222-2222-2222-222222222222",
+	}
+	for i, want := range wantOrder {
+		if got[i].OverrideID.String() != want {
+			t.Errorf("got[%d].OverrideID=%s, want %s", i, got[i].OverrideID, want)
+		}
+	}
+	// Unmute row had empty Reason on insert -> SQL NULL bind ->
+	// scan back as empty string (not "null").
+	unmute := got[2]
+	if unmute.Mute {
+		t.Errorf("unmute row Mute=true, want false")
+	}
+	if unmute.Reason != "" {
+		t.Errorf("unmute row Reason=%q, want empty (NULL-bind round-trip)", unmute.Reason)
+	}
+	// Spot-check the scope_filter JSON round-trip on the
+	// cross-repo row.
+	cross := got[1]
+	if cross.ScopeFilter.RepoID != "repo-b" {
+		t.Errorf("cross-repo row RepoID=%q", cross.ScopeFilter.RepoID)
+	}
+}
+
+// TestSQLStore_ListAllOverrides_EmptyTableReturnsEmptyNonNilSlice
+// pins the JSON-stability contract at the SQL surface --
+// even with zero rows, the projection MUST get a non-nil
+// empty slice so the encoded JSON is `[]`.
+func TestSQLStore_ListAllOverrides_EmptyTableReturnsEmptyNonNilSlice(t *testing.T) {
+	_, store, ok := openStewardSQLStore(t)
+	if !ok {
+		return
+	}
+	got, err := store.ListAllOverrides(context.Background())
+	if err != nil {
+		t.Fatalf("ListAllOverrides: %v", err)
+	}
+	if got == nil {
+		t.Fatal("got=nil, want non-nil empty slice")
+	}
+	if len(got) != 0 {
+		t.Errorf("len(got)=%d, want 0", len(got))
+	}
+}

@@ -129,49 +129,93 @@ otherwise the gateway short-circuits with
 `writeDegraded` path in `internal/evaluator/gate_evaluate.go`)
 and the per-iteration `degraded is false` check below trips
 the `checks{name:eval.gate} rate > 0.99` floor and aborts
-the run. The operator should run the seeder helper
-(`cmd/seed-load-fixtures`) once per lab refresh:
+the run.
+
+There is no shipped seeder binary; seeding is performed by
+the operator with `curl` against the two gateway verbs the
+service already exposes (`mgmt.register_repo` and
+`ingest.coverage`, both documented in
+`services/clean-code/internal/api/defaults.go`). The recipe
+below MUST emit the SAME `(repo_id, sha)` strings that the
+k6 script samples from -- the `printf` formats are
+identical to the JavaScript generators in
+`eval_gate_load.js` (`repos` and `shas` constants).
+
+Save the snippet as `seed.sh`, `chmod +x seed.sh`, then run:
 
 ```sh
-cd services/clean-code
-go run ./cmd/seed-load-fixtures \
-  --gateway       "${CLEAN_CODE_GATEWAY_URL}" \
-  --token         "${CLEAN_CODE_OIDC_TOKEN}" \
-  --repos         100 \
-  --shas-per-repo 50
-```
+#!/usr/bin/env bash
+# seed.sh -- pre-register the 100 x 50 closed fixture set
+# the k6 scenario draws from. Requires CLEAN_CODE_GATEWAY_URL
+# and CLEAN_CODE_OIDC_TOKEN exported the same way the k6
+# scenario expects them.
+set -euo pipefail
 
-The seeder MUST generate the SAME pairs the scenario draws
-from. Recipe (Bash reference -- the seeder itself can use any
-language as long as it emits identical strings):
+: "${CLEAN_CODE_GATEWAY_URL:?must be set}"
+: "${CLEAN_CODE_OIDC_TOKEN:?must be set}"
 
-```sh
+auth_header="Authorization: Bearer ${CLEAN_CODE_OIDC_TOKEN}"
+ct_header="Content-Type: application/json"
+
 for i in $(seq 0 99); do
   repo_id=$(printf "00000000-0000-0000-0000-%012d" "$i")
-  # mgmt.register_repo $repo_id  -- omitted for brevity
+
+  # 1. mgmt.register_repo -- creates the `repo` row with
+  #    scan_status='scanned'. Idempotent: re-running the
+  #    seeder against an already-registered repo is a no-op
+  #    (HTTP 200 with the existing row).
+  curl --fail-with-body --silent --show-error \
+       -X POST "${CLEAN_CODE_GATEWAY_URL}/v1/mgmt/register_repo" \
+       -H "${auth_header}" -H "${ct_header}" \
+       -d "{\"repo_id\":\"${repo_id}\"}" > /dev/null
+
   for j in $(seq 0 49); do
     sha=$(printf "0000000000000000000000000000%06x%06x" "$i" "$j")
-    # ingest.metrics $repo_id $sha  -- emit MetricSample rows for
-    # every metric_kind the active policy_version references
+
+    # 2. ingest.coverage -- writes a MetricSample row per
+    #    metric_kind referenced by the active policy_version.
+    #    Replace the `metrics` body with one entry per
+    #    metric_kind your active policy uses; the example
+    #    below covers the three coverage-pack kinds pinned
+    #    in tech-spec Sec 4.1.1 (coverage_line_ratio /
+    #    coverage_branch_ratio / pass_first_try_ratio).
+    curl --fail-with-body --silent --show-error \
+         -X POST "${CLEAN_CODE_GATEWAY_URL}/v1/ingest/coverage" \
+         -H "${auth_header}" -H "${ct_header}" \
+         -d "{
+               \"repo_id\":\"${repo_id}\",
+               \"sha\":\"${sha}\",
+               \"metrics\":[
+                 {\"kind\":\"coverage_line_ratio\",   \"value\":0.95},
+                 {\"kind\":\"coverage_branch_ratio\", \"value\":0.90},
+                 {\"kind\":\"pass_first_try_ratio\",  \"value\":0.85}
+               ]
+             }" > /dev/null
   done
 done
+
+echo "Seeded 100 repos x 50 SHAs = 5000 (repo_id, sha) pairs."
 ```
 
-The seeder is itself a separate Stage 10 artifact; if it has
-not yet landed, the operator can fall back to the manual
-`mgmt.register_repo` + `ingest.metrics` loop above using
-`curl`. Whichever route is used, the pre-run invariant is:
+Pre-run invariants the seeder must hold:
 
   - Every `repo_id[i]` is in the `repo` table with
     `scan_status='scanned'`.
   - Every `(repo_id[i], sha[i][j])` has a complete MetricSample
     row set, so `samples_ready(repo_id, sha) == true` in
-    `internal/evaluator/sql_readiness.go::SamplesReady`.
+    `internal/evaluator/sql_readiness.go::SamplesReady`. If
+    the active policy version references metric_kinds beyond
+    the three above, add them to the `metrics` JSON array.
 
-Run with `--summary-export` to archive a JSON of the run for
-release-tag review. A successful run reports `checks ........ 100.00%`
-in the summary; anything less than `99.00%` will have exited
-with code 99.
+Re-run the seeder once per lab refresh / per release-tag
+acceptance run. The seed step takes ~5_000 round-trips on
+the gateway; expect 1-5 minutes wall clock against a healthy
+lab deployment.
+
+Run the k6 scenario itself with `--summary-export` to archive
+the run JSON for release-tag review. A successful run reports
+`checks ........ 100.00%` in the summary; anything less than
+`99.00%` will have exited with code 99.
 
 ## Why these thresholds
 

@@ -81,10 +81,11 @@
 // keeping the test reproducible across runs.
 //
 // SHAs are deterministic SHA1-shaped 40-char hex strings
-// derived from (repo_index, sha_index) so the seeder
-// shipped in README.md (`cmd/seed-load-fixtures`) can
-// generate the SAME 5_000 pairs without sharing state
-// with the k6 process.
+// derived from (repo_index, sha_index) so the operator's
+// seeder (see README.md "Seeding the fixtures" -- a
+// self-contained `curl`-based shell script, no shipped
+// binary) can generate the SAME 5_000 pairs without
+// sharing state with the k6 process.
 //
 // A separate `degraded === false` check in the per-request
 // evaluator (below) guards against the failure mode where

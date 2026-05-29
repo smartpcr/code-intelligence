@@ -293,9 +293,23 @@ func decodeRequest(r io.Reader) (ParseRequest, error) {
 	}, nil
 }
 
-// encodeResponse writes a [ParseResult] to `w`.
+// encodeResponse writes a [ParseResult] to `w`. A nil `res`
+// is encoded as two zero-length frames so the wire shape is
+// invariant: [decodeResponse] always reads exactly two frames
+// (degraded_reason, ast_file_bytes). A single-frame nil
+// encoding would desync the reader and surface as a confusing
+// `decode response: read ast_file_bytes: unexpected EOF`
+// wrapped in [ErrParserCrash]. Downstream consumers
+// (e.g. [WrapParser]) already treat `len(AstFileBytes) == 0`
+// as the "no AST produced" signal, so the round-tripped
+// `&ParseResult{AstFileBytes: []byte{}, DegradedReason: ""}`
+// is semantically equivalent to the nil the child handler
+// returned.
 func encodeResponse(w io.Writer, res *ParseResult) error {
 	if res == nil {
+		if err := writeFrame(w, nil); err != nil {
+			return err
+		}
 		return writeFrame(w, nil)
 	}
 	if err := writeFrame(w, []byte(res.DegradedReason)); err != nil {

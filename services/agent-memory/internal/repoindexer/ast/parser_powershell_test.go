@@ -233,7 +233,7 @@ func TestPowerShellFixture_EmitsExpectedParseResult(t *testing.T) {
 
 	// Classes
 	if got, want := len(res.Classes), 1; got != want {
-		t.Fatalf("classes = %d; want %d (%v)", got, want, classNames(res.Classes))
+		t.Fatalf("classes = %d; want %d (%v)", got, want, psClassNames(res.Classes))
 	}
 	if got, want := res.Classes[0].QualifiedName, "Greeter"; got != want {
 		t.Errorf("class[0].QualifiedName = %q; want %q", got, want)
@@ -393,7 +393,7 @@ function Format-Hello {
 	// `Dispatcher.emitContains` in dispatcher.go on the
 	// canonical_dispatcher branch).
 	if got, want := len(res.Classes), 1; got != want {
-		t.Fatalf("classes = %d; want %d (Greeter); got names %v", got, want, classNames(res.Classes))
+		t.Fatalf("classes = %d; want %d (Greeter); got names %v", got, want, psClassNames(res.Classes))
 	}
 	if got, want := res.Classes[0].QualifiedName, "Greeter"; got != want {
 		t.Errorf("class[0].QualifiedName = %q; want %q", got, want)
@@ -775,7 +775,7 @@ func TestPowerShellEnvelope_ToParseResult_MapsAllFields(t *testing.T) {
 
 // --- test helpers ------------------------------------------
 
-func classNames(cs []ClassDecl) []string {
+func psClassNames(cs []ClassDecl) []string {
 	out := make([]string, 0, len(cs))
 	for _, c := range cs {
 		out = append(out, c.QualifiedName)
@@ -837,12 +837,8 @@ func langMetaString(imp Import, key string) string {
 	return s
 }
 
-// isRelativeImport reports whether a PowerShell import module
-// specifier is a workspace-relative path (dot-source, e.g.
-// `./helpers.ps1` or `../shared/foo.ps1`). The dispatcher's
-// Pass 0 drops relative imports because they map onto in-repo
-// File nodes that a later cross-file resolver workstream will
-// stitch (see ParseResult.Imports docstring at parser.go).
-func isRelativeImport(module string) bool {
-	return strings.HasPrefix(module, "./") || strings.HasPrefix(module, "../")
-}
+// isRelativeImport for PowerShell dot-sources is provided by the
+// dispatcher-level helper in dispatcher_relative_import_legacy.go
+// (canonical home), reused here verbatim. The previously inlined
+// copy was removed to fix a package-level redeclaration that
+// blocked the build after the rich-types restoration landed.

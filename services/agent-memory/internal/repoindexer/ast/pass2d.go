@@ -22,13 +22,17 @@ func Pass2dOverrides(pr ParseResult, methodNodeID map[string]string) ([]Edge, ma
 		if m.LangMeta == nil {
 			continue
 		}
-		traitName, ok := m.LangMeta["trait"]
-		if !ok || traitName == "" {
+		traitNameRaw, ok := m.LangMeta["trait"]
+		if !ok {
+			continue
+		}
+		traitName, _ := traitNameRaw.(string)
+		if traitName == "" {
 			continue
 		}
 
-		traitMethodKey := traitName + "." + m.Name
-		implMethodKey := m.ClassName + "." + m.Name
+		traitMethodKey := traitName + "." + m.QualifiedName
+		implMethodKey := m.EnclosingClass + "." + m.QualifiedName
 
 		traitNodeID, traitFound := methodNodeID[traitMethodKey]
 		implNodeID, implFound := methodNodeID[implMethodKey]

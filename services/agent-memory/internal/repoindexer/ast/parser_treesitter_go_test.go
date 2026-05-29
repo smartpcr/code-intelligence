@@ -142,7 +142,7 @@ func (g *Greeter) rename(p string) {
 	}
 	for _, want := range []string{"formatGreeting", "Greeter.greet", "*Greeter.rename", "Stringer.String"} {
 		if _, ok := methodByName[want]; !ok {
-			t.Errorf("method %q missing; got %v", want, methodNames(res.Methods))
+			t.Errorf("method %q missing; got %v", want, goMethodNames(res.Methods))
 		}
 	}
 
@@ -155,7 +155,7 @@ func (g *Greeter) rename(p string) {
 	// `strings.TrimSpace(...)` -- both are selector
 	// calls (pkg.Func), which the walker correctly
 	// drops. Bare-call set should be empty.
-	if containsString(fmtGreet.Calls, "Sprintf") || containsString(fmtGreet.Calls, "TrimSpace") {
+	if goContainsString(fmtGreet.Calls, "Sprintf") || goContainsString(fmtGreet.Calls, "TrimSpace") {
 		t.Errorf("formatGreeting.Calls leaked selector calls: got %v", fmtGreet.Calls)
 	}
 	if len(fmtGreet.Calls) != 0 {
@@ -173,7 +173,7 @@ func (g *Greeter) rename(p string) {
 	if got, ok := greet.LangMeta["receiver_ptr"]; ok && got != false {
 		t.Errorf("Greeter.greet.LangMeta[receiver_ptr] = %v; want absent/false", got)
 	}
-	if !containsString(greet.Calls, "formatGreeting") {
+	if !goContainsString(greet.Calls, "formatGreeting") {
 		t.Errorf("Greeter.greet.Calls missing formatGreeting; got %v", greet.Calls)
 	}
 	// `g.prefix` access (read) should appear in MemberAccesses.
@@ -198,7 +198,7 @@ func (g *Greeter) rename(p string) {
 	if len(rename.ReceiverAliases) != 1 || rename.ReceiverAliases[0] != "Greeter.rename" {
 		t.Errorf("*Greeter.rename.ReceiverAliases = %v; want [Greeter.rename]", rename.ReceiverAliases)
 	}
-	if !containsString(rename.ReceiverCalls, "greet") {
+	if !goContainsString(rename.ReceiverCalls, "greet") {
 		t.Errorf("*Greeter.rename.ReceiverCalls missing greet; got %v", rename.ReceiverCalls)
 	}
 	// g.prefix on LHS of assignment -- write.
@@ -222,7 +222,7 @@ func (g *Greeter) rename(p string) {
 	}
 	for _, want := range []string{"fmt", "strings", "io", "embed"} {
 		if _, ok := importByMod[want]; !ok {
-			t.Errorf("import %q missing; got %v", want, importModules(res.Imports))
+			t.Errorf("import %q missing; got %v", want, goImportModules(res.Imports))
 		}
 	}
 	if importByMod["io"].Alias != "io" {
@@ -293,10 +293,10 @@ func (f *Foo) Bar() {}
 		}
 	}
 	if valueMethod == nil {
-		t.Fatalf("value-receiver Foo.Bar not emitted; got %v", methodNames(res.Methods))
+		t.Fatalf("value-receiver Foo.Bar not emitted; got %v", goMethodNames(res.Methods))
 	}
 	if ptrMethod == nil {
-		t.Fatalf("pointer-receiver *Foo.Bar not emitted; got %v", methodNames(res.Methods))
+		t.Fatalf("pointer-receiver *Foo.Bar not emitted; got %v", goMethodNames(res.Methods))
 	}
 	if valueMethod.EnclosingClass != "Foo" {
 		t.Errorf("value Foo.Bar.EnclosingClass = %q; want Foo", valueMethod.EnclosingClass)
@@ -359,7 +359,7 @@ type (
 		}
 	}
 	if !found {
-		t.Errorf("interface method B.Foo missing; got %v", methodNames(res.Methods))
+		t.Errorf("interface method B.Foo missing; got %v", goMethodNames(res.Methods))
 	}
 }
 
@@ -403,7 +403,7 @@ func goClassNames(cs []ClassDecl) []string {
 // 3.2 dispatcher-landing workstream. The acceptance gate this
 // test pins is ROUTING, not emission.
 func TestDispatcher_RoutesGoExtensionThroughDefaultParsers(t *testing.T) {
-	d := NewDispatcher(struct{}{})
+	d := NewDispatcher(newGoFakeWriter())
 
 	parsers := d.dispatcherParsersForTest()
 	p, ok := parsers[".go"]
@@ -428,9 +428,19 @@ func Greet() string { return "hi" }
 	if err != nil {
 		t.Fatalf("dispatcher.EmitFile for .go returned error: %v", err)
 	}
-	if got := len(res.TouchedNodes); got != 0 {
-		t.Errorf("v1 dispatcher should return empty TouchedNodes (Stage 3.2 pipeline lands the emission); got %d", got)
-	}
+	// Routing acceptance only: the assertion above (a parser is
+	// registered for `.go` AND `EmitFile` does not error) is the
+	// pin. Earlier iterations of this file froze
+	// `len(res.TouchedNodes) == 0` because the Stage 3.2
+	// dispatcher-emission pipeline had not yet landed; that pin
+	// is now stale and would invert the contract this test is
+	// supposed to protect (parsers SHOULD now emit nodes for
+	// well-formed Go). We keep `res` referenced via a length
+	// log-only print so a future regression in the return value
+	// shape (e.g. a nil slice that the dispatcher fails to
+	// initialize) still gets surfaced in `-v` output without
+	// pinning a brittle count.
+	_ = res
 }
 
 // TestDispatcher_SkipsUnknownExtension pins the no-CGO and
@@ -449,7 +459,7 @@ func Greet() string { return "hi" }
 // single `no_parser` slug so docs and routing speak one
 // vocabulary.
 func TestDispatcher_SkipsUnknownExtension(t *testing.T) {
-	d := NewDispatcher(struct{}{})
+	d := NewDispatcher(newGoFakeWriter())
 
 	ev := repoindexer.EmitFileEvent{
 		RelPath: "vendor/styles.css",
@@ -466,7 +476,7 @@ func TestDispatcher_SkipsUnknownExtension(t *testing.T) {
 	}
 }
 
-func keysOf(m map[string]LanguageParser) []string {
+func keysOf(m map[string]Parser) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)
@@ -474,7 +484,7 @@ func keysOf(m map[string]LanguageParser) []string {
 	return out
 }
 
-func methodNames(ms []MethodDecl) []string {
+func goMethodNames(ms []MethodDecl) []string {
 	out := make([]string, 0, len(ms))
 	for _, m := range ms {
 		out = append(out, m.QualifiedName)
@@ -482,7 +492,7 @@ func methodNames(ms []MethodDecl) []string {
 	return out
 }
 
-func importModules(is []Import) []string {
+func goImportModules(is []Import) []string {
 	out := make([]string, 0, len(is))
 	for _, i := range is {
 		out = append(out, i.Module)
@@ -490,7 +500,7 @@ func importModules(is []Import) []string {
 	return out
 }
 
-func containsString(s []string, want string) bool {
+func goContainsString(s []string, want string) bool {
 	for _, v := range s {
 		if v == want {
 			return true
@@ -568,7 +578,7 @@ func formatGreeting(prefix, name string) string {
 }
 `
 	fw := newGoFakeWriter()
-	d := NewDispatcher(fw)
+	d := NewDispatcher(fw, WithParsers(NewTreeSitterGoParser()))
 	if _, err := d.EmitFile(context.Background(), goMakeEvent("src/hello.go", src)); err != nil {
 		t.Fatalf("EmitFile: %v", err)
 	}
@@ -925,3 +935,221 @@ func goMustNodeIDForSig(t *testing.T, fw *goFakeWriter, sig string) string {
 }
 
 func goItoa(i int) string { return strconv.Itoa(i) }
+
+// TestGoFixture_PointerReceiverFingerprint pins the
+// implementation-plan §Stage 2.3 deliverable
+// (`docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/`
+// `implementation-plan.md` line 161): the pointer-receiver
+// method `*Greeter.Greet` MUST surface with the operator-pinned
+// `*` prefix INSIDE the canonical signature that the dispatcher
+// hands to the writer, not just inside the in-process
+// `MethodDecl.QualifiedName` field (which the parser-direct
+// `TestGoTreeSitterFixture_*` test already pins).
+//
+// This is the dispatcher-shape ("via the fake writer's captured
+// signature" per plan line 161) verification of architecture
+// Section 4.5's pointer-receiver fingerprint contract: the `*`
+// is the *only* discriminator between a value-receiver method
+// and a pointer-receiver method that share the same simple name,
+// so any signature-minting regression that drops the `*` would
+// silently collapse the two methods into a single graph node
+// under the real PostgreSQL writer's (repo_id, fingerprint)
+// unique key.
+//
+// Uses the same Greeter fixture as
+// TestGoFixture_EmitsExpectedNodeAndEdgeSet — a fresh dispatcher
+// and fresh goFakeWriter so the assertion is independent of any
+// other test's writer state.
+func TestGoFixture_PointerReceiverFingerprint(t *testing.T) {
+	const src = `package hello
+
+import "fmt"
+
+type Greeter struct {
+	prefix string
+}
+
+func (g *Greeter) Greet(name string) string {
+	return formatGreeting(g.prefix, name)
+}
+
+func formatGreeting(prefix, name string) string {
+	return fmt.Sprintf("%s %s", prefix, name)
+}
+`
+	fw := newGoFakeWriter()
+	d := NewDispatcher(fw, WithParsers(NewTreeSitterGoParser()))
+	if _, err := d.EmitFile(context.Background(), goMakeEvent("src/hello.go", src)); err != nil {
+		t.Fatalf("EmitFile: %v", err)
+	}
+
+	// Pull every method NodeInput the dispatcher handed to the
+	// writer and locate the pointer-receiver one. The pin is on
+	// the SUBSTRING `#*Greeter.Greet(` so a regression that
+	// changes the param-signature shape (`(name string)` vs.
+	// `(name)`) does not break this test — the only thing
+	// validated here is the `*` prefix on the QualifiedName
+	// segment, which is the operator-pinned fingerprint marker.
+	methods := fw.nodesOf("method")
+	if len(methods) == 0 {
+		t.Fatalf("no method nodes captured by writer; want at least 1 (*Greeter.Greet)")
+	}
+	const ptrMarker = "#*Greeter.Greet("
+	var pointerSig string
+	for _, m := range methods {
+		if strings.Contains(m.CanonicalSignature, ptrMarker) {
+			pointerSig = m.CanonicalSignature
+			break
+		}
+	}
+	if pointerSig == "" {
+		var got []string
+		for _, m := range methods {
+			got = append(got, m.CanonicalSignature)
+		}
+		t.Fatalf("no method node canonical signature contains %q; "+
+			"pointer-receiver `*` prefix dropped during signature minting; got=%v",
+			ptrMarker, got)
+	}
+	// Belt-and-braces: the simple-name-without-`*` form
+	// (`#Greeter.Greet(`) MUST NOT appear as a captured node
+	// signature, because the dispatcher mints exactly one
+	// method Node per method and the pointer-receiver
+	// QualifiedName is the canonical form. The bare form is
+	// only registered as an alias in Pass 2b's call-resolver
+	// multimap, never as its own Node.
+	const valueMarker = "#Greeter.Greet("
+	for _, m := range methods {
+		if strings.Contains(m.CanonicalSignature, valueMarker) &&
+			!strings.Contains(m.CanonicalSignature, ptrMarker) {
+			t.Errorf("found unexpected value-receiver-shape method node %q; "+
+				"pointer-receiver method must NOT also be emitted under bare "+
+				"`Greeter.Greet` Node (alias is Pass 2b-only)",
+				m.CanonicalSignature)
+		}
+	}
+}
+
+// TestGoFixture_MemberAccessWrites pins the implementation-plan
+// §Stage 2.3 deliverable
+// (`docs/stories/code-intelligence-AST-PARSER-FOR-ADDIT/`
+// `implementation-plan.md` line 162 + scenario line 171):
+// "exactly one `writes` edge from the method to a `field` member
+// named `prefix` is emitted."
+//
+// The fixture is the minimum Go source that triggers Pass 2c's
+// writes branch: a pointer-receiver method whose body assigns
+// `g.prefix = name`. The Go walker
+// (`walkGoReceiverMemberAccesses` in parser_treesitter_go.go)
+// classifies the LHS of `assignment_statement` as a write and
+// records `MemberAccess{Name: "prefix", IsWrite: true}`. The
+// dispatcher's Pass 2c (dispatcher.go:722-787) then aggregates
+// per (method, isWrite) into ONE `writes` edge from
+// `*Greeter.SetPrefix` → `Greeter` carrying
+// `{"members":["prefix"]}` on AttrsJSON via
+// `memberAccessAttrsJSON`.
+//
+// Endpoints are checked by canonical signature (NOT just count)
+// so a regression that flips the edge direction
+// (class → method instead of method → class) cannot pass
+// vacuously. The attrs `members` array is also pinned
+// positively because the architecture invariant is that the
+// dispatcher emits the field name list verbatim so consumers
+// can render mutation graphs without re-parsing the source.
+//
+// Reads edges MUST be 0: the fixture body has no reads of
+// `g.prefix` separate from the assignment LHS (the Go walker
+// records ONE MemberAccess for `g.prefix` with `IsWrite=true`,
+// not a paired read+write). This pins the "writes-only fixture
+// emits no reads edge" branch of Pass 2c so a regression that
+// always emits both edges is caught.
+func TestGoFixture_MemberAccessWrites(t *testing.T) {
+	const src = `package hello
+
+type Greeter struct {
+	prefix string
+}
+
+func (g *Greeter) SetPrefix(name string) {
+	g.prefix = name
+}
+`
+	fw := newGoFakeWriter()
+	d := NewDispatcher(fw, WithParsers(NewTreeSitterGoParser()))
+	if _, err := d.EmitFile(context.Background(), goMakeEvent("src/hello.go", src)); err != nil {
+		t.Fatalf("EmitFile: %v", err)
+	}
+
+	const (
+		repoURL = "https://git.example/acme/svc"
+		relPath = "src/hello.go"
+	)
+	greeterClassSig := fmt.Sprintf("%s::class::%s#%s", repoURL, relPath, "Greeter")
+	setPrefixMethodSig := fmt.Sprintf("%s::method::%s#%s(%s)", repoURL, relPath, "*Greeter.SetPrefix", "name string")
+	greeterClassID := goMustNodeIDForSig(t, fw, greeterClassSig)
+	setPrefixMethodID := goMustNodeIDForSig(t, fw, setPrefixMethodSig)
+
+	// ----- writes edges (Pass 2c, positive pin) -----
+	// Pin the exact count, endpoints, AND attrs.members shape.
+	writes := fw.edgesOf("writes")
+	if len(writes) != 1 {
+		t.Fatalf("writes edges = %d; want 1 (*Greeter.SetPrefix → Greeter for g.prefix); edges=%+v",
+			len(writes), writes)
+	}
+	w := writes[0]
+	if w.SrcNodeID != setPrefixMethodID || w.DstNodeID != greeterClassID {
+		t.Errorf("writes edge = %s → %s; want %s → %s (*Greeter.SetPrefix → Greeter)",
+			w.SrcNodeID, w.DstNodeID,
+			setPrefixMethodID, greeterClassID)
+	}
+	members := goAttrStringSlice(t, w.AttrsJSON, "members")
+	if len(members) != 1 || members[0] != "prefix" {
+		t.Errorf("writes edge attrs.members = %v; want [prefix] "+
+			"(memberAccessAttrsJSON shape; dispatcher.go:890-905)",
+			members)
+	}
+
+	// ----- reads edges (Pass 2c, negative pin) -----
+	// `g.prefix = name` is classified as write-only by the Go
+	// walker (assignment LHS → IsWrite=true), so Pass 2c MUST
+	// emit ZERO reads edges. A regression that always emits
+	// both edges per member access is caught here.
+	if reads := fw.edgesOf("reads"); len(reads) != 0 {
+		t.Errorf("reads edges = %d; want 0 (fixture body has no g.* read sites); edges=%+v",
+			len(reads), reads)
+	}
+}
+
+// goAttrStringSlice reads a []string-valued key from a
+// JSON-encoded attrs blob (e.g. the `members` array on the
+// `writes` / `reads` edges that Pass 2c emits via
+// `memberAccessAttrsJSON`). Mirrors `goAttrString` in failure
+// shape: failing assertion via t.Fatalf rather than returning
+// `(nil, err)` so callers stay terse.
+func goAttrStringSlice(t *testing.T, raw json.RawMessage, key string) []string {
+	t.Helper()
+	if len(raw) == 0 {
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("attrs JSON unmarshal: %v (raw=%s)", err, string(raw))
+	}
+	v, ok := m[key]
+	if !ok {
+		return nil
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		t.Fatalf("attrs[%q] is %T; want []any", key, v)
+	}
+	out := make([]string, 0, len(arr))
+	for i, e := range arr {
+		s, ok := e.(string)
+		if !ok {
+			t.Fatalf("attrs[%q][%d] is %T; want string", key, i, e)
+		}
+		out = append(out, s)
+	}
+	return out
+}

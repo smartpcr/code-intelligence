@@ -38,6 +38,8 @@ func moduleRoot_pwsh() (string, error) {
 // ---------------------------------------------------------------------------
 
 type powershellParserState struct {
+	t *testing.T
+
 	// Scenario 1: Build
 	buildCGO1ExitCode int
 	buildCGO1Output   string
@@ -117,10 +119,8 @@ func (s *powershellParserState) bothBuildsSucceed() error {
 // ---------------------------------------------------------------------------
 
 func (s *powershellParserState) parserWithPwshAbsent() error {
-	origPath := os.Getenv("PATH")
-	os.Setenv("PATH", "")
+	s.t.Setenv("PATH", "")
 	s.parser = ast.NewPowerShellParser()
-	os.Setenv("PATH", origPath)
 	return nil
 }
 
@@ -174,10 +174,8 @@ func (s *powershellParserState) parserWithFakePwshThatSleeps() error {
 		return fmt.Errorf("failed to write fake pwsh: %w", err)
 	}
 
-	origPath := os.Getenv("PATH")
-	os.Setenv("PATH", tmpDir+string(os.PathListSeparator)+origPath)
+	s.t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	s.slowParser = ast.NewPowerShellParser()
-	os.Setenv("PATH", origPath)
 	return nil
 }
 
@@ -206,38 +204,40 @@ func (s *powershellParserState) errorDoesNotWrapSentinel() error {
 // Godog wiring
 // ---------------------------------------------------------------------------
 
-func InitializeScenario_powershell_parser_powershellparser_subprocess_implementation(ctx *godog.ScenarioContext) {
-	s := &powershellParserState{}
+func initializeScenario_powershell_parser(t *testing.T) func(ctx *godog.ScenarioContext) {
+	return func(ctx *godog.ScenarioContext) {
+		s := &powershellParserState{t: t}
 
-	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
-		if s.fakePwshDir != "" {
-			os.RemoveAll(s.fakePwshDir)
-		}
-		return ctx, nil
-	})
+		ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
+			if s.fakePwshDir != "" {
+				os.RemoveAll(s.fakePwshDir)
+			}
+			return ctx, nil
+		})
 
-	// Scenario 1: Build
-	ctx.Given(`^the file has no build tags$`, s.theFileHasNoBuildTags)
-	ctx.When(`^go build \./internal/repoindexer/ast/\.\.\. runs from services/agent-memory under CGO_ENABLED=1$`, s.goBuildAstRunsUnderCGO1)
-	ctx.When(`^go build \./internal/repoindexer/ast/\.\.\. runs from services/agent-memory under CGO_ENABLED=0$`, s.goBuildAstRunsUnderCGO0)
-	ctx.Then(`^both builds succeed$`, s.bothBuildsSucceed)
+		// Scenario 1: Build
+		ctx.Given(`^the file has no build tags$`, s.theFileHasNoBuildTags)
+		ctx.When(`^go build \./internal/repoindexer/ast/\.\.\. runs from services/agent-memory under CGO_ENABLED=1$`, s.goBuildAstRunsUnderCGO1)
+		ctx.When(`^go build \./internal/repoindexer/ast/\.\.\. runs from services/agent-memory under CGO_ENABLED=0$`, s.goBuildAstRunsUnderCGO0)
+		ctx.Then(`^both builds succeed$`, s.bothBuildsSucceed)
 
-	// Scenario 2: Sentinel
-	ctx.Given(`^a PowerShell parser constructed with pwsh absent from PATH$`, s.parserWithPwshAbsent)
-	ctx.When(`^Parse "([^"]*)" with source "([^"]*)" runs$`, s.parseRunsOnAbsentParser)
-	ctx.Then(`^it returns an error wrapping ErrParserUnavailable$`, s.returnsErrParserUnavailable)
-	ctx.Then(`^the ParseResult is empty$`, s.parseResultIsEmpty)
+		// Scenario 2: Sentinel
+		ctx.Given(`^a PowerShell parser constructed with pwsh absent from PATH$`, s.parserWithPwshAbsent)
+		ctx.When(`^Parse "([^"]*)" with source "([^"]*)" runs$`, s.parseRunsOnAbsentParser)
+		ctx.Then(`^it returns an error wrapping ErrParserUnavailable$`, s.returnsErrParserUnavailable)
+		ctx.Then(`^the ParseResult is empty$`, s.parseResultIsEmpty)
 
-	// Scenario 3: Timeout
-	ctx.Given(`^a PowerShell parser constructed with a fake pwsh that sleeps$`, s.parserWithFakePwshThatSleeps)
-	ctx.When(`^Parse "([^"]*)" with source "([^"]*)" runs on the slow parser$`, s.parseRunsOnSlowParser)
-	ctx.Then(`^it returns a non-nil error$`, s.returnsNonNilError)
-	ctx.Then(`^the error does not wrap ErrParserUnavailable$`, s.errorDoesNotWrapSentinel)
+		// Scenario 3: Timeout
+		ctx.Given(`^a PowerShell parser constructed with a fake pwsh that sleeps$`, s.parserWithFakePwshThatSleeps)
+		ctx.When(`^Parse "([^"]*)" with source "([^"]*)" runs on the slow parser$`, s.parseRunsOnSlowParser)
+		ctx.Then(`^it returns a non-nil error$`, s.returnsNonNilError)
+		ctx.Then(`^the error does not wrap ErrParserUnavailable$`, s.errorDoesNotWrapSentinel)
+	}
 }
 
 func TestE2E_powershell_parser_powershellparser_subprocess_implementation(t *testing.T) {
 	suite := godog.TestSuite{
-		ScenarioInitializer: InitializeScenario_powershell_parser_powershellparser_subprocess_implementation,
+		ScenarioInitializer: initializeScenario_powershell_parser(t),
 		Options: &godog.Options{
 			Format:   "pretty",
 			Paths:    []string{"powershell_parser_powershellparser_subprocess_implementation.feature"},

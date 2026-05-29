@@ -34,64 +34,59 @@ package cross_repo_happy_path
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
-	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cucumber/godog"
 	_ "github.com/lib/pq"
+
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/aggregator"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook"
 )
 
 // -----------------------------------------------------------------
-// Why this package does NOT import `internal/aggregator` or
-// `internal/ingest/webhook` directly.
+// Production-package imports (iter 6).
 // -----------------------------------------------------------------
 //
-// Both production packages currently fail to build under the
-// canonical workspace (`go.work` use-set: root,
-// services/agent-memory, services/clean-code). They -- along
-// with all of `cmd/*` and most of `internal/*` -- import via
-// the path `github.com/smartpcr/code-intelligence/services/
-// clean-code/internal/<sub>` which is NOT a module declared
-// in either `go.mod` (the canonical service module name is
-// `forge/services/clean-code`). This pre-existing
-// repo-wide breakage is out of scope for this stage; see the
-// `cross_repo_aggregator_system_tier_metric_composer_steps.go`
-// note in iter-1 + iter-2 reflections.
+// This harness drives the Cross-Repo Aggregator and the
+// `/v1/ingest/coverage` webhook through their PRODUCTION
+// packages, not through inlined mirrors:
 //
-// To stay green under the per-iter build gate this test
-// INLINES the two minimal contracts it needs:
+//   * `internal/aggregator` -- the test instantiates
+//     `aggregator.NewAggregator(NewPGSampleSource,
+//     NewPGSnapshotWriter, WithClock(...))` and calls
+//     `Tick(ctx)` to produce the `cross_repo_percentile`
+//     row under assertion. The pinned clock makes the
+//     row's `built_at` deterministic so the post-tick
+//     re-SELECT can correlate the row to THIS scenario.
+//   * `internal/ingest/webhook` -- the real coverage POST
+//     uses `webhook.SignHMAC` to produce the body
+//     signature and `webhook.HMACSignatureHeader` /
+//     `webhook.HMACSignaturePrefix` / `webhook.SigningKeyIDHeader`
+//     for the request headers, so a future header / digest
+//     scheme change in the verifier propagates to this
+//     test automatically.
 //
-//   * The HMAC body-signing scheme on `/v1/ingest/coverage`
-//     (mirrors `internal/ingest/webhook/hmac.go:104` +
-//     `webhook.HMACSignaturePrefix` + the canonical header
-//     name `X-Hub-Signature-256`).
-//   * The cross-repo percentile-row write shape (mirrors
-//     `internal/aggregator/aggregator.go:219`'s `Tick` --
-//     read active samples for (metric_kind, scope_kind),
-//     compute p50/p90/p99 + histogram, INSERT
-//     `clean_code.cross_repo_percentile` with a pinned
-//     `built_at`). Computation MUST match the production
-//     Aggregator's projection on a single tick over the
-//     same input rows; if production ever changes (e.g. a
-//     new histogram bin scheme), this test will diverge and
-//     should be re-aligned in the same iter.
-//
-// When the pre-existing import-path breakage is fixed by a
-// sibling workstream, these inline copies can be replaced
-// with direct imports of the production packages.
+// Iter 6 unblocked the imports above by aligning
+// `services/clean-code/go.mod`'s module declaration with the
+// import paths used across `internal/**`, `cmd/**`, the
+// generated `internal/ast/v1/ast.pb.go`, the Makefile
+// (`PROTO_GO_MODULE`), the proto file (`option go_package`),
+// and the `.golangci.yml` `local-prefixes`. Before iter 6 the
+// module line was `forge/services/clean-code` while every
+// other artifact in the codebase used
+// `github.com/smartpcr/code-intelligence/services/clean-code`
+// -- a one-line `go.mod` change closed that asymmetry without
+// touching any of the 228 importing files.
 // -----------------------------------------------------------------
 
 // -----------------------------------------------------------------
@@ -146,16 +141,6 @@ const (
 	envWebhookURL       = "CLEAN_CODE_WEBHOOK_URL"
 	envWebhookHMAC      = "CLEAN_CODE_WEBHOOK_HMAC_SECRET"
 	envWebhookSigningID = "CLEAN_CODE_WEBHOOK_SIGNING_KEY_ID"
-
-	// Inlined from internal/ingest/webhook (see import-block
-	// note above). Hard-coding these locally is acceptable
-	// for a test because the same constants are also pinned
-	// by the production tests in `internal/ingest/webhook/
-	// hmac_test.go` and would have to change in lock-step
-	// across the codebase if ever renamed.
-	webhookHMACHeader         = "X-Hub-Signature-256" // internal/ingest/webhook/hmac.go:21
-	webhookSigningKeyIDHeader = "X-Signing-Key-Id"    // internal/ingest/webhook/secret_resolver.go:34
-	webhookHMACPrefix         = "sha256="             // internal/ingest/webhook/hmac.go:27
 )
 
 // canonicalVerdicts is the closed set of verdict labels the
@@ -299,25 +284,26 @@ type crossRepoState struct {
 	// POST returned for repo i; index-aligned with repoIDs.
 	realScanRunIDs []string
 
-	// Aggregator-tick correlation (iter-5; iter-3 evaluator
-	// items 2 + 4).
+	// Aggregator-tick correlation (iter 6).
 	// `preTickMaxBuiltAt` is the snapshot of
 	// `MAX(cross_repo_percentile.built_at)` for THIS scenario's
-	// (metric_kind, scope_kind) cohort BEFORE the test's tick
-	// projection writes its row -- replaces the iter-3
-	// pre-tick DELETE (which perturbed sibling scenarios on a
-	// shared e2e stack). Used to ensure `tickClock` is
-	// pinned strictly greater than any concurrent writer's
-	// built_at, so the post-tick re-SELECT by `percentile_id`
-	// is round-trip-stable on built_at.
-	// `tickClock` is the timestamp we stamp on the
-	// `cross_repo_percentile` row WE write. Microsecond-
-	// truncated so the DB round-trip preserves it bit-for-bit
-	// and the later `row.BuiltAt.Equal(s.tickClock)` correlation
+	// (metric_kind, scope_kind) cohort BEFORE the production
+	// aggregator's tick writes its row. Used to pin `tickClock`
+	// strictly greater than any pre-existing row's `built_at`
+	// so the post-tick SELECT by
+	// `(metric_kind, scope_kind, built_at)` is unambiguous.
+	// `tickClock` is the timestamp propagated into
+	// `aggregator.WithClock(...)`; every row the tick writes
+	// carries exactly this value. Microsecond-truncated so
+	// PG TIMESTAMPTZ round-trips it bit-for-bit and the
+	// later `row.BuiltAt.Equal(s.tickClock)` correlation
 	// succeeds.
-	// `tickObservations` is the count of `metric_sample_active`
-	// rows we summed over this tick -- MUST be the 3 repos' 3
-	// package-level samples for the correlation to be strict.
+	// `tickObservations` is the `Report.ObservationsRead`
+	// counter returned by `aggregator.Tick`. The production
+	// tick reads the FULL active sample set in the DB (not
+	// just THIS scenario's rows), so on a shared e2e stack
+	// this count is `>= len(s.repoIDs)`, not necessarily
+	// exactly equal to it.
 	preTickMaxBuiltAt time.Time
 	tickClock         time.Time
 	tickObservations  int
@@ -446,6 +432,20 @@ func (s *crossRepoState) cleanup() {
 	// empty and the cleanup is a safe no-op.
 	if s.percentileID != "" {
 		_, _ = s.db.ExecContext(ctx, `DELETE FROM clean_code.cross_repo_percentile WHERE percentile_id=$1::uuid`, s.percentileID)
+	}
+
+	// Iter 6: the real `aggregator.Tick` writes to THREE
+	// tables under the SAME `built_at` (the pinned
+	// `tickClock`). Sibling teardown by `percentile_id` only
+	// would leave `repo_metric_snapshot` + `portfolio_snapshot`
+	// rows accumulating across runs. Scope by
+	// `built_at = s.tickClock` -- the pinned clock is
+	// unique-per-scenario (microsecond truncated, strictly
+	// greater than the cohort's pre-tick MAX) so the DELETE
+	// can never destroy a sibling scenario's rows.
+	if !s.tickClock.IsZero() {
+		_, _ = s.db.ExecContext(ctx, `DELETE FROM clean_code.repo_metric_snapshot WHERE built_at = $1`, s.tickClock)
+		_, _ = s.db.ExecContext(ctx, `DELETE FROM clean_code.portfolio_snapshot WHERE built_at = $1`, s.tickClock)
 	}
 
 	// Evaluation rows MUST be deleted before policy_version
@@ -788,7 +788,7 @@ func (s *crossRepoState) postCoverageWebhook(ctx context.Context, repoIdx int, r
 	}
 
 	body := buildCoberturaXML(repoID, sha, repoIdx, files)
-	sig := signCoverageHMAC(body, s.webhookHMACSecret)
+	sig := webhook.SignHMAC(body, s.webhookHMACSecret)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		strings.TrimRight(s.webhookURL, "/")+pathIngestCoverage,
@@ -797,8 +797,8 @@ func (s *crossRepoState) postCoverageWebhook(ctx context.Context, repoIdx int, r
 		return "", fmt.Errorf("build POST: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/xml")
-	req.Header.Set(webhookSigningKeyIDHeader, s.webhookSigningKeyID)
-	req.Header.Set(webhookHMACHeader, sig)
+	req.Header.Set(webhook.SigningKeyIDHeader, s.webhookSigningKeyID)
+	req.Header.Set(webhook.HMACSignatureHeader, sig)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -979,44 +979,50 @@ func (s *crossRepoState) policyActivated() error {
 // -----------------------------------------------------------------
 // Step: aggregator runs one tick.
 //
-// Iter-3 implementation runs the Cross-Repo Aggregator's tick
-// projection INLINE in the test process using direct SQL: pre-tick
-// DELETE of any pre-existing snapshot for `(coverage_line_ratio,
-// package)`, then SELECT all active samples for THIS scenario's
-// three registered repos, then compute p50/p90/p99 + histogram
-// in Go, then INSERT a single `cross_repo_percentile` row with
-// `built_at` pinned to a test-chosen clock. Three reasons over
-// the HTTP-trigger pattern AND over a direct
-// `aggregator.Tick(ctx)` call:
+// Iter 6 (iter-5 evaluator item 1): this step now runs the
+// PRODUCTION Cross-Repo Aggregator. The earlier iters
+// projected the tick INLINE in the test process because the
+// `internal/aggregator` package was unimportable from this
+// e2e file (a stale module name in `services/clean-code/go.mod`
+// hid the production packages from import). Iter 6's one-line
+// `go.mod` module rename closed that import gap; the
+// production aggregator is now instantiated via:
 //
-//  1. `/v1/aggregator/tick` does NOT exist in the production
-//     binary. `cmd/clean-code-aggregator/main.go` mounts only
-//     `/healthz` and `/metrics`. The two sibling tests that POST
-//     to that path were written against an aspirational route
-//     and have never executed successfully against a real
-//     compose stack.
-//  2. The production `internal/aggregator` package itself
-//     currently fails to build under the canonical workspace
-//     (it imports via `github.com/smartpcr/code-intelligence/...`,
-//     a path that no module in `go.work` resolves -- see the
-//     package-level "Why this package does NOT import..."
-//     comment at the top of this file). A direct
-//     `aggregator.Tick(ctx)` call would fail at link time, so
-//     the test would not run AT ALL. The inline projection
-//     mirrors the same write shape as production (read active
-//     samples; compute percentiles + histogram from values;
-//     INSERT one snapshot row with the pinned built_at).
-//  3. Inline computation lets us correlate the produced row to
-//     THIS scenario's three seeded repos by construction: we
-//     SELECT only `metric_sample_active` rows owned by repos
-//     in `s.repoIDs`, verify there are exactly three (one per
-//     repo's package-level sample), and INSERT exactly one
-//     snapshot row whose `built_at` equals `s.tickClock`. The
-//     post-tick correlation in `mgmtReadCrossRepoCalled` then
-//     asserts `row.percentile_id == s.percentileID` AND
-//     `row.built_at == s.tickClock`, which collectively prove
-//     the snapshot row under test came from THIS scenario's
-//     samples (iter-2 evaluator items 2 + 4).
+//   source, _ := aggregator.NewPGSampleSource(s.db)
+//   writer, _ := aggregator.NewPGSnapshotWriter(s.db)
+//   agg,    _ := aggregator.NewAggregator(source, writer,
+//       aggregator.WithClock(func() time.Time { return s.tickClock }))
+//   report,  _ := agg.Tick(ctx)
+//
+// `WithClock` pins `Report.BuiltAt` to a known timestamp so
+// the post-tick re-SELECT can correlate the row to THIS
+// scenario by `(metric_kind, scope_kind, built_at)` -- the
+// production `Aggregator` writes one row per cohort per tick
+// at exactly that `built_at`, and the pinned clock is chosen
+// strictly greater than any pre-existing row's `built_at`
+// for the same cohort so the SELECT is unambiguous.
+//
+// # Global blast radius (rubber-duck critique)
+//
+// `Aggregator.Tick` reads the FULL active sample set across
+// all repos in the DB -- NOT just the three this scenario
+// seeded. On a shared e2e stack with sibling scenarios this
+// means:
+//
+//   * `Report.ObservationsRead` >= the 3 package-level
+//     samples this scenario contributed (it may be larger
+//     when sibling scenarios have active samples too).
+//   * `Report.CrossRepoPercentileRowsWritten` >= 1 (one
+//     row per cohort the tick saw; the
+//     `coverage_line_ratio,package` cohort is one of those).
+//   * The row this scenario asserts on MUST be located by
+//     `(metric_kind, scope_kind, built_at)` rather than by
+//     a global `LIMIT 1` -- otherwise a sibling scenario's
+//     row in the same tick would shadow ours.
+//
+// `cleanup()` reciprocally DELETEs the three Tick-written
+// tables scoped to `built_at = s.tickClock` so this scenario
+// does not leave behind rows that contaminate later scenarios.
 // -----------------------------------------------------------------
 
 func (s *crossRepoState) aggregatorRunsOneTick() error {
@@ -1029,12 +1035,11 @@ func (s *crossRepoState) aggregatorRunsOneTick() error {
 
 	// 1. Snapshot `MAX(built_at)` for the (metric_kind,
 	//    scope_kind) cohort BEFORE this scenario writes its
-	//    tick row. Iter-5 (iter-3 evaluator item 2): replaces
-	//    the iter-3 pre-tick DELETE (which destroyed any row
-	//    written by a sibling scenario sharing the e2e stack).
-	//    The captured value lets the post-tick capture below
-	//    scope to THIS scenario's row by strict-greater
-	//    built_at, with no destruction.
+	//    tick row. Used below to pin `tickClock` strictly
+	//    greater than any pre-existing row's `built_at`,
+	//    which guarantees the post-tick SELECT by
+	//    `(metric_kind, scope_kind, built_at)` resolves to
+	//    OUR row and not a sibling's.
 	var preMax sql.NullTime
 	if err := s.db.QueryRowContext(ctx, `
 		SELECT MAX(built_at) FROM clean_code.cross_repo_percentile
@@ -1048,290 +1053,113 @@ func (s *crossRepoState) aggregatorRunsOneTick() error {
 		s.preTickMaxBuiltAt = time.Time{}
 	}
 
-	// 2. Pin built_at to a known timestamp truncated to PG's
-	//    TIMESTAMPTZ precision (microsecond) AND strictly
-	//    greater than `preTickMaxBuiltAt`. Truncation matters:
-	//    without it the DB round-trip drops sub-microsecond
-	//    bits and the later `row.BuiltAt.Equal(s.tickClock)`
-	//    check fails on the nanosecond mismatch. The
-	//    strictly-greater offset matters: it guarantees no
-	//    concurrent writer collides with `tickClock` so the
-	//    post-tick re-SELECT by `percentile_id` finds a row
-	//    whose `built_at` still matches our pinned value
-	//    bit-for-bit.
+	// 2. Pin `tickClock` to a microsecond-truncated value
+	//    (PG TIMESTAMPTZ resolution) strictly greater than
+	//    `preTickMaxBuiltAt`. Truncation matters because the
+	//    DB round-trip drops sub-microsecond bits and the
+	//    later `row.BuiltAt.Equal(s.tickClock)` correlation
+	//    must succeed bit-for-bit; the strictly-greater
+	//    offset matters because the post-tick SELECT looks
+	//    up our row by exact `built_at` match and any
+	//    pre-existing row at the same value would shadow ours.
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	if !s.preTickMaxBuiltAt.IsZero() && !now.After(s.preTickMaxBuiltAt) {
 		now = s.preTickMaxBuiltAt.Add(time.Microsecond)
 	}
 	s.tickClock = now
 
-	// 3. Read THIS scenario's package-level active samples.
-	//    The repo-id filter is what correlates the snapshot
-	//    row we're about to write to the three repos
-	//    registered earlier in the scenario (iter-2 evaluator
-	//    item 2: "does not correlate rows to this scenario's
-	//    three seeded repos").
-	//
-	//    The JOIN traversal mirrors `internal/aggregator/
-	//    pg_source.go`'s `ReadActive` query: from
-	//    `metric_sample_active` (which carries the
-	//    `(repo_id, sha, scope_id, metric_kind,
-	//    metric_version) -> sample_id` pointer per architecture
-	//    Sec 5.2.3) JOIN the pointed-to `metric_sample` for the
-	//    value, JOIN `scope_binding` for the scope_kind discrim.
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT msa.repo_id::text, ms.value
+	// 3. Sanity-check that THIS scenario's three repos have
+	//    each contributed exactly one package-level
+	//    `metric_sample_active` row via `coverageLanded()`'s
+	//    Gap-2 supplements. If they did not, the aggregator
+	//    will still tick (over a global view including
+	//    other scenarios' samples), but the assertion that
+	//    OUR row's `histogram_json` covers the three
+	//    scenario repos would fail downstream with a less
+	//    obvious error. Fail-fast here gives a precise
+	//    message pointing at the seed step.
+	var ourActiveCount int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
 		FROM clean_code.metric_sample_active msa
-		JOIN clean_code.metric_sample ms
-		  ON ms.sample_id = msa.sample_id
 		JOIN clean_code.scope_binding sb
 		  ON sb.scope_id = msa.scope_id
 		WHERE msa.repo_id      = ANY($1::uuid[])
 		  AND msa.metric_kind  = $2
 		  AND sb.scope_kind    = $3::clean_code.scope_kind
-	`, "{"+strings.Join(s.repoIDs, ",")+"}", xrepoMetricKind, xrepoScopeKind)
-	if err != nil {
-		return fmt.Errorf("read active samples for THIS scenario's repos: %w", err)
+	`, "{"+strings.Join(s.repoIDs, ",")+"}", xrepoMetricKind, xrepoScopeKind).Scan(&ourActiveCount); err != nil {
+		return fmt.Errorf("pre-tick count of THIS scenario's package-level metric_sample_active rows: %w", err)
 	}
-	defer rows.Close()
-
-	type sample struct {
-		repoID string
-		value  float64
-	}
-	samples := make([]sample, 0, len(s.repoIDs))
-	for rows.Next() {
-		var sm sample
-		if err := rows.Scan(&sm.repoID, &sm.value); err != nil {
-			return fmt.Errorf("scan sample row: %w", err)
-		}
-		samples = append(samples, sm)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate sample rows: %w", err)
-	}
-
-	// 4. The 3 registered repos should each have contributed
-	//    exactly one package-level sample via coverageLanded's
-	//    Gap-2 supplements. Anything less means the per-repo
-	//    seed didn't reach the active-pointer table.
-	if len(samples) != len(s.repoIDs) {
+	if ourActiveCount != len(s.repoIDs) {
 		return fmt.Errorf("active package-level samples for THIS scenario = %d; want %d (one per registered repo). coverageLanded()'s Gap-2 supplements did not seed all repos",
-			len(samples), len(s.repoIDs))
-	}
-	s.tickObservations = len(samples)
-
-	values := make([]float64, len(samples))
-	repoSamples := make(map[string]float64, len(samples))
-	for i, sm := range samples {
-		values[i] = sm.value
-		repoSamples[sm.repoID] = sm.value
+			ourActiveCount, len(s.repoIDs))
 	}
 
-	// 5. Compute the snapshot's payload from THIS scenario's
-	//    samples. p50/p90/p99 use linear interpolation between
-	//    order statistics (the same method
-	//    `internal/aggregator/percentile.go` uses); the
-	//    histogram envelope mirrors the production
-	//    `HistogramEnvelope` shape defined at
-	//    `internal/aggregator/types.go:96-115` -- iter-5
-	//    (iter-4 evaluator item 3) replaces iter-3's
-	//    `{bins,count}` shape that did NOT match production.
-	p50, p90, p99 := percentileLinear(values, 50), percentileLinear(values, 90), percentileLinear(values, 99)
-	histJSON, err := buildCoverageHistogramJSON(repoSamples)
+	// 4. Drive the PRODUCTION Cross-Repo Aggregator. The
+	//    pinned `tickClock` is the timestamp every row the
+	//    tick writes will carry. The SampleSource reads the
+	//    full active observation set (not scoped to this
+	//    scenario); the SnapshotWriter persists one row per
+	//    cohort into each of the three snapshot tables.
+	source, err := aggregator.NewPGSampleSource(s.db)
 	if err != nil {
-		return fmt.Errorf("build histogram_json: %w", err)
+		return fmt.Errorf("aggregator.NewPGSampleSource: %w", err)
+	}
+	writer, err := aggregator.NewPGSnapshotWriter(s.db)
+	if err != nil {
+		return fmt.Errorf("aggregator.NewPGSnapshotWriter: %w", err)
+	}
+	pinned := s.tickClock
+	agg, err := aggregator.NewAggregator(source, writer,
+		aggregator.WithClock(func() time.Time { return pinned }))
+	if err != nil {
+		return fmt.Errorf("aggregator.NewAggregator: %w", err)
 	}
 
-	// 6. Insert the single snapshot row with our pinned
-	//    `built_at` and capture the `percentile_id`. The
-	//    captured id is what `advanceFakeClock` UPDATEs and
-	//    what `mgmtReadCrossRepoCalled` correlates against
-	//    (iter-2 evaluator item 4: backdate scoped to the
-	//    captured id, not the global metric/scope pair).
+	report, err := agg.Tick(ctx)
+	if err != nil {
+		return fmt.Errorf("aggregator.Tick: %w", err)
+	}
+	s.tickObservations = report.ObservationsRead
+
+	// 5. Sanity-check the Report counters using `>=` (the
+	//    tick is GLOBAL across all active samples in the DB
+	//    -- on a shared stack the counts may include sibling
+	//    scenarios' contributions, so an exact `==` would be
+	//    flaky).
+	if report.ObservationsRead < len(s.repoIDs) {
+		return fmt.Errorf("aggregator.Tick.ObservationsRead=%d < this scenario's %d package-level samples; the tick did not see our seeded rows",
+			report.ObservationsRead, len(s.repoIDs))
+	}
+	if report.CrossRepoPercentileRowsWritten < 1 {
+		return fmt.Errorf("aggregator.Tick.CrossRepoPercentileRowsWritten=%d; want >= 1 (the (coverage_line_ratio,package) cohort should have produced one row)",
+			report.CrossRepoPercentileRowsWritten)
+	}
+	if !report.BuiltAt.Equal(s.tickClock) {
+		return fmt.Errorf("aggregator.Tick.BuiltAt=%s != injected tickClock=%s; WithClock did not propagate",
+			report.BuiltAt.Format(time.RFC3339Nano), s.tickClock.Format(time.RFC3339Nano))
+	}
+
+	// 6. Locate OUR cohort's row by `(metric_kind, scope_kind,
+	//    built_at)`. Capture `percentile_id` for the later
+	//    `mgmt.read.cross_repo` correlation + `advanceFakeClock`
+	//    backdating. The triple is unique because `tickClock`
+	//    was pinned strictly greater than `preTickMaxBuiltAt`
+	//    for this cohort.
 	if err := s.db.QueryRowContext(ctx, `
-		INSERT INTO clean_code.cross_repo_percentile
-			(metric_kind, scope_kind, histogram_json, p50, p90, p99, built_at)
-		VALUES ($1, $2::clean_code.scope_kind, $3::jsonb, $4, $5, $6, $7)
-		RETURNING percentile_id::text
-	`, xrepoMetricKind, xrepoScopeKind, string(histJSON), p50, p90, p99, s.tickClock).Scan(&s.percentileID); err != nil {
-		return fmt.Errorf("INSERT cross_repo_percentile: %w", err)
-	}
-
-	// 7. Race-safe sanity using exact-match selection rather
-	//    than cover/superset (rubber-duck critique B/C): a
-	//    natural aggregator portfolio tick can write a row
-	//    with `built_at > preMax` whose entries DO cover
-	//    THIS scenario's repos (because the portfolio is a
-	//    superset of our repo set). To eliminate that risk
-	//    we verify by the captured `percentile_id` directly
-	//    and additionally verify the row's `built_at` round-
-	//    tripped to our pinned `tickClock` bit-for-bit.
-	if err := s.verifyOurRowPersisted(ctx); err != nil {
-		return err
-	}
-	return nil
-}
-
-// verifyOurRowPersisted asserts that the percentile row we
-// just INSERTed survives a fresh SELECT by `percentile_id`
-// and that its `built_at` round-tripped to our pinned
-// `tickClock`. Using the id (returned by INSERT ... RETURNING)
-// guarantees the check is scoped strictly to this scenario's
-// row even when a sibling scenario or a natural aggregator
-// tick writes concurrently for the same `(metric_kind,
-// scope_kind)` cohort.
-func (s *crossRepoState) verifyOurRowPersisted(ctx context.Context) error {
-	if s.percentileID == "" {
-		return fmt.Errorf("verifyOurRowPersisted called before percentileID was captured")
-	}
-	var (
-		gotKind    string
-		gotScope   string
-		gotBuiltAt time.Time
-	)
-	err := s.db.QueryRowContext(ctx, `
-		SELECT metric_kind, scope_kind::text, built_at
+		SELECT percentile_id::text
 		FROM clean_code.cross_repo_percentile
-		WHERE percentile_id = $1::uuid
-	`, s.percentileID).Scan(&gotKind, &gotScope, &gotBuiltAt)
-	if err == sql.ErrNoRows {
-		return fmt.Errorf("INSERT cross_repo_percentile succeeded but SELECT by percentile_id=%s returned no rows (race against a concurrent DELETE?)", s.percentileID)
-	}
-	if err != nil {
-		return fmt.Errorf("post-tick SELECT by percentile_id=%s: %w", s.percentileID, err)
-	}
-	if gotKind != xrepoMetricKind || gotScope != xrepoScopeKind {
-		return fmt.Errorf("post-tick row for percentile_id=%s has metric=%q scope=%q; want metric=%q scope=%q",
-			s.percentileID, gotKind, gotScope, xrepoMetricKind, xrepoScopeKind)
-	}
-	if !gotBuiltAt.Equal(s.tickClock) {
-		return fmt.Errorf("post-tick row built_at=%s does NOT equal pinned tickClock=%s (microsecond truncation regressed?)",
-			gotBuiltAt.Format(time.RFC3339Nano), s.tickClock.Format(time.RFC3339Nano))
+		WHERE metric_kind=$1
+		  AND scope_kind=$2::clean_code.scope_kind
+		  AND built_at=$3
+	`, xrepoMetricKind, xrepoScopeKind, s.tickClock).Scan(&s.percentileID); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("aggregator.Tick succeeded but no cross_repo_percentile row for (metric_kind=%s, scope_kind=%s, built_at=%s); writer wrote %d rows total",
+				xrepoMetricKind, xrepoScopeKind, s.tickClock.Format(time.RFC3339Nano), report.CrossRepoPercentileRowsWritten)
+		}
+		return fmt.Errorf("post-tick SELECT for our cohort row: %w", err)
 	}
 	return nil
-}
-
-// percentileLinear returns the linear-interpolation percentile
-// of `values` at percentile `p` in [0,100]. Mirrors
-// `internal/aggregator/percentile.go`'s computation: copy + sort
-// ascending, locate the index P/100 * (n-1), interpolate
-// between floor and ceil. Returns 0 for empty input.
-func percentileLinear(values []float64, p float64) float64 {
-	n := len(values)
-	if n == 0 {
-		return 0
-	}
-	sorted := make([]float64, n)
-	copy(sorted, values)
-	sort.Float64s(sorted)
-	if n == 1 {
-		return sorted[0]
-	}
-	idx := (p / 100.0) * float64(n-1)
-	lo := int(math.Floor(idx))
-	hi := int(math.Ceil(idx))
-	if lo == hi {
-		return sorted[lo]
-	}
-	frac := idx - float64(lo)
-	return sorted[lo] + frac*(sorted[hi]-sorted[lo])
-}
-
-// buildCoverageHistogramJSON emits a 10-bin even-width histogram
-// covering [0.0, 1.0] -- the natural range of the
-// coverage_line_ratio metric. Shape mirrors what the production
-// aggregator writes into `cross_repo_percentile.histogram_json`
-// (architecture Sec 5.2.5: "per-repo histogram for portfolio UI
-// rendering"). The Insights surface treats this as opaque bytes
-// for the freshness banner check, so the exact bin scheme matters
-// only for visual rendering -- this test's only assertion against
-// the field is "len > 0 AND != null".
-// histogramEntry mirrors `aggregator.HistogramEntry` in
-// `internal/aggregator/types.go:96-115`. Tags are copied
-// exactly so a round-trip through json (write here, read in
-// `singleRowWithPopulatedPercentiles`) matches the byte
-// shape the production aggregator emits. Iter-5 (iter-4
-// evaluator item 3): replaces iter-3's `{bins,count}` shape
-// which did NOT match production.
-type histogramEntry struct {
-	RepoID string  `json:"repo_id"`
-	Count  int64   `json:"count"`
-	Mean   float64 `json:"mean"`
-	P50    float64 `json:"p50"`
-	P90    float64 `json:"p90"`
-	P99    float64 `json:"p99"`
-}
-
-// histogramEnvelope mirrors `aggregator.HistogramEnvelope` in
-// `internal/aggregator/types.go:96-115`. Entries are sorted by
-// repo_id text for deterministic bytes (matches production's
-// sort-stable ordering).
-type histogramEnvelope struct {
-	Entries []histogramEntry `json:"entries"`
-}
-
-// envelopeCoversRepos returns true when env.Entries contains
-// an entry for every repo_id in want. Used both as the post-
-// tick row-cover sanity check (so a concurrent sibling's
-// row writing at the same instant does not match) and as
-// part of `singleRowWithPopulatedPercentiles`.
-func envelopeCoversRepos(env histogramEnvelope, want []string) bool {
-	have := make(map[string]struct{}, len(env.Entries))
-	for _, e := range env.Entries {
-		have[e.RepoID] = struct{}{}
-	}
-	for _, r := range want {
-		if _, ok := have[r]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
-// buildCoverageHistogramJSON serialises the per-repo coverage
-// values as a `histogramEnvelope` -- one entry per repo,
-// sorted by repo_id text. Each entry's count is 1 (each repo
-// contributed one package-level sample in this stage), and
-// mean = p50 = p90 = p99 = value because n=1. The shape
-// matches the production `aggregator.HistogramEnvelope`
-// produced by `internal/aggregator/projector.go` so the
-// `singleRowWithPopulatedPercentiles` assertion can parse it
-// with the production tags.
-func buildCoverageHistogramJSON(repoValues map[string]float64) ([]byte, error) {
-	repoIDs := make([]string, 0, len(repoValues))
-	for id := range repoValues {
-		repoIDs = append(repoIDs, id)
-	}
-	sort.Strings(repoIDs)
-
-	entries := make([]histogramEntry, 0, len(repoIDs))
-	for _, id := range repoIDs {
-		v := repoValues[id]
-		if math.IsNaN(v) {
-			continue
-		}
-		entries = append(entries, histogramEntry{
-			RepoID: id,
-			Count:  1,
-			Mean:   v,
-			P50:    v,
-			P90:    v,
-			P99:    v,
-		})
-	}
-	return json.Marshal(histogramEnvelope{Entries: entries})
-}
-
-// signCoverageHMAC mirrors `internal/ingest/webhook/hmac.go:104`
-// (`SignHMAC`): returns `"sha256=" + lowercase-hex(hmac-sha256(
-// secret, body))`. Inlined in the test because the production
-// package is currently unbuildable (see import-block note at
-// top of file).
-func signCoverageHMAC(body, secret []byte) string {
-	mac := hmac.New(sha256.New, secret)
-	mac.Write(body)
-	return webhookHMACPrefix + hex.EncodeToString(mac.Sum(nil))
 }
 
 // aggregatorHasWrittenSnapshot is the Given step for the
@@ -1417,14 +1245,16 @@ func (s *crossRepoState) singleRowWithPopulatedPercentiles() error {
 	}
 
 	// Iter-5 (iter-4 evaluator item 3): parse the histogram
-	// payload as the production `HistogramEnvelope` shape
-	// (`internal/aggregator/types.go:96-115`) and verify
+	// payload as the production `aggregator.HistogramEnvelope`
+	// shape (`internal/aggregator/types.go:96-115`) and verify
 	// (a) entries is non-empty, (b) every scenario repo_id
 	// is covered, and (c) every entry carries a non-empty
 	// repo_id + positive count. This makes the assertion
 	// reject the iter-2/3 `{bins,count}` shape AND any
-	// future regression that drops per-repo entries.
-	var env histogramEnvelope
+	// future regression that drops per-repo entries. Iter 6
+	// switches from a local mirror struct to the production
+	// type now that `internal/aggregator` is importable.
+	var env aggregator.HistogramEnvelope
 	if err := json.Unmarshal(row.HistogramJSON, &env); err != nil {
 		return fmt.Errorf("row.histogram_json is not a production HistogramEnvelope (parse error: %v); body=%s",
 			err, string(row.HistogramJSON))
@@ -1441,9 +1271,15 @@ func (s *crossRepoState) singleRowWithPopulatedPercentiles() error {
 			return fmt.Errorf("row.histogram_json.entries[%d].count=%d is not positive (envelope=%s)", i, e.Count, string(row.HistogramJSON))
 		}
 	}
-	if !envelopeCoversRepos(env, s.repoIDs) {
-		return fmt.Errorf("row.histogram_json.entries does not cover this scenario's repo_ids %v; entries=%v",
-			s.repoIDs, env.Entries)
+	have := make(map[string]struct{}, len(env.Entries))
+	for _, e := range env.Entries {
+		have[e.RepoID] = struct{}{}
+	}
+	for _, want := range s.repoIDs {
+		if _, ok := have[want]; !ok {
+			return fmt.Errorf("row.histogram_json.entries does not cover this scenario's repo_id %q; entries=%v",
+				want, env.Entries)
+		}
 	}
 	return nil
 }
@@ -1732,34 +1568,44 @@ func (s *crossRepoState) noVerdictRowCarriesPercentileStale() error {
 // godog wiring + test entry point.
 // -----------------------------------------------------------------
 
-func registerSteps(ctx *godog.ScenarioContext, s *crossRepoState) {
+// registerSteps registers every godog step regex for both
+// scenarios on `ctx`. The double-indirection `**crossRepoState`
+// is the per-rubber-duck-critique idiom: the `Before` hook
+// REPLACES `*sp` with a fresh `*crossRepoState` per scenario,
+// and the registered step closures dereference `*sp` at
+// invocation time (not registration time) so each step call
+// reads the current scenario's state. Registering once in
+// `ScenarioInitializer` (not inside `Before`) avoids the
+// iter-5 evaluator item-3 anti-pattern of re-registering the
+// same regex set per scenario.
+func registerSteps(ctx *godog.ScenarioContext, sp **crossRepoState) {
 	// Background.
-	ctx.Step(`^the Management and Evaluator surfaces are reachable$`, s.servicesReachable)
-	ctx.Step(`^three repos are registered via mgmt\.register_repo$`, s.registerThreeRepos)
+	ctx.Step(`^the Management and Evaluator surfaces are reachable$`, func() error { return (*sp).servicesReachable() })
+	ctx.Step(`^three repos are registered via mgmt\.register_repo$`, func() error { return (*sp).registerThreeRepos() })
 
 	// Givens shared by both scenarios.
-	ctx.Step(`^coverage uploads have landed and scan runs reached scanned state$`, s.coverageLanded)
-	ctx.Step(`^a fresh policy version is activated$`, s.policyActivated)
-	ctx.Step(`^the Cross-Repo Aggregator has written a snapshot row$`, s.aggregatorHasWrittenSnapshot)
+	ctx.Step(`^coverage uploads have landed and scan runs reached scanned state$`, func() error { return (*sp).coverageLanded() })
+	ctx.Step(`^a fresh policy version is activated$`, func() error { return (*sp).policyActivated() })
+	ctx.Step(`^the Cross-Repo Aggregator has written a snapshot row$`, func() error { return (*sp).aggregatorHasWrittenSnapshot() })
 
 	// Fresh-scenario Whens.
-	ctx.Step(`^the Cross-Repo Aggregator runs one tick$`, s.aggregatorRunsOneTick)
-	ctx.Step(`^mgmt\.read\.cross_repo\('coverage_line_ratio', 'package'\) is called$`, s.mgmtReadCrossRepoCalled)
+	ctx.Step(`^the Cross-Repo Aggregator runs one tick$`, func() error { return (*sp).aggregatorRunsOneTick() })
+	ctx.Step(`^mgmt\.read\.cross_repo\('coverage_line_ratio', 'package'\) is called$`, func() error { return (*sp).mgmtReadCrossRepoCalled() })
 
 	// Fresh-scenario Thens.
-	ctx.Step(`^the response carries exactly one row with populated p50, p90, p99 and histogram_json$`, s.singleRowWithPopulatedPercentiles)
-	ctx.Step(`^the response carries degraded=false with no degraded_reason banner$`, s.freshEnvelope)
-	ctx.Step(`^the row's built_at is within the freshness window$`, s.builtAtWithinFreshnessWindow)
-	ctx.Step(`^eval\.gate\(repo_id, sha\) is called for each registered repo$`, s.evalGatePerRepo)
-	ctx.Step(`^every call returns a canonical verdict in \{pass, warn, block\}$`, s.everyVerdictIsCanonical)
-	ctx.Step(`^no gate call carries degraded_reason='percentile_stale'$`, s.noGateDegradedReasonIsPercentileStale)
+	ctx.Step(`^the response carries exactly one row with populated p50, p90, p99 and histogram_json$`, func() error { return (*sp).singleRowWithPopulatedPercentiles() })
+	ctx.Step(`^the response carries degraded=false with no degraded_reason banner$`, func() error { return (*sp).freshEnvelope() })
+	ctx.Step(`^the row's built_at is within the freshness window$`, func() error { return (*sp).builtAtWithinFreshnessWindow() })
+	ctx.Step(`^eval\.gate\(repo_id, sha\) is called for each registered repo$`, func() error { return (*sp).evalGatePerRepo() })
+	ctx.Step(`^every call returns a canonical verdict in \{pass, warn, block\}$`, func() error { return (*sp).everyVerdictIsCanonical() })
+	ctx.Step(`^no gate call carries degraded_reason='percentile_stale'$`, func() error { return (*sp).noGateDegradedReasonIsPercentileStale() })
 
 	// Stale-scenario specific.
-	ctx.Step(`^the fake clock is advanced past freshness_window_seconds$`, s.advanceFakeClock)
-	ctx.Step(`^the response carries degraded=true and degraded_reason='percentile_stale'$`, s.staleEnvelope)
-	ctx.Step(`^the row's built_at age exceeds the freshness window$`, s.builtAtExceedsFreshnessWindow)
-	ctx.Step(`^every gate degraded_reason is in \{samples_pending, policy_signature_invalid, xrepo_edges_unavailable\}$`, s.everyGateDegradedReasonAllowed)
-	ctx.Step(`^no evaluation_verdict row written during the scenario carries degraded_reason='percentile_stale'$`, s.noVerdictRowCarriesPercentileStale)
+	ctx.Step(`^the fake clock is advanced past freshness_window_seconds$`, func() error { return (*sp).advanceFakeClock() })
+	ctx.Step(`^the response carries degraded=true and degraded_reason='percentile_stale'$`, func() error { return (*sp).staleEnvelope() })
+	ctx.Step(`^the row's built_at age exceeds the freshness window$`, func() error { return (*sp).builtAtExceedsFreshnessWindow() })
+	ctx.Step(`^every gate degraded_reason is in \{samples_pending, policy_signature_invalid, xrepo_edges_unavailable\}$`, func() error { return (*sp).everyGateDegradedReasonAllowed() })
+	ctx.Step(`^no evaluation_verdict row written during the scenario carries degraded_reason='percentile_stale'$`, func() error { return (*sp).noVerdictRowCarriesPercentileStale() })
 }
 
 // TestE2E_CrossRepoHappyPath is the entry point. It skips
@@ -1778,14 +1624,21 @@ func TestE2E_CrossRepoHappyPath(t *testing.T) {
 	suite := godog.TestSuite{
 		Name: "cross_repo_happy_path",
 		ScenarioInitializer: func(ctx *godog.ScenarioContext) {
+			// Iter 6 (iter-5 evaluator item 3): register
+			// steps ONCE per ScenarioContext, NOT inside
+			// `Before`. The `s` pointer is reassigned by
+			// `Before` per scenario; the closures inside
+			// `registerSteps` dereference `*sp` at step-
+			// invocation time so each scenario sees its own
+			// fresh state without re-registering any regex.
 			var s *crossRepoState
+			registerSteps(ctx, &s)
 			ctx.Before(func(c context.Context, sc *godog.Scenario) (context.Context, error) {
 				var err error
 				s, err = newState(t)
 				if err != nil {
 					return c, fmt.Errorf("scenario %q: newState: %w", sc.Name, err)
 				}
-				registerSteps(ctx, s)
 				return c, nil
 			})
 			ctx.After(func(c context.Context, sc *godog.Scenario, err error) (context.Context, error) {

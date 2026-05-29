@@ -889,3 +889,368 @@ pub struct Foo;
 			got, want)
 	}
 }
+
+// TestRustFixture_EmitsExpectedNodeAndEdgeSet is the
+// implementation-plan §5.3 line 360-362 acceptance test for
+// the Rust tree-sitter parser. The fixture is the canonical
+// trait+impl+free-function+use shape called out by the
+// workstream brief; the parser must surface every node and
+// every relationship the dispatcher's Pass 1-2d passes need
+// to mint the corresponding graph edges:
+//
+//   - "2 class nodes" -> 2 ClassDecl entries
+//     (Greeter trait, GreeterImpl struct)
+//   - "3 method nodes" -> 3 MethodDecl entries
+//     (Greeter.greet trait-default, GreeterImpl.greet impl
+//     override, format_greeting free function)
+//   - "1 implements edge" -> the GreeterImpl ClassDecl
+//     carries `Implements=["Greeter"]` (dispatcher Pass 2a
+//     mints the edge from this slice)
+//   - "1 static_calls edge" -> GreeterImpl.greet MethodDecl
+//     carries `Calls=["format_greeting"]` (dispatcher Pass 2b
+//     resolves bare-name calls against the same-file callee
+//     index to mint the edge)
+//   - "1 imports edge" -> a single Import entry with
+//     Module="std::fmt" and Symbols=["Display"] (dispatcher
+//     Pass 0/2a mints the synthetic package node + edge)
+//
+// Mirrors TestCSharpFixture_EmitsExpectedNodeAndEdgeSet (Stage
+// 4.3) and TestCFixture_EmitsExpectedNodeAndEdgeSet (Stage
+// 3.4): the "edge" terminology in the workstream brief maps
+// to the parser-level ParseResult fields the dispatcher
+// consumes. The end-to-end dispatcher-emitted Edge set lives
+// in parser_treesitter_rust_dispatcher_test.go
+// (TestDispatcherFixture_RustGraph_StageFiveThree, gated on
+// `//go:build cgo && canonical_dispatcher`).
+func TestRustFixture_EmitsExpectedNodeAndEdgeSet(t *testing.T) {
+	// Fixture matches the Stage 5.3 workstream brief
+	// verbatim: trait/struct lack ``pub`` so a regression
+	// that silently drops non-public items is caught here
+	// (per rubber-duck iter-1 finding #1).
+	const src = `use std::fmt::Display;
+
+trait Greeter {
+    fn greet(&self, name: &str) -> String {
+        String::new()
+    }
+}
+
+struct GreeterImpl;
+
+impl Greeter for GreeterImpl {
+    fn greet(&self, name: &str) -> String {
+        format_greeting(name)
+    }
+}
+
+pub fn format_greeting(name: &str) -> String {
+    String::from(name)
+}
+`
+	p := NewTreeSitterRustParser()
+	res, err := p.Parse("src/lib.rs", []byte(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// ----- Class nodes (2): Greeter trait + GreeterImpl struct.
+	if got := len(res.Classes); got != 2 {
+		t.Fatalf("expected 2 class nodes; got %d (%v)",
+			got, rustClassNames(res.Classes))
+	}
+	byClass := rustClassByName(res.Classes)
+	greeter, ok := byClass["Greeter"]
+	if !ok {
+		t.Fatalf("class %q missing; got %v", "Greeter", rustClassNames(res.Classes))
+	}
+	if greeter.Kind != "trait" {
+		t.Errorf("Greeter.Kind = %q; want %q", greeter.Kind, "trait")
+	}
+	greeterImpl, ok := byClass["GreeterImpl"]
+	if !ok {
+		t.Fatalf("class %q missing; got %v", "GreeterImpl", rustClassNames(res.Classes))
+	}
+	if greeterImpl.Kind != "struct" {
+		t.Errorf("GreeterImpl.Kind = %q; want %q", greeterImpl.Kind, "struct")
+	}
+
+	// ----- Method nodes (3): Greeter.greet + GreeterImpl.greet + format_greeting.
+	if got := len(res.Methods); got != 3 {
+		t.Fatalf("expected 3 method nodes; got %d (%v)",
+			got, rustMethodQNs(res.Methods))
+	}
+	byMethod := rustMethodByQN(res.Methods)
+	for _, want := range []string{"Greeter.greet", "GreeterImpl.greet", "format_greeting"} {
+		if _, ok := byMethod[want]; !ok {
+			t.Errorf("method %q missing; got %v", want, rustMethodQNs(res.Methods))
+		}
+	}
+
+	// ----- Implements edge (GreeterImpl -> Greeter): one entry on GreeterImpl.Implements.
+	if !rustStringSlicesEqual(greeterImpl.Implements, []string{"Greeter"}) {
+		t.Errorf("GreeterImpl.Implements = %v; want [Greeter] (parser proxy for the implements edge)",
+			greeterImpl.Implements)
+	}
+	// Greeter trait MUST NOT itself carry an Implements
+	// (it IS the target of an implements edge, not the
+	// source). A walker that conflates impl-block traits
+	// into the trait's own Implements would falsely
+	// produce an extra implements edge.
+	if len(greeter.Implements) != 0 {
+		t.Errorf("Greeter.Implements = %v; want [] (the trait is the implements TARGET, not the source)",
+			greeter.Implements)
+	}
+
+	// ----- static_calls edge (GreeterImpl.greet -> format_greeting):
+	// one bare-name entry on GreeterImpl.greet.Calls.
+	implGreet := byMethod["GreeterImpl.greet"]
+	if !rustStringSlicesEqual(implGreet.Calls, []string{"format_greeting"}) {
+		t.Errorf("GreeterImpl.greet.Calls = %v; want [format_greeting] (parser proxy for static_calls edge)",
+			implGreet.Calls)
+	}
+	// The body has NO self-qualified calls and NO
+	// receiver method calls, so ReceiverCalls must stay
+	// empty — otherwise the dispatcher's Pass 2b would
+	// mint a SECOND static_calls edge and break the "1
+	// static_calls edge" assertion.
+	if len(implGreet.ReceiverCalls) != 0 {
+		t.Errorf("GreeterImpl.greet.ReceiverCalls = %v; want [] (no self.X() in the fixture body)",
+			implGreet.ReceiverCalls)
+	}
+	// The trait-default Greeter.greet body calls
+	// `String::new()` which the parser records as the
+	// rightmost-segment "new" in Calls. That bare name
+	// is NOT a same-file callee, so the dispatcher's
+	// Pass 2b drops it -> still only 1 static_calls edge
+	// total. We deliberately do NOT assert
+	// Greeter.greet.Calls here so a future scoped-call
+	// refactor (e.g. dropping rightmost-segment recording)
+	// does not spuriously break this fixture; the
+	// dispatcher-level test
+	// TestDispatcherFixture_RustGraph_StageFiveThree
+	// pins the final edge count of 1.
+
+	// ----- imports edge (file -> std::fmt package, Symbols=[Display]):
+	// one Import entry with the precise Module + Symbols shape.
+	if got := len(res.Imports); got != 1 {
+		t.Fatalf("expected 1 import (std::fmt::Display); got %d (%v)",
+			got, res.Imports)
+	}
+	imp := res.Imports[0]
+	if imp.Module != "std::fmt" {
+		t.Errorf("import.Module = %q; want %q", imp.Module, "std::fmt")
+	}
+	if !rustStringSlicesEqual(imp.Symbols, []string{"Display"}) {
+		t.Errorf("import.Symbols = %v; want [Display]", imp.Symbols)
+	}
+	if imp.Alias != "" {
+		t.Errorf("import.Alias = %q; want empty (no `as` clause in the fixture)", imp.Alias)
+	}
+}
+
+// TestRustFixture_OverridesEdgeFromImplToTraitDefault pins
+// the implementation-plan §5.3 line 363 acceptance test for
+// the Pass 2d overrides edge. The dispatcher's Pass 2d emits
+// one `overrides` edge per impl method that satisfies BOTH:
+//
+//  1. MethodDecl.LangMeta["trait"] == <TraitName>
+//     (i.e. the method was declared inside an
+//     `impl Trait for Foo` block), AND
+//  2. the same-file methodNodeID lookup for
+//     `<TraitName>.<methodName>` succeeds AND the resolved
+//     trait method carries LangMeta["trait_default"] == true
+//     (i.e. the trait declared a DEFAULT body for the method,
+//     making the impl method an "override" rather than a
+//     "satisfies-required-spec").
+//
+// The fixture matches the workstream brief verbatim. Asserts
+// the parser-level proxies for (1) and (2) so a regression in
+// either LangMeta key surfaces here even when the test runs
+// without the canonical_dispatcher build tag. The
+// end-to-end overrides edge count = 1 lives in
+// TestDispatcherFixture_RustGraph_StageFiveThree
+// (parser_treesitter_rust_dispatcher_test.go,
+// //go:build cgo && canonical_dispatcher).
+func TestRustFixture_OverridesEdgeFromImplToTraitDefault(t *testing.T) {
+	// Fixture matches the Stage 5.3 workstream brief
+	// verbatim: trait/struct lack ``pub`` so a regression
+	// that silently drops non-public items is caught here
+	// (per rubber-duck iter-1 finding #1).
+	const src = `use std::fmt::Display;
+
+trait Greeter {
+    fn greet(&self, name: &str) -> String {
+        String::new()
+    }
+}
+
+struct GreeterImpl;
+
+impl Greeter for GreeterImpl {
+    fn greet(&self, name: &str) -> String {
+        format_greeting(name)
+    }
+}
+
+pub fn format_greeting(name: &str) -> String {
+    String::from(name)
+}
+`
+	p := NewTreeSitterRustParser()
+	res, err := p.Parse("src/lib.rs", []byte(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	byMethod := rustMethodByQN(res.Methods)
+
+	// (1) trait_default proxy on the trait method.
+	traitGreet, ok := byMethod["Greeter.greet"]
+	if !ok {
+		t.Fatalf("trait method Greeter.greet missing; got %v", rustMethodQNs(res.Methods))
+	}
+	if traitGreet.LangMeta == nil || traitGreet.LangMeta["trait_default"] != true {
+		t.Errorf("Greeter.greet.LangMeta[trait_default] = %v; want true (Pass 2d eligibility key on the TRAIT side)",
+			traitGreet.LangMeta)
+	}
+	if traitGreet.EnclosingClass != "Greeter" {
+		t.Errorf("Greeter.greet.EnclosingClass = %q; want \"Greeter\" (Pass 2d resolves the trait-side endpoint via EnclosingClass for the same-file methodNodeID lookup)",
+			traitGreet.EnclosingClass)
+	}
+
+	// (2) trait proxy on the impl method.
+	implGreet, ok := byMethod["GreeterImpl.greet"]
+	if !ok {
+		t.Fatalf("impl method GreeterImpl.greet missing; got %v", rustMethodQNs(res.Methods))
+	}
+	if implGreet.LangMeta == nil || implGreet.LangMeta["trait"] != "Greeter" {
+		t.Errorf("GreeterImpl.greet.LangMeta[trait] = %v; want \"Greeter\" (Pass 2d eligibility key on the IMPL side)",
+			implGreet.LangMeta)
+	}
+	if implGreet.EnclosingClass != "GreeterImpl" {
+		t.Errorf("GreeterImpl.greet.EnclosingClass = %q; want \"GreeterImpl\" (Pass 2d resolves the impl-side endpoint via EnclosingClass)",
+			implGreet.EnclosingClass)
+	}
+
+	// The free function MUST NOT carry either Pass 2d
+	// eligibility key — otherwise the dispatcher's Pass
+	// 2d would attempt a methodNodeID lookup for
+	// `<trait>.format_greeting` and could spuriously
+	// match an unrelated trait method elsewhere in the
+	// same file.
+	free, ok := byMethod["format_greeting"]
+	if !ok {
+		t.Fatalf("free function format_greeting missing; got %v", rustMethodQNs(res.Methods))
+	}
+	if free.LangMeta != nil {
+		if _, hasTrait := free.LangMeta["trait"]; hasTrait {
+			t.Errorf("format_greeting.LangMeta[trait] must NOT be set on a free function; got %v",
+				free.LangMeta)
+		}
+		if _, hasDefault := free.LangMeta["trait_default"]; hasDefault {
+			t.Errorf("format_greeting.LangMeta[trait_default] must NOT be set on a free function; got %v",
+				free.LangMeta)
+		}
+	}
+}
+
+// TestRustFixture_OverridesCrossFileMissIsSilent pins the
+// implementation-plan §5.3 line 364 acceptance test for the
+// cross-file overrides miss path (A4 rule in architecture
+// Section 7.2). The fixture contains an `impl Trait for Foo`
+// where the trait `Greeter` is NOT declared in the same file
+// — the parser must still tag the impl method with
+// `LangMeta["trait"]="Greeter"` (so a future cross-file
+// resolver can stitch the relationship) BUT the dispatcher's
+// Pass 2d methodNodeID lookup for `Greeter.greet` will miss
+// because the trait method is not in this file's symbol
+// table, and Pass 2d MUST drop the override silently rather
+// than mint a dangling edge.
+//
+// The parser-level assertion: the IMPL side still carries
+// `LangMeta["trait"]="Greeter"` (so cross-file resolution can
+// re-attempt later); the TRAIT side has no class/method node
+// in the local ParseResult (so the dispatcher's same-file
+// methodNodeID lookup will miss as required).
+//
+// The end-to-end "zero overrides edge" assertion lives in
+// TestDispatcherFixture_RustGraph_CrossFileNoOverrides
+// (parser_treesitter_rust_dispatcher_test.go,
+// //go:build cgo && canonical_dispatcher).
+func TestRustFixture_OverridesCrossFileMissIsSilent(t *testing.T) {
+	// `struct GreeterImpl;` is intentionally NOT prefixed
+	// with `pub` so the test matches the Stage 5.3 brief
+	// convention and would catch a regression that drops
+	// non-public items (per rubber-duck iter-1 finding #1).
+	const src = `struct GreeterImpl;
+
+impl Greeter for GreeterImpl {
+    fn greet(&self, name: &str) -> String {
+        String::from(name)
+    }
+}
+`
+	p := NewTreeSitterRustParser()
+	res, err := p.Parse("src/lib.rs", []byte(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Tight exact-count guard: only GreeterImpl is local;
+	// the cross-file Greeter trait MUST NOT be minted as a
+	// class node (per rubber-duck iter-1 finding #2).
+	if got := len(res.Classes); got != 1 {
+		t.Fatalf("expected 1 class node (local GreeterImpl only); got %d (%v)",
+			got, rustClassNames(res.Classes))
+	}
+
+	// The trait MUST NOT be minted as a class node (it lives
+	// in another file). Only GreeterImpl is declared here.
+	byClass := rustClassByName(res.Classes)
+	if _, ok := byClass["Greeter"]; ok {
+		t.Errorf("cross-file trait Greeter was minted as a class node; classes=%v",
+			rustClassNames(res.Classes))
+	}
+	if _, ok := byClass["GreeterImpl"]; !ok {
+		t.Fatalf("local struct GreeterImpl missing; classes=%v", rustClassNames(res.Classes))
+	}
+
+	// Tight exact-count guard: only the impl-side
+	// GreeterImpl.greet must exist; a regression that
+	// minted a phantom trait method would push this to 2.
+	if got := len(res.Methods); got != 1 {
+		t.Fatalf("expected 1 method node (impl-side GreeterImpl.greet only); got %d (%v)",
+			got, rustMethodQNs(res.Methods))
+	}
+
+	// The impl method MUST still carry the trait proxy so
+	// the cross-file resolver can stitch it later; the
+	// dispatcher's Pass 2d will simply miss in
+	// methodNodeID and drop the edge silently.
+	byMethod := rustMethodByQN(res.Methods)
+	implGreet, ok := byMethod["GreeterImpl.greet"]
+	if !ok {
+		t.Fatalf("impl method GreeterImpl.greet missing; got %v", rustMethodQNs(res.Methods))
+	}
+	if implGreet.LangMeta == nil || implGreet.LangMeta["trait"] != "Greeter" {
+		t.Errorf("GreeterImpl.greet.LangMeta[trait] = %v; want \"Greeter\" (cross-file resolver needs this even when same-file Pass 2d misses)",
+			implGreet.LangMeta)
+	}
+
+	// No trait method in the local ParseResult — the
+	// dispatcher's `Greeter.greet` methodNodeID lookup
+	// will miss as the A4 rule requires. We assert the
+	// absence of `Greeter.greet` (and the absence of any
+	// method node whose EnclosingClass is the cross-file
+	// trait) so a regression that minted a phantom trait
+	// method is caught.
+	if _, ok := byMethod["Greeter.greet"]; ok {
+		t.Errorf("phantom trait method Greeter.greet was minted; got %v",
+			rustMethodQNs(res.Methods))
+	}
+	for _, m := range res.Methods {
+		if m.EnclosingClass == "Greeter" {
+			t.Errorf("method %q has EnclosingClass=%q (cross-file trait must not enclose any local method)",
+				m.QualifiedName, m.EnclosingClass)
+		}
+	}
+}

@@ -302,6 +302,165 @@ Architecture: Sec 6.5 (Steward writer ownership).
 Canonical detail in this file: "### Operator rotation
 (signing key)" under Stage 4.1.
 
+### 7. Change a repo's AST mode (`mgmt.set_mode`)
+
+When the operator switches a repo between `embedded` and
+`linked` AST mode (e.g. during the Stage 10.5 migration).
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     -H 'X-OIDC-Subject: alice@acme.com' \
+     --data '{ "repo_id": "<uuid>",
+               "mode": "linked" }' \
+     https://clean-coded.example.com/v1/mgmt/set_mode
+```
+
+- `X-OIDC-Subject` is REQUIRED.
+- On a real transition: returns HTTP 200 with
+  `{"repo_id":"<uuid>","mode":"linked","previous_mode":"embedded","changed":true}`
+  and appends a `repo_event(kind='mode_changed',
+  payload={mode, previous_mode, actor})`.
+- On a no-op (mode already matches): returns HTTP 200 with
+  `changed:false` and appends NO event -- `mode_changed`
+  records a transition, not a re-assertion.
+- HTTP 404 if `repo_id` is unknown.
+
+Canonical detail in this file: "## Stage 6.2 --
+`mgmt.register_repo` and `mgmt.set_mode`" (search for
+`## Stage 6.2`), subsection "`mgmt.set_mode` semantics".
+Architecture: Sec 5.1.4 (`mode_changed` RepoEvent kind).
+Tech-spec: Sec 8.5 (`mgmt.set_mode` in the canonical
+verb registry).
+See also: `./rollout.md` Stage 10.5 for the
+`embedded` → `linked` migration playbook.
+
+### 8. Publish a policy version (`policy.publish`)
+
+When the operator creates a new signed policy version
+(rule refs, threshold refs, refactor weights).
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     --data '{ "name": "default-v3",
+               "rule_refs": [{"rule_id": "solid.srp.lcom4_high", "version": 1}],
+               "threshold_refs": [],
+               "refactor_weights": {
+                 "alpha": 0.4, "beta": 0.3, "gamma": 0.2, "delta": 0.1,
+                 "effort_model_version": "v1.0",
+                 "window_days": 90
+               } }' \
+     https://clean-coded.example.com/v1/policy/publish
+```
+
+- Append-only: each call creates a NEW `policy_version` row
+  with a fresh `policy_version_id` and an Ed25519 signature.
+- Every `rule_refs` entry MUST reference an existing
+  `(rule_id, version)` pair from a prior
+  `policy.publish_rulepack` call; unknown refs return 400.
+- HTTP 503 if no signing key is active
+  (`ErrNoActiveSigningKey`).
+
+Canonical detail in this file: the "Policy Steward"
+section (search for `### policy.publish body`).
+Architecture: Sec 5.3 (PolicyVersion schema); Sec 6.5
+(Steward writer ownership).
+Tech-spec: Sec 8.5 (`policy.publish` in the canonical
+verb registry).
+
+### 9. Activate a policy (`policy.activate`)
+
+When the operator makes a published policy version the
+active policy for the deployment.
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     --data '{ "policy_version_id": "f4c1...-uuid",
+               "activated_by": "alice@example" }' \
+     https://clean-coded.example.com/v1/policy/activate
+```
+
+- Append-only: a `policy_activation` row is inserted; the
+  latest row wins globally (v1 is single-tenant).
+- The body MUST NOT contain a `scope` field -- rejected
+  with 400 (`DisallowUnknownFields`).
+- HTTP 503 if no signing key is active.
+
+Canonical detail in this file: the "Policy Steward"
+section (search for `### policy.activate body`).
+Architecture: Sec 5.3.4 (single-tenant activation).
+Tech-spec: Sec 8.5 (`policy.activate` in the canonical
+verb registry).
+
+### 10. Register a rule pack (`policy.publish_rulepack`)
+
+When the operator registers a new rule pack (with its rules)
+into the policy catalogue.
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     --data '{ "pack_id": "solid.srp",
+               "version": 1,
+               "display_name": "Single Responsibility",
+               "description_md": "SOLID SRP rulepack.",
+               "rules": [
+                 { "rule_id": "solid.srp.lcom4_high",
+                   "version": 1,
+                   "predicate_dsl": "lcom4 > 0.7",
+                   "severity_default": "block",
+                   "description_md": "High LCOM4." }
+               ] }' \
+     https://clean-coded.example.com/v1/policy/publish_rulepack
+```
+
+- Pack + all rules are appended in a SINGLE transaction;
+  partial packs never persist.
+- Re-publishing the same `(pack_id, version)` returns
+  HTTP 409 (append-only contract).
+- Unsigned -- only `policy.publish` signs.
+- HTTP 503 if no signing key is active.
+
+Canonical detail in this file: the "Policy Steward"
+section (search for `### policy.publish_rulepack body`).
+Architecture: Sec 6.5 (Steward writer ownership).
+Tech-spec: Sec 8.5 (`policy.publish_rulepack` in the
+canonical verb registry).
+
+### 11. Evaluate a gate verdict (`eval.gate`)
+
+When the operator (or CI pipeline) requests a pass / warn /
+block verdict for a `(repo_id, sha)`.
+
+```bash
+curl -X POST \
+     -H 'Content-Type: application/json' \
+     --data '{ "repo_id": "<uuid>",
+               "sha": "abc1234..." }' \
+     https://clean-coded.example.com/v1/eval/gate
+```
+
+- Resolves the active `policy_version_id` from the latest
+  `policy_activation` row -- callers MUST NOT supply a
+  `policy_version_id` (rejected with 400; use
+  `/v1/eval/replay` for admin replays).
+- Returns `{ "verdict": "pass"|"warn"|"block",
+  "degraded": false|true, ... }`.
+- HTTP 409 (`ErrNoActivePolicy`) if no policy has been
+  activated yet.
+- NOT idempotent: each call writes a fresh
+  `evaluation_run` + `evaluation_verdict` row.
+
+Canonical detail in this file: "## Stage 6.1 --
+`eval.gate` verb and synchronous SOLID delegation"
+(search for `## Stage 6.1`).
+Architecture: Sec 3.7 (eval.gate sequence); Sec 5.4.2
+(verdict enum).
+Tech-spec: Sec 8.5 (`eval.gate` in the canonical verb
+registry).
+
 ## Stage 10.2 -- Aged mute insights report
 
 This section captures the operator-facing contract of the

@@ -1,8 +1,8 @@
 package recipes
 
 import (
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
+	"forge/services/clean-code/internal/ast/parser"
+	"forge/services/clean-code/internal/ast/scope"
 )
 
 // fanInMetricKind is the canonical metric_kind string for the

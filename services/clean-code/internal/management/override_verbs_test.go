@@ -13,7 +13,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
+	"forge/services/clean-code/internal/policy/steward"
 )
 
 // sampleOverrideBody mints a JSON body the Override handler

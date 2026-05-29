@@ -23,7 +23,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
+	"forge/services/clean-code/internal/metric_ingestor"
 )
 
 const pgStaleSweepTestSchema = "clean_code_stale_sweep_test"

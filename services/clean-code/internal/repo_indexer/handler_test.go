@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/repo_indexer"
+	"forge/services/clean-code/internal/repo_indexer"
 )
 
 // hmacTestSecret is the shared secret the HMAC-verified

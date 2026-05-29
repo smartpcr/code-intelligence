@@ -8,7 +8,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
+	"forge/services/clean-code/internal/ast/parser"
 )
 
 // InProcessWorkerFactory returns a [WorkerFactory] that, instead

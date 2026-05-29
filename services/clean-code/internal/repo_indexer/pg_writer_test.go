@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/repo_indexer"
+	"forge/services/clean-code/internal/repo_indexer"
 )
 
 // TestNewPGCatalogWriter_RejectsNilDB pins the

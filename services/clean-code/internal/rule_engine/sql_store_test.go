@@ -14,7 +14,7 @@ import (
 	"github.com/gofrs/uuid"
 	_ "github.com/lib/pq"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
+	"forge/services/clean-code/internal/policy/steward"
 )
 
 // envSQLStoreURL is the libpq DSN the rule_engine SQLStore

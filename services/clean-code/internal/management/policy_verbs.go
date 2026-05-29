@@ -10,7 +10,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
+	"forge/services/clean-code/internal/policy/steward"
 )
 
 // Canonical HTTP paths for the Stage 5.2 write verbs. Pinned

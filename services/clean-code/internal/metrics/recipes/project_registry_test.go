@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
+	"forge/services/clean-code/internal/metrics/recipes"
 )
 
 // TestDefaultProjectRegistry_Stage25BasePack pins the

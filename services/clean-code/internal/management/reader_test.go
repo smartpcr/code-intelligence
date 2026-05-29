@@ -29,7 +29,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/management/insights"
+	"forge/services/clean-code/internal/management/insights"
 )
 
 // -----------------------------------------------------------

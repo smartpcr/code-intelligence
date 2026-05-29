@@ -4,11 +4,11 @@ import (
 	"context"
 	"testing"
 
-	astv1 "github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/v1"
+	astv1 "forge/services/clean-code/internal/ast/v1"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
+	"forge/services/clean-code/internal/ast/parser"
+	"forge/services/clean-code/internal/ast/scope"
+	"forge/services/clean-code/internal/metrics/recipes"
 )
 
 // TestLocRecipe_MetricKindIsCanonical pins the literal `loc`

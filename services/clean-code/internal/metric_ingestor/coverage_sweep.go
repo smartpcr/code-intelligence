@@ -8,7 +8,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/coverage"
+	"forge/services/clean-code/internal/ingest/coverage"
 )
 
 // ErrCoverageSHAMismatch is returned by [CoverageSweep.Run]

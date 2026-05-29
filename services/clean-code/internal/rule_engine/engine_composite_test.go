@@ -7,8 +7,8 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/dsl"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
+	"forge/services/clean-code/internal/policy/dsl"
+	"forge/services/clean-code/internal/policy/steward"
 )
 
 // Stage 5.7 evaluator feedback item #7 -- the engine MUST

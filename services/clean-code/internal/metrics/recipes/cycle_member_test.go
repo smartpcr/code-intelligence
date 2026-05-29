@@ -5,10 +5,10 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
-	astv1 "github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/v1"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
+	"forge/services/clean-code/internal/ast/parser"
+	astv1 "forge/services/clean-code/internal/ast/v1"
+	"forge/services/clean-code/internal/ast/scope"
+	"forge/services/clean-code/internal/metrics/recipes"
 )
 
 // makePkgFile is a tiny helper that builds a fresh AstFile

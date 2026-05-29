@@ -9,8 +9,8 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/reconciler"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
+	"forge/services/clean-code/internal/audit/reconciler"
+	"forge/services/clean-code/internal/policy/keys"
 )
 
 // WALReconcilerConfig configures the composition-root factory

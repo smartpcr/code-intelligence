@@ -12,9 +12,9 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/lib/pq"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/dsl"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
+	"forge/services/clean-code/internal/audit/wal"
+	"forge/services/clean-code/internal/policy/dsl"
+	"forge/services/clean-code/internal/policy/steward"
 )
 
 // DefaultSchema is the canonical PostgreSQL schema the

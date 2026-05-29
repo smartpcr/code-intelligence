@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
+	"forge/services/clean-code/internal/ast/scope"
 )
 
 // recover_must_panic_with helper -- ensures the deferred

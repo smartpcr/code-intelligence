@@ -10,7 +10,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/aggregator"
+	"forge/services/clean-code/internal/aggregator"
 )
 
 // fixedClock returns a constant time -- the aggregator stamps

@@ -27,7 +27,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/churn"
+	"forge/services/clean-code/internal/ingest/churn"
 )
 
 // pgChurnTestSchema is the deliberately non-production

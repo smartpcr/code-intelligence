@@ -11,7 +11,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook"
+	"forge/services/clean-code/internal/ingest/webhook"
 )
 
 func hashOf(body string) webhook.PayloadHash {

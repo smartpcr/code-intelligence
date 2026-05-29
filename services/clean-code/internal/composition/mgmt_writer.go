@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
+	"forge/services/clean-code/internal/management"
+	"forge/services/clean-code/internal/metric_ingestor"
 )
 
 // BuildMgmtWriter assembles the production

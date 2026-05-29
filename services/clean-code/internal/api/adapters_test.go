@@ -10,9 +10,9 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
+	"forge/services/clean-code/internal/ingest/webhook"
+	"forge/services/clean-code/internal/management"
+	"forge/services/clean-code/internal/policy/steward"
 )
 
 // TestNewProductionWiring_AllDepsNil pins the contract:

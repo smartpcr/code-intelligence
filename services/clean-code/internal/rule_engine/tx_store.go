@@ -10,8 +10,8 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/lib/pq"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
+	"forge/services/clean-code/internal/audit/wal"
+	"forge/services/clean-code/internal/policy/steward"
 )
 
 // txStore is the transaction-scoped [Store] handed to the

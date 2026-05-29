@@ -13,7 +13,7 @@ import (
 	"github.com/gofrs/uuid"
 	_ "github.com/lib/pq"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
+	"forge/services/clean-code/internal/policy/keys"
 )
 
 // envSQLStoreURL is the libpq DSN the SQLStore live tests

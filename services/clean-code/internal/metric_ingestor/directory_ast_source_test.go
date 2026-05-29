@@ -9,7 +9,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
+	"forge/services/clean-code/internal/metric_ingestor"
 )
 
 func TestDirectoryAstFileSource_MissingRoot(t *testing.T) {

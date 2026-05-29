@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
+	"forge/services/clean-code/internal/policy/steward"
 )
 
 // overrideWireRequest is the inbound wire shape for the

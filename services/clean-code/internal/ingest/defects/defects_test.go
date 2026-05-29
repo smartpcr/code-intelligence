@@ -7,7 +7,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/defects"
+	"forge/services/clean-code/internal/ingest/defects"
 )
 
 // fixedRepoID is a stable non-zero UUID for the happy-path

@@ -9,7 +9,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
+	"forge/services/clean-code/internal/management"
 )
 
 // stubMetricsBackend implements management.MetricsBackend for

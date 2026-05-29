@@ -9,7 +9,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/repo_indexer"
+	"forge/services/clean-code/internal/repo_indexer"
 )
 
 // This file teaches [PGScanRunStore] the

@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/management/insights"
+	"forge/services/clean-code/internal/management/insights"
 )
 
 // fixedAgedMuteClock pins a deterministic [insights.Clock] for

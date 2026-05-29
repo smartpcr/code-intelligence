@@ -10,7 +10,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
+	"forge/services/clean-code/internal/metrics/recipes"
 )
 
 // deterministicUUID returns a per-test counter-based UUID

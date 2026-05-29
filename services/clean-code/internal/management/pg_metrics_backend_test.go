@@ -44,7 +44,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/management"
+	"forge/services/clean-code/internal/management"
 )
 
 const pgMetricsTestSchema = "clean_code_mgmt_test"

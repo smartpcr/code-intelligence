@@ -10,8 +10,8 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/churn"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
+	"forge/services/clean-code/internal/ingest/churn"
+	"forge/services/clean-code/internal/metric_ingestor"
 )
 
 // recordingDispatcher is a test fake for

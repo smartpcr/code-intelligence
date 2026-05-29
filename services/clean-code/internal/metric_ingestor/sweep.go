@@ -5,7 +5,7 @@
 //
 //  1. [ChurnSweep] -- the writer-side pipeline for the
 //     `modification_count_in_window` materialiser
-//     ([github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/materialisers]).
+//     ([forge/services/clean-code/internal/metrics/materialisers]).
 //  2. [Ingestor] -- the per-ScanRun COORDINATOR that owns
 //     dispatch ordering between the foundation-tier recipe
 //     loop ([FoundationRecipeDispatcher]) and the
@@ -81,9 +81,9 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/churn"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/materialisers"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
+	"forge/services/clean-code/internal/ingest/churn"
+	"forge/services/clean-code/internal/metrics/materialisers"
+	"forge/services/clean-code/internal/metrics/recipes"
 )
 
 // Sentinel errors. Surfaced as wrapped errors so the

@@ -3,8 +3,8 @@ package recipes_test
 import (
 	"testing"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
+	"forge/services/clean-code/internal/ast/scope"
+	"forge/services/clean-code/internal/metrics/recipes"
 )
 
 // findMethodDraft locates the draft for `methodLocalID` in

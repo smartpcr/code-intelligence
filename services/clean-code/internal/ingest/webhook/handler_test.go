@@ -15,10 +15,10 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/churn"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metric_ingestor"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/materialisers"
+	"forge/services/clean-code/internal/ingest/churn"
+	"forge/services/clean-code/internal/ingest/webhook"
+	"forge/services/clean-code/internal/metric_ingestor"
+	"forge/services/clean-code/internal/metrics/materialisers"
 )
 
 // fixedRepoID is a stable repo_id literal so the deterministic

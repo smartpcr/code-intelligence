@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ingest/webhook"
+	"forge/services/clean-code/internal/ingest/webhook"
 )
 
 // hmacUnitSecret is the deterministic secret every HMAC unit

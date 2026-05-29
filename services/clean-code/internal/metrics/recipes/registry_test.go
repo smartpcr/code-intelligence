@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
+	"forge/services/clean-code/internal/metrics/recipes"
 )
 
 // TestDefaultRegistry_FoundationTierRecipes is the

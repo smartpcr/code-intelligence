@@ -5,8 +5,8 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
+	"forge/services/clean-code/internal/audit/wal"
+	"forge/services/clean-code/internal/policy/keys"
 )
 
 // NewKeysManagerWALSigner adapts a `policy/keys.Manager` to

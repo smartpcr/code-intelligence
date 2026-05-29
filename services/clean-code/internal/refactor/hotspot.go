@@ -9,8 +9,8 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
+	"forge/services/clean-code/internal/policy/steward"
+	"forge/services/clean-code/internal/rule_engine"
 )
 
 // Canonical input metric_kind constants for the composite

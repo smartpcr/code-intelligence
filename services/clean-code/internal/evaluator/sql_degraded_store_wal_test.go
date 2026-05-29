@@ -12,7 +12,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
+	"forge/services/clean-code/internal/audit/wal"
 )
 
 // TestSQLDegradedRunStore_AppendDegradedRun_EmitsWALFramesAroundEachInsert

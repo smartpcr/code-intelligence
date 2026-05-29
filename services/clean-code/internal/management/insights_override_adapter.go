@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/management/insights"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
+	"forge/services/clean-code/internal/management/insights"
+	"forge/services/clean-code/internal/policy/steward"
 )
 
 // OverrideReaderFromStore is the production bridge from a

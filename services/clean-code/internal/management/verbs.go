@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/keys"
+	"forge/services/clean-code/internal/policy/keys"
 )
 
 // VerbListActivePath is the canonical HTTP path the

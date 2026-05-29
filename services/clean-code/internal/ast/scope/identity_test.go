@@ -7,7 +7,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
+	"forge/services/clean-code/internal/ast/scope"
 )
 
 // mustRepoID is a test-only helper turning a literal canonical

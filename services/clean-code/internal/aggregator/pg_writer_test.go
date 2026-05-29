@@ -9,7 +9,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/aggregator"
+	"forge/services/clean-code/internal/aggregator"
 )
 
 const pgWriterTestSchema = "clean_code_aggregator_test"

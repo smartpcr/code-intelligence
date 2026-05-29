@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/config"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/materialisers"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
+	"forge/services/clean-code/internal/ast/scope"
+	"forge/services/clean-code/internal/config"
+	"forge/services/clean-code/internal/metrics/materialisers"
+	"forge/services/clean-code/internal/metrics/recipes"
 )
 
 // fixedClock returns a closure that always reports `t`. The

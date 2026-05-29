@@ -6,7 +6,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/audit/wal"
+	"forge/services/clean-code/internal/audit/wal"
 )
 
 // Verifier is the narrow port the [Reconciler] uses to

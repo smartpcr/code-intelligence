@@ -54,7 +54,7 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/isolation"
+	"forge/services/clean-code/internal/ast/isolation"
 )
 
 // TestMgmtSetMode_DrainsInFlightScansThenFlips is the

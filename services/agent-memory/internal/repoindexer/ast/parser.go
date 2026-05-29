@@ -347,6 +347,18 @@ type Import struct {
 	// Module is the imported module specifier (e.g.
 	// `"./utils"`, `"os"`, `"@scope/pkg"`).
 	Module string
+	// Path is the raw / on-disk form of the imported module
+	// reference. For most parsers it mirrors `Module`
+	// verbatim; the field is present so subprocess-backed
+	// parsers (the PowerShell `pwsh` extractor in
+	// parser_powershell.go is the v1 caller) can preserve
+	// the original argument text the host process emitted
+	// without losing fidelity at the dispatcher boundary.
+	// Consumers that do not care about the distinction
+	// should fall back to `Module`. Parsers that do not
+	// populate `Path` (TS / Python / Go / Rust / C / C++ /
+	// C# in v1) leave it as the zero value.
+	Path string
 	// Symbols lists the named symbols imported from Module.
 	// Empty for whole-module imports (`import os`,
 	// `import "./utils"`).
@@ -410,34 +422,21 @@ func RegisterParser(p Parser) {
 	}
 }
 
-// Edge represents a directed relationship between two nodes.
-type Edge struct {
-	Kind   string
-	Source string
-	Target string
-}
-
-// Node represents an AST-derived graph node.
-type Node struct {
-	Kind string
-	Name string
-}
-
-// EmitResult summarises the output of an EmitFile call.
-type EmitResult struct {
-	NodeCount int
-	EdgeCount int
-}
-
-// Writer receives nodes and edges produced by the emitter.
+// Edge, Node, EmitResult, and Logger are declared in
+// dispatcher.go (the canonical home, as the dispatcher itself
+// is the only consumer of these types in the v1 surface).
+// PR #173 (sibling Rust register-cgo E2E) erroneously
+// re-declared them here as "additive surfaces", which made
+// the package fail to compile (`Edge redeclared in this
+// block`). This stage (PowerShell register-cgo) removes the
+// duplicates so the build is green for downstream merges.
+// `Writer` remains here because it is a distinct interface
+// name (vs `NodeEdgeWriter` in dispatcher.go) and has no
+// collision; it relies on `Node` / `Edge` declared in
+// dispatcher.go and resolves within the same package.
 type Writer interface {
 	InsertNode(n Node) error
 	InsertEdge(e Edge) error
-}
-
-// Logger receives structured log events from the dispatcher.
-type Logger interface {
-	Log(event string, fields map[string]string)
 }
 
 // SelectParser returns the registered parser for the given filename's

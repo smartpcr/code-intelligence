@@ -630,16 +630,21 @@ func formatGreeting(prefix, name string) string {
 			len(pkgs), pkgs)
 	}
 	// Pin the package-node attrs that `packageAttrsJSON` in
-	// dispatcher.go actually emits: `module` (the import
-	// specifier) and `source="external"` (every Pass 0 module
-	// is external by construction). `language` is intentionally
-	// NOT asserted -- it is NOT part of packageAttrsJSON's
-	// output today.
+	// dispatcher.go emits today: `module` (the import
+	// specifier), `source="external"` (every Pass 0 module
+	// is external by construction), and `language` (the
+	// producing parser's Language() string, threaded in at
+	// the Pass-0 call site by iter-3 of this workstream to
+	// land the sibling C dispatcher test's `language="c"`
+	// assertion -- see `parser_treesitter_c_dispatcher_test.go:128`).
 	if got := goAttrString(t, pkgs[0].AttrsJSON, "module"); got != "fmt" {
 		t.Errorf("fmt attrs.module = %q; want %q", got, "fmt")
 	}
 	if got := goAttrString(t, pkgs[0].AttrsJSON, "source"); got != "external" {
 		t.Errorf("fmt attrs.source = %q; want %q", got, "external")
+	}
+	if got := goAttrString(t, pkgs[0].AttrsJSON, "language"); got != "go" {
+		t.Errorf("fmt attrs.language = %q; want %q", got, "go")
 	}
 
 	// ----- node ids by canonical signature -----

@@ -47,25 +47,19 @@ import (
 // the entry here AND the corresponding section in the .md
 // doc.
 var expectedBaselineFailures = map[string][]string{
-	// The C++ and C# tree-sitter parsers are intentionally
-	// incomplete stubs landed by earlier parser-stage
-	// workstreams. parser_treesitter_cpp.go declares (in
-	// its file header) that "Methods, free functions,
-	// calls, and includes are out of scope here; sibling
-	// stages own them"; parser_treesitter_csharp.go
-	// declares itself a "PLACEHOLDER... SIBLING STAGE
-	// WORKSTREAM owns the full C# implementation". The
-	// corresponding fixture tests assert the *finished*
-	// extractor contract (Greeter.greet, Base.identify,
-	// log_global; C# classes/methods/inheritance), so they
-	// fail on the current stubs by design. The C++-parser
-	// and C#-parser sibling stages own removing these
-	// waivers; this workstream (Go fixture test) is not
-	// the owner.
-	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/repoindexer/ast": {
-		"TestCppFixture_EmitsExpectedNodeAndEdgeSet",
-		"TestCSharpFixture_EmitsExpectedNodeAndEdgeSet",
-	},
+	// No baseline failures remain in this repository. As
+	// of iter-4 of the Go-fixture-test stage the C++
+	// (Methods/Calls/Imports) and C#
+	// (Classes/Methods/Inheritance/Using) walkers landed
+	// in `parser_treesitter_cpp.go` and
+	// `parser_treesitter_csharp.go` as a cross-cutting
+	// baseline-repair authorised by the operator's pinned
+	// answer to the `baseline-package-break` open
+	// question. The previously-waived
+	// `TestCppFixture_EmitsExpectedNodeAndEdgeSet` and
+	// `TestCSharpFixture_EmitsExpectedNodeAndEdgeSet`
+	// tests now PASS, so leaving them registered here
+	// would trip the stale-waiver guard below.
 }
 
 // TestBaselineFailuresAreOnlyDocumentedOnes runs

@@ -232,6 +232,84 @@ edges). The orchestrator's validator is expected to run the
 contract test on every iter regardless of CGO availability,
 and the full CGO suite on CI's Linux runner.
 
+## AST parser support matrix (architecture §8.5)
+
+This is the canonical hand-off table referenced by
+`docs\stories\code-intelligence-AST-PARSER-FOR-ADDIT\architecture.md`
+Section 8.5 ("Documentation deliverable"). It is the single
+source of truth for which AST languages are supported under
+which build tag, and which skip-reason the dispatcher emits when
+a language cannot be parsed on the host. The legacy tables
+earlier in this file (the original "AST parser language support
+matrix" and the "AST parser support matrix (Stage 3.2)" table)
+document Stage-3.2 historical state and the per-stage walker
+details; this Section-8.5 table is what consumers should read
+to answer "is language X supported on build configuration Y,
+and if not, what shows up in the logs?".
+
+| Language                | CGO=on (production)             | CGO=off (`make test` portable)  | Notes                                                                                                                                                                                                                                                |
+| ----------------------- | ------------------------------- | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TypeScript / JavaScript | NOT supported -- files skipped  | NOT supported -- files skipped  | Extensions `.ts .tsx .js .jsx .mjs .cjs`. The tree-sitter walker (`NewTreeSitterTypeScriptParser` in `parser_treesitter.go`, gated by `//go:build cgo`) and the stdlib scanner fallback (`NewTypeScriptParser` in `parser_typescript.go`, build-tag-agnostic) BOTH exist and are individually unit-tested, but NEITHER is wired into `defaultParsers()` -- see `parsers_cgo.go` (registers only C / C++ / C# / Go / Rust / PowerShell) and `parsers_nocgo.go` (registers only PowerShell). No service-layer `WithParsers(...)` call adds them, so the production `NewDispatcher(fw)` extension lookup misses under both build tags and emits `ast.dispatch.skip{reason:"no_parser"}` per file -- identical behaviour to the CGO-dependent languages under CGO=off. Production wiring is a follow-up; see the `// future` note in `parser_typescript.go::NewTypeScriptParser`. |
+| Python                  | NOT supported -- files skipped  | NOT supported -- files skipped  | Extensions `.py .pyi`. Mirrors TypeScript: tree-sitter walker (`NewTreeSitterPythonParser` in `parser_treesitter.go`, `//go:build cgo`) and scanner fallback (`NewPythonParser` in `parser_python.go`) both exist but neither is registered in `defaultParsers()`. Files are skipped with `ast.dispatch.skip{reason:"no_parser"}` under both build tags.                                                                                                                                                                                                                                                                                                                                                                                              |
+| C                       | tree-sitter                     | NOT supported -- files skipped  | Extensions `.c .h`. **Requires CGO.** Under CGO=off `defaultParsers()` does not register the parser; the dispatcher emits `ast.dispatch.skip{reason:"no_parser"}` per file and continues.                                                            |
+| C++                     | tree-sitter                     | NOT supported -- files skipped  | Extensions `.cc .cpp .cxx .c++ .hpp .hh .hxx .h++` (`.h` routes to C per §9 R6). **Requires CGO.** Under CGO=off files are skipped with `ast.dispatch.skip{reason:"no_parser"}`.                                                                     |
+| C#                      | tree-sitter                     | NOT supported -- files skipped  | Extension `.cs`. **Requires CGO.** Under CGO=off files are skipped with `ast.dispatch.skip{reason:"no_parser"}`.                                                                                                                                     |
+| Go                      | tree-sitter                     | NOT supported -- files skipped  | Extension `.go`. **Requires CGO.** Under CGO=off files are skipped with `ast.dispatch.skip{reason:"no_parser"}`.                                                                                                                                     |
+| Rust                    | tree-sitter                     | NOT supported -- files skipped  | Extension `.rs`. **Requires CGO.** Under CGO=off files are skipped with `ast.dispatch.skip{reason:"no_parser"}` (asserted by `TestDefaultParsers_NoCGOOmitsRust` in `parsers_nocgo_rust_test.go`).                                                   |
+| PowerShell              | `pwsh` subprocess (Section 6)   | `pwsh` subprocess (same impl)   | Extensions `.ps1 .psm1 .psd1`. **No CGO dependency** -- registers under both `//go:build cgo` and `//go:build !cgo`. **Requires `pwsh` on PATH** (either build tag); when absent the parser returns `ErrParserUnavailable` and the dispatcher emits `ast.dispatch.skip{reason:"pwsh_not_available"}` per file and continues. |
+
+Skip-reason summary (verbatim structured-log keys per
+architecture §8.3):
+
+- **TypeScript / JavaScript / Python parsers exist but are
+  not wired into `defaultParsers()`.** Both a tree-sitter
+  walker (CGO=on, in `parser_treesitter.go`:
+  `NewTreeSitterTypeScriptParser` / `NewTreeSitterPythonParser`)
+  and a stdlib scanner (CGO=off-safe, in `parser_typescript.go`:
+  `NewTypeScriptParser` and `parser_python.go`:
+  `NewPythonParser`) are implemented and individually
+  fixture-tested, but `parsers_cgo.go::defaultParsers()` and
+  `parsers_nocgo.go::defaultParsers()` register NEITHER, and
+  no service-layer `WithParsers(...)` call adds them (the
+  only `WithParsers(...)` callers in the repo are tests). As
+  a result the production `NewDispatcher(fw)` routes
+  `.ts` / `.tsx` / `.js` / `.jsx` / `.mjs` / `.cjs` /
+  `.py` / `.pyi` files through the `no_parser` skip branch
+  (`ast.dispatch.skip{reason:"no_parser"}` at Info level)
+  under BOTH build tags -- identical behaviour to the
+  CGO-dependent languages under CGO=off. Wiring TS / JS /
+  Python production support is a separate task; see the
+  `// future` note in `parser_typescript.go::NewTypeScriptParser`
+  and the constructor docs in `parser_treesitter.go`.
+- **C / C++ / C# / Go / Rust require CGO.** Under CGO=off
+  builds (the default `make test` portable gate on stock
+  Windows toolchains), these languages have NO parser
+  registered in `defaultParsers()`. The dispatcher's
+  extension lookup misses and it emits
+  `ast.dispatch.skip{reason:"no_parser"}` per file at Info
+  level (same skip key used for any unrecognized extension),
+  then continues draining its queue. To exercise the
+  tree-sitter back-ends locally set `CGO_ENABLED=1` and put a
+  C compiler (gcc / clang / tdm-gcc) on PATH; the canonical
+  exerciser is `make test-cgo` in `services\agent-memory`
+  and CI's `make test-race` step in
+  `.github\workflows\agent-memory-ci.yml`.
+- **PowerShell requires `pwsh` on PATH (either build tag).**
+  The `pwsh`-subprocess parser registers under BOTH
+  `//go:build cgo` and `//go:build !cgo` (it has no
+  compile-time CGO dependency), so PowerShell coverage does
+  not depend on the CGO build tag. It DOES depend on the
+  PowerShell SDK being installed: when `exec.LookPath("pwsh")`
+  fails at parser-construction time, `Parse()` returns
+  `ErrParserUnavailable` (wrapped with `reason=pwsh_not_available`).
+  The dispatcher's sentinel branch (architecture §2.2.1)
+  detects this with `errors.Is` and logs
+  `ast.dispatch.skip{reason:"pwsh_not_available"}` at Info
+  level per file -- it does NOT escalate to `ast.parse.error`
+  and does NOT abort the worker. Genuine pwsh parse failures
+  (and the 10s per-file timeout `defaultPowerShellTimeout`)
+  surface as un-wrapped errors that DO trip `ast.parse.error`.
+
 ## Current local validation caveats
 
 

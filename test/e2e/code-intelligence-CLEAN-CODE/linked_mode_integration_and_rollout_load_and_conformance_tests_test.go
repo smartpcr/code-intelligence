@@ -210,6 +210,7 @@ import { Trend } from 'k6/metrics';
 const evalGate = new Trend('eval_gate', true);
 
 export const options = {
+  summaryTrendStats: ['avg','min','med','max','p(50)','p(95)','p(99)'],
   scenarios: {
     load_test: {
       executor: 'constant-arrival-rate',
@@ -281,6 +282,19 @@ export default function () {
 	metric, ok := summary.Metrics["eval_gate"]
 	if !ok {
 		return fmt.Errorf("eval_gate metric not found in k6 summary")
+	}
+	var missing []string
+	if _, ok := metric.Values["p(50)"]; !ok {
+		missing = append(missing, "p(50)")
+	}
+	if _, ok := metric.Values["p(95)"]; !ok {
+		missing = append(missing, "p(95)")
+	}
+	if _, ok := metric.Values["p(99)"]; !ok {
+		missing = append(missing, "p(99)")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("k6 summary missing percentile(s) %v; ensure summaryTrendStats includes them", missing)
 	}
 	s.p50ms = metric.Values["p(50)"]
 	s.p95ms = metric.Values["p(95)"]

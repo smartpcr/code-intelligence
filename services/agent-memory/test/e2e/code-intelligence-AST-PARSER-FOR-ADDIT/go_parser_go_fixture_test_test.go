@@ -19,15 +19,6 @@ import (
 // Shared helpers (unique per-stage to avoid collisions in e2e package)
 // ---------------------------------------------------------------------------
 
-func requireEnv_go_fixture_test(t *testing.T, name string) string {
-	t.Helper()
-	v, ok := os.LookupEnv(name)
-	if !ok || v == "" {
-		t.Skipf("required env var %s is not set", name)
-	}
-	return v
-}
-
 func goFixtureModuleRoot() (string, error) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {

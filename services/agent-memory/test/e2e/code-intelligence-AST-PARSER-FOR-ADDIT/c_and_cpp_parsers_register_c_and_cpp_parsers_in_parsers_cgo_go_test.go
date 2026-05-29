@@ -55,7 +55,7 @@ func TestE2EProbe_CCppRegistration(t *testing.T) {
 	}
 
 	d := NewDispatcher(&e2eCCppRegSpyWriter{})
-	p := d.pickParser(filename, hints)
+	p := d.selectParser(filename, hints)
 
 	out := e2eCCppRegResult{Found: p != nil}
 	if p != nil {

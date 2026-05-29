@@ -141,6 +141,9 @@ func (s *loadConformanceState) itInventoriesMetricKindReferences(ctx context.Con
 }
 
 func (s *loadConformanceState) noReferenceUsesANonCanonicalAlias(ctx context.Context) error {
+	if len(s.references) == 0 {
+		return fmt.Errorf("no metric_kind references found — verify scan patterns")
+	}
 	for _, ref := range s.references {
 		if !canonicalMetricKinds[ref.Value] {
 			s.violations = append(s.violations, ref)

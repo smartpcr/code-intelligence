@@ -15,7 +15,6 @@ MIGRATIONS_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))migrations
 # ---------------------------------------------------------------------------
 
 BIN_DIR             := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))bin
-CLEAN_CODED         := $(BIN_DIR)/clean-coded
 
 GO                  ?= go
 DOCKER              ?= docker
@@ -30,8 +29,15 @@ PROTOC              ?= protoc
 PROTOC_GEN_GO_VERSION ?= v1.36.11
 
 GO_PKGS             ?= ./...
+TEST_FLAGS          ?= -count=1
 DOCKER_IMAGE        ?= clean-code/clean-coded:dev
-CLEAN_CODE_MAIN_PKG ?= ./cmd/clean-coded
+
+# CMD_DIRS lists every `cmd/*` package that produces a binary.
+# Iterating over this list is how `make build` emits a binary
+# per service (the legacy single-binary layout that built a
+# `clean-coded` binary from `./cmd/clean-coded` was removed in
+# #89; the service is now a fleet of focused entry points).
+CMD_DIRS            := $(notdir $(patsubst %/,%,$(dir $(wildcard cmd/*/main.go))))
 
 # Inputs to `make proto`. Stage 2.1 ships exactly one .proto file
 # (`proto/ast/v1/ast.proto`); add new IDLs here as the canonical
@@ -55,40 +61,32 @@ COMPOSE_FILE ?= ../../tests/e2e/phase-09-audit-wal/docker-compose.yml
 .PHONY: migrate-up migrate-down seed-phase-09 test-phase-09
 
 build:
-	$(GO) build -o $(CLEAN_CODED) $(CLEAN_CODE_MAIN_PKG)
+	@mkdir -p $(BIN_DIR)
+	@for cmd in $(CMD_DIRS); do \
+	    echo "$(GO) build -o $(BIN_DIR)/$$cmd ./cmd/$$cmd"; \
+	    $(GO) build -o $(BIN_DIR)/$$cmd ./cmd/$$cmd || exit $$?; \
+	done
 
-## test: developer-facing wrapper. Runs the fallback path
-## (`test-nocgo`) unconditionally, then attempts the cgo path
-## via the `try-cgo` helper mode, which probes for a C compiler
-## in Go (portable across POSIX shells AND Windows cmd.exe).
-## On a developer host without gcc/cc/clang, the cgo half emits
-## a visible skip notice and exits 0 -- enough for local
-## iteration. CI does NOT rely on this conditional: it invokes
-## `make test-nocgo` AND `make test-cgo` as SEPARATE
-## non-optional steps (see `.github/workflows/clean-code-ci.yml`)
-## so the supported tree-sitter path is ALWAYS validated.
+## test: run the full Go test suite. CI overrides via
+## `test-nocgo` / `test-cgo` for explicit CGO mode pinning.
 test:
-	$(GO) run ./cmd/maketest nocgo
-	$(GO) run ./cmd/maketest try-cgo
+	$(GO) test $(TEST_FLAGS) $(GO_PKGS)
 
 ## test-nocgo: exercise the `//go:build !cgo` lexer-fallback
 ## adapters for Python / TypeScript / Java (and stdlib parser
 ## for Go). MUST be runnable on hosts without a C compiler --
 ## this is the fallback contract the !cgo build tag exists for.
-## Delegates to `cmd/maketest` so the recipe works identically
-## in POSIX shells AND Windows cmd.exe.
 test-nocgo:
-	$(GO) run ./cmd/maketest nocgo
+	CGO_ENABLED=0 $(GO) test $(TEST_FLAGS) $(GO_PKGS)
 
 ## test-cgo: exercise the `//go:build cgo` tree-sitter-backed
 ## adapters. Requires a working C toolchain (`gcc` / `cc` /
 ## `clang`). CI runs this target as a NON-OPTIONAL step on
 ## Linux runners (ubuntu-latest ships gcc by default) -- the
 ## explicit step ensures the supported tree-sitter path is
-## ALWAYS validated, never silently skipped. Delegates to
-## `cmd/maketest` for cross-shell portability.
+## ALWAYS validated, never silently skipped.
 test-cgo:
-	$(GO) run ./cmd/maketest cgo
+	CGO_ENABLED=1 $(GO) test $(TEST_FLAGS) $(GO_PKGS)
 
 test-race:
 	$(GO) test -race $(GO_PKGS)

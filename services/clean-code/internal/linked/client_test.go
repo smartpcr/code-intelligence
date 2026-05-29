@@ -315,11 +315,15 @@ func TestFetchEdges_RejectsUnknownJSONFields(t *testing.T) {
 	t.Parallel()
 	// DisallowUnknownFields ensures wire-shape drift surfaces
 	// as a hard error rather than silently dropping data.
+	// The production default is tolerant (forward-compat with
+	// additive agent-memory wire fields); strict decoding is
+	// opt-in via WithStrictDecoding(true) for contract tests
+	// and canary deploys.
 	url := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"xrepo_edges":[],"unknown_field":1}`)
 	})
-	c, _ := NewHTTPClient(url)
+	c, _ := NewHTTPClient(url, WithStrictDecoding(true))
 	_, err := c.FetchEdges(context.Background(), mustUUID(t, "11111111-1111-1111-1111-111111111111"), "deadbeef")
 	if !errors.Is(err, ErrMalformedResponse) {
 		t.Fatalf("FetchEdges err = %v, want ErrMalformedResponse (DisallowUnknownFields should catch unknown_field)", err)

@@ -9,6 +9,7 @@ package aggregator_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"testing"
@@ -343,6 +344,70 @@ func TestAggregator_LinkedReader_CtxDeadlineErrorAbortsTick(t *testing.T) {
 	_, err = agg.Tick(context.Background())
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Tick err = %v, want context.DeadlineExceeded propagated", err)
+	}
+}
+
+// TestAggregator_LinkedReader_ModeStoreError_AbortsTick pins
+// the FATAL classification for mode-store errors. When the
+// reader returns an error wrapping [aggregator.ErrLinkedModeStore]
+// (as production's `linked.AggregatorAdapter.ResolveLinkedEdges`
+// does when `ReadRepoMode` fails), the tick MUST:
+//
+//  1. abort with a non-nil error,
+//  2. carry BOTH the sentinel AND the raw cause on the error
+//     chain (operators inspect raw cause; the aggregator
+//     classifies via the sentinel), AND
+//  3. NOT increment `Report.LinkedEdgeFetchFailures` (that
+//     counter is reserved for class-3 agent-memory remote
+//     faults; a spike must unambiguously point at agent-memory
+//     uptime, not at a Postgres outage in the management plane).
+//
+// This is the aggregator-side half of the fatal-vs-degrade fix
+// for the iter-2 evaluator finding; the linked-side wrap is
+// pinned by `TestAggregatorAdapter_ModeReadErrorPropagates` in
+// `internal/linked/client_test.go`.
+func TestAggregator_LinkedReader_ModeStoreError_AbortsTick(t *testing.T) {
+	t.Parallel()
+	tickAt := time.Date(2025, 7, 1, 12, 0, 0, 0, time.UTC)
+	composer, _ := aggregator.NewSystemTierComposer()
+	in := systemTierTickInput(t, 0)
+	sysSource := aggregator.NewInMemorySystemTierInputSource([]aggregator.SystemTierInput{in})
+	sysWriter := aggregator.NewInMemorySystemTierWriter()
+
+	rawCause := errors.New("pg: connection refused")
+	// Wrap exactly the way `linked.AggregatorAdapter.ResolveLinkedEdges`
+	// wraps in production (Go 1.20+ multi-`%w`): the sentinel
+	// is first so classification is fast, the raw cause is
+	// second so log detail is preserved.
+	wrappedErr := fmt.Errorf("%w: linked.AggregatorAdapter: read repo mode: %w", aggregator.ErrLinkedModeStore, rawCause)
+	reader := &stubLinkedReader{
+		reply: func(uuid.UUID, string) (aggregator.LinkedEdges, error) {
+			return aggregator.LinkedEdges{}, wrappedErr
+		},
+	}
+
+	agg, err := aggregator.NewAggregator(
+		aggregator.NewInMemorySampleSource(nil),
+		aggregator.NewInMemorySnapshotWriter(),
+		aggregator.WithClock(fixedClock(tickAt)),
+		aggregator.WithSystemTier(composer, sysSource, sysWriter),
+		aggregator.WithLinkedEdgeReader(reader, nil),
+	)
+	if err != nil {
+		t.Fatalf("NewAggregator: %v", err)
+	}
+	report, err := agg.Tick(context.Background())
+	if err == nil {
+		t.Fatalf("Tick: nil err; want non-nil (mode-store error MUST abort tick)")
+	}
+	if !errors.Is(err, aggregator.ErrLinkedModeStore) {
+		t.Errorf("Tick err = %v, want errors.Is(aggregator.ErrLinkedModeStore) (sentinel must remain on chain so callers can classify FATAL vs remote)", err)
+	}
+	if !errors.Is(err, rawCause) {
+		t.Errorf("Tick err = %v, want errors.Is(rawCause) (raw cause must remain on chain for operator log detail)", err)
+	}
+	if report.LinkedEdgeFetchFailures != 0 {
+		t.Errorf("LinkedEdgeFetchFailures = %d, want 0 (FATAL mode-store path must NOT bump the remote-fault counter; that counter is reserved for class-3 agent-memory faults so operator signal stays clean)", report.LinkedEdgeFetchFailures)
 	}
 }
 

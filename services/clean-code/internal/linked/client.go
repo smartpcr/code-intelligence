@@ -459,9 +459,13 @@ func (a *AggregatorAdapter) ResolveLinkedEdges(ctx context.Context, repoID uuid.
 	if err != nil {
 		// Mode-store errors are FATAL (architecture pin:
 		// the catalog read is not a fail-safe-to-degraded
-		// condition). Propagate so the aggregator's outer
-		// loop surfaces the operator-visible error.
-		return aggregator.LinkedEdges{}, fmt.Errorf("linked.AggregatorAdapter: read repo mode (repo_id=%s): %w", repoID, err)
+		// condition). Wrap with [aggregator.ErrLinkedModeStore]
+		// using Go 1.20+ multi-`%w` chaining so the
+		// aggregator can [errors.Is] check the sentinel AND
+		// the raw cause for operator-facing log detail.
+		// Propagate so the aggregator's outer loop surfaces
+		// the operator-visible error.
+		return aggregator.LinkedEdges{}, fmt.Errorf("%w: linked.AggregatorAdapter: read repo mode (repo_id=%s): %w", aggregator.ErrLinkedModeStore, repoID, err)
 	}
 	if mode != linkedModeValue {
 		return aggregator.LinkedEdges{Applicable: false}, nil

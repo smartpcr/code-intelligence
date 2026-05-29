@@ -465,7 +465,10 @@ func TestAggregatorAdapter_ModeReadErrorPropagates(t *testing.T) {
 		t.Fatalf("want propagated error, got nil")
 	}
 	if !errors.Is(err, storeErr) {
-		t.Errorf("err = %v, want errors.Is(storeErr)", err)
+		t.Errorf("err = %v, want errors.Is(storeErr) (raw cause must remain on chain for operator log detail)", err)
+	}
+	if !errors.Is(err, aggregator.ErrLinkedModeStore) {
+		t.Errorf("err = %v, want errors.Is(aggregator.ErrLinkedModeStore) (sentinel must be wrapped so aggregator can classify as FATAL)", err)
 	}
 	if fc.calls.Load() != 0 {
 		t.Errorf("client.calls = %d, want 0 when mode read fails", fc.calls.Load())

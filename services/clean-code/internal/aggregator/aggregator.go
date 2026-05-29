@@ -98,14 +98,39 @@ type Aggregator struct {
 //
 // # Failure modes
 //
-// Implementations distinguish FATAL errors (e.g. the
-// management repo-mode catalog read failed) from REMOTE
-// errors (e.g. the agent-memory HTTP fetch failed) only
-// implicitly through `errors.Is` sentinels. The aggregator's
-// [tickSystemTier] uses [errors.Is] against
-// `context.Canceled` / `context.DeadlineExceeded` to decide
-// "abort tick" vs "log + degrade in place"; every other
-// error class is treated as remote/degrade.
+// Implementations distinguish THREE error classes via
+// `errors.Is` sentinels:
+//
+//  1. CONTEXT-CANCEL / DEADLINE-EXCEEDED (`context.Canceled`,
+//     `context.DeadlineExceeded`) -- the aggregator's
+//     [Aggregator.applyLinkedEdges] propagates these so the
+//     outer tick honours operator-requested cancellation
+//     regardless of linked-mode wiring.
+//
+//  2. MODE-STORE FAILURE -- the per-repo `ReadRepoMode` call
+//     into `internal/management` failed (PG outage, role
+//     misconfig, migration drift). Implementations MUST wrap
+//     the underlying error with [ErrLinkedModeStore] so the
+//     aggregator can [errors.Is] check it and treat it as
+//     FATAL (abort tick). `Report.LinkedEdgeFetchFailures`
+//     is NOT incremented on this path -- that counter is
+//     reserved for class (3) so the operator signal
+//     unambiguously points at agent-memory uptime.
+//
+//  3. REMOTE / agent-memory failure -- the upstream
+//     agent-memory `/v1/cross-repo/edges` call failed
+//     (network error, 5xx, 404, malformed JSON). The
+//     aggregator LOGS + leaves the input in embedded shape
+//     so the composer degrades the row with
+//     `xrepo_edges_unavailable`. `Report.LinkedEdgeFetchFailures`
+//     IS incremented.
+//
+// CLASSIFICATION ORDER MATTERS: a cancelled tick can present
+// as any of the three classes (a transport may wrap a ctx
+// error inside a domain-specific error type), so
+// [Aggregator.applyLinkedEdges] checks ctx errors FIRST, then
+// [ErrLinkedModeStore], then falls through to the
+// remote-degrade path.
 type LinkedEdgeReader interface {
 	ResolveLinkedEdges(ctx context.Context, repoID uuid.UUID, sha string) (LinkedEdges, error)
 }
@@ -233,6 +258,38 @@ var ErrAggregatorNilSource = errors.New("aggregator: NewAggregator: source is ni
 // ErrAggregatorNilWriter surfaces a nil [SnapshotWriter] at
 // composition-root wiring time.
 var ErrAggregatorNilWriter = errors.New("aggregator: NewAggregator: writer is nil")
+
+// ErrLinkedModeStore is the sentinel that [LinkedEdgeReader]
+// implementations MUST wrap when the per-repo mode catalog
+// (the `internal/management` store reached via
+// [management.RepoModeReader.ReadRepoMode]) fails to answer.
+//
+// Why a sentinel and not a typed error: the aggregator's
+// [Aggregator.applyLinkedEdges] needs to distinguish the
+// THREE error classes returned by a [LinkedEdgeReader]:
+//
+//  1. context cancel / deadline  -> abort the tick
+//  2. mode-store read failure    -> abort the tick (FATAL);
+//     `LinkedEdgeFetchFailures` is NOT incremented because
+//     that counter is reserved for agent-memory remote
+//     faults and operators must see a clean signal pointing
+//     at the management plane (PG mgmt DB, role wiring,
+//     migration drift) rather than at agent-memory uptime
+//  3. any other error            -> log + leave the input in
+//     embedded shape so the downstream composer degrades the
+//     row with `xrepo_edges_unavailable`. The
+//     `LinkedEdgeFetchFailures` counter IS incremented here
+//     so the operator can correlate degradation rate with
+//     agent-memory uptime via the Prometheus exporter.
+//
+// The sentinel lives in this package (NOT in `internal/linked/`)
+// because `internal/linked/` already imports
+// `internal/aggregator` to satisfy the [LinkedEdgeReader]
+// interface; placing the sentinel in `linked` would force a
+// cycle. Hosting it here keeps the dependency edge one-way and
+// lets EXTERNAL implementations of [LinkedEdgeReader] reuse the
+// same classification contract.
+var ErrLinkedModeStore = errors.New("aggregator: linked mode store read failed")
 
 // SystemTierWired reports whether the Stage 7.2 system-tier
 // pipeline (composer + source + writer) is installed on this
@@ -607,14 +664,26 @@ func (a *Aggregator) tickSystemTier(ctx context.Context, report *Report) error {
 // availability flags + Mode in place. Updates the Report's
 // linked-mode counters in place.
 //
-// Error split (architecture Sec 3.10 step 4 fail-safe):
+// Error split (architecture Sec 3.10 step 4 fail-safe). The
+// classification ORDER below matters; see [LinkedEdgeReader]
+// godoc for the full rationale.
 //
-//   - context.Canceled / context.DeadlineExceeded -> aborts
-//     the tick by returning the error verbatim. The aggregator
-//     loop honours operator-requested cancellation regardless
-//     of the linked-mode wiring.
+//  1. context.Canceled / context.DeadlineExceeded -> aborts
+//     the tick by returning the error verbatim. The
+//     aggregator loop honours operator-requested cancellation
+//     regardless of the linked-mode wiring. Checked FIRST
+//     because a transport may wrap a ctx error inside a
+//     domain-specific error type.
 //
-//   - any other error -> LOGGED and SWALLOWED: the input is
+//  2. errors.Is(err, ErrLinkedModeStore) -> FATAL. The
+//     management plane's repo-mode catalog failed (PG outage,
+//     role misconfig, migration drift). Aborts the tick by
+//     returning the wrapped error. [Report.LinkedEdgeFetchFailures]
+//     is NOT incremented on this path -- that counter is
+//     reserved for agent-memory remote faults so the
+//     operator's degradation-rate signal stays clean.
+//
+//  3. any other error -> LOGGED and SWALLOWED: the input is
 //     left in its embedded shape (Mode=embedded,
 //     XRepoEdgesAvailable=false, CallEdgesAvailable=false) so
 //     the downstream composer naturally degrades the row with
@@ -622,12 +691,6 @@ func (a *Aggregator) tickSystemTier(ctx context.Context, report *Report) error {
 //     [Report.LinkedEdgeFetchFailures] is incremented so
 //     operators can correlate degradation rate with
 //     agent-memory uptime via the Prometheus exporter.
-//
-// Mode-store errors surfaced by the [LinkedEdgeReader]
-// implementation are propagated via this remote-error path
-// (matching the [LinkedEdgeReader] doc contract) UNLESS they
-// are wrapped ctx errors -- the implementation is responsible
-// for choosing the right error class.
 //
 // When the reader is not wired this is a no-op.
 func (a *Aggregator) applyLinkedEdges(ctx context.Context, in *SystemTierInput, report *Report) error {
@@ -637,7 +700,7 @@ func (a *Aggregator) applyLinkedEdges(ctx context.Context, in *SystemTierInput, 
 	report.LinkedEdgeReaderInvocations++
 	edges, err := a.linkedReader.ResolveLinkedEdges(ctx, in.RepoID, in.SHA)
 	if err != nil {
-		// Honour caller cancellation / deadline exceeded
+		// (1) Honour caller cancellation / deadline exceeded
 		// even when the linked reader wraps them; both
 		// errors.Is and the live ctx.Err() are consulted so
 		// a transport that loses the sentinel cannot
@@ -648,7 +711,24 @@ func (a *Aggregator) applyLinkedEdges(ctx context.Context, in *SystemTierInput, 
 			}
 			return fmt.Errorf("aggregator: linked edge resolution cancelled (repo_id=%s, sha=%s): %w", in.RepoID, in.SHA, err)
 		}
-		// Remote agent-memory failure -- log + leave the
+		// (2) FATAL mode-store error -- the management plane
+		// catalog read failed. Abort the tick WITHOUT
+		// incrementing LinkedEdgeFetchFailures (which is
+		// reserved for class (3) remote faults). Operators
+		// see this surface as a tick error pointing at the
+		// management plane; agent-memory uptime metrics stay
+		// clean.
+		if errors.Is(err, ErrLinkedModeStore) {
+			if a.linkedLogger != nil {
+				a.linkedLogger.ErrorContext(ctx, "aggregator: linked mode-store read failed; aborting tick",
+					"repo_id", in.RepoID.String(),
+					"sha", in.SHA,
+					"err", err.Error(),
+				)
+			}
+			return fmt.Errorf("aggregator: linked mode-store read failed (repo_id=%s, sha=%s): %w", in.RepoID, in.SHA, err)
+		}
+		// (3) Remote agent-memory failure -- log + leave the
 		// input in embedded shape so the composer degrades
 		// the row. This is the architecture's fail-safe
 		// path; surfacing the error here would block every

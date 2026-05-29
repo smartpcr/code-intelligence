@@ -68,10 +68,27 @@
 //
 // Mode-store errors (the per-repo `ReadRepoMode` call into
 // `internal/management`) are deliberately handled
-// DIFFERENTLY: they are propagated as fatal because a broken
+// DIFFERENTLY: they are propagated as FATAL because a broken
 // catalog is not a fail-safe-to-degraded condition -- the
 // operator wants the tick to fail loudly rather than silently
-// force every linked-marked repo into embedded behaviour.
+// force every linked-marked repo into embedded behaviour. The
+// [AggregatorAdapter] WRAPS such errors with the
+// [aggregator.ErrLinkedModeStore] sentinel via Go 1.20+
+// multi-`%w` chaining so that:
+//
+//   - the aggregator's classification step can
+//     `errors.Is(err, aggregator.ErrLinkedModeStore)` to
+//     distinguish FATAL mode-store errors from REMOTE
+//     agent-memory faults (which use the fail-safe-degrade
+//     path), AND
+//   - the raw cause is preserved on the chain for
+//     operator-facing log detail.
+//
+// The aggregator's `Report.LinkedEdgeFetchFailures` counter
+// is NOT incremented on the mode-store fatal path: that
+// counter is reserved for class-3 agent-memory remote faults
+// so a spike unambiguously points at agent-memory uptime
+// rather than at the management plane.
 //
 // # Wire contract (Sec 8.7 "linked-mode endpoint")
 //

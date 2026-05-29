@@ -822,14 +822,6 @@ type TaskPlanner struct {
 	// [WithEffortModel] / [NewEffortModelFromConfig].
 	effortModel EffortModel
 
-	// effortEstimator is the optional Stage 8.3 estimator.
-	// Nil = Stage 8.2 byte-identical behaviour (every emitted
-	// task carries `EffortHours = 0.0`). Non-nil = the
-	// estimator's value lands on `task.EffortHours`; an
-	// estimator error aborts the whole batch (no plan or
-	// task row lands). Wired via [WithEffortEstimator].
-	effortEstimator EffortEstimator
-
 	// optErr accumulates errors stashed by the [TaskOption]
 	// setters (nil callbacks) so [NewTaskPlanner] can
 	// surface them after applying every option. Rubber-duck

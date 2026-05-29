@@ -840,6 +840,48 @@ storyId: "code-intelligence:CLEAN-CODE"
 - [ ] Linked-mode usage is gated by `mgmt.set_mode(repo_id, 'linked')` and the global config flag; default remains embedded.
 - [ ] Add `internal/linked/client_test.go` covering: linked endpoint reachable returns edges; unreachable returns empty + degraded stamp.
 
+### Realized file surface (this stage ONLY; do not conflate with sibling Stages 10.2/10.3/10.4/10.5)
+
+The branch `ws/code-intelligence-CLEAN-CODE/phase-linked-mode-integration-and-rollout-stage-optional-agent-memory-linked-mode-adapter` MUST land these files (and ONLY these) -- the workstream's ground truth file surface is therefore ~14 paths, NOT the full Phase-10 union of ~40 paths. Reviewers comparing `git diff origin/feature/clean-code...HEAD` must score against THIS list:
+
+Production source (services/clean-code):
+
+- `services/clean-code/internal/linked/client.go` -- HTTP adapter + `AggregatorAdapter` + `ResolveLinkedEdges` (the gating entrypoint).
+- `services/clean-code/internal/linked/doc.go` -- package contract.
+- `services/clean-code/internal/linked/client_test.go` -- coverage required by the implementation step above.
+- `services/clean-code/internal/aggregator/aggregator.go` -- `LinkedEdgeReader` seam, `applyLinkedEdges` three-class error classifier (context-abort, mode-store-abort, remote-degrade), `ErrLinkedModeStore` sentinel.
+- `services/clean-code/internal/aggregator/linked_reader_wiring_test.go` -- aggregator-side coverage of the three error classes plus nil/unwired/not-applicable paths.
+- `services/clean-code/internal/config/config.go` -- `EnableLinkedModeAdapter` flag (default `false`) + env override `CLEAN_CODE_ENABLE_LINKED_MODE_ADAPTER`.
+- `services/clean-code/cmd/clean-code-aggregator/main.go` -- composition wiring (adapter is constructed and registered with the aggregator only when `cfg.EnableLinkedModeAdapter` is true).
+- `services/clean-code/cmd/clean-code-refactor-planner/main.go` -- baseline build-gate fix (orphan `EffortEstimator` field removal carried in from `feature/clean-code`; required for `go build ./...` to succeed from worktree root).
+- `services/clean-code/internal/refactor/task_planner.go` -- same baseline build-gate fix.
+
+Operator-facing docs (services/clean-code/docs and CHANGELOG):
+
+- `services/clean-code/docs/runbook.md` -- linked-mode operator playbook + the renamed-API note for the Stage 8.3 ML loader.
+- `services/clean-code/CHANGELOG.md` -- historical Stage 8.3 entry annotated with the post-PR-148 rename note.
+
+Architecture / planning artefacts:
+
+- `docs/stories/code-intelligence-CLEAN-CODE/architecture.md` -- the linked-mode contract section (matches the three-class implementation in `aggregator.go`).
+- `docs/stories/code-intelligence-CLEAN-CODE/implementation-plan.md` -- this stage section (the document you are reading right now).
+
+Root-module test proxy (required by the Forge `go test ./...` gate at the worktree root):
+
+- `repo_indexer_and_metric_ingestor_stale_scanrun_sweep_loop_test.go` -- embedded `TestMain` proxy that descends into `services/clean-code` and forwards `-run/-v/-count/-timeout/-short/-race/-cpu` flags. See Stage 10.1 design note "Strategy E pivot" in iteration history; the proxy is inlined into the only pre-existing tracked root-module test file rather than a new `tools/forge_gate_proxy/` directory so it is visible to Forge without scaffolding a new package.
+
+### Out of scope (deferred to sibling stages -- DO NOT land in this branch)
+
+These paths appear in later Stage 10.x sections below and MUST NOT be expected in this branch's diff:
+
+- `services/clean-code/internal/management/insights/aged_mutes.go` + `_test.go` -- belong to **Stage 10.2** (Aged mute insights report), see lines 850-865 below.
+- `services/clean-code/test/load/**` (k6 scenarios) -- belong to **Stage 10.3** (Load and conformance tests), see lines 867-881 below.
+- `services/clean-code/test/conformance/canonical_names_test.go`, `canonical_states_test.go`, `wal_scope_test.go` -- belong to **Stage 10.3**.
+- `services/clean-code/test/e2e/**` (cross-repo happy path) -- belongs to **Stage 10.4**, see lines 883-897 below.
+- Rollout playbook additions and operator runbooks beyond the linked-mode playbook -- belong to **Stage 10.5**, see lines 899-908 below.
+- `go.work` / `go.work.sum` -- intentionally gitignored at `.gitignore:65-68` because the monorepo uses one module per service. Creating these files is futile (they are filtered out of the branch diff by `.gitignore`).
+- `tools/forge_gate_proxy/proxy_test.go` -- never created; the proxy was inlined into the existing tracked root test file (see "Strategy E pivot" above).
+
 ### Dependencies
 - phase-cross-repo-aggregator/stage-system-tier-metric-composer
 

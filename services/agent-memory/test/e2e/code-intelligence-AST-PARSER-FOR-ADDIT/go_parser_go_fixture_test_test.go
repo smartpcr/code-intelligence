@@ -129,6 +129,7 @@ type e2eGoFixtureEdgeSummary struct {
 type e2eGoFixtureWritesTarget struct {
 	TargetSignature string ` + "`" + `json:"target_signature"` + "`" + `
 	TargetKind      string ` + "`" + `json:"target_kind"` + "`" + `
+	UnresolvedDstID string ` + "`" + `json:"unresolved_dst_id,omitempty"` + "`" + `
 }
 
 type e2eGoFixtureOutput struct {
@@ -180,13 +181,17 @@ func TestE2EProbe_GoFixtureEmitFile(t *testing.T) {
 			targetNode, ok := spy.nodeMap[e.DstNodeID]
 			sig := ""
 			kind := ""
+			unresolvedID := ""
 			if ok {
 				sig = targetNode.CanonicalSignature
 				kind = targetNode.Kind
+			} else {
+				unresolvedID = e.DstNodeID
 			}
 			result.WritesTargets = append(result.WritesTargets, e2eGoFixtureWritesTarget{
 				TargetSignature: sig,
 				TargetKind:      kind,
+				UnresolvedDstID: unresolvedID,
 			})
 		}
 	}
@@ -212,6 +217,7 @@ type goFixtureEdgeSummary struct {
 type goFixtureWritesTarget struct {
 	TargetSignature string `json:"target_signature"`
 	TargetKind      string `json:"target_kind"`
+	UnresolvedDstID string `json:"unresolved_dst_id,omitempty"`
 }
 
 type goFixtureOutput struct {

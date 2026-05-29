@@ -8,16 +8,18 @@ import (
 	"testing"
 )
 
-// TestTreeSitterCParser_LanguageAndExtensions verifies the
-// placeholder parser advertises the canonical C language id
+// TestTreeSitterCParser_LanguageAndExtensions verifies the C
+// tree-sitter parser advertises the canonical C language id
 // and the `.c` / `.h` extension set from the workstream brief
-// §4 "Register extensions". The sibling stage workstream
-// `stage-3.1-ctreesitterparser-implementation` will replace
-// the stub Parse() with a real walker, but the
-// (Language, Extensions) contract MUST stay stable through
-// that swap because the dispatcher routes files by extension
-// (lower-case) at registration time -- a drift here would
-// silently mis-route real `.c` / `.h` source files.
+// §4 "Register extensions". The (Language, Extensions)
+// contract MUST stay stable because the dispatcher routes
+// files by extension (lower-case) at registration time -- a
+// drift here would silently mis-route real `.c` / `.h` source
+// files. This test pins the contract regardless of how the
+// underlying Parse() walker is implemented, so any future
+// refactor of the walker (e.g. swapping the tree-sitter
+// grammar version) is caught here before it can produce a
+// dispatcher-level routing regression.
 func TestTreeSitterCParser_LanguageAndExtensions(t *testing.T) {
 	p := NewTreeSitterCParser()
 	if got := p.Language(); got != "c" {

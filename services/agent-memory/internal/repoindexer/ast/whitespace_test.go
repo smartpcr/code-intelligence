@@ -7,22 +7,6 @@ import (
 	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
 )
 
-// localMethodSignature is a test-only mirror of the canonical-
-// signature scheme documented in doc.go (`<url>::method::
-// <relPath>#<qualifiedName>(<normalisedParams>)`). The
-// canonical implementation lives on the Stage 3.2 dispatcher
-// (gated behind `//go:build canonical_dispatcher`); the
-// scenario-pinning test for whitespace stability needs a
-// local equivalent so it can run independently of the
-// dispatcher landing workstream. Renamed from `methodSignature`
-// to avoid a build-time collision with the canonical
-// dispatcher's `methodSignature` (dispatcher.go:1077) once
-// that file is built under the `canonical_dispatcher` tag.
-func localMethodSignature(repoURL, relPath, qualifiedName, paramsRaw string) string {
-	return repoURL + "::method::" + relPath + "#" + qualifiedName +
-		"(" + NormalizeSignature(paramsRaw) + ")"
-}
-
 // TestNormalizeSignature_StableAcrossFormatters pins the
 // acceptance scenario "whitespace normalisation -- Given the
 // same method reformatted only by adding spaces, When the
@@ -91,8 +75,8 @@ func TestNormalizeSignature_FingerprintsIdentical(t *testing.T) {
 	paramsTight := "int,Map<K,V>,string"
 	paramsLoose := "  int ,  Map < K , V > ,  // c\n  string "
 
-	sigTight := localMethodSignature(repoURL, relPath, qual, paramsTight)
-	sigLoose := localMethodSignature(repoURL, relPath, qual, paramsLoose)
+	sigTight := methodSignature(repoURL, relPath, qual, paramsTight)
+	sigLoose := methodSignature(repoURL, relPath, qual, paramsLoose)
 	if sigTight != sigLoose {
 		t.Fatalf("methodSignature diverges:\n  tight = %q\n  loose = %q", sigTight, sigLoose)
 	}

@@ -295,35 +295,36 @@ func (s *psFixtureState) theParseResultHasNoClassesMethodsOrImports() error {
 // Godog wiring
 // ---------------------------------------------------------------------------
 
-func InitializeScenario_powershell_parser_powershell_fixture_test(ctx *godog.ScenarioContext) {
-	modRoot, _ := psFixtureModuleRoot() // already verified in TestE2E entrypoint
-	s := &psFixtureState{modRoot: modRoot}
+func initializeScenarioWithModRoot(modRoot string) func(*godog.ScenarioContext) {
+	return func(ctx *godog.ScenarioContext) {
+		s := &psFixtureState{modRoot: modRoot}
 
-	// Scenario 1: pwsh-present fixture parses
-	ctx.Given(`^the embedded PowerShell fixture$`, s.theEmbeddedPowerShellFixture)
-	ctx.When(`^EmitFile runs for the PowerShell fixture$`, s.emitFileRunsForThePowerShellFixture)
-	ctx.Then(`^(\d+) class, (\d+) method, and (\d+) package nodes are emitted for PowerShell$`,
-		s.classMethodAndPackageNodesAreEmittedForPowerShell)
-	ctx.Then(`^the PowerShell fixture emits contains, static_calls, and imports edges$`,
-		s.thePowerShellFixtureEmitsContainsStaticCallsAndImportsEdges)
+		// Scenario 1: pwsh-present fixture parses
+		ctx.Given(`^the embedded PowerShell fixture$`, s.theEmbeddedPowerShellFixture)
+		ctx.When(`^EmitFile runs for the PowerShell fixture$`, s.emitFileRunsForThePowerShellFixture)
+		ctx.Then(`^(\d+) class, (\d+) method, and (\d+) package nodes are emitted for PowerShell$`,
+			s.classMethodAndPackageNodesAreEmittedForPowerShell)
+		ctx.Then(`^the PowerShell fixture emits contains, static_calls, and imports edges$`,
+			s.thePowerShellFixtureEmitsContainsStaticCallsAndImportsEdges)
 
-	// Scenario 2: pwsh-absent fixture is skipped
-	ctx.Given(`^the PowerShell AST implementation is available$`,
-		s.thePowerShellASTImplementationIsAvailable)
-	ctx.When(`^TestPowerShellFixture_EmitsExpectedNodeAndEdgeSet runs without pwsh on PATH$`,
-		s.testPowerShellFixtureRunsWithoutPwshOnPATH)
-	ctx.Then(`^it calls t\.Skip and reports no failure$`,
-		s.itCallsTSkipAndReportsNoFailure)
+		// Scenario 2: pwsh-absent fixture is skipped
+		ctx.Given(`^the PowerShell AST implementation is available$`,
+			s.thePowerShellASTImplementationIsAvailable)
+		ctx.When(`^TestPowerShellFixture_EmitsExpectedNodeAndEdgeSet runs without pwsh on PATH$`,
+			s.testPowerShellFixtureRunsWithoutPwshOnPATH)
+		ctx.Then(`^it calls t\.Skip and reports no failure$`,
+			s.itCallsTSkipAndReportsNoFailure)
 
-	// Scenario 3: Sentinel-returning parser
-	ctx.Given(`^a PowerShell parser with empty pwshBin$`,
-		s.aPowerShellParserWithEmptyPwshBin)
-	ctx.When(`^TestPowerShellParser_NoPwsh_ReturnsSentinel runs$`,
-		s.testPowerShellParserNoPwshReturnsSentinelRuns)
-	ctx.Then(`^errors\.Is returns true for ErrParserUnavailable$`,
-		s.errorsIsReturnsTrueForErrParserUnavailable)
-	ctx.Then(`^the ParseResult has no classes methods or imports$`,
-		s.theParseResultHasNoClassesMethodsOrImports)
+		// Scenario 3: Sentinel-returning parser
+		ctx.Given(`^a PowerShell parser with empty pwshBin$`,
+			s.aPowerShellParserWithEmptyPwshBin)
+		ctx.When(`^TestPowerShellParser_NoPwsh_ReturnsSentinel runs$`,
+			s.testPowerShellParserNoPwshReturnsSentinelRuns)
+		ctx.Then(`^errors\.Is returns true for ErrParserUnavailable$`,
+			s.errorsIsReturnsTrueForErrParserUnavailable)
+		ctx.Then(`^the ParseResult has no classes methods or imports$`,
+			s.theParseResultHasNoClassesMethodsOrImports)
+	}
 }
 
 func TestE2E_powershell_parser_powershell_fixture_test(t *testing.T) {
@@ -336,7 +337,7 @@ func TestE2E_powershell_parser_powershell_fixture_test(t *testing.T) {
 	}
 
 	suite := godog.TestSuite{
-		ScenarioInitializer: InitializeScenario_powershell_parser_powershell_fixture_test,
+		ScenarioInitializer: initializeScenarioWithModRoot(modRoot),
 		Options: &godog.Options{
 			Format:   "pretty",
 			Paths:    []string{"powershell_parser_powershell_fixture_test.feature"},

@@ -3,13 +3,149 @@
 package e2e
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/cucumber/godog"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/repoindexer/ast"
 )
+
+// ---------------------------------------------------------------------------
+// Probe — a _test.go injected at runtime into internal/repoindexer/ast/
+// that constructs a Dispatcher from the unexported defaultParsers() and
+// checks whether the extension map routes the given filename. This
+// exercises the REAL defaultParsers() → NewDispatcher → extMap path
+// that parsers_cgo.go provides when CGO_ENABLED=1.
+//
+// The probe accepts E2E_PROBE_FILENAME via env var.
+// ---------------------------------------------------------------------------
+
+const goRegProbeSource = `package ast
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+type e2eGoRegResult struct {
+	Language string ` + "`" + `json:"language"` + "`" + `
+	Found    bool   ` + "`" + `json:"found"` + "`" + `
+}
+
+func TestE2EProbe_GoRegistration(t *testing.T) {
+	filename := os.Getenv("E2E_PROBE_FILENAME")
+	if filename == "" {
+		t.Skip("E2E_PROBE_FILENAME not set")
+	}
+
+	// Exercise the real defaultParsers() and NewDispatcher path.
+	parsers := defaultParsers()
+	d := NewDispatcher(parsers, nil, nil)
+	ext := filepath.Ext(filename)
+	p, found := d.extMap[ext]
+
+	out := e2eGoRegResult{Found: found}
+	if found {
+		out.Language = p.Language()
+	}
+
+	data, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	fmt.Printf("PROBE_OUTPUT:%s\n", string(data))
+}
+`
+
+// ---------------------------------------------------------------------------
+// Local mirror type for JSON deserialization of probe output
+// ---------------------------------------------------------------------------
+
+type goRegProbeOutput struct {
+	Language string `json:"language"`
+	Found    bool   `json:"found"`
+}
+
+// ---------------------------------------------------------------------------
+// moduleRoot_goReg locates the Go module root (directory containing
+// go.mod) by walking up from this source file's location.
+// ---------------------------------------------------------------------------
+
+func moduleRoot_goReg() (string, error) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		return "", fmt.Errorf("runtime.Caller failed")
+	}
+	dir := filepath.Dir(thisFile)
+	// test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT -> 3 levels up to module root
+	for i := 0; i < 3; i++ {
+		dir = filepath.Dir(dir)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err != nil {
+		return "", fmt.Errorf("go.mod not found at %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
+// ---------------------------------------------------------------------------
+// runGoRegProbe writes the probe _test.go into the ast package,
+// runs it with CGO_ENABLED=1, and returns the parsed JSON result.
+// ---------------------------------------------------------------------------
+
+func runGoRegProbe(filename string) (*goRegProbeOutput, error) {
+	modRoot, err := moduleRoot_goReg()
+	if err != nil {
+		return nil, err
+	}
+
+	astDir := filepath.Join(modRoot, "internal", "repoindexer", "ast")
+	pid := os.Getpid()
+
+	probeFile := filepath.Join(astDir, fmt.Sprintf("e2e_probe_go_reg_%d_test.go", pid))
+	if err := os.WriteFile(probeFile, []byte(goRegProbeSource), 0644); err != nil {
+		return nil, fmt.Errorf("write probe: %w", err)
+	}
+	defer os.Remove(probeFile)
+
+	env := append(os.Environ(),
+		"CGO_ENABLED=1",
+		"E2E_PROBE_FILENAME="+filename,
+	)
+
+	cmd := exec.Command("go", "test",
+		"-run", "TestE2EProbe_GoRegistration",
+		"-v", "-count=1",
+		"./internal/repoindexer/ast/",
+	)
+	cmd.Dir = modRoot
+	cmd.Env = env
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("probe failed: %v\noutput:\n%s", err, string(output))
+	}
+
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "PROBE_OUTPUT:") {
+			raw := strings.TrimPrefix(line, "PROBE_OUTPUT:")
+			var out goRegProbeOutput
+			if err := json.Unmarshal([]byte(raw), &out); err != nil {
+				return nil, fmt.Errorf("parse JSON: %w\nraw: %s", err, raw)
+			}
+			return &out, nil
+		}
+	}
+	return nil, fmt.Errorf("PROBE_OUTPUT marker not found in output:\n%s", string(output))
+}
 
 // ---------------------------------------------------------------------------
 // Fakes for the CGO=off EmitFile scenario
@@ -45,8 +181,8 @@ func (l *captureLogger) Log(msg string, attrs map[string]string) {
 // ---------------------------------------------------------------------------
 
 type goRegState struct {
-	// Scenario 1: CGO=on routing
-	parser ast.Parser
+	// Scenario 1: CGO=on routing (probe result)
+	probeResult *goRegProbeOutput
 
 	// Scenario 2: CGO=off EmitFile
 	dispatcher *ast.Dispatcher
@@ -59,15 +195,13 @@ type goRegState struct {
 // ---------------------------------------------------------------------------
 // Given: the dispatcher constructed with defaultParsers under CGO=on
 //
-// parsers_cgo.go registers the Go parser via init(). Because the ast
-// package is imported above, the init() has already run by test time.
-// We also verify defaultParsers() includes the Go parser.
+// This is a precondition marker. The actual defaultParsers() exercise
+// happens in the When step via the probe subprocess (which constructs
+// a Dispatcher from defaultParsers() inside the ast package where the
+// unexported function is accessible).
 // ---------------------------------------------------------------------------
 
 func (s *goRegState) theDispatcherConstructedWithDefaultParsersUnderCGOOn() error {
-	// parsers_cgo.go init() fires on import — nothing else needed.
-	// defaultParsers() returns the CGO parser set; SelectParser uses
-	// the global registry populated by init().
 	return nil
 }
 
@@ -92,10 +226,21 @@ func (s *goRegState) theDispatcherConstructedWithDefaultParsersUnderCGOOff() err
 
 // ---------------------------------------------------------------------------
 // When: selectParser runs for "<filename>"
+//
+// Uses the probe subprocess to exercise defaultParsers() →
+// NewDispatcher → extMap lookup inside the ast package with
+// CGO_ENABLED=1.
 // ---------------------------------------------------------------------------
 
 func (s *goRegState) selectParserRunsFor(filename string) error {
-	s.parser = ast.SelectParser(filename, nil)
+	result, err := runGoRegProbe(filename)
+	if err != nil {
+		return fmt.Errorf("selectParser probe for %q failed: %w", filename, err)
+	}
+	if !result.Found {
+		return fmt.Errorf("selectParser(%q) returned nil — extension not registered in defaultParsers()", filename)
+	}
+	s.probeResult = result
 	return nil
 }
 
@@ -114,12 +259,11 @@ func (s *goRegState) emitFileProcessesAFile(ext string) error {
 // ---------------------------------------------------------------------------
 
 func (s *goRegState) theReturnedParserLanguageIs(expected string) error {
-	if s.parser == nil {
-		return fmt.Errorf("no parser was selected in the When step")
+	if s.probeResult == nil {
+		return fmt.Errorf("no probe result — the When step did not run")
 	}
-	got := s.parser.Language()
-	if got != expected {
-		return fmt.Errorf("Language() = %q, want %q", got, expected)
+	if s.probeResult.Language != expected {
+		return fmt.Errorf("Language() = %q, want %q", s.probeResult.Language, expected)
 	}
 	return nil
 }

@@ -82,10 +82,14 @@
 //
 // SHAs are deterministic SHA1-shaped 40-char hex strings
 // derived from (repo_index, sha_index) so the operator's
-// seeder (see README.md "Seeding the fixtures" -- a
-// self-contained `curl`-based shell script, no shipped
-// binary) can generate the SAME 5_000 pairs without
-// sharing state with the k6 process.
+// lab fixture pre-seed SQL (see README.md "Seeding the
+// fixtures") can generate the SAME 5_000 pairs without
+// sharing state with the k6 process. The seed is direct
+// SQL against the `clean_code` schema -- the runtime
+// `mgmt.register_repo` verb mints `repo_id` server-side
+// (DB DEFAULT gen_random_uuid()) and `ingest.coverage`
+// requires Cobertura XML, so neither verb can pin the
+// deterministic UUIDs the closed set depends on.
 //
 // A separate `degraded === false` check in the per-request
 // evaluator (below) guards against the failure mode where

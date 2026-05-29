@@ -48,11 +48,15 @@ is incompatible with the short-lived CI sandbox.
    references a CLOSED set of `100 repos x 50 SHAs = 5_000` deterministic
    `(repo_id, sha)` pairs derived in the script's init context
    (`eval_gate_load.js`, `repos` and `shas` constants). The seeder MUST
-   pre-register, for EVERY pair in this closed set:
-     - the `repo` row with `scan_status='scanned'`, and
-     - at least one `MetricSample` row per metric_kind the active policy
-       version references, so `eval.gate` does NOT fall through to the
-       `samples_pending` degraded fast path.
+   pre-create, for EVERY pair in this closed set:
+     - the `clean_code.repo` row at the operator-pinned UUID, and
+     - the `clean_code.commit` row with `scan_status='scanned'` (the
+       `scan_status` column lives on `commit`, not `repo` -- see
+       `migrations/0001_catalog_lifecycle.up.sql:229`), and
+     - at least one `clean_code.metric_sample` row plus its matching
+       `clean_code.metric_sample_active` pointer per metric_kind the
+       active policy version references, so `eval.gate` does NOT fall
+       through to the `samples_pending` degraded fast path.
    The deterministic pair-generation rules (re-implement in the seeder
    without sharing state with the k6 process):
      - `repo_id[i] = "00000000-0000-0000-0000-" + zeroPad12(i)` for
@@ -68,8 +72,7 @@ is incompatible with the short-lived CI sandbox.
    degraded_reason: "samples_pending"` and the
    `degraded is false` check fails, which rolls into the
    `checks{name:eval.gate} rate > 0.99` threshold and aborts the
-   run. The previous-iter design used `Date.now()`-derived unique
-   SHAs which were unseedable; the closed set replaces that.
+   run. See **Seeding the fixtures** below for the concrete recipe.
 4. **OIDC bearer token**: an operator-role token with the
    `eval.gate` scope, issued by the cluster's
    identity-provider per architecture Sec 6.1.
@@ -127,95 +130,264 @@ The 5_000 `(repo_id, sha)` pairs MUST exist before the run;
 otherwise the gateway short-circuits with
 `degraded: true, degraded_reason: "samples_pending"` (the
 `writeDegraded` path in `internal/evaluator/gate_evaluate.go`)
-and the per-iteration `degraded is false` check below trips
-the `checks{name:eval.gate} rate > 0.99` floor and aborts
-the run.
+and the per-iteration `degraded is false` check trips the
+`checks{name:eval.gate} rate > 0.99` floor and aborts the run.
 
-There is no shipped seeder binary; seeding is performed by
-the operator with `curl` against the two gateway verbs the
-service already exposes (`mgmt.register_repo` and
-`ingest.coverage`, both documented in
-`services/clean-code/internal/api/defaults.go`). The recipe
-below MUST emit the SAME `(repo_id, sha)` strings that the
-k6 script samples from -- the `printf` formats are
-identical to the JavaScript generators in
-`eval_gate_load.js` (`repos` and `shas` constants).
+### Why the runtime API verbs are NOT used for pre-seeding
 
-Save the snippet as `seed.sh`, `chmod +x seed.sh`, then run:
+The clean-code service exposes two runtime verbs an operator
+could in principle drive to create the fixture rows. Neither
+is suitable for pre-seeding the closed 5_000-pair set the k6
+scenario expects:
+
+  - **`mgmt.register_repo`** (`POST /v1/mgmt/register_repo`,
+    JSON body `{repo_url, default_branch, mode?, modes?,
+    display_name?}`) creates one `clean_code.repo` row. The
+    `repo_id` UUID is **minted server-side** (column DEFAULT
+    `gen_random_uuid()` per `migrations/0001_catalog_lifecycle.up.sql:149`)
+    and returned in the response body. The wire decoder also
+    runs with `DisallowUnknownFields`
+    (`internal/management/register_repo_verb.go:97-119`), so
+    an operator CANNOT supply a chosen `repo_id` -- the
+    request would fail with HTTP 400. This is incompatible
+    with the k6 scenario's deterministic `00000000-0000-0000-0000-{NNN}`
+    repo_id set (`eval_gate_load.js:148-156`).
+  - **`ingest.coverage`** (`POST /v1/ingest/coverage`,
+    `Content-Type: application/xml`) ingests **Cobertura XML**
+    and emits `MetricSample` rows. `repo_id` and `sha` are
+    read from attributes on the root `<coverage>` element
+    (`internal/ingest/coverage/cobertura.go:1112-1161`); a
+    JSON body is rejected as `ErrMalformedXML`. Even with a
+    valid Cobertura payload, ingest also requires the
+    catalog `repo` row to already exist AND an active signed
+    `policy_version` (rejection happens further downstream).
+
+### Lab fixture pre-seed (direct SQL)
+
+The lab-bare-metal validation lane reaches the database
+directly via `psql` against the `clean_code` schema. This is
+the only path that can pin the deterministic UUIDs the k6
+scenario draws from. Save the snippet below as `seed.sql`
+and run:
 
 ```sh
-#!/usr/bin/env bash
-# seed.sh -- pre-register the 100 x 50 closed fixture set
-# the k6 scenario draws from. Requires CLEAN_CODE_GATEWAY_URL
-# and CLEAN_CODE_OIDC_TOKEN exported the same way the k6
-# scenario expects them.
-set -euo pipefail
-
-: "${CLEAN_CODE_GATEWAY_URL:?must be set}"
-: "${CLEAN_CODE_OIDC_TOKEN:?must be set}"
-
-auth_header="Authorization: Bearer ${CLEAN_CODE_OIDC_TOKEN}"
-ct_header="Content-Type: application/json"
-
-for i in $(seq 0 99); do
-  repo_id=$(printf "00000000-0000-0000-0000-%012d" "$i")
-
-  # 1. mgmt.register_repo -- creates the `repo` row with
-  #    scan_status='scanned'. Idempotent: re-running the
-  #    seeder against an already-registered repo is a no-op
-  #    (HTTP 200 with the existing row).
-  curl --fail-with-body --silent --show-error \
-       -X POST "${CLEAN_CODE_GATEWAY_URL}/v1/mgmt/register_repo" \
-       -H "${auth_header}" -H "${ct_header}" \
-       -d "{\"repo_id\":\"${repo_id}\"}" > /dev/null
-
-  for j in $(seq 0 49); do
-    sha=$(printf "0000000000000000000000000000%06x%06x" "$i" "$j")
-
-    # 2. ingest.coverage -- writes a MetricSample row per
-    #    metric_kind referenced by the active policy_version.
-    #    Replace the `metrics` body with one entry per
-    #    metric_kind your active policy uses; the example
-    #    below covers the three coverage-pack kinds pinned
-    #    in tech-spec Sec 4.1.1 (coverage_line_ratio /
-    #    coverage_branch_ratio / pass_first_try_ratio).
-    curl --fail-with-body --silent --show-error \
-         -X POST "${CLEAN_CODE_GATEWAY_URL}/v1/ingest/coverage" \
-         -H "${auth_header}" -H "${ct_header}" \
-         -d "{
-               \"repo_id\":\"${repo_id}\",
-               \"sha\":\"${sha}\",
-               \"metrics\":[
-                 {\"kind\":\"coverage_line_ratio\",   \"value\":0.95},
-                 {\"kind\":\"coverage_branch_ratio\", \"value\":0.90},
-                 {\"kind\":\"pass_first_try_ratio\",  \"value\":0.85}
-               ]
-             }" > /dev/null
-  done
-done
-
-echo "Seeded 100 repos x 50 SHAs = 5000 (repo_id, sha) pairs."
+psql "${CLEAN_CODE_DATABASE_URL}" \
+     -v ON_ERROR_STOP=1 \
+     -f seed.sql
 ```
 
-Pre-run invariants the seeder must hold:
+The SQL is idempotent via `ON CONFLICT DO NOTHING` -- safe to
+re-run on a lab refresh. It pre-seeds six rows per
+`(repo_id, sha)` pair so the `eval.gate` happy path can run
+end-to-end:
 
-  - Every `repo_id[i]` is in the `repo` table with
-    `scan_status='scanned'`.
-  - Every `(repo_id[i], sha[i][j])` has a complete MetricSample
-    row set, so `samples_ready(repo_id, sha) == true` in
-    `internal/evaluator/sql_readiness.go::SamplesReady`. If
-    the active policy version references metric_kinds beyond
-    the three above, add them to the `metrics` JSON array.
+  - `clean_code.repo` (100 rows; pinned UUIDs)
+  - `clean_code.commit` (5 000 rows; `scan_status='scanned'`
+    skips the `samples_pending` fast path)
+  - `clean_code.scan_run` (100 rows; one per repo, supplies
+    the `producer_run_id` FK on `metric_sample`)
+  - `clean_code.scope_binding` (100 rows; repo-level scope so
+    every SHA reuses the same scope_id)
+  - `clean_code.metric_sample` + `clean_code.metric_sample_active`
+    (5 000 rows each, for `coverage_line_ratio` as the example
+    metric_kind)
 
-Re-run the seeder once per lab refresh / per release-tag
-acceptance run. The seed step takes ~5_000 round-trips on
-the gateway; expect 1-5 minutes wall clock against a healthy
-lab deployment.
+```sql
+-- seed.sql -- pre-seed the 5_000 (repo_id, sha) pairs the
+-- eval_gate_load.js scenario draws from. Idempotent.
+--
+-- Column lists re-check against the migrations (path:
+-- services/clean-code/migrations/):
+--   clean_code.repo            -- 0001_catalog_lifecycle.up.sql:147-170
+--   clean_code.commit          -- 0001_catalog_lifecycle.up.sql:212-231
+--   clean_code.scan_run        -- 0001_catalog_lifecycle.up.sql:337-...
+--   clean_code.scope_binding   -- 0002_measurement.up.sql:186-219
+--   clean_code.metric_sample   -- 0002_measurement.up.sql:257-...
+--   clean_code.metric_sample_active -- 0002_measurement.up.sql:506-...
+--
+-- Enum value cross-refs:
+--   repo_mode               -- 'embedded' (0001:75-78)
+--   commit_scan_status      -- 'scanned'  (0001:87-...)
+--   scan_run_kind           -- 'full'     (0001:117-...)
+--   scan_run_sha_binding    -- 'single'   (0001:129-132)
+--   scope_kind              -- 'repo'     (0002:142-...)
+--   metric_sample_pack      -- 'ingested' (0002:103-108)
+--   metric_sample_source    -- 'ingested' (0002:115-119)
 
-Run the k6 scenario itself with `--summary-export` to archive
-the run JSON for release-tag review. A successful run reports
-`checks ........ 100.00%` in the summary; anything less than
-`99.00%` will have exited with code 99.
+BEGIN;
+
+-- 100 repos with operator-pinned UUIDs matching the k6
+-- scenario's deterministic UUID generator.
+INSERT INTO clean_code.repo
+    (repo_id, display_name, mode, default_branch)
+SELECT
+    ('00000000-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid,
+    'load-fixture-' || i,
+    'embedded',
+    'main'
+FROM generate_series(0, 99) AS s(i)
+ON CONFLICT (repo_id) DO NOTHING;
+
+-- 100 x 50 commits with scan_status='scanned'. The SHA
+-- encoding mirrors eval_gate_load.js:172-190 exactly
+-- (28 zero-pad + 6-hex repo index + 6-hex sha index).
+INSERT INTO clean_code.commit
+    (repo_id, sha, committed_at, scan_status)
+SELECT
+    ('00000000-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid,
+    repeat('0', 28) || lpad(to_hex(i), 6, '0') || lpad(to_hex(j), 6, '0'),
+    now(),
+    'scanned'
+FROM generate_series(0, 99) AS r(i)
+CROSS JOIN generate_series(0, 49) AS s(j)
+ON CONFLICT (repo_id, sha) DO NOTHING;
+
+-- One scan_run per repo to supply the producer_run_id FK on
+-- metric_sample below. scan_run.scan_run_id UUID is also
+-- operator-pinned so the metric_sample INSERT can reference
+-- it without a follow-up SELECT.
+INSERT INTO clean_code.scan_run
+    (scan_run_id, repo_id, kind, sha_binding, to_sha)
+SELECT
+    ('00000001-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid,
+    ('00000000-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid,
+    'full',
+    'single',
+    repeat('0', 28) || lpad(to_hex(i), 6, '0') || repeat('0', 6)
+FROM generate_series(0, 99) AS s(i)
+ON CONFLICT (scan_run_id) DO NOTHING;
+
+-- One scope_binding per repo (scope_kind='repo' so all 50
+-- SHAs of a repo share one scope_id; this keeps the seed
+-- proportional to repo count rather than pair count).
+INSERT INTO clean_code.scope_binding
+    (scope_id, repo_id, scope_kind, canonical_signature, first_seen_sha)
+SELECT
+    ('00000002-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid,
+    ('00000000-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid,
+    'repo',
+    'load-fixture-scope-' || i,
+    repeat('0', 28) || lpad(to_hex(i), 6, '0') || repeat('0', 6)
+FROM generate_series(0, 99) AS s(i)
+ON CONFLICT (scope_id) DO NOTHING;
+
+-- One metric_sample per (repo_id, sha) pair for the
+-- `coverage_line_ratio` metric_kind. If the active policy
+-- references additional metric_kinds, copy this block and
+-- the matching metric_sample_active block below for each
+-- one (canonical kinds are pinned in tech-spec Sec 4.1.1).
+INSERT INTO clean_code.metric_sample
+    (sample_id, repo_id, sha, scope_id, metric_kind, metric_version,
+     value, pack, source, producer_run_id)
+SELECT
+    gen_random_uuid(),
+    ('00000000-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid,
+    repeat('0', 28) || lpad(to_hex(i), 6, '0') || lpad(to_hex(j), 6, '0'),
+    ('00000002-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid,
+    'coverage_line_ratio',
+    1,
+    0.95,
+    'ingested',
+    'ingested',
+    ('00000001-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid
+FROM generate_series(0, 99) AS r(i)
+CROSS JOIN generate_series(0, 49) AS s(j)
+ON CONFLICT DO NOTHING;
+
+-- metric_sample_active pointer rows -- the evaluator's
+-- active-row lookup reads through this table, not raw
+-- metric_sample. Without these the predicate eval sees
+-- "no value" and the gate verdict depends on the policy's
+-- handling of missing data (commonly 'pass').
+INSERT INTO clean_code.metric_sample_active
+    (repo_id, sha, scope_id, metric_kind, metric_version, sample_id)
+SELECT
+    m.repo_id, m.sha, m.scope_id, m.metric_kind, m.metric_version,
+    m.sample_id
+FROM clean_code.metric_sample AS m
+WHERE m.metric_kind = 'coverage_line_ratio'
+  AND m.repo_id IN (
+      SELECT ('00000000-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid
+      FROM generate_series(0, 99) AS s(i)
+  )
+ON CONFLICT (repo_id, sha, scope_id, metric_kind, metric_version) DO NOTHING;
+
+COMMIT;
+
+-- Sanity probes after a fresh run:
+--   SELECT COUNT(*) FROM clean_code.repo;            -- expect 100
+--   SELECT COUNT(*) FROM clean_code.commit;          -- expect 5000
+--   SELECT COUNT(*) FROM clean_code.metric_sample;   -- expect 5000
+--   SELECT COUNT(*) FROM clean_code.metric_sample_active; -- expect 5000
+```
+
+### Active signed policy (operator prerequisite, NOT in `seed.sql`)
+
+The seed above takes the catalog/measurement substrate from
+empty to "`scan_status='scanned'`, MetricSample rows present".
+The `eval.gate` happy path ALSO requires an active
+`clean_code.policy_version` whose **Ed25519** signature
+(`migrations/0003_policy_audit_refactor.up.sql:331-341`) the
+evaluator can verify, and a `clean_code.policy_activation`
+row referencing it
+(`migrations/0003_policy_audit_refactor.up.sql:381-399`).
+
+The lab harness must publish this once via the
+`policy.publish` verb against the lab's signing key BEFORE
+the load run begins. Inserting an unsigned or
+test-key-signed `policy_version` row directly via SQL is
+NOT a substitute -- the evaluator returns
+`{verdict: 'warn', degraded: true, degraded_reason: 'policy_signature_invalid'}`
+on any signature-verify failure and the `degraded is false`
+check trips the `checks` floor.
+
+If the active policy references metric_kinds beyond
+`coverage_line_ratio`, repeat the `metric_sample` +
+`metric_sample_active` INSERT blocks for each additional
+metric_kind so the predicate evaluator finds non-null values
+for every gate input.
+
+### Runtime smoke tests via the API (informational only)
+
+For a one-off end-to-end check OUTSIDE the load scenario --
+i.e. when reproducibility against deterministic UUIDs is NOT
+required -- the runtime verbs can be exercised directly:
+
+```sh
+# mgmt.register_repo -- server mints the repo_id.
+curl --fail-with-body -X POST \
+     "${CLEAN_CODE_GATEWAY_URL}/v1/mgmt/register_repo" \
+     -H "Authorization: Bearer ${CLEAN_CODE_OIDC_TOKEN}" \
+     -H "X-OIDC-Subject: smoke-operator" \
+     -H "Content-Type: application/json" \
+     -d '{"repo_url": "https://example.com/smoke", "default_branch": "main"}'
+# Response: {"repo_id":"<uuid>","created":true,"mode":"embedded"}
+
+# ingest.coverage -- Cobertura XML with repo_id+sha on root.
+# Substitute <repo_id> with the UUID returned above.
+curl --fail-with-body -X POST \
+     "${CLEAN_CODE_GATEWAY_URL}/v1/ingest/coverage" \
+     -H "Authorization: Bearer ${CLEAN_CODE_OIDC_TOKEN}" \
+     -H "X-OIDC-Subject: smoke-operator" \
+     -H "Content-Type: application/xml" \
+     -d '<?xml version="1.0"?>
+<coverage repo_id="<repo_id>" sha="0000000000000000000000000000000000000001">
+  <packages><package><classes><class filename="src/main.go">
+    <lines><line number="1" hits="1"/></lines>
+  </class></classes></package></packages>
+</coverage>'
+```
+
+Neither verb supports operator-pinned `repo_id` UUIDs, which
+is why the load scenario's deterministic fixture set is
+pre-seeded via the SQL above, not via these verbs. Re-run
+the SQL seed once per lab refresh / release-tag acceptance
+run; expect ~5 seconds wall clock against a healthy lab DB.
+
+Then run the k6 scenario with `--summary-export` to archive
+the run JSON for release-tag review. A successful run
+reports `checks ........ 100.00%` in the summary; anything
+less than `99.00%` exits with code 99.
 
 ## Why these thresholds
 

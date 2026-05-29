@@ -723,3 +723,112 @@ func stringSlicesEqualOrdered(a, b []string) bool {
 	}
 	return true
 }
+
+// TestTreeSitterCppParser_RegisteredInDefaultParsers verifies
+// the parser is reachable through `defaultParsers()` (the
+// factory parsers_cgo.go::defaultParsers wires into the
+// dispatcher). Without this assertion, the parser could be
+// implemented but silently unreachable -- the
+// implemented-but-unreachable failure mode previously flagged
+// by the rubber-duck review for the C tree-sitter parser. This
+// test is the C++ twin of
+// TestTreeSitterCParser_RegisteredInDefaultParsers and pins
+// the `parsers_cgo.go` registration line so a future edit
+// that drops `NewTreeSitterCppParser()` from
+// `defaultParsers()` fails loudly here instead of silently
+// regressing `.cc` / `.cpp` / `.cxx` / `.c++` / `.hpp` /
+// `.hh` / `.hxx` / `.h++` ingestion to "no parser registered
+// for extension" skips.
+//
+// The test runs on the CGO build path only (the file's
+// `//go:build cgo` tag); the CGO=off counterpart in
+// parsers_nocgo.go intentionally does NOT register C++ (per
+// architecture Section 3 -- ".c / .cpp / .cs / .go / .rs are
+// SKIPPED by the dispatcher" under CGO=off), so a parallel
+// CGO=off assertion would contradict the documented
+// "tree-sitter-backed only" stance.
+//
+// `.h` is intentionally NOT in the want-set: it is claimed by
+// the C parser per the pinned `dot-h-extension-routing` rule
+// (tech-spec Section 8 R6) and parser_treesitter_cpp.go:51-58
+// explicitly documents that the C++ parser does not register
+// `.h` because the dispatcher's `buildExtMap` overwrite rule
+// would otherwise non-deterministically re-route `.h` files
+// when registration order drifts. See parsers_cgo.go for the
+// documented registration order rationale.
+func TestTreeSitterCppParser_RegisteredInDefaultParsers(t *testing.T) {
+	parsers := defaultParsers()
+	want := map[string]bool{
+		".cc":  false,
+		".cpp": false,
+		".cxx": false,
+		".c++": false,
+		".hpp": false,
+		".hh":  false,
+		".hxx": false,
+		".h++": false,
+	}
+	for _, p := range parsers {
+		if p.Language() != "cpp" {
+			continue
+		}
+		for _, ext := range p.Extensions() {
+			if _, ok := want[ext]; ok {
+				want[ext] = true
+			}
+		}
+	}
+	for ext, found := range want {
+		if !found {
+			t.Errorf("defaultParsers() does not register the C++ parser for %q; saw %d parsers", ext, len(parsers))
+		}
+	}
+}
+
+// TestDefaultParsers_CBeforeCpp pins the registration order
+// documented in parsers_cgo.go so a future edit that swaps
+// the C and C++ entries (or moves either past the other)
+// fails loudly here. The order matters because:
+//
+//   - `buildExtMap` (dispatcher.go) iterates `defaultParsers()`
+//     in order and LATER entries overwrite EARLIER ones for
+//     any shared extension. Today `.h` is claimed only by C,
+//     but a future revision of parser_treesitter_cpp.go that
+//     accidentally adds `.h` to its Extensions would silently
+//     re-route `.h` files to the C++ grammar.
+//
+//   - The cross-language dispatcher test
+//     `TestDispatcher_DotHRoutesToC_EvenWithCppHint`
+//     (implementation-plan.md line 444, added in a later
+//     workstream) relies on the C parser being registered.
+//     Pinning the order here keeps that later test
+//     deterministic across any edits to this slice.
+//
+// The check is "position of C < position of C++" rather than
+// "exact slice equality" so this test does not break every
+// time a new language (Go, Rust, ...) is appended.
+func TestDefaultParsers_CBeforeCpp(t *testing.T) {
+	parsers := defaultParsers()
+	cIdx, cppIdx := -1, -1
+	for i, p := range parsers {
+		switch p.Language() {
+		case "c":
+			if cIdx == -1 {
+				cIdx = i
+			}
+		case "cpp":
+			if cppIdx == -1 {
+				cppIdx = i
+			}
+		}
+	}
+	if cIdx == -1 {
+		t.Fatalf("defaultParsers() does not include the C parser; saw %d parsers", len(parsers))
+	}
+	if cppIdx == -1 {
+		t.Fatalf("defaultParsers() does not include the C++ parser; saw %d parsers", len(parsers))
+	}
+	if cIdx >= cppIdx {
+		t.Errorf("defaultParsers() ordering: C at index %d must come BEFORE C++ at index %d (see parsers_cgo.go documented order)", cIdx, cppIdx)
+	}
+}

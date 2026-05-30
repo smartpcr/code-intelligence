@@ -76,12 +76,11 @@ func (s *devPolicyState) loaderLoadCalledWithEmbeddedTrue() error {
 }
 
 func (s *devPolicyState) everyYAMLProducedAtLeastOneRule() error {
-	// Independently walk the embedded FS, parse each YAML, and verify
-	// that every rule_id declared in each file appears in Bundle.Rules.
-	embFS, err := (devpolicy.LoaderSource{UseEmbedded: true}).FS()
-	if err != nil {
-		return fmt.Errorf("LoaderSource.FS(): %w", err)
-	}
+	// Independently walk the on-disk rulepacks source tree (NOT via
+	// LoaderSource.FS()) so the verification is truly independent of
+	// the embed wiring the Loader uses.
+	rulepacksDir := filepath.Join(s.modRoot, "policy", "rulepacks")
+	embFS := os.DirFS(rulepacksDir)
 
 	loadedIDs := make(map[string]bool)
 	for _, r := range s.bundle.Rules {

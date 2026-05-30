@@ -49,10 +49,20 @@ storyId: "code-intelligence:REPO-SCANNER"
   (requires `CGO_ENABLED=1` and a C toolchain on PATH --
   `gcc`/`clang` on Linux/macOS, `mingw-w64` on Windows) and
   `make test-nocgo` (no toolchain needed) per implementation-plan
-  Stage 1.1. The PowerShell smoke test additionally requires
-  `pwsh` on PATH (per tech-spec C2). `make test-cgo-no-pwsh`
-  unsets PATH entries so the `pwsh_not_available` skip path is
-  exercised.
+  Stage 1.1; both targets exist verbatim in
+  `services/agent-memory/Makefile` (`test-cgo` runs
+  `CGO_ENABLED=1 go test ./...`, `test-nocgo` runs
+  `CGO_ENABLED=0 go test ./...`). The fuller live-pwsh PowerShell
+  parse path additionally requires `pwsh` on PATH (per tech-spec
+  C2); the `pwsh_not_available` skip-path coverage is provided
+  in-tree by `TestPowerShellParser_NoPwsh_ReturnsSentinel` in
+  `services/agent-memory/internal/repoindexer/ast/parser_powershell_test.go`
+  (line 34) which constructs a `powershellParser{pwshBin: ""}`
+  directly to force the empty-bin branch without needing PATH
+  surgery, and by `TestDispatcher_ErrParserUnavailable_LogsSkip`
+  in `dispatcher_pass2bd_test.go` (line 49) for the dispatcher
+  side -- both run inside the existing `make test-nocgo` /
+  `make test-cgo` invocations (no separate Makefile target).
 - **CI runner**: GitHub-hosted `ubuntu-latest` for the Linux CGO
   matrix (`apt-get install -y build-essential powershell` from a
   cached step) and `windows-latest` for the Windows CGO matrix
@@ -1383,13 +1393,52 @@ storyId: "code-intelligence:REPO-SCANNER"
 
 - **Edge:** quickstart-on-windows-without-cgo-still-runs-degraded
   - **Given** a Windows runner without a CGO toolchain
-    installed.
+    installed AND the QUICKSTART invoked with
+    `codeintel scan ... --store memory --out graph.json`
+    (architecture S9.1 default for the no-CGO path; memory
+    sink has no CGO dependency per impl-plan Stage 3.5).
   - **When** the QUICKSTART steps run end-to-end against the
-    polyglot fixture.
-  - **Then** the scan summary lists `skipped.no_parser >= 1`
-    for `.c/.cpp/.cs/.go/.rs` AND the SQLite build step fails
-    fast with a clear "requires `cgo` build tag" error
-    (impl-plan Stage 3.4 build-tag guard).
+    polyglot fixture (`scan --store=memory` -> static JSON ->
+    open `web/` against the exported JSON -> see both
+    diagrams).
+  - **Then** the scan summary lists
+    `stats.skipped.no_parser >= 1` for `.c/.cpp/.cs/.go/.rs`
+    (tree-sitter parsers are CGO-only per tech-spec C7) but
+    the QUICKSTART completes successfully because (a) the
+    `--store=memory` sink has no native dependency, and (b)
+    the web UI renders the exported JSON's `SkipBanner` to
+    name the missing prereq (impl-plan Stage 8.x
+    `SkipBanner.tsx`).
+  - **And** the same QUICKSTART invoked with
+    `--store=postgres --pg-url $AGENT_MEMORY_PG_URL` against
+    a docker-compose Postgres also completes in degraded
+    mode -- the postgres sink does not depend on CGO either
+    (`graphwriter` uses `database/sql` + `lib/pq`, not
+    `mattn/go-sqlite3`).
+
+- **Edge:** quickstart-with-sqlite-store-without-cgo-fails-at-build
+  - **Given** the same Windows runner without a CGO toolchain
+    AND an operator who explicitly asks for the SQLite store
+    via `--store=sqlite` (or who tries to `go build
+    -tags '!cgo' ./cmd/codeintel`).
+  - **When** the build step runs.
+  - **Then** the build fails fast with a clear compile error
+    that names the missing `cgo` tag, NOT a runtime
+    error at scan time (impl-plan Stage 3.4 scenario
+    `sqlite-requires-cgo`: "`go vet -tags '!cgo'
+    ./internal/graphsink/sqlite/...` runs ... the package
+    fails to compile with a build-tag error naming the
+    missing `cgo` tag"). This proves the operator-pinned
+    `mattn/go-sqlite3` choice is enforced at compile time
+    rather than producing a confusing runtime failure deep
+    inside a scan.
+  - **And** the QUICKSTART docs (architecture S9.2 Windows
+    quickstart section, plus
+    `services/agent-memory/web/README.md` per implementation-
+    plan Phase 9) carry an explicit callout naming this
+    SQLite-needs-CGO constraint and pointing Windows
+    operators without a C toolchain to `--store=memory` or
+    `--store=postgres` as the supported no-CGO sinks.
 
 ---
 
@@ -1433,3 +1482,32 @@ storyId: "code-intelligence:REPO-SCANNER"
   the env-var-only contract explicit there too. Stale snapshot
   file `e2e-scenarios.md.iter-snapshot.bak` (which still held
   the pre-fix phrasing) was removed from the story directory.
+- 2026-05-30 (iter 3): addressed both iter-2 evaluator findings
+  (score 88). Item 1 (Phase 1 setup cited the non-existent
+  `make test-cgo-no-pwsh` Makefile target) is FIXED: the Phase
+  1 `### Setup` `Local` bullet (lines 48-65) now cites only
+  the real Makefile targets `test-cgo` and `test-nocgo` (both
+  verified present in `services/agent-memory/Makefile` lines
+  58-70) and routes the `pwsh_not_available` skip-path
+  coverage through the existing in-tree test
+  `TestPowerShellParser_NoPwsh_ReturnsSentinel`
+  (`parser_powershell_test.go` line 34) which forces the
+  empty-bin branch in-process and runs under either existing
+  make target -- no new Makefile target is invented. Item 2
+  (Phase 9 Edge `quickstart-on-windows-without-cgo-still-runs-degraded`
+  was internally contradictory: "runs end-to-end in degraded
+  mode" vs. "SQLite build fails fast") is FIXED by SPLITTING
+  the edge into two coherent scenarios: (a)
+  `quickstart-on-windows-without-cgo-still-runs-degraded` now
+  pins the QUICKSTART to a non-SQLite backend (`--store=memory`
+  per architecture S9.1, with `--store=postgres` as a parallel
+  no-CGO sink) and asserts only the parser-degradation
+  contract (`stats.skipped.no_parser >= 1` for the CGO-only
+  extensions plus the web `SkipBanner`); (b) a new edge
+  `quickstart-with-sqlite-store-without-cgo-fails-at-build`
+  pins the SQLite-needs-CGO build-tag failure to compile time
+  (matching impl-plan Stage 3.4 scenario `sqlite-requires-cgo`
+  verbatim: `go vet -tags '!cgo' ./internal/graphsink/sqlite/...`
+  fails with a clear cgo-tag error) and references the
+  QUICKSTART doc callout pointing Windows operators without a
+  C toolchain to `--store=memory` or `--store=postgres`.

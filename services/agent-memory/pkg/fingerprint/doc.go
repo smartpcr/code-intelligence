@@ -35,4 +35,36 @@
 // to in the package's golden test vectors so a future
 // re-implementation in another runtime can reproduce identical
 // fingerprints byte-for-byte.
+//
+// # RepoID derivation from URL (REPO-SCANNER S3.4)
+//
+// The package also exports RepoIDFromURL(url) which derives a
+// deterministic 16-byte RepoID from a repository URL using
+// RFC 4122 §4.3 name-based UUIDs (SHA-1 variant, v5) under a
+// pinned namespace (`namespaceRepoURL` in repo_id.go):
+//
+//	RepoID = uuid.NewSHA1(namespaceRepoURL, []byte(url))
+//
+// This is the helper every graphsink backend uses to assign a
+// repo's primary key without coordinating through the database
+// (REPO-SCANNER architecture.md §3.4 "AncestryWriter --
+// factored from worker.go"). Because the namespace constant
+// and the URL are inputs both sides of the wire can compute,
+// the Postgres, SQLite, and in-memory adapters all derive the
+// same RepoID for the same URL — that byte-equality is what
+// makes the S2 / R5 backend-parity claim hold in practice
+// (the RepoID enters every NodeFingerprint /
+// EdgeFingerprint pre-image, so a divergent RepoID would
+// silently shard the node identity space per backend).
+//
+// Callers MUST treat RepoIDFromURL as a pure function: no
+// scheme / case / trailing-slash normalisation is performed.
+// Two URL spellings that point at the same physical repo
+// (e.g. with and without `.git`) intentionally produce
+// distinct RepoIDs; if you need them collapsed, normalise
+// before calling. The empty URL is rejected with ErrEmptyURL.
+// Golden vectors in `repo_id_test.go` pin the deterministic
+// UUIDs for representative URLs (https / ssh-style git /
+// file://) so any drift in the namespace, the upstream uuid
+// implementation, or the input encoding breaks the test.
 package fingerprint

@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -126,12 +127,42 @@ func MintRepoID(rootPath string) uuid.UUID {
 // (e.g. the `--diagnostics` JSON sink) can do so without
 // reaching into UUID internals.
 //
-// On Windows, [filepath.Clean] rewrites separators to
-// backslash; [filepath.ToSlash] then flips them to forward
-// slash so the byte string fed to UUID-v5 is identical
-// across OSes for the same logical path.
+// The normalisation is host-OS-independent: a Windows-shaped
+// input such as `C:\Users\dev\repo` MUST produce the same
+// canonical bytes whether the caller is running on Windows,
+// Linux, or macOS. On Linux/macOS, [filepath.Clean] and
+// [filepath.ToSlash] both treat `\` as a literal byte, so we
+// cannot rely on them to fold separators; instead we rewrite
+// `\` to `/` ourselves and then run the POSIX-only
+// [path.Clean], which is slash-based on every host.
+//
+// Concretely:
+//
+//   - `\` is replaced with `/` so backslashes become real
+//     separators regardless of the host's [filepath.Separator].
+//   - [path.Clean] (NOT [filepath.Clean]) then collapses
+//     trailing slashes, `.`, `..`, and duplicate slashes
+//     uniformly across operating systems.
+//
+// Anchor: REFACTOR-GUIDE `architecture.md` Sec 4.1 (the
+// `repo_id` pre-image MUST be stable across the analyzer's
+// host OS so re-runs on the same logical path -- whether
+// invoked from a Windows laptop or a Linux CI runner -- mint
+// the same UUID); e2e Phase 1 "MintRepoID is deterministic
+// across re-runs" pins the Windows / forward-slash
+// equivalence on every host.
 func NormalisePath(rootPath string) string {
-	return filepath.ToSlash(filepath.Clean(rootPath))
+	// 1. Fold backslashes -> forward slashes. On POSIX this
+	//    is the only way to turn a Windows-shaped input into
+	//    a slash-delimited path, because filepath.Clean on
+	//    POSIX keeps `\` as a literal byte.
+	slashed := strings.ReplaceAll(rootPath, `\`, "/")
+	// 2. Use path.Clean (not filepath.Clean) so the
+	//    collapsing rules are identical on every host.
+	//    path.Clean is documented as always using "/" as the
+	//    path separator, which is exactly what the pre-image
+	//    requires.
+	return path.Clean(slashed)
 }
 
 // DetectHeadSHA shells out to `git rev-parse HEAD` for the

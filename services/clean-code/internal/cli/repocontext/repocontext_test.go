@@ -119,6 +119,49 @@ func TestMintRepoID_TrailingSlashNormalisation(t *testing.T) {
 	}
 }
 
+// TestNormalisePath_HostIndependent locks the canonical
+// pre-image bytes for both POSIX and Windows-shaped inputs
+// to the exact strings the [MintRepoID] hash MUST see on
+// every host OS. It guards against a future regression where
+// [NormalisePath] silently delegates to [filepath.Clean] /
+// [filepath.ToSlash] -- both of which are no-ops on `\` when
+// invoked from a non-Windows host -- and therefore diverges
+// from the cross-OS stability invariant in `architecture.md`
+// Sec 4.1.
+//
+// Unlike [TestMintRepoID_ForwardSlashNormalisation] this test
+// asserts on the byte string itself (not just the resulting
+// UUID), so a future refactor that swaps in a different
+// equally-deterministic-but-different normalisation surfaces
+// loudly here rather than silently re-minting every repo id.
+func TestNormalisePath_HostIndependent(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"posix bare", "/tmp/foo", "/tmp/foo"},
+		{"posix trailing slash", "/tmp/foo/", "/tmp/foo"},
+		{"posix dot segment", "/tmp/./foo", "/tmp/foo"},
+		{"posix dotdot segment", "/tmp/foo/../bar", "/tmp/bar"},
+		{"windows backslash", `C:\Users\dev\repo`, "C:/Users/dev/repo"},
+		{"windows forward slash", "C:/Users/dev/repo", "C:/Users/dev/repo"},
+		{"windows trailing backslash", `C:\Users\dev\repo\`, "C:/Users/dev/repo"},
+		{"mixed separators", `C:\Users/dev\repo`, "C:/Users/dev/repo"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := repocontext.NormalisePath(tc.in); got != tc.want {
+				t.Fatalf("NormalisePath(%q) on %s = %q; want %q",
+					tc.in, runtime.GOOS, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestDetectHeadSHA_NonGitFallback asserts the
 // `("working-copy", false)` shape for a directory without
 // `.git`. Mirrors the e2e Phase 1 scenario "HEAD SHA fallback

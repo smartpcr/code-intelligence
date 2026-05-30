@@ -17,8 +17,8 @@ import (
 
 	"github.com/cucumber/godog"
 	"github.com/gofrs/uuid"
-	"github.com/microsoft/cleancode-service/internal/cli/repocontext"
-	"github.com/microsoft/cleancode-service/internal/cli/scopebinding"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/repocontext"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/scopebinding"
 )
 
 // requireEnv skips the test when the named environment variable is unset.

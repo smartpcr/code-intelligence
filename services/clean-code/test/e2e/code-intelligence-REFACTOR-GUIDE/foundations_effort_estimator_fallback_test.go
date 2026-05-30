@@ -11,22 +11,11 @@ package e2e
 import (
 	"fmt"
 	"math"
-	"os"
 	"testing"
 
 	"github.com/cucumber/godog"
 	"github.com/microsoft/cleancode-service/internal/cli/effort"
 )
-
-// requireEnv skips the test when the named environment variable is unset.
-func requireEnv(t *testing.T, name string) string {
-	t.Helper()
-	v := os.Getenv(name)
-	if v == "" {
-		t.Skipf("environment variable %s is not set; skipping", name)
-	}
-	return v
-}
 
 type effortEstimatorState struct {
 	model   *effort.FallbackModel

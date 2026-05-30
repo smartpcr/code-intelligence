@@ -21,16 +21,6 @@ import (
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/scopebinding"
 )
 
-// requireEnv skips the test when the named environment variable is unset.
-func requireEnv(t *testing.T, name string) string {
-	t.Helper()
-	v := os.Getenv(name)
-	if v == "" {
-		t.Skipf("environment variable %s is not set; skipping", name)
-	}
-	return v
-}
-
 // repoContextState holds per-scenario state for repo-context
 // and scope-binding scenarios.
 type repoContextState struct {

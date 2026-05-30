@@ -1,6 +1,6 @@
 module github.com/smartpcr/code-intelligence/services/clean-code
 
-go 1.22.0
+go 1.25.1
 
 require (
 	github.com/cucumber/godog v0.15.0

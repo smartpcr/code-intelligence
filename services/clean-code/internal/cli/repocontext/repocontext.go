@@ -397,6 +397,14 @@ func detectJavaModule(rootPath string) string {
 // first `package x.y.z;` declaration and returns the dotted
 // package name. Returns "" if no such declaration is found
 // before EOF.
+//
+// The scanner tracks `/* ... */` block-comment state across
+// lines so a header whose interior lines do NOT start with
+// `*` (e.g. `/* line one\n   line two\n*/`) is still skipped
+// in its entirety and the real `package` declaration below it
+// is recognised. Single-line block comments and a `/* ... */`
+// that closes on the same line as the package keyword are
+// also handled.
 func readJavaPackage(path string) string {
 	f, err := os.Open(path)
 	if err != nil {
@@ -404,8 +412,37 @@ func readJavaPackage(path string) string {
 	}
 	defer func() { _ = f.Close() }()
 	sc := bufio.NewScanner(f)
+	var inBlockComment bool
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
+
+		// If a previous line opened a `/* ... */` block that
+		// has not yet closed, consume bytes until we see the
+		// closing `*/`. Anything after the `*/` on the same
+		// line is re-evaluated as ordinary source below.
+		if inBlockComment {
+			idx := strings.Index(line, "*/")
+			if idx < 0 {
+				continue
+			}
+			inBlockComment = false
+			line = strings.TrimSpace(line[idx+2:])
+		}
+
+		// Strip any number of leading single-line block
+		// comments (`/* a */ /* b */ package ...`) and flag
+		// a `/*` that runs past the end of the current line
+		// so the next iteration knows it is mid-block.
+		for strings.HasPrefix(line, "/*") {
+			end := strings.Index(line[2:], "*/")
+			if end < 0 {
+				inBlockComment = true
+				line = ""
+				break
+			}
+			line = strings.TrimSpace(line[2+end+2:])
+		}
+
 		if line == "" || strings.HasPrefix(line, "//") {
 			continue
 		}
@@ -414,9 +451,6 @@ func readJavaPackage(path string) string {
 			// the package statement but not arbitrary
 			// declarations; stop scanning once we hit a
 			// non-package, non-comment, non-blank line.
-			if strings.HasPrefix(line, "/*") || strings.HasPrefix(line, "*") {
-				continue
-			}
 			return ""
 		}
 		rest := strings.TrimSpace(strings.TrimPrefix(line, "package"))

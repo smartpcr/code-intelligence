@@ -16,21 +16,6 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// requireEnv skips the test when a required env-var is unset.
-// One copy per package — sibling stage files in the same package
-// must guard against redefinition at merge time.
-// ---------------------------------------------------------------------------
-
-func requireEnv(t *testing.T, name string) string {
-	t.Helper()
-	v, ok := os.LookupEnv(name)
-	if !ok || v == "" {
-		t.Skipf("required env var %s is not set — skipping", name)
-	}
-	return v
-}
-
-// ---------------------------------------------------------------------------
 // validationState holds per-scenario state for the validation suite.
 // ---------------------------------------------------------------------------
 

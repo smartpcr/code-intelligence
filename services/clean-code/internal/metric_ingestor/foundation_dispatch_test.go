@@ -244,8 +244,8 @@ func TestRegistryBackedDispatcher_DefaultRegistry_NonEmptySource(t *testing.T) {
 	if err := d.Dispatch(context.Background(), mustScanRun(t), metric_ingestor.FoundationInput{}); err != nil {
 		t.Fatalf("Dispatch DefaultRegistry: err=%v, want nil", err)
 	}
-	if got := len(reg.Recipes()); got != 6 {
-		t.Errorf("DefaultRegistry recipes = %d, want 6 (cyclo, cognitive_complexity, loc, lcom4, fan_in, fan_out)", got)
+	if got := len(reg.Recipes()); got != 9 {
+		t.Errorf("DefaultRegistry recipes = %d, want 9 (cyclo, cognitive_complexity, loc, lcom4, fan_in, fan_out, interface_width, depth_of_inheritance, coupling_between_objects)", got)
 	}
 }
 

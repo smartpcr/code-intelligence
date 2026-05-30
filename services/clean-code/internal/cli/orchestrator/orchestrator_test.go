@@ -380,3 +380,221 @@ func TestOrchestrator_Run_ParserPanicSurfacesAsSkipAndPipelineContinues(t *testi
 		t.Errorf("worker did NOT survive the first panic: no parser_panic skip recorded for %q; got skips=%v (per-job recover is mandatory)", cleanRel, res.Skips)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Scenario 6: project-level recipe dispatch
+//
+// Workstream-2.2 iter-2 evaluator item 3 -- The project-level
+// recipe fan-out at `orchestrator.go:381-383` MUST be
+// regression-tested: a fixture corpus rich enough to exercise
+// BOTH project recipes registered in
+// `recipes.DefaultProjectRegistry()` --
+// `{cycle_member, duplication_ratio}` -- and an assertion
+// that at least one draft of EACH `metric_kind` appears in
+// `res.Drafts`. This pins the contract that
+// `o.projectRecReg.All()` is iterated (not silently
+// short-circuited) AND that each project recipe receives the
+// full AST corpus (not a per-file slice).
+//
+// Fixture shape:
+//   - Two Go files forming an import cycle (pkg `a` imports
+//     `b`, pkg `b` imports `a`) -- the canonical cycle_member
+//     input. The cycle_member recipe identifies SCCs in the
+//     import graph and emits value=1.0 for files/packages
+//     inside an SCC and value=0.0 for those outside.
+//   - One additional Go file containing repeated content
+//     across many symbols so the duplication_ratio recipe's
+//     lexical window aggregator sees enough source-byte
+//     fanout to emit at least one row. The recipe operates on
+//     `AttrSourceBytes` (see `recipes/recipe.go:137-160`),
+//     which the parser fleet stamps on every `AstFile` per
+//     `internal/ast/parser/internal.go:160-170`.
+//
+// What is asserted:
+//
+//   - len(res.Files) == 3 (all three Go files parsed
+//     successfully).
+//   - At least one draft with `MetricKind == "cycle_member"`
+//     and at least one with value == 1.0 -- a member of the
+//     SCC -- so the recipe demonstrably RAN and saw the
+//     cycle.
+//   - At least one draft with
+//     `MetricKind == "duplication_ratio"` -- demonstrating
+//     the second project recipe was also dispatched (even if
+//     the exact value is small for a 3-file fixture, the
+//     row's presence proves the dispatch path was hit).
+//
+// What is NOT asserted (out of scope for this regression):
+//
+//   - Exact SCC membership identities -- the per-recipe unit
+//     tests at `internal/metrics/recipes/cycle_member_test.go`
+//     pin those.
+//   - Exact duplication_ratio values -- the per-recipe unit
+//     tests at `recipes/duplication_ratio_test.go` pin those.
+// ---------------------------------------------------------------------------
+
+func TestOrchestrator_Run_ProjectRecipeDispatch_EmitsCycleMemberAndDuplicationRatio(t *testing.T) {
+	root := t.TempDir()
+
+	// Cycle-leg 1: package `a` imports `b`. The `Worker`
+	// struct + `Job` interface give the per-file SOLID-pack
+	// recipes (interface_width, depth_of_inheritance,
+	// coupling_between_objects) at least one class/interface
+	// scope to attach drafts to, so the test cross-check at
+	// the bottom asserts the Stage 2.2 dispatch path is
+	// complete.
+	writeFixtureFile(t, root, "a/a.go", strings.Join([]string{
+		"package a",
+		"",
+		"import _ \"example.com/cycle/b\"",
+		"",
+		"type Job interface {",
+		"\tRun() error",
+		"\tName() string",
+		"}",
+		"",
+		"type Worker struct {",
+		"\tID int",
+		"}",
+		"",
+		"func (w *Worker) Run() error { return nil }",
+		"func (w *Worker) Name() string { return \"w\" }",
+		"",
+		"func A() int { return 1 }",
+		"",
+	}, "\n"))
+	// Cycle-leg 2: package `b` imports `a`. Also gives `b`
+	// a struct/method pair so the per-file recipes see
+	// class scopes in this file too.
+	writeFixtureFile(t, root, "b/b.go", strings.Join([]string{
+		"package b",
+		"",
+		"import _ \"example.com/cycle/a\"",
+		"",
+		"type Helper struct {",
+		"\tCount int",
+		"}",
+		"",
+		"func (h *Helper) Tick() { h.Count++ }",
+		"",
+		"func B() int { return 2 }",
+		"",
+	}, "\n"))
+	// A standalone package whose source bytes give the
+	// duplication_ratio recipe enough lexical material to
+	// chew on. Repeated identifiers / literals are typical
+	// dup-ratio fuel (the recipe's windowed-shingle pass
+	// produces non-zero output when many tokens repeat).
+	dupContent := strings.Repeat("var Foo int = 42\n", 40) +
+		strings.Repeat("var Bar int = 99\n", 40)
+	writeFixtureFile(t, root, "c/c.go", "package c\n\n"+dupContent)
+
+	rc := testRepoContext(t, root)
+	// Stamp the module path so cycle_member can canonicalise
+	// the `example.com/cycle/...` import targets against the
+	// in-corpus package directory index.
+	rc.ModulePath = "example.com/cycle"
+
+	o := orchestrator.New(orchestrator.Options{Workers: 2})
+
+	res, err := o.Run(context.Background(), rc, root)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got, want := len(res.Files), 3; got != want {
+		paths := make([]string, len(res.Files))
+		for i, f := range res.Files {
+			paths[i] = f.GetPath()
+		}
+		t.Fatalf("res.Files: got %d (paths=%v), want %d (all three Go files must parse for the project recipes to see the full corpus)", got, paths, want)
+	}
+
+	// Assert that the project-recipe dispatch path ran every
+	// recipe registered in DefaultProjectRegistry. We scan
+	// res.Drafts (the flat collection populated by both per-
+	// file and project recipes) by metric_kind.
+	var (
+		cycleMemberDrafts      []recipes.MetricSampleDraft
+		duplicationRatioDrafts []recipes.MetricSampleDraft
+	)
+	for _, d := range res.Drafts {
+		switch d.MetricKind {
+		case "cycle_member":
+			cycleMemberDrafts = append(cycleMemberDrafts, d)
+		case "duplication_ratio":
+			duplicationRatioDrafts = append(duplicationRatioDrafts, d)
+		}
+	}
+
+	if len(cycleMemberDrafts) == 0 {
+		kinds := uniqueMetricKinds(res.Drafts)
+		t.Fatalf("no cycle_member drafts emitted; saw metric_kinds=%v -- project-level dispatch at orchestrator.go:381-383 either skipped DefaultProjectRegistry().All() or failed to feed the full AST corpus", kinds)
+	}
+	if len(duplicationRatioDrafts) == 0 {
+		kinds := uniqueMetricKinds(res.Drafts)
+		t.Fatalf("no duplication_ratio drafts emitted; saw metric_kinds=%v -- project-level dispatch must reach BOTH DefaultProjectRegistry entries, not just the first", kinds)
+	}
+
+	// Assert at least one cycle_member draft has value == 1.0
+	// (a member of an SCC). This proves the recipe actually
+	// SAW the import cycle, not just that it was invoked.
+	sawCycleMember := false
+	for _, d := range cycleMemberDrafts {
+		if d.Value == 1.0 {
+			sawCycleMember = true
+			break
+		}
+	}
+	if !sawCycleMember {
+		values := make([]float64, len(cycleMemberDrafts))
+		for i, d := range cycleMemberDrafts {
+			values[i] = d.Value
+		}
+		t.Errorf("no cycle_member draft with value=1.0; got values=%v -- the recipe ran but did not detect the synthetic a<->b cycle (possible canonicalisation gap)", values)
+	}
+
+	// Cross-check the per-file dispatch path also ran the
+	// nine canonical per-file metrics. This is a regression
+	// against the workstream-2.2 evaluator item 2 fix
+	// (registering interface_width, depth_of_inheritance,
+	// coupling_between_objects in DefaultRegistry).
+	wantPerFileLit := []string{
+		"loc",
+		"interface_width",
+		"depth_of_inheritance",
+		"coupling_between_objects",
+	}
+	gotKindsSet := map[string]bool{}
+	for _, d := range res.Drafts {
+		gotKindsSet[d.MetricKind] = true
+	}
+	for _, k := range wantPerFileLit {
+		if !gotKindsSet[k] {
+			t.Errorf("per-file dispatch did not emit %q; got metric_kinds=%v -- DefaultRegistry must register all nine foundation-tier recipes", k, uniqueMetricKinds(res.Drafts))
+		}
+	}
+}
+
+// uniqueMetricKinds collects the distinct `MetricKind`
+// strings observed across `drafts`, in sorted order, so
+// failure messages are deterministic across runs.
+func uniqueMetricKinds(drafts []recipes.MetricSampleDraft) []string {
+	seen := map[string]bool{}
+	for _, d := range drafts {
+		seen[d.MetricKind] = true
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	// Tiny insertion sort: deterministic output without
+	// pulling `sort` into the test file (the existing tests
+	// already import `strings`, `os`, `context`, etc., but
+	// not `sort` -- keeping the import set minimal).
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j-1] > out[j]; j-- {
+			out[j-1], out[j] = out[j], out[j-1]
+		}
+	}
+	return out
+}

@@ -122,7 +122,10 @@ func TestWalk_SkipDirectories_AllBaseline(t *testing.T) {
 	root := t.TempDir()
 	// One source file per skip directory, plus a sentinel
 	// at the root so the walker has something to emit.
-	for _, dir := range walk.DefaultSkipDirs {
+	// `walk.DefaultSkipDirs()` is a function returning a
+	// fresh slice (walker.go:131) -- callers must invoke it,
+	// not range over the symbol itself.
+	for _, dir := range walk.DefaultSkipDirs() {
 		writeFile(t, root, dir+"/foo.go", "package x")
 	}
 	writeFile(t, root, "keep.go", "package x\n")
@@ -137,13 +140,14 @@ func TestWalk_SkipDirectories_AllBaseline(t *testing.T) {
 	if names := pathsOf(got); !equalStrings(names, []string{"keep.go"}) {
 		t.Errorf("emitted files = %v; want [keep.go]", names)
 	}
-	for _, dir := range walk.DefaultSkipDirs {
+	skipDirs := walk.DefaultSkipDirs()
+	for _, dir := range skipDirs {
 		if !hasSkip(gotSk, dir, walk.SkipReasonDirectory) {
 			t.Errorf("missing WalkSkip{Reason:directory_skip, Path:%q}; got %v", dir, gotSk)
 		}
 	}
 	// Exactly one directory_skip per skip directory.
-	if got, want := countSkips(gotSk, walk.SkipReasonDirectory), len(walk.DefaultSkipDirs); got != want {
+	if got, want := countSkips(gotSk, walk.SkipReasonDirectory), len(skipDirs); got != want {
 		t.Errorf("directory_skip count = %d; want %d (got skips: %v)", got, want, gotSk)
 	}
 }

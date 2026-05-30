@@ -297,6 +297,84 @@ func TestGlobalsValidateAcceptsDefaults(t *testing.T) {
 	}
 }
 
+// TestValidateUsesVerbInReservedFlagMessage confirms the
+// `verb` argument threaded through Validate is actually woven
+// into the literal stderr prefix -- i.e. calling Validate("report",
+// stderr) emits `cleanc report: --with-churn is reserved ...`
+// rather than the legacy `cleanc analyze:` baked into the const
+// form. Without this guard the iter-4 fix for item 4 (REPORT
+// FLAG SURFACE INCOMPLETE) is half-done: the flag surface lights
+// up but the error text still misleads operators into thinking
+// the rejection came from `analyze`. The substring assertions
+// the e2e scenarios pin (`--with-churn is reserved`) remain
+// satisfied either way; this test covers the cosmetic accuracy
+// gap that wasn't otherwise observable.
+func TestValidateUsesVerbInReservedFlagMessage(t *testing.T) {
+	t.Parallel()
+
+	verbs := []string{VerbAnalyze, VerbReport}
+	for _, verb := range verbs {
+		verb := verb
+		t.Run("verb="+verb, func(t *testing.T) {
+			t.Parallel()
+			fs := flag.NewFlagSet("t", flag.ContinueOnError)
+			g := Register(fs)
+			churn := true
+			g.WithChurn = &churn
+
+			var buf bytes.Buffer
+			if err := g.Validate(verb, &buf); err == nil {
+				t.Fatalf("Validate(%q) returned nil, want non-nil error", verb)
+			}
+			got := buf.String()
+			wantPrefix := "cleanc " + verb + ":"
+			if !contains(got, wantPrefix) {
+				t.Errorf("stderr = %q, want substring %q", got, wantPrefix)
+			}
+			if !contains(got, "--with-churn is reserved") {
+				t.Errorf("stderr = %q lost the e2e substring %q", got, "--with-churn is reserved")
+			}
+		})
+	}
+}
+
+// TestReservedTelemetryMessageForRoundTrip confirms the helper
+// builds the verb-prefixed line for non-empty verbs and falls
+// back to the legacy `ReservedTelemetryMessage` constant when
+// verb is empty, so older callers (and any test still anchored
+// on the constant) keep working unchanged.
+func TestReservedTelemetryMessageForRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	if got := ReservedTelemetryMessageFor(""); got != ReservedTelemetryMessage {
+		t.Errorf("ReservedTelemetryMessageFor(\"\") = %q, want fallback %q", got, ReservedTelemetryMessage)
+	}
+	got := ReservedTelemetryMessageFor(VerbReport)
+	if !contains(got, "cleanc report:") {
+		t.Errorf("ReservedTelemetryMessageFor(report) = %q, want `cleanc report:` prefix", got)
+	}
+	if !contains(got, "--telemetry-otlp is reserved for a future story") {
+		t.Errorf("ReservedTelemetryMessageFor(report) = %q dropped e2e substring", got)
+	}
+}
+
+// TestReservedWithChurnMessageForRoundTrip mirrors the telemetry
+// helper test for the `--with-churn` reservation message.
+func TestReservedWithChurnMessageForRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	if got := ReservedWithChurnMessageFor(""); got != ReservedWithChurnMessage {
+		t.Errorf("ReservedWithChurnMessageFor(\"\") = %q, want fallback %q", got, ReservedWithChurnMessage)
+	}
+	got := ReservedWithChurnMessageFor(VerbReport)
+	if !contains(got, "cleanc report:") {
+		t.Errorf("ReservedWithChurnMessageFor(report) = %q, want `cleanc report:` prefix", got)
+	}
+	if !contains(got, "--with-churn is reserved for P2 and rejected in P0/P1") {
+		t.Errorf("ReservedWithChurnMessageFor(report) = %q dropped e2e substring", got)
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

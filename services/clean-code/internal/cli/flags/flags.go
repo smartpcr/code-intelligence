@@ -179,24 +179,30 @@ func Register(fs *flag.FlagSet) *Globals {
 
 // Validate runs the cross-flag rules pinned by e2e-scenarios.md
 // Stage 3.3 / Stage 4.4: rejected reserved flags and the
-// closed-set `--exit-on` membership. The `verb` argument lets
-// future stages add verb-scoped checks; the current rules apply
-// equally to `analyze` and `report`.
+// closed-set `--exit-on` membership. The `verb` argument is woven
+// into the literal stderr messages so an operator invoking
+// `cleanc report --with-churn=true findings.json` sees a
+// `cleanc report: --with-churn is reserved ...` prefix rather
+// than the misleading `cleanc analyze:` baked into the const
+// form -- the substring assertions in e2e-scenarios.md Stage 4.4
+// (`--with-churn is reserved`) still match in either case.
 //
 // If `stderr` is non-nil and a rule trips, Validate writes the
-// pinned literal message before returning a non-nil error so the
-// dispatcher can exit with `ExitUsage` without duplicating the
-// message strings.
+// verb-prefixed literal message before returning a non-nil error
+// so the dispatcher can exit with `ExitUsage` without duplicating
+// the message strings. An empty `verb` falls back to the legacy
+// `cleanc analyze:` prefix held in the exported message constants
+// so callers that pre-date this helper keep working unchanged.
 func (g *Globals) Validate(verb string, stderr io.Writer) error {
 	if g.TelemetryOTLP != nil && *g.TelemetryOTLP != "" {
 		if stderr != nil {
-			fmt.Fprintln(stderr, ReservedTelemetryMessage)
+			fmt.Fprintln(stderr, ReservedTelemetryMessageFor(verb))
 		}
 		return fmt.Errorf("--telemetry-otlp is reserved")
 	}
 	if g.WithChurn != nil && *g.WithChurn {
 		if stderr != nil {
-			fmt.Fprintln(stderr, ReservedWithChurnMessage)
+			fmt.Fprintln(stderr, ReservedWithChurnMessageFor(verb))
 		}
 		return fmt.Errorf("--with-churn is reserved")
 	}
@@ -207,6 +213,30 @@ func (g *Globals) Validate(verb string, stderr io.Writer) error {
 		return fmt.Errorf("--exit-on out of range")
 	}
 	return nil
+}
+
+// ReservedTelemetryMessageFor returns the literal stderr line
+// emitted when `--telemetry-otlp` is set on a P0/P1 build,
+// prefixed with the invoking verb so `cleanc report
+// --telemetry-otlp=...` does not mislead operators with an
+// `analyze` tag. Pass an empty `verb` to get the legacy
+// `cleanc analyze:` prefix held in [ReservedTelemetryMessage].
+func ReservedTelemetryMessageFor(verb string) string {
+	if verb == "" {
+		return ReservedTelemetryMessage
+	}
+	return fmt.Sprintf("cleanc %s: --telemetry-otlp is reserved for a future story (not implemented in P0/P1)", verb)
+}
+
+// ReservedWithChurnMessageFor returns the literal stderr line
+// emitted when `--with-churn` is set on a P0/P1 build, prefixed
+// with the invoking verb. Pass an empty `verb` to get the legacy
+// `cleanc analyze:` prefix held in [ReservedWithChurnMessage].
+func ReservedWithChurnMessageFor(verb string) string {
+	if verb == "" {
+		return ReservedWithChurnMessage
+	}
+	return fmt.Sprintf("cleanc %s: --with-churn is reserved for P2 and rejected in P0/P1", verb)
 }
 
 // ExitOnLevels is the closed severity set accepted by

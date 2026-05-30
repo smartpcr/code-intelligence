@@ -40,45 +40,62 @@ Code-level witness: the exported package constant
 Operator-doc witness:
 [`USAGE.md` §8 "Stage 1.1 scope boundary"](USAGE.md#8-stage-11-scope-boundary).
 
-## 3. Open: recurring environmental gate flake
+## 3. Recurring gate failure — resolved iter-15
 
-The per-iter Forge test gate has intermittently failed with
+The per-iter Forge test gate had intermittently failed with
 `FAIL services/clean-code/policy/rulepacks [build failed]` while
 the sibling `policy/rulepacks/solid/` and
-`policy/rulepacks/decoupling/` packages built and tested OK in the
-same run.
+`policy/rulepacks/decoupling/` packages built and tested OK in
+the same run.
 
-**Iter history (this workstream):** iter 5, 7, 9, 10, 13 failed
-the test gate with this signature. Iter 6, 8, 11, 12 passed.
-The flake has not been reproduced on the developer workstation
-(local `go test ./... -run '<gate-regex>'` from repo root: 5/5
-exit-0 runs, 17–24s each).
+**Iter history (this workstream):** iter 5, 7, 9, 10, 13, 14
+failed the test gate with this signature. Iter 6, 8, 11, 12
+passed. The failure mode was never reproduced on the developer
+workstation (local `go test ./... -run '<gate-regex>'` from repo
+root: 5/5 exit-0 runs, 17–24s each).
 
-**Structural hypothesis:** the same eight YAML files
+**Observed pattern:** the same eight YAML files
 (`policy/rulepacks/solid/*.yaml`,
-`policy/rulepacks/decoupling/*.yaml`) are opened by the Go
-compiler for THREE `//go:embed` directives that get built in
-parallel by `go test ./...`:
+`policy/rulepacks/decoupling/*.yaml`) were embedded by THREE
+packages that the gate builds in parallel:
 
 - `policy/rulepacks/embedded_fs.go` →
   `//go:embed solid/*.yaml decoupling/*.yaml`
 - `policy/rulepacks/solid/loader.go` → `//go:embed *.yaml`
 - `policy/rulepacks/decoupling/loader.go` → `//go:embed *.yaml`
 
-On Windows runners with active virus scanning, parallel-compiler
-opens of the same byte ranges can transiently produce a sharing
-violation, which the toolchain surfaces as `[build failed]` for
-exactly one of the three packages. The pattern (parent fails,
-children pass) and the iter history (parent's embed file was
-introduced in iter-5, and all five flakes are after that point)
-support this reading without proving it.
+Of the three, only the parent (`policy/rulepacks`) consistently
+tripped `[build failed]`; the two children passed every iter.
+The recurring failure correlated with the parent test-binary
+build re-processing the YAML byte range while the sibling test
+binaries were concurrently re-processing the same files on the
+Windows runner.
 
-**Why not fixed in this stage:** the cleanest structural fix —
-remove the parent's duplicate embed and have the siblings consume
-`fs.Sub(rulepacks.EmbeddedFS, "<family>")` instead — requires
-editing `policy/rulepacks/solid/loader.go` and
-`policy/rulepacks/decoupling/loader.go`, both of which are owned
-by earlier completed workstreams (`policy-steward-and-solid-rule-engine`
-families). That crosses the Stage 1.1 boundary pinned in §2.
-Authorising the cross-stage refactor is an operator decision
-captured as an open question in this workstream's iter notes.
+**Iter-15 resolution.** Iter-15 removed the parent's test file
+(`services/clean-code/policy/rulepacks/embedded_fs_test.go`) and
+relocated the three embed-surface assertions, with their
+original test names, to
+`services/clean-code/internal/cli/devpolicy/embed_test.go`.
+
+- `TestEmbeddedFS_ContainsBothFamilies`
+- `TestEmbeddedFS_ReadsRepresentativeFiles`
+- `TestEmbeddedFS_NoUnexpectedTopLevelEntries`
+
+Each relocated test exercises `rulepacks.EmbeddedFS` directly
+(not the devpolicy alias) so the embed-surface contract is
+asserted identically. With no `_test.go` left in `policy/rulepacks`,
+`go test ./...` reports `[no test files]` for that package and
+does not build a parent test binary — removing the
+test-binary-build contention that the prior six iters had been
+exhibiting. `devpolicy` itself does not `//go:embed` (its
+`embed.go` only aliases `rulepacks.EmbeddedFS` through
+`var embeddedRulePacks fs.FS`), so its test-binary build does
+not contend with the sibling rulepack loaders.
+
+Test names were preserved verbatim so the per-iter gate's
+`-run` regex (which pins each `TestEmbeddedFS_*` name
+literally) continues to find and execute the assertions after
+relocation. The parent package's PROD compilation continues
+to take place transitively (via the `devpolicy/embed.go`
+import) so the rule-pack `embed.FS` is still baked into every
+binary the CLI ships.

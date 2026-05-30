@@ -28,5 +28,6 @@ func CanonicalPackageSig(repoURL, pkgDir string) string {
 
 // CanonicalFileSig returns the canonical signature for a file node.
 func CanonicalFileSig(repoURL, relPath string) string {
-	return repoURL + "::file::" + relPath
+	normalized := strings.ReplaceAll(relPath, "\\", "/")
+	return repoURL + "::file::" + normalized
 }

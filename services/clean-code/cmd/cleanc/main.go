@@ -341,22 +341,54 @@ func runReport(stdout, stderr io.Writer, args []string) int {
 // `fs.Args()` and re-invoking Parse on the remainder until all
 // flags are consumed.
 //
+// The conventional `--` end-of-flags sentinel is honoured
+// across iterations: every token AFTER the first `--` is
+// collected verbatim as a positional, even if it starts with a
+// dash (e.g. `cleanc analyze -- -my-repo` treats `-my-repo` as
+// the repo path rather than rejecting it as an unknown flag).
+// Without this up-front split the inner loop would lose the
+// sentinel after the first `fs.Parse` call -- `flag.FlagSet`
+// strips `--` from `fs.Args()` -- and the second iteration
+// would hand a leading-dash token back to `fs.Parse`, which
+// would reject it.
+//
 // The function returns the collected positional arguments in
 // the order they appeared on the command line, or the first
 // parse error encountered.
 func parseInterleavedFlags(fs *flag.FlagSet, args []string) ([]string, error) {
+	var trailing []string
+	if i := indexOfEndOfFlags(args); i >= 0 {
+		// Copy so a later append into `positionals` cannot
+		// alias / mutate the caller's slice.
+		trailing = append([]string(nil), args[i+1:]...)
+		args = args[:i]
+	}
 	var positionals []string
 	for len(args) > 0 {
 		if err := fs.Parse(args); err != nil {
 			return positionals, err
 		}
 		if fs.NArg() == 0 {
-			return positionals, nil
+			break
 		}
 		positionals = append(positionals, fs.Arg(0))
 		args = fs.Args()[1:]
 	}
-	return positionals, nil
+	return append(positionals, trailing...), nil
+}
+
+// indexOfEndOfFlags returns the index of the first standalone
+// `--` token in `args`, or -1 if none is present. Only the
+// first occurrence is treated as the sentinel; later `--`
+// tokens are positional arguments (which is the convention
+// followed by getopt, POSIX utilities, and `go run -- --`).
+func indexOfEndOfFlags(args []string) int {
+	for i, a := range args {
+		if a == "--" {
+			return i
+		}
+	}
+	return -1
 }
 
 // runApply handles the reserved `cleanc apply` verb. The

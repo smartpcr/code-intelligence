@@ -330,6 +330,39 @@ migrations\migrator.go:31:20: method Migrator.Up already declared at migrations\
 
 #### Sibling stage workstreams (NOT owned here)
 
+> **⚠ HISTORICAL — superseded by sibling-stage merges.** This
+> subsection (and the dependent sub-subsections that follow it
+> through "## Polyglot coverage matrix") was authored during the
+> Go-parser stage of `code-intelligence:AST-PARSER-FOR-ADDIT`
+> when C, C++, C#, Rust, and PowerShell parsers were still split
+> across in-flight sibling worktrees. **All of those sibling
+> stages have since merged.** Concretely, claims below that are
+> now stale:
+>
+> - C and C# parsers are NOT stubs — `parser_treesitter_c.go`
+>   and `parser_treesitter_csharp.go` ship real tree-sitter
+>   walkers (registered by
+>   [`parsers_cgo.go`](../../services/agent-memory/internal/repoindexer/ast/parsers_cgo.go)).
+> - C++, Rust, and PowerShell parser files are NOT absent or
+>   future sibling work — `parser_treesitter_cpp.go`,
+>   `parser_treesitter_rust.go`, and `parser_powershell.go` are
+>   all present and registered.
+> - `parsers_cgo.go` does NOT register
+>   `NewTreeSitterTypeScriptParser` or
+>   `NewTreeSitterPythonParser`; those parsers exist in the
+>   package but are only enabled via explicit
+>   `ast.WithParsers(...)` (see
+>   [`parsers_cgo.go`](../../services/agent-memory/internal/repoindexer/ast/parsers_cgo.go)
+>   and
+>   [`parsers_nocgo.go`](../../services/agent-memory/internal/repoindexer/ast/parsers_nocgo.go)).
+>
+> **For the current, authoritative parser roster and
+> degradation matrix see
+> [`services/agent-memory/internal/repoindexer/ast/COVERAGE.md`](../../services/agent-memory/internal/repoindexer/ast/COVERAGE.md)
+> and the skim matrix at lines 60-69 of this file.** The text
+> below is retained for historical lineage only and must not be
+> read as current state.
+
 The story `code-intelligence:AST-PARSER-FOR-ADDIT` is decomposed into one stage workstream per language (or language group). This stage owns the Go tree-sitter parser AND two STUB parsers: `parser_treesitter_c.go` (added in iter 8) and `parser_treesitter_csharp.go` (added in iter 9). Both stubs honor the `LanguageParser` contract and register in `defaultParsers()` so `.c` / `.h` and `.cs` files have a route, but `Parse()` returns an empty `ParseResult{}` because the real walkers are sibling-stage work. The remaining C++/Rust/PowerShell tree-sitter parser files (`parser_treesitter_cpp.go`, `parser_treesitter_rust.go`, `parser_powershell.go`, and their `_test.go` siblings) belong to other active worktrees on this same story and will land via their own stage merges:
 
 | Sibling stage worktree                                          | Branch slug                                                                          | Parser files owned                                                                                                                                                                                                                                                            |

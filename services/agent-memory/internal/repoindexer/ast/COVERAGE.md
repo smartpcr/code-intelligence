@@ -70,19 +70,38 @@ S7).
   the project's `parser_treesitter_c` workstream owns the C
   header extensions."
 
-The C-before-C++ ordering pinned by
-`TestDefaultParsers_CBeforeCpp`
+**Today's roster has no extension overlap between C and C++.**
+The C-before-C++ slice ordering in
+[`parsers_cgo.go`](./parsers_cgo.go) (`defaultParsers()` lists
+`NewTreeSitterCParser()` at index 0, `NewTreeSitterCppParser()`
+at index 1) therefore has **no effect on `.h` routing** in the
+current code; `.h` routes to C purely because C is the only
+parser whose `Extensions()` claims it.
+
+The `TestDefaultParsers_CBeforeCpp` pin
 ([`parser_treesitter_cpp_test.go`](./parser_treesitter_cpp_test.go)
-lines 788-834) is a **defensive guard**, not a tie-breaker for
-today's roster: today the two parsers' extension sets do not
-overlap. The dispatcher's `extMap` is overwrite-on-last-wins, so
-if a future revision of `parser_treesitter_cpp.go` accidentally
-added `.h` to its `Extensions()`, the C++ parser would silently
-re-route `.h` files away from C; pinning C earlier in the slice
-keeps C's `.h` claim authoritative even under that hypothetical
-edit. The C++ test's own comment block calls this out as
-future-proofing for the implementation-plan §line-444 test
-`TestDispatcher_DotHRoutesToC_EvenWithCppHint`.
+lines 788-834) is a **positional canary**, not a tie-breaker:
+
+- The dispatcher's `extMap` build at
+  [`dispatcher.go`](./dispatcher.go) lines 163-165 iterates
+  `defaultParsers()` in slice order and **the LAST entry for a
+  given extension wins** (each iteration overwrites the previous
+  `extMap[ext]`). So if a future revision of
+  `parser_treesitter_cpp.go` accidentally added `.h` to its
+  `Extensions()`, the existing C-before-C++ ordering would
+  silently route `.h` files to **C++**, not keep C authoritative.
+  That risk is documented inline as a **code-review canary** in
+  both [`parsers_cgo.go`](./parsers_cgo.go) (the `Order is
+  significant` block) and the test's own first bullet — the
+  ordering pin does NOT protect against it.
+- What the pin DOES do: keep the slice order deterministic so
+  the downstream cross-language dispatcher test
+  `TestDispatcher_DotHRoutesToC_EvenWithCppHint`
+  (implementation-plan §line-444) stays stable across edits to
+  `defaultParsers()`. The test asserts `cIdx < cppIdx`, so any
+  edit that reorders C past C++ trips this canary and forces a
+  code-review conversation about extension routing before the
+  change merges.
 
 ## Per-language coverage matrix
 

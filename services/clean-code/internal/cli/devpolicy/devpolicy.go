@@ -7,3 +7,9 @@
 // Package devpolicy loads YAML rule packs into an in-memory unsigned
 // PolicyVersion for dev-mode CLI usage.
 package devpolicy
+
+// DevPolicyLoader loads YAML rule packs into an unsigned in-memory
+// PolicyVersion for local development use.
+type DevPolicyLoader struct {
+	RulePackPaths []string
+}

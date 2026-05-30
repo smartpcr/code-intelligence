@@ -179,6 +179,53 @@ func (d *Dispatcher) dispatcherParsersForTest() map[string]Parser {
 	return out
 }
 
+// selectParser resolves the Parser the dispatcher would route the
+// given file to, applying the architecture §4.1 contract:
+//
+//  1. A known (lower-cased) file extension always wins over hints.
+//  2. If the extension is not registered, walk the per-event hint
+//     list (preferred) or fall back to the dispatcher-global hint
+//     list (set via `WithLanguageHints`). Hints are alias-expanded
+//     via `normalizeHints`; the first hint whose canonical language
+//     matches a registered parser's `Language()` wins.
+//  3. If neither path resolves a parser, returns `nil`. The
+//     dispatcher's `EmitFile` interprets that as the
+//     `ast.dispatch.skip{reason=no_parser}` branch.
+//
+// This method is the single source of truth for the routing
+// decision; `EmitFile` calls it before opening the file. The
+// canonical cross-language routing tests
+// (`TestDispatcher_RoutesByExtension`,
+// `TestDispatcher_DotHRoutesToC_EvenWithCppHint`,
+// `TestDispatcher_NoParserForUnknown`) call this method directly so
+// extension routing can be asserted without going through the full
+// EmitFile / writer pipeline.
+func (d *Dispatcher) selectParser(relPath string, eventHints []string) Parser {
+	ext := strings.ToLower(filepath.Ext(relPath))
+	if p, ok := d.extMap[ext]; ok {
+		return p
+	}
+	// Per-event hints take precedence over the dispatcher-global
+	// hint list; fall back to the global list only when the
+	// per-event slice is empty (architecture §4.1, tested by
+	// `TestDispatcher_PerEventLanguageHintsOverrideGlobal`).
+	hints := eventHints
+	if len(hints) == 0 {
+		hints = d.languageHints
+	}
+	if len(hints) == 0 {
+		return nil
+	}
+	for _, hint := range normalizeHints(hints) {
+		for _, candidate := range d.parsers {
+			if candidate.Language() == hint {
+				return candidate
+			}
+		}
+	}
+	return nil
+}
+
 // EmitFile parses one file event and writes the resulting Nodes /
 // Edges through the dispatcher's NodeEdgeWriter. The returned
 // `repoindexer.EmitResult.TouchedNodes` lists every Node the
@@ -218,46 +265,19 @@ func (d *Dispatcher) dispatcherParsersForTest() map[string]Parser {
 // only) the dispatcher walks the ParseResult per the Pass contract
 // but skips every `InsertNode` / `InsertEdge` call.
 func (d *Dispatcher) EmitFile(ctx context.Context, ev repoindexer.EmitFileEvent) (repoindexer.EmitResult, error) {
-	ext := strings.ToLower(filepath.Ext(ev.RelPath))
-
-	p, ok := d.extMap[ext]
-	if !ok {
-		// Hint-fallback: prefer the per-event `EmitFileEvent.LanguageHints`
-		// (the worker fills these in from `repo.language_hints[]` for
-		// the specific repo this file belongs to) over the dispatcher
-		// global hints, and fall back to the global list only when the
-		// per-event slice is empty. This is the v1 contract per
-		// architecture ┬º4.1 ΓÇö hints route ONLY unknown / unmapped
-		// extensions; a known extension always wins.
-		// Tests: `TestDispatcher_LanguageHintsFallbackForUnknownExtension`,
-		// `TestDispatcher_PerEventLanguageHintsOverrideGlobal`.
-		hints := ev.LanguageHints
-		if len(hints) == 0 {
-			hints = d.languageHints
+	// Routing decision (extension > per-event hints > dispatcher-
+	// global hints) lives on `selectParser` so the cross-language
+	// dispatcher routing tests can exercise it directly without
+	// going through the full Parse / writer pipeline.
+	p := d.selectParser(ev.RelPath, ev.LanguageHints)
+	if p == nil {
+		if d.logger != nil {
+			d.logger.Info("ast.dispatch.skip",
+				slog.String("file", ev.RelPath),
+				slog.String("reason", "no_parser"),
+			)
 		}
-		if len(hints) > 0 {
-			for _, hint := range normalizeHints(hints) {
-				for _, candidate := range d.parsers {
-					if candidate.Language() == hint {
-						p = candidate
-						ok = true
-						break
-					}
-				}
-				if ok {
-					break
-				}
-			}
-		}
-		if !ok {
-			if d.logger != nil {
-				d.logger.Info("ast.dispatch.skip",
-					slog.String("file", ev.RelPath),
-					slog.String("reason", "no_parser"),
-				)
-			}
-			return repoindexer.EmitResult{}, nil
-		}
+		return repoindexer.EmitResult{}, nil
 	}
 
 	if ev.Open == nil {

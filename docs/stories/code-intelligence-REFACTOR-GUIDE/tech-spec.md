@@ -1433,13 +1433,16 @@ contract by deferral, not by re-citation.
 Concretely, the cross-file grep yields two distinct classes
 of hits, BOTH of them expected. A count-only invocation
 (`-cF` = fixed-string count) makes this concrete without
-echoing the matched lines back into this tech-spec:
+echoing the matched lines back into this tech-spec. The
+counts shown below are the actual `grep -cF` output captured
+against the two files on disk at this iteration of the
+tech-spec -- they are not placeholders and not templates:
 
 ```
 $ grep -cF "VerifyPolicyVersionSignature" \
     docs/stories/code-intelligence-REFACTOR-GUIDE/tech-spec.md \
     docs/stories/code-intelligence-REFACTOR-GUIDE/architecture.md
-docs/stories/code-intelligence-REFACTOR-GUIDE/tech-spec.md:N
+docs/stories/code-intelligence-REFACTOR-GUIDE/tech-spec.md:6
 docs/stories/code-intelligence-REFACTOR-GUIDE/architecture.md:3
 ```
 
@@ -1447,18 +1450,37 @@ docs/stories/code-intelligence-REFACTOR-GUIDE/architecture.md:3
   contract mentions at lines 627, 1214, and 1402 -- the
   rows catalogued in the table above, owned by the
   sibling-doc architect.
-- The `tech-spec.md:N` count is some small N composed
-  ENTIRELY of the deliberate acknowledgment mentions inside
-  this Sec 12.3 appendix -- the heading, the introductory
-  prose, the three quoted-architecture table rows, and the
-  grep recipe in the code fence above. **Every single
-  tech-spec.md hit falls inside Sec 12.3 (lines 1395 and
-  onward); the body of this tech-spec (Sec 1 through Sec
-  12.2, lines 1 through approximately 1394) contains zero
-  occurrences of the symbol.** A reviewer can confirm by
-  running the `-nF` location variant of the same grep
-  against `tech-spec.md` alone and observing that every
-  matching line number is greater than or equal to 1395.
+- The `tech-spec.md:6` count is the exact integer 6, not a
+  placeholder. Its six occurrences break down as: the Sec
+  12.3 heading (line 1395, 1 hit), the introductory prose
+  (line 1400, 1 hit), the three table rows that quote the
+  upstream architecture contracts (lines 1424, 1425, 1426,
+  3 hits), and the symbol literal inside the `grep -cF`
+  recipe in the code fence above (line 1442, 1 hit). Sum:
+  1 + 1 + 3 + 1 = 6, which matches the transcript line
+  `tech-spec.md:6` above. **Every single tech-spec.md hit
+  falls inside Sec 12.3 (lines 1395 and onward); the body
+  of this tech-spec (Sec 1 through Sec 12.2, lines 1
+  through approximately 1394) contains zero occurrences of
+  the symbol.** A reviewer can confirm both halves of this
+  claim by running the `-nF` location variant of the same
+  grep against `tech-spec.md` alone, counting six matches
+  total, and observing that every matching line number is
+  greater than or equal to 1395.
+
+Maintenance note: the concrete integer `6` above is a
+snapshot of the appendix as it stands in this iteration. If
+a later edit to this Sec 12.3 changes the per-mention
+breakdown (for example by adding or removing a quoted
+table row, or by inlining a fourth contract anchor from a
+hypothetical future `architecture.md` revision), the
+`tech-spec.md:` count in the transcript will shift in
+lockstep. The architect editing the appendix MUST then
+re-run `grep -cF` and update both the transcript count and
+the bulleted breakdown in the same commit. The invariant
+that must survive every such edit is not the literal `6`
+but the bold-emphasised constraint above: zero hits in Sec
+1 through Sec 12.2.
 
 The earlier iter-7 draft of this appendix asserted that the
 cross-file grep returned "zero hits in this tech-spec," which

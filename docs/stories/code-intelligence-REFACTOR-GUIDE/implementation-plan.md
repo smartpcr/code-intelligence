@@ -71,7 +71,7 @@ storyId: "code-intelligence:REFACTOR-GUIDE"
 
 - [ ] Create `services/clean-code/internal/cli/effort/effort.go` with a `FallbackModel` struct implementing the `refactor.EffortModel` interface (`services/clean-code/internal/refactor/effort_model.go:140-155`).
 - [ ] Implement the deterministic formula pinned in `tech-spec.md` Sec 8.5: `base = 0.02*loc + 0.10*cyclo + 0.05*fan_in + 1.0`, multiply by `taskKindFactor[TaskKind]` (1.5 / 1.3 / 1.4 / 0.7 / 1.0), clamp to `[0.1, 80.0]`, round half-up to 1 decimal.
-- [ ] Implement input extraction from `refactor.HotSpot.Breakdown` z-scores reversed against the policy weights so `loc`, `cyclo`, `fan_in` are read without re-querying the metric reader; treat missing dark metrics as `0` per `tech-spec.md` Sec 8.5 note.
+- [ ] Wire input extraction through a `WithInputSource(provider EffortInputProvider)` constructor option where `EffortInputProvider` is `func(scopeID uuid.UUID) (loc, cyclo, fanIn float64, ok bool)`; the CLI orchestrator builds the provider by walking the same `[]InMemoryMetricSample` rows it already loaded into `refactor.InMemoryMetricSampleReader` and indexing them by `(scope_id, metric_kind)` -- this satisfies `tech-spec.md` Sec 8.5 lines 973-975 ("inputs come from the same in-memory `MetricSampleReader` rows the Planner used") without re-querying the reader at `Estimate` time; missing dark metrics return `ok=false` and contribute `0` to the formula (Sec 8.5 final paragraph). `HotSpot.Breakdown` is NOT used as an input source (it only carries z-scores `ComplexityZ`/`ChurnZ`/`CouplingZ` per `services/clean-code/internal/refactor/hotspot.go:264-284`, not raw `loc`/`fan_in`).
 - [ ] Expose `func New(logger *slog.Logger) refactor.EffortModel` that logs one WARNING line on first invocation per run: `"effort estimator using deterministic fallback formula <version> (no ONNX model loaded)"` (per `architecture.md` Sec 3.5).
 - [ ] Add an `EffortSource` enum (`ml` / `fallback`) and a constructor option `effort.WithSourceTag(string)` so callers can stamp every produced `EffortHours` with provenance (consumed by Phase 4 prompt emitter).
 - [ ] Add a single-line opt-in `Mode() string` method so the orchestrator's diagnostics writer can surface the effort mode in every `RunArtifact` (`tech-spec.md` C15).
@@ -82,7 +82,7 @@ storyId: "code-intelligence:REFACTOR-GUIDE"
 
 ### Test Scenarios
 
-- [ ] Scenario: deterministic output -- Given fixture inputs `{loc: 500, cyclo: 20, fan_in: 8, TaskKind: split_class}`, When `FallbackModel.EstimateEffort` runs, Then result is `(0.02*500 + 0.10*20 + 0.05*8 + 1.0) * 1.5 = 19.05` rounded to `19.1` hours.
+- [ ] Scenario: deterministic output -- Given fixture inputs `{loc: 500, cyclo: 20, fan_in: 8, TaskKind: split_class}`, When `FallbackModel.Estimate` runs, Then result is `(0.02*500 + 0.10*20 + 0.05*8 + 1.0) * 1.5 = (10 + 2 + 0.4 + 1.0) * 1.5 = 13.4 * 1.5 = 20.1` hours (already at 1 decimal, no rounding needed).
 - [ ] Scenario: clamp upper bound -- Given fixture inputs that would compute to 120.0 hours, When estimation runs, Then result is exactly `80.0`.
 - [ ] Scenario: clamp lower bound -- Given fixture inputs that would compute to 0.05 hours, When estimation runs, Then result is exactly `0.1`.
 - [ ] Scenario: task-kind multiplier -- Given identical metric inputs, When estimation runs for `split_class` vs `extract_method`, Then the `split_class` output is exactly `1.5 / 0.7` times the `extract_method` output (modulo rounding).
@@ -91,7 +91,8 @@ storyId: "code-intelligence:REFACTOR-GUIDE"
 
 ### Implementation Steps
 
-- [ ] Create `services/clean-code/internal/cli/devpolicy/embed.go` (no build tag) declaring `//go:embed ../../../policy/rulepacks/solid/*.yaml ../../../policy/rulepacks/decoupling/*.yaml` into a `var embeddedRulePacks embed.FS` (per `cli-policy-distribution` pin, `architecture.md` Sec 1.3, Sec 3.8).
+- [ ] Add `services/clean-code/policy/rulepacks/embedded_fs.go` (a new file in the EXISTING `rulepacks` package alongside the `solid/` and `decoupling/` subdirs) declaring `//go:embed solid/*.yaml decoupling/*.yaml` into an exported `var EmbeddedFS embed.FS`; this is the only Go-embed shape that works because `//go:embed` patterns may not contain `..` and may not reference files outside the package directory tree (Go spec, `embed/embed.go`).
+- [ ] Create `services/clean-code/internal/cli/devpolicy/embed.go` (no build tag) importing the rulepacks package and exposing `var embeddedRulePacks fs.FS = rulepacks.EmbeddedFS` so the loader below can treat embedded and filesystem sources uniformly (per `cli-policy-distribution` pin, `architecture.md` Sec 1.3, Sec 3.8 -- note: arch Sec 3.8 lines 604-606 and `tech-spec.md` Sec 8.4 lines 940-942 informally describe the embed pattern as `../../policy/rulepacks/...` for prose readability; the actual Go file lives in the rulepacks package as above, flagged for arch/tech-spec sync in this iteration's summary).
 - [ ] Create `services/clean-code/internal/cli/devpolicy/loader.go` with a `Loader` interface and `Bundle` struct matching `architecture.md` Sec 5.8 (`PolicyVersion`, `Rules`, `RulePacks`).
 - [ ] Implement YAML decoding into canonical `steward.RulePack` / `steward.Rule` shapes (`services/clean-code/internal/policy/steward/types.go:112-200`) -- one `Rule` per `rules:` entry, one `RulePack` per file.
 - [ ] Implement `synthesisePolicyVersion(rules []steward.Rule, weights refactor.PolicyWeights) steward.PolicyVersion` returning a `PolicyVersion` whose `Signature == nil` and whose `PolicyVersionID` is `UUID-v5(namespace=cleanc.dev-policy, name=sha256(sorted_rule_ids)+effort_model_version)` so it is stable per `(loaded packs, effort model)` (`architecture.md` Sec 4.5; `tech-spec.md` C11).
@@ -301,7 +302,7 @@ storyId: "code-intelligence:REFACTOR-GUIDE"
 - [ ] Translate walker errors / parser internal errors / engine errors into the exit-code matrix per `tech-spec.md` Sec 8.6 (`2` / `70`); a `panic` anywhere in the pipeline is recovered in `main` and surfaced as exit code 70 with the stack trace on stderr.
 - [ ] Honour `--dev-mode=false` by refusing to start: print `"dev-mode disabled but no signed-policy loader available; rebuild with -tags prod"` and exit 64.
 - [ ] Reject unknown flag values for `--exit-on` (must be one of `info`/`warn`/`block`) at flag-parse time with exit 64.
-- [ ] Add a `--profile <cpu|mem|trace>` reserved flag that exits 64 in P0/P1 with a `not yet implemented` message so the surface is locked.
+- [ ] Reject any flag not in `tech-spec.md` Sec 8.1 lines 900-912 at flag-parse time with exit 64 -- the CLI surface is bounded by the upstream pin and Stage 4.4 covers the only reserved-but-not-implemented entries (`--with-churn`, `--telemetry-otlp`).
 
 ### Dependencies
 
@@ -397,7 +398,6 @@ storyId: "code-intelligence:REFACTOR-GUIDE"
 - [ ] Resolve `scope.signature` / `scope.kind` / `scope.file_path` / `scope.start_line` / `scope.end_line` by looking up `Task.ScopeID` in `scopebinding.Table`; fail-closed with a non-nil error if the binding is absent (consistency check, never expected in a healthy run).
 - [ ] Call `refactor.ValidateTaskKind(task.Kind)` before emitting; if it returns `ErrRejectedTaskKindAlias`, exit code 70 with a clear message naming the offending task id (`tech-spec.md` C5).
 - [ ] Sort tasks before emission by `(severity DESC, score DESC, scope_id ASC)` so two runs produce byte-identical JSONL output (`tech-spec.md` C11).
-- [ ] Add a `--emit-prompts-pretty` reserved flag (defaults off) that pretty-prints each record across multiple lines for human inspection; mutually exclusive with the JSONL contract.
 
 ### Dependencies
 
@@ -416,7 +416,7 @@ storyId: "code-intelligence:REFACTOR-GUIDE"
 ### Implementation Steps
 
 - [ ] In `cmd/cleanc/main.go` `runAnalyze`, when `--emit-prompts <path>` is non-empty, construct `suggest.NewJSONL()` and call `Emit(ctx, art, w)` after the report + findings writers complete.
-- [ ] When `--emit-prompts` is set with no value or to `-`, write to stdout (mutually exclusive with stdout-default `--out`; the analyze command refuses both at flag-parse time with exit 64).
+- [ ] When `--emit-prompts` is set to the literal `-`, write JSONL to stdout. This contract requires `--out <path>` to be set to a non-stdout file path; if `--out` is unset (default = stdout) the command refuses at flag-parse time with exit 64 and the message `"--emit-prompts - requires --out <path>; cannot route both markdown and JSONL to stdout"`. When `--emit-prompts` is bare (no value) the command also exits 64 with `"--emit-prompts requires a path or '-' for stdout"`.
 - [ ] Append a `Diagnostics.PromptCount int` field to `RunArtifact` and stamp it from the emitter's row count; the markdown / JSON renderers surface this in the diagnostics block.
 - [ ] When `--emit-prompts` is set, the markdown report's diagnostics block adds a line `"Prompts emitted: N to <path>"`.
 - [ ] Add a `--emit-prompts` exit-code contract: an emitter error is exit code 70 (internal). A successful emission with zero tasks is exit code 0 (not 1) and the file is created empty.
@@ -429,9 +429,10 @@ storyId: "code-intelligence:REFACTOR-GUIDE"
 ### Test Scenarios
 
 - [ ] Scenario: file written -- Given `--emit-prompts prompts.jsonl` on a fixture with 5 tasks, When `cleanc analyze` runs, Then `prompts.jsonl` exists with exactly 5 lines and exit code is 0.
-- [ ] Scenario: stdout sink -- Given `--emit-prompts -` and no `--out`, When `cleanc analyze` runs, Then stdout receives the JSONL stream (one line per task) and exit code matches the severity threshold.
+- [ ] Scenario: stdout sink with explicit out -- Given `--emit-prompts -` AND `--out report.md`, When `cleanc analyze <fixture>` runs, Then `report.md` exists with the markdown report and stdout receives the JSONL stream (one line per task) and exit code matches the severity threshold.
 - [ ] Scenario: zero tasks -- Given a fixture producing zero tasks, When `--emit-prompts prompts.jsonl` is set, Then `prompts.jsonl` exists, is zero bytes, and exit code is 0.
-- [ ] Scenario: ambiguous stdout refused -- Given both `--emit-prompts -` AND no `--out` flag (so markdown defaults to stdout), When `cleanc analyze` runs, Then exit code is 64 before any pipeline stage runs.
+- [ ] Scenario: stdout collision refused -- Given `--emit-prompts -` AND no `--out` flag (so markdown would also default to stdout), When `cleanc analyze` runs, Then exit code is 64, stderr contains the exact message `--emit-prompts - requires --out <path>; cannot route both markdown and JSONL to stdout`, and no pipeline stage starts.
+- [ ] Scenario: bare emit-prompts refused -- Given `--emit-prompts` with no value supplied on the command line, When `cleanc analyze` runs, Then exit code is 64 and stderr contains `--emit-prompts requires a path or '-' for stdout`.
 - [ ] Scenario: diagnostics count -- Given `--emit-prompts prompts.jsonl` with 7 tasks, When the markdown report is generated, Then the diagnostics block contains `"Prompts emitted: 7 to prompts.jsonl"`.
 
 ## Stage 4.4: Reserved Verbs And Flags

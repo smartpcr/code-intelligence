@@ -368,13 +368,18 @@ package repoindexer
 // cache is single-writer.
 //
 // A first-time CLI scan does NOT know the repo's fingerprint.RepoID
-// before EnsureRepoAndCommit runs -- repo.repo_id is allocated by
-// the Postgres schema's `DEFAULT gen_random_uuid()` on first INSERT
-// (migrations/0002_repo_commit.sql line 32). For the SQLite/memory
-// backends the AncestryWriter derives a deterministic RepoID from
-// the URL on the first call so SQLite-scanned graphs can be replayed
-// into Postgres without losing fingerprint parity (S2). Either way
-// the RepoID is the OUTPUT of EnsureRepoAndCommit, never an input.
+// before EnsureRepoAndCommit runs in the sense that it does not call
+// the helper itself -- the writer hides that detail. Internally all
+// three backends (Postgres, SQLite, memory) derive a deterministic
+// RepoID from the URL via fingerprint.RepoIDFromURL(URL) (see
+// graphsink.Sink doc and migrations/0002_repo_commit.sql line 32):
+// the SQLite/memory sinks simply insert the row with that ID, while
+// the Postgres sink calls graphwriter.Writer.EnsureRepoWithID to
+// supply the precomputed UUID and override the schema's
+// `DEFAULT gen_random_uuid()`. The RepoID is thus the OUTPUT of
+// EnsureRepoAndCommit AND a pure function of the URL -- backend
+// parity (S2) holds because all three backends produce the same
+// RepoID for the same URL.
 type AncestryWriter struct {
     Sink    graphsink.Sink   // any sink: postgres, sqlite, memory
     RepoURL string
@@ -393,10 +398,12 @@ type AncestryWriter struct {
 // argument.
 func NewAncestryWriter(sink graphsink.Sink, repoURL, sha string) *AncestryWriter
 
-// EnsureRepoAndCommit performs Sink.EnsureRepo (which allocates the
-// RepoID), Sink.EnsureCommit, and InsertNode(kind=repo) in that
-// order, caches the resulting RepoAncestry on the writer, and
-// returns it. The CLI captures the returned RepoID for use in
+// EnsureRepoAndCommit performs Sink.EnsureRepo (which derives the
+// deterministic RepoID via fingerprint.RepoIDFromURL(URL) and passes
+// it through RepoInput.RepoID; see graphsink.Sink doc), then
+// Sink.EnsureCommit, and InsertNode(kind=repo) in that order. It
+// caches the resulting RepoAncestry on the writer and returns it.
+// The CLI captures the returned RepoID for use in
 // EmitFileEvent.RepoID and for the diagram projector's repo
 // scoping.
 func (a *AncestryWriter) EnsureRepoAndCommit(ctx context.Context, defaultBranch string, hints []string) (RepoAncestry, error)
@@ -422,17 +429,48 @@ type FileAncestry struct {
 }
 ```
 
-The Postgres backend's `Sink.EnsureRepo` delegates straight to
-`*graphwriter.Writer.EnsureRepo` (writer.go:281-328) so the assigned
-`RepoID` matches the queue worker's. The SQLite and memory backends
-synthesize `RepoID = fingerprint.RepoIDFromURL(repoURL)` (a new
-deterministic helper to be added in `pkg/fingerprint`, computed as
-`uuid.NewSHA1(namespaceRepoURL, repoURL)`) so the same URL always
-hashes to the same `fingerprint.RepoID` and a SQLite-scanned graph
-replayed into Postgres preserves Node/Edge fingerprint parity (S2,
-R5). The mgmt-api / queue worker path remains the canonical Postgres
-RepoID allocator -- the deterministic helper is a fallback used only
-when there is no Postgres row to read from.
+All three backends -- Postgres, SQLite, memory -- derive `RepoID`
+deterministically from the repo URL via a new pure-function helper
+`fingerprint.RepoIDFromURL(URL) (RepoID, error)` (computed as
+`uuid.NewSHA1(namespaceRepoURL, URL)`, where `namespaceRepoURL` is a
+fixed UUIDv4 constant added to `pkg/fingerprint`). The computed
+`RepoID` is passed to the sink via a new optional field
+`RepoInput.RepoID fingerprint.RepoID` (an extension of
+`graphwriter.RepoInput` at `writer.go:250-255`); when zero-valued
+the legacy `gen_random_uuid()` allocation kicks in, preserving
+backward compatibility for mgmt-api callers that have not migrated.
+The Postgres sink adapter inspects `RepoInput.RepoID`: when
+non-zero it calls a new exported variant
+`graphwriter.Writer.EnsureRepoWithID(ctx, RepoID, RepoInput)`
+which supplies the precomputed UUID as the inserted value,
+overriding the schema default
+`repo_id uuid PRIMARY KEY DEFAULT gen_random_uuid()`
+(`migrations/0002_repo_commit.sql:32`); when zero it falls
+through to the existing `EnsureRepo`. The SQLite and memory
+sinks always require `RepoInput.RepoID` to be non-zero (a
+construction-time guard) because they have no equivalent random
+default. The `Sink` interface signature itself (S3.2) is
+unchanged -- the extension lives in the `RepoInput` payload.
+
+Because the same `RepoIDFromURL(URL)` runs in every backend, the
+`RepoID` field that enters every `NodeFingerprint` and
+`EdgeFingerprint` pre-image is byte-identical across backends for
+the same URL -- this is what makes the S2 / R5 backend-parity
+claim TRUE in practice. The `RepoID` is therefore both an OUTPUT
+of `EnsureRepoAndCommit` (the CLI does not need to compute it
+itself; the writer does) AND a pure function of the URL (so
+nothing in the dispatcher needs to wait for I/O to know it).
+
+> Caveat for legacy repos. Repos already in Postgres before this
+> story shipped were inserted via the queue worker / mgmt-api with
+> the schema default `gen_random_uuid()`, so their stored
+> `repo_id` does NOT match `RepoIDFromURL(URL)`. On URL collision
+> the `ON CONFLICT (url) DO UPDATE` path in `EnsureRepoWithID`
+> RETURNS the EXISTING `repo_id` (not the precomputed one) so the
+> CLI sees the legacy UUID and the rest of the scan uses it.
+> Backend-parity therefore holds for repos first ingested via this
+> story's code path; legacy Postgres repos are documented as a
+> known parity gap in **implementation-plan.md S6**.
 
 The canonical-signature helpers (`canonicalRepoSig`,
 `canonicalPackageDir`, `canonicalPackageSig`, `canonicalFileSig`)
@@ -603,15 +641,28 @@ For local-path scans the synthesized identity is:
 
 **Decision (pinned, S9.1, operator answer 2026-05-30):** the
 synthesized `sha` for non-git local scans is a deterministic hex
-hash of the directory's mtime tree, computed as
-`sha256( for each f in Workspace.Walk in stable order: f.RelPath + 0x00 + f.ModTime.UTC().Unix() + 0x00 + f.Size + 0x00 )[:16]`
-expressed as a 32-char lowercase hex string (exact byte format to
-be specified in **tech-spec.md S3.4**). The operator may override
-it with `--sha <value>` when they want a stable identity across
-re-scans that ignores mtime drift. The literal string `local` was
-considered and rejected because every non-git scan would collide
-under the same `(repo_id, sha)` key, breaking re-scan dedupe whenever
-the directory's contents actually changed.
+hash of the directory's mtime tree, computed by a new helper
+`fingerprint.MTimeTreeSHA(rootDir string, excludes []string)
+(string, error)`. The helper walks `rootDir` directly via
+`os.ReadDir` / `os.Stat` (NOT via `Workspace.Walk`, because the
+hash must be available BEFORE the materializer constructs a
+`Workspace`), applies the same exclude-dir set as `gitWorkspace`
+(`.git`, `node_modules`, `vendor`, `target`, `bin`, `obj`,
+`__pycache__`, ...), and computes
+`sha256( for each (relPath, stat) in stable lexicographic order: relPath + 0x00 + stat.ModTime().UTC().Unix() + 0x00 + stat.Size() + 0x00 )[:16]`
+expressed as a 32-char lowercase hex string. Note this uses
+`os.FileInfo.ModTime()` and `os.FileInfo.Size()` directly --
+neither `repoindexer.WalkFile` nor any other `Materializer`
+interface needs to be extended, because the helper runs entirely
+in the CLI (`cmd/codeintel`) before any `Materializer.Materialize`
+call. (Exact byte format and exclude-set are specified in
+**tech-spec.md S3.4**.) The operator may override the synthesized
+value with `--sha <value>` when they want a stable identity
+across re-scans that ignores mtime drift. The literal string
+`local` was considered and rejected because every non-git scan
+would collide under the same `(repo_id, sha)` key, breaking
+re-scan dedupe whenever the directory's contents actually
+changed.
 
 ### 4.4 Diagram contract (NEW)
 
@@ -871,15 +922,17 @@ User       CLI               LocalDirMaterializer   AncestryWriter        ast.Di
  |           |                       |                    |                    |                    |                    |
  |--scan---->|                       |                    |                    |                    |                    |
  |           |--Open("repo.db")------------------------------------------------------------------>  |                    |
- |           |--mtime-tree hash for /path/to/repo (S9.1) ----------------------> sha := <hex>        |                    |
+ |           |--MTimeTreeSHA("/path/to/repo", excludes) via os.Stat (S9.1) ----> sha := <hex>        |                    |
  |           |--Materialize(file://...,sha)-------------->|                    |                    |                    |
  |           |<--Workspace-----------|                    |                    |                    |                    |
  |           |--NewAncestryWriter(sink, URL, sha) ---------------------------->                                           |
  |           |                                                                                                            |
  |           |== 1. Pre-walk ancestry (AncestryWriter.EnsureRepoAndCommit) =====================|                       |
- |           |  // RepoID is NOT supplied by the CLI; the sink allocates it.                                              |
+ |           |  // RepoID is NOT supplied by the CLI; the sink derives it deterministically                              |
+ |           |  // via fingerprint.RepoIDFromURL(URL) -- same in all three backends.                                     |
  |           |--EnsureRepoAndCommit(ctx, defaultBranch, hints) --------------->|                                          |
- |           |                                                                  |--Sink.EnsureRepo(RepoInput{URL,...})-->|
+ |           |                                                                  |  repoID := RepoIDFromURL(URL)           |
+ |           |                                                                  |--Sink.EnsureRepo(RepoInput{RepoID:repoID,URL,...})|
  |           |                                                                  |<-- RepoRecord{RepoID, RepoUUID, ...}---|
  |           |                                                                  |--Sink.EnsureCommit(RepoID, SHA, ...)-->|
  |           |                                                                  |<-- CommitID ---------------------------|
@@ -942,14 +995,21 @@ User       CLI               LocalDirMaterializer   AncestryWriter        ast.Di
 ```
 
 Key invariants:
-- The CLI does NOT pre-allocate `fingerprint.RepoID`. It is the
-  RETURN value of `EnsureRepoAndCommit`, populated either by
-  Postgres's `gen_random_uuid()` default or by the SQLite/memory
-  sink's `fingerprint.RepoIDFromURL` helper. Both shapes preserve
-  the S2 backend-parity rule: scanning the same URL twice (even
-  across backends) yields the same `RepoID` for the SQLite/memory
-  case, and the existing `EnsureRepo` URL-upsert idempotence holds
-  for the Postgres case.
+- The CLI does NOT pre-allocate `fingerprint.RepoID` itself -- it is
+  the RETURN value of `EnsureRepoAndCommit`. Internally the sink
+  derives it deterministically via `fingerprint.RepoIDFromURL(URL)`
+  and supplies it as the inserted value in all three backends
+  (`graphsink.sqlite.Sink` / `graphsink.memory.Sink` insert with
+  the precomputed ID; `graphsink.postgres.Sink` calls
+  `graphwriter.Writer.EnsureRepoWithID` to override the schema
+  default `gen_random_uuid()`). This makes the S2 backend-parity
+  rule TRUE without conditions for repos first ingested via this
+  story's code path: scanning the same URL on any backend produces
+  the same `RepoID`, and therefore the same `NodeFingerprint` /
+  `EdgeFingerprint` pre-image bytes. Legacy Postgres repos
+  pre-dating this story keep their non-deterministic `repo_id`
+  values via the `ON CONFLICT (url) DO UPDATE` branch -- this is
+  the documented parity exception (see S3.4 caveat).
 - The pre-walk ancestry (`EnsureRepoAndCommit`) MUST run before any
   `EmitFile`; `EmitFile`'s `RepoNodeID` field is only meaningful
   after the `repo` Node is inserted.
@@ -1225,3 +1285,23 @@ allowed to assume a different default.
   to the canonical `implementation-plan.md` per the sequential
   plan-doc set (architecture -> tech-spec -> implementation-plan ->
   e2e-scenarios).
+- 2026-05-31 (iter 4): closed the two parity / interface gaps the
+  iter-3 fixes introduced. Item 1 (backend fingerprint parity
+  contradiction): unified RepoID allocation across all three
+  backends -- S3.4 now states Postgres, SQLite, and memory all
+  derive `RepoID = fingerprint.RepoIDFromURL(URL)` via the new
+  optional `RepoInput.RepoID` field; the Postgres adapter calls
+  the new `graphwriter.Writer.EnsureRepoWithID` to override the
+  schema's `gen_random_uuid()` default when the field is supplied.
+  S6.1 sequence rewritten to show `repoID := RepoIDFromURL(URL)`
+  computed inside the sink before `Sink.EnsureRepo`. S6.5 parity
+  invariant rewritten so the legacy-Postgres exception is the
+  only caveat (documented in implementation-plan.md S6). Item 2
+  (`WalkFile.ModTime` interface gap): the mtime-tree hash is now
+  defined as a CLI-side helper `fingerprint.MTimeTreeSHA(rootDir,
+  excludes)` that reads `os.FileInfo.ModTime()` / `os.FileInfo.Size()`
+  via `os.ReadDir` / `os.Stat` BEFORE any `Materializer.Materialize`
+  call -- the existing `Materializer` / `Workspace` / `WalkFile`
+  contracts in `internal/repoindexer/materialize.go` are
+  unchanged. S6.1 sequence's mtime-hash step relabelled
+  accordingly.

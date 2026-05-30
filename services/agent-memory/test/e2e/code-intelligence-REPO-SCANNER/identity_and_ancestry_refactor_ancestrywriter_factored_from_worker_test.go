@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -11,76 +12,173 @@ import (
 	"testing"
 
 	"github.com/cucumber/godog"
+
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/repoindexer"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
 )
 
 // ---------------------------------------------------------------------------
-// Spy sink — records InsertNode / InsertEdge calls for assertion
+// Spy writer — satisfies RepoCommitNodeEdgeWriter, records every call so the
+// step assertions can interrogate counts, sequencing, and parent/child kinds.
 // ---------------------------------------------------------------------------
 
-type ancestrySpySink struct {
-	mu       sync.Mutex
-	seq      int
-	nodes    []ancestryNodeCall
-	edges    []ancestryEdgeCall
-	kindByFP map[string]string
+type ancestrySpyWriter struct {
+	mu  sync.Mutex
+	seq int
+
+	ensureRepoCalls   int
+	ensureCommitCalls int
+	insertNodeCalls   []ancestryNodeCall
+	insertEdgeCalls   []ancestryEdgeCall
+
+	// kindByNodeID lets the edge-by-kind-pair assertion resolve
+	// the kind of each endpoint of an InsertEdge call. Populated
+	// on every successful InsertNode.
+	kindByNodeID map[string]string
+
+	// repos / nodes / edges enforce idempotent dedupe so a
+	// per-file replay behaves like the real graphwriter.
+	repos map[string]graphwriter.RepoRecord
+	nodes map[string]graphwriter.NodeRecord
+	edges map[string]graphwriter.EdgeRecord
+
+	nodeSeq int
+	edgeSeq int
+	repoSeq int
 }
 
 type ancestryNodeCall struct {
-	seq   int
-	kind  string
-	fpHex string
+	seq    int
+	kind   string
+	nodeID string
 }
 
 type ancestryEdgeCall struct {
-	seq   int
-	kind  string
-	srcFP string
-	dstFP string
+	seq           int
+	kind          string
+	srcNodeID     string
+	dstNodeID     string
+	srcKind       string
+	dstKind       string
 }
 
-func newAncestrySpySink() *ancestrySpySink {
-	return &ancestrySpySink{kindByFP: make(map[string]string)}
+func newAncestrySpyWriter() *ancestrySpyWriter {
+	return &ancestrySpyWriter{
+		kindByNodeID: make(map[string]string),
+		repos:        make(map[string]graphwriter.RepoRecord),
+		nodes:        make(map[string]graphwriter.NodeRecord),
+		edges:        make(map[string]graphwriter.EdgeRecord),
+	}
 }
 
-func (s *ancestrySpySink) InsertNode(ctx context.Context, n *repoindexer.Node) error {
+func (s *ancestrySpyWriter) EnsureRepo(_ context.Context, in graphwriter.RepoInput) (graphwriter.RepoRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.seq++
-	fpHex := n.Fingerprint.Hex()
-	s.nodes = append(s.nodes, ancestryNodeCall{
-		seq:   s.seq,
-		kind:  n.Kind,
-		fpHex: fpHex,
-	})
-	s.kindByFP[fpHex] = n.Kind
-	return nil
+	s.ensureRepoCalls++
+	if rec, ok := s.repos[in.URL]; ok {
+		rec.Inserted = false
+		return rec, nil
+	}
+	s.repoSeq++
+	id := fingerprint.RepoID{}
+	id[0] = byte(s.repoSeq)
+	id[15] = 0x5A
+	rec := graphwriter.RepoRecord{
+		RepoID:   id.String(),
+		ID:       id,
+		Inserted: true,
+	}
+	s.repos[in.URL] = rec
+	return rec, nil
 }
 
-func (s *ancestrySpySink) InsertEdge(ctx context.Context, e *repoindexer.Edge) error {
+func (s *ancestrySpyWriter) EnsureCommit(_ context.Context, in graphwriter.CommitInput) (graphwriter.CommitRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.seq++
-	s.edges = append(s.edges, ancestryEdgeCall{
-		seq:   s.seq,
-		kind:  e.Kind,
-		srcFP: e.SrcFingerprint.Hex(),
-		dstFP: e.DstFingerprint.Hex(),
-	})
-	return nil
+	s.ensureCommitCalls++
+	return graphwriter.CommitRecord{
+		RepoID:   in.RepoID.String(),
+		SHA:      in.SHA,
+		Inserted: true,
+	}, nil
 }
 
-func (s *ancestrySpySink) currentSeq() int {
+func (s *ancestrySpyWriter) InsertNode(_ context.Context, in graphwriter.NodeInput) (graphwriter.NodeRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seq++
+	key := in.RepoID.String() + "|" + in.Kind + "|" + in.CanonicalSignature + "|" + in.FromSHA
+	if rec, ok := s.nodes[key]; ok {
+		// Idempotent replay must NOT be counted as a new call;
+		// the scenarios assert on the count of distinct Node
+		// emissions, not the number of times the writer was
+		// hit. Replaying the same (kind, signature) tuple
+		// would otherwise inflate "InsertNode with kind X is
+		// called exactly N times".
+		rec.Inserted = false
+		return rec, nil
+	}
+	s.nodeSeq++
+	nodeID := fmt.Sprintf("node-%04d", s.nodeSeq)
+	rec := graphwriter.NodeRecord{
+		NodeID:   nodeID,
+		Inserted: true,
+	}
+	s.nodes[key] = rec
+	s.kindByNodeID[nodeID] = in.Kind
+	s.insertNodeCalls = append(s.insertNodeCalls, ancestryNodeCall{
+		seq:    s.seq,
+		kind:   in.Kind,
+		nodeID: nodeID,
+	})
+	return rec, nil
+}
+
+func (s *ancestrySpyWriter) InsertEdge(_ context.Context, in graphwriter.EdgeInput) (graphwriter.EdgeRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seq++
+	key := in.RepoID.String() + "|" + in.Kind + "|" + in.SrcNodeID + "|" + in.DstNodeID + "|" + in.FromSHA
+	if rec, ok := s.edges[key]; ok {
+		rec.Inserted = false
+		return rec, nil
+	}
+	s.edgeSeq++
+	rec := graphwriter.EdgeRecord{
+		EdgeID:   fmt.Sprintf("edge-%04d", s.edgeSeq),
+		Inserted: true,
+	}
+	s.edges[key] = rec
+	s.insertEdgeCalls = append(s.insertEdgeCalls, ancestryEdgeCall{
+		seq:       s.seq,
+		kind:      in.Kind,
+		srcNodeID: in.SrcNodeID,
+		dstNodeID: in.DstNodeID,
+		srcKind:   s.kindByNodeID[in.SrcNodeID],
+		dstKind:   s.kindByNodeID[in.DstNodeID],
+	})
+	return rec, nil
+}
+
+// currentSeq returns the monotonically-increasing call counter at
+// the moment it is called. Used to take a snapshot of the writer
+// state immediately after EnsureRepoAndCommit so subsequent
+// assertions can verify "no per-file InsertNode happened before
+// this point".
+func (s *ancestrySpyWriter) currentSeq() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.seq
 }
 
-func (s *ancestrySpySink) nodeCountByKind(kind string) int {
+func (s *ancestrySpyWriter) nodeCountByKind(kind string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0
-	for _, c := range s.nodes {
+	for _, c := range s.insertNodeCalls {
 		if c.kind == kind {
 			n++
 		}
@@ -88,33 +186,31 @@ func (s *ancestrySpySink) nodeCountByKind(kind string) int {
 	return n
 }
 
-func (s *ancestrySpySink) edgeCountByKindPair(edgeKind, srcKind, dstKind string) int {
+func (s *ancestrySpyWriter) edgeCountByKindPair(edgeKind, srcKind, dstKind string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0
-	for _, e := range s.edges {
-		if e.kind != edgeKind {
-			continue
-		}
-		if s.kindByFP[e.srcFP] == srcKind && s.kindByFP[e.dstFP] == dstKind {
+	for _, e := range s.insertEdgeCalls {
+		if e.kind == edgeKind && e.srcKind == srcKind && e.dstKind == dstKind {
 			n++
 		}
 	}
 	return n
 }
 
-func (s *ancestrySpySink) totalNodeCount() int {
+func (s *ancestrySpyWriter) totalNodeCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.nodes)
+	return len(s.insertNodeCalls)
 }
 
 // allNodesUpToSeqHaveKinds checks that every InsertNode call with
-// seq <= cutoff has a kind in the allowed set.
-func (s *ancestrySpySink) allNodesUpToSeqHaveKinds(cutoff int, allowed map[string]bool) error {
+// seq <= cutoff has a kind in the allowed set. Used to enforce
+// "EnsureRepoAndCommit completes before any EnsureFile call".
+func (s *ancestrySpyWriter) allNodesUpToSeqHaveKinds(cutoff int, allowed map[string]bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, c := range s.nodes {
+	for _, c := range s.insertNodeCalls {
 		if c.seq <= cutoff && !allowed[c.kind] {
 			return fmt.Errorf(
 				"InsertNode(kind=%q) at seq %d should be repo-level (cutoff %d)",
@@ -125,12 +221,10 @@ func (s *ancestrySpySink) allNodesUpToSeqHaveKinds(cutoff int, allowed map[strin
 	return nil
 }
 
-// allNodesBeyondSeqHaveKinds checks that every InsertNode call with
-// seq > cutoff has a kind in the allowed set.
-func (s *ancestrySpySink) allNodesBeyondSeqHaveKinds(cutoff int, allowed map[string]bool) error {
+func (s *ancestrySpyWriter) allNodesBeyondSeqHaveKinds(cutoff int, allowed map[string]bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, c := range s.nodes {
+	for _, c := range s.insertNodeCalls {
 		if c.seq > cutoff && !allowed[c.kind] {
 			return fmt.Errorf(
 				"InsertNode(kind=%q) at seq %d occurred after repo-setup cutoff %d",
@@ -146,7 +240,7 @@ func (s *ancestrySpySink) allNodesBeyondSeqHaveKinds(cutoff int, allowed map[str
 // ---------------------------------------------------------------------------
 
 type ancestryWriterState struct {
-	spy    *ancestrySpySink
+	spy    *ancestrySpyWriter
 	writer *repoindexer.AncestryWriter
 	files  []string
 	err    error
@@ -159,18 +253,9 @@ const (
 	ancestryTestSHA     = "abc123def456"
 )
 
-// countMethodCalls returns how many times the named method was invoked
-// by the AncestryWriter implementation. The MethodCalls slice is
-// populated by the real EnsureRepo and EnsureCommit methods, not by
-// the test code — this is genuine observation, not manual counting.
-func (st *ancestryWriterState) countMethodCalls(method string) int {
-	n := 0
-	for _, m := range st.writer.MethodCalls {
-		if m == method {
-			n++
-		}
-	}
-	return n
+func (st *ancestryWriterState) fresh() {
+	st.spy = newAncestrySpyWriter()
+	st.writer = repoindexer.NewAncestryWriter(st.spy, ancestryTestRepoURL, ancestryTestSHA)
 }
 
 // ---------------------------------------------------------------------------
@@ -178,12 +263,7 @@ func (st *ancestryWriterState) countMethodCalls(method string) int {
 // ---------------------------------------------------------------------------
 
 func (st *ancestryWriterState) aScanThatWalksFiles(n int) error {
-	st.spy = newAncestrySpySink()
-	var err error
-	st.writer, err = repoindexer.NewAncestryWriter(st.spy, ancestryTestRepoURL, ancestryTestSHA)
-	if err != nil {
-		return fmt.Errorf("NewAncestryWriter: %w", err)
-	}
+	st.fresh()
 	st.files = make([]string, n)
 	for i := 0; i < n; i++ {
 		st.files[i] = fmt.Sprintf("pkg/mod%d/file%d.go", i%10, i)
@@ -192,12 +272,7 @@ func (st *ancestryWriterState) aScanThatWalksFiles(n int) error {
 }
 
 func (st *ancestryWriterState) filesAllUnder(n int, dir string) error {
-	st.spy = newAncestrySpySink()
-	var err error
-	st.writer, err = repoindexer.NewAncestryWriter(st.spy, ancestryTestRepoURL, ancestryTestSHA)
-	if err != nil {
-		return fmt.Errorf("NewAncestryWriter: %w", err)
-	}
+	st.fresh()
 	st.files = make([]string, n)
 	for i := 0; i < n; i++ {
 		st.files[i] = fmt.Sprintf("%sfile%d.go", dir, i)
@@ -206,12 +281,7 @@ func (st *ancestryWriterState) filesAllUnder(n int, dir string) error {
 }
 
 func (st *ancestryWriterState) aWorkspaceOfFiles(n int) error {
-	st.spy = newAncestrySpySink()
-	var err error
-	st.writer, err = repoindexer.NewAncestryWriter(st.spy, ancestryTestRepoURL, ancestryTestSHA)
-	if err != nil {
-		return fmt.Errorf("NewAncestryWriter: %w", err)
-	}
+	st.fresh()
 	dirs := []string{"internal/foo/", "internal/bar/", "pkg/baz/"}
 	st.files = make([]string, n)
 	for i := 0; i < n; i++ {
@@ -221,12 +291,7 @@ func (st *ancestryWriterState) aWorkspaceOfFiles(n int) error {
 }
 
 func (st *ancestryWriterState) aFreshAncestryWriter() error {
-	st.spy = newAncestrySpySink()
-	var err error
-	st.writer, err = repoindexer.NewAncestryWriter(st.spy, ancestryTestRepoURL, ancestryTestSHA)
-	if err != nil {
-		return fmt.Errorf("NewAncestryWriter: %w", err)
-	}
+	st.fresh()
 	return nil
 }
 
@@ -236,24 +301,22 @@ func (st *ancestryWriterState) aFreshAncestryWriter() error {
 
 // theAncestryWriterRuns drives the scan workflow by calling the
 // combined EnsureRepoAndCommit method, then EnsureFile per file.
-// EnsureRepoAndCommit internally calls EnsureRepo and EnsureCommit,
-// which record themselves in writer.MethodCalls — a genuine
-// observation mechanism, not manual counter increments.
+// EnsureRepoAndCommit invokes EnsureRepo and EnsureCommit on the
+// spy writer, which records the calls — genuine observation, not
+// manual counter increments.
 func (st *ancestryWriterState) theAncestryWriterRuns() error {
 	ctx := context.Background()
 
-	// Call the combined method — exercises EnsureRepoAndCommit.
-	if err := st.writer.EnsureRepoAndCommit(ctx); err != nil {
+	if _, err := st.writer.EnsureRepoAndCommit(ctx, "main", []string{"go"}); err != nil {
 		return fmt.Errorf("EnsureRepoAndCommit: %w", err)
 	}
 
-	// Record seq point: everything through here is repo-level setup;
-	// everything after is EnsureFile-driven.
+	// Record seq point: everything up to here is repo-level
+	// setup; everything after is EnsureFile-driven.
 	st.seqAfterRepoSetup = st.spy.currentSeq()
 
-	// EnsureFile for each file in the workspace.
 	for _, f := range st.files {
-		if err := st.writer.EnsureFile(ctx, f); err != nil {
+		if _, err := st.writer.EnsureFile(ctx, repoindexer.WalkFile{RelPath: f}); err != nil {
 			return fmt.Errorf("EnsureFile(%q): %w", f, err)
 		}
 	}
@@ -270,7 +333,7 @@ func (st *ancestryWriterState) ensureFileRunsOncePerFile() error {
 
 func (st *ancestryWriterState) ensureFileCalledBeforeEnsureRepoAndCommit() error {
 	ctx := context.Background()
-	st.err = st.writer.EnsureFile(ctx, "some/file.go")
+	_, st.err = st.writer.EnsureFile(ctx, repoindexer.WalkFile{RelPath: "some/file.go"})
 	return nil
 }
 
@@ -279,7 +342,9 @@ func (st *ancestryWriterState) ensureFileCalledBeforeEnsureRepoAndCommit() error
 // ---------------------------------------------------------------------------
 
 func (st *ancestryWriterState) ensureRepoCalledExactlyNTimes(n int) error {
-	got := st.countMethodCalls("EnsureRepo")
+	st.spy.mu.Lock()
+	got := st.spy.ensureRepoCalls
+	st.spy.mu.Unlock()
 	if got != n {
 		return fmt.Errorf("w.EnsureRepo invoked %d times, want %d", got, n)
 	}
@@ -287,7 +352,9 @@ func (st *ancestryWriterState) ensureRepoCalledExactlyNTimes(n int) error {
 }
 
 func (st *ancestryWriterState) ensureCommitCalledExactlyNTimes(n int) error {
-	got := st.countMethodCalls("EnsureCommit")
+	st.spy.mu.Lock()
+	got := st.spy.ensureCommitCalls
+	st.spy.mu.Unlock()
 	if got != n {
 		return fmt.Errorf("w.EnsureCommit invoked %d times, want %d", got, n)
 	}
@@ -342,6 +409,9 @@ func (st *ancestryWriterState) nContainsEdgesAreInserted(n int, srcKind, dstKind
 func (st *ancestryWriterState) aNonNilErrorIsReturnedAncestry() error {
 	if st.err == nil {
 		return fmt.Errorf("expected non-nil error, got nil")
+	}
+	if !errors.Is(st.err, repoindexer.ErrAncestryNotReady) {
+		return fmt.Errorf("expected ErrAncestryNotReady, got %v", st.err)
 	}
 	return nil
 }

@@ -98,7 +98,7 @@ const (
 	SkipReasonEmpty = "empty"
 )
 
-// DefaultSkipDirs is the hard-coded baseline list of
+// defaultSkipDirs is the hard-coded baseline list of
 // directory names the walker never enters. Membership is
 // matched on the directory's bare name (no path component),
 // so `vendor/` matches both `vendor/` at the root and any
@@ -108,7 +108,14 @@ const (
 // list"); `tech-spec.md` Sec 4.2. Both documents pin THIS
 // exact list; changing it requires a docs+code coordinated
 // edit.
-var DefaultSkipDirs = []string{
+//
+// This is UNEXPORTED on purpose: an exported mutable slice
+// would let any caller (including a parallel test) append to
+// or reassign it, racing with every concurrently-running
+// [DefaultWalker.Walk]. External callers that need to inspect
+// the baseline use [DefaultSkipDirs], which returns a fresh
+// copy.
+var defaultSkipDirs = []string{
 	".git",
 	"node_modules",
 	"vendor",
@@ -119,6 +126,18 @@ var DefaultSkipDirs = []string{
 	"__pycache__",
 	".venv",
 	"venv",
+}
+
+// DefaultSkipDirs returns a copy of the hard-coded baseline
+// list of directory names the walker never enters. A fresh
+// slice is allocated per call so callers can append to or
+// reorder the result without affecting any concurrently
+// running [DefaultWalker.Walk] (which reads the package-
+// internal slice directly).
+//
+// Anchor: `architecture.md` Sec 3.1; `tech-spec.md` Sec 4.2.
+func DefaultSkipDirs() []string {
+	return append([]string(nil), defaultSkipDirs...)
 }
 
 // WalkedFile is the (path, content) pair the walker emits per
@@ -175,8 +194,9 @@ type Walker interface {
 // (`implementation-plan.md` Stage 2.1 size-cap scenario).
 type DefaultWalker struct {
 	// SkipDirs is the set of directory names skipped
-	// before traversal. Defaults to [DefaultSkipDirs] when
-	// nil.
+	// before traversal. Defaults to the package-internal
+	// baseline (the same list returned by
+	// [DefaultSkipDirs]) when nil.
 	SkipDirs map[string]struct{}
 
 	// MaxBytes is the inclusive per-file size cap.
@@ -246,8 +266,14 @@ func (w *DefaultWalker) run(ctx context.Context, root string, files chan<- Walke
 	}
 	skipDirs := w.SkipDirs
 	if skipDirs == nil {
-		skipDirs = make(map[string]struct{}, len(DefaultSkipDirs))
-		for _, name := range DefaultSkipDirs {
+		// Read the unexported baseline directly: the
+		// slice is package-private and never mutated
+		// after init, so this is race-free even when
+		// many DefaultWalker.Walk calls run concurrently.
+		// The map copy below also means the caller never
+		// sees the baseline slice itself.
+		skipDirs = make(map[string]struct{}, len(defaultSkipDirs))
+		for _, name := range defaultSkipDirs {
 			skipDirs[name] = struct{}{}
 		}
 	}

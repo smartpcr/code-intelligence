@@ -545,19 +545,8 @@ func parseGitignoreFile(path string, domain []string) []gitignore.Pattern {
 	var out []gitignore.Pattern
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		line := scanner.Text()
-		// Strip a UTF-8 BOM if it slipped into the first
-		// line; git itself tolerates it silently.
-		line = strings.TrimPrefix(line, "\uFEFF")
-		// Trim trailing whitespace per the spec (gitignore
-		// drops trailing spaces unless backslash-quoted;
-		// the parser handles the quoted case, we only need
-		// to drop the trailing whitespace on bare lines).
-		line = strings.TrimRight(line, " \t\r")
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "#") {
+		line, keep := prepareGitignoreLine(scanner.Text())
+		if !keep {
 			continue
 		}
 		out = append(out, gitignore.ParsePattern(line, domain))
@@ -565,6 +554,55 @@ func parseGitignoreFile(path string, domain []string) []gitignore.Pattern {
 	// A scanner error is non-fatal; we still return any
 	// patterns parsed before the failure.
 	return out
+}
+
+// prepareGitignoreLine normalises one raw line from a
+// gitignore-format file and reports whether the line should
+// be handed to [gitignore.ParsePattern] (`keep=true`) or
+// skipped (`keep=false`).
+//
+// The function applies ONLY the transformations that go-git's
+// `gitignore.ParsePattern` does not perform itself:
+//
+//   - Strip a UTF-8 BOM from the first line (git tolerates).
+//   - Strip a lone trailing `\r` (bufio.Scanner with the
+//     default ScanLines split drops `\r` preceding `\n` in
+//     CRLF, but leaves a standalone trailing `\r` on the
+//     file's last record when no final `\n` is present).
+//   - Skip blank lines (per the gitignore spec; trailing
+//     UNESCAPED spaces are dropped by go-git, so a line of
+//     pure spaces is blank).
+//   - Skip comment lines (lines whose first byte is `#`).
+//
+// Critically, trailing whitespace is NOT trimmed before
+// returning. Per `git-scm.com/docs/gitignore` ("Trailing
+// spaces are ignored unless they are quoted with backslash"),
+// trailing spaces have escape semantics: a pattern ending in
+// `\ ` (backslash-space) matches a literal trailing-space
+// filename. go-git's [gitignore.ParsePattern] already
+// implements this rule exactly. A naive pre-trim such as
+// `strings.TrimRight(line, " \t\r")` would corrupt `foo\ `
+// into the malformed `foo\` that matches nothing -- so we
+// hand the raw line through and let go-git own the trim.
+//
+// The escape-aware blank-line probe below mirrors go-git's
+// own `if !strings.HasSuffix(p, "\\ ") { p = TrimRight(p,
+// " ") }` rule so a pure-space line is recognised as blank
+// without disturbing the escape contract.
+func prepareGitignoreLine(raw string) (string, bool) {
+	raw = strings.TrimPrefix(raw, "\uFEFF")
+	raw = strings.TrimRight(raw, "\r")
+	probe := raw
+	if !strings.HasSuffix(probe, `\ `) {
+		probe = strings.TrimRight(probe, " ")
+	}
+	if probe == "" {
+		return "", false
+	}
+	if strings.HasPrefix(raw, "#") {
+		return "", false
+	}
+	return raw, true
 }
 
 // sendFile writes a [WalkedFile] honouring context

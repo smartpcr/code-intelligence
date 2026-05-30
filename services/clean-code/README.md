@@ -126,16 +126,31 @@ workflow file itself it runs:
 dev-laptop CLI for `cleanc analyze <repo-path>` (see workstream
 `ws-code-intelligence-refactor-guide-phase-foundations-stage-cli-binary-skeleton`).
 
-Stage 1.1 owns ONLY the dispatcher and the global flag surface:
+Stage 1.1 owns the dispatcher, the global flag surface, and the
+foundational internal CLI support packages required to make the
+skeleton self-contained:
 
 - `cmd/cleanc/` -- entry, sub-command dispatcher, build-tag-gated defaults.
 - `internal/cli/flags/` -- exit codes, verb names, flag defaults.
-- `internal/cli/devpolicy/{bypass,unsigned_dev,unsigned_prod,embed}.go`
-  -- interface, sentinels, build-tag alias, embed shell. The concrete
-  loader/synthesizer bodies (`internal/cli/devpolicy/loader.go` body,
-  `internal/cli/repocontext/`, `internal/cli/scopebinding/`) are
-  deferred to Stages 1.2 and 1.4 per the implementation-plan section
-  divisions.
+- `internal/cli/devpolicy/` -- bypass interface, dev/prod build-tag
+  paired sentinels (`unsigned_dev.go`, `unsigned_prod.go`), embed
+  alias to `policy/rulepacks.EmbeddedFS`, and the foundational
+  `loader.go` that wires sentinels + embed together.
+- `internal/cli/repocontext/` -- `MintRepoID`, `DetectHeadSHA`,
+  `DetectModulePath` foundational helpers.
+- `internal/cli/scopebinding/` -- `ScopeBinding`, `Store`, `Table`
+  foundational types.
+- `internal/cli/effort/` -- foundational `fallback` constants for
+  the dev-mode effort score path.
+
+These foundational packages compile and pass tests as part of
+Stage 1.1 so the skeleton runs end-to-end. Subsequent stages own
+the next-layer integrations against them: Stage 1.2 (repo context
+wiring into the orchestrator), Stage 1.4 (the full dev-mode policy
+loader pipeline that consumes the sentinels), and Stage 1.5+ (the
+ONNX effort model that supersedes the fallback). See
+[`../../docs/cleanc/STAGE-1-1-STATUS.md`](../../docs/cleanc/STAGE-1-1-STATUS.md)
+for the per-acceptance-criterion mapping to code witnesses.
 
 Operator-facing usage, exit codes, and the Stage 1.1 scope boundary
 appendix live in [`../../docs/cleanc/USAGE.md`](../../docs/cleanc/USAGE.md).

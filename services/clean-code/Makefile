@@ -57,7 +57,7 @@ PROTO_FILES         ?= ast/v1/ast.proto
 PG_URL ?= postgres://clean_code_admin:e2e_test_password@localhost:5432/clean_code?sslmode=disable
 COMPOSE_FILE ?= ../../tests/e2e/phase-09-audit-wal/docker-compose.yml
 
-.PHONY: build test test-cgo test-nocgo test-race lint vet tidy clean proto proto-tools docker-build compose-up compose-down
+.PHONY: build build-prod test test-cgo test-nocgo test-race lint vet tidy clean proto proto-tools docker-build compose-up compose-down
 .PHONY: migrate-up migrate-down seed-phase-09 test-phase-09
 
 build:
@@ -65,6 +65,21 @@ build:
 	@for cmd in $(CMD_DIRS); do \
 	    echo "$(GO) build -o $(BIN_DIR)/$$cmd ./cmd/$$cmd"; \
 	    $(GO) build -o $(BIN_DIR)/$$cmd ./cmd/$$cmd || exit $$?; \
+	done
+
+## build-prod: compile every `cmd/` binary with `-tags prod`.
+## The prod build tag flips `flags.DefaultDevMode` to false and
+## activates the `prodSentinelLoader` in `internal/cli/devpolicy`
+## so that unsigned rule-pack bypass is excluded at compile time
+## (architecture.md Sec 1.6, "policy-signing-required"; tech-spec
+## Sec 8.9, "Build-tag matrix"). Referenced by USAGE.md §2.1 and
+## by the `build-prod` job in `.github/workflows/clean-code-ci.yml`
+## (implementation-plan.md Stage 1.4).
+build-prod:
+	@mkdir -p $(BIN_DIR)
+	@for cmd in $(CMD_DIRS); do \
+	    echo "$(GO) build -tags prod -o $(BIN_DIR)/$$cmd ./cmd/$$cmd"; \
+	    $(GO) build -tags prod -o $(BIN_DIR)/$$cmd ./cmd/$$cmd || exit $$?; \
 	done
 
 ## test: run the full Go test suite. CI overrides via

@@ -355,5 +355,76 @@ The procedural meta-question (slug `please-close-iter1-baseline-orphan-via-wizar
 
 The Go parser implementation and its dedicated tests remain green under CGO=0 (`go test -count=1 ./internal/repoindexer/ast` → `ok`); CGO=1 verified by static-read in iter-2 / iter-3 / iter-11 / iter-12 / iter-13 evaluators. No further structural change is required for this workstream to land on `feature/memory`.
 
+## Polyglot coverage matrix
+
+The polyglot smoke gate
+(`services\agent-memory\internal\repoindexer\ast\parsers_polyglot_smoke_test.go`,
+build tag `//go:build cgo`) drives one canonical fixture per
+supported language through `ast.Dispatcher.EmitFile` against an
+in-memory `NodeEdgeWriter` stub and asserts the minimum-coverage
+contract: **>=1 class/type Node, >=1 method Node, and >=1
+`static_calls` Edge** per language. Fixtures live under
+`services\agent-memory\internal\repoindexer\ast\testdata\polyglot\`
+(one file per extension, named `hello.<ext>`); Go's testing
+tooling never compiles or vets files under `testdata`, so the
+`.go` fixture cannot accidentally participate in
+`go build ./...` or `go vet ./...`.
+
+Each fixture declares a class/type, a free function (or class
+member where the language has no free functions, e.g. C#), a
+same-file caller→callee call, and one import — the four shapes
+the dispatcher's Pass 0 (imports), Pass 1a (classes), Pass 1b
+(methods), and Pass 2b (`static_calls` resolution) must each
+produce at least one edge for.
+
+| Language   | Fixture (`testdata\polyglot\…`) | Extension | Smoke row | Tree-sitter (CGO=1) | Runtime dependency        |
+| ---------- | ------------------------------- | --------- | --------- | ------------------- | ------------------------- |
+| TypeScript | `hello.ts`                      | `.ts`     | pass      | `typescript`        | none (CGO toolchain only) |
+| Python     | `hello.py`                      | `.py`     | pass      | `python`            | none (CGO toolchain only) |
+| C          | `hello.c`                       | `.c`      | pass      | `c`                 | none (CGO toolchain only) |
+| C++        | `hello.cpp`                     | `.cpp`    | pass      | `cpp`               | none (CGO toolchain only) |
+| C#         | `hello.cs`                      | `.cs`     | pass      | `csharp`            | none (CGO toolchain only) |
+| Go         | `hello.go`                      | `.go`     | pass      | `golang`            | none (CGO toolchain only) |
+| Rust       | `hello.rs`                      | `.rs`     | pass      | `rust`              | none (CGO toolchain only) |
+| PowerShell | `hello.ps1`                     | `.ps1`    | pass / skip | n/a (subprocess) | `pwsh` on PATH; row `t.Skip`-ped when absent |
+
+Reproducing the gate on this Windows worktree (the MinGW-W64 /
+LLVM-MinGW UCRT C toolchain from the `MartinStorsjo.LLVM-MinGW`
+WinGet package is on PATH; `pwsh` from PowerShell 7+ is required
+for the PowerShell row to participate instead of `t.Skip`):
+
+```powershell
+$env:CGO_ENABLED='1'
+Set-Location services\agent-memory
+go test -tags cgo -count=1 -run TestPolyglotParseSmoke -v .\internal\repoindexer\ast
+```
+
+The gate is intentionally threshold-based (`>=1`) rather than
+count-pinned: per-language counts and edge directions are already
+pinned by the dedicated fixture tests in this package (e.g.
+`TestGoTreeSitterFixture_EmitsExpectedNodeAndEdgeSet`,
+`TestCFixture_EmitFile_EmitsExpectedNodesAndEdges`,
+`TestDispatcherFixture_RustGraph_StageFiveThree`,
+`TestPowerShellFixture_DispatcherEmitsExpectedNodesAndEdges`).
+The polyglot smoke is the coverage-matrix gate -- it proves
+EVERY supported extension reaches the dispatcher under one
+build invocation, so a regression that drops a language from the
+parser roster (or breaks the Pass 2b `static_calls` resolver for
+one language) is caught here even when the per-language test
+still passes in isolation.
+
+### CGO-off degradation (already documented above)
+
+The smoke gate carries `//go:build cgo` and is skipped on the
+CGO=0 build. The CGO=0 dispatcher honours its existing
+no-`.c`/`.cpp`/`.cs`/`.go`/`.rs` skip contract: those extensions
+produce `ast.dispatch.skip{reason="no_parser"}` log lines, the
+PowerShell parser still runs (subprocess-based, no CGO needed),
+and the TypeScript / Python scanners cover the v1 set. The
+`parsers_nocgo_rust_test.go` and sibling matrix tests already
+guard the no-`.rs` skip; the polyglot smoke does not duplicate
+that coverage.
+
+
 
 

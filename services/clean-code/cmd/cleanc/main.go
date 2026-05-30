@@ -125,7 +125,7 @@ func writeGlobalUsage(w io.Writer) {
 	fmt.Fprintln(w, "  analyze <repo-path>   scan a repo and emit findings + tasks")
 	fmt.Fprintln(w, "  report <findings>     re-render markdown from a previously written findings.json")
 	fmt.Fprintln(w, "  version               print the binary version, parser set, and rule-pack set")
-	fmt.Fprintln(w, "  apply                 reserved (pending operator pin `cli-l7-authority`)")
+	fmt.Fprintln(w, "  apply                 reserved (pending operator pin cli-l7-authority)")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "run `cleanc help <subcommand>` for per-sub-command flag documentation.")
 }
@@ -431,5 +431,5 @@ const (
 	analyzeUsage = "usage: cleanc analyze <repo-path> [flags]"
 	reportUsage  = "usage: cleanc report <findings.json> [flags]"
 	versionUsage = "usage: cleanc version"
-	applyUsage   = "usage: cleanc apply (reserved; pending operator pin `cli-l7-authority`)"
+	applyUsage   = "usage: cleanc apply (reserved; pending operator pin cli-l7-authority)"
 )

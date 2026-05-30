@@ -390,6 +390,77 @@ func TestReservedSurface(t *testing.T) {
 	}
 }
 
+// TestApplyHelpUsesBareIdentifier (iter-8) pins the consistency
+// invariant that the operator-pin id `cli-l7-authority` appears
+// in the SAME bare form across every operator-facing surface:
+//
+//   - the runtime apply rejection (`flags.ReservedApplyMessage`),
+//   - the global help listing (`cleanc help` → `writeGlobalUsage`),
+//   - the per-verb usage block (`cleanc help apply` → `applyUsage`).
+//
+// Wrapping `cli-l7-authority` in backticks on any surface breaks
+// the parity with `e2e-scenarios.md` Stage 4.4 line 1050 (which
+// pins the bare identifier as the literal substring) and creates
+// drift between what an operator sees in stderr vs. in `help`.
+// This test grep-checks each surface for the backtick-wrapped
+// form and fails loudly if any one regresses.
+func TestApplyHelpUsesBareIdentifier(t *testing.T) {
+	t.Parallel()
+
+	const backtickWrapped = "`cli-l7-authority`"
+	const bareID = "cli-l7-authority"
+
+	t.Run("cleanc help (global) does not backtick-wrap the pin id", func(t *testing.T) {
+		t.Parallel()
+		stdout, _, code := captureRun("help")
+		if code != flags.ExitOK {
+			t.Errorf("exit code = %d, want %d", code, flags.ExitOK)
+		}
+		if strings.Contains(stdout, backtickWrapped) {
+			t.Errorf("`cleanc help` wraps %q in backticks; e2e line 1050 wants the bare id\nstdout=%s",
+				bareID, stdout)
+		}
+		if !strings.Contains(stdout, bareID) {
+			t.Errorf("`cleanc help` apply line missing bare id %q\nstdout=%s", bareID, stdout)
+		}
+	})
+
+	t.Run("cleanc help apply does not backtick-wrap the pin id", func(t *testing.T) {
+		t.Parallel()
+		stdout, _, code := captureRun("help", "apply")
+		if code != flags.ExitOK {
+			t.Errorf("exit code = %d, want %d", code, flags.ExitOK)
+		}
+		if strings.Contains(stdout, backtickWrapped) {
+			t.Errorf("`cleanc help apply` wraps %q in backticks; cross-surface drift with ReservedApplyMessage\nstdout=%s",
+				bareID, stdout)
+		}
+		if !strings.Contains(stdout, bareID) {
+			t.Errorf("`cleanc help apply` missing bare id %q\nstdout=%s", bareID, stdout)
+		}
+	})
+
+	t.Run("applyUsage constant does not backtick-wrap the pin id", func(t *testing.T) {
+		t.Parallel()
+		if strings.Contains(applyUsage, backtickWrapped) {
+			t.Errorf("applyUsage const wraps %q in backticks: %q", bareID, applyUsage)
+		}
+		if !strings.Contains(applyUsage, bareID) {
+			t.Errorf("applyUsage const missing bare id %q: %q", bareID, applyUsage)
+		}
+	})
+
+	t.Run("ReservedApplyMessage agrees with help surfaces", func(t *testing.T) {
+		t.Parallel()
+		if strings.Contains(flags.ReservedApplyMessage, backtickWrapped) {
+			t.Errorf("ReservedApplyMessage wraps %q in backticks: %q", bareID, flags.ReservedApplyMessage)
+		}
+		if !strings.Contains(flags.ReservedApplyMessage, bareID) {
+			t.Errorf("ReservedApplyMessage missing bare id %q: %q", bareID, flags.ReservedApplyMessage)
+		}
+	})
+}
+
 // TestReportMissingFindingsExitsUsage validates the report
 // sub-command rejects a missing positional argument with
 // ExitUsage.

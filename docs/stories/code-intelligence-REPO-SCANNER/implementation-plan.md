@@ -21,7 +21,7 @@ storyId: "code-intelligence:REPO-SCANNER"
 - [ ] Add a `make test-cgo` target to `services/agent-memory/Makefile` that runs `CGO_ENABLED=1 go test ./internal/repoindexer/ast/...` and prints the active toolchain (`go env CGO_ENABLED CC CXX`).
 - [ ] Add a `make test-nocgo` target that runs `CGO_ENABLED=0 go test ./internal/repoindexer/ast/...` so the parser-registration split (`parsers_cgo.go` vs `parsers_nocgo.go`) is exercised in CI.
 - [ ] Document the C toolchain prerequisites (mingw on Windows, gcc/clang elsewhere) in `services/agent-memory/README.md` under a new "Building with CGO" subsection.
-- [ ] Wire both targets into `services/agent-memory/.github/workflows/*` (or the existing CI entry point) so each PR runs CGO=1 and CGO=0 in parallel.
+- [ ] Wire both targets into the existing CI job in `.github/workflows/agent-memory-ci.yml` so each PR runs CGO=1 and CGO=0 in parallel (the repo's actual CI entry point; no service-local `.github` directory exists).
 
 ### Dependencies
 - _none -- start stage_
@@ -97,15 +97,17 @@ storyId: "code-intelligence:REPO-SCANNER"
 ## Stage 2.3: AncestryWriter factored from worker
 
 ### Implementation Steps
-- [ ] Add `internal/repoindexer/ancestry.go` with the `AncestryWriter` type, `NewAncestryWriter`, `EnsureRepoAndCommit`, `EnsureFile`, and the `RepoAncestry` / `FileAncestry` value types per architecture S3.4.
-- [ ] Make the type accept the existing `ast.NodeEdgeWriter`-shaped writer for now; the `graphsink.Sink` migration lands in Phase 3 and only widens the parameter type.
-- [ ] Add `ancestry_test.go` with a fake writer asserting (a) `repo` Node inserted once, (b) `package` Node deduped by directory, (c) `file` Node inserted per WalkFile, and (d) two `contains` Edges per file (`repo->pkg` once per new directory, `pkg->file` always).
+- [ ] Declare a narrow writer interface `repoindexer.RepoCommitNodeEdgeWriter` in a new `internal/repoindexer/ancestry_writer_iface.go` file with the four methods `EnsureRepo`, `EnsureCommit`, `InsertNode`, `InsertEdge`. `*graphwriter.Writer` satisfies this interface natively (no new method needed) so Phase 2 can land without depending on Phase 3 yet.
+- [ ] Add `internal/repoindexer/ancestry.go` with the `AncestryWriter` type, `NewAncestryWriter(w RepoCommitNodeEdgeWriter, repoURL, sha string)`, `EnsureRepoAndCommit(ctx, defaultBranch, hints)`, `EnsureFile(ctx, WalkFile)`, and the `RepoAncestry` / `FileAncestry` value types per architecture S3.4. The constructor accepts the new `RepoCommitNodeEdgeWriter`; Stage 3.1 widens the parameter to `graphsink.Sink` (a strict superset that adds `Flush` + `Close`).
+- [ ] Implement `EnsureRepoAndCommit` so it calls `w.EnsureRepo` (using a deterministic `RepoID` derived via `fingerprint.RepoIDFromURL` from Stage 2.1, passed through `RepoInput.RepoID` once Stage 3.2 ships -- until then the legacy zero-value path is used and the deterministic ID is recorded on the cached `RepoAncestry`), then `w.EnsureCommit`, then `w.InsertNode(kind=repo)`; cache the result on the writer for subsequent `EnsureFile` calls.
+- [ ] Add `ancestry_test.go` with a fake `RepoCommitNodeEdgeWriter` asserting (a) `EnsureRepo` + `EnsureCommit` + `InsertNode(kind=repo)` are each called exactly once before any `EnsureFile`, (b) `package` Node deduped by directory, (c) `file` Node inserted per WalkFile, (d) two `contains` Edges per file (`repo->pkg` once per new directory, `pkg->file` always), and (e) calling `EnsureFile` before `EnsureRepoAndCommit` returns a non-nil error.
 - [ ] Add a doc comment block on `AncestryWriter` noting "not safe for concurrent use; one writer per scan; the package cache is single-writer" per architecture S3.4.
 
 ### Dependencies
 - phase-identity-and-ancestry-refactor/stage-promote-canonical-signature-helpers
 
 ### Test Scenarios
+- [ ] Scenario: ensurerepo-and-commit-called-once -- Given a scan that walks 100 files, When the ancestry writer runs, Then `w.EnsureRepo`, `w.EnsureCommit`, and `InsertNode(kind=repo)` are each called exactly once and complete before any `EnsureFile` call.
 - [ ] Scenario: repo-node-once -- Given a scan that walks 100 files, When the ancestry writer runs, Then `InsertNode(kind=repo)` is called exactly once.
 - [ ] Scenario: package-deduped -- Given 50 files all under `internal/foo/`, When `EnsureFile` runs per file, Then `InsertNode(kind=package)` is called exactly once and the `repo->package` `contains` Edge is inserted exactly once.
 - [ ] Scenario: file-and-contains-per-walkfile -- Given a workspace of 7 files, When `EnsureFile` runs once per file, Then 7 `file` Nodes and 7 `package->file` `contains` Edges are inserted.
@@ -134,17 +136,19 @@ storyId: "code-intelligence:REPO-SCANNER"
 ## Stage 3.1: Sink interface skeleton
 
 ### Implementation Steps
-- [ ] Create `internal/graphsink/sink.go` declaring the `Sink` interface (`EnsureRepo`, `EnsureCommit`, `InsertNode`, `InsertEdge`, `Flush`, `Close`) per architecture S3.2.
-- [ ] Create `internal/graphsink/reader.go` declaring the `Reader` interface (`ListNodes`, `ListEdgesFrom`, `ListEdgesTo`, `GetNode`, `LookupBySignature`) per architecture S5.4.
+- [ ] Create `internal/graphsink/sink.go` declaring the `Sink` interface (`EnsureRepo`, `EnsureCommit`, `InsertNode`, `InsertEdge`, `Flush`, `Close`) per architecture S3.2. `Sink` is a strict superset of `repoindexer.RepoCommitNodeEdgeWriter` (Stage 2.3) -- it adds `Flush` + `Close` only -- so every existing `*graphwriter.Writer` consumer compiles unchanged.
+- [ ] Create `internal/graphsink/reader.go` declaring the `Reader` interface with `ListRepos(ctx, ReaderOptions) ([]RepoSummary, error)`, `ListNodes`, `ListEdgesFrom`, `ListEdgesTo`, `GetNode`, and `LookupBySignature`. `ListRepos` returns the `{RepoID, URL, SHA, GeneratedAt}` tuples that `GET /api/repos` (Stage 7.2) needs, since `internal/graphreader` does not expose a repo-listing method today (the production mgmt-api implements it via direct SQL at `internal/mgmtapi/read.go:803`).
+- [ ] Add a `RepoSummary` value type in `internal/graphsink/types.go` with the four fields plus the textual UUID form `RepoUUID` so the JSON envelope matches the wire shape Stage 7.2 emits.
 - [ ] Add `internal/graphsink/doc.go` summarising the three backends, the snapshot-vs-append rule (S5), and the parity invariant (S2).
-- [ ] Widen `AncestryWriter`'s writer parameter from `ast.NodeEdgeWriter` to `graphsink.Sink` (Phase 2.3 already accepts the narrower shape; `Sink` is a strict superset).
+- [ ] Widen `AncestryWriter`'s writer parameter from `repoindexer.RepoCommitNodeEdgeWriter` to `graphsink.Sink` (Stage 2.3 already accepts the narrower shape; `Sink` is a strict superset, so existing call sites compile unchanged).
 
 ### Dependencies
 - _none -- start stage_
 
 ### Test Scenarios
 - [ ] Scenario: sink-interface-compiles -- Given an empty implementation `type stubSink struct{}` in a test file with the required methods, When `go vet ./internal/graphsink/...` runs, Then the implementation satisfies `graphsink.Sink`.
-- [ ] Scenario: reader-interface-compiles -- Given a stub `Reader` impl in tests, When `go vet ./internal/graphsink/...` runs, Then the stub satisfies `graphsink.Reader`.
+- [ ] Scenario: reader-interface-compiles -- Given a stub `Reader` impl in tests (including `ListRepos`), When `go vet ./internal/graphsink/...` runs, Then the stub satisfies `graphsink.Reader`.
+- [ ] Scenario: graphwriter-still-satisfies-narrow-writer -- Given the unchanged `*graphwriter.Writer`, When a test assigns it to a `repoindexer.RepoCommitNodeEdgeWriter` variable, Then the assignment compiles without modification (proves the Phase 2 interface stays satisfied by the real production writer).
 
 ## Stage 3.2: RepoID extension to RepoInput
 
@@ -166,9 +170,11 @@ storyId: "code-intelligence:REPO-SCANNER"
 
 ### Implementation Steps
 - [ ] Create `internal/graphsink/postgres/sink.go` that wraps `*graphwriter.Writer`, forwarding all six `Sink` methods 1:1, calling `EnsureRepoWithID` when `RepoInput.RepoID` is non-zero and falling back to `EnsureRepo` otherwise.
-- [ ] Create `internal/graphsink/postgres/reader.go` that wraps `*graphreader.Reader` for the four signature-identical methods and implements `LookupBySignature` via `ListNodes` + `ListNodesFilter.CanonicalSignature`.
-- [ ] Add a CI lint rule (or a `go vet`-friendly comment ban) that prohibits direct SQL inside `internal/graphsink/postgres/` per tech-spec C5.
+- [ ] Create `internal/graphsink/postgres/reader.go` that wraps `*graphreader.Reader` for the four signature-identical methods (`ListNodes`, `ListEdgesFrom`, `ListEdgesTo`, `GetNode`) and implements `LookupBySignature` via `ListNodes` + `ListNodesFilter.CanonicalSignature`.
+- [ ] Implement `ListRepos` in the Postgres reader by issuing a parameterised SQL query mirroring the existing `internal/mgmtapi/read.go:handleListRepos` SELECT (line 816) -- it lives inside `internal/graphsink/postgres` (not in the adapter package boundary the lint rule below polices) because it reads from the `repo` + `repo_commit` tables and there is no existing reader-level helper to wrap; cross-reference the mgmt-api handler in a doc comment so the two queries stay in sync.
+- [ ] Add a CI lint rule (or a `go vet`-friendly comment ban) that prohibits direct SQL inside `internal/graphsink/postgres/sink.go` (writes go through `*graphwriter.Writer` per tech-spec C5); the rule explicitly exempts `reader.go::ListRepos` since the production reader has no `ListRepos` helper yet.
 - [ ] Add `postgres_sink_test.go` (sqlmock) verifying every `Sink` method delegates to the underlying writer and propagates `WriteContractViolation` (SQLSTATE 42501) verbatim.
+- [ ] Add `postgres_reader_test.go` (sqlmock) verifying `ListRepos` returns the expected `RepoSummary` tuples and orders results by `created_at DESC` to match the mgmt-api semantics.
 
 ### Dependencies
 - phase-graphsink-storage-abstraction/stage-sink-interface-skeleton
@@ -217,9 +223,10 @@ storyId: "code-intelligence:REPO-SCANNER"
 
 ### Implementation Steps
 - [ ] Add `internal/graphsink/sqlite/reader.go` implementing `graphsink.Reader` with `ListNodes` honoring `ListNodesFilter.ParentNodeID` / `Kinds` / `CanonicalSignature` and `ReaderOptions.Limit` clamped at `graphreader.MaxListLimit`.
+- [ ] Implement `ListRepos` against the SQLite `repo` + `repo_commit` tables, joining each `repo` row to its most recent `repo_commit.committed_at` so `RepoSummary.GeneratedAt` is populated for the `GET /api/repos` consumer.
 - [ ] Add `ListEdgesFrom` / `ListEdgesTo` returning slices ordered by `(kind, dst_node_id)` to match the Postgres reader's deterministic order.
 - [ ] Implement `LookupBySignature` directly via SQL `WHERE repo_id=? AND kind=? AND canonical_signature=?` rather than wrapping `ListNodes`.
-- [ ] Add `sqlite_reader_test.go` with a fixture graph and assertions on (a) hierarchy walk via `ParentNodeID`, (b) inbound / outbound edge enumeration, (c) `MaxListLimit` clamp surfaces in the returned slice.
+- [ ] Add `sqlite_reader_test.go` with a fixture graph and assertions on (a) hierarchy walk via `ParentNodeID`, (b) inbound / outbound edge enumeration, (c) `MaxListLimit` clamp surfaces in the returned slice, (d) `ListRepos` returns the scanned repo with its latest `committed_at`.
 
 ### Dependencies
 - phase-graphsink-storage-abstraction/stage-sqlite-sink-backend
@@ -234,7 +241,8 @@ storyId: "code-intelligence:REPO-SCANNER"
 ### Implementation Steps
 - [ ] Add `internal/graphsink/memory/reader.go` implementing `graphsink.Reader` by linear scan over the in-process slices, applying the same filters as the SQLite reader.
 - [ ] Add a `LookupBySignature` fast-path that maintains a `map[sigKey]nodeID` populated on insert.
-- [ ] Add `memory_reader_test.go` mirroring the SQLite reader test cases for parity.
+- [ ] Implement `ListRepos` by returning the single in-process `RepoSummary` captured by `EnsureRepo` + `EnsureCommit` (the memory backend stores exactly one repo per process per architecture S3.2.4).
+- [ ] Add `memory_reader_test.go` mirroring the SQLite reader test cases for parity, including a `ListRepos` parity assertion.
 
 ### Dependencies
 - phase-graphsink-storage-abstraction/stage-memory-sink-and-json-export
@@ -308,6 +316,7 @@ storyId: "code-intelligence:REPO-SCANNER"
 - [ ] Add `github.com/spf13/cobra` to `services/agent-memory/go.mod`, pinning the latest stable version.
 - [ ] Create `services/agent-memory/cmd/codeintel/main.go` with the root cobra command and persistent flags (`--store`, `--db`, `--log`, `--with-embeddings`); wire `slog.Default` to a text handler by default and a JSON handler when `--log=json`.
 - [ ] Scaffold empty subcommands `scan`, `scan-many`, `diagram`, `serve` returning `errors.New("not implemented")` so the CLI compiles end-to-end.
+- [ ] Add a `version` subcommand via cobra's built-in `cmd.SetVersionTemplate` (or a dedicated `cmd/codeintel/version.go`) that prints the build's semver, git commit, and build date populated via `-ldflags "-X main.version=..."`.
 - [ ] Add `cmd/codeintel/README.md` with a one-paragraph "what it does" description pointing back to architecture S3.1.
 
 ### Dependencies
@@ -487,8 +496,8 @@ storyId: "code-intelligence:REPO-SCANNER"
 ## Stage 7.2: repos handler
 
 ### Implementation Steps
-- [ ] Add `cmd/codeintel/serve_repos.go` exposing `GET /api/repos`; for SQLite/memory backends the response lists the single repo loaded; for Postgres it queries `graphreader.ListRepos` (or equivalent).
-- [ ] Return `[{id, url, sha, generatedAt}]` JSON; `generatedAt` is the most recent `repo_commit.committed_at`.
+- [ ] Add `cmd/codeintel/serve_repos.go` exposing `GET /api/repos` by calling `graphsink.Reader.ListRepos` (added in Stage 3.1) -- this works uniformly across the SQLite, memory, and Postgres backends, replacing the previous "or equivalent" gap where `internal/graphreader` had no repo-listing primitive.
+- [ ] Return `[{id, url, sha, generatedAt}]` JSON marshalled directly from the `RepoSummary` slice; `generatedAt` is the most recent `repo_commit.committed_at` already populated by each backend's `ListRepos` implementation (Stages 3.3, 3.6, 3.7).
 
 ### Dependencies
 - phase-serve-endpoint/stage-codeintel-serve-binary

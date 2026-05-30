@@ -107,28 +107,28 @@ func (s *validationState) theExitCodeIs(expected int) error {
 	return nil
 }
 
-// treeSitterTestNames lists test functions that live in cgo-only
-// build-tagged files (parser_treesitter_*.go). When CGO_ENABLED=0
-// these tests must NOT appear in the verbose test output.
-var treeSitterTestNames = []string{
-	"TestCTreeSitterParser",
-	"TestCppTreeSitterParser",
-	"TestCSharpTreeSitterParser",
-	"TestGoTreeSitterParser",
-	"TestRustTreeSitterParser",
-}
+// treeSitterPattern matches any test function whose name contains
+// "TreeSitterParser". This auto-discovers new tree-sitter parser tests
+// (e.g., Java, Python) without maintaining a hand-curated list.
+const treeSitterPattern = "TreeSitterParser"
 
 func (s *validationState) theNewTreeSitterParserTestsAreExcludedByBuildTags() error {
 	combined := s.stdout + "\n" + s.stderr
-	for _, name := range treeSitterTestNames {
-		// In verbose go test output, a running test shows as
-		// "--- PASS: TestX" or "=== RUN   TestX". If any tree-sitter
-		// test name appears, the build tags did not exclude it.
-		if strings.Contains(combined, name) {
+	for _, line := range strings.Split(combined, "\n") {
+		line = strings.TrimSpace(line)
+		// Verbose go test output shows "=== RUN   TestX" for each test.
+		// Check only RUN lines so we don't false-positive on log text.
+		if !strings.HasPrefix(line, "=== RUN") {
+			continue
+		}
+		if strings.Contains(line, treeSitterPattern) {
+			// Extract the test name from the RUN line for the error message.
+			parts := strings.Fields(line)
+			testName := parts[len(parts)-1]
 			return fmt.Errorf(
 				"tree-sitter test %q was NOT excluded under CGO_ENABLED=0; "+
 					"it should be gated by a //go:build cgo tag",
-				name,
+				testName,
 			)
 		}
 	}

@@ -169,14 +169,10 @@ func (r *CouplingBetweenObjectsRecipe) AppliesTo(ast *parser.AstFile) bool {
 
 // cboCountedEdgeKinds is the closed set of edge kinds that
 // contribute to coupling_between_objects. Pinned as a slice
-// of sentinel constants rather than a map literal so a
+// of sentinel strings rather than a map literal so a
 // `grep -nF EdgeKindExtends` lands one definition site at
 // the package boundary, and so the test harness can iterate
 // over the exact list to assert each kind is exercised.
-// All eight entries reference the package-level EdgeKind*
-// constants (see recipe.go and depth_of_inheritance.go) so
-// any drift between this set and the parser fleet's emission
-// shape is caught at compile-time, not at runtime.
 var cboCountedEdgeKinds = []string{
 	EdgeKindExtends,
 	EdgeKindImplements,

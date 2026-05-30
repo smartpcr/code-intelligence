@@ -99,6 +99,12 @@ func (s *cgoBuildState) makeIsAvailable() error {
 // ---------------------------------------------------------------------------
 
 func (s *cgoBuildState) makeTargetRunsFrom(target, modRelPath string) error {
+	// Validate that the Gherkin-specified relative path matches the resolved module root.
+	normalised := filepath.ToSlash(s.modRoot)
+	if !strings.HasSuffix(normalised, modRelPath) {
+		return fmt.Errorf("modRelPath %q does not match resolved module root %q", modRelPath, s.modRoot)
+	}
+
 	cmd := exec.Command("make", target)
 	cmd.Dir = s.modRoot
 	out, err := cmd.CombinedOutput()

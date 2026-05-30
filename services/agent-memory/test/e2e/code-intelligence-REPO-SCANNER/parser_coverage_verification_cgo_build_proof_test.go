@@ -173,6 +173,40 @@ func (s *cgoBuildState) underCGO0FileIsIncluded(fileName string) error {
 	return fmt.Errorf("%s NOT compiled under CGO_ENABLED=0 (should be included); files: %v", fileName, all)
 }
 
+func (s *cgoBuildState) parsersNocgoRegistersOnly(fileName, expectedConstructor string) error {
+	// Read parsers_nocgo.go and verify only the expected constructor
+	// appears in the defaultParsers() return list.
+	filePath := filepath.Join(s.modRoot, "internal", "repoindexer", "ast", fileName)
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("cannot read %s: %w", fileName, err)
+	}
+	src := string(content)
+
+	// Extract constructor calls: lines matching New*Parser() inside defaultParsers.
+	var constructors []string
+	for _, line := range strings.Split(src, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "New") && strings.Contains(trimmed, "Parser()") {
+			// Strip trailing comma and parens for the constructor name.
+			name := strings.TrimRight(trimmed, " ,")
+			name = strings.TrimSuffix(name, "()")
+			constructors = append(constructors, name)
+		}
+	}
+
+	if len(constructors) == 0 {
+		return fmt.Errorf("%s: no New*Parser() constructors found in file;\ncontent:\n%s", fileName, src)
+	}
+	if len(constructors) != 1 || constructors[0] != expectedConstructor {
+		return fmt.Errorf(
+			"%s: expected only %s, found %v — additional parsers registered under nocgo",
+			fileName, expectedConstructor, constructors,
+		)
+	}
+	return nil
+}
+
 func (s *cgoBuildState) goEnvCGOEnabledAfterEchoMarkerEquals(expected string) error {
 	// The Makefile's test-cgo target runs:
 	//   @echo "==> test-cgo: active Go toolchain (CGO_ENABLED=1)"
@@ -256,6 +290,7 @@ func InitializeScenario_parser_coverage_verification_cgo_build_proof(ctx *godog.
 	ctx.Then(`^under CGO_ENABLED=1 "([^"]*)" is compiled in the ast package$`, s.underCGO1FileIsCompiledInAstPackage)
 	ctx.Then(`^under CGO_ENABLED=0 "([^"]*)" is excluded by build tags$`, s.underCGO0FileIsExcluded)
 	ctx.Then(`^under CGO_ENABLED=0 "([^"]*)" is included by build tags$`, s.underCGO0FileIsIncluded)
+	ctx.Then(`^"([^"]*)" registers only "([^"]*)" as additional parsers$`, s.parsersNocgoRegistersOnly)
 	ctx.Then(`^the "go env CGO_ENABLED" value printed after the toolchain echo marker equals "([^"]*)"$`, s.goEnvCGOEnabledAfterEchoMarkerEquals)
 }
 

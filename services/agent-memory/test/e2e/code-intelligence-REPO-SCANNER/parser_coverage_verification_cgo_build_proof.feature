@@ -26,6 +26,7 @@ Feature: CGO build proof for parser coverage verification
     And under CGO_ENABLED=0 "parsers_cgo.go" is excluded by build tags
     And under CGO_ENABLED=0 "parsers_nocgo.go" is included by build tags
     And under CGO_ENABLED=0 "parsers_cgo_rust_test.go" is excluded by build tags
+    And "parsers_nocgo.go" registers only "NewPowerShellParser" as additional parsers
 
   Scenario: cgo-flag-printed
     Given a host with "gcc" or "clang" on PATH and "make" available

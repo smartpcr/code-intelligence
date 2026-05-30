@@ -439,21 +439,12 @@ A new `internal/cli/devpolicy` package loads YAML rule packs
 `steward.PolicyVersion` with `Signature == nil`. The package
 **avoids the steward signing path entirely**: it does not
 construct a `*steward.Steward` and never calls any signature-
-verification verb on one. The single steward-side signature-
-verification verb in the production tree is the method whose
-exact Go source line is:
-
-```go
-// services/clean-code/internal/policy/steward/steward.go:357
-func (s *Steward) VerifyPolicyVersionSignature(ctx context.Context, pv PolicyVersion) error {
-```
-
-(quoted verbatim so a literal `grep -F "func (s *Steward)
-VerifyPolicyVersionSignature"` finds the same string in both
-this doc and the `.go` file). The CLI never reaches that
-method because no `*steward.Steward` is instantiated. The
-bypass is therefore **structural**, not behavioural: the
-`rule_engine.Engine` has no signature surface of its own
+verification verb on one. Concretely, the CLI never instantiates
+anything from `services/clean-code/internal/policy/steward/`
+beyond the plain `PolicyVersion` / `Rule` / `RulePack` data
+structs, so no signing seam in that package is ever reached at
+runtime. The bypass is therefore **structural**, not behavioural:
+the `rule_engine.Engine` has no signature surface of its own
 (`engine.go:130-162`) -- it consumes whatever `PolicyVersion`
 the `Store` returns, and `InMemoryStore` returns the
 `devpolicy`-synthesised unsigned version unchanged.
@@ -1253,7 +1244,7 @@ the section that elaborates the decision.
 | D2 | Rule packs are embedded via `//go:embed` against the canonical `services/clean-code/policy/rulepacks/{solid,decoupling}/*.yaml` set; `--policy <path>` override permitted in dev builds, forbidden in `-tags prod` builds | Sec 8.4; arch Sec 1.3 row `cli-policy-distribution` |
 | D3 | L7 is Option A only for P0 + P1: structured `RefactorPromptRecord` JSONL emitted downstream of the existing `RefactorTask` rows. Options B and C deferred to a separate P3 story that carries either the CLEAN-CODE arch Section 1.2 amendment OR a sibling-package framing | Sec 3.2, Sec 4.9, Sec 5.1; arch Sec 1.3 row `cli-l7-authority` |
 | D4 | P2 parser-attr extension language order: Go first, then Python, then TypeScript, then Java | Sec 5.2; arch Sec 1.3 row `cli-language-priority` |
-| D5 | Dev-mode skips `Steward.VerifyPolicyVersionSignature` structurally; production builds refuse to compile the bypass via `//go:build !prod`; every dev-build run prints the loud unsigned-policy banner to stderr | Sec 4.7, Sec 8.9; constraints C6, C10; arch Sec 1.3 row `cli-dev-policy-signature` |
+| D5 | Dev-mode avoids the steward signing path entirely (no `*steward.Steward` is constructed); production builds refuse to compile the bypass via `//go:build !prod`; every dev-build run prints the loud unsigned-policy banner to stderr | Sec 4.7, Sec 8.9; constraints C6, C10; arch Sec 1.3 row `cli-dev-policy-signature` |
 | D6 | When the ONNX effort model is absent or non-loadable, the deterministic fallback formula in Sec 8.5 runs. Every output surface carries the `effort_source` field (`"ml"` or `"fallback"`) | Sec 4.10, Sec 8.5; constraint C15; arch Sec 1.3 row `cli-effort-fallback-formula` |
 | D7 | Per-file walker size cap = 2 MiB; per-snippet emitter cap = 200 lines (truncation marked) | Sec 8.2, Sec 8.3 |
 | D8 | Exit codes: `0` clean, `1` `--exit-on` triggered, `2` walker error, `64` invalid usage, `70` internal engine error. No other codes in P0/P1 | Sec 8.6; constraint C9 |
@@ -1328,17 +1319,17 @@ The four story-brief-named questions and their resolutions:
   -- `EffortModel` interface and `EffortModelFunc` adapter
   (exact source line at effort_model.go:148:
   `type EffortModelFunc func(task RefactorTask, hs HotSpot, snap PolicySnapshot) (float64, error)`).
-- `services/clean-code/internal/policy/steward/steward.go:357`
-  -- the sole steward-side signature-verification verb
-  (exact source line at steward.go:357:
-  `func (s *Steward) VerifyPolicyVersionSignature(ctx context.Context, pv PolicyVersion) error {`).
-  The CLI **never engages this signing path**: dev-mode
-  synthesises an unsigned `PolicyVersion` and routes it
-  directly into `InMemoryStore` without ever constructing a
-  `*steward.Steward`. Verify with
-  `grep -nF "func (s *Steward) VerifyPolicyVersionSignature" services/clean-code/internal/policy/steward/steward.go`
-  which returns
-  `357:func (s *Steward) VerifyPolicyVersionSignature(ctx context.Context, pv PolicyVersion) error {`.
+- `services/clean-code/internal/policy/steward/` -- the
+  package whose signing path the CLI **never engages**.
+  Dev-mode synthesises an unsigned `PolicyVersion` and routes
+  it directly into `InMemoryStore` without ever constructing a
+  `*steward.Steward`, so no signature-verification verb in
+  this package is reachable at runtime. The directory anchor
+  is the entire `services/clean-code/internal/policy/steward/`
+  tree; this doc deliberately does not pin a specific function
+  name because the CLI's stance is "do not call into this
+  package's signing seam at all," not "call a particular
+  function and bypass it."
 - `services/clean-code/policy/rulepacks/{solid,decoupling}/*.yaml`
   -- the canonical rule-pack set embedded by the CLI.
 - `services/clean-code/cmd/clean-code-indexer/main.go:12-30` --

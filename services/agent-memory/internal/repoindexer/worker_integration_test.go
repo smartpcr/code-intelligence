@@ -1174,3 +1174,461 @@ func TestWorker_repoRegisteredFiresOnRetryAfterCommitWasInserted(t *testing.T) {
 		t.Errorf("expected duplicate ingest_jobs INSERT to be rejected by UNIQUE index; got nil error")
 	}
 }
+
+// TestWorker_fullIngest_graphIsByteIdenticalToCanonicalIdentity
+// pins the four `node`/`edge` columns the Stage 2.4 "Worker
+// adopts AncestryWriter" plan requires to remain byte-identical
+// across the refactor: `kind`, `canonical_signature`,
+// `parent_node_id`, and `fingerprint`. The pre-refactor inline
+// loop computed canonical signatures via the same
+// `CanonicalRepoSig` / `CanonicalPackageSig` / `CanonicalFileSig`
+// helpers AncestryWriter calls; this test recomputes the
+// expected `(kind, canonical_signature)` for every node from the
+// fixture's known shape (NOT from the row under test, which would
+// be tautological per rubber-duck review), recomputes the expected
+// `fingerprint` via the shared `fingerprint.NodeFingerprint`
+// pre-image, and asserts each `node` row matches the expectation
+// column-for-column. Edge rows are pinned identically through
+// `fingerprint.EdgeFingerprint`. `attrs_json` is compared as
+// `jsonb` so a future schema-normalisation reorder of keys
+// does not produce a false failure; only the semantic content
+// is asserted.
+//
+// Existing `TestWorker_fullIngest_idempotentReIngest` only
+// counts rows -- evaluator iter-1 finding #1.
+func TestWorker_fullIngest_graphIsByteIdenticalToCanonicalIdentity(t *testing.T) {
+	fix := openFixture(t)
+	defer fix.cleanup()
+	gw := graphwriter.New(fix.app, slog.Default())
+	ctx, cancel := context.WithTimeout(context.Background(), testDBTimeout)
+	defer cancel()
+
+	repoURL := "https://example.test/byte-identity"
+	sha := "byte-identity-sha"
+	repoID, _ := seedRepoAndJob(t, ctx, gw, fix, repoURL, sha)
+
+	// Hard-coded fixture so the expected node/edge sets do
+	// not depend on the row contents under test. Three
+	// packages ("" for the repo root, "pkg/a", "pkg/b") and
+	// four files exercise every parent-edge path the
+	// AncestryWriter mints.
+	files := []InMemoryFile{
+		{RelPath: "pkg/a/file_00.go", Content: []byte("package a\n")},
+		{RelPath: "pkg/a/file_01.go", Content: []byte("package a\n")},
+		{RelPath: "pkg/b/file_00.go", Content: []byte("package b\n")},
+		{RelPath: "readme.md", Content: []byte("readme\n")},
+	}
+	mat := &InMemoryMaterializer{Files: files}
+	w := NewWorker(fix.app, gw, WorkerOptions{
+		Materializer: mat,
+		Emitter:      NoopASTEmitter{},
+		Publisher:    &recordingEventPublisher{},
+	})
+	if _, err := w.runFull(ctx, Job{RepoID: repoID, Mode: ModeFull, ToSHA: sha}); err != nil {
+		t.Fatalf("runFull: %v", err)
+	}
+
+	// The fingerprint pre-image folds in the ACTUAL
+	// `repo.repo_id` UUID (legacy Postgres path allocates it
+	// via gen_random_uuid()), not the deterministic
+	// `RepoIDFromURL` value. Read the assigned UUID back so
+	// the recomputed expectations match what the writer
+	// stored.
+	var assignedUUID string
+	if err := fix.owner.QueryRowContext(ctx,
+		`SELECT repo_id::text FROM repo WHERE url = $1`, repoURL,
+	).Scan(&assignedUUID); err != nil {
+		t.Fatalf("read repo.repo_id: %v", err)
+	}
+	repoIDParsed, err := fingerprint.ParseRepoID(assignedUUID)
+	if err != nil {
+		t.Fatalf("ParseRepoID(%q): %v", assignedUUID, err)
+	}
+
+	// 1. The single kind=repo Node.
+	var (
+		repoNodeID  string
+		repoSig     string
+		repoFromSHA string
+		repoFP      []byte
+		repoParent  sql.NullString
+	)
+	if err := fix.owner.QueryRowContext(ctx, `
+		SELECT node_id::text, canonical_signature,
+		       from_sha, fingerprint, parent_node_id::text
+		FROM node
+		WHERE kind = 'repo' AND from_sha = $1
+	`, sha).Scan(&repoNodeID, &repoSig, &repoFromSHA, &repoFP, &repoParent); err != nil {
+		t.Fatalf("read repo node: %v", err)
+	}
+	if repoParent.Valid {
+		t.Errorf("repo node parent_node_id = %q; want NULL", repoParent.String)
+	}
+	if repoSig != CanonicalRepoSig(repoURL) {
+		t.Errorf("repo canonical_signature = %q; want %q",
+			repoSig, CanonicalRepoSig(repoURL))
+	}
+	if repoFromSHA != sha {
+		t.Errorf("repo from_sha = %q; want %q", repoFromSHA, sha)
+	}
+	wantRepoFP, err := fingerprint.NodeFingerprint(
+		repoIDParsed, "repo", CanonicalRepoSig(repoURL), sha,
+	)
+	if err != nil {
+		t.Fatalf("NodeFingerprint(repo): %v", err)
+	}
+	if !bytes.Equal(repoFP, wantRepoFP.Bytes()) {
+		t.Errorf("repo fingerprint = %x; want %x", repoFP, wantRepoFP.Bytes())
+	}
+	assertNodeAttrsJSON(t, fix, repoNodeID, `{"producer":"repoindexer.full"}`)
+
+	// 2. Three kind=package Nodes — one per distinct package
+	// dir. Build the expected set up-front from the fixture,
+	// then drain the table and tick off each expected row.
+	wantPackageDirs := []string{"", "pkg/a", "pkg/b"}
+	pkgNodeIDByDir := map[string]string{}
+	for _, dir := range wantPackageDirs {
+		wantSig := CanonicalPackageSig(repoURL, dir)
+		var (
+			pkgNodeID string
+			gotSig    string
+			gotFrom   string
+			gotFP     []byte
+			gotParent sql.NullString
+		)
+		if err := fix.owner.QueryRowContext(ctx, `
+			SELECT node_id::text, canonical_signature, from_sha,
+			       fingerprint, parent_node_id::text
+			FROM node
+			WHERE kind = 'package' AND from_sha = $1
+			  AND canonical_signature = $2
+		`, sha, wantSig).Scan(&pkgNodeID, &gotSig, &gotFrom, &gotFP, &gotParent); err != nil {
+			t.Fatalf("read package %q: %v", dir, err)
+		}
+		if gotSig != wantSig {
+			t.Errorf("package %q canonical_signature = %q; want %q",
+				dir, gotSig, wantSig)
+		}
+		if gotFrom != sha {
+			t.Errorf("package %q from_sha = %q; want %q",
+				dir, gotFrom, sha)
+		}
+		if !gotParent.Valid || gotParent.String != repoNodeID {
+			t.Errorf("package %q parent_node_id = (%v, %q); want (true, %q)",
+				dir, gotParent.Valid, gotParent.String, repoNodeID)
+		}
+		wantFP, err := fingerprint.NodeFingerprint(
+			repoIDParsed, "package", wantSig, sha,
+		)
+		if err != nil {
+			t.Fatalf("NodeFingerprint(package %q): %v", dir, err)
+		}
+		if !bytes.Equal(gotFP, wantFP.Bytes()) {
+			t.Errorf("package %q fingerprint = %x; want %x",
+				dir, gotFP, wantFP.Bytes())
+		}
+		// attrs_json: AncestryWriter emits `rel_path` only when
+		// non-empty (json:",omitempty"); the root-files package
+		// gets `{"producer":"repoindexer.full"}`.
+		var wantAttrs string
+		if dir == "" {
+			wantAttrs = `{"producer":"repoindexer.full"}`
+		} else {
+			wantAttrs = fmt.Sprintf(`{"rel_path":%q,"producer":"repoindexer.full"}`, dir)
+		}
+		assertNodeAttrsJSON(t, fix, pkgNodeID, wantAttrs)
+		pkgNodeIDByDir[dir] = pkgNodeID
+	}
+
+	// 3. Four kind=file Nodes — one per fixture file. Each
+	// must root through the package node for its dir.
+	for _, f := range files {
+		dir := CanonicalPackageDir(f.RelPath)
+		wantSig := CanonicalFileSig(repoURL, f.RelPath)
+		wantParent := pkgNodeIDByDir[dir]
+		var (
+			gotSig    string
+			gotFrom   string
+			gotFP     []byte
+			gotParent sql.NullString
+			fileNode  string
+		)
+		if err := fix.owner.QueryRowContext(ctx, `
+			SELECT node_id::text, canonical_signature, from_sha,
+			       fingerprint, parent_node_id::text
+			FROM node
+			WHERE kind = 'file' AND from_sha = $1
+			  AND canonical_signature = $2
+		`, sha, wantSig).Scan(&fileNode, &gotSig, &gotFrom, &gotFP, &gotParent); err != nil {
+			t.Fatalf("read file %q: %v", f.RelPath, err)
+		}
+		if gotSig != wantSig {
+			t.Errorf("file %q canonical_signature = %q; want %q",
+				f.RelPath, gotSig, wantSig)
+		}
+		if gotFrom != sha {
+			t.Errorf("file %q from_sha = %q; want %q",
+				f.RelPath, gotFrom, sha)
+		}
+		if !gotParent.Valid || gotParent.String != wantParent {
+			t.Errorf("file %q parent_node_id = (%v, %q); want (true, %q for dir %q)",
+				f.RelPath, gotParent.Valid, gotParent.String, wantParent, dir)
+		}
+		wantFP, err := fingerprint.NodeFingerprint(
+			repoIDParsed, "file", wantSig, sha,
+		)
+		if err != nil {
+			t.Fatalf("NodeFingerprint(file %q): %v", f.RelPath, err)
+		}
+		if !bytes.Equal(gotFP, wantFP.Bytes()) {
+			t.Errorf("file %q fingerprint = %x; want %x",
+				f.RelPath, gotFP, wantFP.Bytes())
+		}
+		wantAttrs := fmt.Sprintf(
+			`{"rel_path":%q,"producer":"repoindexer.full"}`, f.RelPath,
+		)
+		assertNodeAttrsJSON(t, fix, fileNode, wantAttrs)
+	}
+
+	// 4. Edges: every `contains` edge's src/dst endpoints
+	// AND fingerprint must match the canonical
+	// `EdgeFingerprint(repoID, "contains", srcFP, dstFP, sha)`
+	// pre-image. Build the expected set from the fixture so
+	// no row contents are used to compute its own
+	// expectation.
+	type edgeExpect struct {
+		label   string
+		srcSig  string
+		dstSig  string
+		srcKind string
+		dstKind string
+	}
+	var wantEdges []edgeExpect
+	for _, dir := range wantPackageDirs {
+		wantEdges = append(wantEdges, edgeExpect{
+			label:   "repo->pkg:" + dir,
+			srcSig:  CanonicalRepoSig(repoURL),
+			dstSig:  CanonicalPackageSig(repoURL, dir),
+			srcKind: "repo",
+			dstKind: "package",
+		})
+	}
+	for _, f := range files {
+		wantEdges = append(wantEdges, edgeExpect{
+			label:   "pkg->file:" + f.RelPath,
+			srcSig:  CanonicalPackageSig(repoURL, CanonicalPackageDir(f.RelPath)),
+			dstSig:  CanonicalFileSig(repoURL, f.RelPath),
+			srcKind: "package",
+			dstKind: "file",
+		})
+	}
+	for _, e := range wantEdges {
+		srcFP, err := fingerprint.NodeFingerprint(repoIDParsed, e.srcKind, e.srcSig, sha)
+		if err != nil {
+			t.Fatalf("NodeFingerprint(src %s): %v", e.label, err)
+		}
+		dstFP, err := fingerprint.NodeFingerprint(repoIDParsed, e.dstKind, e.dstSig, sha)
+		if err != nil {
+			t.Fatalf("NodeFingerprint(dst %s): %v", e.label, err)
+		}
+		wantEdgeFP, err := fingerprint.EdgeFingerprint(repoIDParsed, "contains", srcFP, dstFP, sha)
+		if err != nil {
+			t.Fatalf("EdgeFingerprint(%s): %v", e.label, err)
+		}
+		var (
+			gotKind    string
+			gotFromSHA string
+			gotSrcSig  string
+			gotDstSig  string
+			gotFP      []byte
+		)
+		if err := fix.owner.QueryRowContext(ctx, `
+			SELECT e.kind::text, e.from_sha, src.canonical_signature,
+			       dst.canonical_signature, e.fingerprint
+			FROM edge e
+			JOIN node src ON src.node_id = e.src_node_id
+			JOIN node dst ON dst.node_id = e.dst_node_id
+			WHERE e.from_sha = $1 AND e.fingerprint = $2
+		`, sha, wantEdgeFP.Bytes()).Scan(
+			&gotKind, &gotFromSHA, &gotSrcSig, &gotDstSig, &gotFP,
+		); err != nil {
+			t.Fatalf("read edge %s: %v", e.label, err)
+		}
+		if gotKind != "contains" {
+			t.Errorf("edge %s kind = %q; want contains", e.label, gotKind)
+		}
+		if gotFromSHA != sha {
+			t.Errorf("edge %s from_sha = %q; want %q", e.label, gotFromSHA, sha)
+		}
+		if gotSrcSig != e.srcSig {
+			t.Errorf("edge %s src canonical_signature = %q; want %q",
+				e.label, gotSrcSig, e.srcSig)
+		}
+		if gotDstSig != e.dstSig {
+			t.Errorf("edge %s dst canonical_signature = %q; want %q",
+				e.label, gotDstSig, e.dstSig)
+		}
+		if !bytes.Equal(gotFP, wantEdgeFP.Bytes()) {
+			t.Errorf("edge %s fingerprint = %x; want %x",
+				e.label, gotFP, wantEdgeFP.Bytes())
+		}
+	}
+
+	// 5. Total edge count for this repo must equal the
+	// expected set; a stray edge would otherwise be invisible
+	// to the per-fingerprint loop above.
+	var totalEdges int
+	if err := fix.owner.QueryRowContext(ctx, `
+		SELECT count(*) FROM edge
+		WHERE repo_id::text = $1 AND from_sha = $2
+	`, assignedUUID, sha).Scan(&totalEdges); err != nil {
+		t.Fatalf("count edges: %v", err)
+	}
+	if totalEdges != len(wantEdges) {
+		t.Errorf("edge row count = %d; want %d (extra/missing edges in graph)",
+			totalEdges, len(wantEdges))
+	}
+}
+
+// assertNodeAttrsJSON compares the node's attrs_json column
+// against a wanted JSON literal using PostgreSQL's `jsonb`
+// equality (key-order insensitive, whitespace insensitive) so
+// the assertion is robust to harmless schema-level
+// normalisation.
+func assertNodeAttrsJSON(t *testing.T, fix *dbFixture, nodeID, want string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var ok bool
+	if err := fix.owner.QueryRowContext(ctx, `
+		SELECT attrs_json::jsonb = $1::jsonb
+		FROM node WHERE node_id::text = $2
+	`, want, nodeID).Scan(&ok); err != nil {
+		t.Fatalf("compare attrs_json for node %s: %v", nodeID, err)
+	}
+	if !ok {
+		var actual string
+		_ = fix.owner.QueryRowContext(ctx, `
+			SELECT attrs_json::text FROM node WHERE node_id::text = $1
+		`, nodeID).Scan(&actual)
+		t.Errorf("node %s attrs_json = %s; want %s", nodeID, actual, want)
+	}
+}
+
+// TestWorker_runFull_preservesParentSHAAndCurrentHead pins the
+// two bridge fields the Stage 2.4 refactor introduces:
+//
+//   - `aw.SetParentSHA(job.FromSHA)` -- the worker forwards
+//     `Job.FromSHA` through AncestryWriter into
+//     `repo_commit.parent_sha`. Pre-refactor inline path
+//     wrote `nullableSHA(job.FromSHA)` directly; post-refactor
+//     must reach the same column with the same value.
+//
+//   - `aw.SetCurrentHeadSHA(repoHeadSHA)` -- the worker round-
+//     trips the existing `repo.current_head_sha` value through
+//     EnsureRepo's upsert so a delayed re-ingest of a
+//     historical SHA does NOT silently rewind the operator-
+//     facing head pointer. Pre-refactor handler never wrote
+//     the `repo` row at all; post-refactor calls EnsureRepo
+//     (mandatory because AncestryWriter owns the sequence) but
+//     MUST preserve the column value.
+//
+// Evaluator iter-1 finding #2.
+func TestWorker_runFull_preservesParentSHAAndCurrentHead(t *testing.T) {
+	fix := openFixture(t)
+	defer fix.cleanup()
+	gw := graphwriter.New(fix.app, slog.Default())
+	ctx, cancel := context.WithTimeout(context.Background(), testDBTimeout)
+	defer cancel()
+
+	repoURL := "https://example.test/bridge-fields"
+	// preservedHead != scanSHA: the worker must NOT bump
+	// repo.current_head_sha to scanSHA. Setting them unequal
+	// is the only way to distinguish "round-trip preserved
+	// the column" from "AncestryWriter happened to write the
+	// same value because the test seeded ToSHA == head".
+	preservedHead := "preserved-head-sha"
+	parentSHA := "parent-sha-from-job"
+	scanSHA := "new-scan-sha"
+
+	// Seed the repo directly (bypassing seedRepoAndJob, which
+	// sets current_head_sha = job.ToSHA and would make the
+	// preservation assertion trivial).
+	rec, err := gw.EnsureRepo(ctx, graphwriter.RepoInput{
+		URL:            repoURL,
+		DefaultBranch:  "main",
+		CurrentHeadSHA: preservedHead,
+		LanguageHints:  []string{"go"},
+	})
+	if err != nil {
+		t.Fatalf("EnsureRepo: %v", err)
+	}
+
+	mat := &InMemoryMaterializer{Files: []InMemoryFile{
+		{RelPath: "x.go", Content: []byte("package main\n")},
+	}}
+	w := NewWorker(fix.app, gw, WorkerOptions{
+		Materializer: mat,
+		Emitter:      NoopASTEmitter{},
+		Publisher:    &recordingEventPublisher{},
+	})
+	job := Job{
+		RepoID:  rec.ID,
+		Mode:    ModeFull,
+		ToSHA:   scanSHA,
+		FromSHA: parentSHA,
+	}
+	if _, err := w.runFull(ctx, job); err != nil {
+		t.Fatalf("runFull: %v", err)
+	}
+
+	// 1. The repo's current_head_sha column must still be
+	// preservedHead. A regression that lets EnsureRepo bump
+	// it to job.ToSHA would surface here.
+	var gotHead string
+	if err := fix.owner.QueryRowContext(ctx,
+		`SELECT current_head_sha FROM repo WHERE repo_id::text = $1`,
+		rec.RepoID,
+	).Scan(&gotHead); err != nil {
+		t.Fatalf("read repo.current_head_sha: %v", err)
+	}
+	if gotHead != preservedHead {
+		t.Errorf("repo.current_head_sha = %q after runFull; want %q (worker must NOT bump to job.ToSHA = %q)",
+			gotHead, preservedHead, scanSHA)
+	}
+
+	// 2. repo_commit for the scan SHA must carry the job's
+	// FromSHA as parent_sha. NULL or empty here would mean
+	// SetParentSHA was bypassed.
+	var gotParent sql.NullString
+	if err := fix.owner.QueryRowContext(ctx, `
+		SELECT parent_sha FROM repo_commit
+		WHERE repo_id::text = $1 AND sha = $2
+	`, rec.RepoID, scanSHA).Scan(&gotParent); err != nil {
+		t.Fatalf("read repo_commit.parent_sha: %v", err)
+	}
+	if !gotParent.Valid || gotParent.String != parentSHA {
+		t.Errorf("repo_commit.parent_sha = (valid=%v, %q); want (valid=true, %q) — job.FromSHA must round-trip into the commit row via SetParentSHA",
+			gotParent.Valid, gotParent.String, parentSHA)
+	}
+
+	// 3. Belt-and-braces: the repo's default_branch and
+	// language_hints must also survive the round-trip
+	// unchanged. AncestryWriter forwards them on the
+	// EnsureRepo upsert; a regression that ignored the
+	// values the worker reads up-front would surface here.
+	var gotBranch string
+	var gotHints []string
+	if err := fix.owner.QueryRowContext(ctx, `
+		SELECT default_branch, language_hints
+		FROM repo WHERE repo_id::text = $1
+	`, rec.RepoID).Scan(&gotBranch, pq.Array(&gotHints)); err != nil {
+		t.Fatalf("read repo metadata: %v", err)
+	}
+	if gotBranch != "main" {
+		t.Errorf("repo.default_branch = %q; want \"main\" (round-trip lost)", gotBranch)
+	}
+	if len(gotHints) != 1 || gotHints[0] != "go" {
+		t.Errorf("repo.language_hints = %v; want [go] (round-trip lost)", gotHints)
+	}
+}

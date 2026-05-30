@@ -384,7 +384,7 @@ produce at least one edge for.
 | C          | `hello.c`                       | `.c`      | pass      | `c`                 | none (CGO toolchain only) |
 | C++        | `hello.cpp`                     | `.cpp`    | pass      | `cpp`               | none (CGO toolchain only) |
 | C#         | `hello.cs`                      | `.cs`     | pass      | `csharp`            | none (CGO toolchain only) |
-| Go         | `hello.go`                      | `.go`     | pass      | `golang`            | none (CGO toolchain only) |
+| Go         | `hello.go`                      | `.go`     | pass      | `go`                | none (CGO toolchain only) |
 | Rust       | `hello.rs`                      | `.rs`     | pass      | `rust`              | none (CGO toolchain only) |
 | PowerShell | `hello.ps1`                     | `.ps1`    | pass / skip | n/a (subprocess) | `pwsh` on PATH; row `t.Skip`-ped when absent |
 

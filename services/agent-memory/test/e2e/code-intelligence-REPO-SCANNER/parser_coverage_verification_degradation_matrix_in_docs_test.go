@@ -160,7 +160,7 @@ func (s *degradationMatrixState) eachRowNamesItsSourceParserFile(pattern string)
 
 func (s *degradationMatrixState) linkToCoverageResolvesToExistingFile(target string) error {
 	// Extract relative Markdown links from tests.md that reference COVERAGE.md.
-	linkRe := regexp.MustCompile(`\]\(([^)]+` + regexp.QuoteMeta(target) + `[^)]*)\)`)
+	linkRe := regexp.MustCompile(`\]\(([^)]*` + regexp.QuoteMeta(target) + `[^)]*)\)`)
 	matches := linkRe.FindAllStringSubmatch(s.testsMD, -1)
 	if len(matches) == 0 {
 		return fmt.Errorf("no Markdown link referencing %q found in tests.md", target)

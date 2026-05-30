@@ -6,10 +6,15 @@
 > This document owns: **problem statement, in/out-of-scope, non-goals,
 > hard constraints, parameter pins, and risks.** Component boundaries,
 > data shapes, and interface contracts live in this story's
-> `architecture.md` (REFACTOR-GUIDE arch) and the upstream
-> `docs/stories/code-intelligence-CLEAN-CODE/architecture.md`
-> (CLEAN-CODE arch). When this doc and `architecture.md` disagree,
-> the operator arbitrates and the resolution is recorded in Sec 10.
+> already-merged `architecture.md` (REFACTOR-GUIDE arch) and the
+> upstream `docs/stories/code-intelligence-CLEAN-CODE/architecture.md`
+> (CLEAN-CODE arch). In this sequential plan-doc mode, both
+> architecture docs are the upstream authority: when this tech-spec
+> and either `architecture.md` disagree, the architecture controls
+> and any amendment requires a future story rather than a local
+> change inside this PR. Sec 10 of this doc only re-states the pins
+> the architecture already locked in arch Sec 1.3 / Sec 8; it does
+> not arbitrate them.
 >
 > **Authority.** Per the repo `README.md`, when docs and code
 > disagree the docs win. This tech-spec inherits CLEAN-CODE arch
@@ -403,10 +408,25 @@ readers / writers
 refactor.WithEffortModel(refactor.EffortModelFunc(...)))` with the
 in-memory hot-spot reader, finding-detail reader, and refactor-
 plan-task writer. The effort callback (Sec 4.10) is wired into
-the `WithEffortModel` option seam at
-`services/clean-code/internal/refactor/task_planner.go:719-734`
-via the `EffortModelFunc` adapter at
-`services/clean-code/internal/refactor/effort_model.go:144-152`.
+the `WithEffortModel` option seam whose exact Go source line is:
+
+```go
+// services/clean-code/internal/refactor/task_planner.go:734
+func WithEffortModel(em EffortModel) TaskOption {
+```
+
+(quoted verbatim so a literal `grep -F "func WithEffortModel"`
+finds the same string in both this doc and the `.go` file).
+`WithEffortModel` lives in `task_planner.go`, not `planner.go`
+-- `planner.go:650` is an `InMemoryFindingReader` struct field
+declaration (`findings []InMemoryFinding`) and contains no
+`func WithEffortModel`. The callback is adapted to the
+`EffortModel` interface via the `EffortModelFunc` adapter:
+
+```go
+// services/clean-code/internal/refactor/effort_model.go:148
+type EffortModelFunc func(task RefactorTask, hs HotSpot, snap PolicySnapshot) (float64, error)
+```
 
 ### 4.7 Dev-mode policy loader + signature bypass (L8 = friction)
 
@@ -417,13 +437,28 @@ A new `internal/cli/devpolicy` package loads YAML rule packs
 (embedded by default via `//go:embed`, filesystem when
 `--policy <path>` is passed) and synthesises an in-memory
 `steward.PolicyVersion` with `Signature == nil`. The package
-never invokes `Steward.VerifyPolicyVersionSignature`
-(`services/clean-code/internal/policy/steward/steward.go:357`);
-the bypass is **structural**, not behavioural, because the
+**avoids the steward signing path entirely**: it does not
+construct a `*steward.Steward` and never calls any signature-
+verification verb on one. The single steward-side signature-
+verification verb in the production tree is the method whose
+exact Go source line is:
+
+```go
+// services/clean-code/internal/policy/steward/steward.go:357
+func (s *Steward) VerifyPolicyVersionSignature(ctx context.Context, pv PolicyVersion) error {
+```
+
+(quoted verbatim so a literal `grep -F "func (s *Steward)
+VerifyPolicyVersionSignature"` finds the same string in both
+this doc and the `.go` file). The CLI never reaches that
+method because no `*steward.Steward` is instantiated. The
+bypass is therefore **structural**, not behavioural: the
 `rule_engine.Engine` has no signature surface of its own
-(`engine.go:130-162`) -- it consumes whatever `PolicyVersion` the
-`Store` returns. Production safety is enforced at compile time
-by a `//go:build !prod` constraint on the bypass loader; a
+(`engine.go:130-162`) -- it consumes whatever `PolicyVersion`
+the `Store` returns, and `InMemoryStore` returns the
+`devpolicy`-synthesised unsigned version unchanged.
+Production safety is enforced at compile time by a
+`//go:build !prod` constraint on the bypass loader; a
 `-tags prod` build cannot compile it. Every dev-build run prints
 a loud `WARNING: dev-mode policy is unsigned` banner.
 
@@ -1279,14 +1314,31 @@ The four story-brief-named questions and their resolutions:
   `MetricSampleReader` / `FindingReader` / `HotSpotWriter`
   contracts, `NewPlanner`, and the in-memory readers / writers.
 - `services/clean-code/internal/refactor/task_planner.go:77-118,
-  181-191, 719-734, 839, 1231, 1317, 1380` -- canonical
-  `TaskKind` enum, `ValidateTaskKind`, `WithEffortModel`,
+  181-191, 734, 839, 1231, 1317, 1380` -- canonical
+  `TaskKind` enum, `ValidateTaskKind`, and `WithEffortModel`
+  (exact source line at task_planner.go:734:
+  `func WithEffortModel(em EffortModel) TaskOption {`),
   `NewTaskPlanner`, and the in-memory readers / writers.
-- `services/clean-code/internal/refactor/effort_model.go:140-155`
-  -- `EffortModel` interface and `EffortModelFunc` adapter.
+  Verify with `grep -nF "func WithEffortModel" services/clean-code/internal/refactor/task_planner.go`
+  which returns `734:func WithEffortModel(em EffortModel) TaskOption {`
+  and NOT `services/clean-code/internal/refactor/planner.go`
+  (planner.go:650 is `findings []InMemoryFinding`, an
+  `InMemoryFindingReader` struct field, NOT a function).
+- `services/clean-code/internal/refactor/effort_model.go:144-152`
+  -- `EffortModel` interface and `EffortModelFunc` adapter
+  (exact source line at effort_model.go:148:
+  `type EffortModelFunc func(task RefactorTask, hs HotSpot, snap PolicySnapshot) (float64, error)`).
 - `services/clean-code/internal/policy/steward/steward.go:357`
-  -- `Steward.VerifyPolicyVersionSignature` (the function the
-  CLI structurally never invokes).
+  -- the sole steward-side signature-verification verb
+  (exact source line at steward.go:357:
+  `func (s *Steward) VerifyPolicyVersionSignature(ctx context.Context, pv PolicyVersion) error {`).
+  The CLI **never engages this signing path**: dev-mode
+  synthesises an unsigned `PolicyVersion` and routes it
+  directly into `InMemoryStore` without ever constructing a
+  `*steward.Steward`. Verify with
+  `grep -nF "func (s *Steward) VerifyPolicyVersionSignature" services/clean-code/internal/policy/steward/steward.go`
+  which returns
+  `357:func (s *Steward) VerifyPolicyVersionSignature(ctx context.Context, pv PolicyVersion) error {`.
 - `services/clean-code/policy/rulepacks/{solid,decoupling}/*.yaml`
   -- the canonical rule-pack set embedded by the CLI.
 - `services/clean-code/cmd/clean-code-indexer/main.go:12-30` --

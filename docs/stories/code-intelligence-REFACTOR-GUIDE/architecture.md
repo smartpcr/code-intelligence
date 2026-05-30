@@ -60,7 +60,7 @@ disposition.
 | Dev-mode `PolicyVersion` synthesiser that loads YAML rule packs from disk (or embedded) and constructs an unsigned `steward.PolicyVersion` for the in-memory `rule_engine.InMemoryStore` | Re-implementing rule pack signature verification or threshold publishing; v1 production still requires signed policies per CLEAN-CODE arch G5 |
 | Deterministic effort estimator that runs when the ONNX model is missing or non-loadable | Re-implementing the Stage 8.3 ML effort model |
 | Markdown + JSON serialisers for `refactor.PlanResult` and the per-hotspot task list | UI / dashboard rendering |
-| **Structured refactor-edit-instructions emitter** (the operator's pinned L7 Option A): one JSON-Lines record per `refactor_task`, carrying `rule_id`, `file`, `line_range`, `scope_kind`, `source_snippet`, `task_kind`, `prose_suggestion` -- pasted into an AI coder to synthesise patches | Synthesising patches inside the CLI binary itself (deferred to P3 mechanical patches; see open question `L7-authority`) |
+| **Structured refactor-edit-instructions emitter** (the operator's pinned L7 Option A): one JSON-Lines record per `refactor_task`, carrying `rule_id`, `file`, `line_range`, `scope_kind`, `source_snippet`, `task_kind`, `prose_suggestion` -- pasted into an AI coder to synthesise patches | Synthesising patches inside the CLI binary itself (deferred to P3 mechanical patches; resolved under operator pin `cli-l7-authority` in Section 1.3, with the lifting / sibling-package debate carried into a separate story) |
 | Stable `scope_id` minting from `(repo_id, scope_kind, canonical_signature, first_seen_sha)` where `repo_id` is a deterministic UUID derived from the absolute local path so re-runs are idempotent (CLEAN-CODE arch G2) | Cross-repo / portfolio percentiles; the CLI is single-repo, single-SHA |
 | Graceful "dark metric" reporting: when a metric recipe sits on a parser attr that today's Stage 2.1 parser fleet does not emit (`decision_blocks`, `call_edges`, `field_accesses`), the CLI prints a one-line "metric dark: needs parser extension" diagnostic instead of silently dropping it | Extending the per-language parsers to close the dark-metric gap; that work is the P2 roadmap item and ships under a separate story |
 
@@ -70,28 +70,30 @@ The story description's gap analysis pins the L1 - L9 layer
 nomenclature this doc uses verbatim. Every L-numbered subsection
 in Section 3 anchors back to the matching cell in the story's
 "Summary" table and the matching "L`N` --" deep-dive. The four
-operator-pinned open questions in the story description
-("Architectural authority for L7", "Language priority", "Where
-does the CLI binary live", "Rule pack distribution") are
-re-emitted as structured `open-questions` at the bottom of this
-file so the wizard can route them to the operator.
+choice points raised in the story description's "Open questions"
+list ("Architectural authority for L7", "Language priority",
+"Where does the CLI binary live", "Rule pack distribution") are
+resolved as defaults in Section 1.3 below and re-stated as
+RESOLVED entries in Section 8; any later override lands in a
+follow-up story rather than re-opening this plan.
 
 ### 1.3 Operator pins (this story)
 
 This story does not introduce new metric_kinds or rule packs;
 the pins below are CLI-shape choices that the rest of the
-document hangs from. Where a pin is **proposed** the operator
-has not yet answered; the corresponding entry appears in the
-Section 8 `open-questions` block and the next iteration of this
-doc resolves it.
+document hangs from. Each entry is a RESOLVED default for this
+story -- the architecture and sibling plans build on these
+values without further operator intervention. An operator who
+wants a different value lands a follow-up story; this plan does
+not block on a wizard answer.
 
-| Pin id | Question | Default proposed | Re-stated at |
+| Pin id | Question | Decision (this story) | Re-stated at |
 | --- | --- | --- | --- |
-| `cli-binary-location` | Where does the `cleanc` binary live? | `services/clean-code/cmd/cleanc/main.go` (sibling to the six existing service binaries) | Section 3.6, Section 9; open question `cli-binary-location` |
-| `cli-policy-distribution` | How are rule packs distributed with the CLI? | `//go:embed` the canonical `services/clean-code/policy/rulepacks/{solid,decoupling}/*.yaml` set into the binary; allow `--policy <path>` override | Section 3.8, Section 7.1; open question `cli-policy-distribution` |
-| `cli-l7-authority` | Does the CLI emit structured refactor prompts only (Option A) or also synthesise mechanical patches (Options B/C)? | **Option A only for P1**; Options B/C deferred to P3 pending an architecture amendment to lift the CLEAN-CODE arch Section 1.2 "no auto-fix" clause | Section 3.7, Section 6.2, Section 9; open question `L7-authority` |
-| `cli-language-priority` | Which target language is P2's parser-attr extension first? | **Go first**, then Python, then TypeScript, then Java (matches the existing test corpus weighting) | Section 9; open question `language-priority` |
-| `cli-dev-policy-signature` | Does dev-mode skip signature verification entirely or accept a baked-in dev key? | **Skip with a loud `WARNING: dev-mode policy is unsigned` banner**; production binaries refuse to skip via a `-tags prod` build constraint | Section 3.8, Section 7.2 |
+| `cli-binary-location` | Where does the `cleanc` binary live? | `services/clean-code/cmd/cleanc/main.go` (sibling to the six existing service binaries) | Section 3.6, Section 9 |
+| `cli-policy-distribution` | How are rule packs distributed with the CLI? | `//go:embed` the canonical `services/clean-code/policy/rulepacks/{solid,decoupling}/*.yaml` set into the binary; `--policy <path>` override allowed in dev builds | Section 3.8, Section 7.1 |
+| `cli-l7-authority` | Does the CLI emit structured refactor prompts only (Option A) or also synthesise mechanical patches (Options B/C)? | **Option A only for P0/P1**; Options B/C deferred to a separate P3 story that carries the architecture amendment OR the sibling-package framing | Section 3.7, Section 6.2, Section 9 |
+| `cli-language-priority` | Which target language is P2's parser-attr extension first? | **Go first**, then Python, then TypeScript, then Java (matches the existing test corpus weighting) | Section 9 |
+| `cli-dev-policy-signature` | Does dev-mode skip signature verification entirely or accept a baked-in dev key? | **Skip the steward signature path entirely in dev-mode**, with a loud `WARNING: dev-mode policy is unsigned` banner; production builds refuse to compile the bypass via a `-tags prod` build constraint | Section 3.8, Section 7.2 |
 | `cli-effort-fallback-formula` | When the ONNX effort model is missing, what deterministic estimator runs? | `effort_hours = round_half_up(0.02 * loc + 0.10 * cyclo + 0.05 * fan_in + 1.0, 1)` clamped to `[0.1, 80.0]` | Section 3.5, Section 4.5 |
 
 ### 1.4 Guiding invariants this story honours
@@ -256,7 +258,8 @@ effects. It owns:
     dependency already implied by the agent-memory service)
     instead of inventing a new gitignore engine. The next
     iteration of `tech-spec.md` MUST pin the exact import path
-    if the operator answers `cli-policy-distribution` in a way
+    if the operator pin `cli-policy-distribution` (Section 1.3)
+    is later overridden in a way
     that adds or removes a vendored package.
   - Files whose detected language is not in
     `parser.SupportedLanguages` (`go`, `python`, `typescript`,
@@ -320,18 +323,27 @@ each `*parser.AstFile` plus the project-wide collection of
 `*AstFile`s into `MetricSampleDraft` rows.
 
 The CLI calls each recipe via the existing
-`recipes.Recipe.AppliesTo` / `Recipe.Apply` contract. Recipes
-that today gate on parser attrs the Stage 2.1 fleet does not
-emit (`AttrDecisionBlocks`, `AttrCallEdges`,
-`AttrFieldAccesses`) return `false` from `AppliesTo` and emit
-zero drafts -- not a silent zero-value sample but a no-op.
+`recipes.Recipe.AppliesTo` / `Recipe.Compute` contract
+(`services/clean-code/internal/metrics/recipes/recipe.go:404-441`).
+Recipes that today gate on parser attrs the Stage 2.1 fleet does
+not emit (`AttrDecisionBlocks`, `AttrCallEdges`,
+`AttrFieldAccesses` -- defined as canonical constants at
+`recipes/recipe.go:55-122`) return `false` from `AppliesTo` and
+emit zero drafts -- not a silent zero-value sample but a no-op.
 
-The CLI's orchestrator (Section 3.6) tracks which recipes
-returned zero drafts due to a known-dark attr and surfaces a
+The CLI's orchestrator (Section 3.6) carries a CLI-local
+`metricAttrRequirements` lookup table that maps each
+`metric_kind` to the parser-attr constants its `AppliesTo`
+predicate consults (a 13-row constant slice maintained next to
+the orchestrator, NOT a new method on the `Recipe` contract).
+When the orchestrator observes `AppliesTo(file) == false` for a
+recipe whose `AppliesTo` would otherwise short-circuit on an
+unstamped attr, it consults the table and surfaces a
 "dark metric" diagnostic per `(metric_kind, language)` pair in
 the `report.md` and in a `--diagnostics` JSON output. This
-makes the parser-attr gap visible to the operator without
-faking samples.
+keeps the recipe contract unchanged (the orchestrator's
+introspection is external) and makes the parser-attr gap
+visible to the operator without faking samples.
 
 The recipes that **light up today** for the four pinned
 languages (per the story brief's L3 deep-dive):
@@ -376,17 +388,28 @@ composition root pre-loads the store with:
    `InMemoryStore.InsertRule` (the YAML loader emits one
    `steward.Rule` per `rules:` entry in the rule pack).
 3. Each `rule_engine.Sample` synthesised from the recipe
-   drafts (Section 4.4) via `InMemoryStore.InsertSample`.
-4. A single `commit_parents` entry: `(repo_id, head_sha) -> ""`
-   so the engine treats the working copy as a root commit; this
-   makes every firing rule produce a `delta=new` finding (per
-   the engine's documented "no prior" branch).
+   drafts (Section 4.4) as a single batch via
+   `InMemoryStore.InsertSamples(repoID, headSHA, samples)`
+   (`services/clean-code/internal/rule_engine/inmem_store.go:144-151`
+   -- the store exposes a plural, batched insert keyed by
+   `(repo_id, sha)`; no per-row `InsertSample` exists).
+4. A single parent registration: `InMemoryStore.RegisterCommit(repoID, headSHA, "")`
+   (`inmem_store.go:412-423`) so the engine treats the working
+   copy as a root commit; this makes every firing rule produce
+   a `delta=new` finding (per the engine's documented "no prior"
+   branch).
 
-The CLI then calls `Engine.RunBatch(ctx, repoID, headSHA,
-policyVersionID)` and consumes the returned `RunResult` for
-audit (the `EvaluationRun`, `EvaluationVerdict`, and finding
-ids land in the in-memory store and are read back by the
-report renderer).
+The CLI then constructs the engine via
+`rule_engine.New(rule_engine.Config{Store: store})`
+(`services/clean-code/internal/rule_engine/engine.go:130-162`;
+note the canonical constructor is `New`, not `NewEngine`) and
+calls `Engine.RunBatch(ctx, repoID, headSHA, policyVersionID)`
+(`engine.go:197-199`). The returned `RunResult` carries the
+audit row IDs (`EvaluationRun`, `EvaluationVerdict`, and the
+finding ids) and the in-memory store retains the rows, which
+the report renderer reads back through the store's `Findings()`
+/ `Runs()` / `Verdicts()` accessors
+(`inmem_store.go:700-720`).
 
 ### 3.5 L5 -- Refactor Planner and Task Planner (REUSED, with effort fallback)
 
@@ -428,9 +451,13 @@ path implied by that version. When the file is missing or the
 loader returns an error, the CLI's effort estimator runs the
 deterministic formula pinned in Section 1.3 row
 `cli-effort-fallback-formula`. The fallback is wired by
-implementing the same effort-callback seam the production
-TaskPlanner accepts (`tech-spec.md` pins the exact callback
-shape); the in-memory writer then receives `RefactorTask`
+implementing the `refactor.EffortModel` interface
+(`services/clean-code/internal/refactor/effort_model.go:140-155`)
+behind `refactor.WithEffortModel(...)` -- the production
+TaskPlanner already accepts arbitrary `EffortModel`
+implementations via this option seam
+(`services/clean-code/internal/refactor/task_planner.go:719-734`).
+The in-memory writer then receives `RefactorTask`
 rows with non-zero `EffortHours`. The fallback logs a single
 WARNING line on the first invocation per run and exposes the
 formula in `--diagnostics` so the report consumer knows the
@@ -438,8 +465,8 @@ estimates are heuristic.
 
 ### 3.6 L6 -- CLI composition root (NEW)
 
-**Disposition:** missing. **Package:** `cmd/cleanc` (new, see
-open question `cli-binary-location`) plus
+**Disposition:** missing. **Package:** `cmd/cleanc` (resolved per
+operator pin `cli-binary-location` in Section 1.3) plus
 `internal/cli/orchestrator` (new). **Responsibility:** parse
 flags, wire every component above into one pipeline, drive the
 pipeline, and dispatch the output writers.
@@ -491,8 +518,10 @@ the requested output formats.
 ### 3.7 L7 -- Report and Suggestion writers (NEW)
 
 **Disposition:** the structured-prompt half of L7 ships in P1;
-mechanical patches are deferred to P3 pending the operator
-answer on `cli-l7-authority`. **Packages:**
+mechanical patches are deferred to P3 pending the new story
+that lifts the CLEAN-CODE arch Section 1.2 "no auto-fix" clause
+OR carves out a sibling package (per operator pin
+`cli-l7-authority` in Section 1.3). **Packages:**
 `internal/cli/report` (new) and `internal/cli/suggest` (new).
 
 #### 3.7.1 Markdown report (`internal/cli/report`)
@@ -558,8 +587,9 @@ clean-code service collides with the
 strictly downstream of the existing `RefactorTask` rows, the
 suggest package does NOT rewrite source bytes; it serialises
 context for an external coder. This preserves the existing
-architectural boundary and defers the amendment debate to
-P3 / operator answer on `cli-l7-authority`.
+architectural boundary and pushes the Option B/C amendment
+debate into the follow-up story scoped by operator pin
+`cli-l7-authority` (Section 1.3).
 
 ### 3.8 L8 -- Dev-mode Policy Loader (NEW)
 
@@ -591,16 +621,32 @@ Outputs (in-memory, not persisted):
   `solid/srp.yaml`).
 - `PolicyVersion.Signature` is the empty byte slice; the CLI
   attaches a `dev_unsigned` flag to its diagnostics so the
-  rule engine wrapper knows to skip signature verification.
+  report makes the unsigned-policy mode obvious to the operator.
 
-**Signature bypass.** Production `clean-code` requires
-`PolicyVersion.Signature` to validate (CLEAN-CODE arch G5). The
-CLI bypasses this check ONLY in `--dev-mode`. The bypass is a
-single function call on a wrapper around `Engine` (the wrapper
-overrides the signature check; in non-dev builds the wrapper
-type does not exist, enforced by a `//go:build !prod` tag on
-the file that declares it). The CLI prints a loud banner on
-every run:
+**Signature bypass.** Production `clean-code` verifies signatures
+through `Steward.VerifyPolicyVersionSignature`
+(`services/clean-code/internal/policy/steward/steward.go:357`),
+which is the only component in the service that enforces
+CLEAN-CODE arch G5. The rule engine (`rule_engine.Engine`,
+`services/clean-code/internal/rule_engine/engine.go:130-162`)
+has NO signature verification surface of its own; it consumes
+the `PolicyVersion` from whichever `Store` implementation it
+was constructed with. The CLI bypass is therefore STRUCTURAL,
+not behavioural: the CLI never invokes the Steward. Instead,
+`internal/cli/devpolicy` constructs a `steward.PolicyVersion`
+with `Signature == nil` and inserts it directly into the
+`rule_engine.InMemoryStore` via `InsertPolicyVersion`; the
+engine then runs against that store with no signature check
+ever reached.
+
+Production safety is enforced at compile time, not run time:
+the only file in the CLI tree that synthesises an unsigned
+`PolicyVersion` carries a `//go:build !prod` build constraint.
+A `-tags prod` build cannot compile the bypass loader at all
+and must use a sibling loader that calls the Steward (out of
+scope for this CLI story; reserved for the operator workflow
+that ships signed policy artefacts). Every dev-build run prints
+a loud banner:
 
 ```
 WARNING: dev-mode policy is unsigned. Do NOT use cleanc output
@@ -827,14 +873,25 @@ No new interface. The orchestrator passes the resulting
 ### 5.3 Orchestrator -> Recipes (reused)
 
 The recipe set is iterated through the existing project
-registry (`recipes.DefaultProjectRegistry()`). The orchestrator
-calls `recipes.Recipe.AppliesTo(file)` then
-`recipes.Recipe.Apply(...)` per recipe per file (and once per
-project-scoped recipe). The dark-metric diagnostic is
-collected by inspecting `Recipe.RequiredAttrs()` on a
-zero-draft return (the inspector helper lives in the
-orchestrator, NOT inside the recipes package, so the recipe
-contract is not perturbed).
+registry (`recipes.DefaultProjectRegistry()` at
+`services/clean-code/internal/metrics/recipes/project_registry.go:123`).
+The orchestrator calls `recipes.Recipe.AppliesTo(file)` then
+`recipes.Recipe.Compute(file)` per recipe per file (and once
+per project-scoped recipe). The dark-metric diagnostic is
+NOT collected by reflecting on the recipe -- the `Recipe`
+contract at
+`services/clean-code/internal/metrics/recipes/recipe.go:404-441`
+exposes only `MetricKind() / Version() / Pack() / AppliesTo /
+Compute`. Instead, the orchestrator maintains a CLI-local
+`metricAttrRequirements` table (a constant slice of
+`(metric_kind, []requiredAttr)` rows next to the orchestrator
+that mirrors the `AppliesTo` gates in
+`recipes/recipe.go:55-122`: `cyclo` / `cognitive_complexity` ->
+`AttrDecisionBlocks`; `fan_in` / `fan_out` -> `AttrCallEdges`;
+`lcom4` -> `AttrCallEdges` + `AttrFieldAccesses`). When
+`AppliesTo` returns false, the orchestrator consults the table
+to attribute the no-op to the missing attr and surfaces the
+diagnostic. The recipe contract stays unchanged.
 
 ### 5.4 Orchestrator -> Rule engine (reused)
 
@@ -843,16 +900,17 @@ contract is not perturbed).
 store := rule_engine.NewInMemoryStore()
 store.InsertPolicyVersion(pv)
 for _, r := range rules { store.InsertRule(r) }
-for _, s := range samples { store.InsertSample(s) }
-store.SetCommitParent(repoID, headSHA, "")
+store.InsertSamples(repoID, headSHA, samples)   // PLURAL: single batched call
+store.RegisterCommit(repoID, headSHA, "")       // empty parent -> root commit
 
-engine := rule_engine.NewEngine(store, /* dsl resolver, clock */)
+engine, err := rule_engine.New(rule_engine.Config{Store: store})
 result, err := engine.RunBatch(ctx, repoID, headSHA, pv.PolicyVersionID)
 ```
 
-The CLI does not subclass `Engine` or `Store`; it wraps
-`Engine.RunBatch` with a thin signature-bypass shim when
-`--dev-mode` is on (Section 3.8).
+The CLI does not subclass `Engine` or `Store`. The Engine
+exposes no signature surface, so there is no wrapper to write;
+the bypass is achieved upstream by `internal/cli/devpolicy`
+never invoking the Steward in the first place (Section 3.8).
 
 ### 5.5 Orchestrator -> Planner (reused)
 
@@ -883,17 +941,21 @@ planTaskWriter := refactor.NewInMemoryRefactorPlanTaskWriter()
 taskPlanner, err := refactor.NewTaskPlanner(
     &policyReader, hotSpotReader, findingDetailReader,
     planTaskWriter,
-    refactor.WithEffortFunc(cliEffortCallback),
+    refactor.WithEffortModel(refactor.EffortModelFunc(cliEffortCallback)),
 )
 planAndTasks, err := taskPlanner.Plan(ctx, repoID, headSHA)
 ```
 
-The `refactor.WithEffortFunc` option seam is the one the
-`internal/cli/effort` package plugs into (Section 3.9). The
-exact option-name is pinned in `tech-spec.md`; if the existing
-`task_planner.go` does not yet expose this option the
-implementation plan calls out adding it as a Stage-0 prereq
-inside `services/clean-code/internal/refactor`.
+The `refactor.WithEffortModel` option seam
+(`services/clean-code/internal/refactor/task_planner.go:719-734`)
+is the binding the `internal/cli/effort` package plugs into
+(Section 3.9). The CLI wraps its callback in
+`refactor.EffortModelFunc`, the function-adapter to the
+`refactor.EffortModel` interface defined at
+`services/clean-code/internal/refactor/effort_model.go:140-155`.
+No production-side patch is required: both the option and the
+adapter exist in the current TaskPlanner; the implementation
+plan does not need a Stage-0 prereq for them.
 
 ### 5.7 Orchestrator -> Report writers (NEW, internal-only)
 
@@ -973,8 +1035,8 @@ NOT used because they corrupt under Windows codepage round-trips.
     |              |              |              |              | AppliesTo /  |              |              |
     |              |              |              |              | Apply -> drafts             |              |
     |              |              |              |              |------------->|              |              |
-    |              |              |              |              |              | InsertSample |              |
-    |              |              |              |              |              | (per draft)  |              |
+    |              |              |              |              |              | InsertSamples|              |
+    |              |              |              |              |              | (batched)    |              |
     |              |              |              |              |              |              |              |
     |              | RunBatch(repoID, headSHA, pv.PolicyVersionID)                                          |
     |              |--------------------------------------------------------> | EvaluationRun,              |
@@ -1074,13 +1136,13 @@ architecture amendment. The sequence:
     |  exit code   |                                                        |
 ```
 
-Per the open question `cli-l7-authority`, P3 lands ONLY after
-either (a) the CLEAN-CODE arch Section 1.2 "no auto-fix"
-clause is amended OR (b) the mechanical transformer is housed
-in a sibling package outside the planner so the planner's
-contract is unchanged. The architecture document for P3 will
-be a new story; this doc only reserves the sub-command name
-and exit code so the eventual addition is non-breaking.
+Per operator pin `cli-l7-authority` (Section 1.3), P3 lands
+ONLY after either (a) the CLEAN-CODE arch Section 1.2 "no
+auto-fix" clause is amended OR (b) the mechanical transformer
+is housed in a sibling package outside the planner so the
+planner's contract is unchanged. The architecture document for
+P3 will be a new story; this doc only reserves the sub-command
+name and exit code so the eventual addition is non-breaking.
 
 ---
 
@@ -1095,10 +1157,10 @@ operator can override with `--policy <path>` where `<path>` is
 a directory of YAML files in the same shape. The embedded
 build guarantees the CLI works offline; the override exists
 so an operator can try a new pack without rebuilding the
-binary. The operator answer to `cli-policy-distribution`
-finalises whether `--policy <path>` is allowed at all in
-production builds (it is allowed unconditionally in dev
-builds).
+binary. Per operator pin `cli-policy-distribution` (Section 1.3),
+`--policy <path>` is allowed unconditionally in dev builds and
+forbidden in `-tags prod` builds (the bypass file is excluded
+from compilation; see Section 7.2).
 
 ### 7.2 Dev-mode vs production builds
 
@@ -1135,14 +1197,24 @@ interpretation.
 
 ---
 
-## 8. Open questions
+## 8. Resolved decisions and deferred items
 
-The story description's four open questions are re-emitted as
-structured records below for the wizard. Section 1.3 has also
-proposed defaults that the operator can confirm or override.
+This story does not emit any unresolved open questions. Every
+choice point that the story description's "Open questions" list
+flagged is resolved here as a pinned default; any future
+override is a NEW story rather than a re-opening of this plan.
 
-(See the `open-questions` JSON block immediately after the
-Iteration Summary.)
+| Pin id | Resolved decision | Anchor |
+| --- | --- | --- |
+| `cli-l7-authority` | **Option A only for P0/P1.** The CLI emits structured prompt records strictly downstream of the existing `RefactorTask` rows and never rewrites source bytes. Option B (mechanical patches inside `services/clean-code`) and Option C (hybrid via a sibling package) are DEFERRED to a separate P3 story that carries either (a) the CLEAN-CODE arch Section 1.2 "no auto-fix" amendment or (b) the sibling-package framing. | Section 1.3, Section 3.7, Section 6.3 |
+| `cli-language-priority` | **Go first**, then Python, then TypeScript, then Java. This matches the existing parser test-corpus weighting; the P2 parser-attr extension (`decision_blocks`, `call_edges`, `field_accesses`) lands in that order. | Section 1.3, Section 9 |
+| `cli-binary-location` | **`services/clean-code/cmd/cleanc/main.go`**, sibling to the six existing service binaries. The `internal/cli/*` packages live alongside the other `internal/` packages so they participate in the same `make build` / `make test` / `make lint` targets. | Section 1.3, Section 3.6, Section 9 |
+| `cli-policy-distribution` | **`//go:embed` the canonical `services/clean-code/policy/rulepacks/{solid,decoupling}/*.yaml`** set into the binary. A `--policy <path>` override is permitted in dev builds (no build tag) and forbidden in `-tags prod` builds (the bypass loader is excluded from compilation; see Section 7.2). | Section 1.3, Section 3.8, Section 7.1 |
+| `cli-dev-policy-signature` | **Skip the Steward signature path entirely in dev-mode.** The `internal/cli/devpolicy` package never invokes `Steward.VerifyPolicyVersionSignature`; it inserts an unsigned `steward.PolicyVersion` directly into `rule_engine.InMemoryStore`. A loud `WARNING: dev-mode policy is unsigned` banner prints on every run; production builds refuse to compile the bypass via a `//go:build !prod` constraint. | Section 1.3, Section 3.8, Section 7.2 |
+| `cli-effort-fallback-formula` | **`effort_hours = round_half_up(0.02 * loc + 0.10 * cyclo + 0.05 * fan_in + 1.0, 1)`** clamped to `[0.1, 80.0]`, then multiplied by the per-`TaskKind` factor in Section 3.9. Diagnostics emit `effort_source: fallback` whenever this branch runs. | Section 1.3, Section 3.5, Section 3.9, Section 7.3 |
+
+No `open-questions` JSON block is emitted by this iteration --
+all six pins are resolved.
 
 ---
 
@@ -1255,47 +1327,96 @@ ties each phase to the Sections above so the sibling
   - Interfaces between components -> Section 5 (every binding mapped to an existing Go contract; no new domain interfaces invented)
   - End-to-end sequence flows for the primary scenarios -> Section 6 (P0 analyze, P1 prompt emission, P3 future apply)
   - P0 - P3 phased roadmap mapping -> Section 9
-- **Iter 1 -- no prior evaluator feedback to reconcile.** When iter 2 arrives, the "Prior feedback resolution" subsection will appear here with one `[x]` per checkbox.
+- **Iter 2 -- evaluator feedback resolved.** See the
+  `### Prior feedback resolution` subsection below; every
+  numbered item from iter 1's "What still needs work" list is
+  marked `[x] ADDRESSED` with a `Select-String -SimpleMatch`
+  audit trail.
 - **Sibling-doc anchors:** Section numbers above are intentionally stable so the parallel `tech-spec.md`, `implementation-plan.md`, and `e2e-scenarios.md` can cite "REFACTOR-GUIDE arch Section 3.X" without text-search drift.
-- **Open questions for next iteration:**
-  - 4 operator questions (the four pinned in the story brief) are emitted in the JSON block below.
-  - Two CLI-shape pins are also surfaced (`cli-binary-location` and `cli-policy-distribution`) because both materially change Section 3.6 and Section 3.8 if the operator overrides them.
+- **No open-questions block this iter.** Every operator choice
+  point is pinned in Section 1.3 and re-stated in Section 8 as
+  a RESOLVED entry; any future override is a follow-up story
+  rather than a wizard prompt against this plan.
 
-```json open-questions
-{ "openQuestions": [
-    { "id": "L7-authority",
-      "text": "Will the team accept lifting the CLEAN-CODE arch Section 1.2 'no auto-fix' clause so the CLI can ship mechanical patches (Options B / C) in P3, or should the CLI strictly stay on structured-prompt Option A even in later phases?",
-      "type": "choice",
-      "choices": [
-        "A-only: stay on structured prompts only; never ship mechanical patches inside the CLI",
-        "amend: lift the no-auto-fix clause and ship mechanical patches in P3 inside services/clean-code",
-        "sibling: keep the no-auto-fix clause but house mechanical patches in a sibling package outside services/clean-code"
-      ]
-    },
-    { "id": "language-priority",
-      "text": "Which target language gets the P2 parser-attr extension (decision_blocks / call_edges / field_accesses) first?",
-      "type": "choice",
-      "choices": ["Go", "Python", "TypeScript", "Java"]
-    },
-    { "id": "cli-binary-location",
-      "text": "Where should the cleanc binary live in the deployed surface?",
-      "type": "choice",
-      "choices": [
-        "sibling: services/clean-code/cmd/cleanc/ alongside the six existing service binaries",
-        "separate-repo: a new repo that depends on services/clean-code as a Go module",
-        "library: services/clean-code exports a pkg/ library and an external CLI repo wraps it"
-      ]
-    },
-    { "id": "cli-policy-distribution",
-      "text": "How are the SOLID / decoupling rule packs distributed with the CLI binary?",
-      "type": "choice",
-      "choices": [
-        "embedded: //go:embed the YAML into the binary; --policy <path> is an override only",
-        "external-required: the CLI refuses to run without --policy <path> pointing at a checked-out tree",
-        "hybrid: embedded defaults plus a versioned download URL pinned in CLI config"
-      ]
-    }
-] }
-```
+### Prior feedback resolution
 
-DONE
+Each numbered item from iter 1's "What still needs work" list,
+mirrored verbatim with its resolution. The `Select-String -SimpleMatch`
+output is the Windows-PowerShell equivalent of `grep -F`;
+empty output (`(empty)`) means the offending phrase no longer
+exists in the file.
+
+- [x] 1. ADDRESSED -- removed the trailing `json open-questions`
+  JSON block, rewrote Section 8 as "Resolved decisions and
+  deferred items", and promoted Section 1.3's six pins from
+  "Default proposed" to "Decision (this story)". Every pin now
+  has a Section-8 anchor row stating the chosen value and the
+  follow-up-story escape hatch.
+  - Audit: `Select-String -SimpleMatch 'json open-questions'`
+    on the file -> `(empty)`.
+  - Audit: `Select-String -SimpleMatch '## 8. Open questions'`
+    on the file -> `(empty)`.
+- [x] 2. ADDRESSED -- replaced `Recipe.Apply` with `Recipe.Compute`
+  in Section 3.3 (paragraph at "calls each recipe via the
+  existing recipes.Recipe.AppliesTo / Recipe.Compute contract")
+  and Section 5.3 ("calls recipes.Recipe.AppliesTo(file) then
+  recipes.Recipe.Compute(file)"). Both citations now anchor to
+  `services/clean-code/internal/metrics/recipes/recipe.go:404-441`.
+  - Audit: `Select-String -SimpleMatch 'Recipe.Apply'` on the
+    file -> `(empty)`.
+- [x] 3. ADDRESSED -- deleted the invented `Recipe.RequiredAttrs()`
+  reference from Section 5.3 and replaced it with a CLI-local
+  `metricAttrRequirements` lookup table that lives in the
+  orchestrator (NOT the recipes package). The table mirrors the
+  `AppliesTo` gates anchored at
+  `services/clean-code/internal/metrics/recipes/recipe.go:55-122`
+  (`AttrDecisionBlocks` / `AttrCallEdges` / `AttrFieldAccesses`
+  constants). The recipe contract is unchanged.
+  - Audit: `Select-String -SimpleMatch 'RequiredAttrs'` on the
+    file -> `(empty)`.
+- [x] 4. ADDRESSED -- replaced the invented `InsertSample` /
+  `SetCommitParent` / `NewEngine` symbols in Section 3.4,
+  Section 5.4, and the Section 6.1 sequence diagram with the
+  real `InMemoryStore.InsertSamples(repoID, sha, samples)` at
+  `services/clean-code/internal/rule_engine/inmem_store.go:144-151`,
+  `InMemoryStore.RegisterCommit(repoID, sha, parentSHA)` at
+  `inmem_store.go:412-423`, and `rule_engine.New(rule_engine.Config{Store: store})`
+  at `services/clean-code/internal/rule_engine/engine.go:130-162`.
+  Section 5.4's code block now reflects the batched insert,
+  the empty-parent root-commit registration, and the canonical
+  constructor.
+  - Audit: `Select-String -SimpleMatch 'InsertSample('` on the
+    file -> `(empty)`.
+  - Audit: `Select-String -SimpleMatch 'SetCommitParent'` on
+    the file -> `(empty)`.
+  - Audit: `Select-String -SimpleMatch 'NewEngine('` on the
+    file -> `(empty)`.
+- [x] 5. ADDRESSED -- replaced `refactor.WithEffortFunc(cliEffortCallback)`
+  in Section 5.6 with `refactor.WithEffortModel(refactor.EffortModelFunc(cliEffortCallback))`,
+  citing `services/clean-code/internal/refactor/task_planner.go:719-734`
+  for the option seam and
+  `services/clean-code/internal/refactor/effort_model.go:140-155`
+  for the `EffortModelFunc` adapter. Removed the "if the
+  existing task_planner.go does not yet expose this option,
+  add it as a Stage-0 prereq" hedge -- the option exists. The
+  Section 3.5 narrative about the seam now also names
+  `WithEffortModel` instead of an undefined "effort-callback".
+  - Audit: `Select-String -SimpleMatch 'WithEffortFunc'` on the
+    file -> `(empty)`.
+- [x] 6. ADDRESSED -- rewrote Section 3.8's "Signature bypass"
+  paragraph. The bypass is NOT a wrapper around `Engine`
+  (`rule_engine.Engine` has no signature surface); it is
+  STRUCTURAL: `internal/cli/devpolicy` never invokes
+  `Steward.VerifyPolicyVersionSignature`
+  (`services/clean-code/internal/policy/steward/steward.go:357`,
+  the actual production verifier) and feeds an unsigned
+  `PolicyVersion` directly into `rule_engine.InMemoryStore.InsertPolicyVersion`.
+  Production safety is enforced at compile time via
+  `//go:build !prod` on the devpolicy loader file -- a
+  `-tags prod` build cannot compile the bypass at all. The
+  Section 5.4 narrative was updated to match (no
+  "signature-bypass shim around Engine.RunBatch" prose).
+  - Audit: `Select-String -SimpleMatch 'wrapper around `Engine`'`
+    on the file -> `(empty)`.
+  - Audit: `Select-String -SimpleMatch 'signature-bypass shim'`
+    on the file -> `(empty)`.

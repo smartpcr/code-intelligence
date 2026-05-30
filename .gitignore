@@ -139,6 +139,3 @@ services/clean-code/deploy/local/**/_data/
 
 # Forge plan-doc allowlist (auto-fix)
 !/tests/
-
-# Forge plan-doc allowlist (auto-fix)
-!/tests/

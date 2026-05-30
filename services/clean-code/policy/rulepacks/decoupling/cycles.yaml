@@ -1,63 +1,9 @@
-# clean-code Stage 5.6 -- decoupling / cycles rule pack
-#
-# Architecture references:
-#   - Sec 1.3 "Decoupled functional areas" (CR1):
-#     a module that participates in an import cycle is a
-#     decoupling smell.
-#   - Sec 1.4.1 canonical metric_kind `cycle_member` -- a 0/1
-#     indicator emitted by the Stage 2.5 cycle-and-duplication
-#     recipe (1 = the scope is a member of at least one
-#     strongly-connected component of size >= 2; 0 = clean).
-#   - Sec 5.3.2 RulePack and Sec 5.3.1 Rule canonical row
-#     shapes; Stage 5.2 `policy.publish_rulepack` is the only
-#     write surface for these rows.
-#
-# pack_id convention: `<family>.<subname>` per the
-# `clean_code.rule_pack.pack_id` column comment in migration
-# `0003_policy_audit_refactor.up.sql` line 200: "(e.g.
-# `solid.srp`, `solid.dip`, `decoupling.cycles`,
-# `base.complexity`)". The `decoupling` family groups the
-# three sub-packs cycles / coupling / duplication so a
-# future read verb like "list rule_packs in family
-# `decoupling`" partitions them under one prefix without
-# colliding on the `(pack_id, version)` primary key.
-#
-# Loading: the Policy Steward bootstrap (Stage 5.5/5.6
-# follow-up) reads this file at startup and calls
-# `policy.publish_rulepack` exactly once with the parsed
-# payload if no rule_pack row with `(pack_id='decoupling.cycles',
-# version=1)` already exists. The schema mirrors
-# `steward.PublishRulepackRequest` (snake_case field names).
-#
-# Severity is `block`: an import cycle is never "warn" --
-# either the operator mutes the rule for a specific scope via
-# `mgmt.override`, or the cycle is broken in a follow-up
-# refactor task. The cycle severity matches the decoupling
-# brief "block when any module in a watched scope is in a
-# cycle".
-pack_id: decoupling.cycles
-version: 1
-display_name: Decoupling -- import cycles
-description_md: |-
-  Detects when a scope is a member of an import / dependency
-  cycle. Any positive `cycle_member` sample marks the scope as
-  part of a strongly-connected component; the rule blocks the
-  gate so the cycle is broken before merge.
-
-  Materialised by `internal/metrics/recipes/cycle_member.go`
-  (Stage 2.5); the v1 watched scope_kinds are `package` and
-  `file`.
+pack_id: "decoupling-cycles"
+version: "1.0"
 rules:
-  - rule_id: decoupling.cycle_member
-    version: 1
-    predicate_dsl: "metric_kind == 'cycle_member' AND value > 0"
-    severity_default: block
-    description_md: |-
-      Scope is a member of an import / dependency cycle.
-      `cycle_member` is a 0/1 indicator: any sample with
-      `value > 0` marks the scope as inside a strongly-
-      connected component of size >= 2.
-
-      Suggested refactor: invert the dependency (DIP) or
-      extract the shared abstraction into a new module so the
-      back-edge becomes a forward-edge through the new node.
+  - rule_id: "cycle-member-violation"
+    metric_kind: "cycle_member"
+    scope_kind: "module"
+    predicate_dsl: "metric_kind == 'cycle_member' AND value >= 1"
+    description: "Module participates in a dependency cycle"
+    suggested_refactor: "Break the cycle by inverting the dependency or extracting a shared interface"

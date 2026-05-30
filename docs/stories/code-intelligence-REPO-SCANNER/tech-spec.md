@@ -1,24 +1,34 @@
 # Repo Scanner -- Tech Spec
 
 > Story: `code-intelligence:REPO-SCANNER` -- Points 21
-> Iteration scope (this file, iter 1): **problem framing only** --
+> Iteration scope (this file, iter 2): **problem framing only** --
 > the problem statement, in/out-of-scope items, explicit non-goals,
 > hard constraints, and identified risks. Field-level data shapes,
 > CLI flag catalogues, HTTP request/response schemas, env-var
 > matrices, log-event taxonomies, and rotation policies are deferred
 > to later iterations of this same file (the forward-looking section
-> anchors S2-S10 in S8 below mark the slots the architecture and
-> sibling docs already cite).
+> anchors S2-S10 in S8 below mark the slots the upstream architecture
+> cites).
 >
-> Sibling artifacts (parallel; do not duplicate their content):
+> Doc relationships:
 >
-> - `architecture.md` -- component map, data flows, public types,
->   sequence diagrams, pinned defaults table.
-> - `implementation-plan.md` -- stage order, branch list, test
->   plan, parity-test catalogue.
-> - `e2e-scenarios.md` -- input/output walk-throughs and golden
->   assertions for the four primary scenarios (A scan-local,
->   B scan-many, C module diagram, D call-chain diagram).
+> - **Upstream (authoritative)**: `architecture.md` is the merged
+>   architecture for this story. It owns the component map, data
+>   flows, public types, sequence diagrams, and the pinned-defaults
+>   table. This tech-spec is downstream of it: when this file's
+>   framing or constraints conflict with `architecture.md`, the
+>   architecture wins and this file is the one that gets edited.
+> - **Downstream (later artifacts in this workstream)**:
+>   `implementation-plan.md` (stage order, branch list, test plan,
+>   parity-test catalogue) and `e2e-scenarios.md` (input/output
+>   walk-throughs and golden assertions for the four primary
+>   scenarios -- A scan-local, B scan-many, C module diagram, D
+>   call-chain diagram) are produced AFTER this file in the
+>   workstream's per-doc plan flow (Phase 53 sequence). Any
+>   cross-reference this file makes to those two artifacts is
+>   forward-looking and **non-normative**; if the future content
+>   of either doc diverges, the rewrite belongs to a downstream
+>   iteration, not to this file.
 >
 > Anchoring rule: every Go package, type, table, migration, env
 > var, and shell command this document names already exists at the
@@ -456,10 +466,14 @@ down by capability group:
   diagram envelope from `architecture.md` S4.4.
 - 8.5 Docs.
 
-This document does NOT re-state the criteria; it MUST stay
-consistent with the framing the architecture owns. If a
-constraint here would prevent a criterion there from being met,
-the constraint wins and the criterion is the bug.
+The architecture is **upstream and authoritative** for this story
+(see the doc-relationships block at the top of this file). This
+tech-spec adapts to it -- it MUST NOT redefine, weaken, or
+override the acceptance criteria, and it MUST NOT introduce a
+constraint that would prevent any of the criteria above from
+being met. If a constraint in this file appears to do so, the
+constraint is wrong and this file is what gets edited; the
+architecture's success bar is the contract.
 
 ---
 
@@ -483,12 +497,22 @@ This file MUST NOT contradict any of those five.
 
 ## 8. Forward-looking section anchors (future iterations of this file)
 
-The architecture document and the two other sibling docs already
-cite the following sections of `tech-spec.md` as ownership
-targets. This iteration intentionally does NOT fill them in --
-they are listed here so a future iteration of this file knows
-which slots to expand, and so that a reader following an
-architecture cross-reference sees the slot exists.
+The architecture document (the only upstream artifact for this
+story; see the doc-relationships block at the top of this file)
+already cites the following sections of `tech-spec.md` as
+ownership targets. This iteration intentionally does NOT fill
+them in -- they are listed here so a future iteration of this
+file knows which slots to expand, and so that a reader following
+an architecture cross-reference sees the slot exists.
+
+> Note on downstream artifacts. `implementation-plan.md` and
+> `e2e-scenarios.md` are produced AFTER this file in the
+> workstream's Phase 53 sequence; any future references they
+> make to the slots below are forward-looking and
+> **non-normative** -- they will conform to whichever shape
+> this file lands. The "Earliest citation" column below
+> therefore lists ONLY the upstream architecture; it does NOT
+> list downstream docs.
 
 | Section | Topic | Earliest citation |
 | --- | --- | --- |
@@ -550,3 +574,21 @@ written against (`HEAD` of branch
   anchors the architecture already cites so future iterations
   know where to expand. Section 9 captures the source references
   this iteration verified.
+- 2026-05-30: iter 2 -- evaluator score 88, three doc-authority /
+  sequencing items addressed:
+  (1) reframed the top-of-file blockquote so `architecture.md` is
+      explicitly upstream / authoritative and
+      `implementation-plan.md` / `e2e-scenarios.md` are explicitly
+      downstream (later artifacts in this workstream's Phase 53
+      per-doc plan flow);
+  (2) rewrote the closing paragraph of S6 ("Acceptance Criteria
+      (pointer)") so this tech-spec adapts to the architecture's
+      success bar instead of overriding it -- removed the
+      "constraint wins and the criterion is the bug" wording;
+  (3) tightened the lede of S8 ("Forward-looking section anchors")
+      to cite only the upstream architecture as the source of the
+      future-section pointers, with a Note callout flagging any
+      downstream-doc references as non-normative.
+  Also bumped the iteration-scope label from "iter 1" to "iter 2"
+  and removed the residual "sibling docs already cite" phrase
+  from the top-of-file scope note.

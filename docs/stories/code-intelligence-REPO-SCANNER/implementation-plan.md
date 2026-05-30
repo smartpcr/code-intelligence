@@ -675,8 +675,7 @@ storyId: "code-intelligence:REPO-SCANNER"
 ## Stage 9.1: Quickstart documentation
 
 ### Implementation Steps
-- [ ] Add `services/agent-memory/cmd/codeintel/QUICKSTART.md` with a "Scan a repo in 60 seconds" walkthrough covering `go build ./cmd/codeintel`, `codeintel scan ./fixture`, `codeintel serve`, and `npm run dev` from `web/`.
-- [ ] Add a single-screenshot placeholder at `services/agent-memory/web/docs/screenshot-placeholder.txt` describing the two diagram families so the README anchors a visual reference once a real screenshot is added.
+- [ ] Add `services/agent-memory/cmd/codeintel/QUICKSTART.md` with a "Scan a repo in 60 seconds" walkthrough covering `go build ./cmd/codeintel`, `codeintel scan ./fixture`, `codeintel serve`, and `npm run dev` from `web/`; include an inline ASCII diagram of the module and call-chain views so the doc is self-describing without external image assets.
 - [ ] Update `services/agent-memory/README.md` to link to QUICKSTART and to the web README.
 
 ### Dependencies
@@ -707,6 +706,7 @@ storyId: "code-intelligence:REPO-SCANNER"
 - [ ] Add a sibling `services/agent-memory/web/e2e/` Playwright smoke test (operator-pinned 2026-05-30 -- Playwright matches the repo's existing e2e workflow conventions) that loads the served URL, picks the repo, switches modes, and asserts the canvas contains nodes for both diagrams.
 - [ ] Add Playwright to `services/agent-memory/web/package.json` as a `devDependency`, scaffold `playwright.config.ts` pinned to the Chromium-only project for CI speed, and add an `npm run test:e2e` script invoked by the CI job.
 - [ ] Wire the e2e job into CI behind the `e2e` tag and document how to run it locally in QUICKSTART.
+- [ ] Inside the Playwright walk, capture two reference PNGs (`module.png`, `call-chain.png`) via `await page.screenshot({ path: "../docs/screenshots/module.png" })` once each diagram has rendered; commit both under `services/agent-memory/web/docs/screenshots/` and update `services/agent-memory/web/README.md` to embed them with `![module diagram](docs/screenshots/module.png)` so the web README has real visual references produced by the e2e walk itself.
 
 ### Dependencies
 - phase-docs-and-shipping/stage-context-refresh
@@ -715,6 +715,7 @@ storyId: "code-intelligence:REPO-SCANNER"
 - [ ] Scenario: e2e-scan-serve-fetch -- Given a clean checkout, When the Go e2e test runs, Then it scans `services/agent-memory/`, serves the result, fetches `GET /api/repos` and both diagram endpoints, and asserts each response is 200 with non-empty `nodes`.
 - [ ] Scenario: e2e-ui-renders-both -- Given the served URL, When the Playwright test runs, Then it switches between Module and Call Chain modes and asserts at least one node is rendered in each.
 - [ ] Scenario: e2e-acceptance-criteria -- Given the architecture S8 acceptance criteria, When the e2e walk finishes, Then each criterion in S8.2, S8.3, S8.4 is exercised by at least one of the steps above.
+- [ ] Scenario: e2e-screenshots-committed -- Given the Playwright walk completes, When the test harness exits, Then `services/agent-memory/web/docs/screenshots/module.png` and `call-chain.png` both exist with byte size >0 and `web/README.md` references both filenames via `![...](docs/screenshots/...png)` markdown.
 
 ### Cross-Stage Dependencies
 - phase-codeintel-cli-binary/stage-scan-subcommand

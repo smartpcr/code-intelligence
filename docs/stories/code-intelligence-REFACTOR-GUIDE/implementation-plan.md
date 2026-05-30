@@ -150,7 +150,9 @@ storyId: "code-intelligence:REFACTOR-GUIDE"
 
 - [ ] Create `services/clean-code/internal/cli/orchestrator/orchestrator.go` with an `Orchestrator` struct holding the walker, parser registry, recipe registry, and a `GOMAXPROCS`-sized worker pool (`architecture.md` Sec 10).
 - [ ] Implement parse fan-out: for each `WalkedFile`, dispatch to a worker that calls `parser.DefaultRegistry().Parse(ctx, file.RepoRelPath, file.Content)` and pushes the resulting `*parser.AstFile` to a result channel.
-- [ ] Implement recipe fan-out: for each `*AstFile`, iterate `recipes.DefaultProjectRegistry().Recipes()` and call `Recipe.AppliesTo(file)` then `Recipe.Compute(file)`; collect `MetricSampleDraft` rows into a slice keyed by `(metric_kind, scope_id)`.
+- [ ] Implement per-file recipe fan-out: for each `*AstFile`, iterate `recipes.DefaultRegistry().Recipes()` (the per-file `Recipe` slice at `services/clean-code/internal/metrics/recipes/registry.go:90`) and, when `Recipe.AppliesTo(file)` returns true, append `Recipe.Compute(file)` (signature `Compute(ast *parser.AstFile) []MetricSampleDraft` at `recipe.go:441`) to a draft slice -- this is the dispatch path for `loc`, `cyclo`, `cognitive_complexity`, `lcom4`, `fan_in`, `fan_out`, `interface_width`, `depth_of_inheritance`, and `coupling_between_objects`.
+- [ ] Implement project-level recipe fan-out: AFTER per-file parsing completes, iterate `recipes.DefaultProjectRegistry().All()` (the `[]ProjectRecipe` accessor at `services/clean-code/internal/metrics/recipes/project_registry.go:103`; note the method is `All()` NOT `Recipes()`) and call `ProjectRecipe.ComputeProject(asts []*parser.AstFile) []MetricSampleDraft` (interface at `project_registry.go:27-40`) on the full `[]*AstFile` corpus -- this is the dispatch path for `cycle_member` and `duplication_ratio`, which need cross-file inputs.
+- [ ] Merge the per-file and project-level draft slices into a single `[]MetricSampleDraft` keyed by `(metric_kind, scope_id)`; the project-level rows already carry the originating `scope_id` from `ComputeProject`'s `MetricSampleDraft` output.
 - [ ] Stamp `AttrModulePath` on each `*AstFile` from the `RepoContext.ModulePath` before calling recipes so `cycle_member` can resolve intra-repo imports (`architecture.md` Sec 4.1 note).
 - [ ] For each parsed `*AstFile`, walk its scope tree and `scopebinding.Table.Insert` one `ScopeBinding` per encountered scope so Phase 4's prompt emitter can resolve `ScopeID` -> `(file_path, start_line, end_line)`.
 - [ ] Surface parser panics (defensive `recover()` in the worker) as `WalkSkip{Reason: "parser_panic"}` rows instead of crashing the orchestrator; the orchestrator's exit code is `70` only when the panic happens outside per-file parsing (`tech-spec.md` Sec 8.6).
@@ -175,7 +177,7 @@ storyId: "code-intelligence:REFACTOR-GUIDE"
 
 - [ ] In `internal/cli/orchestrator`, add `loadStore(bundle devpolicy.Bundle, samples []rule_engine.Sample) *rule_engine.InMemoryStore` that calls `InsertPolicyVersion(bundle.PolicyVersion)` and one `InsertRule` per `bundle.Rules` entry (`architecture.md` Sec 3.4 steps 1 - 2).
 - [ ] Convert each `MetricSampleDraft` from Stage 2.2 into a `rule_engine.Sample` per `architecture.md` Sec 4.4 field mapping; stamp `ScopeSignature` from `scopebinding.Table.Get`.
-- [ ] Call `store.InsertSamples(repoCtx.RepoID, repoCtx.HeadSHA, samples)` (the canonical plural / batched API at `services/clean-code/internal/rule_engine/inmem_store.go:144-151`); fail-fast on any returned error (exit code 70).
+- [ ] Call `store.InsertSamples(repoCtx.RepoID, repoCtx.HeadSHA, samples)` (the canonical plural / batched API at `services/clean-code/internal/rule_engine/inmem_store.go:146-151`); the method returns no value (void), so guard it with a nil-store / nil-samples precondition check that exits 70 BEFORE invocation -- the genuine error surfaces appear later via `rule_engine.New` (returns `(*Engine, error)` at `engine.go:133`) and `engine.RunBatch` (returns `(RunResult, error)` at `engine.go:197`).
 - [ ] Call `store.RegisterCommit(repoCtx.RepoID, repoCtx.HeadSHA, "")` (empty parent SHA -> root commit, per `inmem_store.go:412-423`) so every firing rule emits a `delta=new` finding.
 - [ ] Construct the engine via `rule_engine.New(rule_engine.Config{Store: store})` (canonical constructor name; `engine.go:130-162`) and call `engine.RunBatch(ctx, repoCtx.RepoID, repoCtx.HeadSHA, bundle.PolicyVersion.PolicyVersionID)`.
 - [ ] Read back `EvaluationRun`, `EvaluationVerdict`, and `[]Finding` via the store's `Runs()` / `Verdicts()` / `Findings()` accessors (`inmem_store.go:700-720`); attach them to a partially-populated `RunArtifact` (Section 4.7).
@@ -191,7 +193,7 @@ storyId: "code-intelligence:REFACTOR-GUIDE"
 - [ ] Scenario: smoke run on fixture -- Given a fixture with one Go file containing a 2000-line class (triggers `loc >= 1500` rule), When the orchestrator runs the engine stage, Then `RunArtifact.Findings` has at least one entry with `RuleID` from the SRP / cohesion pack and `Delta == "new"`.
 - [ ] Scenario: empty corpus -- Given a fixture repo with zero source files, When the engine stage runs, Then `Findings` is empty, `Verdict.Verdict == "pass"`, and exit code is 0.
 - [ ] Scenario: store wiring uses plural insert -- Given a test double recording calls on `InsertSamples`, When the orchestrator's engine stage runs, Then `InsertSamples` is called exactly once with the full batch (no per-row `InsertSample` calls).
-- [ ] Scenario: engine error surfaces -- Given a test double `Store` whose `InsertPolicyVersion` returns an error, When the orchestrator runs, Then the binary exits with code 70 and stderr contains the engine error string.
+- [ ] Scenario: engine error surfaces -- Given a test double `Store` whose `AppendEvaluation` returns an error (the genuine error-returning Store surface at `services/clean-code/internal/rule_engine/inmem_store.go:477`; `InsertPolicyVersion` / `InsertRule` / `InsertSamples` / `RegisterCommit` are void per `inmem_store.go:116-146,423` and cannot be used as fail-fast points), When the orchestrator runs the engine stage, Then `engine.RunBatch` returns the error, the binary exits with code 70, and stderr contains the engine error string.
 
 ## Stage 2.4: Planner and Task Planner Wiring
 
@@ -441,7 +443,7 @@ storyId: "code-intelligence:REFACTOR-GUIDE"
 
 - [ ] Implement `cleanc apply <task_id>` as a stub: print `"not implemented; pending operator pin cli-l7-authority (see docs/stories/code-intelligence-REFACTOR-GUIDE/architecture.md Sec 6.3)"` and exit 64 (`architecture.md` Sec 3.6 last bullet).
 - [ ] Implement `--telemetry-otlp <url>` flag rejection: when set, print `"--telemetry-otlp is reserved for a future story; rejected in P0/P1"` and exit 64 BEFORE the pipeline starts (`tech-spec.md` Sec 8.1 last row).
-- [ ] Implement `--with-churn` flag handling: accept the flag (so its surface is locked) but emit a stderr warning `"--with-churn requires the P2 parser-attr extension; modification_count_in_window will not light up"` and continue without invoking any git-history walk (`architecture.md` Sec 3.6 flag table).
+- [ ] Implement `--with-churn` flag rejection: when set, print stderr `"--with-churn is reserved for P2 and rejected in P0/P1; modification_count_in_window will not light up until the parser-attr extension ships"` and exit 64 BEFORE the pipeline starts -- matches `--telemetry-otlp`'s exit-64 pre-pipeline treatment per `tech-spec.md` Sec 8.1 line 906 verb "rejected" (any softening of this behavior requires an upstream tech-spec amendment).
 - [ ] Implement `--snippet-cap-lines <int>` as a reserved flag that exits 64 in P0/P1 with `"reserved for a future minor release"`; the surface is locked but not honoured (`tech-spec.md` Sec 8.2).
 - [ ] Add a `TestReservedSurface` table-driven test that exercises every reserved verb/flag and asserts the exact exit code + stderr message string; the test acts as a regression guard against accidentally activating a reserved surface.
 
@@ -453,7 +455,7 @@ storyId: "code-intelligence:REFACTOR-GUIDE"
 
 - [ ] Scenario: apply not implemented -- Given a built binary, When `cleanc apply 00000000-0000-0000-0000-000000000000` runs, Then exit code is 64 and stderr contains `pending operator pin cli-l7-authority`.
 - [ ] Scenario: telemetry flag rejected -- Given a fixture repo, When `cleanc analyze . --telemetry-otlp http://localhost:4317` runs, Then exit code is 64 and no `--out` / `--findings` file is created.
-- [ ] Scenario: churn warning -- Given a fixture repo, When `cleanc analyze . --with-churn` runs, Then exit code is 0 or 1 (severity dependent) AND stderr contains the with-churn warning string.
+- [ ] Scenario: churn flag rejected -- Given a fixture repo, When `cleanc analyze . --with-churn` runs, Then exit code is 64 BEFORE any pipeline stage starts, no `--out` / `--findings` artifact is written, and stderr contains `--with-churn is reserved for P2 and rejected in P0/P1`.
 - [ ] Scenario: snippet cap reserved -- Given a fixture repo, When `cleanc analyze . --snippet-cap-lines 100` runs, Then exit code is 64 before any pipeline stage starts.
 
 # Phase 5: Hardening And Release

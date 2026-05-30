@@ -189,7 +189,8 @@ storyId: "code-intelligence:REPO-SCANNER"
 
 ### Implementation Steps
 - [ ] Create `internal/graphsink/sqlite/schema.sql` mirroring `migrations/0002_repo_commit.sql` and `0003_node_edge.sql` with SQLite types (`TEXT` for uuid, `BLOB` for bytea, `TEXT` for jsonb+CHECK json_valid, `INTEGER` for timestamptz unix-millis) and `CHECK` constraints replacing the `node_kind` / `edge_kind` ENUMs.
-- [ ] Add `internal/graphsink/sqlite/sink.go` implementing the `Sink` interface against `database/sql` with the `modernc.org/sqlite` CGO-free driver; bootstrap the schema on `Open`.
+- [ ] Add `internal/graphsink/sqlite/sink.go` implementing the `Sink` interface against `database/sql` with the `github.com/mattn/go-sqlite3` driver (operator-pinned 2026-05-30 -- requires `CGO_ENABLED=1`, which the codeintel build already mandates for tree-sitter parsers per tech-spec C7); bootstrap the schema on `Open`.
+- [ ] Add `//go:build cgo` tags to `sink.go` and `reader.go` (Stage 3.6) so a CGO=0 build fails fast with a clear compile-time error rather than silently producing a binary that cannot open a SQLite file.
 - [ ] Reuse `pkg/fingerprint.NodeFingerprint` / `EdgeFingerprint` verbatim in `InsertNode` / `InsertEdge` so identity is byte-identical to Postgres.
 - [ ] Implement `EnsureRepo` to require non-zero `RepoInput.RepoID` (construction-time guard per architecture S3.4), inserting the precomputed UUID directly.
 - [ ] Add `sqlite_sink_test.go` covering schema bootstrap, idempotent re-insert via `(repo_id, fingerprint)` UNIQUE, and `Close` committing the open transaction.
@@ -202,6 +203,7 @@ storyId: "code-intelligence:REPO-SCANNER"
 - [ ] Scenario: sqlite-idempotent-reinsert -- Given a Node already inserted, When the same `NodeInput` is inserted again, Then no new row is created and the existing row's `node_id` is returned.
 - [ ] Scenario: sqlite-enum-check-rejects-bad-kind -- Given an `InsertNode` call with `Kind="bogus"`, When the SQLite backend runs, Then a CHECK-constraint error is returned and no row is inserted.
 - [ ] Scenario: sqlite-requires-precomputed-repoid -- Given a zero-value `RepoInput.RepoID`, When `EnsureRepo` runs against the SQLite sink, Then a construction-time error is returned.
+- [ ] Scenario: sqlite-requires-cgo -- Given the `internal/graphsink/sqlite/` package, When `go vet -tags '!cgo' ./internal/graphsink/sqlite/...` runs (or equivalent CGO=0 build), Then the package fails to compile with a build-tag error naming the missing `cgo` tag (proves operator-pinned `mattn/go-sqlite3` choice is enforced at compile time).
 
 ## Stage 3.5: Memory sink and JSON export
 
@@ -496,8 +498,9 @@ storyId: "code-intelligence:REPO-SCANNER"
 ## Stage 7.2: repos handler
 
 ### Implementation Steps
-- [ ] Add `cmd/codeintel/serve_repos.go` exposing `GET /api/repos` by calling `graphsink.Reader.ListRepos` (added in Stage 3.1) -- this works uniformly across the SQLite, memory, and Postgres backends, replacing the previous "or equivalent" gap where `internal/graphreader` had no repo-listing primitive.
-- [ ] Return `[{id, url, sha, generatedAt}]` JSON marshalled directly from the `RepoSummary` slice; `generatedAt` is the most recent `repo_commit.committed_at` already populated by each backend's `ListRepos` implementation (Stages 3.3, 3.6, 3.7).
+- [ ] Add `cmd/codeintel/serve_repos.go` exposing `GET /api/repos` by calling `graphsink.Reader.ListRepos` (defined in Stage 3.1 and implemented per-backend in Stages 3.3 / 3.6 / 3.7); the handler is backend-agnostic and works identically against SQLite, memory, and Postgres.
+- [ ] Return `[{id, url, sha, generatedAt}]` JSON marshalled directly from the `RepoSummary` slice; `generatedAt` is the most recent `repo_commit.committed_at` already populated by each backend's `ListRepos` implementation.
+- [ ] Add `serve_repos_test.go` (httptest) asserting (a) empty backend returns `[]` (not `null`), (b) one-repo backend returns the expected single-element JSON array, (c) the response Content-Type is `application/json`.
 
 ### Dependencies
 - phase-serve-endpoint/stage-codeintel-serve-binary
@@ -505,6 +508,7 @@ storyId: "code-intelligence:REPO-SCANNER"
 ### Test Scenarios
 - [ ] Scenario: repos-sqlite-single -- Given a `repo.db` with one scanned repo, When `GET /api/repos` runs, Then the response is a one-element JSON array with the correct `url` and `sha`.
 - [ ] Scenario: repos-postgres-multi -- Given a Postgres backend with three repos, When `GET /api/repos` runs, Then the response array length is 3 and contains the expected URLs.
+- [ ] Scenario: repos-empty-returns-empty-array -- Given a backend with zero repos, When `GET /api/repos` runs, Then the response body is `[]` (not `null`) and the Content-Type is `application/json`.
 
 ## Stage 7.3: module diagram handler
 
@@ -695,7 +699,8 @@ storyId: "code-intelligence:REPO-SCANNER"
 
 ### Implementation Steps
 - [ ] Add `services/agent-memory/cmd/codeintel/e2e_test.go` (tagged `//go:build e2e`) that scans the repo's own `services/agent-memory/` directory to a temp SQLite file, builds the module diagram, builds a call-chain diagram, and serves them via `codeintel serve` on an ephemeral port.
-- [ ] Add a sibling `services/agent-memory/web/e2e/` Playwright (or Vitest browser) smoke test that loads the served URL, picks the repo, switches modes, and asserts the canvas contains nodes for both diagrams.
+- [ ] Add a sibling `services/agent-memory/web/e2e/` Playwright smoke test (operator-pinned 2026-05-30 -- Playwright matches the repo's existing e2e workflow conventions) that loads the served URL, picks the repo, switches modes, and asserts the canvas contains nodes for both diagrams.
+- [ ] Add Playwright to `services/agent-memory/web/package.json` as a `devDependency`, scaffold `playwright.config.ts` pinned to the Chromium-only project for CI speed, and add an `npm run test:e2e` script invoked by the CI job.
 - [ ] Wire the e2e job into CI behind the `e2e` tag and document how to run it locally in QUICKSTART.
 
 ### Dependencies

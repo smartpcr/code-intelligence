@@ -4,6 +4,8 @@
 // </copyright>
 // -----------------------------------------------------------------------
 
+// Package effort provides the deterministic effort-estimator fallback
+// used when the ONNX model is unavailable.
 package effort
 
 import "fmt"

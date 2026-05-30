@@ -15,7 +15,6 @@ MIGRATIONS_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))migrations
 # ---------------------------------------------------------------------------
 
 BIN_DIR             := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))bin
-
 GO                  ?= go
 DOCKER              ?= docker
 COMPOSE             ?= docker compose
@@ -63,8 +62,8 @@ COMPOSE_FILE ?= ../../tests/e2e/phase-09-audit-wal/docker-compose.yml
 build:
 	@mkdir -p $(BIN_DIR)
 	@for cmd in $(CMD_DIRS); do \
-	    echo "$(GO) build -o $(BIN_DIR)/$$cmd ./cmd/$$cmd"; \
-	    $(GO) build -o $(BIN_DIR)/$$cmd ./cmd/$$cmd || exit $$?; \
+		echo "$(GO) build -o $(BIN_DIR)/$$cmd ./cmd/$$cmd"; \
+		$(GO) build -o $(BIN_DIR)/$$cmd ./cmd/$$cmd || exit $$?; \
 	done
 
 ## test: run the full Go test suite. CI overrides via

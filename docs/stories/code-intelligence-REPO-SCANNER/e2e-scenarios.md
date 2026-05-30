@@ -51,8 +51,15 @@ storyId: "code-intelligence:REPO-SCANNER"
   `make test-nocgo` (no toolchain needed) per implementation-plan
   Stage 1.1; both targets exist verbatim in
   `services/agent-memory/Makefile` (`test-cgo` runs
-  `CGO_ENABLED=1 go test ./...`, `test-nocgo` runs
-  `CGO_ENABLED=0 go test ./...`). The fuller live-pwsh PowerShell
+  `CGO_ENABLED=1 go test ./internal/repoindexer/ast/...` after
+  printing `go env CGO_ENABLED CC CXX`; `test-nocgo` runs
+  `CGO_ENABLED=0 go test ./internal/repoindexer/ast/...` after
+  printing the same toolchain probe). The targets are scoped to
+  the parser-dispatcher subtree because that is the only code
+  path that branches on `//go:build cgo` (the
+  `parsers_cgo.go` / `parsers_nocgo.go` registration split); the
+  broader Go suite is still covered by `make test` /
+  `make test-race`. The fuller live-pwsh PowerShell
   parse path additionally requires `pwsh` on PATH (per tech-spec
   C2); the `pwsh_not_available` skip-path coverage is provided
   in-tree by `TestPowerShellParser_NoPwsh_ReturnsSentinel` in

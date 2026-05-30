@@ -83,6 +83,30 @@ jobs:
         # caught before the race-detector pass.
         run: make test
 
+      - name: make test-nocgo
+        # REPO-SCANNER impl-plan Stage 1.1 (`cgo-build-proof`):
+        # exercise the `//go:build !cgo` parser registration in
+        # `internal/repoindexer/ast/parsers_nocgo.go` (PowerShell-
+        # only fleet) so the no-CGO build mode is deterministically
+        # validated on every PR. The target prints `go env
+        # CGO_ENABLED CC CXX` first; CI log scraping pins the
+        # build mode by checking that line equals `CGO_ENABLED=0`
+        # (scenario `cgo-flag-printed`).
+        run: make test-nocgo
+
+      - name: make test-cgo
+        # REPO-SCANNER impl-plan Stage 1.1 (`cgo-build-proof`):
+        # exercise the `//go:build cgo` parser registration in
+        # `internal/repoindexer/ast/parsers_cgo.go` (tree-sitter
+        # fleet: C, C++, C#, Go, Rust + PowerShell) so the CGO
+        # build mode is deterministically validated on every PR.
+        # `ubuntu-latest` ships `gcc` by default; if a runner
+        # image rotation drops it, this step fails with cgo's
+        # `C compiler "gcc" not found` error (resolves
+        # REPO-SCANNER e2e-scenarios.md scenario
+        # `cgo-build-passes-all-languages`).
+        run: make test-cgo
+
       - name: make test-race
         # `make test` is portable (no `-race`); `make test-race`
         # adds the race detector and is what we run on Linux

@@ -14,7 +14,7 @@ import (
 	"testing"
 
 	"github.com/cucumber/godog"
-	"github.com/microsoft/cleancode-service/internal/cli/effort"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/effort"
 )
 
 type effortEstimatorState struct {

@@ -56,6 +56,14 @@ services/agent-memory/span-ingestor
 # rely on `make clean` rather than gitignore.
 services/clean-code/bin/
 services/clean-code/dist/
+# _build/ is the local CGO/test scratch output that
+# `make build` -> `mkdir _build && go build -o _build/cleanc`
+# leaves behind on a developer laptop. The canonical published
+# binary lives under bin/ (already ignored above); _build/ MUST
+# never be committed because (a) it is a multi-MB platform-
+# specific binary and (b) iter-9 evaluator item 6 flagged a
+# committed _build/cleanc as a contract violation.
+services/clean-code/_build/
 services/clean-code/cmd/**/clean-coded.exe
 services/clean-code/cmd/**/*-linux
 services/clean-code/cmd/**/*-darwin

@@ -4,7 +4,35 @@
 // </copyright>
 // -----------------------------------------------------------------------
 
-//go:build !prod
+// This file is a STALE COPY of the dev-build [Loader]
+// implementation. The canonical `//go:build !prod` loader is in
+// `unsigned_dev.go`, added by the CLI Binary Skeleton workstream
+// (commit 94e3f11) as the Stage 1.1 shell. This file's
+// pre-skeleton implementation:
+//
+//   - Redeclares `devLoader`, `NewLoader`, and `Load` (all
+//     declared in `unsigned_dev.go` under the same `!prod` tag).
+//   - References an undefined `rulePackYAML` type and an
+//     undefined `SynthesisePolicyVersion` helper.
+//   - References `steward.Rule.MetricKind` /
+//     `steward.Rule.ScopeKind` / `steward.Rule.Description` /
+//     `steward.Rule.SuggestedRefactor` fields that do not exist
+//     on the current `steward.Rule` struct (see
+//     `internal/policy/steward/types.go:151-156`).
+//
+// The Stage 1.4 implementation-plan follow-up workstream is
+// expected to replace `unsigned_dev.go`'s stub body with a
+// real YAML decoder, at which point this file should be
+// deleted outright. Until then, gating with the
+// `legacy_superseded` build tag (NEVER set) keeps the file
+// on disk while excluding it from every compilation, so the
+// duplicates + undefined symbols do not break the default
+// `go build ./...` invocation.
+//
+// See `banner.go` for the full rationale behind the
+// `legacy_superseded` build tag convention.
+
+//go:build legacy_superseded
 
 package devpolicy
 

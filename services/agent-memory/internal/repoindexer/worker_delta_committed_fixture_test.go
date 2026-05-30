@@ -198,7 +198,7 @@ func TestWorker_deltaIngest_committedFixtureEndToEnd(t *testing.T) {
 			LEFT JOIN node_retirement nr ON nr.node_id = n.node_id
 			WHERE n.repo_id = $1 AND n.kind = 'file' AND n.canonical_signature = $2
 			  AND nr.node_id IS NULL
-		`, repoIDStr, canonicalFileSig(repoURL, path)).Scan(dst); err != nil {
+		`, repoIDStr, CanonicalFileSig(repoURL, path)).Scan(dst); err != nil {
 			t.Fatalf("lookup pre-delta File Node %s: %v", path, err)
 		}
 	}
@@ -208,7 +208,7 @@ func TestWorker_deltaIngest_committedFixtureEndToEnd(t *testing.T) {
 		WHERE n.repo_id = $1 AND n.kind = 'package'
 		  AND n.canonical_signature = $2
 		  AND nr.node_id IS NULL
-	`, repoIDStr, canonicalPackageSig(repoURL, "pkg")).Scan(&oldPkgID); err != nil {
+	`, repoIDStr, CanonicalPackageSig(repoURL, "pkg")).Scan(&oldPkgID); err != nil {
 		t.Fatalf("lookup pre-delta pkg Package Node: %v", err)
 	}
 
@@ -286,7 +286,7 @@ func TestWorker_deltaIngest_committedFixtureEndToEnd(t *testing.T) {
 		WHERE n.repo_id = $1 AND n.kind = 'file'
 		  AND n.canonical_signature = $2
 		  AND nr.node_id IS NULL
-	`, repoIDStr, canonicalFileSig(repoURL, "pkg/modify_me.go")).Scan(&newModifyID); err != nil {
+	`, repoIDStr, CanonicalFileSig(repoURL, "pkg/modify_me.go")).Scan(&newModifyID); err != nil {
 		t.Fatalf("lookup live modify_me.go File Node post-delta: %v", err)
 	}
 	if newModifyID == oldModifyID {
@@ -314,7 +314,7 @@ func TestWorker_deltaIngest_committedFixtureEndToEnd(t *testing.T) {
 		WHERE n.repo_id = $1 AND n.kind = 'file'
 		  AND n.canonical_signature = $2
 		  AND nr.node_id IS NULL
-	`, repoIDStr, canonicalFileSig(repoURL, "pkg/modify_me.go")).Scan(&liveModifyCount); err != nil {
+	`, repoIDStr, CanonicalFileSig(repoURL, "pkg/modify_me.go")).Scan(&liveModifyCount); err != nil {
 		t.Fatalf("count live modify_me.go File Nodes: %v", err)
 	}
 	if liveModifyCount != 1 {
@@ -366,7 +366,7 @@ func TestWorker_deltaIngest_committedFixtureEndToEnd(t *testing.T) {
 		WHERE n.repo_id = $1 AND n.kind = 'file'
 		  AND n.canonical_signature = $2
 		  AND nr.node_id IS NULL
-	`, repoIDStr, canonicalFileSig(repoURL, "pkg/rename_me_new.go")).Scan(&newRenameID); err != nil {
+	`, repoIDStr, CanonicalFileSig(repoURL, "pkg/rename_me_new.go")).Scan(&newRenameID); err != nil {
 		t.Fatalf("lookup new rename File Node: %v", err)
 	}
 	var renameEdgeCount int
@@ -400,7 +400,7 @@ func TestWorker_deltaIngest_committedFixtureEndToEnd(t *testing.T) {
 		WHERE n.repo_id = $1 AND n.kind = 'file'
 		  AND n.canonical_signature = $2
 		  AND nr.node_id IS NULL
-	`, repoIDStr, canonicalFileSig(repoURL, "pkg/added.go")).Scan(&addedLiveCount); err != nil {
+	`, repoIDStr, CanonicalFileSig(repoURL, "pkg/added.go")).Scan(&addedLiveCount); err != nil {
 		t.Fatalf("count live added.go File Nodes: %v", err)
 	}
 	if addedLiveCount != 1 {

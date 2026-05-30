@@ -221,7 +221,7 @@ func TestWorker_deltaIngest_removedFileRetiresNodes(t *testing.T) {
 	if err := fix.owner.QueryRowContext(ctx, `
 		SELECT n.node_id::text FROM node n
 		WHERE n.repo_id = $1 AND n.kind = 'file' AND n.canonical_signature = $2
-	`, repoIDStr, canonicalFileSig(repoURL, removedPath)).Scan(&removedFileNodeID); err != nil {
+	`, repoIDStr, CanonicalFileSig(repoURL, removedPath)).Scan(&removedFileNodeID); err != nil {
 		t.Fatalf("lookup removed File Node: %v", err)
 	}
 
@@ -353,7 +353,7 @@ func TestWorker_deltaIngest_renamePairProducesRenamedToEdge(t *testing.T) {
 	if err := fix.owner.QueryRowContext(ctx, `
 		SELECT node_id::text FROM node
 		WHERE repo_id = $1 AND kind = 'file' AND canonical_signature = $2
-	`, repoIDStr, canonicalFileSig(repoURL, "pkg/old_name.go")).Scan(&oldFileNodeID); err != nil {
+	`, repoIDStr, CanonicalFileSig(repoURL, "pkg/old_name.go")).Scan(&oldFileNodeID); err != nil {
 		t.Fatalf("lookup old File Node: %v", err)
 	}
 
@@ -394,7 +394,7 @@ func TestWorker_deltaIngest_renamePairProducesRenamedToEdge(t *testing.T) {
 		  AND n.kind = 'file'
 		  AND n.canonical_signature = $2
 		  AND nr.node_id IS NULL
-	`, repoIDStr, canonicalFileSig(repoURL, "pkg/new_name.go")).Scan(&newFileNodeID); err != nil {
+	`, repoIDStr, CanonicalFileSig(repoURL, "pkg/new_name.go")).Scan(&newFileNodeID); err != nil {
 		t.Fatalf("lookup new File Node: %v", err)
 	}
 
@@ -516,7 +516,7 @@ func TestWorker_deltaIngest_bulkRemoveUsesBatchRetire(t *testing.T) {
 		if err := fix.owner.QueryRowContext(ctx, `
 			SELECT node_id::text FROM node
 			WHERE repo_id = $1 AND kind = 'file' AND canonical_signature = $2
-		`, repoIDStr, canonicalFileSig(repoURL, relPathBulk(i))).Scan(&nid); err != nil {
+		`, repoIDStr, CanonicalFileSig(repoURL, relPathBulk(i))).Scan(&nid); err != nil {
 			t.Fatalf("lookup file %d: %v", i, err)
 		}
 		preDeleteFileIDs = append(preDeleteFileIDs, nid)

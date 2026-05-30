@@ -72,8 +72,8 @@
 // # Canonical signature scheme
 //
 // Every signature is prefixed with the Repo URL and a kind
-// discriminator (consistent with `internal/repoindexer/worker.go`
-// `canonicalFileSig` / `canonicalPackageSig`):
+// discriminator (consistent with `internal/repoindexer/canonical.go`
+// `CanonicalFileSig` / `CanonicalPackageSig`):
 //
 //	repo:   <url>
 //	pkg:    <url>::pkg::<dir>

@@ -6,10 +6,11 @@
 // `defaultParsers()` only registers the scanner-only PowerShell
 // parser (see `parsers_nocgo.go`); every other compiled-language
 // extension this story added (`.c`, `.h`, `.cc`, `.cpp`,
-// `.cxx`, `.hpp`, `.hh`, `.hxx`, `.cs`, `.go`, `.rs`) MUST fall
-// through to the `ast.dispatch.skip{reason=no_parser}` branch
-// in `EmitFile` (dispatcher.go lines 273-281) WITHOUT
-// panicking, opening the file, or touching the writer.
+// `.cxx`, `.c++`, `.hpp`, `.hh`, `.hxx`, `.h++`, `.cs`, `.go`,
+// `.rs`) MUST fall through to the
+// `ast.dispatch.skip{reason=no_parser}` branch in `EmitFile`
+// (dispatcher.go lines 273-281) WITHOUT panicking, opening the
+// file, or touching the writer.
 //
 // This file is gated `!cgo` for two reasons:
 //   1. Under CGO=1 the new parsers ARE registered, so the
@@ -48,7 +49,7 @@ import (
 // The list MUST stay in lock-step with the cgo-side
 // `Extensions()` declarations on:
 //   - cTreeSitterParser    (.c, .h)
-//   - cppTreeSitterParser  (.cc, .cpp, .cxx, .hpp, .hh, .hxx)
+//   - cppTreeSitterParser  (.cc, .cpp, .cxx, .c++, .hpp, .hh, .hxx, .h++)
 //   - csTreeSitterParser   (.cs)
 //   - goTreeSitterParser   (.go)
 //   - rustTreeSitterParser (.rs)
@@ -59,7 +60,7 @@ import (
 // not apply to it.
 var nocgoSkipExtensions = []string{
 	".c", ".h",
-	".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx",
+	".cc", ".cpp", ".cxx", ".c++", ".hpp", ".hh", ".hxx", ".h++",
 	".cs",
 	".go",
 	".rs",

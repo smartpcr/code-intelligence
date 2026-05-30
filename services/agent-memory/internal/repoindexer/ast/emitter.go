@@ -54,12 +54,10 @@ func (em *Emitter) Emit() ([]Edge, []string) {
 	for _, caller := range em.result.Methods {
 		callerQualName := caller.ClassName + "." + caller.Name
 
-		for _, callee := range em.result.Methods {
-			if callee.Name == caller.Name {
-				continue
-			}
-
-			shortName := callee.Name
+		// Iterate over actual call sites recorded by the parser,
+		// not the full method list (which would produce a spurious
+		// cross-product of edges).
+		for _, shortName := range caller.Calls {
 			targets := methodTargets[shortName]
 
 			callsRaw = append(callsRaw, shortName)

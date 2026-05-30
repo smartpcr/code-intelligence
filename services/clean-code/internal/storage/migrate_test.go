@@ -4083,3 +4083,194 @@ t.Errorf("0007 down.sql contains DROP TABLE -- " +
 "only delete rows, not the table.")
 }
 }
+
+// TestDiscoverMigrations_findsStage22SolidScopeTreeSeedPair
+// pins discovery of the
+// `0013_seed_solid_scope_tree_metric_kinds` pair. This
+// migration is the catalog companion to Stage 2.2's parse +
+// recipe fan-out: when iter-2 of that workstream registered
+// the three SOLID-pack scope-tree recipes (`interface_width`,
+// `depth_of_inheritance`, `coupling_between_objects`) in
+// `internal/metrics/recipes/registry.go::DefaultRegistry`,
+// the metric-ingestor startup probe
+// `verifyMetricKindCatalog`
+// (`cmd/clean-code-metric-ingestor/main.go:369-373`) -- which
+// derives expected rows from `recipes.DefaultRegistry()` via
+// `metric_ingestor.MetricKindCatalogRowsForRegistry` --
+// began demanding three additional `metric_kind` catalog
+// rows that the prior seed migration
+// (`0007_seed_foundation_metric_kinds.up.sql`) did NOT
+// supply. The 0013 pair closes that gap. Without this test
+// a future refactor that orphans one half (or renames the
+// migration) ships a binary that fails readiness on a fresh
+// schema -- and only an integration-level deploy catches it.
+func TestDiscoverMigrations_findsStage22SolidScopeTreeSeedPair(t *testing.T) {
+	t.Parallel()
+	dir, err := MigrationDir(callerDir(t))
+	if err != nil {
+		t.Fatalf("MigrationDir: %v", err)
+	}
+	migs, err := DiscoverMigrations(dir)
+	if err != nil {
+		t.Fatalf("DiscoverMigrations(%q): %v", dir, err)
+	}
+	var got *Migration
+	for i := range migs {
+		if migs[i].Version == "0013" {
+			got = &migs[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("DiscoverMigrations(%q) missing the Stage 2.2 "+
+			"0013_seed_solid_scope_tree_metric_kinds pair", dir)
+	}
+	if got.Name != "seed_solid_scope_tree_metric_kinds" {
+		t.Errorf("Stage 2.2 seed migration name = %q, want %q",
+			got.Name, "seed_solid_scope_tree_metric_kinds")
+	}
+	if _, err := os.Stat(got.UpPath); err != nil {
+		t.Errorf("up path %q: %v", got.UpPath, err)
+	}
+	if _, err := os.Stat(got.DownPath); err != nil {
+		t.Errorf("down path %q: %v", got.DownPath, err)
+	}
+}
+
+// TestSeedSolidScopeTreeMetricKindsUpSQLBodyMentionsExpectedObjects
+// pins the structural shape of
+// `0013_seed_solid_scope_tree_metric_kinds.up.sql`. The
+// three SOLID-pack scope-tree kinds + their (kind, version)
+// pairs MUST be present at `metric_version = 1` so the
+// metric_sample FK
+// (`migrations/0002_measurement.up.sql:348-350`) is always
+// satisfied for samples emitted by the Stage 2.2 recipes on
+// a fresh schema. A regression that drops one of the three
+// (or bumps a version without also bumping the in-process
+// producer at
+// `internal/metric_ingestor/metric_kind_catalog.go`)
+// surfaces here BEFORE the binary even tries to boot against
+// a freshly-migrated database.
+func TestSeedSolidScopeTreeMetricKindsUpSQLBodyMentionsExpectedObjects(t *testing.T) {
+	t.Parallel()
+	dir, err := MigrationDir(callerDir(t))
+	if err != nil {
+		t.Fatalf("MigrationDir: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir,
+		"0013_seed_solid_scope_tree_metric_kinds.up.sql"))
+	if err != nil {
+		t.Fatalf("read up.sql: %v", err)
+	}
+	sql := strings.ReplaceAll(string(body), "\r\n", "\n")
+
+	wantSubstrs := []string{
+		// Idempotence -- per the table COMMENT at
+		// `0001_catalog_lifecycle.up.sql:283-286`, a
+		// Steward-curated row MUST NOT be overwritten by
+		// re-running the seed migration. ON CONFLICT DO
+		// NOTHING preserves Steward precedence; the
+		// in-process VerifyMetricKindCatalog (called at
+		// startup) surfaces (kind, version) drift between
+		// the Steward row and the in-process producer.
+		"ON CONFLICT (metric_kind) DO NOTHING",
+		// The three SOLID-pack scope-tree kinds Stage 2.2
+		// adds to `recipes.DefaultRegistry()`
+		// (`internal/metrics/recipes/registry.go::DefaultRegistry`).
+		"'interface_width'",
+		"'depth_of_inheritance'",
+		"'coupling_between_objects'",
+		// All three rows must seed at metric_version = 1 to
+		// match the recipe `Version()` constants the
+		// in-process catalog producer derives at
+		// `internal/metric_ingestor/metric_kind_catalog.go::MetricKindCatalogRowsForRegistry`.
+		// A future bump that ships the recipe without
+		// bumping the seed (or vice versa) surfaces as a
+		// startup `ErrMetricKindCatalogVersionMismatch`.
+		"'interface_width', 1",
+		"'depth_of_inheritance', 1",
+		"'coupling_between_objects', 1",
+		// All three rows belong to the SOLID pack at the
+		// foundation tier per `packToTier`
+		// (`internal/metric_ingestor/metric_kind_catalog.go:151-160`).
+		"'foundation', 'solid'",
+		// Wrapped in a transaction so a partial seed is
+		// impossible -- either all three land or none do.
+		"BEGIN",
+		"COMMIT",
+		// Targets the canonical catalog table -- a typo
+		// against `metric_kinds` (plural) would silently
+		// land in a non-existent table and crash with a
+		// 42P01 (undefined_table).
+		"INSERT INTO clean_code.metric_kind",
+	}
+	for _, want := range wantSubstrs {
+		if !strings.Contains(sql, want) {
+			t.Errorf("0013 up.sql missing required substring %q", want)
+		}
+	}
+}
+
+// TestSeedSolidScopeTreeMetricKindsDownSQLDeletesSeededRows
+// pins the rollback shape. The down migration MUST DELETE
+// exactly the rows the up migration INSERTed (and no
+// others). FK ON DELETE RESTRICT from `metric_sample`
+// blocks the DELETE once metric_sample rows reference a
+// kind -- the comment in the down file documents this. A
+// Steward-curated row bumped to `metric_version >= 2` MUST
+// be preserved by the `(metric_kind, metric_version)` tuple
+// predicate -- mirroring the precedent set by 0007's down.
+func TestSeedSolidScopeTreeMetricKindsDownSQLDeletesSeededRows(t *testing.T) {
+	t.Parallel()
+	dir, err := MigrationDir(callerDir(t))
+	if err != nil {
+		t.Fatalf("MigrationDir: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir,
+		"0013_seed_solid_scope_tree_metric_kinds.down.sql"))
+	if err != nil {
+		t.Fatalf("read down.sql: %v", err)
+	}
+	sql := strings.ReplaceAll(string(body), "\r\n", "\n")
+	code := sqlCodeOnly(sql)
+
+	if !strings.Contains(code, "DELETE FROM clean_code.metric_kind") {
+		t.Errorf("0013 down.sql missing DELETE FROM clean_code.metric_kind")
+	}
+	// The down must enumerate every kind the up seeded;
+	// a partial down would leave orphan rows the next up
+	// would silently skip via ON CONFLICT DO NOTHING.
+	// Check against the raw SQL (sqlCodeOnly strips string
+	// literals; the kind names ARE string literals).
+	wantKinds := []string{
+		"'interface_width'",
+		"'depth_of_inheritance'",
+		"'coupling_between_objects'",
+	}
+	for _, want := range wantKinds {
+		if !strings.Contains(sql, want) {
+			t.Errorf("0013 down.sql missing kind %q", want)
+		}
+	}
+	// The tuple predicate must scope to v=1 specifically so
+	// a Steward-customized row at v>=2 is preserved. A
+	// regression that uses `WHERE metric_kind IN (...)`
+	// without the version constraint would silently delete
+	// Steward customizations.
+	if !strings.Contains(code, "metric_version") {
+		t.Errorf("0013 down.sql missing metric_version tuple predicate -- " +
+			"a Steward-curated row at v>=2 would be silently deleted")
+	}
+	// Roles + schema belong to 0004 / 0001 respectively;
+	// 0013 down must only unwind its own rows.
+	if strings.Contains(code, "DROP ROLE") {
+		t.Errorf("0013 down.sql contains DROP ROLE")
+	}
+	if strings.Contains(code, "DROP SCHEMA") {
+		t.Errorf("0013 down.sql contains DROP SCHEMA")
+	}
+	if strings.Contains(code, "DROP TABLE") {
+		t.Errorf("0013 down.sql contains DROP TABLE -- " +
+			"only delete rows, not the table.")
+	}
+}

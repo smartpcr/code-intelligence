@@ -103,13 +103,26 @@ func (reg *Registry) Recipes() []Recipe {
 //     `loc` (architecture Sec 1.4.1 rows 1-3).
 //   - Stage 2.4 SOLID pack foundation: `lcom4`, `fan_in`,
 //     `fan_out` (architecture Sec 1.4.1 rows 4-6).
+//   - Stage 2.2 SOLID pack scope-tree set:
+//     `interface_width`, `depth_of_inheritance`,
+//     `coupling_between_objects` (architecture Sec 1.4.1
+//     rows 8-10). These three are the "lit on Stage 2.1
+//     parser shape" SOLID metrics that the per-file
+//     orchestrator dispatch path
+//     (`internal/cli/orchestrator/orchestrator.go`) must be
+//     able to reach end-to-end -- without them the workstream
+//     requirement "all named per-file metrics dispatched" is
+//     not demonstrably met.
 //
 // The base pack is the entirety of `pack='base'` AST-emitted
 // kinds at this stage (`cycle_member` and `duplication_ratio`
 // land in Stage 2.5, `modification_count_in_window` lands in
 // Stage 2.6 as a materialiser, not a recipe). The SOLID
 // foundation set is the three structural-coupling /
-// cohesion recipes pinned by impl-plan Stage 2.4 line 221.
+// cohesion recipes pinned by impl-plan Stage 2.4 line 221;
+// the SOLID scope-tree set is the three Sec 1.4.1 rows 8-10
+// recipes that derive from scope topology + extends/embeds/
+// implements/imports edges the Stage 2.1 parsers emit today.
 //
 // The exact registered set is asserted by
 // [TestDefaultRegistry_FoundationTierRecipes] (the renamed
@@ -131,6 +144,15 @@ func DefaultRegistry() *Registry {
 	reg.Register(NewLCOM4Recipe())
 	reg.Register(NewFanInRecipe())
 	reg.Register(NewFanOutRecipe())
+	// Stage 2.2 SOLID pack scope-tree set (architecture
+	// Sec 1.4.1 rows 8-10). Registered here so the
+	// orchestrator's per-file dispatch path
+	// (`internal/cli/orchestrator/orchestrator.go` lines
+	// 372-378) reaches every named per-file metric the
+	// workstream brief enumerates.
+	reg.Register(NewInterfaceWidthRecipe())
+	reg.Register(NewDepthOfInheritanceRecipe())
+	reg.Register(NewCouplingBetweenObjectsRecipe())
 	return reg
 }
 

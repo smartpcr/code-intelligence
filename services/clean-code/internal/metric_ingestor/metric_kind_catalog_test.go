@@ -160,18 +160,23 @@ func TestMetricKindCatalogRowsForRegistry_CoversDefaultRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MetricKindCatalogRowsForRegistry: err=%v, want nil", err)
 	}
-	// 6 registered recipes (cyclo, cognitive_complexity, loc,
-	// lcom4, fan_in, fan_out) + 1 materialiser
-	// (modification_count_in_window) + 3 ingested kinds
-	// (pass_first_try_ratio, coverage_line_ratio,
-	// coverage_branch_ratio) = 10 catalog rows.
-	const want = 10
+	// 9 registered recipes (cyclo, cognitive_complexity, loc,
+	// lcom4, fan_in, fan_out, interface_width,
+	// depth_of_inheritance, coupling_between_objects) + 1
+	// materialiser (modification_count_in_window) + 3
+	// ingested kinds (pass_first_try_ratio,
+	// coverage_line_ratio, coverage_branch_ratio) = 13
+	// catalog rows.
+	const want = 13
 	if got := len(rows); got != want {
 		t.Errorf("rows=%d, want %d (foundation registry + materialiser + ingested); got=%v", got, want, kindsOf(rows))
 	}
 	expected := map[string]bool{
 		"cyclo": false, "cognitive_complexity": false, "loc": false,
 		"lcom4": false, "fan_in": false, "fan_out": false,
+		"interface_width":              false,
+		"depth_of_inheritance":         false,
+		"coupling_between_objects":     false,
 		"modification_count_in_window": false,
 		"coverage_line_ratio":          false,
 		"coverage_branch_ratio":        false,

@@ -133,6 +133,18 @@ var foundationCatalogMetadata = map[string]struct {
 		Unit:          "count",
 		DescriptionMD: "Outbound call-graph edge count per method (architecture Sec 1.4.1 row 6).",
 	},
+	"interface_width": {
+		Unit:          "count",
+		DescriptionMD: "Method count of a class/interface's exposed surface; drives ISP rule (architecture Sec 1.4.1 row 8).",
+	},
+	"depth_of_inheritance": {
+		Unit:          "count",
+		DescriptionMD: "Length of the per-file inheritance chain (extends/embeds) from a class to its deepest ancestor; drives LSP / composition-over-inheritance rules (architecture Sec 1.4.1 row 9).",
+	},
+	"coupling_between_objects": {
+		Unit:          "count",
+		DescriptionMD: "Count of distinct external classes a class depends on via extends/implements/embeds/imports/calls/field-access edges; drives DIP / decoupling rules (architecture Sec 1.4.1 row 10).",
+	},
 	"modification_count_in_window": {
 		Unit:          "count",
 		DescriptionMD: "Number of file modifications observed within the configured window_days for a given scope (architecture Sec 1.4.1 row 12; tech-spec Sec 8.2).",

@@ -12,24 +12,35 @@ import (
 )
 
 // TestDefaultRegistry_FoundationTierRecipes is the
-// implementation-plan Stage 2.3 + 2.4 scenario
-// `foundation-tier-recipes-only-canonical-kinds` (lines 208,
-// 221): the registry after init lists EXACTLY the six
-// foundation-tier metric_kinds in sorted order --
-// `{cognitive_complexity, cyclo, fan_in, fan_out, lcom4,
-// loc}`. Forbidden aliases (`cyclomatic_complexity`,
+// implementation-plan Stage 2.3 + 2.4 + workstream Stage 2.2
+// scenario `foundation-tier-recipes-only-canonical-kinds`
+// (lines 208, 221; workstream item 2): the registry after
+// init lists EXACTLY the nine foundation-tier metric_kinds
+// in sorted order --
+// `{cognitive_complexity, coupling_between_objects, cyclo,
+// depth_of_inheritance, fan_in, fan_out, interface_width,
+// lcom4, loc}`. The trio
+// `{interface_width, depth_of_inheritance,
+// coupling_between_objects}` were added in Stage 2.2 so the
+// orchestrator's per-file dispatch path
+// (`internal/cli/orchestrator/orchestrator.go` lines 372-378)
+// reaches every named per-file metric the workstream brief
+// enumerates. Forbidden aliases (`cyclomatic_complexity`,
 // `lines_of_code`, `function_length`, `parameter_count`,
 // `nesting_depth`, `incoming_calls`, `outgoing_calls`,
-// `cohesion`) MUST NOT appear.
+// `cohesion`, `cbo`, `dit`, `wmc`) MUST NOT appear.
 func TestDefaultRegistry_FoundationTierRecipes(t *testing.T) {
 	t.Parallel()
 	reg := recipes.DefaultRegistry()
 	got := reg.MetricKinds()
 	want := []string{
 		"cognitive_complexity",
+		"coupling_between_objects",
 		"cyclo",
+		"depth_of_inheritance",
 		"fan_in",
 		"fan_out",
+		"interface_width",
 		"lcom4",
 		"loc",
 	}
@@ -42,6 +53,8 @@ func TestDefaultRegistry_FoundationTierRecipes(t *testing.T) {
 		"parameter_count", "nesting_depth", "cognitive",
 		"incoming_calls", "outgoing_calls", "cohesion",
 		"fanin", "fan-in", "fanout", "fan-out",
+		"cbo", "dit", "wmc", "class_coupling", "inheritance_depth",
+		"class_width", "method_count",
 	}
 	for _, bad := range forbidden {
 		if reg.Lookup(bad) != nil {
@@ -63,6 +76,9 @@ func TestDefaultRegistry_DispatchByMetricKind(t *testing.T) {
 		"lcom4",
 		"fan_in",
 		"fan_out",
+		"interface_width",
+		"depth_of_inheritance",
+		"coupling_between_objects",
 	} {
 		r := reg.Lookup(k)
 		if r == nil {
@@ -154,8 +170,8 @@ func TestRegistry_NilSafeLookup(t *testing.T) {
 // The test captures the line into an in-memory JSON handler
 // and asserts:
 //   - the line's message is the canonical "metric recipes registered" string,
-//   - the line's count == 6 (the Stage 2.3 base pack + Stage 2.4 SOLID foundation),
-//   - the line lists ALL six metric_kinds in sorted order,
+//   - the line's count == 9 (the Stage 2.3 base pack + Stage 2.4 SOLID foundation + Stage 2.2 SOLID scope-tree set),
+//   - the line lists ALL nine metric_kinds in sorted order,
 //   - the line lists matching `metric_kind_versions` tokens,
 //   - the line carries packs=['base','solid'] (sorted distinct) / source='computed'.
 func TestRegistry_LogRegistered_EmitsStartupLine(t *testing.T) {
@@ -177,8 +193,8 @@ func TestRegistry_LogRegistered_EmitsStartupLine(t *testing.T) {
 	if got := rec["component"]; got != "recipes.registry" {
 		t.Errorf("component=%v, want %q", got, "recipes.registry")
 	}
-	if got := rec["count"]; got != float64(6) {
-		t.Errorf("count=%v, want 6 (Stage 2.3 base + Stage 2.4 SOLID: cyclo, cognitive_complexity, loc, lcom4, fan_in, fan_out)", got)
+	if got := rec["count"]; got != float64(9) {
+		t.Errorf("count=%v, want 9 (Stage 2.3 base + Stage 2.4 SOLID foundation + Stage 2.2 SOLID scope-tree: cyclo, cognitive_complexity, loc, lcom4, fan_in, fan_out, interface_width, depth_of_inheritance, coupling_between_objects)", got)
 	}
 	if got := rec["source"]; got != "computed" {
 		t.Errorf("source=%v, want %q", got, "computed")
@@ -193,9 +209,12 @@ func TestRegistry_LogRegistered_EmitsStartupLine(t *testing.T) {
 	kinds, _ := rec["metric_kinds"].([]any)
 	wantKinds := []any{
 		"cognitive_complexity",
+		"coupling_between_objects",
 		"cyclo",
+		"depth_of_inheritance",
 		"fan_in",
 		"fan_out",
+		"interface_width",
 		"lcom4",
 		"loc",
 	}
@@ -205,9 +224,12 @@ func TestRegistry_LogRegistered_EmitsStartupLine(t *testing.T) {
 	versions, _ := rec["metric_kind_versions"].([]any)
 	wantVersions := []any{
 		"cognitive_complexity:v1",
+		"coupling_between_objects:v1",
 		"cyclo:v1",
+		"depth_of_inheritance:v1",
 		"fan_in:v1",
 		"fan_out:v1",
+		"interface_width:v1",
 		"lcom4:v1",
 		"loc:v1",
 	}
@@ -264,9 +286,12 @@ func TestDefaultRegistryWithLog_LogsAndReturns(t *testing.T) {
 	}
 	want := []string{
 		"cognitive_complexity",
+		"coupling_between_objects",
 		"cyclo",
+		"depth_of_inheritance",
 		"fan_in",
 		"fan_out",
+		"interface_width",
 		"lcom4",
 		"loc",
 	}

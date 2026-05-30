@@ -2,6 +2,8 @@
 -- This allows Pass 2d to store trait→impl override relationships
 -- as graph edges rather than only in attrs_json.
 
+-- migrate:up
+
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -13,3 +15,10 @@ BEGIN
     END IF;
 END
 $$;
+
+-- migrate:down
+
+-- PostgreSQL does not support DROP VALUE from an enum.
+-- To fully reverse this migration, recreate the type without 'overrides'
+-- and cascade-update all dependent columns. Left as a manual step.
+SELECT 1;

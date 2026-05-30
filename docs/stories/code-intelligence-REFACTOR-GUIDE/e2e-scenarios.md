@@ -118,20 +118,14 @@ CLI does NOT speak to Postgres, KMS, or OIDC ([arch Sec 1.1],
 
 # Phase 1: Foundations
 
-Implements `implementation-plan.md` Phase 1 (Stages 1.1 - 1.4):
-the CLI binary skeleton, the `RepoContext` / `ScopeBinding`
-in-memory layer, the deterministic effort-estimator fallback,
-and the dev-mode policy loader (embedded `//go:embed` rule packs
-plus the unsigned-policy bypass that compiles only under no-tag
-builds). No pipeline stages run yet -- this phase locks the
-foundations the later phases compose on top of.
-
 ### Setup
 - **Type**: inline
 - **Local**: `cd services/clean-code && make build && go test ./cmd/cleanc/... ./internal/cli/repocontext/... ./internal/cli/scopebinding/... ./internal/cli/effort/... ./internal/cli/devpolicy/... -count=1`
 - **CI runner**: GitHub-hosted `ubuntu-latest`; no lab hardware required (the CLI has no DB / HTTP / collector dependency per [arch Sec 1.1] / [tech-spec C8]).
 - **Secrets**: none (the dev-mode policy loader is unsigned by design per [arch Sec 3.8] / [tech-spec C6]; no KMS key, no Vault entry, no GitHub environment).
 - **Pre-test bootstrap**: `make build` (compiles `bin/cleanc` from `cmd/cleanc/main.go` so the version + help scenarios can shell out to the actual binary; the test code does not invoke `go run`).
+
+> Phase 1 covers `implementation-plan.md` Phase 1 (Stages 1.1 - 1.4): CLI binary skeleton, `RepoContext` / `ScopeBinding` in-memory layer, deterministic effort-estimator fallback, dev-mode policy loader. No pipeline stages run yet -- this phase locks the foundations the later phases compose on top of. Each scenario below carries its own `[impl-plan Stage X.Y]` anchor.
 
 ### Scenarios
 
@@ -353,19 +347,14 @@ Feature: Dev banner text is byte-exact and uncustomisable [impl-plan Stage 1.4] 
 
 # Phase 2: Pipeline
 
-Implements `implementation-plan.md` Phase 2 (Stages 2.1 - 2.5):
-the repo walker, the parse + recipe fan-out, the rule-engine
-wiring, the planner + task-planner wiring, and the dark-metric
-diagnostics. The pipeline is in-process; the rule engine,
-planner, and task planner read from / write to the in-memory
-`*InMemory*` stores listed in [arch Sec 2].
-
 ### Setup
 - **Type**: inline
 - **Local**: `cd services/clean-code && make build && go test ./internal/cli/walk/... ./internal/cli/orchestrator/... -count=1`
 - **CI runner**: GitHub-hosted `ubuntu-latest`; the same job re-runs on `windows-latest` for the `@cross-platform` symlink-loop scenario per [arch Sec 3.1] "Failure modes".
 - **Secrets**: none.
-- **Pre-test bootstrap**: `make build`; `make fixtures-cli` extracts the in-tree fixture corpus at `services/clean-code/internal/cli/testdata/fixtures/{go,python,typescript,java}/` (the corpus is checked in; the make target is a no-op when files already exist).
+- **Pre-test bootstrap**: `make build`; no fixture-extraction step is required -- the in-tree fixture corpus at `services/clean-code/internal/cli/testdata/fixtures/{go,python,typescript,java}/` is checked in to the worktree per [impl-plan Stage 3.5] (line 347), so a clean `git checkout` is the only bootstrap needed.
+
+> Phase 2 covers `implementation-plan.md` Phase 2 (Stages 2.1 - 2.5): repo walker, parse + recipe fan-out, rule-engine wiring, planner + task-planner wiring, dark-metric diagnostics. The pipeline is in-process; the rule engine, planner, and task planner read from / write to the in-memory `*InMemory*` stores listed in [arch Sec 2]. Each scenario below carries its own `[impl-plan Stage X.Y]` anchor.
 
 ### Scenarios
 
@@ -670,19 +659,14 @@ Feature: Dark-metric diagnostic carries the locked taxonomy [impl-plan Stage 2.5
 
 # Phase 3: P0 Reports and Delivery
 
-Implements `implementation-plan.md` Phase 3 (Stages 3.1 - 3.5):
-the markdown report renderer, the JSON findings artifact, the
-end-to-end `analyze` wiring, the `report` / `version`
-sub-commands, and the P0 golden fixture corpus. Phase 3 is the
-first phase where the binary produces user-visible files; every
-output is byte-stable per `tech-spec C11`.
-
 ### Setup
 - **Type**: inline
 - **Local**: `cd services/clean-code && make build && go test ./internal/cli/report/... ./internal/cli/orchestrator/... ./cmd/cleanc/... -count=1`
 - **CI runner**: GitHub-hosted `ubuntu-latest`; the golden-file snapshot tests also run on `windows-latest` for the `@cross-platform` byte-identical scenario (line endings must be normalised to `\n` in golden files regardless of host).
 - **Secrets**: none.
-- **Pre-test bootstrap**: `make build`; `make fixtures-cli` ensures the in-tree fixture corpus is present; `make update-cli-golden=0` is the default (golden files are checked in and read-only during the test run, per [impl-plan Stage 3.5]).
+- **Pre-test bootstrap**: `make build`; no fixture-extraction step is required (the corpus under `services/clean-code/internal/cli/testdata/fixtures/` is checked in per [impl-plan Stage 3.5]); the default test mode runs `go test` WITHOUT the `UPDATE=1` env var, leaving the checked-in golden files under `services/clean-code/internal/cli/testdata/golden/<scenario>/` read-only; per [impl-plan Stage 3.5] line 352, `make update-cli-golden` (which sets `UPDATE=1`) is the dedicated regeneration target and is invoked only when the orchestrator output legitimately changes (gated by code review).
+
+> Phase 3 covers `implementation-plan.md` Phase 3 (Stages 3.1 - 3.5): markdown report renderer, JSON findings artifact, end-to-end `analyze` wiring, `report` / `version` sub-commands, P0 golden fixture corpus. Phase 3 is the first phase where the binary produces user-visible files; every output is byte-stable per [tech-spec C11]. Each scenario below carries its own `[impl-plan Stage X.Y]` anchor.
 
 ### Scenarios
 
@@ -881,21 +865,14 @@ Feature: Golden snapshots for the four-language corpus [impl-plan Stage 3.5]
 
 # Phase 4: P1 Structured Prompt Emitter
 
-Implements `implementation-plan.md` Phase 4 (Stages 4.1 - 4.4):
-the `RefactorPromptRecord` shape and snippet extractor, the
-JSONL emitter, the `--emit-prompts` flag wiring, and the
-reserved verbs / flags (`apply`, `--telemetry-otlp`,
-`--with-churn`, `--snippet-cap-lines`). Phase 4 ships the L7
-Option A artefact per operator pin `cli-l7-authority` ([arch
-Sec 1.3]); L7 Options B / C (mechanical patches) remain deferred
-to P3.
-
 ### Setup
 - **Type**: inline
 - **Local**: `cd services/clean-code && make build && go test ./internal/cli/suggest/... ./cmd/cleanc/... -count=1`
 - **CI runner**: GitHub-hosted `ubuntu-latest`.
 - **Secrets**: none.
-- **Pre-test bootstrap**: `make build`; `make fixtures-cli` ensures the in-tree fixture corpus is present; no AI-coder service is contacted (the prompts are written to disk and never POSTed anywhere).
+- **Pre-test bootstrap**: `make build`; no fixture-extraction step is required (the corpus under `services/clean-code/internal/cli/testdata/fixtures/` is checked in per [impl-plan Stage 3.5]); no AI-coder service is contacted (the prompts are written to disk and never POSTed anywhere).
+
+> Phase 4 covers `implementation-plan.md` Phase 4 (Stages 4.1 - 4.4): `RefactorPromptRecord` shape and snippet extractor, JSONL emitter, `--emit-prompts` flag wiring, reserved verbs / flags (`apply`, `--telemetry-otlp`, `--with-churn`, `--snippet-cap-lines`). Phase 4 ships the L7 Option A artefact per operator pin `cli-l7-authority` ([arch Sec 1.3]); L7 Options B / C (mechanical patches) remain deferred to P3. Each scenario below carries its own `[impl-plan Stage X.Y]` anchor.
 
 ### Scenarios
 
@@ -1110,21 +1087,14 @@ Feature: TestReservedSurface table guards every reserved verb/flag in one place 
 
 # Phase 5: Hardening and Release
 
-Implements `implementation-plan.md` Phase 5 (Stages 5.1 - 5.4):
-the build-tag matrix (`-tags prod` excludes the unsigned-policy
-bypass), the custom lint rules (`no-production-sql-import`,
-`no-production-build-tag-bypass`), the end-to-end golden tests
-under `tests/e2e/cleanc/`, and the user-facing documentation
-(README cleanc section, USAGE.md, PROMPT-FORMAT.md, CHANGELOG).
-Phase 5 is the release gate: a PR merging without all Phase 5
-scenarios green is a regression even if Phases 1 - 4 all pass.
-
 ### Setup
 - **Type**: inline
 - **Local**: `cd services/clean-code && make build && make build-prod && make lint-cli && make test-prod && make e2e-cleanc`
 - **CI runner**: GitHub-hosted `ubuntu-latest` for the primary matrix entry plus `windows-latest` for the `@cross-platform` golden-snapshot scenario; `make build-prod`, `make test-prod`, and `make lint-cli` each run as their own matrix entries on `ubuntu-latest` (the prod-build job MUST be green for the merge gate per `tech-spec D11`).
 - **Secrets**: none (the prod build path explicitly excludes the unsigned-policy bypass at compile time and therefore needs no signing key for these tests; signed-policy authoring is a separate operator workflow scoped out of this story per [arch Sec 3.8]).
-- **Pre-test bootstrap**: `make build` (no-tag dev binary at `bin/cleanc`); `make build-prod` (prod binary at `bin/cleanc-prod`); `make fixtures-cli` ensures the e2e scenario corpora under `tests/e2e/cleanc/scenarios/*/` are extracted.
+- **Pre-test bootstrap**: `make build` (no-tag dev binary at `bin/cleanc`); `make build-prod` (prod binary at `bin/cleanc-prod`); the e2e scenario corpora under `tests/e2e/cleanc/scenarios/*/` are checked into the worktree per [impl-plan Stage 5.3] (lines 511 - 515), so no extraction step is required beyond `git checkout`.
+
+> Phase 5 covers `implementation-plan.md` Phase 5 (Stages 5.1 - 5.4): build-tag matrix (`-tags prod` excludes the unsigned-policy bypass), custom lint rules (`no-production-sql-import`, `no-production-build-tag-bypass`), end-to-end golden tests under `tests/e2e/cleanc/`, user-facing documentation (README cleanc section, USAGE.md, PROMPT-FORMAT.md, CHANGELOG). Phase 5 is the release gate: a PR merging without all Phase 5 scenarios green is a regression even if Phases 1 - 4 all pass. Each scenario below carries its own `[impl-plan Stage X.Y]` anchor.
 
 ### Scenarios
 
@@ -1306,40 +1276,33 @@ scenario among the phases above.
 | C12 Snippet preserves raw file bytes (no parser normalisation) | tech-spec Sec 7 | Phase 4 `@invariant` UTF-8 + tab preserved |
 | C15 Effort estimator mode surfaced in every output | tech-spec Sec 7 | Phase 1 `@invariant` `Mode()` returns `fallback`; Phase 2 `@happy/@invariant` diagnostics record `fallback`; Phase 4 `@happy/@invariant` `effort_source` in `RefactorPromptRecord` |
 
-## Cross-doc consistency notes
+## Anchors to upstream authoritative state
 
-The following minor inconsistencies between the parallel-authored
-sibling docs were observed during this iteration and surfaced
-here so the next iteration of either doc can align without
-re-litigating:
+The scenarios above test the as-authored upstream state. Two
+implementation details are repeated here as test rationale so a
+reader does NOT have to chase three sibling docs to understand
+why a scenario asserts what it does:
 
-1. **`//go:embed` pattern path.** [arch Sec 3.8] lines 604 - 606
-   and [tech-spec Sec 8.4] lines 940 - 942 describe the embed
-   pattern as `../../policy/rulepacks/...` for prose readability;
-   [impl-plan Stage 1.4] line 94 - 95 correctly notes that Go's
-   `//go:embed` directive does NOT support `..` and pins the
-   actual file to live IN the `rulepacks` package as
-   `services/clean-code/policy/rulepacks/embedded_fs.go`. The
-   scenarios in Phase 1 ("Embedded rule packs load with a stable
-   PolicyVersionID") test the impl-plan-correct location; no
-   change is required to the test scenarios, but
-   `architecture.md` / `tech-spec.md` would benefit from a
-   one-line clarification.
-2. **`HotSpot.Breakdown` is z-scores only.** [arch Sec 3.5] line
-   674 lists `ScopeInputs.Loc`, `ScopeInputs.Cyclo`,
-   `ScopeInputs.FanIn` as the inputs to the effort fallback and
-   notes "the values are already on the `Breakdown` carried by
-   `PlanResult`". [impl-plan Stage 1.3] line 74 corrects that:
-   `HotSpot.Breakdown` carries only z-scores
-   (`ComplexityZ`/`ChurnZ`/`CouplingZ`) per
-   `services/clean-code/internal/refactor/hotspot.go:264-284`,
-   not raw `loc`/`fan_in`. The Phase 1 effort scenarios test the
-   impl-plan-correct path (the `EffortInputProvider` indexes the
-   `InMemoryMetricSample` rows by `(scope_id, metric_kind)`); no
-   change is required to the test scenarios.
+1. **Embedded rule-pack `//go:embed` lives inside the rule-pack
+   package.** [impl-plan Stage 1.4] (lines 94 - 95) pins the
+   embed file to `services/clean-code/policy/rulepacks/embedded_fs.go`
+   because Go's `//go:embed` directive cannot reference parent
+   directories with `..`. The Phase 1 "Embedded rule packs load
+   with a stable PolicyVersionID" scenario asserts the
+   `Bundle.Rules` non-empty count from THIS embed location;
+   testing any other location would be wrong.
+2. **`HotSpot.Breakdown` carries z-scores, NOT raw `loc`/`fan_in`.**
+   [impl-plan Stage 1.3] (line 74) and the symbol at
+   `services/clean-code/internal/refactor/hotspot.go:264-284`
+   define `HotSpot.Breakdown` as `{ComplexityZ, ChurnZ, CouplingZ}`.
+   The Phase 1 effort scenarios therefore source the raw
+   `loc` / `cyclo` / `fan_in` inputs to the effort fallback from
+   the `EffortInputProvider` (which indexes `InMemoryMetricSample`
+   rows by `(scope_id, metric_kind)`), NOT from `HotSpot.Breakdown`.
 
-These notes are repeated from `implementation-plan.md` so the
-QA contract does not silently drift from the as-built behaviour.
+These two notes exist to keep the QA contract aligned with
+upstream authoritative behaviour and do NOT request any change
+to sibling docs.
 
 ## Iteration summary anchor
 

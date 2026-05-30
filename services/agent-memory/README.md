@@ -113,14 +113,26 @@ make test-nocgo
 make test-cgo
 ```
 
-Both targets are wired into the agent-memory CI job so every PR
-runs the CGO=1 and CGO=0 build modes back-to-back; a regression
+Both targets are wired into the `lint-build-test` job in
+[`.github/workflows/agent-memory-ci.yml`](../../.github/workflows/agent-memory-ci.yml),
+which fires on every PR targeting `feature/memory`,
+`feature/scanner`, or any `ws/code-intelligence-AGENT-MEMORY/**`
+/ `ws/code-intelligence-REPO-SCANNER/**` workstream branch (the
+two convergence trees that share this Go module). A regression
 in either parser-registration file therefore fails CI before it
-can land on `feature/scanner`. The broader Go suite continues to
-run under `make test` / `make test-race` (which default to
-whatever CGO mode the runner provides) so this pair of targets
-only adds the explicit build-tag split coverage, not redundant
-load on the full test matrix.
+can land on either feature branch. The broader Go suite
+continues to run under `make test` / `make test-race` (which
+default to whatever CGO mode the runner provides) so this pair
+of targets only adds the explicit build-tag split coverage, not
+redundant load on the full test matrix.
+
+CI is `ubuntu-latest` only today. Windows CGO validation is
+supported **locally** through the toolchain matrix above; a
+`windows-latest` matrix leg is tracked as a follow-up under
+REPO-SCANNER Phase 1 (the brief for the `cgo-build-proof`
+stage is Linux CI-proof + Windows local-proof, intentionally
+defers a `windows-latest` runner to avoid toolchain-flake noise
+in this stage).
 
 ## Local dependency stack
 

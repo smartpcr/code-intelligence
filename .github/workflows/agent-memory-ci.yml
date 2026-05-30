@@ -1,16 +1,32 @@
 name: agent-memory CI
 
-# Runs on every PR that touches the agent-memory service tree or any
-# of the workstream branches that converge into `feature/memory`.
-# Implementation-plan.md Stage 1.1 requires the full `make
-# lint/build/test` triple to pass plus a `docker compose up -d` +
-# healthcheck sweep over the three local dependencies.
+# Runs on every PR that touches the agent-memory service tree, on
+# any of the workstream branches that converge into
+# `feature/memory`, AND on the REPO-SCANNER workstream branches
+# that converge into `feature/scanner` (the scanner story reuses
+# the agent-memory codebase as its host package -- it imports
+# `internal/repoindexer/ast/`, `pkg/fingerprint`, etc. -- so its
+# PRs MUST also run this job, including the
+# REPO-SCANNER Stage 1.1 (`cgo-build-proof`) `make test-cgo` /
+# `make test-nocgo` gates added below). Implementation-plan.md
+# Stage 1.1 requires the full `make lint/build/test` triple to
+# pass plus a `docker compose up -d` + healthcheck sweep over
+# the three local dependencies.
 
 on:
   pull_request:
     branches:
       - feature/memory
       - "ws/code-intelligence-AGENT-MEMORY/**"
+      # REPO-SCANNER convergence -- the scanner story reuses
+      # this Go module (CGO parser dispatcher, fingerprint
+      # helpers, graphsink) so its PRs MUST exercise the same
+      # build + test matrix the memory story does. Without
+      # these two entries the REPO-SCANNER Stage 1.1
+      # `make test-cgo` / `make test-nocgo` gates would never
+      # run on a scanner PR.
+      - feature/scanner
+      - "ws/code-intelligence-REPO-SCANNER/**"
     paths:
       - "services/agent-memory/**"
       - ".github/workflows/agent-memory-ci.yml"
@@ -21,6 +37,8 @@ on:
     branches:
       - feature/memory
       - "ws/code-intelligence-AGENT-MEMORY/**"
+      - feature/scanner
+      - "ws/code-intelligence-REPO-SCANNER/**"
     paths:
       - "services/agent-memory/**"
       - ".github/workflows/agent-memory-ci.yml"

@@ -70,13 +70,22 @@ storyId: "code-intelligence:REPO-SCANNER"
   in `dispatcher_pass2bd_test.go` (line 49) for the dispatcher
   side -- both run inside the existing `make test-nocgo` /
   `make test-cgo` invocations (no separate Makefile target).
-- **CI runner**: GitHub-hosted `ubuntu-latest` for the Linux CGO
-  matrix (`apt-get install -y build-essential powershell` from a
-  cached step) and `windows-latest` for the Windows CGO matrix
-  (`choco install mingw` + `choco install powershell-core` from a
-  cached step). Both matrix legs run inside the existing
-  `.github/workflows/agent-memory-ci.yml` workflow under labels
-  `ubuntu-latest`, `windows-latest`. No self-hosted runner.
+- **CI runner**: GitHub-hosted `ubuntu-latest` is the CGO-build
+  proof gate today; the runner image ships `gcc` and `pwsh` by
+  default so no per-step toolchain install is required. The
+  `lint-build-test` job in
+  `.github/workflows/agent-memory-ci.yml` runs `make test-nocgo`
+  and `make test-cgo` back-to-back (added by REPO-SCANNER Stage
+  1.1) to exercise both build-tag parser-registration files.
+  Windows CGO validation is provided **locally** via the
+  "Building with CGO" subsection of
+  `services/agent-memory/README.md` (MinGW-W64 toolchain setup
+  pinned for developer machines); a `windows-latest` matrix leg
+  in CI is tracked as follow-up under REPO-SCANNER's Phase 1
+  scope expansion (the brief for Stage 1.1 is Linux CGO-proof
+  only -- expanding the matrix risks toolchain-flake noise in
+  this stage and is intentionally deferred). No self-hosted
+  runner.
 - **Secrets**: none -- this phase reads no remote services and
   produces no artifacts that require signing.
 - **Pre-test bootstrap**:

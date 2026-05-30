@@ -7,6 +7,7 @@
 package scopebinding
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
@@ -68,11 +69,29 @@ func NewTable() *Table {
 	return &Table{}
 }
 
-// Insert adds or replaces the binding for b.ScopeID.
-// Inserting a binding with a zero ScopeID is a no-op.
-func (t *Table) Insert(b ScopeBinding) {
+// ErrZeroScopeID is returned by [Table.Insert] when the caller
+// passes a [ScopeBinding] whose ScopeID is uuid.Nil. A zero
+// scope id is a wiring bug -- the orchestrator MUST mint the
+// scope id (via [MintScopeID]) before attempting to insert the
+// binding -- so [Table.Insert] surfaces the condition as a
+// caller-visible diagnostic instead of silently swallowing
+// the stray write. Callers can `errors.Is(err, ErrZeroScopeID)`
+// to distinguish this Stage 1.1 wiring-bug error from any
+// future I/O-shaped error a Stage 1.2 backing store may add
+// behind the same signature.
+var ErrZeroScopeID = errors.New("scopebinding: Table.Insert: ScopeID must not be uuid.Nil")
+
+// Insert adds or replaces the binding for b.ScopeID and
+// returns a nil error on success. When b.ScopeID is uuid.Nil
+// the insert is rejected and Insert returns [ErrZeroScopeID]
+// without mutating the table; the orchestrator MUST mint the
+// scope id (via [MintScopeID]) before attempting to insert
+// the binding. Concurrent callers are serialised through the
+// package-internal mutex so [Table.Len] stays accurate even
+// under fan-out workloads.
+func (t *Table) Insert(b ScopeBinding) error {
 	if b.ScopeID == uuid.Nil {
-		return
+		return ErrZeroScopeID
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -81,6 +100,7 @@ func (t *Table) Insert(b ScopeBinding) {
 	} else {
 		t.len++
 	}
+	return nil
 }
 
 // Get returns the binding for the supplied scope ID and true,

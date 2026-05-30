@@ -176,21 +176,36 @@ cleanc not-a-verb
 
 ## 8. Stage 1.1 scope boundary
 
-Per the operator's 2026-05-30 wizard answers, the Stage 1.1
-workstream lives entirely under
-`services/clean-code/cmd/cleanc/`,
-`services/clean-code/internal/cli/flags/`, and the
-`services/clean-code/internal/cli/devpolicy/` shells
-(sentinels + bypass + banner + build-tag matrix).  The
-`internal/cli/repocontext/` and `internal/cli/scopebinding/`
-minter bodies are deferred to **Stage 1.2**
-(implementation-plan lines 46-54); the `devpolicy/loader.go`
-body and `embed.go` are deferred to **Stage 1.4**
-(implementation-plan lines 90-100).
+Stage 1.1 ships the CLI binary skeleton **plus** the
+foundational internal CLI support packages required to make
+the skeleton self-contained:
 
-The operator's pin — *"Iter-9 commit `40b4139` already implements
-this interpretation"* — closes the recurring iter-2/3/8/9
-"missing files" critique.  The code-level witness is the
-`Stage11ScopeNote` constant in
-`services/clean-code/cmd/cleanc/doc.go`, asserted by
-`TestStage11ScopeNote_PinsOperatorDecision`.
+- `cmd/cleanc/` — entry, sub-command dispatcher, build-tag-paired defaults.
+- `internal/cli/flags/` — exit codes, verb names, flag defaults.
+- `internal/cli/devpolicy/` — `Loader` interface, source-resolution
+  choice point (`LoaderSource.FS`), `ErrDevModeUnavailable` /
+  `ErrLoaderNotYetImplemented` sentinels, `BannerText` /
+  `EmitBanner`, and the build-tag matrix (`unsigned_dev.go` /
+  `unsigned_prod.go`). The dev-build `Load` body is a stub
+  that returns `ErrLoaderNotYetImplemented`.
+- `internal/cli/repocontext/` — foundational `MintRepoID`,
+  `DetectHeadSHA`, `DetectModulePath` helpers.
+- `internal/cli/scopebinding/` — foundational `ScopeBinding`
+  struct, `MintScopeID` / `TryMintScopeID`, concurrent `Table`,
+  string-keyed `Store`.
+- `internal/cli/effort/` — `FallbackModel.Estimate` deterministic
+  effort score used when the ONNX model is unavailable.
+
+The next-layer integrations land in downstream workstreams:
+**Stage 1.2** wires `repocontext` / `scopebinding` into the
+walker / orchestrator (implementation-plan lines 46-54);
+**Stage 1.4** swaps the dev-build `Loader.Load` stub for the
+real YAML decoder + unsigned `steward.PolicyVersion`
+synthesiser (implementation-plan lines 90-100); **Stage 1.5+**
+supersedes the `effort` fallback with the ONNX model.
+
+The operator's literal 2026-05-30 scope phrasing is preserved
+verbatim in the `Stage11ScopeNote` constant in
+`services/clean-code/cmd/cleanc/doc.go` (pinned by
+`TestStage11ScopeNote_PinsOperatorDecision`) for audit
+traceability against the iter-9 baseline commit.

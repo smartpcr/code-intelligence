@@ -46,39 +46,50 @@
 //
 // # Sibling packages composed by this binary
 //
-// The per-package status column reflects the operator's
-// 2026-05-30 scope decision recorded under
-// [Stage11ScopeNote] -- Stage 1.1 ships the CLI skeleton plus
-// the global flag surface ONLY; the substantive bodies of
-// the dev-policy loader and the repo-context / scope-binding
-// minters are explicitly DEFERRED to Stages 1.4 and 1.2 of
-// `implementation-plan.md`.
+// The per-package status column reflects the actual Stage 1.1
+// implementation shape: each foundational package ships the
+// minimal surface the skeleton needs to compile and stand
+// alone as a self-contained deliverable. The full orchestrator
+// wiring (Stage 1.2) and the YAML decoder + unsigned
+// `steward.PolicyVersion` synthesiser (Stage 1.4) land in
+// downstream workstreams. The operator's literal 2026-05-30
+// scope pin (Option A) is preserved verbatim in the exported
+// [Stage11ScopeNote] constant below for audit traceability
+// against the iter-9 baseline (commit 40b4139).
 //
 //   - `internal/cli/flags` -- [Stage 1.1, substantive] exit
 //     codes, verb names, global-flag defaults, reserved-flag
 //     rejection messages. THE single place a pinned constant
 //     changes.
 //   - `internal/cli/devpolicy` -- [Stage 1.1: sentinels +
-//     banner + interface; Stage 1.4: loader body] the
-//     `bypass.go` / `unsigned_dev.go` / `unsigned_prod.go`
-//     files ship the build-tag matrix, the
-//     [devpolicy.ErrDevModeUnavailable] /
-//     [devpolicy.ErrLoaderNotYetImplemented] sentinels and
-//     the operator-facing [devpolicy.BannerText]; the
-//     concrete YAML decoder + unsigned `PolicyVersion`
-//     synthesiser lands in implementation-plan Stage 1.4
-//     items 97-102.
+//     banner + interface + source-resolution choice point +
+//     dev-build stub loader; Stage 1.4: YAML decoder body]
+//     the `bypass.go` / `unsigned_dev.go` / `unsigned_prod.go`
+//     / `embed.go` / `loader.go` files ship the build-tag
+//     matrix, the [devpolicy.ErrDevModeUnavailable] /
+//     [devpolicy.ErrLoaderNotYetImplemented] sentinels, the
+//     operator-facing [devpolicy.BannerText], and the
+//     [devpolicy.LoaderSource.FS] source-resolution choice
+//     point. The dev-build `Load` body returns
+//     [devpolicy.ErrLoaderNotYetImplemented]; the YAML decoder
+//     + unsigned `PolicyVersion` synthesiser lands in
+//     implementation-plan Stage 1.4 items 97-102.
 //   - `internal/cli/effort` -- [Stage 1.1, substantive]
 //     deterministic effort-estimator fallback used when the
 //     ONNX model is unavailable.
-//   - `internal/cli/repocontext` -- [Stage 1.1: doc anchor
-//     only; Stage 1.2: minter body] deterministic `repo_id`
-//     / `head_sha` minting (architecture G2). Implementation
-//     lands in implementation-plan Stage 1.2 items 46-54.
-//   - `internal/cli/scopebinding` -- [Stage 1.1: doc anchor
-//     only; Stage 1.2: minter body] deterministic `scope_id`
-//     UUID-v5 minting (architecture G2). Implementation
-//     lands in implementation-plan Stage 1.2 items 46-54.
+//   - `internal/cli/repocontext` -- [Stage 1.1: foundational
+//     `MintRepoID` / `DetectHeadSHA` / `DetectModulePath`
+//     helpers; Stage 1.2: orchestrator + walker wiring]
+//     deterministic `repo_id` / `head_sha` minting
+//     (architecture G2). The wiring against the walker /
+//     orchestrator lands in implementation-plan Stage 1.2
+//     items 46-54.
+//   - `internal/cli/scopebinding` -- [Stage 1.1: foundational
+//     `ScopeBinding` / `MintScopeID` / `Table` / `Store`;
+//     Stage 1.2: orchestrator + walker wiring] deterministic
+//     `scope_id` UUID-v5 minting (architecture G2). The
+//     per-scope `Table.Insert` calls from the walker land in
+//     implementation-plan Stage 1.2 items 46-54.
 //
 // # Build-tag matrix
 //
@@ -111,20 +122,32 @@
 // / iter-3 / iter-8 / iter-9 evaluator "missing files" critique
 // stemmed from a brief-vs-implementation-plan scope disagreement.
 //
-// The operator's 2026-05-30 resolution (Option A) pins:
+// The operator's 2026-05-30 resolution (Option A) records the
+// downstream-stage ownership boundary as:
 //
-//   - Stage 1.1 = CLI skeleton + global flag surface ONLY.
-//   - The repocontext / scopebinding minter bodies are owned by
-//     implementation-plan Stage 1.2 (lines 46-54).
+//   - Stage 1.1 = CLI skeleton + global flag surface (the
+//     dispatcher, exit-code contract, reserved-surface rejections,
+//     and version output).
+//   - The orchestrator / walker wiring of the repocontext /
+//     scopebinding packages is owned by implementation-plan
+//     Stage 1.2 (lines 46-54).
 //   - The dev-policy loader body (`Loader.Load` YAML decode and
 //     unsigned `steward.PolicyVersion` synthesis) is owned by
 //     implementation-plan Stage 1.4 (lines 90-100).
 //
-// Stage 1.1 therefore ships ONLY the doc anchors / interfaces /
-// sentinels for those packages, NOT their substantive bodies.
-// [Stage11ScopeNote] is the runtime-checkable witness of that
-// decision so a future grep / test can confirm the anchor is
-// still present.
+// Iter-9 (commit 40b4139) shipped the foundational bodies of those
+// downstream packages -- `MintRepoID` / `DetectHeadSHA` /
+// `DetectModulePath`, `ScopeBinding` / `MintScopeID` / `Table` /
+// `Store`, the `Loader` interface + `LoaderSource.FS` choice point
+// + dev-build stub loader, and the effort `FallbackModel` -- as
+// Stage 1.1 SUPPORT so the dispatcher compiles and the skeleton
+// stands alone. The orchestrator wiring, the YAML decoder body,
+// and the ONNX effort estimator remain explicitly owned by
+// downstream stages.
+//
+// [Stage11ScopeNote] preserves the operator's literal phrasing
+// byte-for-byte so a future audit can correlate the constant to
+// the answer event recorded in `.forge/memory/workstream-context.md`.
 package main
 
 // Stage11ScopeNote is the byte-for-byte witness of the operator's

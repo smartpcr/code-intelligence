@@ -46,10 +46,16 @@
 //     change. A future renaming or namespacing change would be
 //     a hard cross-version migration and is intentionally loud
 //     to make.
-//   - [Table.Insert] is a no-op for a zero ScopeID; this guards
-//     against partial-construction bugs (an unbound binding
-//     never enters the index). [Table.Len] is accurate even
-//     under concurrent Insert calls.
+//   - [Table.Insert] returns [ErrZeroScopeID] for a zero
+//     ScopeID and does NOT mutate the table; this surfaces
+//     the orchestrator wiring bug (forgot to mint the scope
+//     id before insert) as a caller-visible diagnostic
+//     rather than a silent no-op. Callers can
+//     `errors.Is(err, ErrZeroScopeID)` to discriminate the
+//     wiring-bug failure from any future I/O-shaped error a
+//     Stage 1.2 backing store may add behind the same
+//     signature. [Table.Len] is accurate even under
+//     concurrent Insert calls.
 //
 // # Sibling packages
 //

@@ -3,6 +3,7 @@ package devpolicy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 
@@ -132,12 +133,26 @@ var ErrMissingPolicyDir = errors.New("devpolicy: LoaderSource.DirPath must be no
 // Stage 1.4 follow-up workstream) will stay decoupled from the
 // source-kind switch: they will call `src.FS()` and walk the
 // returned FS uniformly.
+//
+// For the filesystem source, FS eagerly stats s.DirPath and
+// verifies it is a directory before returning the os.DirFS
+// handle. This surfaces an operator typo in `--policy <path>`
+// here -- as a clear "policy dir: ... no such file or
+// directory" / "is not a directory" diagnostic -- rather than
+// as an opaque walk/read error later inside the loader.
 func (s LoaderSource) FS() (fs.FS, error) {
 	if s.UseEmbedded {
 		return embeddedRulePacks, nil
 	}
 	if s.DirPath == "" {
 		return nil, ErrMissingPolicyDir
+	}
+	info, err := os.Stat(s.DirPath)
+	if err != nil {
+		return nil, fmt.Errorf("devpolicy: policy dir: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("devpolicy: policy dir: %s is not a directory", s.DirPath)
 	}
 	return os.DirFS(s.DirPath), nil
 }

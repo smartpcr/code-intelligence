@@ -301,11 +301,16 @@ func InitializeScenario_parser_coverage_verification_cgo_build_proof(ctx *godog.
 }
 
 func TestE2E_parser_coverage_verification_cgo_build_proof(t *testing.T) {
+	// Resolve the feature file relative to this source file so the test
+	// works regardless of the working directory `go test` is invoked from.
+	_, thisFile, _, _ := runtime.Caller(0)
+	featurePath := filepath.Join(filepath.Dir(thisFile), "parser_coverage_verification_cgo_build_proof.feature")
+
 	suite := godog.TestSuite{
 		ScenarioInitializer: InitializeScenario_parser_coverage_verification_cgo_build_proof,
 		Options: &godog.Options{
 			Format:   "pretty",
-			Paths:    []string{"parser_coverage_verification_cgo_build_proof.feature"},
+			Paths:    []string{featurePath},
 			TestingT: t,
 		},
 	}

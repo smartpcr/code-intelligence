@@ -33,16 +33,16 @@ func TestMigrator_Up_AppliesAll(t *testing.T) {
 		t.Fatalf("Migrator.Up: %v", err)
 	}
 
-	// Verify at least 0022 was recorded.
+	// Verify at least 0022 was recorded in the canonical journal table.
 	var count int
 	err := db.QueryRow(
-		"SELECT COUNT(*) FROM schema_migrations WHERE version = '0022_edge_kind_overrides'",
+		"SELECT COUNT(*) FROM "+JournalTable+" WHERE version = '0022'",
 	).Scan(&count)
 	if err != nil {
-		t.Fatalf("query schema_migrations: %v", err)
+		t.Fatalf("query %s: %v", JournalTable, err)
 	}
 	if count != 1 {
-		t.Fatalf("expected migration 0022_edge_kind_overrides to be recorded, got count=%d", count)
+		t.Fatalf("expected migration 0022 to be recorded, got count=%d", count)
 	}
 }
 
@@ -52,7 +52,19 @@ func TestMigrations_0022_EdgeKindOverrides(t *testing.T) {
 	db := openTestDB(t)
 	m := New(db)
 
-	if !m.Has("0022_edge_kind_overrides") {
+	// Verify the migration is embedded via All().
+	all, err := All()
+	if err != nil {
+		t.Fatalf("All(): %v", err)
+	}
+	found := false
+	for _, mg := range all {
+		if mg.Version == "0022" && mg.Name == "edge_kind_overrides" {
+			found = true
+			break
+		}
+	}
+	if !found {
 		t.Fatal("migration 0022_edge_kind_overrides is not embedded in the migrations package")
 	}
 
@@ -61,17 +73,15 @@ func TestMigrations_0022_EdgeKindOverrides(t *testing.T) {
 		t.Fatalf("Migrator.Up: %v", err)
 	}
 
-	// Probe: verify 'overrides' is a valid edge_kind enum value.
-	// Since we may not have the full enum type from prior migrations,
-	// we verify the SQL file was applied by checking schema_migrations.
+	// Verify the migration was recorded in the canonical journal table.
 	var version string
-	err := db.QueryRow(
-		"SELECT version FROM schema_migrations WHERE version = '0022_edge_kind_overrides'",
+	err = db.QueryRow(
+		"SELECT version FROM "+JournalTable+" WHERE version = '0022'",
 	).Scan(&version)
 	if err != nil {
-		t.Fatalf("0022_edge_kind_overrides not found in schema_migrations: %v", err)
+		t.Fatalf("0022 not found in %s: %v", JournalTable, err)
 	}
-	if version != "0022_edge_kind_overrides" {
+	if version != "0022" {
 		t.Fatalf("unexpected version: %s", version)
 	}
 }

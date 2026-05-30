@@ -441,7 +441,7 @@ func (w *Worker) deltaProcessModified(
 
 	// 1. Look up the CURRENT (not-yet-retired) File Node for
 	// this path so we can root the descendant CTE at its id.
-	oldFile, found, err := w.lookupCurrentNodeBySig(ctx, job.RepoID, "file", canonicalFileSig(repoURL, relPath))
+	oldFile, found, err := w.lookupCurrentNodeBySig(ctx, job.RepoID, "file", CanonicalFileSig(repoURL, relPath))
 	if err != nil {
 		return c, fmt.Errorf("repoindexer: deltaProcessModified: lookup file %s: %w", relPath, err)
 	}
@@ -476,7 +476,7 @@ func (w *Worker) deltaProcessModified(
 	// — the package directory is the same; reuse the existing
 	// Package Node by canonical_signature lookup so we don't
 	// mint a parallel one).
-	pkgSig := canonicalPackageSig(repoURL, canonicalPackageDir(relPath))
+	pkgSig := CanonicalPackageSig(repoURL, CanonicalPackageDir(relPath))
 	pkgNode, found, err := w.lookupCurrentNodeBySig(ctx, job.RepoID, "package", pkgSig)
 	if err != nil {
 		return c, fmt.Errorf("repoindexer: deltaProcessModified: lookup package: %w", err)
@@ -617,7 +617,7 @@ func (w *Worker) deltaProcessModified(
 		oldSigSet[old.CanonicalSignature] = struct{}{}
 	}
 	newParentSigByID := make(map[string]string, len(emitResult.TouchedNodes)+1)
-	newParentSigByID[fileRec.NodeID] = canonicalFileSig(repoURL, relPath)
+	newParentSigByID[fileRec.NodeID] = CanonicalFileSig(repoURL, relPath)
 	for _, t := range emitResult.TouchedNodes {
 		newParentSigByID[t.NodeID] = t.CanonicalSignature
 	}
@@ -795,7 +795,7 @@ func (w *Worker) deltaProcessDeleted(
 
 	// Look up every live File Node for this path (normally one;
 	// duplicate live roots are tolerated by walking both).
-	sig := canonicalFileSig(repoURL, relPath)
+	sig := CanonicalFileSig(repoURL, relPath)
 	descendants, err := w.queryLiveDescendantsBySigPrefix(ctx, job.RepoID, sig)
 	if err != nil {
 		return c, fmt.Errorf("repoindexer: deltaProcessDeleted: query descendants %s: %w", relPath, err)
@@ -860,7 +860,7 @@ func (w *Worker) deltaProcessRenamed(
 
 	// 1. Look up the OLD file node (must be live; if it's
 	// already retired we fall back to a plain Added).
-	oldFile, oldFound, err := w.lookupCurrentNodeBySig(ctx, job.RepoID, "file", canonicalFileSig(repoURL, prevRelPath))
+	oldFile, oldFound, err := w.lookupCurrentNodeBySig(ctx, job.RepoID, "file", CanonicalFileSig(repoURL, prevRelPath))
 	if err != nil {
 		return c, fmt.Errorf("repoindexer: deltaProcessRenamed: lookup old file: %w", err)
 	}
@@ -874,7 +874,7 @@ func (w *Worker) deltaProcessRenamed(
 
 	// 3. Look up the freshly-ensured new File Node so we can
 	// link it from the renamed_to edge.
-	newFile, newFound, err := w.lookupCurrentNodeBySig(ctx, job.RepoID, "file", canonicalFileSig(repoURL, relPath))
+	newFile, newFound, err := w.lookupCurrentNodeBySig(ctx, job.RepoID, "file", CanonicalFileSig(repoURL, relPath))
 	if err != nil {
 		return c, fmt.Errorf("repoindexer: deltaProcessRenamed: lookup new file: %w", err)
 	}
@@ -1142,7 +1142,7 @@ func detectRenamePairs(
 // them. The query prefers the most recently inserted live row
 // (ORDER BY node_id) for determinism.
 func (w *Worker) lookupCurrentRepoNodeID(ctx context.Context, repoID fingerprint.RepoID, repoURL string) (string, error) {
-	sig := canonicalRepoSig(repoURL)
+	sig := CanonicalRepoSig(repoURL)
 	var nodeID string
 	err := w.db.QueryRowContext(ctx, `
 		SELECT n.node_id::text
@@ -1441,11 +1441,11 @@ func (w *Worker) ensurePackageNode(
 	cache map[string]string,
 	relPath string,
 ) (string, bool, error) {
-	dir := canonicalPackageDir(relPath)
+	dir := CanonicalPackageDir(relPath)
 	if id, ok := cache[dir]; ok {
 		return id, false, nil
 	}
-	sig := canonicalPackageSig(repoURL, dir)
+	sig := CanonicalPackageSig(repoURL, dir)
 	// First try to reuse an existing live Package Node so we
 	// don't mint a parallel one at to_sha.
 	existing, found, err := w.lookupCurrentNodeBySig(ctx, job.RepoID, "package", sig)
@@ -1504,7 +1504,7 @@ func (w *Worker) ensureFileNode(ctx context.Context, job Job, repoURL, pkgNodeID
 	rec, err := w.writer.InsertNode(ctx, graphwriter.NodeInput{
 		RepoID:             job.RepoID,
 		Kind:               "file",
-		CanonicalSignature: canonicalFileSig(repoURL, relPath),
+		CanonicalSignature: CanonicalFileSig(repoURL, relPath),
 		ParentNodeID:       pkgNodeID,
 		FromSHA:            job.ToSHA,
 		AttrsJSON:          attrs,

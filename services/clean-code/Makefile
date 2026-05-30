@@ -59,6 +59,7 @@ COMPOSE_FILE ?= ../../tests/e2e/phase-09-audit-wal/docker-compose.yml
 
 .PHONY: build build-prod test test-cgo test-nocgo test-race lint vet tidy clean proto proto-tools docker-build compose-up compose-down
 .PHONY: migrate-up migrate-down seed-phase-09 test-phase-09
+.PHONY: test-e2e
 
 build:
 	@mkdir -p $(BIN_DIR)
@@ -170,3 +171,12 @@ seed-phase-09:
 
 test-phase-09:
 	go test -tags e2e -v -count=1 -timeout 120s ./test/e2e/code-intelligence-CLEAN-CODE/...
+
+# ---------------------------------------------------------------------------
+# CLI Binary Skeleton E2E targets (Stage 1.1)
+# ---------------------------------------------------------------------------
+
+# test-e2e runs the E2E acceptance tests (behind the `e2e` build tag).
+# Pre-requisite: `make build` (wired as a dependency).
+test-e2e: build
+	go test -tags e2e ./test/e2e/... -count=1

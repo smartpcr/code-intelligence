@@ -13,6 +13,43 @@
 
 ## AST parser language support matrix
 
+> **Canonical degradation matrix**: see
+> [`services/agent-memory/internal/repoindexer/ast/COVERAGE.md`](../../services/agent-memory/internal/repoindexer/ast/COVERAGE.md)
+> for the eight-language row-by-row breakdown of which file
+> extensions parse with CGO=1, which parse with CGO=0, which
+> require `pwsh` on PATH, and the exact `ast.dispatch.skip`
+> `reason` slug emitted when a parser is unavailable. That file
+> is the source of truth per REPO-SCANNER architecture S7
+> ("Degraded language coverage MUST be loud, not silent") and
+> AST-PARSER-FOR-ADDIT tech-spec C1 (parser surface) / C2
+> (canonical-signature stability) / C7 (build-tag duality). The
+> tables below remain for in-context skim; on any disagreement
+> `COVERAGE.md` wins.
+
+**CGO + `pwsh` caveats (recap of `COVERAGE.md`):**
+
+- The CGO=0 `defaultParsers()`
+  ([`parsers_nocgo.go`](../../services/agent-memory/internal/repoindexer/ast/parsers_nocgo.go))
+  registers **only** the PowerShell subprocess parser. Every
+  `.c` / `.h` / `.cpp` / `.cxx` / `.c++` / `.hpp` / `.hh` /
+  `.hxx` / `.h++` / `.cs` / `.go` / `.rs` file therefore skips
+  with `ast.dispatch.skip{reason="no_parser"}` and the worker
+  drains the next file (architecture S7 loud-not-silent
+  guarantee).
+- The CGO=1 `defaultParsers()`
+  ([`parsers_cgo.go`](../../services/agent-memory/internal/repoindexer/ast/parsers_cgo.go))
+  registers the five tree-sitter parsers (C, C++, C#, Go, Rust)
+  plus PowerShell.
+- TypeScript/JavaScript and Python parsers ship in this package
+  but are **not** in `defaultParsers()` under either build tag;
+  callers add them via `ast.WithParsers(...)` (see
+  `polyglotParserSet()` in `parsers_polyglot_smoke_test.go`).
+- `pwsh` not on PATH (any build): the PowerShell parser returns
+  `ErrParserUnavailable`; the dispatcher emits
+  `ast.dispatch.skip{reason="pwsh_not_available"}` at Info level
+  and continues. PowerShell is the only language in either
+  roster that participates under CGO=0.
+
 The `services\agent-memory\internal\repoindexer\ast` package
 ships per-language `LanguageParser` implementations selected by
 file extension. Tree-sitter backed parsers require CGO at build

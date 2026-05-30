@@ -1,9 +1,66 @@
-pack_id: "decoupling-cycles"
-version: "1.0"
+# clean-code Stage 5.6 -- decoupling / cycles rule pack
+#
+# Architecture references:
+#   - Sec 1.3 "Decoupled functional areas" (CR1): dependency
+#     cycles between modules are the most acute form of
+#     coupling; the `cycle_member` metric flags any scope that
+#     participates in a strongly-connected component of the
+#     import/dependency graph.
+#   - Sec 1.4.1 canonical metric_kind `cycle_member` (file /
+#     package scope) -- materialised by the Stage 2.5
+#     `internal/metrics/recipes/cycle_member.go` recipe, which
+#     emits `1` when the scope is inside any SCC of size >=2 and
+#     `0` otherwise.
+#   - Sec 5.3.5 + the implementation-plan Stage 5.6 brief: the
+#     cycle rule is a `severity=block` smell -- "block when any
+#     module in a watched scope is in a cycle" (Stage 5.6 line
+#     533).
+#
+# Marker requirement: the leading `# clean-code Stage` comment
+# is asserted by `internal/cli/devpolicy/embed_test.go` to
+# detect stale/wrong embedded bytes, so do NOT remove it.
+#
+# Predicate shape note:
+#   This rule's predicate is a pure literal comparison (no
+#   `threshold('<uuid>')` atom), per `TestCanonicalThresholdIDs_MatchYAML`
+#   line 117 ("the cycle_member metric has no threshold-UUID in
+#   the YAML -- cycles.yaml uses a literal `value > 0`
+#   comparison, no threshold atom"). Rationale: cycle_member is
+#   a boolean indicator (0 or 1), so the threshold catalogue
+#   adds no operator value -- the cut-off is pinned at the
+#   semantic floor (>=1 == in a cycle).
+#
+# pack_id convention: `<family>.<subname>` per the
+# `clean_code.rule_pack.pack_id` column comment in migration
+# `0003_policy_audit_refactor.up.sql` line 200. The
+# `decoupling` family groups cycles / coupling / duplication
+# so each file is its own rule_pack row keyed on
+# `(pack_id, version)` -- the family prefix `decoupling.*` is
+# a partition convention, not a literal pack_id.
+pack_id: decoupling.cycles
+version: 1
+display_name: Decoupling -- cycle membership
+description_md: |-
+  Detects when a scope's `cycle_member` indicator is non-zero
+  -- i.e. the scope participates in a strongly-connected
+  component of the import/dependency graph. The Stage 2.5
+  `cycle_member` recipe emits `1` for any scope inside a SCC
+  of size >=2 and `0` otherwise; this rule blocks on any
+  positive value. Consumed downstream as the trigger for a
+  Stage 6.4 `break_cycle` refactor task (Sec 5.5.3
+  `refactor_task.kind`).
 rules:
-  - rule_id: "cycle-member-violation"
-    metric_kind: "cycle_member"
-    scope_kind: "module"
-    predicate_dsl: "metric_kind == 'cycle_member' AND value >= 1"
-    description: "Module participates in a dependency cycle"
-    suggested_refactor: "Break the cycle by inverting the dependency or extracting a shared interface"
+  - rule_id: decoupling.cycle_member_present
+    version: 1
+    predicate_dsl: "metric_kind == 'cycle_member' AND value > 0"
+    severity_default: block
+    description_md: |-
+      Scope's `cycle_member` indicator is positive, meaning
+      the scope is in a strongly-connected component of the
+      import graph (size >= 2). Even a small change to one
+      member tends to ripple through the cycle. Suggested
+      refactor: invert one of the dependencies (DIP) so the
+      edges flow through a single abstraction, OR extract a
+      shared interface and let both former members depend on
+      it -- the Refactor Planner emits this as a
+      `kind='break_cycle'` task (Sec 5.5.3).

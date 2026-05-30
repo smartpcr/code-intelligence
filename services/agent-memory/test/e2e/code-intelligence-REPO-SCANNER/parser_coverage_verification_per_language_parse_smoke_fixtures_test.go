@@ -580,6 +580,8 @@ func plsBuildEnvWithoutPwsh(cgoVal string) []string {
 		case upper == "CXX":
 			result = append(result, e)
 			cxxSet = true
+		case upper == "CGO_ENABLED":
+			// skip; we append our own CGO_ENABLED below
 		default:
 			result = append(result, e)
 		}

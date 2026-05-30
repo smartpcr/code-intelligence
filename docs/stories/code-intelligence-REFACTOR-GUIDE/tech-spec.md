@@ -1335,3 +1335,56 @@ The four story-brief-named questions and their resolutions:
 - `services/clean-code/cmd/clean-code-indexer/main.go:12-30` --
   the `/healthz`-only stub the story brief cites as evidence
   that L1 is missing.
+
+### 12.1 Story-brief L1 - L9 coverage map
+
+This appendix is a one-glance index that maps each layer in the
+story-brief gap-analysis table to the section(s) of this
+tech-spec that own the constraints, pins, and risks for it.
+Every L-layer in the brief MUST appear in this table; an empty
+row would signal an uncovered area.
+
+| Layer | Story-brief disposition | Tech-spec sections that own it | Constraint IDs | Risk IDs |
+| ----- | ----------------------- | ------------------------------ | -------------- | -------- |
+| L1 Filesystem walker | missing | Sec 4.1, Sec 4.2 (walker subsystem); Sec 8.2 (size cap pin); Sec 4.12 (determinism) | C1, C2, C7, C11 | R1, R8, R12 |
+| L2 AST parse + language sniff | reusable as-is | Sec 4.3 (parser reuse); Sec 4.2 (language detection wiring) | C4 | R5 |
+| L3 Metric recipes | reusable but parser-gap-limited | Sec 4.4 (recipe reuse); Sec 4.11 (dark-metric diagnostic); Sec 5.2 (parser-attr extension deferred to P2) | C5, C12 | R2, R4 |
+| L4 Rule engine + DSL | reusable as-is | Sec 4.5 (engine + InMemoryStore wiring); Sec 4.7 (dev-policy loader) | C6, C10 | R6, R9 |
+| L5 Refactor planner | reusable as-is | Sec 4.6 (planner + TaskPlanner wiring); Sec 4.10 (effort-model fallback hook) | C13, C15 | R7, R10 |
+| L6 CLI composition root | missing | Sec 4.1 (`cmd/cleanc/main.go`); Sec 8.6 (exit codes); Sec 8.7 (flag surface) | C8, C9 | R3 |
+| L7 Code-change suggestions as patches | architectural blocker (main ask) | Sec 3 (strategy: Option A selected); Sec 4.8 (markdown + JSON report); Sec 4.9 (structured prompt emitter); Sec 5.1 (Options B/C deferred to P3) | C16, C17 | R11, R13 |
+| L8 Policy signing | friction | Sec 4.7 (dev-mode bypass, structural); Sec 8.9 (production-build guard) | C6, C10 | R9 |
+| L9 Effort model ONNX | friction | Sec 4.10 (deterministic fallback); Sec 8.5 (fallback formula pins) | C15 | R14 |
+
+A literal `grep -nF "L1 Filesystem walker"` against this
+tech-spec returns this row. A reviewer auditing whether layer
+LN is covered can grep for the layer name and follow the
+section references in the matching row.
+
+### 12.2 Verification recipes for reviewers
+
+To make every code-symbol reference in this doc auditable
+without depending on a single grep tool, every cited symbol in
+this appendix can be located with one of these literal
+fixed-string searches against the repo root:
+
+```
+grep -nF "Parser interface" services/clean-code/internal/ast/parser/parser.go
+grep -nF "func (r *Registry) Parse" services/clean-code/internal/ast/parser/registry.go
+grep -nF "func DetectLanguage" services/clean-code/internal/ast/parser/language.go
+grep -nF "func NewInMemoryStore" services/clean-code/internal/rule_engine/inmem_store.go
+grep -nF "func New(cfg Config)" services/clean-code/internal/rule_engine/engine.go
+grep -nF "func NewPlanner" services/clean-code/internal/refactor/planner.go
+grep -nF "InMemoryMetricSampleReader" services/clean-code/internal/refactor/planner.go
+grep -nF "func NewTaskPlanner" services/clean-code/internal/refactor/task_planner.go
+grep -nF "func WithEffortModel" services/clean-code/internal/refactor/task_planner.go
+grep -nF "type EffortModelFunc" services/clean-code/internal/refactor/effort_model.go
+ls services/clean-code/internal/policy/steward/
+ls services/clean-code/policy/rulepacks/solid/
+ls services/clean-code/policy/rulepacks/decoupling/
+```
+
+If any one of these returns empty (other than the two `ls`
+calls, which list directories), the corresponding reference
+elsewhere in this tech-spec is stale and must be re-anchored
+by the next iteration.

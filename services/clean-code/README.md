@@ -36,8 +36,14 @@ that fixes the code, not one that rewrites the spec.
 
 ```
 services/clean-code/
-├── cmd/              # main packages, one per binary (clean-coded, future workers)
-│   └── clean-coded/  # primary service binary: /healthz + /readyz + future surfaces
+├── cmd/              # one package per binary; Makefile CMD_DIRS auto-discovers them
+│   ├── cleanc/                       # Stage 1.1 dev-laptop CLI (see docs/cleanc/USAGE.md)
+│   ├── clean-code-aggregator/        # aggregator service
+│   ├── clean-code-eval-gate/         # eval.gate transport
+│   ├── clean-code-gateway/           # public gateway
+│   ├── clean-code-indexer/           # indexer (Stage 1 stub)
+│   ├── clean-code-metric-ingestor/   # metric ingestor
+│   └── clean-code-refactor-planner/  # refactor planner
 ├── internal/         # service-private libraries
 │   ├── config/       # env + file config loader; exposes the five operator pins
 │   ├── health/       # /healthz + /readyz HTTP handler + readiness check registry
@@ -47,7 +53,7 @@ services/clean-code/
 ├── pkg/              # reusable, importable libraries (none yet)
 ├── proto/            # protobuf / gRPC service definitions (none yet)
 ├── web/              # static assets / mgmt UI bundles (none yet)
-├── Dockerfile        # multi-stage build for the clean-coded container
+├── Dockerfile        # multi-stage build (SERVICE build-arg picks which cmd/* to ship)
 └── deploy/
     └── local/        # docker compose stack for local dev + CI integration
         ├── docker-compose.yml
@@ -60,7 +66,7 @@ services/clean-code/
 
 ```
 cd services/clean-code
-make build      # go build ./... -> bin/clean-coded
+make build      # builds bin/<cmd> for every cmd/*/main.go (see CMD_DIRS in Makefile)
 make test       # go test -count=1 ./... (portable; no -race)
 make test-race  # go test -race -count=1 ./... (CGO; Linux CI only)
 make lint       # golangci-lint run ./...
@@ -71,8 +77,8 @@ make lint       # golangci-lint run ./...
 what CI runs on Linux runners where CGO is available.
 
 The local dependency stack (PostgreSQL 16 with `pgcrypto`, Prometheus
-scrape target, OTel Collector, plus the `clean-coded` service itself)
-is started with:
+scrape target, OTel Collector, plus the clean-code service container
+itself) is started with:
 
 ```
 make compose-up   # docker compose up -d --build
@@ -112,4 +118,41 @@ workflow file itself it runs:
 2. `make build`
 3. `make test`
 4. `make test-race` (Linux runner, CGO available)
-5. `docker build` of the `clean-coded` container image
+5. `docker build` of the clean-code service container image
+
+## Stage 1.1 -- `cleanc` CLI binary
+
+`bin/cleanc` is the Stage 1.1 deliverable -- a single-binary, no-server
+dev-laptop CLI for `cleanc analyze <repo-path>` (see workstream
+`ws-code-intelligence-refactor-guide-phase-foundations-stage-cli-binary-skeleton`).
+
+Stage 1.1 owns the dispatcher, the global flag surface, and the
+foundational internal CLI support packages required to make the
+skeleton self-contained:
+
+- `cmd/cleanc/` -- entry, sub-command dispatcher, build-tag-gated defaults.
+- `internal/cli/flags/` -- exit codes, verb names, flag defaults.
+- `internal/cli/devpolicy/` -- bypass interface, dev/prod build-tag
+  paired sentinels (`unsigned_dev.go`, `unsigned_prod.go`), embed
+  alias to `policy/rulepacks.EmbeddedFS`, and the foundational
+  `loader.go` that wires sentinels + embed together.
+- `internal/cli/repocontext/` -- `MintRepoID`, `DetectHeadSHA`,
+  `DetectModulePath` foundational helpers.
+- `internal/cli/scopebinding/` -- `ScopeBinding`, `Store`, `Table`
+  foundational types.
+- `internal/cli/effort/` -- foundational `fallback` constants for
+  the dev-mode effort score path.
+
+These foundational packages compile and pass tests as part of
+Stage 1.1 so the skeleton runs end-to-end. Subsequent stages own
+the next-layer integrations against them: Stage 1.2 (repo context
+wiring into the orchestrator), Stage 1.4 (the full dev-mode policy
+loader pipeline that consumes the sentinels), and Stage 1.5+ (the
+ONNX effort model that supersedes the fallback). See
+[`../../docs/cleanc/STAGE-1-1-STATUS.md`](../../docs/cleanc/STAGE-1-1-STATUS.md)
+for the per-acceptance-criterion mapping to code witnesses.
+
+Operator-facing usage, exit codes, and the Stage 1.1 scope boundary
+appendix live in [`../../docs/cleanc/USAGE.md`](../../docs/cleanc/USAGE.md).
+The same boundary is code-pinned by `Stage11ScopeNote` in
+[`cmd/cleanc/doc.go`](cmd/cleanc/doc.go).

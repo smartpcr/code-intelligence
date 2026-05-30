@@ -1,6 +1,7 @@
 package scopebinding_test
 
 import (
+	"errors"
 	"sync"
 	"testing"
 
@@ -96,7 +97,9 @@ func TestTable_RoundTrip(t *testing.T) {
 		Language:  "go",
 	}
 	table := scopebinding.NewTable()
-	table.Insert(in)
+	if err := table.Insert(in); err != nil {
+		t.Fatalf("Insert returned unexpected error: %v", err)
+	}
 	out, ok := table.Get(id)
 	if !ok {
 		t.Fatalf("Get(X) returned ok=false after Insert(X)")
@@ -121,20 +124,29 @@ func TestTable_MissingReturnsZero(t *testing.T) {
 	}
 }
 
-// TestTable_InsertZeroScopeIDIsNoOp guards against the most
-// common programmer bug: forgetting to mint the scope id
-// before insert. We do NOT want to silently overwrite a
-// `uuid.Nil` slot with the most recent stray binding; the
-// orchestrator catches the bug upstream.
-func TestTable_InsertZeroScopeIDIsNoOp(t *testing.T) {
+// TestTable_InsertZeroScopeIDReturnsError guards against the
+// most common programmer bug: forgetting to mint the scope id
+// before insert. A zero ScopeID is a wiring bug -- Insert
+// MUST surface it as a caller-visible [scopebinding.ErrZeroScopeID]
+// error and MUST NOT mutate the table; the orchestrator can
+// then either log the diagnostic (best-effort mode) or fail
+// loud (strict mode) rather than silently dropping a stray
+// binding.
+func TestTable_InsertZeroScopeIDReturnsError(t *testing.T) {
 	t.Parallel()
 	table := scopebinding.NewTable()
-	table.Insert(scopebinding.ScopeBinding{ScopeID: uuid.Nil, Signature: "stray"})
+	err := table.Insert(scopebinding.ScopeBinding{ScopeID: uuid.Nil, Signature: "stray"})
+	if err == nil {
+		t.Fatalf("expected error on zero ScopeID insert; got nil")
+	}
+	if !errors.Is(err, scopebinding.ErrZeroScopeID) {
+		t.Fatalf("expected errors.Is(err, ErrZeroScopeID); got err=%v", err)
+	}
 	if got := table.Len(); got != 0 {
-		t.Fatalf("zero ScopeID insert was not a no-op; Len()=%d", got)
+		t.Fatalf("zero ScopeID insert mutated the table; Len()=%d (want 0)", got)
 	}
 	if _, ok := table.Get(uuid.Nil); ok {
-		t.Fatalf("zero ScopeID lookup returned ok=true")
+		t.Fatalf("zero ScopeID lookup returned ok=true after rejected insert")
 	}
 }
 
@@ -154,7 +166,7 @@ func TestTable_ConcurrentInsert(t *testing.T) {
 	for i := 0; i < N; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			table.Insert(scopebinding.ScopeBinding{
+			if err := table.Insert(scopebinding.ScopeBinding{
 				ScopeID:   ids[idx],
 				ScopeKind: "method",
 				Signature: "pkg.Fn",
@@ -162,7 +174,9 @@ func TestTable_ConcurrentInsert(t *testing.T) {
 				StartLine: idx + 1,
 				EndLine:   idx + 10,
 				Language:  "go",
-			})
+			}); err != nil {
+				t.Errorf("concurrent Insert returned error: %v", err)
+			}
 		}(i)
 	}
 	wg.Wait()
@@ -190,8 +204,12 @@ func TestTable_LastWriteWins(t *testing.T) {
 	repoID := uuid.Must(uuid.NewV4())
 	id := scopebinding.MintScopeID(repoID, "method", "pkg.Fn", "abcd1234")
 	table := scopebinding.NewTable()
-	table.Insert(scopebinding.ScopeBinding{ScopeID: id, EndLine: 10})
-	table.Insert(scopebinding.ScopeBinding{ScopeID: id, EndLine: 25})
+	if err := table.Insert(scopebinding.ScopeBinding{ScopeID: id, EndLine: 10}); err != nil {
+		t.Fatalf("first Insert returned error: %v", err)
+	}
+	if err := table.Insert(scopebinding.ScopeBinding{ScopeID: id, EndLine: 25}); err != nil {
+		t.Fatalf("second Insert returned error: %v", err)
+	}
 	if got := table.Len(); got != 1 {
 		t.Fatalf("Len() after two inserts of same id = %d; want 1", got)
 	}

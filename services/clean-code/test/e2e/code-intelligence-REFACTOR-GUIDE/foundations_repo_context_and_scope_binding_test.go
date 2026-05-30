@@ -21,6 +21,21 @@ import (
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/scopebinding"
 )
 
+// e2eScopeIDNamespace is a test-local UUID namespace used to derive
+// deterministic uuid.UUID values from the string ScopeIDs in the
+// .feature file (e.g. "scope-abc-123"). It is intentionally
+// distinct from any production namespace so it cannot collide with
+// real scope identifiers.
+var e2eScopeIDNamespace = uuid.Must(uuid.FromString("00000000-0000-0000-0000-000000000001"))
+
+// e2eScopeID hashes a string ScopeID from the .feature file into a
+// deterministic UUID-v5 so insert and lookup steps produce the same
+// `ScopeBinding.ScopeID` value byte-for-byte without modifying the
+// production `scopebinding.Store` API.
+func e2eScopeID(scopeID string) uuid.UUID {
+	return uuid.NewV5(e2eScopeIDNamespace, scopeID)
+}
+
 // repoContextState holds per-scenario state for repo-context
 // and scope-binding scenarios.
 type repoContextState struct {
@@ -84,7 +99,7 @@ func (s *repoContextState) aGoModFileContaining(moduleDecl string) error {
 
 func (s *repoContextState) aScopeBindingInsertedWithScopeID(scopeID string) {
 	s.insertedBinding = scopebinding.ScopeBinding{
-		ScopeID:   scopeID,
+		ScopeID:   e2eScopeID(scopeID),
 		ScopeKind: "class",
 		FilePath:  "src/main/java/com/example/Foo.java",
 		StartLine: 10,
@@ -112,7 +127,7 @@ func (s *repoContextState) detectModulePathRuns() {
 }
 
 func (s *repoContextState) getScopeBindingRuns(scopeID string) {
-	s.retrievedBinding, s.retrieveErr = s.store.Get(scopeID)
+	s.retrievedBinding, s.retrieveErr = s.store.GetByString(e2eScopeID(scopeID).String())
 }
 
 // --- Then steps ---

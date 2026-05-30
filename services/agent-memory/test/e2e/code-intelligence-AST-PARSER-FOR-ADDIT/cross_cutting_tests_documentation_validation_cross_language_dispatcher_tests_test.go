@@ -144,7 +144,9 @@ type crossLangState struct {
 	emitErr     error
 
 	// ErrParserUnavailable (scenario 6)
-	logEntries []logEntry
+	unavailableReason string
+	unavailableExt    string
+	logEntries        []logEntry
 
 	// First-class attr key (scenario 7) — uses real ast.MergeLangMeta
 	parserLangMeta map[string]string
@@ -418,7 +420,8 @@ func (s *crossLangState) exactlyOneStaticCallsEdgeFromSiblingToStarFooBar() erro
 // ---------------------------------------------------------------------------
 
 func (s *crossLangState) aStubParserReturningErrParserUnavailableWithReason(reason, ext string) error {
-	// Setup deferred to the When step so the dispatcher is built fresh.
+	s.unavailableReason = reason
+	s.unavailableExt = ext
 	return nil
 }
 
@@ -427,7 +430,7 @@ func (s *crossLangState) emitFileProcessesAnExtFile(ext string) error {
 	stub := &unavailableParser{
 		lang:   "stub",
 		exts:   []string{ext},
-		reason: "test_unavailable",
+		reason: s.unavailableReason,
 	}
 	s.recorder = &recordingWriter{}
 	s.dispatcher = ast.NewDispatcher(

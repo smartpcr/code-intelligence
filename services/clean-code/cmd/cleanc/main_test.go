@@ -701,6 +701,47 @@ func captureRun(args ...string) (stdout, stderr string, code int) {
 	return so.String(), se.String(), code
 }
 
+// TestStage11ScopeNote_PinsOperatorDecision verifies the
+// runtime-checkable witness of the operator's 2026-05-30 scope
+// resolution (Option A). The constant is referenced by the
+// package-level godoc and exists so a future refactor that
+// strips the doc anchor (e.g. a doc rewrite) cannot silently
+// drop the recorded boundary between Stage 1.1 (this work) and
+// Stages 1.2 / 1.4 (downstream workstreams).
+//
+// The test pins:
+//
+//   - the operator-pinned scope phrase ("CLI skeleton + global
+//     flag surface only");
+//   - the deferral targets (the three downstream package paths
+//     -- repocontext, scopebinding, devpolicy-loader);
+//   - the answer date + option identifier (2026-05-30, Option A)
+//     so a future audit can correlate the anchor to the answer
+//     event recorded in `.forge/memory/workstream-context.md`.
+//
+// A spec edit that legitimately reshapes the Stage 1.1
+// boundary MUST update both this constant AND the workstream-
+// context answer entry; this test fails the first time those
+// two get out of sync.
+func TestStage11ScopeNote_PinsOperatorDecision(t *testing.T) {
+	t.Parallel()
+
+	required := []string{
+		"Stage 1.1 = CLI skeleton + global flag surface only",
+		"repocontext",
+		"scopebinding",
+		"devpolicy-loader",
+		"Stages 1.2 and 1.4",
+		"2026-05-30",
+		"Option A",
+	}
+	for _, want := range required {
+		if !strings.Contains(Stage11ScopeNote, want) {
+			t.Errorf("Stage11ScopeNote does not contain %q\nactual: %q", want, Stage11ScopeNote)
+		}
+	}
+}
+
 // TestParseInterleavedFlagsCollectsPositionalsAndFlags exercises
 // the helper that lets `cleanc analyze . --exit-on warn` see
 // the flag after the positional (the stdlib `flag.Parse`

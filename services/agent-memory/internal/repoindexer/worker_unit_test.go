@@ -11,47 +11,6 @@ import (
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
 )
 
-// TestCanonicalSignatures_disambiguatePkgAndFile pins the
-// rationale that `::pkg::` and `::file::` separators prevent
-// collisions between a directory and a same-named file.
-func TestCanonicalSignatures_disambiguatePkgAndFile(t *testing.T) {
-	t.Parallel()
-	url := "https://example.test/repo"
-	pkgSig := canonicalPackageSig(url, "foo.go")
-	fileSig := canonicalFileSig(url, "foo.go")
-	if pkgSig == fileSig {
-		t.Errorf("pkg and file signatures must not collide: %s", pkgSig)
-	}
-	if !strings.Contains(pkgSig, "::pkg::") {
-		t.Errorf("pkg signature missing ::pkg:: separator: %s", pkgSig)
-	}
-	if !strings.Contains(fileSig, "::file::") {
-		t.Errorf("file signature missing ::file:: separator: %s", fileSig)
-	}
-}
-
-// TestCanonicalPackageDir_rootCollapses asserts the rationale
-// for collapsing "." (path.Dir's "no parent" sentinel) to ""
-// so the canonical signature reads consistently for repo-root
-// files.
-func TestCanonicalPackageDir_rootCollapses(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		in, want string
-	}{
-		{"README.md", ""},
-		{"a/b.go", "a"},
-		{"a/b/c.go", "a/b"},
-	}
-	for _, c := range cases {
-		t.Run(c.in, func(t *testing.T) {
-			if got := canonicalPackageDir(c.in); got != c.want {
-				t.Errorf("canonicalPackageDir(%q) = %q, want %q", c.in, got, c.want)
-			}
-		})
-	}
-}
-
 // TestNewWorker_panicsOnNilCorePieces guards the constructor
 // contract: a nil DB, nil writer, nil materializer, or nil
 // publisher is a programming error worth panicking on rather

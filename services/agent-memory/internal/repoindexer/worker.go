@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"path"
 	"time"
 
 	"github.com/lib/pq"
@@ -1089,7 +1088,7 @@ func (w *Worker) runFull(ctx context.Context, job Job) (FullSummary, error) {
 	repoNode, err := w.writer.InsertNode(ctx, graphwriter.NodeInput{
 		RepoID:             job.RepoID,
 		Kind:               "repo",
-		CanonicalSignature: canonicalRepoSig(repoURL),
+		CanonicalSignature: CanonicalRepoSig(repoURL),
 		FromSHA:            job.ToSHA,
 		AttrsJSON:          repoAttrs,
 	})
@@ -1111,7 +1110,7 @@ func (w *Worker) runFull(ctx context.Context, job Job) (FullSummary, error) {
 	packages := make(map[string]pkgEntry)
 
 	walkErr := ws.Walk(func(file WalkFile) error {
-		dir := canonicalPackageDir(file.RelPath)
+		dir := CanonicalPackageDir(file.RelPath)
 		pkg, ok := packages[dir]
 		if !ok {
 			pkgAttrs, mErr := json.Marshal(fullModeAttrs{
@@ -1123,7 +1122,7 @@ func (w *Worker) runFull(ctx context.Context, job Job) (FullSummary, error) {
 			pkgRec, pErr := w.writer.InsertNode(ctx, graphwriter.NodeInput{
 				RepoID:             job.RepoID,
 				Kind:               "package",
-				CanonicalSignature: canonicalPackageSig(repoURL, dir),
+				CanonicalSignature: CanonicalPackageSig(repoURL, dir),
 				ParentNodeID:       repoNode.NodeID,
 				FromSHA:            job.ToSHA,
 				AttrsJSON:          pkgAttrs,
@@ -1164,7 +1163,7 @@ func (w *Worker) runFull(ctx context.Context, job Job) (FullSummary, error) {
 		fileRec, fErr := w.writer.InsertNode(ctx, graphwriter.NodeInput{
 			RepoID:             job.RepoID,
 			Kind:               "file",
-			CanonicalSignature: canonicalFileSig(repoURL, file.RelPath),
+			CanonicalSignature: CanonicalFileSig(repoURL, file.RelPath),
 			ParentNodeID:       pkg.nodeID,
 			FromSHA:            job.ToSHA,
 			AttrsJSON:          fileAttrs,
@@ -1219,41 +1218,9 @@ func (w *Worker) runFull(ctx context.Context, job Job) (FullSummary, error) {
 	return summary, nil
 }
 
-// canonicalRepoSig is the canonical signature for the root Repo
-// Node. Just the URL -- there's only one Repo Node per repo so a
-// richer signature would be redundant.
-func canonicalRepoSig(repoURL string) string { return repoURL }
-
-// canonicalPackageDir normalises the directory key the
-// package cache uses. Returns "" for files at the repo root (so
-// the root "package" has a stable signature) and the
-// forward-slash directory path otherwise.
-//
-// path.Dir from Go's standard library returns "." for files
-// without a directory; we collapse that to "" so the canonical
-// signature reads as `<url>::pkg::` rather than `<url>::pkg::.`,
-// matching how operators expect to read the value.
-func canonicalPackageDir(relPath string) string {
-	d := path.Dir(relPath)
-	if d == "." || d == "/" {
-		return ""
-	}
-	return d
-}
-
-// canonicalPackageSig is the canonical signature for a Package
-// Node. The format is `<repo url>::pkg::<dir path>` where the
-// dir path is forward-slash relative. Choosing a distinct
-// `::pkg::` separator prevents collisions with the file-level
-// canonical signature `::file::<path>` -- a directory named
-// `foo.go` cannot collide with a file named `foo.go` because
-// the segment between `<repo url>` and the path differs.
-func canonicalPackageSig(repoURL, dir string) string {
-	return repoURL + "::pkg::" + dir
-}
-
-// canonicalFileSig is the canonical signature for a File Node.
-// Format `<repo url>::file::<rel path>`.
-func canonicalFileSig(repoURL, relPath string) string {
-	return repoURL + "::file::" + relPath
-}
+// The four canonical-signature helpers (CanonicalRepoSig,
+// CanonicalPackageDir, CanonicalPackageSig, CanonicalFileSig)
+// were promoted out of this file into canonical.go so other
+// packages (graphsink backends, the diagram projector) can mint
+// matching identities. See canonical.go for the definitions and
+// canonical_test.go for the byte-output pins.

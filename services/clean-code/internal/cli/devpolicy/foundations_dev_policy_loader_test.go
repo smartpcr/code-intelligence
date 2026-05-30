@@ -9,6 +9,7 @@ package devpolicy_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
@@ -251,13 +252,39 @@ func TestProdRefusal_e2e_check(t *testing.T) {
 	}
 }
 `
-	tmpFile := filepath.Join(s.modRoot, "internal", "cli", "devpolicy", "prod_e2e_check_test.go")
-	if err := os.WriteFile(tmpFile, []byte(testCode), 0644); err != nil {
+	// Write the temp test file into an OS temp directory instead of the
+	// source tree, then use -overlay to map it into the package for the
+	// go test invocation.  This avoids leaving a _test.go behind if the
+	// process is killed before cleanup runs.
+	tmpDir, err := os.MkdirTemp("", "prod-e2e-check-*")
+	if err != nil {
+		return fmt.Errorf("creating temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	tmpTestFile := filepath.Join(tmpDir, "prod_e2e_check_test.go")
+	if err := os.WriteFile(tmpTestFile, []byte(testCode), 0644); err != nil {
 		return fmt.Errorf("writing temp prod test: %w", err)
 	}
-	defer os.Remove(tmpFile)
 
-	cmd := exec.Command("go", "test", "-tags", "prod", "-run", "TestProdRefusal_e2e_check", "-count=1", "-v", "./internal/cli/devpolicy/")
+	// Build the overlay JSON that maps the virtual source-tree path to
+	// the actual temp file so `go test` sees it inside the package.
+	virtualPath := filepath.Join(s.modRoot, "internal", "cli", "devpolicy", "prod_e2e_check_test.go")
+	overlay := struct {
+		Replace map[string]string `json:"Replace"`
+	}{
+		Replace: map[string]string{virtualPath: tmpTestFile},
+	}
+	overlayJSON, err := json.Marshal(overlay)
+	if err != nil {
+		return fmt.Errorf("marshalling overlay JSON: %w", err)
+	}
+	overlayFile := filepath.Join(tmpDir, "overlay.json")
+	if err := os.WriteFile(overlayFile, overlayJSON, 0644); err != nil {
+		return fmt.Errorf("writing overlay.json: %w", err)
+	}
+
+	cmd := exec.Command("go", "test", "-overlay", overlayFile, "-tags", "prod", "-run", "TestProdRefusal_e2e_check", "-count=1", "-v", "./internal/cli/devpolicy/")
 	cmd.Dir = s.modRoot
 	out, err := cmd.CombinedOutput()
 	s.prodOut = string(out)

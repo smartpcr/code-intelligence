@@ -15,7 +15,7 @@ func CanonicalRepoSig(repoURL string) string {
 func CanonicalPackageDir(relPath string) string {
 	normalized := strings.ReplaceAll(relPath, "\\", "/")
 	dir := path.Dir(normalized)
-	if dir == "." {
+	if dir == "." || dir == "/" {
 		return ""
 	}
 	return dir

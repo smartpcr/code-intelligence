@@ -1,8 +1,11 @@
-module github.com/smartpcr/code-intelligence/services/clean-code
+module github.com/microsoft/cleancode-service
 
-go 1.25.1
+go 1.22.0
 
-require github.com/cucumber/godog v0.15.0
+require (
+	github.com/cucumber/godog v0.15.0
+	gopkg.in/yaml.v3 v3.0.1
+)
 
 require (
 	github.com/cucumber/gherkin/go/v26 v26.2.0 // indirect

@@ -1,12 +1,13 @@
 // -----------------------------------------------------------------------
-// <copyright file="embedded_fs.go" company="Microsoft Corp.">
+// <copyright file="embed_prod.go" company="Microsoft Corp.">
 //     Copyright (c) Microsoft Corp. All rights reserved.
 // </copyright>
 // -----------------------------------------------------------------------
 
-package rulepacks
+//go:build prod
 
-import "embed"
+package devpolicy
 
-//go:embed solid/*.yaml decoupling/*.yaml
-var EmbeddedFS embed.FS
+import "io/fs"
+
+var embeddedRulePacks fs.FS

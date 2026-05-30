@@ -1,12 +1,8 @@
 // -----------------------------------------------------------------------
-// <copyright file="embedded_fs.go" company="Microsoft Corp.">
+// <copyright file="doc.go" company="Microsoft Corp.">
 //     Copyright (c) Microsoft Corp. All rights reserved.
 // </copyright>
 // -----------------------------------------------------------------------
 
-package rulepacks
-
-import "embed"
-
-//go:embed solid/*.yaml decoupling/*.yaml
-var EmbeddedFS embed.FS
+// Package scopebinding provides scope binding for the CLI (stub for Phase 1 gate).
+package scopebinding

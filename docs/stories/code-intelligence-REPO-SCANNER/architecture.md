@@ -242,10 +242,17 @@ type Sink interface {
 }
 ```
 
-The `RepoInput` / `RepoRecord` / `CommitInput` / `CommitRecord` types
-are reused verbatim from `internal/graphwriter` -- there is no new DTO
-introduced at this seam. Field-level shapes belong to **tech-spec.md
-S5**.
+The `RepoRecord` / `CommitInput` / `CommitRecord` types are reused
+verbatim from `internal/graphwriter`. The `RepoInput` type is
+**extended** in this story with one new optional field
+`RepoID fingerprint.RepoID` (zero-valued for legacy mgmt-api /
+queue-worker callers; non-zero for codeintel-CLI callers, where it
+carries the deterministic `fingerprint.RepoIDFromURL(URL)` value
+the Postgres adapter forwards to `graphwriter.Writer.EnsureRepoWithID`
+and the SQLite/memory adapters use as the inserted PK). See S3.4
+for the full rationale of why the field is needed and S2 / R5 for
+the parity invariant it enforces. Field-level shapes belong to
+**tech-spec.md S5**.
 
 #### 3.2.1 Backend matrix
 
@@ -1126,11 +1133,27 @@ in the org.
 Same as Scenario A except the CLI selects the Postgres backend and
 takes the same `AGENT_MEMORY_PG_URL` env var the
 `cmd/repoindexer/main.go` worker uses. Because the backend forwards
-1:1 to `*graphwriter.Writer`, the resulting `node` / `edge` rows are
-byte-identical to what the queue worker would produce -- the
-backend-parity test in **implementation-plan.md S6** asserts equal `(repo_id,
-fingerprint)` tuples across a `--store=sqlite` scan and a
-`--store=postgres` scan of the same fixture.
+1:1 to `*graphwriter.Writer` (with one extension: the adapter calls
+the new `EnsureRepoWithID` when `RepoInput.RepoID` is non-zero so
+the deterministic UUID from `fingerprint.RepoIDFromURL(URL)` lands
+as the row's primary key instead of `gen_random_uuid()`), the
+resulting `node` / `edge` rows for repos first ingested via this
+story's code path are byte-identical to what a queue-worker
+ingestion would produce IF the worker / mgmt-api path is also
+migrated to set `RepoInput.RepoID` (a follow-up story, not in
+scope here). For repos first ingested via the legacy worker /
+mgmt-api path -- which today omits `RepoInput.RepoID` and accepts
+the schema-default random UUID -- the existing rows keep their
+non-deterministic `repo_id` and the `--store=postgres` CLI scan
+sees them on `ON CONFLICT (url) DO UPDATE`; in that case the
+Postgres rows and a fresh `--store=sqlite` scan of the same URL
+do NOT match (the deterministic vs random `repo_id` flows into
+every `NodeFingerprint`). The backend-parity test in
+**implementation-plan.md S6** asserts equal `(repo_id, fingerprint)`
+tuples for a `--store=sqlite` scan against a `--store=postgres`
+scan of the same fixture into a clean schema where both runs use
+the deterministic-ID path; the legacy-data case is a documented
+exception.
 
 This is the only path that exercises the AGENT-MEMORY G5 tombstone /
 retirement invariants. The CLI does NOT trigger the delta handler; if
@@ -1305,3 +1328,14 @@ allowed to assume a different default.
   contracts in `internal/repoindexer/materialize.go` are
   unchanged. S6.1 sequence's mtime-hash step relabelled
   accordingly.
+- 2026-05-30 (iter 5): minor consistency cleanup. (a) S3.2 seam
+  text fixed: `RepoInput` is explicitly called out as EXTENDED
+  with the new optional `RepoID fingerprint.RepoID` field rather
+  than "reused verbatim" -- this resolves the S3.2 vs S3.4
+  contradiction the iter-4 evaluator flagged. (b) S6.5 Postgres-
+  vs-queue-worker parity wording rewritten: the claim is now
+  scoped to "repos first ingested via this story's code path"
+  with the legacy-data exception documented inline; the wording
+  also makes the Postgres adapter's `EnsureRepoWithID` extension
+  visible at the parity claim site so readers don't have to
+  cross-reference S3.4.

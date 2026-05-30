@@ -71,6 +71,19 @@ const (
 	// the guard misses a more elaborate cycle.
 	SkipReasonSymlinkLoop = "symlink_loop"
 
+	// SkipReasonSymlink is emitted for any symlink the
+	// walker visits whose target is NOT a detected
+	// ancestor loop. The walker intentionally never
+	// follows symlinks (the loop guard is best-effort and
+	// [filepath.WalkDir] does not descend into them by
+	// default), but the entry was seen on disk so it
+	// surfaces here to preserve the channel contract:
+	// every visited entry appears on EXACTLY ONE of the
+	// files or skips channels. The orchestrator can then
+	// account for symlinked source files in the skip
+	// summary instead of having them vanish silently.
+	SkipReasonSymlink = "symlink"
+
 	// SkipReasonReadError is emitted when reading a file's
 	// bytes fails (permission denied, transient IO error).
 	// Per `tech-spec.md` C8 the walker continues; the read
@@ -349,10 +362,15 @@ func (w *DefaultWalker) run(ctx context.Context, root string, files chan<- Walke
 
 		// 3. Symlink-loop guard. Symlinks to non-loop
 		//    targets are NOT followed (WalkDir's default);
-		//    only true ancestor cycles are reported.
+		//    true ancestor cycles surface as symlink_loop,
+		//    every other symlink surfaces as the generic
+		//    symlink skip so the entry never disappears
+		//    silently from the channel contract.
 		if isSymlink(d) {
 			if loopsToAncestor(absPath) {
 				sendSkip(ctx, skips, WalkSkip{Path: relPath, Reason: SkipReasonSymlinkLoop})
+			} else {
+				sendSkip(ctx, skips, WalkSkip{Path: relPath, Reason: SkipReasonSymlink})
 			}
 			// Either way we do not recurse into the
 			// symlink target.

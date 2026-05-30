@@ -265,29 +265,45 @@ storyId: "code-intelligence:REPO-SCANNER"
 - **Local**: `docker compose -f
   tests/e2e/phase-3-graphsink-storage-abstraction/docker-compose.yml
   up -d` brings up Postgres 16 (matching the production schema
-  via `migrations/0001`-`0023`); then `cd services/agent-memory
-  && go test ./internal/graphsink/... -tags integration` exercises
-  all three sinks. Unit-only runs (no docker) work with `go test
-  ./internal/graphsink/... -short`.
+  range from `migrations/0001_enums.sql` through
+  `migrations/0022_edge_kind_overrides.sql` -- the current tree
+  HEAD); then `cd services/agent-memory && go test
+  ./internal/graphsink/... -tags integration` exercises all
+  three sinks. The integration test fixtures apply the schema
+  programmatically via `migrations.New(db).Up(ctx)` (the same
+  helper used by `internal/graphwriter/writer_integration_test.go`
+  line 107 and ~20 other `*_integration_test.go` files in this
+  service); no shell-level `psql -f` step is required because
+  the repo has no consolidated `all.sql` artifact. Unit-only
+  runs (no docker) work with `go test ./internal/graphsink/...
+  -short`.
 - **CI runner**: GitHub-hosted `ubuntu-latest` (the existing
   `agent-memory-ci.yml` workflow already runs docker compose for
   the queue worker's integration tests). Job uses the standard
   `docker-compose` action; no self-hosted runner.
-- **Secrets**: none -- the compose file embeds a local-only
-  Postgres role (`agent_memory_app` / `agent_memory_app`) per
-  the convention used in the existing
-  `tests/e2e/phase-09-audit-wal/docker-compose.yml`. Connection
-  strings are read from the env var `AGENT_MEMORY_PG_URL` (no
-  literal credentials in test code).
+- **Secrets**: none. All Postgres connection details (host,
+  port, role, password, database) are read by the test process
+  from the single env var `AGENT_MEMORY_PG_URL`; no literal
+  credentials appear in test source or this doc. The compose
+  file at `tests/e2e/phase-3-graphsink-storage-abstraction/docker-compose.yml`
+  defines an isolated local-only Postgres service whose
+  credentials are set by the compose env block (in-file, not
+  exported), and the CI workflow injects the matching
+  `AGENT_MEMORY_PG_URL` via the standard
+  `agent-memory-ci.yml` job-env step.
 - **Pre-test bootstrap**:
   - `docker compose -f
     tests/e2e/phase-3-graphsink-storage-abstraction/docker-compose.yml
     up -d` (services started: `postgres`).
-  - `psql "$AGENT_MEMORY_PG_URL" -f services/agent-memory/migrations/all.sql`
-    (re-applies migrations 0001-0023 against the fresh DB; the
-    compose file's healthcheck must report `healthy` before this
-    step runs).
+  - Wait for the compose `postgres` healthcheck to report
+    `healthy` (the existing
+    `tests/e2e/phase-09-audit-wal/docker-compose.yml`
+    healthcheck pattern -- `pg_isready` with 5s interval -- is
+    reused verbatim).
   - `go test -tags integration ./internal/graphsink/...`
+    (the test `TestMain` calls `migrations.New(db).Up(ctx)` to
+    apply the full migration set against the empty schema; no
+    separate migration shell step exists or is needed).
 
 ### Scenarios
 - **Scenario:** sink-interface-satisfied-by-stub
@@ -890,9 +906,16 @@ storyId: "code-intelligence:REPO-SCANNER"
 - **Type**: compose
 - **Local**: `docker compose -f
   tests/e2e/phase-7-serve-endpoint/docker-compose.yml up -d`
-  brings up Postgres 16 (for `--store=postgres` parity) and a
-  `codeintel-serve` container running `codeintel serve --store
-  sqlite --db /data/polyglot.db --addr :8088`. Then `cd
+  brings up Postgres 16 (for `--store=postgres` parity, schema
+  range `migrations/0001_enums.sql` through
+  `migrations/0022_edge_kind_overrides.sql` -- the current tree
+  HEAD) and a `codeintel-serve` container running `codeintel
+  serve --store sqlite --db /data/polyglot.db --addr :8088`.
+  The Postgres schema is applied programmatically by the test
+  process via `migrations.New(db).Up(ctx)` (the helper used
+  across the existing `*_integration_test.go` suite -- e.g.
+  `internal/mgmtapi/read_integration_test.go` line 118); the
+  repo has no consolidated `all.sql` artifact. Then `cd
   services/agent-memory && go test ./cmd/codeintel/... -tags
   integration -run TestServe`. Unit-only runs (httptest, no
   docker) use `go test ./cmd/codeintel/... -short -run
@@ -901,26 +924,38 @@ storyId: "code-intelligence:REPO-SCANNER"
   `agent-memory-ci.yml` workflow already exercises docker
   compose for the queue worker). Labels: `ubuntu-latest`. No
   self-hosted runner.
-- **Secrets**: none. The Postgres role lives in the compose
-  file. Cross-origin tests reference the dev origin via the env
-  var `CODEINTEL_CORS_ORIGIN=http://localhost:5173`
-  (architecture S9.2, tech-spec S6.3); the bind address is
-  parameterised through `CODEINTEL_SERVE_ADDR`. Connection
-  strings appear ONLY as env-var names in test source
-  (`AGENT_MEMORY_PG_URL`, `CODEINTEL_DB_PATH`).
+- **Secrets**: none. All connection details (Postgres host,
+  port, role, password, database; serve bind address; CORS dev
+  origin) are read from env vars in test source and never
+  appear as literals: `AGENT_MEMORY_PG_URL` (Postgres DSN),
+  `CODEINTEL_DB_PATH` (SQLite path mounted into the
+  `codeintel-serve` container), `CODEINTEL_SERVE_ADDR` (HTTP
+  bind), `CODEINTEL_CORS_ORIGIN` (pinned to
+  `http://localhost:5173` per architecture S9.2 and tech-spec
+  S6.3). Postgres credentials live exclusively inside the
+  compose service's env block; the CI workflow injects the
+  matching `AGENT_MEMORY_PG_URL` via the existing
+  `agent-memory-ci.yml` job-env step.
 - **Pre-test bootstrap**:
   - `docker compose -f
     tests/e2e/phase-7-serve-endpoint/docker-compose.yml up -d`
     (services started: `postgres`, `codeintel-serve`).
-  - `psql "$AGENT_MEMORY_PG_URL" -f
-    services/agent-memory/migrations/all.sql`.
+  - Wait for the compose `postgres` healthcheck (`pg_isready`,
+    5s interval -- reusing the pattern from
+    `tests/e2e/phase-09-audit-wal/docker-compose.yml`).
   - `./bin/codeintel scan
     ./internal/repoindexer/ast/testdata/polyglot --store sqlite
-    --out /data/polyglot.db` (populates the volume mounted by
-    the `codeintel-serve` container).
+    --out "$CODEINTEL_DB_PATH"` (populates the SQLite file
+    mounted at the path the `codeintel-serve` container
+    reads).
+  - For the Postgres-backed scenarios: `go test -tags
+    integration -run TestServePostgres ./cmd/codeintel/...`
+    (the test `TestMain` calls `migrations.New(db).Up(ctx)`
+    before the first scenario runs; no separate migration
+    shell step exists or is needed).
   - Wait for `curl -sf
-    "http://localhost:${CODEINTEL_SERVE_ADDR##*:}/api/repos"` to
-    succeed before invoking the test suite.
+    "http://localhost:${CODEINTEL_SERVE_ADDR##*:}/api/repos"`
+    to succeed before invoking the SQLite-backed test suite.
 
 ### Scenarios
 - **Scenario:** serve-binds-on-supplied-addr
@@ -1376,3 +1411,25 @@ storyId: "code-intelligence:REPO-SCANNER"
   No `lab-*` setup type is used because the story is a
   developer-tool CLI with hosted-runner-friendly toolchain
   needs (CGO + `pwsh`).
+- 2026-05-30 (iter 2): addressed both evaluator findings from
+  iter 1 (score 86). Item 1 (Phase 3 + Phase 7 compose-bootstrap
+  referenced a non-existent `services/agent-memory/migrations/all.sql`
+  and the wrong upper bound `0001-0023`) is now FIXED: the
+  Phase 3 and Phase 7 setup envelopes name the real migration
+  range as `migrations/0001_enums.sql` through
+  `migrations/0022_edge_kind_overrides.sql` (the actual current
+  tree HEAD), and the shell-level `psql -f all.sql` step is
+  replaced by an in-process `migrations.New(db).Up(ctx)`
+  invocation from the integration-test `TestMain` -- the same
+  helper used by `internal/graphwriter/writer_integration_test.go`
+  line 107 and ~20 other `*_integration_test.go` files across
+  the agent-memory service. Item 2 (Phase 3 Secrets bullet
+  reproduced a `role / password` literal) is FIXED: the bullet
+  now references only env-var names
+  (`AGENT_MEMORY_PG_URL`) and notes that credential material
+  lives exclusively inside the compose service's env block --
+  no role / password literals appear in the plan doc. The
+  Phase 7 Secrets bullet was re-stated for symmetry to make
+  the env-var-only contract explicit there too. Stale snapshot
+  file `e2e-scenarios.md.iter-snapshot.bak` (which still held
+  the pre-fix phrasing) was removed from the story directory.

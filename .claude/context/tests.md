@@ -24,10 +24,11 @@ skipped.
 | ---------- | ------------------------ | ------------------------- | ----------------- |
 | TypeScript | `.ts .tsx .js .jsx .mjs .cjs` | tree-sitter (`typescript`/`tsx`) | scanner (`parser_typescript.go`) |
 | Python     | `.py .pyi`               | tree-sitter (`python`)    | scanner (`parser_python.go`) |
-| Go         | `.go`                    | tree-sitter (`golang`)    | (none -- file skipped) |
-| C          | `.c .h`                  | tree-sitter (`c`) ΓÇö **stub** in this stage; full walker lands via sibling `stage-3.1-ctreesitterparser-implementation` | (none -- file skipped) |
-| C#         | `.cs`                    | tree-sitter (`csharp`) ΓÇö **stub** in this stage (iter 9); full walker lands via sibling `stage-4.1-csharptreesitterparser-implementation` | (none -- file skipped) |
-| Rust       | `.rs`                    | tree-sitter (`rust`)    | (none -- file skipped) |
+| Go         | `.go`                    | tree-sitter (`golang`)    | (none — file skipped) |
+| C          | `.c .h`                  | tree-sitter (`c`) — **stub** in this stage; full walker lands via sibling `stage-3.1-ctreesitterparser-implementation` | (none — file skipped) |
+| C++        | `.cc .cpp .cxx .c++ .hpp .hh .hxx .h++` | tree-sitter (`cpp`) | (none — file skipped) |
+| C#         | `.cs`                    | tree-sitter (`csharp`) — **stub** in this stage (iter 9); full walker lands via sibling `stage-4.1-csharptreesitterparser-implementation` | (none — file skipped) |
+| Rust       | `.rs`                    | tree-sitter (`rust`)    | (none — file skipped) |
 | PowerShell | `.ps1 .psm1 .psd1`      | subprocess (`pwsh`)     | subprocess (`pwsh`)    |
 
 ### Skip keys

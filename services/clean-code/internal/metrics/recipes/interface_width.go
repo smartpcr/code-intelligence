@@ -296,15 +296,18 @@ func isGoExportedName(name string) bool {
 
 // isPythonPublicName implements the PEP-8 visibility
 // convention: a name is private iff it starts with `_` BUT a
-// name starting with `__` (dunder) is part of the public
-// surface (the language's special-method protocol -- e.g.
-// `__init__`, `__str__`, `__eq__` -- is the canonical public
-// hook into a class).
+// dunder name (double underscore on BOTH sides, e.g.
+// `__init__`, `__str__`, `__eq__`) is part of the public
+// surface -- it is the language's special-method protocol and
+// the canonical public hook into a class. Names with a double
+// leading underscore but no trailing `__` (e.g.
+// `__private_method`) trigger Python's name-mangling and are
+// private.
 func isPythonPublicName(name string) bool {
 	if name == "" {
 		return false
 	}
-	if strings.HasPrefix(name, "__") {
+	if strings.HasPrefix(name, "__") && strings.HasSuffix(name, "__") && len(name) > 4 {
 		return true
 	}
 	if strings.HasPrefix(name, "_") {

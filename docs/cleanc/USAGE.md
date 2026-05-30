@@ -173,3 +173,24 @@ cleanc not-a-verb
 - `docs/stories/code-intelligence-REFACTOR-GUIDE/implementation-plan.md`
   - **Stage 1.1** — this skeleton.
   - **Stages 1.2 / 1.4 / 2.x / 3.x / 4.x** — downstream wiring that replaces each Stage 1.1 stub.
+
+## 8. Stage 1.1 scope boundary
+
+Per the operator's 2026-05-30 wizard answers, the Stage 1.1
+workstream lives entirely under
+`services/clean-code/cmd/cleanc/`,
+`services/clean-code/internal/cli/flags/`, and the
+`services/clean-code/internal/cli/devpolicy/` shells
+(sentinels + bypass + banner + build-tag matrix).  The
+`internal/cli/repocontext/` and `internal/cli/scopebinding/`
+minter bodies are deferred to **Stage 1.2**
+(implementation-plan lines 46-54); the `devpolicy/loader.go`
+body and `embed.go` are deferred to **Stage 1.4**
+(implementation-plan lines 90-100).
+
+The operator's pin — *"Iter-9 commit `40b4139` already implements
+this interpretation"* — closes the recurring iter-2/3/8/9
+"missing files" critique.  The code-level witness is the
+`Stage11ScopeNote` constant in
+`services/clean-code/cmd/cleanc/doc.go`, asserted by
+`TestStage11ScopeNote_PinsOperatorDecision`.

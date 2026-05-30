@@ -144,3 +144,6 @@ services/clean-code/deploy/local/**/_data/
 
 .worktree/
 .forge/
+
+# Forge plan-doc allowlist (auto-fix)
+!/tests/

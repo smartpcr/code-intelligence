@@ -1,104 +1,57 @@
 # clean-code Stage 5.5 -- SOLID / Single Responsibility rule pack
 #
 # Architecture references:
-#   - Sec 1.3 "SOLID coding principles" (goal 2): the SRP rule
-#     emits findings on classes that mix too many concerns.
-#   - Sec 1.4.1 canonical metric_kinds (architecture lines
-#     97 and 101):
-#       * `lcom4` (class scope, pack=solid): "Lack of cohesion
-#         of methods (LCOM4 variant). Drives SRP rule."
+#   - Sec 1.3 "SOLID coding principles" (goal 2): the SRP
+#     smell is a class doing too many things, revealed by
+#     low cohesion (LCOM4) or a class-scope public surface
+#     that is too wide (interface_width).
+#   - Sec 1.4.1 canonical metric_kind (line 101):
+#       * `lcom4` (class scope, pack=solid): "Lack of
+#         Cohesion of Methods. Drives SRP rule."
 #       * `interface_width` (class, interface scope,
-#         pack=solid): "Public method count. Drives ISP rule."
-#         For SRP we focus on the CLASS scope -- a class with
-#         too many public methods is doing too many things.
-#   - Sec 3.5.1.a SOLID input recipe for SRP: "A class with
-#     `lcom4 >= threshold AND interface_width >= threshold` is
-#     flagged."
-#
-# # Why two rules instead of one compound predicate
-#
-# The DSL evaluator (Stage 5.4) operates on a SINGLE
-# [dsl.Sample] row at a time -- there is no join across
-# samples. A "compound" predicate that references both
-# `lcom4` AND `interface_width` cannot fire because no single
-# sample carries both metric_kinds. The implementation-plan
-# Stage 5.7 SOLID Rule Engine is the canonical composer: it
-# aggregates findings by `(scope_id, policy_version_id)` and
-# reports the conjunctive smell ("both rules fire on the same
-# class") as a higher-tier insight. The two rules here are
-# the INPUT signals that feed that composition; each is a
-# warn-severity hot-spot indicator on its own.
-#
-# # Why scope_kind == 'class'
-#
-# Both `lcom4` and `interface_width` are class-scoped per
-# architecture Sec 1.4.1. Pinning `scope_kind == 'class'` in
-# the predicate is belt-and-braces: lcom4 has no other valid
-# scope, but interface_width is shared with ISP (which
-# scopes to `interface`); explicit scope binding keeps SRP
-# findings off interface samples and prevents accidental
-# cross-rule firings as the catalogue grows.
-#
-# # Threshold rationale (v1 defaults)
-#
-#   - lcom4 >= 10: a class with LCOM4 in double digits has at
-#     least 10 disconnected method-attribute clusters -- the
-#     canonical Chidamber-Kemerer band where the cohesion
-#     loss is operator-visible.
-#   - interface_width >= 15: a public surface of 15+ methods
-#     on one class is the "god class" warning band; the
-#     ISP rule uses a higher cut-off (20) on `interface`
-#     scope, so the two thresholds do not collide.
-#
-# Operators re-tune by republishing this pack at `version=2`
-# with edited literal cut-offs. v1 deliberately uses literal
-# predicates (matching `decoupling/cycles.yaml`) rather than
-# `threshold('<uuid>')` atoms because the implementation-plan
-# Stage 5.5 brief (line 517) does not mandate Threshold-row
-# extraction for SOLID -- only the Stage 5.6 decoupling
-# coupling rule does.
+#         pack=solid): "Public method count. Drives ISP
+#         rule." -- also used by SRP on class scope.
+#   - Sec 3.5.1.a SOLID input recipe for SRP: "Inputs:
+#     `lcom4` (class), `interface_width` (class). A class
+#     with `lcom4 >= threshold AND interface_width >=
+#     threshold` is flagged."
+#   - implementation-plan Stage 5.5 brief (line 516): "Add
+#     `policy/rulepacks/solid/srp.yaml`: SRP rule per
+#     architecture Sec 1.3 consuming `metric_kind IN
+#     ('lcom4','interface_width')`."
 #
 # # pack_id convention
 #
-# `<family>.<subname>` per the `clean_code.rule_pack.pack_id`
-# column comment in migration `0003_policy_audit_refactor.up.sql`
-# line 200: "(e.g. `solid.srp`, `solid.dip`, `decoupling.cycles`,
-# `base.complexity`)". Existing tests
-# (`internal/policy/steward/helpers_test.go`,
-# `cmd/clean-coded/routes_test.go`,
-# `internal/management/override_verbs_test.go`) all reference
-# pack_id `solid.srp` and rule_id `solid.srp.lcom4_high`
-# verbatim, so this file pins those literals as the source of
-# truth.
+# `<family>.<subname>` per migration
+# `0003_policy_audit_refactor.up.sql` line 200.
 pack_id: solid.srp
 version: 1
 display_name: SOLID -- Single Responsibility
 description_md: |-
-  Two input rules that watch the canonical SRP metric_kinds
-  on class scope: `lcom4` (cohesion loss) and
-  `interface_width` (public surface). Each fires
-  independently at severity=warn; the Stage 5.7 SOLID Rule
-  Engine composes the conjunctive "high LCOM4 AND wide
-  interface" finding from same-scope hits.
+  Two v1 rules detecting SRP violations. The first fires on
+  class-scope `lcom4` samples exceeding threshold (low cohesion
+  = multiple responsibilities). The second fires on class-scope
+  `interface_width` samples exceeding threshold (too-wide public
+  surface = the class does too much). Together they cover the
+  canonical SRP input pair `{lcom4, interface_width}` from
+  architecture Sec 3.5.1.a.
 rules:
   - rule_id: solid.srp.lcom4_high
     version: 1
     predicate_dsl: "metric_kind == 'lcom4' AND scope_kind == 'class' AND value >= 10"
     severity_default: warn
     description_md: |-
-      Class `lcom4` (LCOM4 variant) is >= 10 -- the
-      attribute-method graph has at least 10 disconnected
-      components, the canonical Chidamber-Kemerer
-      "low cohesion" band. Suggested refactor: split the
-      class along the cohesion boundaries (SRP).
+      Class `lcom4` >= 10 -- the class has at least 10
+      disconnected method-field clusters, indicating multiple
+      unrelated responsibilities. Suggested refactor: split the
+      class along the cohesion boundaries (the canonical SRP
+      refactor).
   - rule_id: solid.srp.interface_width_high
     version: 1
     predicate_dsl: "metric_kind == 'interface_width' AND scope_kind == 'class' AND value >= 15"
     severity_default: warn
     description_md: |-
-      Class `interface_width` (public method count) is >= 15
-      -- the class exposes too many concerns through its
-      public surface. Suggested refactor: extract a smaller
-      facade per cohesive method cluster (SRP). Note: the
-      ISP rule uses the same metric_kind on `interface`
-      scope; this rule is SRP-specific on `class` scope.
+      Class `interface_width` >= 15 -- the class exposes 15+
+      public methods, suggesting it handles too many concerns.
+      Suggested refactor: split the class into focused,
+      single-responsibility components (SRP).

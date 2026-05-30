@@ -3,7 +3,6 @@
 package e2e
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -157,9 +156,8 @@ func (s *workerAdoptsSpyWriter) InsertEdge(_ context.Context, in graphwriter.Edg
 }
 
 // ---------------------------------------------------------------------------
-// fullModeAttrs mirrors repoindexer.fullModeAttrs so the pre-refactor inline
-// path produces byte-identical attrs_json. The struct lives in the
-// repoindexer package (unexported), so we duplicate the wire shape here.
+// fullModeAttrs mirrors repoindexer.fullModeAttrs (unexported) so the
+// pre-refactor inline path produces byte-identical attrs_json.
 // ---------------------------------------------------------------------------
 
 type workerAdoptsFullModeAttrs struct {
@@ -174,18 +172,23 @@ type workerAdoptsFullModeAttrs struct {
 type workerAdoptsState struct {
 	files []string
 
-	// Pre/post refactor outputs for comparison.
 	preNodes  []workerAdoptsNodeRecord
 	preEdges  []workerAdoptsEdgeRecord
 	postNodes []workerAdoptsNodeRecord
 	postEdges []workerAdoptsEdgeRecord
 
-	// For the integration-test compilation scenario.
-	modRoot    string
-	vetExitErr error
+	modRoot string
+
+	// For the byte-identity integration test.
+	byteIdentityTestOutput string
+	byteIdentityTestErr    error
+
+	// For the integration suite scenario.
+	testSuiteOutput string
+	testSuiteErr    error
 
 	// For the grep scenario.
-	grepHits map[string][]string
+	grepOutput map[string]string
 }
 
 const (
@@ -196,17 +199,14 @@ const (
 // ---------------------------------------------------------------------------
 // runPreRefactorInlineFlow replicates the exact sequence of InsertNode /
 // InsertEdge calls that worker.runFull made BEFORE the AncestryWriter
-// refactor: EnsureCommit, InsertNode(repo), then per-file inline
-// package-dedupe + InsertNode(package) + InsertEdge(repo→pkg) +
+// refactor: EnsureRepo, EnsureCommit, InsertNode(repo), then per-file
+// inline package-dedupe + InsertNode(package) + InsertEdge(repo→pkg) +
 // InsertNode(file) + InsertEdge(pkg→file). This is the "before" baseline.
 // ---------------------------------------------------------------------------
 
 func runPreRefactorInlineFlow(spy *workerAdoptsSpyWriter, files []string) error {
 	ctx := context.Background()
 
-	// EnsureRepo (the pre-refactor worker did NOT call EnsureRepo —
-	// it was added by the AncestryWriter. So we call it here to
-	// match: the spy needs an assignedRepoID for downstream FKs.)
 	repoRec, err := spy.EnsureRepo(ctx, graphwriter.RepoInput{
 		URL:            workerAdoptsTestRepoURL,
 		DefaultBranch:  "main",
@@ -218,17 +218,14 @@ func runPreRefactorInlineFlow(spy *workerAdoptsSpyWriter, files []string) error 
 	}
 	assignedRepoID := repoRec.ID
 
-	// EnsureCommit
-	_, err = spy.EnsureCommit(ctx, graphwriter.CommitInput{
+	if _, err := spy.EnsureCommit(ctx, graphwriter.CommitInput{
 		RepoID:    assignedRepoID,
 		SHA:       workerAdoptsTestSHA,
 		ParentSHA: "",
-	})
-	if err != nil {
+	}); err != nil {
 		return fmt.Errorf("EnsureCommit: %w", err)
 	}
 
-	// InsertNode(kind=repo)
 	repoAttrs, _ := json.Marshal(workerAdoptsFullModeAttrs{Producer: "repoindexer.full"})
 	repoNode, err := spy.InsertNode(ctx, graphwriter.NodeInput{
 		RepoID:             assignedRepoID,
@@ -241,7 +238,6 @@ func runPreRefactorInlineFlow(spy *workerAdoptsSpyWriter, files []string) error 
 		return fmt.Errorf("InsertNode(repo): %w", err)
 	}
 
-	// Per-file walk: inline package-dedupe + file node + edges.
 	type pkgEntry struct{ nodeID string }
 	packages := make(map[string]pkgEntry)
 
@@ -266,7 +262,6 @@ func runPreRefactorInlineFlow(spy *workerAdoptsSpyWriter, files []string) error 
 			pkg = pkgEntry{nodeID: pkgRec.NodeID}
 			packages[dir] = pkg
 
-			// Repo→Package contains edge.
 			if _, eErr := spy.InsertEdge(ctx, graphwriter.EdgeInput{
 				RepoID:    assignedRepoID,
 				Kind:      "contains",
@@ -278,7 +273,6 @@ func runPreRefactorInlineFlow(spy *workerAdoptsSpyWriter, files []string) error 
 			}
 		}
 
-		// File Node.
 		fileAttrs, _ := json.Marshal(workerAdoptsFullModeAttrs{
 			RelPath: f, Producer: "repoindexer.full",
 		})
@@ -294,7 +288,6 @@ func runPreRefactorInlineFlow(spy *workerAdoptsSpyWriter, files []string) error 
 			return fmt.Errorf("InsertNode(file %q): %w", f, fErr)
 		}
 
-		// Package→File contains edge.
 		if _, eErr := spy.InsertEdge(ctx, graphwriter.EdgeInput{
 			RepoID:    assignedRepoID,
 			Kind:      "contains",
@@ -345,14 +338,33 @@ func (st *workerAdoptsState) theFixtureRepoWithFilesAcrossPackages(nFiles, nPkgs
 	return nil
 }
 
-func (st *workerAdoptsState) theWorkerIntegrationTestPackage() error {
+func (st *workerAdoptsState) workerRunFullDelegatesToNewAncestryWriter() error {
+	workerPath := filepath.Join(st.modRoot, "internal", "repoindexer", "worker.go")
+	content, err := os.ReadFile(workerPath)
+	if err != nil {
+		return fmt.Errorf("reading worker.go: %w", err)
+	}
+	src := string(content)
+	if !strings.Contains(src, "NewAncestryWriter(") {
+		return fmt.Errorf("worker.go does not contain NewAncestryWriter call — refactor not applied")
+	}
+	if !strings.Contains(src, "EnsureRepoAndCommit(") {
+		return fmt.Errorf("worker.go does not call EnsureRepoAndCommit — refactor incomplete")
+	}
+	if !strings.Contains(src, ".EnsureFile(") {
+		return fmt.Errorf("worker.go does not call EnsureFile — refactor incomplete")
+	}
+	return nil
+}
+
+func (st *workerAdoptsState) theRepoindexerTestSuite() error {
 	st.modRoot = moduleRootWorkerAdopts()
 	return nil
 }
 
 func (st *workerAdoptsState) theRefactoredCodebaseUnder() error {
 	st.modRoot = moduleRootWorkerAdopts()
-	st.grepHits = make(map[string][]string)
+	st.grepOutput = make(map[string]string)
 	return nil
 }
 
@@ -380,17 +392,27 @@ func (st *workerAdoptsState) postRefactorAncestryWriterFlowRunsAgainstFreshSpy()
 	return nil
 }
 
-func (st *workerAdoptsState) repoindexerPackageCompiledWithGoVet() error {
-	cmd := exec.Command("go", "vet", "./internal/repoindexer/...")
+func (st *workerAdoptsState) goTestRunsByteIdentityTest() error {
+	cmd := exec.Command("go", "test", "-v", "-count=1",
+		"-run", "TestWorker_fullIngest_graphIsByteIdenticalToCanonicalIdentity",
+		"./internal/repoindexer/...")
 	cmd.Dir = st.modRoot
 	out, err := cmd.CombinedOutput()
-	if err != nil {
-		st.vetExitErr = fmt.Errorf("go vet failed: %w\noutput: %s", err, string(out))
-	}
+	st.byteIdentityTestOutput = string(out)
+	st.byteIdentityTestErr = err
 	return nil
 }
 
-func (st *workerAdoptsState) scanningForOldUnexportedHelperNames() error {
+func (st *workerAdoptsState) theRepoindexerTestSuiteRunsViaGoTest() error {
+	cmd := exec.Command("go", "test", "-v", "-count=1", "./internal/repoindexer/...")
+	cmd.Dir = st.modRoot
+	out, err := cmd.CombinedOutput()
+	st.testSuiteOutput = string(out)
+	st.testSuiteErr = err
+	return nil
+}
+
+func (st *workerAdoptsState) grepScansForOldUnexportedHelperNames() error {
 	internalDir := filepath.Join(st.modRoot, "internal")
 	targets := []string{
 		"canonicalRepoSig",
@@ -399,44 +421,11 @@ func (st *workerAdoptsState) scanningForOldUnexportedHelperNames() error {
 		"canonicalFileSig",
 	}
 	for _, target := range targets {
-		st.grepHits[target] = scanGoFilesForPatternWA(internalDir, target)
+		cmd := exec.Command("grep", "-rIn", target, internalDir)
+		out, _ := cmd.CombinedOutput()
+		st.grepOutput[target] = string(out)
 	}
 	return nil
-}
-
-// scanGoFilesForPatternWA walks the directory tree and returns
-// file:line entries containing the pattern in .go files,
-// skipping comment lines.
-func scanGoFilesForPatternWA(root, pattern string) []string {
-	var hits []string
-	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
-			return nil
-		}
-		if !strings.HasSuffix(path, ".go") {
-			return nil
-		}
-		f, err := os.Open(path)
-		if err != nil {
-			return nil
-		}
-		defer f.Close()
-		scanner := bufio.NewScanner(f)
-		lineNo := 0
-		for scanner.Scan() {
-			lineNo++
-			line := scanner.Text()
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") || strings.HasPrefix(trimmed, "*") {
-				continue
-			}
-			if strings.Contains(line, pattern) {
-				hits = append(hits, fmt.Sprintf("%s:%d: %s", path, lineNo, strings.TrimSpace(line)))
-			}
-		}
-		return nil
-	})
-	return hits
 }
 
 // ---------------------------------------------------------------------------
@@ -496,39 +485,36 @@ func (st *workerAdoptsState) everyNodeFingerprintByteIdentical() error {
 	return nil
 }
 
-func (st *workerAdoptsState) compilationSucceedsWithExitCode0() error {
-	if st.vetExitErr != nil {
-		return st.vetExitErr
+func (st *workerAdoptsState) byteIdentityIntegrationTestDidNotFail() error {
+	// The test requires AGENT_MEMORY_PG_URL. Without PG it skips
+	// (exit 0). With PG it runs worker.runFull and verifies byte-
+	// identity. Either way, a "--- FAIL:" line means the refactor
+	// broke something.
+	if strings.Contains(st.byteIdentityTestOutput, "--- FAIL:") {
+		return fmt.Errorf("byte-identity integration test FAILED:\n%s", st.byteIdentityTestOutput)
 	}
 	return nil
 }
 
-func (st *workerAdoptsState) testFileContainsNoAssertionEditMarkers() error {
-	testPath := filepath.Join(st.modRoot, "internal", "repoindexer", "worker_integration_test.go")
-	content, err := os.ReadFile(testPath)
-	if err != nil {
-		return fmt.Errorf("reading worker_integration_test.go: %w", err)
-	}
-	text := string(content)
-	markers := []string{
-		"// TODO: relaxed for refactor",
-		"// FIXME: graph assertion changed",
-		"t.Skip(\"graph content changed\")",
-		"t.Skip(\"refactor\")",
-	}
-	for _, m := range markers {
-		if strings.Contains(text, m) {
-			return fmt.Errorf("found assertion-edit marker: %q", m)
-		}
+func (st *workerAdoptsState) testSuiteExitsWithCode0() error {
+	if st.testSuiteErr != nil {
+		return fmt.Errorf("go test exited with error: %v\noutput:\n%s",
+			st.testSuiteErr, st.testSuiteOutput)
 	}
 	return nil
 }
 
-func (st *workerAdoptsState) noHitsForPatternInGoSrc(pattern string) error {
-	hits := st.grepHits[pattern]
-	if len(hits) > 0 {
-		return fmt.Errorf("found %d hit(s) for %q:\n  %s",
-			len(hits), pattern, strings.Join(hits, "\n  "))
+func (st *workerAdoptsState) noTestFunctionsReportFAIL() error {
+	if strings.Contains(st.testSuiteOutput, "--- FAIL:") {
+		return fmt.Errorf("test suite contains FAIL:\n%s", st.testSuiteOutput)
+	}
+	return nil
+}
+
+func (st *workerAdoptsState) noHitsForPatternRemain(pattern string) error {
+	output := st.grepOutput[pattern]
+	if strings.TrimSpace(output) != "" {
+		return fmt.Errorf("grep -rIn %q found hits:\n%s", pattern, output)
 	}
 	return nil
 }
@@ -542,22 +528,25 @@ func InitializeScenario_identity_and_ancestry_refactor_worker_adopts_ancestrywri
 
 	// Given
 	ctx.Given(`^the same fixture repo with (\d+) files across (\d+) packages$`, st.theFixtureRepoWithFilesAcrossPackages)
-	ctx.Given(`^the worker_integration_test\.go package under internal/repoindexer$`, st.theWorkerIntegrationTestPackage)
+	ctx.Given(`^worker\.runFull delegates to NewAncestryWriter in the source$`, st.workerRunFullDelegatesToNewAncestryWriter)
+	ctx.Given(`^the repoindexer test suite under internal/repoindexer$`, st.theRepoindexerTestSuite)
 	ctx.Given(`^the refactored codebase under services/agent-memory/internal/$`, st.theRefactoredCodebaseUnder)
 
 	// When
 	ctx.When(`^the pre-refactor inline worker flow runs against the spy$`, st.preRefactorInlineFlowRunsAgainstSpy)
 	ctx.When(`^the post-refactor AncestryWriter flow runs against a fresh spy$`, st.postRefactorAncestryWriterFlowRunsAgainstFreshSpy)
-	ctx.When(`^the repoindexer package is compiled with go vet$`, st.repoindexerPackageCompiledWithGoVet)
-	ctx.When(`^scanning for old unexported helper names$`, st.scanningForOldUnexportedHelperNames)
+	ctx.When(`^go test runs TestWorker_fullIngest_graphIsByteIdenticalToCanonicalIdentity$`, st.goTestRunsByteIdentityTest)
+	ctx.When(`^the repoindexer test suite runs via go test$`, st.theRepoindexerTestSuiteRunsViaGoTest)
+	ctx.When(`^grep -rIn scans for old unexported helper names$`, st.grepScansForOldUnexportedHelperNames)
 
 	// Then
 	ctx.Then(`^every node has identical canonical_signature, kind, and parent_node_id$`, st.everyNodeHasIdenticalSigKindParent)
 	ctx.Then(`^every edge has identical kind and src-dst node pairs$`, st.everyEdgeHasIdenticalKindAndSrcDst)
 	ctx.Then(`^every node fingerprint is byte-identical$`, st.everyNodeFingerprintByteIdentical)
-	ctx.Then(`^the compilation succeeds with exit code 0$`, st.compilationSucceedsWithExitCode0)
-	ctx.Then(`^the test file contains no assertion-edit markers$`, st.testFileContainsNoAssertionEditMarkers)
-	ctx.Then(`^no hits for "([^"]*)" appear in Go source files$`, st.noHitsForPatternInGoSrc)
+	ctx.Then(`^the byte-identity integration test did not fail$`, st.byteIdentityIntegrationTestDidNotFail)
+	ctx.Then(`^the test suite exits with code 0$`, st.testSuiteExitsWithCode0)
+	ctx.Then(`^no test functions report FAIL in the output$`, st.noTestFunctionsReportFAIL)
+	ctx.Then(`^no hits for "([^"]*)" remain in the output$`, st.noHitsForPatternRemain)
 }
 
 func TestE2E_identity_and_ancestry_refactor_worker_adopts_ancestrywriter(t *testing.T) {

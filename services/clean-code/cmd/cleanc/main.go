@@ -191,6 +191,22 @@ func runVersion(stdout, stderr io.Writer, args []string) int {
 // requirements; the same checks satisfy the corresponding
 // Stage 3.3 / Stage 4.4 e2e assertions verbatim.
 func runAnalyze(stdout, stderr io.Writer, args []string) int {
+	// Reserved-flag pre-scan: `--snippet-cap-lines` is NOT
+	// registered on the analyze flag-set (it is reserved for
+	// a future minor release per tech-spec Sec 8.1), so the
+	// stdlib parser would reject it with `flag provided but
+	// not defined: -snippet-cap-lines` — which fails the
+	// substring assertion at e2e-scenarios.md Stage 4.4 line
+	// 1072 (`reserved for a future minor release`). Catching
+	// the reserved form here before `fs.Parse` runs lets the
+	// dispatcher emit the contract-mandated message verbatim.
+	for _, a := range args {
+		if flags.IsReservedSnippetCapLinesArg(a) {
+			fmt.Fprintln(stderr, flags.ReservedSnippetCapLinesMessageFor(flags.VerbAnalyze))
+			return flags.ExitUsage
+		}
+	}
+
 	fs := flag.NewFlagSet("cleanc analyze", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
@@ -263,6 +279,17 @@ func runAnalyze(stdout, stderr io.Writer, args []string) int {
 // `analyze` and `report` cannot drift apart (resolves
 // iter-4 evaluator item 4).
 func runReport(stdout, stderr io.Writer, args []string) int {
+	// Reserved-flag pre-scan (see runAnalyze for full
+	// rationale). The `report` verb shares the Sec 8.1 global
+	// flag surface with `analyze` and therefore inherits the
+	// same reserved-flag rejection contract.
+	for _, a := range args {
+		if flags.IsReservedSnippetCapLinesArg(a) {
+			fmt.Fprintln(stderr, flags.ReservedSnippetCapLinesMessageFor(flags.VerbReport))
+			return flags.ExitUsage
+		}
+	}
+
 	fs := flag.NewFlagSet("cleanc report", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {

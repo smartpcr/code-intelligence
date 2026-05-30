@@ -239,6 +239,47 @@ func ReservedWithChurnMessageFor(verb string) string {
 	return fmt.Sprintf("cleanc %s: --with-churn is reserved for P2 and rejected in P0/P1", verb)
 }
 
+// ReservedSnippetCapLinesMessageFor returns the literal stderr
+// line emitted when `--snippet-cap-lines` is set on a P0/P1
+// build, prefixed with the invoking verb so `cleanc report
+// --snippet-cap-lines=120` does not mislead operators with an
+// `analyze` tag. Pass an empty `verb` to get the legacy
+// `cleanc analyze:` prefix held in
+// [ReservedSnippetCapLinesMessage].
+func ReservedSnippetCapLinesMessageFor(verb string) string {
+	if verb == "" {
+		return ReservedSnippetCapLinesMessage
+	}
+	return fmt.Sprintf("cleanc %s: --snippet-cap-lines is reserved for a future minor release", verb)
+}
+
+// IsReservedSnippetCapLinesArg reports whether `arg` is any
+// recognised form of the reserved `--snippet-cap-lines` flag:
+//
+//   - `--snippet-cap-lines`           (boolean / value-as-next-arg)
+//   - `-snippet-cap-lines`            (single-dash form)
+//   - `--snippet-cap-lines=<value>`   (value-attached form)
+//   - `-snippet-cap-lines=<value>`    (single-dash value-attached)
+//
+// The dispatcher pre-scans `args` with this helper BEFORE the
+// flag-set is parsed, so a reserved-flag invocation exits with
+// `ExitUsage` + the literal `reserved for a future minor release`
+// substring (e2e-scenarios.md Stage 4.4 line 1072) rather than
+// the stdlib `flag provided but not defined` error that would
+// otherwise fire (since the flag is intentionally NOT registered
+// on either `analyze` or `report`).
+func IsReservedSnippetCapLinesArg(arg string) bool {
+	for _, prefix := range []string{"--snippet-cap-lines", "-snippet-cap-lines"} {
+		if arg == prefix {
+			return true
+		}
+		if len(arg) > len(prefix) && arg[:len(prefix)] == prefix && arg[len(prefix)] == '=' {
+			return true
+		}
+	}
+	return false
+}
+
 // ExitOnLevels is the closed severity set accepted by
 // `--exit-on`. Lower-cased exact match is enforced by
 // `IsValidExitOn`.
@@ -261,7 +302,33 @@ func IsValidExitOn(v string) bool {
 // against a P0/P1 binary. The operator pin `cli-l7-authority`
 // (architecture.md Sec 1.3) gates whether `apply` is ever
 // implemented; until then the sub-command is reserved.
-const ReservedApplyMessage = "cleanc apply: not implemented; pending operator pin `cli-l7-authority`"
+//
+// The string MUST contain BOTH substrings:
+//
+//   - `not implemented; pending operator pin cli-l7-authority`
+//     (NOTE: no backticks around the pin id — `e2e-scenarios.md`
+//     Stage 4.4 line 1050 asserts the literal phrase with the
+//     bare identifier, so wrapping the id in backticks would
+//     fail the e2e contract).
+//   - `docs/stories/code-intelligence-REFACTOR-GUIDE/architecture.md Sec 6.3`
+//     (the operator-facing pointer required by
+//     `e2e-scenarios.md` Stage 4.4 line 1051).
+const ReservedApplyMessage = "cleanc apply: not implemented; pending operator pin cli-l7-authority (see docs/stories/code-intelligence-REFACTOR-GUIDE/architecture.md Sec 6.3)"
+
+// ReservedSnippetCapLinesMessage is the literal stderr line
+// emitted when the (currently unrecognised) `--snippet-cap-lines`
+// flag appears on an `analyze` or `report` command line. The
+// flag is named in `tech-spec.md` Sec 8.1 as reserved for a
+// future minor release; e2e-scenarios.md Stage 4.4 line 1072
+// pins the literal substring `reserved for a future minor release`
+// so this message MUST contain that phrase verbatim.
+//
+// The legacy `cleanc analyze:` prefix is preserved for the
+// default const so existing call sites that pre-date the
+// verb-aware helper keep working unchanged; callers with
+// a verb in hand should prefer
+// [ReservedSnippetCapLinesMessageFor].
+const ReservedSnippetCapLinesMessage = "cleanc analyze: --snippet-cap-lines is reserved for a future minor release"
 
 // ReservedTelemetryMessage is the literal stderr line the
 // dispatcher writes when `--telemetry-otlp` is set on a

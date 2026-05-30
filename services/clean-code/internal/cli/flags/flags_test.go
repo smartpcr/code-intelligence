@@ -375,6 +375,100 @@ func TestReservedWithChurnMessageForRoundTrip(t *testing.T) {
 	}
 }
 
+// TestReservedSnippetCapLinesMessageForRoundTrip mirrors the
+// telemetry/with-churn helper tests for the new
+// `--snippet-cap-lines` reservation message (e2e-scenarios.md
+// Stage 4.4 line 1072).
+func TestReservedSnippetCapLinesMessageForRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	if got := ReservedSnippetCapLinesMessageFor(""); got != ReservedSnippetCapLinesMessage {
+		t.Errorf("ReservedSnippetCapLinesMessageFor(\"\") = %q, want fallback %q",
+			got, ReservedSnippetCapLinesMessage)
+	}
+	got := ReservedSnippetCapLinesMessageFor(VerbReport)
+	if !contains(got, "cleanc report:") {
+		t.Errorf("ReservedSnippetCapLinesMessageFor(report) = %q, want `cleanc report:` prefix", got)
+	}
+	if !contains(got, "reserved for a future minor release") {
+		t.Errorf("ReservedSnippetCapLinesMessageFor(report) = %q dropped e2e substring", got)
+	}
+}
+
+// TestIsReservedSnippetCapLinesArg pins the closed set of arg
+// forms the pre-scan in cmd/cleanc/main.go recognises as
+// `--snippet-cap-lines`. The helper is the single source of
+// truth — adding a new form (e.g. an alias) means editing this
+// test, not the dispatcher.
+func TestIsReservedSnippetCapLinesArg(t *testing.T) {
+	t.Parallel()
+
+	hits := []string{
+		"--snippet-cap-lines",
+		"-snippet-cap-lines",
+		"--snippet-cap-lines=100",
+		"-snippet-cap-lines=120",
+		"--snippet-cap-lines=",
+	}
+	for _, arg := range hits {
+		arg := arg
+		t.Run("hit_"+arg, func(t *testing.T) {
+			t.Parallel()
+			if !IsReservedSnippetCapLinesArg(arg) {
+				t.Errorf("IsReservedSnippetCapLinesArg(%q) = false, want true", arg)
+			}
+		})
+	}
+
+	misses := []string{
+		"",
+		"--snippet",
+		"--snippet-cap",
+		"--snippet-cap-lines-extra",
+		"--snippet-cap-linesfoo",
+		"--snippet-cap-line=10",
+		"snippet-cap-lines",
+		"100",
+	}
+	for _, arg := range misses {
+		arg := arg
+		t.Run("miss_"+arg, func(t *testing.T) {
+			t.Parallel()
+			if IsReservedSnippetCapLinesArg(arg) {
+				t.Errorf("IsReservedSnippetCapLinesArg(%q) = true, want false", arg)
+			}
+		})
+	}
+}
+
+// TestReservedApplyMessageMatchesE2E pins the literal substrings
+// e2e-scenarios.md Stage 4.4 lines 1050-1051 require from the
+// stderr output of `cleanc apply ...`. Both substrings MUST be
+// present; the test would have caught the iter-6 backtick
+// regression (the `cli-l7-authority` id was wrapped in backticks
+// which broke the bare-pin substring assertion).
+func TestReservedApplyMessageMatchesE2E(t *testing.T) {
+	t.Parallel()
+
+	wantSubstrings := []string{
+		// e2e line 1050 — note: bare pin id, NO backticks.
+		"not implemented; pending operator pin cli-l7-authority",
+		// e2e line 1051 — operator-facing arch reference.
+		"docs/stories/code-intelligence-REFACTOR-GUIDE/architecture.md Sec 6.3",
+	}
+	for _, want := range wantSubstrings {
+		if !contains(ReservedApplyMessage, want) {
+			t.Errorf("ReservedApplyMessage = %q is missing required substring %q",
+				ReservedApplyMessage, want)
+		}
+	}
+	// Guard against the iter-6 regression specifically: backticks
+	// around the pin id break the e2e literal-substring match.
+	if contains(ReservedApplyMessage, "`cli-l7-authority`") {
+		t.Errorf("ReservedApplyMessage wraps `cli-l7-authority` in backticks; e2e line 1050 wants the bare identifier")
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

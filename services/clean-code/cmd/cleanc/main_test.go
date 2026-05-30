@@ -265,16 +265,128 @@ func TestAnalyzeStubExitsInternalError(t *testing.T) {
 }
 
 // TestApplyReservedExitsUsage validates that `cleanc apply`
-// returns ExitUsage with the operator-pin reserved message.
+// returns ExitUsage and emits the operator-pin reserved
+// message in the exact form e2e-scenarios.md Stage 4.4 lines
+// 1048-1051 pin:
+//
+//   - exit code 64
+//   - stderr contains the literal phrase
+//     `not implemented; pending operator pin cli-l7-authority`
+//     (NOTE: the pin identifier MUST be bare — wrapping it in
+//     backticks breaks the substring match because backticks
+//     are NOT part of the e2e literal phrase)
+//   - stderr references
+//     `docs/stories/code-intelligence-REFACTOR-GUIDE/architecture.md Sec 6.3`
+//     so an operator who hits the reservation can read the
+//     authoritative explanation of WHY the verb is gated.
+//
+// The test exercises BOTH the bare `cleanc apply` form (no
+// positional) AND the documented e2e form `cleanc apply
+// <uuid>` so the dispatcher cannot regress by demanding a
+// positional or by silently swallowing one.
 func TestApplyReservedExitsUsage(t *testing.T) {
 	t.Parallel()
 
-	_, stderr, code := captureRun("apply")
-	if code != flags.ExitUsage {
-		t.Errorf("exit code = %d, want %d", code, flags.ExitUsage)
+	cases := [][]string{
+		{"apply"},
+		{"apply", "00000000-0000-0000-0000-000000000000"},
 	}
-	if !strings.Contains(stderr, "pending operator pin `cli-l7-authority`") {
-		t.Errorf("stderr missing reserved-apply message\nstderr=%s", stderr)
+	for _, args := range cases {
+		args := args
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			t.Parallel()
+			_, stderr, code := captureRun(args...)
+			if code != flags.ExitUsage {
+				t.Errorf("exit code = %d, want %d", code, flags.ExitUsage)
+			}
+			// e2e-scenarios.md Stage 4.4 line 1050 — bare pin id, no backticks.
+			if !strings.Contains(stderr, "not implemented; pending operator pin cli-l7-authority") {
+				t.Errorf("stderr missing reserved-apply phrase (bare pin id)\nstderr=%s", stderr)
+			}
+			// e2e-scenarios.md Stage 4.4 line 1051 — arch reference.
+			if !strings.Contains(stderr, "docs/stories/code-intelligence-REFACTOR-GUIDE/architecture.md Sec 6.3") {
+				t.Errorf("stderr missing architecture.md Sec 6.3 reference\nstderr=%s", stderr)
+			}
+		})
+	}
+}
+
+// TestReservedSurface is the table-driven invariant pinned by
+// `e2e-scenarios.md` Stage 4.4 (line 1081 — "Test enumerates
+// every reserved entry from tech-spec Sec 8.1"). It asserts
+// that EVERY currently-reserved verb / flag listed in tech-spec
+// Sec 8.1 exits with `ExitUsage` (64) AND emits the literal
+// substring the e2e contract pins, so an accidental wiring of
+// any reserved surface fails CI loudly.
+//
+// Reserved surface as of Stage 1.1:
+//
+//   - verb `apply` (e2e line 1050) — must contain
+//     `not implemented; pending operator pin cli-l7-authority`
+//   - flag `--telemetry-otlp` (e2e line 1061) — must contain
+//     `--telemetry-otlp is reserved for a future story`
+//   - flag `--with-churn` (e2e line 1067) — must contain
+//     `--with-churn is reserved for P2 and rejected in P0/P1`
+//   - flag `--snippet-cap-lines` (e2e line 1072) — must contain
+//     `reserved for a future minor release`
+//
+// Adding a new reserved entry to tech-spec Sec 8.1 requires
+// adding a row here too; deleting one is a contract change
+// and requires updating e2e-scenarios.md in the same PR.
+func TestReservedSurface(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name           string
+		args           []string
+		wantSubstrings []string
+	}{
+		{
+			name:           "apply verb",
+			args:           []string{"apply", "00000000-0000-0000-0000-000000000000"},
+			wantSubstrings: []string{"not implemented; pending operator pin cli-l7-authority"},
+		},
+		{
+			name:           "--telemetry-otlp on analyze",
+			args:           []string{"analyze", ".", "--telemetry-otlp", "http://localhost:4317"},
+			wantSubstrings: []string{"--telemetry-otlp is reserved for a future story"},
+		},
+		{
+			name:           "--with-churn on analyze",
+			args:           []string{"analyze", ".", "--with-churn"},
+			wantSubstrings: []string{"--with-churn is reserved for P2 and rejected in P0/P1"},
+		},
+		{
+			name:           "--snippet-cap-lines on analyze",
+			args:           []string{"analyze", ".", "--snippet-cap-lines", "100"},
+			wantSubstrings: []string{"reserved for a future minor release"},
+		},
+		{
+			name:           "--snippet-cap-lines=N value-attached form on analyze",
+			args:           []string{"analyze", ".", "--snippet-cap-lines=120"},
+			wantSubstrings: []string{"reserved for a future minor release"},
+		},
+		{
+			name:           "--snippet-cap-lines on report",
+			args:           []string{"report", "findings.json", "--snippet-cap-lines", "100"},
+			wantSubstrings: []string{"reserved for a future minor release"},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, stderr, code := captureRun(tc.args...)
+			if code != flags.ExitUsage {
+				t.Errorf("exit code = %d, want %d (reserved surface must exit 64)\nstderr=%s",
+					code, flags.ExitUsage, stderr)
+			}
+			for _, want := range tc.wantSubstrings {
+				if !strings.Contains(stderr, want) {
+					t.Errorf("stderr missing reserved-surface phrase %q\nstderr=%s", want, stderr)
+				}
+			}
+		})
 	}
 }
 

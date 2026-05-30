@@ -348,6 +348,9 @@ func (s *plsSmokeState) everySubtestPasses() error {
 	if strings.Contains(s.smokeOutput, "--- FAIL:") {
 		return fmt.Errorf("output contains FAIL lines:\n%s", s.smokeOutput)
 	}
+	if strings.Contains(s.smokeOutput, "--- SKIP:") {
+		return fmt.Errorf("output contains SKIP lines (expected all subtests to pass):\n%s", s.smokeOutput)
+	}
 	return nil
 }
 

@@ -23,8 +23,8 @@ steps:
 
   - script: |
       GO_VERSION=$(grep '^go ' services/agent-memory/go.mod | awk '{print $2}')
+      echo "Detected Go version from go.mod: $GO_VERSION"
       echo "##vso[task.setvariable variable=GO_VERSION]$GO_VERSION"
-      echo "Detected Go version: $GO_VERSION"
     displayName: "Detect Go version from go.mod"
 
   - task: GoTool@0

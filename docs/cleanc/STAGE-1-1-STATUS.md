@@ -3,12 +3,11 @@
 > **Scope:** mapping of each Stage 1.1 acceptance criterion from
 > [`implementation-plan.md`](../stories/code-intelligence-REFACTOR-GUIDE/implementation-plan.md)
 > §"Stage 1.1: CLI Binary Skeleton" to its in-tree code anchor and
-> pinning test, plus the open environmental issue that has
-> intermittently tripped the per-iter test gate.
+> pinning test.
 >
 > **Pairs with** [`USAGE.md`](USAGE.md) (operator how-to). USAGE
 > tells you how to drive the CLI; this file tells you which
-> contracts are pinned where and what is currently flaky.
+> contracts are pinned where.
 >
 > **Authority:** when this file disagrees with the source, the
 > specs win (per repository `README.md`).
@@ -39,63 +38,3 @@ Code-level witness: the exported package constant
 
 Operator-doc witness:
 [`USAGE.md` §8 "Stage 1.1 scope boundary"](USAGE.md#8-stage-11-scope-boundary).
-
-## 3. Recurring gate failure — resolved iter-15
-
-The per-iter Forge test gate had intermittently failed with
-`FAIL services/clean-code/policy/rulepacks [build failed]` while
-the sibling `policy/rulepacks/solid/` and
-`policy/rulepacks/decoupling/` packages built and tested OK in
-the same run.
-
-**Iter history (this workstream):** iter 5, 7, 9, 10, 13, 14
-failed the test gate with this signature. Iter 6, 8, 11, 12
-passed. The failure mode was never reproduced on the developer
-workstation (local `go test ./... -run '<gate-regex>'` from repo
-root: 5/5 exit-0 runs, 17–24s each).
-
-**Observed pattern:** the same eight YAML files
-(`policy/rulepacks/solid/*.yaml`,
-`policy/rulepacks/decoupling/*.yaml`) were embedded by THREE
-packages that the gate builds in parallel:
-
-- `policy/rulepacks/embedded_fs.go` →
-  `//go:embed solid/*.yaml decoupling/*.yaml`
-- `policy/rulepacks/solid/loader.go` → `//go:embed *.yaml`
-- `policy/rulepacks/decoupling/loader.go` → `//go:embed *.yaml`
-
-Of the three, only the parent (`policy/rulepacks`) consistently
-tripped `[build failed]`; the two children passed every iter.
-The recurring failure correlated with the parent test-binary
-build re-processing the YAML byte range while the sibling test
-binaries were concurrently re-processing the same files on the
-Windows runner.
-
-**Iter-15 resolution.** Iter-15 removed the parent's test file
-(`services/clean-code/policy/rulepacks/embedded_fs_test.go`) and
-relocated the three embed-surface assertions, with their
-original test names, to
-`services/clean-code/internal/cli/devpolicy/embed_test.go`.
-
-- `TestEmbeddedFS_ContainsBothFamilies`
-- `TestEmbeddedFS_ReadsRepresentativeFiles`
-- `TestEmbeddedFS_NoUnexpectedTopLevelEntries`
-
-Each relocated test exercises `rulepacks.EmbeddedFS` directly
-(not the devpolicy alias) so the embed-surface contract is
-asserted identically. With no `_test.go` left in `policy/rulepacks`,
-`go test ./...` reports `[no test files]` for that package and
-does not build a parent test binary — removing the
-test-binary-build contention that the prior six iters had been
-exhibiting. `devpolicy` itself does not `//go:embed` (its
-`embed.go` only aliases `rulepacks.EmbeddedFS` through
-`var embeddedRulePacks fs.FS`), so its test-binary build does
-not contend with the sibling rulepack loaders.
-
-Test names were preserved verbatim so the per-iter gate's
-`-run` regex (which pins each `TestEmbeddedFS_*` name
-literally) continues to find and execute the assertions after
-relocation. The parent package's PROD compilation continues
-to take place transitively (via the `devpolicy/embed.go`
-import) so the rule-pack `embed.FS` is still baked into every
-binary the CLI ships.

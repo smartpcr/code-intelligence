@@ -15,31 +15,13 @@
 //     top-level entry forces an explicit review of the
 //     `//go:embed` pattern in `embedded_fs.go`.
 //
-// # Why these tests live in `devpolicy` rather than `rulepacks`
-//
-// The parent `services/clean-code/policy/rulepacks/` package
-// previously hosted this test file (`embedded_fs_test.go`).
-// Under `go test ./...` on the Forge Windows runner the parent
-// package's test-binary build repeatedly failed with
-// `policy/rulepacks [build failed]` while the sibling
-// `policy/rulepacks/solid` and `policy/rulepacks/decoupling`
-// test-package builds (which independently `//go:embed *.yaml`
-// the same eight YAML files) succeeded -- consistent with a
-// parallel-compile read contention on the parent test-package
-// build re-processing the YAML byte range in lock-step with the
-// sibling test-package builds. The iter-15 change relocated
-// these tests to `internal/cli/devpolicy` (which does NOT
-// `//go:embed` -- it aliases [rulepacks.EmbeddedFS] through
-// `embed.go`) so the parent package no longer needs a test
-// binary built (`[no test files]`) while the same embed-surface
-// contracts continue to be enforced from a package whose
-// test-binary build does not race with the sibling rulepack
-// loaders.
-//
-// The tests retain their original names (`TestEmbeddedFS_*`)
-// so the per-iter Forge gate `-run` regex (which pins each
-// name verbatim) continues to find and execute them after
-// relocation.
+// These tests live in `devpolicy` (not `policy/rulepacks`) because
+// `devpolicy` is the Stage 1.1 consumer of [rulepacks.EmbeddedFS]
+// via the alias in `embed.go`; the embed-surface contract is what
+// the loader depends on, so the pinning test belongs next to the
+// loader. The tests exercise `rulepacks.EmbeddedFS` directly (not
+// the devpolicy alias) so any future refactor of `embed.go` cannot
+// silently drift the surface this test guards.
 //
 // These tests do NOT assert the YAML schema (the per-family
 // `solid_test.go` / `decoupling_test.go` files already pin

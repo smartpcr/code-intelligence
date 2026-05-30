@@ -51,7 +51,7 @@ func repoRootFromTestFile() (string, error) {
 var expectedLanguages = map[string]string{
 	"TypeScript / JavaScript": "parser_treesitter.go",
 	"Python":                  "parser_treesitter.go",
-	"C ":                      "parser_treesitter_c.go",
+	"C":                       "parser_treesitter_c.go",
 	"C++":                     "parser_treesitter_cpp.go",
 	"C#":                      "parser_treesitter_csharp.go",
 	"Go":                      "parser_treesitter_go.go",
@@ -104,8 +104,8 @@ func (s *degradationMatrixState) markdownLinkCheckerRunsAgainst(relPath string) 
 
 func (s *degradationMatrixState) allEightLanguageRowsArePresent() error {
 	// Parse the per-language coverage matrix table from COVERAGE.md.
-	// Each data row in the markdown table starts with "| " and contains the
-	// language name in the first column.
+	// Each data row is split on "|" and the first column is trimmed and
+	// compared exactly, avoiding fragile substring matches (e.g. "C" vs "C++").
 	scanner := bufio.NewScanner(strings.NewReader(s.coverageMD))
 	tableRowRe := regexp.MustCompile(`^\|[^|]+\|`)
 	for scanner.Scan() {
@@ -117,8 +117,14 @@ func (s *degradationMatrixState) allEightLanguageRowsArePresent() error {
 		if strings.Contains(line, "---") && !strings.ContainsAny(line, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") {
 			continue
 		}
+		cols := strings.Split(line, "|")
+		if len(cols) < 2 {
+			continue
+		}
+		// cols[0] is empty (before the leading "|"), cols[1] is the language column.
+		firstCol := strings.TrimSpace(cols[1])
 		for lang, parserFile := range expectedLanguages {
-			if strings.Contains(line, lang) && strings.Contains(line, parserFile) {
+			if firstCol == lang && strings.Contains(line, parserFile) {
 				s.langRows[lang] = parserFile
 			}
 		}

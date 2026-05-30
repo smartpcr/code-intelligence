@@ -376,6 +376,28 @@ func (s *plsSmokeState) onlyFixturePassesInNocgo(lang string) error {
 		return fmt.Errorf("%s subtest did not PASS in nocgo degradation test;\noutput:\n%s",
 			lang, s.nocgoDegradationOutput)
 	}
+
+	// Verify no OTHER language also passed — the step says "only" this one passes.
+	const passPrefix = "--- PASS: TestNocgoPolyglotDegradation/"
+	var unexpected []string
+	for _, line := range strings.Split(s.nocgoDegradationOutput, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.Contains(trimmed, passPrefix) {
+			continue
+		}
+		// Extract the subtest name after the prefix.
+		idx := strings.Index(trimmed, passPrefix)
+		rest := trimmed[idx+len(passPrefix):]
+		// rest is e.g. "powershell (0.12s)" — grab the first token.
+		subtestName := strings.Fields(rest)[0]
+		if subtestName != lang {
+			unexpected = append(unexpected, subtestName)
+		}
+	}
+	if len(unexpected) > 0 {
+		return fmt.Errorf("expected only %s to PASS under CGO=0, but these also passed: %v;\noutput:\n%s",
+			lang, unexpected, s.nocgoDegradationOutput)
+	}
 	return nil
 }
 

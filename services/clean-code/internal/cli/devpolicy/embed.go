@@ -21,16 +21,25 @@
 //
 // # Why this file (`embed.go`) carries no build tag
 //
-// The `embed.FS` alias must be visible to every compilation mode
-// (`-tags prod` and the default no-tag dev build) so the build-
-// tag-gated unsigned-policy synthesisers (`unsigned_dev.go` and
-// `unsigned_prod.go` -- both follow-up work, see
+// The `embed.FS` alias is intentionally visible in EVERY
+// compilation mode (`-tags prod` AND the default no-tag dev
+// build). A follow-up workstream (implementation-plan
 // `docs/stories/code-intelligence-REFACTOR-GUIDE/implementation-plan.md`
-// Stage 1.4 lines 99-100) can reference the same canonical name
-// without re-importing the rulepacks package from inside their
-// build-tag-gated files. The dev synthesiser will READ from this
-// FS; the prod synthesiser will IGNORE it and return
-// `ErrDevModeUnavailable`. The embed surface itself contains no
+// Stage 1.4 lines 99-100) will add two build-tag-gated
+// synthesiser files in this same `devpolicy` package:
+//
+//   - `unsigned_dev.go` (`//go:build !prod`) -- will READ from
+//     `embeddedRulePacks` to produce an unsigned
+//     `steward.PolicyVersion` (architecture Sec 3.8 structural
+//     bypass).
+//   - `unsigned_prod.go` (`//go:build prod`) -- will IGNORE
+//     `embeddedRulePacks` and return an `ErrDevModeUnavailable`
+//     sentinel (to be introduced by the same follow-up).
+//
+// Declaring `embeddedRulePacks` here (no build tag) lets both
+// future synthesisers reference the same canonical name without
+// re-importing the rulepacks package from inside their
+// build-tag-gated files. The embed surface itself contains no
 // bypass logic and is therefore safe to ship in every build.
 package devpolicy
 

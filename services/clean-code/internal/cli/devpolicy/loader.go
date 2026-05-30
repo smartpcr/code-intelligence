@@ -14,32 +14,43 @@ import (
 // canonical `steward.*` row shapes the rule engine's
 // `InMemoryStore` consumes (architecture Sec 3.8, Sec 5.8).
 //
-// Implementations are build-tag-gated: the no-tag dev build
-// constructs an unsigned `steward.PolicyVersion` (architecture
-// Sec 3.8 "STRUCTURAL signature bypass"); a `-tags prod` build
-// returns [ErrDevModeUnavailable] without producing any
-// `PolicyVersion` so the bypass cannot be smuggled into a
-// production binary at compile time. Both implementations live in
-// sibling `unsigned_dev.go` / `unsigned_prod.go` files (Stage 1.4
-// follow-up); the interface is declared here so callers (the CLI
-// orchestrator and its tests) can program against the canonical
+// This file declares the contract ONLY; no concrete
+// implementation ships in this iteration. A follow-up
+// workstream (implementation-plan Stage 1.4 items 97-102) will
+// add two build-tag-gated synthesiser files in this same
+// `devpolicy` package:
+//
+//   - `unsigned_dev.go` (`//go:build !prod`) -- will construct
+//     an unsigned `steward.PolicyVersion` per architecture
+//     Sec 3.8's "STRUCTURAL signature bypass".
+//   - `unsigned_prod.go` (`//go:build prod`) -- will return an
+//     `ErrDevModeUnavailable` sentinel (introduced by the same
+//     follow-up) without producing any `PolicyVersion`, so the
+//     bypass cannot be smuggled into a production binary at
+//     compile time.
+//
+// Declaring the interface up front lets the future CLI
+// orchestrator and its tests program against the canonical
 // shape regardless of which file is in the active build.
 type Loader interface {
 	// Load reads YAML rule pack files from the source described
-	// by src and returns a fully-populated [Bundle]. Errors:
+	// by src and returns a fully-populated [Bundle]. The
+	// concrete implementation is added by a follow-up workstream
+	// (implementation-plan Stage 1.4 items 97-102); the
+	// contract declared here will be honoured as follows:
 	//
-	//   - YAML decode / validation errors surface unchanged from
-	//     the underlying decoder so the operator sees the
+	//   - YAML decode / validation errors will surface unchanged
+	//     from the underlying decoder so the operator sees the
 	//     offending filename and line.
 	//   - When the active build does not permit the unsigned
-	//     bypass (a `-tags prod` build), the prod
-	//     implementation returns [ErrDevModeUnavailable] without
-	//     reading any bytes.
+	//     bypass (a `-tags prod` build), Load will return an
+	//     `ErrDevModeUnavailable` sentinel (to be introduced by
+	//     the same follow-up) without reading any bytes.
 	//
-	// The returned [Bundle.PolicyVersion.Signature] is always
-	// nil in the dev build (architecture Sec 3.8 / tech-spec
-	// C6); the rule engine's InMemoryStore accepts the
-	// unsigned row without invoking the Steward verifier.
+	// The returned `Bundle.PolicyVersion.Signature` will always
+	// be nil in the dev build (architecture Sec 3.8 / tech-spec
+	// C6); the rule engine's InMemoryStore accepts the unsigned
+	// row without invoking the Steward verifier.
 	Load(ctx context.Context, src LoaderSource) (Bundle, error)
 }
 
@@ -50,11 +61,12 @@ type Loader interface {
 // `embed.FS` baked into the binary at compile time via
 // `services/clean-code/policy/rulepacks/embedded_fs.go`. When
 // UseEmbedded is false, the Loader walks `os.DirFS(DirPath)` --
-// this is the `--policy <path>` override path; it is permitted in
-// the no-tag dev build and FORBIDDEN in a `-tags prod` build (the
-// prod implementation returns [ErrDevModeUnavailable] before any
-// filesystem access). See architecture Sec 7.2 and tech-spec
-// Sec 8.4 for the override-vs-embed precedence rules.
+// this is the `--policy <path>` override path; it is permitted
+// in the no-tag dev build and will be FORBIDDEN in a `-tags
+// prod` build (the prod synthesiser added by the Stage 1.4
+// follow-up will return its `ErrDevModeUnavailable` sentinel
+// before any filesystem access). See architecture Sec 7.2 and
+// tech-spec Sec 8.4 for the override-vs-embed precedence rules.
 type LoaderSource struct {
 	// UseEmbedded selects the embedded rule pack `embed.FS`.
 	// When true, [LoaderSource.DirPath] is ignored.
@@ -115,10 +127,11 @@ var ErrMissingPolicyDir = errors.New("devpolicy: LoaderSource.DirPath must be no
 // `os.DirFS(s.DirPath)` -- the `--policy <path>` override.
 //
 // This is the SINGLE choice point between the embedded and
-// filesystem sources, so the build-tag-gated synthesisers
-// (`unsigned_dev.go` / `unsigned_prod.go`, Stage 1.4 follow-up)
-// stay decoupled from the source-kind switch; they call
-// `src.FS()` and walk the returned FS uniformly.
+// filesystem sources, so the future build-tag-gated synthesisers
+// (`unsigned_dev.go` / `unsigned_prod.go`, to be added by the
+// Stage 1.4 follow-up workstream) will stay decoupled from the
+// source-kind switch: they will call `src.FS()` and walk the
+// returned FS uniformly.
 func (s LoaderSource) FS() (fs.FS, error) {
 	if s.UseEmbedded {
 		return embeddedRulePacks, nil

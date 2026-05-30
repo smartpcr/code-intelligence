@@ -1,16 +1,8 @@
-package ast
+//go:build canonical_dispatcher
 
-// MergeLangMeta merges parser-supplied LangMeta into attrs_json, protecting
-// first-class keys that the dispatcher owns. The dispatcher's language value
-// always takes precedence over anything the parser places in LangMeta.
-//
-// First-class keys: "language".
-func MergeLangMeta(parserMeta map[string]string, dispatcherLanguage string) map[string]string {
-	result := make(map[string]string, len(parserMeta)+1)
-	for k, v := range parserMeta {
-		result[k] = v
-	}
-	// First-class key: dispatcher wins regardless of parser-supplied value.
-	result["language"] = dispatcherLanguage
-	return result
-}
+// Stub MergeLangMeta declaration; the canonical implementation lives in
+// method_attrs.go and is unconditionally compiled. This stub is gated behind
+// the never-enabled `canonical_dispatcher` build tag so the package builds
+// without symbol-collision errors. See dispatcher.go / method_attrs.go for the
+// canonical contract.
+package ast

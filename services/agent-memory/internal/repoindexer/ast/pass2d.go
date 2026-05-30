@@ -9,7 +9,7 @@ import (
 // same file's methodNodeID map.
 //
 // Returns:
-//   - edges: overrides edges for resolved trait→impl pairs.
+//   - edges: overrides edges for resolved traitΓåÆimpl pairs.
 //   - attrsJSON: for unresolved pairs (cross-file miss), the impl method's
 //     LangMeta is serialised as JSON and keyed by "ClassName.MethodName".
 //     The trait name is preserved on attrs_json so downstream passes or
@@ -22,13 +22,24 @@ func Pass2dOverrides(pr ParseResult, methodNodeID map[string]string) ([]Edge, ma
 		if m.LangMeta == nil {
 			continue
 		}
-		traitName, ok := m.LangMeta["trait"]
-		if !ok || traitName == "" {
+		traitNameRaw, ok := m.LangMeta["trait"]
+		if !ok {
+			continue
+		}
+		traitName, _ := traitNameRaw.(string)
+		if traitName == "" {
 			continue
 		}
 
-		traitMethodKey := traitName + "." + m.Name
-		implMethodKey := m.ClassName + "." + m.Name
+		// m.QualifiedName is already dotted (e.g. "MyStruct.bar"),
+		// so extract the simple method name before composing the
+		// trait-side and impl-side lookup keys ΓÇö otherwise we get
+		// double-prefixed keys like "MyTrait.MyStruct.bar" and
+		// "MyStruct.MyStruct.bar" that never resolve. Matches the
+		// dispatcher's inline Pass 2d (dispatcher.go ~line 800).
+		simpleName := lastDottedSegment(m.QualifiedName)
+		traitMethodKey := traitName + "." + simpleName
+		implMethodKey := m.EnclosingClass + "." + simpleName
 
 		traitNodeID, traitFound := methodNodeID[traitMethodKey]
 		implNodeID, implFound := methodNodeID[implMethodKey]

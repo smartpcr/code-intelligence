@@ -23,16 +23,18 @@ each row against the actual roster `defaultParsers()` returns.
 ## TL;DR
 
 - **CGO=1 build** (`CGO_ENABLED=1`, C compiler on PATH) registers
-  the five tree-sitter parsers (C, C++, C#, Go, Rust) plus the
-  `pwsh` subprocess PowerShell parser. Eight extensions parse end
-  to end via `defaultParsers()` when `.ts` / `.tsx` / `.js` /
-  `.jsx` / `.mjs` / `.cjs` / `.py` / `.pyi` are layered on via
-  `WithParsers` (see "TS/JS and Python registration" below).
+  six parsers via `defaultParsers()`: the five tree-sitter parsers
+  (C, C++, C#, Go, Rust) plus the `pwsh` subprocess PowerShell
+  parser. The TypeScript/JavaScript and Python parsers also ship
+  in this package but are **NOT** in `defaultParsers()` -- callers
+  add them explicitly via `ast.WithParsers(...)` to reach the
+  full 8-language coverage the polyglot smoke gate exercises (see
+  "TS/JS and Python registration" below).
 - **CGO=0 build** (stock `make test` on Windows, the portable
-  smoke-test gate, any host without a C toolchain) registers
-  **only** the PowerShell parser; every `.c` / `.h` / `.cpp` /
-  `.cxx` / `.c++` / `.hpp` / `.hh` / `.hxx` / `.h++` / `.cs` /
-  `.go` / `.rs` file is **skipped** with
+  smoke-test gate, any host without a C toolchain): `defaultParsers()`
+  registers **only** the PowerShell parser; every `.c` / `.h` /
+  `.cpp` / `.cxx` / `.c++` / `.hpp` / `.hh` / `.hxx` / `.h++` /
+  `.cs` / `.go` / `.rs` file is **skipped** with
   `ast.dispatch.skip{reason="no_parser"}` and the worker drains
   the next file in the queue (architecture S7 `loud, not silent`
   guarantee).
@@ -48,17 +50,39 @@ S7).
 
 ## Build-tag roster (what `defaultParsers()` returns)
 
-| Build constraint | `defaultParsers()` source | Registered parsers (order matters for overlapping extensions) |
+| Build constraint | `defaultParsers()` source | Registered parsers (slice order) |
 | --- | --- | --- |
 | `//go:build cgo` | [`parsers_cgo.go`](./parsers_cgo.go) | `NewTreeSitterCParser`, `NewTreeSitterCppParser`, `NewTreeSitterCSharpParser`, `NewTreeSitterGoParser`, `NewTreeSitterRustParser`, `NewPowerShellParser` |
 | `//go:build !cgo` | [`parsers_nocgo.go`](./parsers_nocgo.go) | `NewPowerShellParser` (only) |
 
-Ordering note: in [`parsers_cgo.go`](./parsers_cgo.go) the C
-parser is listed BEFORE the C++ parser. Both claim `.h`; the
-dispatcher's `extMap` is overwrite-on-last-wins, so the C++
-parser intentionally owns `.h` headers. This is guarded by
-`TestDefaultParsers_CBeforeCpp` and the inline comment in
-`parsers_cgo.go::defaultParsers`.
+### `.h` routing and the C-before-C++ ordering pin
+
+`.h` headers route to the **C** parser, not C++:
+
+- [`parser_treesitter_c.go`](./parser_treesitter_c.go) `Extensions()`
+  returns `{".c", ".h"}` (line 80).
+- [`parser_treesitter_cpp.go`](./parser_treesitter_cpp.go)
+  `Extensions()` returns
+  `{".cc", ".cpp", ".cxx", ".c++", ".hpp", ".hh", ".hxx", ".h++"}`
+  (line 96). The C++ parser **does not claim plain `.h`** — its
+  factory comment at line 84-89 says so explicitly: "Plain `.h`
+  is NOT claimed because tree-sitter-cpp accepts the C subset and
+  the project's `parser_treesitter_c` workstream owns the C
+  header extensions."
+
+The C-before-C++ ordering pinned by
+`TestDefaultParsers_CBeforeCpp`
+([`parser_treesitter_cpp_test.go`](./parser_treesitter_cpp_test.go)
+lines 788-834) is a **defensive guard**, not a tie-breaker for
+today's roster: today the two parsers' extension sets do not
+overlap. The dispatcher's `extMap` is overwrite-on-last-wins, so
+if a future revision of `parser_treesitter_cpp.go` accidentally
+added `.h` to its `Extensions()`, the C++ parser would silently
+re-route `.h` files away from C; pinning C earlier in the slice
+keeps C's `.h` claim authoritative even under that hypothetical
+edit. The C++ test's own comment block calls this out as
+future-proofing for the implementation-plan §line-444 test
+`TestDispatcher_DotHRoutesToC_EvenWithCppHint`.
 
 ## Per-language coverage matrix
 
@@ -72,8 +96,8 @@ is unavailable on the current build/host.
 | --- | --- | --- | --- | --- | --- | --- |
 | TypeScript / JavaScript | `.ts .tsx .js .jsx .mjs .cjs` | [`parser_treesitter.go`](./parser_treesitter.go) (`NewTreeSitterTypeScriptParser`) + [`parser_typescript.go`](./parser_typescript.go) (`NewTypeScriptParser`, scanner fallback) | parses (tree-sitter) when registered via `WithParsers`; **not** in `defaultParsers()` -- see "TS/JS and Python registration" below | parses (stdlib scanner) when registered via `WithParsers`; **not** in `defaultParsers()` | none (CGO toolchain only for the tree-sitter variant) | `no_parser` if neither variant is registered |
 | Python | `.py .pyi` | [`parser_treesitter.go`](./parser_treesitter.go) (`NewTreeSitterPythonParser`) + [`parser_python.go`](./parser_python.go) (`NewPythonParser`, scanner fallback) | parses (tree-sitter) when registered via `WithParsers`; **not** in `defaultParsers()` -- see "TS/JS and Python registration" below | parses (stdlib scanner) when registered via `WithParsers`; **not** in `defaultParsers()` | none (CGO toolchain only for the tree-sitter variant) | `no_parser` if neither variant is registered |
-| C | `.c .h` (note: `.h` is owned by C++ when both register; see ordering note above) | [`parser_treesitter_c.go`](./parser_treesitter_c.go) (`NewTreeSitterCParser`) | parses (tree-sitter) via `defaultParsers()` | **skipped** -- not in `defaultParsers()`; `.c` files fall through the dispatcher with no Nodes | none (CGO toolchain only) | `no_parser` |
-| C++ | `.cc .cpp .cxx .c++ .hpp .hh .hxx .h++` (and `.h` via the C-before-C++ ordering) | [`parser_treesitter_cpp.go`](./parser_treesitter_cpp.go) (`NewTreeSitterCppParser`) | parses (tree-sitter) via `defaultParsers()` | **skipped** -- not in `defaultParsers()`; `.cpp` / `.h` / etc. fall through with no Nodes | none (CGO toolchain only) | `no_parser` |
+| C | `.c .h` (C owns plain `.h` headers -- see ".h routing" above) | [`parser_treesitter_c.go`](./parser_treesitter_c.go) (`NewTreeSitterCParser`) | parses (tree-sitter) via `defaultParsers()` | **skipped** -- not in `defaultParsers()`; `.c` and `.h` files fall through the dispatcher with no Nodes | none (CGO toolchain only) | `no_parser` |
+| C++ | `.cc .cpp .cxx .c++ .hpp .hh .hxx .h++` (plain `.h` is NOT claimed; routes to C) | [`parser_treesitter_cpp.go`](./parser_treesitter_cpp.go) (`NewTreeSitterCppParser`) | parses (tree-sitter) via `defaultParsers()` | **skipped** -- not in `defaultParsers()`; `.cpp` / `.hpp` / etc. fall through with no Nodes | none (CGO toolchain only) | `no_parser` |
 | C# | `.cs` | [`parser_treesitter_csharp.go`](./parser_treesitter_csharp.go) (`NewTreeSitterCSharpParser`) | parses (tree-sitter) via `defaultParsers()` | **skipped** -- not in `defaultParsers()`; `.cs` files fall through with no Nodes | none (CGO toolchain only) | `no_parser` |
 | Go | `.go` | [`parser_treesitter_go.go`](./parser_treesitter_go.go) (`NewTreeSitterGoParser`) | parses (tree-sitter) via `defaultParsers()` | **skipped** -- not in `defaultParsers()`; `.go` source files fall through with no Nodes | none (CGO toolchain only) | `no_parser` |
 | Rust | `.rs` | [`parser_treesitter_rust.go`](./parser_treesitter_rust.go) (`NewTreeSitterRustParser`) | parses (tree-sitter) via `defaultParsers()` | **skipped** -- not in `defaultParsers()`; `.rs` files fall through with no Nodes (asserted by `TestDefaultParsers_NoCGOOmitsRust` in [`parsers_nocgo_rust_test.go`](./parsers_nocgo_rust_test.go)) | none (CGO toolchain only) | `no_parser` |

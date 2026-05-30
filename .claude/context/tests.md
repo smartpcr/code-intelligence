@@ -57,13 +57,20 @@ time; without CGO the dispatcher falls back to lightweight
 stdlib-only scanners where one exists, otherwise the language is
 skipped.
 
-| Language   | Extensions               | CGO=1 backend             | CGO=0 backend     |
-| ---------- | ------------------------ | ------------------------- | ----------------- |
-| TypeScript | `.ts .tsx .js .jsx .mjs .cjs` | tree-sitter (`typescript`/`tsx`) | scanner (`parser_typescript.go`) |
-| Python     | `.py .pyi`               | tree-sitter (`python`)    | scanner (`parser_python.go`) |
-| Go         | `.go`                    | tree-sitter (`golang`)    | (none -- file skipped) |
-| C          | `.c .h`                  | tree-sitter (`c`) — **stub** in this stage; full walker lands via sibling `stage-3.1-ctreesitterparser-implementation` | (none -- file skipped) |
-| C#         | `.cs`                    | tree-sitter (`csharp`) — **stub** in this stage (iter 9); full walker lands via sibling `stage-4.1-csharptreesitterparser-implementation` | (none -- file skipped) |
+| Language   | Extensions                    | Source parser file (this dir of `services\agent-memory\internal\repoindexer\ast`)                                              | CGO=1 status                            | CGO=0 status                                                                |
+| ---------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- | --------------------------------------------------------------------------- |
+| TypeScript / JavaScript | `.ts .tsx .js .jsx .mjs .cjs` | `parser_treesitter.go` (`NewTreeSitterTypeScriptParser`) + `parser_typescript.go` (`NewTypeScriptParser`, scanner fallback) | parses when registered via `WithParsers`; **not** in `defaultParsers()` | parses (scanner) when registered via `WithParsers`; **not** in `defaultParsers()` |
+| Python     | `.py .pyi`                    | `parser_treesitter.go` (`NewTreeSitterPythonParser`) + `parser_python.go` (`NewPythonParser`, scanner fallback)             | parses when registered via `WithParsers`; **not** in `defaultParsers()` | parses (scanner) when registered via `WithParsers`; **not** in `defaultParsers()` |
+| C          | `.c .h` (C owns plain `.h`)   | `parser_treesitter_c.go` (`NewTreeSitterCParser`)                                                                              | parses via `defaultParsers()`           | skipped (`no_parser`)                                                       |
+| C++        | `.cc .cpp .cxx .c++ .hpp .hh .hxx .h++` (plain `.h` -> C) | `parser_treesitter_cpp.go` (`NewTreeSitterCppParser`)                                                  | parses via `defaultParsers()`           | skipped (`no_parser`)                                                       |
+| C#         | `.cs`                         | `parser_treesitter_csharp.go` (`NewTreeSitterCSharpParser`)                                                                    | parses via `defaultParsers()`           | skipped (`no_parser`)                                                       |
+| Go         | `.go`                         | `parser_treesitter_go.go` (`NewTreeSitterGoParser`)                                                                            | parses via `defaultParsers()`           | skipped (`no_parser`)                                                       |
+| Rust       | `.rs`                         | `parser_treesitter_rust.go` (`NewTreeSitterRustParser`)                                                                        | parses via `defaultParsers()`           | skipped (`no_parser`)                                                       |
+| PowerShell | `.ps1 .psm1 .psd1`            | `parser_powershell.go` (`NewPowerShellParser`) -- subprocess to `pwsh`                                                          | parses iff `pwsh` on PATH               | parses iff `pwsh` on PATH (only language registered under CGO=0)            |
+
+Skim only -- see [`COVERAGE.md`](../../services/agent-memory/internal/repoindexer/ast/COVERAGE.md)
+for the canonical row-by-row breakdown including the exact
+`ast.dispatch.skip{reason=...}` slugs and the `.h` routing rationale.
 
 Notes:
 
@@ -81,13 +88,16 @@ Notes:
   PATH (`gcc` / `clang` on Linux/macOS; `tdm-gcc` on Windows).
   `make test-cgo` in `services\agent-memory` exercises this
   path.
-- Non-CGO scanner support is narrower (TS/Python only). New
-  languages without a non-CGO scanner are CGO-only by design:
-  when the no-CGO build runs, those extensions are simply not
-  registered in `defaultParsers()`, so the dispatcher's lookup
-  misses and it emits an `ast.dispatch.skip` event with
-  `reason="no_parser"` (the same skip reason used for any
-  unrecognized extension).
+- Under CGO=0 the `defaultParsers()` roster (see
+  [`parsers_nocgo.go`](../../services/agent-memory/internal/repoindexer/ast/parsers_nocgo.go))
+  contains **only** the PowerShell parser; every other
+  extension hits the dispatcher's `ast.dispatch.skip` branch
+  with `reason="no_parser"`. The TypeScript and Python
+  CGO-free scanner parsers exist but are NOT in `defaultParsers()`
+  under either build tag -- callers reach the full 8-language
+  coverage by appending them via `ast.WithParsers(...)` (the
+  `polyglotParserSet()` helper in `parsers_polyglot_smoke_test.go`
+  demonstrates the pattern).
 
 ## Common commands
 

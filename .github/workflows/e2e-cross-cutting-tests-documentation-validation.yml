@@ -1,0 +1,54 @@
+name: "E2E — Cross-Cutting Tests Documentation Validation"
+
+on:
+  pull_request:
+    branches:
+      - feature/memory
+      - "ws/code-intelligence-AST-PARSER-FOR-ADDIT/**"
+    paths:
+      - ".claude/context/tests.md"
+      - "services/agent-memory/test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/**"
+      - "tests/e2e/phase-7-cross-cutting-validation/**"
+      - ".github/workflows/e2e-cross-cutting-tests-documentation-validation.yml"
+  push:
+    branches:
+      - feature/memory
+      - "ws/code-intelligence-AST-PARSER-FOR-ADDIT/**"
+    paths:
+      - ".claude/context/tests.md"
+      - "services/agent-memory/test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/**"
+      - "tests/e2e/phase-7-cross-cutting-validation/**"
+      - ".github/workflows/e2e-cross-cutting-tests-documentation-validation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-cross-cutting-docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  documentation-support-matrix-update:
+    name: "documentation-support-matrix-update"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/agent-memory/go.mod
+          cache: true
+
+      - name: Download Go dependencies
+        working-directory: services/agent-memory
+        run: go mod download
+
+      - name: Run E2E scenarios
+        working-directory: services/agent-memory
+        run: |
+          go test -tags e2e -v -count=1 -timeout 120s \
+            -run TestE2E_cross_cutting_tests_documentation_validation_documentation_support_matrix_update \
+            ./test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/...

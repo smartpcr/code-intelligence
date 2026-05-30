@@ -11,7 +11,7 @@ package devpolicy
 import (
 	"io/fs"
 
-	"github.com/microsoft/cleancode-service/policy/rulepacks"
+	"github.com/smartpcr/code-intelligence/services/clean-code/policy/rulepacks"
 )
 
 var embeddedRulePacks fs.FS = rulepacks.EmbeddedRulePacks

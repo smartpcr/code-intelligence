@@ -20,7 +20,7 @@ import (
 	"testing"
 
 	"github.com/cucumber/godog"
-	"github.com/microsoft/cleancode-service/internal/cli/devpolicy"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/devpolicy"
 	"gopkg.in/yaml.v3"
 )
 

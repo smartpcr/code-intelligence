@@ -14,7 +14,7 @@ import (
 	"io/fs"
 	"strings"
 
-	"github.com/microsoft/cleancode-service/internal/policy/steward"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 	"gopkg.in/yaml.v3"
 )
 

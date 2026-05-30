@@ -1,29 +1,87 @@
 package migrations
 
-// This file previously contained `TestMigrator_Up_AppliesAll`
-// and `TestMigrations_0022_EdgeKindOverrides`, written against
-// the duplicate `Migrator` and `Has` helper that lived in
-// migrator.go before that file was reduced to a comment-only
-// stub. Those tests asserted against the wrong journal table
-// (`schema_migrations` instead of the canonical
-// `_schema_migrations`) and the wrong version format
-// (`0022_edge_kind_overrides` instead of the canonical numeric
-// prefix `0022`), so they could never pass against the
-// production Migrator in migrate.go.
-//
-// Equivalent coverage for migration `0022_edge_kind_overrides`
-// is preserved by:
-//
-//   - `migrate_test.go::TestAll_filenamesMatchPlannedSet`
-//     pins `0022_edge_kind_overrides.sql` as an expected
-//     embedded filename.
-//   - `migrate_test.go::TestAll_parsesEveryEmbeddedFile`
-//     pins `"0022"` as the parsed Migration.Version.
-//   - `test_migrate_test.go` exercises the live Up / Down /
-//     AppliedVersions round trip via the canonical Migrator
-//     (skipped when AGENT_MEMORY_PG_URL is unset).
-//   - The e2e suite in
-//     `test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/
-//     shared_additive_surfaces_and_dispatcher_edits_schema_
-//     migration_for_overrides_edge_kind_test.go` validates
-//     the same migration end-to-end against `_schema_migrations`.
+import (
+	"context"
+	"database/sql"
+	"os"
+	"testing"
+
+	_ "github.com/lib/pq"
+)
+
+func openTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	dsn := os.Getenv("AGENT_MEMORY_PG_URL")
+	if dsn == "" {
+		t.Skip("AGENT_MEMORY_PG_URL not set — skipping migration test")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+// TestMigrator_Up_AppliesAll verifies that all embedded migrations
+// are applied successfully to an empty database.
+func TestMigrator_Up_AppliesAll(t *testing.T) {
+	db := openTestDB(t)
+	m := New(db)
+
+	if err := m.Up(context.Background()); err != nil {
+		t.Fatalf("Migrator.Up: %v", err)
+	}
+
+	// Verify at least 0022 was recorded in the canonical journal table.
+	var count int
+	err := db.QueryRow(
+		"SELECT COUNT(*) FROM "+JournalTable+" WHERE version = '0022'",
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("query %s: %v", JournalTable, err)
+	}
+	if count != 1 {
+		t.Fatalf("expected migration 0022 to be recorded, got count=%d", count)
+	}
+}
+
+// TestMigrations_0022_EdgeKindOverrides verifies that the
+// 0022_edge_kind_overrides migration is embedded and reachable.
+func TestMigrations_0022_EdgeKindOverrides(t *testing.T) {
+	db := openTestDB(t)
+	m := New(db)
+
+	// Verify the migration is embedded via All().
+	all, err := All()
+	if err != nil {
+		t.Fatalf("All(): %v", err)
+	}
+	found := false
+	for _, mg := range all {
+		if mg.Version == "0022" && mg.Name == "edge_kind_overrides" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("migration 0022_edge_kind_overrides is not embedded in the migrations package")
+	}
+
+	// Apply migrations so the enum value exists.
+	if err := m.Up(context.Background()); err != nil {
+		t.Fatalf("Migrator.Up: %v", err)
+	}
+
+	// Verify the migration was recorded in the canonical journal table.
+	var version string
+	err = db.QueryRow(
+		"SELECT version FROM "+JournalTable+" WHERE version = '0022'",
+	).Scan(&version)
+	if err != nil {
+		t.Fatalf("0022 not found in %s: %v", JournalTable, err)
+	}
+	if version != "0022" {
+		t.Fatalf("unexpected version: %s", version)
+	}
+}

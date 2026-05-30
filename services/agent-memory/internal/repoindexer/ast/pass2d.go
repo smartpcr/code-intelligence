@@ -22,24 +22,13 @@ func Pass2dOverrides(pr ParseResult, methodNodeID map[string]string) ([]Edge, ma
 		if m.LangMeta == nil {
 			continue
 		}
-		traitNameRaw, ok := m.LangMeta["trait"]
-		if !ok {
-			continue
-		}
-		traitName, _ := traitNameRaw.(string)
-		if traitName == "" {
+		traitName, ok := m.LangMeta["trait"]
+		if !ok || traitName == "" {
 			continue
 		}
 
-		// m.QualifiedName is already dotted (e.g. "MyStruct.bar"),
-		// so extract the simple method name before composing the
-		// trait-side and impl-side lookup keys — otherwise we get
-		// double-prefixed keys like "MyTrait.MyStruct.bar" and
-		// "MyStruct.MyStruct.bar" that never resolve. Matches the
-		// dispatcher's inline Pass 2d (dispatcher.go ~line 800).
-		simpleName := lastDottedSegment(m.QualifiedName)
-		traitMethodKey := traitName + "." + simpleName
-		implMethodKey := m.EnclosingClass + "." + simpleName
+		traitMethodKey := traitName + "." + m.Name
+		implMethodKey := m.ClassName + "." + m.Name
 
 		traitNodeID, traitFound := methodNodeID[traitMethodKey]
 		implNodeID, implFound := methodNodeID[implMethodKey]

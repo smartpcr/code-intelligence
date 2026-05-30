@@ -21,11 +21,11 @@ type AncestryWriter struct {
 	repoID      fingerprint.RepoID
 	packages    map[string]fingerprint.Sum
 
-	// MethodCalls records the name of each internal method invocation
-	// (EnsureRepo, EnsureCommit) in order. This enables test code to
-	// observe real invocations when calling the combined
-	// EnsureRepoAndCommit method, without manual counting.
-	MethodCalls []string
+	// methodCalls records the name of each internal method invocation
+	// (EnsureRepo, EnsureCommit) in order. Unexported to keep test
+	// scaffolding off the production API surface; tests access it via
+	// MethodCallLog() defined in ancestry_writer_export_test.go.
+	methodCalls []string
 }
 
 // NewAncestryWriter creates an AncestryWriter that writes through the
@@ -57,7 +57,7 @@ func (w *AncestryWriter) EnsureRepoAndCommit(ctx context.Context) error {
 // EnsureRepo creates the repo node if it has not been created yet.
 // Idempotent: subsequent calls are no-ops.
 func (w *AncestryWriter) EnsureRepo(ctx context.Context) error {
-	w.MethodCalls = append(w.MethodCalls, "EnsureRepo")
+	w.methodCalls = append(w.methodCalls, "EnsureRepo")
 	if w.repoReady {
 		return nil
 	}
@@ -81,7 +81,7 @@ func (w *AncestryWriter) EnsureRepo(ctx context.Context) error {
 // EnsureCommit records the commit metadata. Must be called after
 // EnsureRepo. Idempotent: subsequent calls are no-ops.
 func (w *AncestryWriter) EnsureCommit(ctx context.Context) error {
-	w.MethodCalls = append(w.MethodCalls, "EnsureCommit")
+	w.methodCalls = append(w.methodCalls, "EnsureCommit")
 	if w.commitReady {
 		return nil
 	}

@@ -1,9 +1,57 @@
-pack_id: "solid-srp"
-version: "1.0"
+# clean-code Stage 5.5 -- SOLID / Single Responsibility rule pack
+#
+# Architecture references:
+#   - Sec 1.3 "SOLID coding principles" (goal 2): the SRP
+#     smell is a class doing too many things, revealed by
+#     low cohesion (LCOM4) or a class-scope public surface
+#     that is too wide (interface_width).
+#   - Sec 1.4.1 canonical metric_kind (line 101):
+#       * `lcom4` (class scope, pack=solid): "Lack of
+#         Cohesion of Methods. Drives SRP rule."
+#       * `interface_width` (class, interface scope,
+#         pack=solid): "Public method count. Drives ISP
+#         rule." -- also used by SRP on class scope.
+#   - Sec 3.5.1.a SOLID input recipe for SRP: "Inputs:
+#     `lcom4` (class), `interface_width` (class). A class
+#     with `lcom4 >= threshold AND interface_width >=
+#     threshold` is flagged."
+#   - implementation-plan Stage 5.5 brief (line 516): "Add
+#     `policy/rulepacks/solid/srp.yaml`: SRP rule per
+#     architecture Sec 1.3 consuming `metric_kind IN
+#     ('lcom4','interface_width')`."
+#
+# # pack_id convention
+#
+# `<family>.<subname>` per migration
+# `0003_policy_audit_refactor.up.sql` line 200.
+pack_id: solid.srp
+version: 1
+display_name: SOLID -- Single Responsibility
+description_md: |-
+  Two v1 rules detecting SRP violations. The first fires on
+  class-scope `lcom4` samples exceeding threshold (low cohesion
+  = multiple responsibilities). The second fires on class-scope
+  `interface_width` samples exceeding threshold (too-wide public
+  surface = the class does too much). Together they cover the
+  canonical SRP input pair `{lcom4, interface_width}` from
+  architecture Sec 3.5.1.a.
 rules:
-  - rule_id: "srp-class-cohesion"
-    metric_kind: "lcom4"
-    scope_kind: "class"
+  - rule_id: solid.srp.lcom4_high
+    version: 1
     predicate_dsl: "metric_kind == 'lcom4' AND scope_kind == 'class' AND value >= 10"
-    description: "Class has low cohesion (LCOM4 >= 10), violating Single Responsibility Principle"
-    suggested_refactor: "Split the class along the cohesion boundaries (SRP)"
+    severity_default: warn
+    description_md: |-
+      Class `lcom4` >= 10 -- the class has at least 10
+      disconnected method-field clusters, indicating multiple
+      unrelated responsibilities. Suggested refactor: split the
+      class along the cohesion boundaries (the canonical SRP
+      refactor).
+  - rule_id: solid.srp.interface_width_high
+    version: 1
+    predicate_dsl: "metric_kind == 'interface_width' AND scope_kind == 'class' AND value >= 15"
+    severity_default: warn
+    description_md: |-
+      Class `interface_width` >= 15 -- the class exposes 15+
+      public methods, suggesting it handles too many concerns.
+      Suggested refactor: split the class into focused,
+      single-responsibility components (SRP).

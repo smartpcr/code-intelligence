@@ -1,0 +1,88 @@
+trigger:
+  paths:
+    - "services/agent-memory/internal/repoindexer/ast/**"
+    - "services/agent-memory/test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/**"
+    - "tests/e2e/phase-7-cross-cutting-validation/**"
+
+pr:
+  paths:
+    - "services/agent-memory/internal/repoindexer/ast/**"
+    - "services/agent-memory/test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/**"
+
+pool:
+  vmImage: "ubuntu-latest"
+
+variables:
+  COMPOSE_FILE: tests/e2e/phase-7-cross-cutting-validation/docker-compose.yml
+  AGENT_MEMORY_PG_URL: "postgres://agent_memory:agent_memory@localhost:5432/agent_memory?sslmode=disable"
+  AGENT_MEMORY_QDRANT_URL: "http://localhost:6333"
+  AGENT_MEMORY_OTEL_ENDPOINT: "http://localhost:4317"
+
+steps:
+  - checkout: self
+
+  - task: GoTool@0
+    displayName: "Set up Go"
+    inputs:
+      version: "1.25"
+
+  - script: |
+      docker compose -f $(COMPOSE_FILE) up -d --build
+    displayName: "Start compose stack (postgres, qdrant, otel-collector)"
+
+  - script: |
+      set -euo pipefail
+      deadline=$(( $(date +%s) + 90 ))
+      while :; do
+        status=$(docker compose -f $(COMPOSE_FILE) ps --format json \
+          | jq -r 'select(.Service=="postgres") | .Health // .State' 2>/dev/null || echo "unknown")
+        echo "  postgres -> $status"
+        if [ "$status" = "healthy" ]; then echo "Postgres ready"; break; fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+          echo "##vso[task.logissue type=error]Postgres did not become healthy within 90s"
+          docker compose -f $(COMPOSE_FILE) logs --tail=100
+          exit 1
+        fi
+        sleep 3
+      done
+    displayName: "Wait for postgres"
+
+  - script: |
+      cd services/agent-memory
+      go mod download
+    displayName: "Download Go dependencies"
+
+  - script: |
+      cd services/agent-memory
+      go build ./internal/repoindexer/ast/...
+    displayName: "Build ast package"
+
+  - script: |
+      cd services/agent-memory
+      CGO_ENABLED=1 go test ./internal/repoindexer/ast -count=1 -v
+    displayName: "Run AST unit tests (CGO=on)"
+    env:
+      AGENT_MEMORY_PG_URL: $(AGENT_MEMORY_PG_URL)
+
+  - script: |
+      cd services/agent-memory
+      CGO_ENABLED=0 go test ./internal/repoindexer/ast -count=1 -v
+    displayName: "Run AST unit tests (CGO=off)"
+    env:
+      AGENT_MEMORY_PG_URL: $(AGENT_MEMORY_PG_URL)
+
+  - script: |
+      cd services/agent-memory
+      CGO_ENABLED=1 go test -tags e2e -v -count=1 -timeout 120s \
+        -run TestE2E_cross_cutting_tests_documentation_validation_cross_language_dispatcher_tests \
+        ./test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/...
+    displayName: "Run E2E cross-language dispatcher scenarios"
+    env:
+      AGENT_MEMORY_PG_URL: $(AGENT_MEMORY_PG_URL)
+      AGENT_MEMORY_QDRANT_URL: $(AGENT_MEMORY_QDRANT_URL)
+      AGENT_MEMORY_OTEL_ENDPOINT: $(AGENT_MEMORY_OTEL_ENDPOINT)
+
+  - script: |
+      docker compose -f $(COMPOSE_FILE) down -v
+    displayName: "Tear down compose stack"
+    condition: always()

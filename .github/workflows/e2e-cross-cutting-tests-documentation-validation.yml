@@ -1,0 +1,74 @@
+name: E2E Cross-Cutting Tests Documentation Validation
+
+on:
+  push:
+    paths:
+      - "services/agent-memory/internal/repoindexer/ast/**"
+      - "services/agent-memory/test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/**"
+      - "tests/e2e/phase-7-cross-cutting-validation/**"
+  pull_request:
+    paths:
+      - "services/agent-memory/internal/repoindexer/ast/**"
+      - "services/agent-memory/test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/**"
+
+jobs:
+  e2e-cross-language-dispatcher:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cgo: ["1", "0"]
+    env:
+      COMPOSE_FILE: tests/e2e/phase-7-cross-cutting-validation/docker-compose.yml
+      AGENT_MEMORY_PG_URL: "postgres://agent_memory:agent_memory@localhost:5432/agent_memory?sslmode=disable"
+      AGENT_MEMORY_QDRANT_URL: "http://localhost:6333"
+      AGENT_MEMORY_OTEL_ENDPOINT: "http://localhost:4317"
+      CGO_ENABLED: ${{ matrix.cgo }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Start compose stack
+        run: docker compose -f ${{ env.COMPOSE_FILE }} up -d --build
+
+      - name: Wait for postgres
+        run: |
+          deadline=$(( $(date +%s) + 90 ))
+          while :; do
+            status=$(docker compose -f ${{ env.COMPOSE_FILE }} ps --format json \
+              | jq -r 'select(.Service=="postgres") | .Health // .State' 2>/dev/null || echo "unknown")
+            echo "  postgres -> $status"
+            if [ "$status" = "healthy" ]; then echo "Postgres ready"; break; fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Postgres did not become healthy within 90s"
+              docker compose -f ${{ env.COMPOSE_FILE }} logs --tail=100
+              exit 1
+            fi
+            sleep 3
+          done
+
+      - name: Download Go dependencies
+        working-directory: services/agent-memory
+        run: go mod download
+
+      - name: Build AST package
+        working-directory: services/agent-memory
+        run: go build ./internal/repoindexer/ast/...
+
+      - name: Run AST unit tests
+        working-directory: services/agent-memory
+        run: go test ./internal/repoindexer/ast -count=1 -v
+
+      - name: Run E2E cross-language dispatcher scenarios
+        working-directory: services/agent-memory
+        run: |
+          go test -tags e2e -v -count=1 -timeout 120s \
+            -run TestE2E_cross_cutting_tests_documentation_validation_cross_language_dispatcher_tests \
+            ./test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/...
+
+      - name: Tear down compose stack
+        if: always()
+        run: docker compose -f ${{ env.COMPOSE_FILE }} down -v

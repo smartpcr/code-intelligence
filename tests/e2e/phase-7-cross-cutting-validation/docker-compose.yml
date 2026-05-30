@@ -1,0 +1,83 @@
+# Phase 7 — Cross-Cutting Validation E2E compose stack.
+#
+# Services started: postgres (partman-enabled), qdrant, and otel-collector.
+# This is a thin overlay of the service-local compose definitions; the
+# build contexts point at the service-local Dockerfiles so the e2e tree
+# owns this file path without forking the image definitions.
+#
+# Usage (from repo root):
+#   docker compose -f tests/e2e/phase-7-cross-cutting-validation/docker-compose.yml up -d
+#   export AGENT_MEMORY_PG_URL="postgres://agent_memory:agent_memory@localhost:5432/agent_memory?sslmode=disable"
+#   export AGENT_MEMORY_QDRANT_URL="http://localhost:6333"
+#   export AGENT_MEMORY_OTEL_ENDPOINT="http://localhost:4317"
+#   cd services/agent-memory
+#   go test -tags e2e ./test/e2e/code-intelligence-AST-PARSER-FOR-ADDIT/...
+
+name: phase-7-cross-cutting-validation
+
+services:
+  postgres:
+    container_name: phase7_postgres
+    build:
+      context: ../../../services/agent-memory/deploy/local/postgres
+      dockerfile: Dockerfile
+    image: agent-memory/postgres:16-partman
+    restart: "no"
+    environment:
+      POSTGRES_USER: agent_memory
+      POSTGRES_PASSWORD: agent_memory
+      POSTGRES_DB: agent_memory
+      PG_PARTMAN_BGW_DBNAME: agent_memory
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=pg_partman_bgw"
+      - "-c"
+      - "pg_partman_bgw.dbname=agent_memory"
+      - "-c"
+      - "pg_partman_bgw.interval=3600"
+      - "-c"
+      - "pg_partman_bgw.role=agent_memory"
+    ports:
+      - "5432:5432"
+    volumes:
+      - ../../../services/agent-memory/deploy/local/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_memory -d agent_memory"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  qdrant:
+    container_name: phase7_qdrant
+    image: qdrant/qdrant:v1.12.6
+    restart: "no"
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  otel-collector:
+    container_name: phase7_otel
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    restart: "no"
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ../../../services/agent-memory/deploy/local/otel/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:13133/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s

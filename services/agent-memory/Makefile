@@ -27,6 +27,13 @@ GOFLAGS         ?=
 # (see .github/workflows/agent-memory-ci.yml) where gcc is present.
 TEST_FLAGS      ?= -count=1
 PKGS            ?= ./...
+# AST_PKGS is the narrow package set exercised by `test-cgo` /
+# `test-nocgo`. Per REPO-SCANNER implementation-plan Stage 1.1,
+# the CGO-mode validation gate is scoped to the parser
+# dispatcher subtree -- the only code path that branches on
+# build tags (`parsers_cgo.go` vs `parsers_nocgo.go`). The full
+# suite is already covered by `make test` / `make test-race`.
+AST_PKGS        ?= ./internal/repoindexer/ast/...
 
 # Inputs to `make proto` -- single proto IDL today; add more here
 # as the Agent Surface grows.
@@ -34,7 +41,7 @@ PROTO_DIR       ?= proto
 PROTO_PKG_DIR   ?= proto/agent
 PROTO_FILES     ?= agent.proto
 
-.PHONY: all build test test-race test-cgo-rust lint vet tidy clean help proto proto-tools loadtest-calibration loadtest-calibration-smoke loadtest-gen-artifact
+.PHONY: all build test test-race test-cgo test-nocgo test-cgo-rust lint vet tidy clean help proto proto-tools loadtest-calibration loadtest-calibration-smoke loadtest-gen-artifact
 
 all: lint build test
 
@@ -46,28 +53,44 @@ build:
 test:
 	$(GO) test $(GOFLAGS) $(TEST_FLAGS) $(PKGS)
 
-## test-nocgo: run the full suite with CGO explicitly off.
-## Validates the scanner / stdlib-only fallback paths (e.g. the
-## non-CGO `parser_typescript.go` / `parser_python.go` scanners
-## and the `ast.dispatch.skip{reason=no_parser}` branch for
-## CGO-only languages like Go). The CI's plain `make test` step
-## runs with whatever CGO mode the runner provides; this
-## explicit target lets a developer reproduce the no-CGO build
-## locally and is the canonical scanner-path validation gate
-## documented in `.claude/context/tests.md`.
+## test-nocgo: exercise the AST parser dispatcher subtree with
+## CGO explicitly OFF. Validates the `//go:build !cgo`
+## registration in `parsers_nocgo.go` (PowerShell only) and the
+## scanner / stdlib-only fallback parsers
+## (`parser_typescript.go`, `parser_python.go`) plus the
+## `ast.dispatch.skip{reason="no_parser"}` branch for
+## CGO-only languages (`.c .cpp .cs .go .rs`). Prints
+## `go env CGO_ENABLED CC CXX` first so the CI log records the
+## active toolchain (REPO-SCANNER impl-plan Stage 1.1 scenario
+## `cgo-flag-printed`). Scoped to `$(AST_PKGS)` because the
+## parser-registration split is the only code path that
+## branches on `//go:build cgo`; the broader suite is covered
+## by `make test`. Documented as the canonical scanner-path
+## validation gate in `.claude/context/tests.md`.
 test-nocgo:
-	CGO_ENABLED=0 $(GO) test $(GOFLAGS) $(TEST_FLAGS) $(PKGS)
+	@echo "==> test-nocgo: active Go toolchain (CGO_ENABLED=0)"
+	@CGO_ENABLED=0 $(GO) env CGO_ENABLED CC CXX
+	CGO_ENABLED=0 $(GO) test $(GOFLAGS) $(TEST_FLAGS) $(AST_PKGS)
 
-## test-cgo: run the full suite with CGO explicitly on so the
-## tree-sitter-backed parsers (`parser_treesitter_go.go`,
-## `parser_treesitter_cpp.go`, `parser_treesitter.go` for TS /
-## Python, etc.) are compiled and exercised. Requires a C
-## compiler on PATH (`gcc` / `clang` on Linux/macOS; a MinGW-W64
-## / TDM-GCC install on Windows). This is the canonical
-## tree-sitter validation gate documented in
-## `.claude/context/tests.md`.
+## test-cgo: exercise the AST parser dispatcher subtree with
+## CGO explicitly ON so the tree-sitter-backed parsers
+## (`parser_treesitter_{c,cpp,csharp,go,rust}.go`,
+## `parser_treesitter.go` for TS / Python) are compiled and
+## exercised against the smacker `go-tree-sitter` grammars.
+## Validates the `//go:build cgo` registration in
+## `parsers_cgo.go` (six parsers). Requires a C compiler on
+## PATH (`gcc` / `clang` on Linux/macOS; a MinGW-W64 /
+## TDM-GCC install on Windows -- see the "Building with CGO"
+## subsection of services/agent-memory/README.md). Prints
+## `go env CGO_ENABLED CC CXX` first so the CI log records the
+## active toolchain (REPO-SCANNER impl-plan Stage 1.1 scenario
+## `cgo-flag-printed`). Scoped to `$(AST_PKGS)` for the same
+## reason as `test-nocgo`. Documented as the canonical
+## tree-sitter validation gate in `.claude/context/tests.md`.
 test-cgo:
-	CGO_ENABLED=1 $(GO) test $(GOFLAGS) $(TEST_FLAGS) $(PKGS)
+	@echo "==> test-cgo: active Go toolchain (CGO_ENABLED=1)"
+	@CGO_ENABLED=1 $(GO) env CGO_ENABLED CC CXX
+	CGO_ENABLED=1 $(GO) test $(GOFLAGS) $(TEST_FLAGS) $(AST_PKGS)
 
 ## test-race: run the full Go test suite with the race detector
 ## (requires CGO; CI invokes this on Linux runners).

@@ -74,7 +74,7 @@ and *what the public types look like*. It deliberately does not own:
 - Scenario walk-throughs with inputs/outputs and golden assertions --
   those belong to **e2e-scenarios.md** (future ownership).
 
-Cross-references use the form `tech-spec.md S4` / `impl-plan S3` and are
+Cross-references use the form `tech-spec.md S4` / `implementation-plan.md S3` and are
 written as forward pointers; when the sibling doc is generated in a
 later iteration of this workstream it will inherit the same section
 labels.
@@ -201,11 +201,16 @@ Non-responsibilities (delegated to existing packages):
 - Fingerprinting -> `pkg/fingerprint`.
 - Postgres DML -> `internal/graphwriter.Writer`.
 
-The CLI parses flags with stdlib `flag` to match the repo convention
-(see `cmd/qdrant-bootstrap/main.go`). **Decision (pinned, S9.3):**
-no cobra-style dependency is added in this story. Configuration
-precedence and per-flag semantics are catalogued in
-**tech-spec.md S2**.
+The CLI parses flags with a vendored cobra-style command framework
+(`github.com/spf13/cobra`, a new top-level dependency added in this
+story; see **tech-spec.md S2.0** for the exact module path and
+version pin). **Decision (pinned, S9.3, operator answer 2026-05-30):**
+cobra was chosen over stdlib `flag` because the CLI has four
+distinct subcommands (`scan`, `scan-many`, `diagram module`,
+`diagram calls`, plus `serve`) and a future plugin/sub-sub-command
+surface; cobra's per-command help, completion, and persistent-flag
+machinery pay back the dependency. Configuration precedence and
+per-flag semantics are catalogued in **tech-spec.md S2**.
 
 ### 3.2 graphsink -- `services/agent-memory/internal/graphsink/` (**NEW**)
 
@@ -253,7 +258,7 @@ S5**.
 All three call into the same `pkg/fingerprint` helpers, so a Node
 inserted into SQLite and later replayed into Postgres produces the same
 `(repo_id, fingerprint)` tuple. The backend-parity test catalogued in
-**impl-plan S6** asserts this on a fixture repo.
+**implementation-plan.md S6** asserts this on a fixture repo.
 
 #### 3.2.2 Postgres backend invariants
 
@@ -361,6 +366,15 @@ package repoindexer
 // runFull) and the codeintel CLI MUST drive identically. Construct
 // one per scan; not safe for concurrent use because the package
 // cache is single-writer.
+//
+// A first-time CLI scan does NOT know the repo's fingerprint.RepoID
+// before EnsureRepoAndCommit runs -- repo.repo_id is allocated by
+// the Postgres schema's `DEFAULT gen_random_uuid()` on first INSERT
+// (migrations/0002_repo_commit.sql line 32). For the SQLite/memory
+// backends the AncestryWriter derives a deterministic RepoID from
+// the URL on the first call so SQLite-scanned graphs can be replayed
+// into Postgres without losing fingerprint parity (S2). Either way
+// the RepoID is the OUTPUT of EnsureRepoAndCommit, never an input.
 type AncestryWriter struct {
     Sink    graphsink.Sink   // any sink: postgres, sqlite, memory
     RepoURL string
@@ -368,14 +382,37 @@ type AncestryWriter struct {
     // The per-scan dedupe cache. Empty at construction; the CLI
     // and the worker MUST share one across the file walk.
     packages map[string]string // canonicalPackageDir -> package node id
+    // ancestry is populated by EnsureRepoAndCommit and is what
+    // EnsureFile reads to obtain RepoID + RepoNodeID. Calling
+    // EnsureFile before EnsureRepoAndCommit returns an error.
+    ancestry RepoAncestry
 }
 
-func (a *AncestryWriter) EnsureRepoAndCommit(ctx context.Context, repoID fingerprint.RepoID, defaultBranch string, hints []string) (RepoAncestry, error)
-func (a *AncestryWriter) EnsureFile(ctx context.Context, repoID fingerprint.RepoID, file WalkFile) (FileAncestry, error)
+// NewAncestryWriter returns a writer scoped to one (repoURL, sha)
+// scan. The RepoID is not yet known and is intentionally not an
+// argument.
+func NewAncestryWriter(sink graphsink.Sink, repoURL, sha string) *AncestryWriter
+
+// EnsureRepoAndCommit performs Sink.EnsureRepo (which allocates the
+// RepoID), Sink.EnsureCommit, and InsertNode(kind=repo) in that
+// order, caches the resulting RepoAncestry on the writer, and
+// returns it. The CLI captures the returned RepoID for use in
+// EmitFileEvent.RepoID and for the diagram projector's repo
+// scoping.
+func (a *AncestryWriter) EnsureRepoAndCommit(ctx context.Context, defaultBranch string, hints []string) (RepoAncestry, error)
+
+// EnsureFile performs the per-file package-on-miss + file
+// InsertNode + contains-edge pair. It reads RepoID + RepoNodeID
+// from a.ancestry and returns the parent/child node ids the CLI
+// passes into EmitFileEvent.
+func (a *AncestryWriter) EnsureFile(ctx context.Context, file WalkFile) (FileAncestry, error)
 
 type RepoAncestry struct {
-    RepoNodeID string
-    CommitInserted bool
+    RepoID         fingerprint.RepoID // assigned by Sink.EnsureRepo (Postgres) or derived from RepoURL (SQLite/memory)
+    RepoUUID       string             // textual UUID form, == graphwriter.RepoRecord.RepoID
+    RepoNodeID     string             // assigned by Sink.InsertNode(kind=repo)
+    CommitID       string             // assigned by Sink.EnsureCommit
+    CommitInserted bool               // true on first scan of this SHA
 }
 type FileAncestry struct {
     FileNodeID     string
@@ -384,6 +421,18 @@ type FileAncestry struct {
     NewlyInserted  bool // file Node freshly inserted (vs idempotent re-hit)
 }
 ```
+
+The Postgres backend's `Sink.EnsureRepo` delegates straight to
+`*graphwriter.Writer.EnsureRepo` (writer.go:281-328) so the assigned
+`RepoID` matches the queue worker's. The SQLite and memory backends
+synthesize `RepoID = fingerprint.RepoIDFromURL(repoURL)` (a new
+deterministic helper to be added in `pkg/fingerprint`, computed as
+`uuid.NewSHA1(namespaceRepoURL, repoURL)`) so the same URL always
+hashes to the same `fingerprint.RepoID` and a SQLite-scanned graph
+replayed into Postgres preserves Node/Edge fingerprint parity (S2,
+R5). The mgmt-api / queue worker path remains the canonical Postgres
+RepoID allocator -- the deterministic helper is a fallback used only
+when there is no Postgres row to read from.
 
 The canonical-signature helpers (`canonicalRepoSig`,
 `canonicalPackageDir`, `canonicalPackageSig`, `canonicalFileSig`)
@@ -548,16 +597,21 @@ For local-path scans the synthesized identity is:
 | Field | Value |
 | --- | --- |
 | `url` | `file://<abs-path>` (lower-cased drive letters on Windows, forward slashes). |
-| `sha` | Output of `git rev-parse HEAD` when the directory is a git checkout; otherwise the literal string `local` -- this is a deliberate sentinel so the canonical signatures from a non-git scan stand apart from any real commit. |
+| `sha` | Output of `git rev-parse HEAD` when the directory is a git checkout; otherwise a **deterministic hex hash of the directory's mtime tree** (see S9.1). The mtime hash is a sentinel that re-derives stably as long as no file is touched, but changes the moment any tracked file's mtime moves -- this makes `(repo_id, sha)` a reasonable change-detection key for re-scans of non-git directories. |
 | `default_branch` | Empty string. |
 | `language_hints` | Empty slice (the CLI does not surface a hint UI in v1). |
 
-**Decision (pinned, S9.1):** the literal string `local` is the
-sentinel `sha` for non-git local scans. The operator may override it
-via `--sha <value>` (impl-plan S3.2) when they want a stable
-identity across re-scans. Hashing the directory's mtime tree was
-considered and rejected because it would change with whitespace-only
-edits and defeat dedupe across re-scans.
+**Decision (pinned, S9.1, operator answer 2026-05-30):** the
+synthesized `sha` for non-git local scans is a deterministic hex
+hash of the directory's mtime tree, computed as
+`sha256( for each f in Workspace.Walk in stable order: f.RelPath + 0x00 + f.ModTime.UTC().Unix() + 0x00 + f.Size + 0x00 )[:16]`
+expressed as a 32-char lowercase hex string (exact byte format to
+be specified in **tech-spec.md S3.4**). The operator may override
+it with `--sha <value>` when they want a stable identity across
+re-scans that ignores mtime drift. The literal string `local` was
+considered and rejected because every non-git scan would collide
+under the same `(repo_id, sha)` key, breaking re-scan dedupe whenever
+the directory's contents actually changed.
 
 ### 4.4 Diagram contract (NEW)
 
@@ -671,19 +725,25 @@ JSON or struct schemas are in tech-spec.md; this is purely about
 - **Surface**:
   - `Workspace.Walk(WalkFn)` yields one `WalkFile` per source file
     (forward-slash relpaths, exclude-dir set already configured).
-  - Before the walk starts, the CLI calls
-    `AncestryWriter.EnsureRepoAndCommit(ctx, repoID, defaultBranch, hints)`
-    which performs `EnsureRepo` + `EnsureCommit` + the `repo`-kind
-    `InsertNode` and returns the `RepoNodeID`.
+  - Before the walk starts, the CLI constructs an
+    `AncestryWriter` with `NewAncestryWriter(sink, repoURL, sha)`
+    and calls
+    `AncestryWriter.EnsureRepoAndCommit(ctx, defaultBranch, hints)`
+    which performs `Sink.EnsureRepo` (allocates `RepoID`) +
+    `Sink.EnsureCommit` + the `repo`-kind `InsertNode` and
+    **returns** a `RepoAncestry` whose `RepoID` and `RepoNodeID`
+    the CLI captures. The CLI does NOT pre-allocate a `RepoID`.
   - Per `WalkFile`, the CLI calls
-    `AncestryWriter.EnsureFile(ctx, repoID, file)` which (a) ensures
-    the per-directory `package` Node and the `repo -> package`
-    `contains` Edge on first sight of that directory and (b) inserts
-    the `file` Node and the `package -> file` `contains` Edge. It
-    returns both `FileNodeID` and `PackageNodeID`.
+    `AncestryWriter.EnsureFile(ctx, file)` (which reads the cached
+    ancestry off the writer) -- this (a) ensures the per-directory
+    `package` Node and the `repo -> package` `contains` Edge on
+    first sight of that directory and (b) inserts the `file` Node
+    and the `package -> file` `contains` Edge. It returns both
+    `FileNodeID` and `PackageNodeID`.
   - The CLI then builds the `EmitFileEvent`
-    (`internal/repoindexer/ast.go`) populating `RepoID`, `RepoURL`,
-    `SHA`, `FileNodeID`, **`RepoNodeID`**, `RelPath`, `AbsPath`,
+    (`internal/repoindexer/ast.go`) populating `RepoID` (from the
+    returned `RepoAncestry.RepoID`), `RepoURL`, `SHA`,
+    `FileNodeID`, **`RepoNodeID`**, `RelPath`, `AbsPath`,
     `LanguageHints`, and `Open` (the field set is identical to the
     one `worker.runFull` populates at lines 1199-1208).
 
@@ -811,39 +871,55 @@ User       CLI               LocalDirMaterializer   AncestryWriter        ast.Di
  |           |                       |                    |                    |                    |                    |
  |--scan---->|                       |                    |                    |                    |                    |
  |           |--Open("repo.db")------------------------------------------------------------------>  |                    |
- |           |--Materialize(file://...,git-HEAD|"local")-->|                    |                    |                    |
+ |           |--mtime-tree hash for /path/to/repo (S9.1) ----------------------> sha := <hex>        |                    |
+ |           |--Materialize(file://...,sha)-------------->|                    |                    |                    |
  |           |<--Workspace-----------|                    |                    |                    |                    |
+ |           |--NewAncestryWriter(sink, URL, sha) ---------------------------->                                           |
  |           |                                                                                                            |
  |           |== 1. Pre-walk ancestry (AncestryWriter.EnsureRepoAndCommit) =====================|                       |
- |           |--EnsureRepo(URL,branch,hints)--------------------------------------------------->|                       |
- |           |--EnsureCommit(repoID, SHA)------------------------------------------------------>|                       |
- |           |--InsertNode(kind=repo,                                                                                    |
- |           |   sig=CanonicalRepoSig(URL),                                                                              |
- |           |   parent=NULL, from_sha=SHA)-------------------------------------------------->  |--NodeFingerprint------>|
- |           |<--RepoNodeID                                                                       |<--fp[32]---------------|
+ |           |  // RepoID is NOT supplied by the CLI; the sink allocates it.                                              |
+ |           |--EnsureRepoAndCommit(ctx, defaultBranch, hints) --------------->|                                          |
+ |           |                                                                  |--Sink.EnsureRepo(RepoInput{URL,...})-->|
+ |           |                                                                  |<-- RepoRecord{RepoID, RepoUUID, ...}---|
+ |           |                                                                  |--Sink.EnsureCommit(RepoID, SHA, ...)-->|
+ |           |                                                                  |<-- CommitID ---------------------------|
+ |           |                                                                  |--Sink.InsertNode(kind=repo,             |
+ |           |                                                                  |   sig=CanonicalRepoSig(URL),            |
+ |           |                                                                  |   parent=NULL,                          |
+ |           |                                                                  |   repoID=RepoID, from_sha=SHA)--------->|--NodeFingerprint------>|
+ |           |                                                                  |<-- RepoNodeID --------------------------|
+ |           |<--RepoAncestry{RepoID, RepoUUID, RepoNodeID, CommitID, CommitInserted}                                     |
  |           |                                                                                                            |
  |           |== 2. Per-WalkFile (AncestryWriter.EnsureFile) ===================================|                       |
  |           |--Walk(WalkFn)-------->|                                                                                    |
  |           |<--WalkFile{RelPath,Reader}--                                                                               |
- |           |  dir := CanonicalPackageDir(RelPath)                                                                       |
- |           |  if dir not in pkg-cache:                                                                                   |
- |           |    InsertNode(kind=package,                                                                                |
- |           |      sig=CanonicalPackageSig(URL,dir),                                                                     |
- |           |      parent=RepoNodeID)------------------------------------------------------->  |--NodeFingerprint------>|
- |           |<-- PackageNodeID                                                                                           |
- |           |    InsertEdge(kind=contains,                                                                               |
- |           |      src=RepoNodeID, dst=PackageNodeID)--------------------------------------->  |--EdgeFingerprint------>|
- |           |    cache[dir] = PackageNodeID                                                                              |
- |           |  InsertNode(kind=file,                                                                                     |
- |           |    sig=CanonicalFileSig(URL,RelPath),                                                                      |
- |           |    parent=PackageNodeID)--------------------------------------------------->     |--NodeFingerprint------>|
- |           |<-- FileNodeID                                                                                              |
- |           |  InsertEdge(kind=contains,                                                                                 |
- |           |    src=PackageNodeID, dst=FileNodeID)----------------------------------------->  |--EdgeFingerprint------>|
+ |           |--EnsureFile(ctx, WalkFile) ------------------------------------>|                                          |
+ |           |                                                                  |  dir := CanonicalPackageDir(RelPath)    |
+ |           |                                                                  |  if dir not in pkg-cache:               |
+ |           |                                                                  |    InsertNode(kind=package,             |
+ |           |                                                                  |      sig=CanonicalPackageSig(URL,dir),  |
+ |           |                                                                  |      parent=RepoNodeID,                 |
+ |           |                                                                  |      repoID=RepoID)------------------>  |--NodeFingerprint------>|
+ |           |                                                                  |<-- PackageNodeID                        |
+ |           |                                                                  |    InsertEdge(kind=contains,            |
+ |           |                                                                  |      src=RepoNodeID,                    |
+ |           |                                                                  |      dst=PackageNodeID,                 |
+ |           |                                                                  |      repoID=RepoID)------------------>  |--EdgeFingerprint------>|
+ |           |                                                                  |    cache[dir] = PackageNodeID           |
+ |           |                                                                  |  InsertNode(kind=file,                  |
+ |           |                                                                  |    sig=CanonicalFileSig(URL,RelPath),   |
+ |           |                                                                  |    parent=PackageNodeID,                |
+ |           |                                                                  |    repoID=RepoID)-------------------->  |--NodeFingerprint------>|
+ |           |                                                                  |<-- FileNodeID                           |
+ |           |                                                                  |  InsertEdge(kind=contains,              |
+ |           |                                                                  |    src=PackageNodeID, dst=FileNodeID,   |
+ |           |                                                                  |    repoID=RepoID)-------------------->  |--EdgeFingerprint------>|
+ |           |<--FileAncestry{FileNodeID, PackageNodeID, ...}-----------------|                                          |
  |           |                                                                                                            |
  |           |== 3. Dispatcher emits class/method/block + static edges ========================|                       |
  |           |  EmitFile(EmitFileEvent{                                                                                   |
- |           |    RepoID, RepoURL, SHA,                                                                                   |
+ |           |    RepoID,           // == ancestry.RepoID                                                                 |
+ |           |    RepoURL, SHA,                                                                                           |
  |           |    FileNodeID, RepoNodeID,                                                                                 |
  |           |    RelPath, AbsPath, LanguageHints, Open})----------------------->|                                       |
  |           |                                                                   |--Parse(src)--> (per-language Parser)  |
@@ -866,6 +942,14 @@ User       CLI               LocalDirMaterializer   AncestryWriter        ast.Di
 ```
 
 Key invariants:
+- The CLI does NOT pre-allocate `fingerprint.RepoID`. It is the
+  RETURN value of `EnsureRepoAndCommit`, populated either by
+  Postgres's `gen_random_uuid()` default or by the SQLite/memory
+  sink's `fingerprint.RepoIDFromURL` helper. Both shapes preserve
+  the S2 backend-parity rule: scanning the same URL twice (even
+  across backends) yields the same `RepoID` for the SQLite/memory
+  case, and the existing `EnsureRepo` URL-upsert idempotence holds
+  for the Postgres case.
 - The pre-walk ancestry (`EnsureRepoAndCommit`) MUST run before any
   `EmitFile`; `EmitFile`'s `RepoNodeID` field is only meaningful
   after the `repo` Node is inserted.
@@ -984,7 +1068,7 @@ takes the same `AGENT_MEMORY_PG_URL` env var the
 `cmd/repoindexer/main.go` worker uses. Because the backend forwards
 1:1 to `*graphwriter.Writer`, the resulting `node` / `edge` rows are
 byte-identical to what the queue worker would produce -- the
-backend-parity test in **impl-plan S6** asserts equal `(repo_id,
+backend-parity test in **implementation-plan.md S6** asserts equal `(repo_id,
 fingerprint)` tuples across a `--store=sqlite` scan and a
 `--store=postgres` scan of the same fixture.
 
@@ -1074,14 +1158,14 @@ the truncated badge is the contract.
 
 | ID | Risk | Mitigation |
 | --- | --- | --- |
-| R1 | A CGO=0 build silently degrades to PowerShell-only coverage. | S7 / S7.1 -- the CLI summary reports `no_parser` per extension, and the docs warn about CGO + `pwsh` prerequisites (impl-plan S2.1). |
-| R2 | Backends diverge on fingerprint computation and split node identity. | S2 -- all three backends route through `pkg/fingerprint`; backend-parity golden test in impl-plan S6 catches drift. |
+| R1 | A CGO=0 build silently degrades to PowerShell-only coverage. | S7 / S7.1 -- the CLI summary reports `no_parser` per extension, and the docs warn about CGO + `pwsh` prerequisites (**implementation-plan.md S2.1**). |
+| R2 | Backends diverge on fingerprint computation and split node identity. | S2 -- all three backends route through `pkg/fingerprint`; backend-parity golden test in **implementation-plan.md S6** catches drift. |
 | R3 | SQLite store collides with a future Postgres re-replay. | S5 -- SQLite is a snapshot store, never replayed in place; replay is "rescan against Postgres" which uses the same fingerprint pre-image. |
 | R4 | Truncation goes unnoticed on large repos. | S6 + S7.3 -- the diagram envelope carries `truncated` + `stats.cappedAt`; the UI renders a badge. |
 | R5 | The dispatcher's same-file-only resolution makes call chains look sparse across files. | Inherit the AGENT-MEMORY A4 contract; UI Inspector exposes `attrs.calls_raw` so consumers see the parser's pre-resolver view. Tech-spec S7 covers the UI copy. |
-| R6 | The memory backend blows RAM on large monorepos. | Default CLI to SQLite; memory mode is documented as one-shot/small (impl-plan S4). |
+| R6 | The memory backend blows RAM on large monorepos. | Default CLI to SQLite; memory mode is documented as one-shot/small (**implementation-plan.md S4**). |
 | R7 | Postgres backend bypasses `graphwriter` audit logging. | The Postgres backend is a thin adapter that delegates to `*graphwriter.Writer` -- it MUST NOT issue direct SQL. The interface boundary (S3.2.2) is the lint rule. |
-| R8 | UI fetches against a serve endpoint that has CORS misconfigured. | Tech-spec S6.3 pins the dev origin (`http://localhost:5173`) on the serve endpoint; impl-plan S5 exercises the path with a Vite dev server. |
+| R8 | UI fetches against a serve endpoint that has CORS misconfigured. | **tech-spec.md S6.3** pins the dev origin (`http://localhost:5173`) on the serve endpoint; **implementation-plan.md S5** exercises the path with a Vite dev server. |
 
 ---
 
@@ -1090,21 +1174,25 @@ the truncated badge is the contract.
 The following decisions were owner-pinnable in iteration 1 and are
 pinned here so the architecture is implementable without further
 operator input. Each pinned default is referenced from the section
-that depends on it; downstream artifacts (tech-spec.md, impl-plan.md,
-acceptance.md) inherit these without further negotiation.
+that depends on it; downstream artifacts (`tech-spec.md`,
+`implementation-plan.md`, `e2e-scenarios.md`) inherit these without
+further negotiation.
 
 | ID | Decision | Pinned default | Anchor | Rejected alternative |
 | --- | --- | --- | --- | --- |
-| S9.1 | Local-scan `sha` sentinel | Literal string `local`; operator may override via `--sha`. | S4.3 | mtime-tree hash -- changes on whitespace-only edits, defeats re-scan dedupe. |
+| S9.1 | Local-scan `sha` sentinel | Deterministic hex hash of the directory's mtime tree (see S4.3 for the exact construction); operator may override via `--sha`. | S4.3 | Literal string `local` -- collides for every non-git scan, breaking `(repo_id, sha)` re-scan dedupe whenever directory contents change. |
 | S9.2 | UI transport | Both supported. `codeintel serve` for live navigation; static JSON for embedding in docs / handing off offline. The diagram envelope (S4.4) is the only contract. | S3.7, S6.3 | "Serve only" would block the static-export use case the story description calls out. |
-| S9.3 | CLI framework | Stdlib `flag` (no cobra). Matches `cmd/qdrant-bootstrap/main.go` and avoids adding a new top-level dependency. | S3.1 | A vendored cobra-style lib -- not worth the dependency for this many subcommands. |
+| S9.3 | CLI framework | Vendored cobra-style library (`github.com/spf13/cobra`, added in this story). Per-command help, completions, and persistent flags justify the dependency given five subcommands (`scan`, `scan-many`, `diagram module`, `diagram calls`, `serve`). | S3.1 | Stdlib `flag` -- matches `cmd/qdrant-bootstrap/main.go` but the subcommand fan-out turns into hand-rolled dispatching. |
 | S9.4 | Multi-repo SQLite layout | One `.db` file per repo. | S3.2.3, S6.2 | One file with a `repo_id` column -- adds a predicate every read path needs and complicates the projector for no immediate benefit. |
 | S9.5 | Module-diagram default granularity | `package`, with drill-down to `file` and `class` via the `--granularity` flag. | S3.6, S4.4, S6.3 | `file` as the default -- buries the package-level summary the story description (Goal 4) asks for. |
 
-Future workstreams MAY revisit any of these (each cell names its
-rejected alternative so the trade-off is recoverable), but no
-downstream artifact in this story is allowed to assume a different
-default.
+All five decisions in this table were pinned by the operator on
+2026-05-30 (iter 3); rows S9.1 and S9.3 invert the iter-2 architect's
+recommendation, S9.2 / S9.4 / S9.5 confirm it. Future workstreams MAY
+revisit any of these (each cell names its rejected alternative so the
+trade-off is recoverable), but no downstream artifact in this story
+(`tech-spec.md`, `implementation-plan.md`, `e2e-scenarios.md`) is
+allowed to assume a different default.
 
 ---
 
@@ -1120,3 +1208,20 @@ default.
   S1.2 to "downstream artifact" language; pinned all five iter-1
   open questions as defaults in S9; section S9 retitled to "Pinned
   Defaults".
+- 2026-05-30 (iter 3): repaired the impossible CLI-facing surface on
+  `AncestryWriter.EnsureRepoAndCommit` -- the method no longer accepts
+  `repoID fingerprint.RepoID` as input because a first-time CLI scan
+  cannot know it before `Sink.EnsureRepo` allocates the row; the
+  RepoID is now an OUTPUT carried in the returned `RepoAncestry`, and
+  `EnsureFile` reads it from the writer's cached ancestry. SQLite /
+  memory backends derive a deterministic `fingerprint.RepoID` via
+  `RepoIDFromURL(URL)` (a new helper) so backend-parity holds without
+  a Postgres trip. Operator-pinned defaults applied: S9.1 SHA sentinel
+  flipped from literal `local` to a deterministic mtime-tree hash;
+  S9.3 CLI framework flipped from stdlib `flag` to vendored
+  `github.com/spf13/cobra`. Stray sibling-doc name `acceptance.md`
+  replaced with `e2e-scenarios.md` everywhere; the four `impl-plan`
+  shorthand references in the risks table and S3.2.1 / S6.5 expanded
+  to the canonical `implementation-plan.md` per the sequential
+  plan-doc set (architecture -> tech-spec -> implementation-plan ->
+  e2e-scenarios).

@@ -17,9 +17,7 @@ const Length = 32
 // NodeFingerprint or EdgeFingerprint.
 type Sum [Length]byte
 
-// Bytes returns a copy of the underlying byte slice. Callers must
-// treat the returned slice as read-only; mutating it does not
-// affect the receiver but is wasteful.
+// Bytes returns a copy of the underlying byte slice.
 func (s Sum) Bytes() []byte {
 	out := make([]byte, Length)
 	copy(out, s[:])
@@ -27,28 +25,19 @@ func (s Sum) Bytes() []byte {
 }
 
 // Hex returns the lowercase hexadecimal encoding of the
-// fingerprint (64 characters). The hex form is what the
-// structured-logging middleware emits for audit and what the
-// `bytea` `decode(..., 'hex')` form in test fixtures expects.
+// fingerprint (64 characters).
 func (s Sum) Hex() string { return hex.EncodeToString(s[:]) }
 
 // String makes Sum implement fmt.Stringer; identical to Hex.
 func (s Sum) String() string { return s.Hex() }
 
 // Equal reports whether two fingerprints are byte-identical.
-// Provided as a method for readability at call sites; the
-// language-level == operator is equivalent.
 func (s Sum) Equal(other Sum) bool { return s == other }
 
-// IsZero reports whether the fingerprint is the all-zeros
-// sentinel. A real SHA-256 digest is overwhelmingly unlikely to
-// hit the zero pattern by chance, so the test exists mainly to
-// catch uninitialised values.
+// IsZero reports whether the fingerprint is the all-zeros sentinel.
 func (s Sum) IsZero() bool { return s == Sum{} }
 
-// SumFromBytes constructs a Sum from a 32-byte slice. Returns an
-// error if the slice is not exactly 32 bytes long, matching the
-// schema-level CHECK in migration 0003.
+// SumFromBytes constructs a Sum from a 32-byte slice.
 func SumFromBytes(b []byte) (Sum, error) {
 	var s Sum
 	if len(b) != Length {
@@ -61,10 +50,7 @@ func SumFromBytes(b []byte) (Sum, error) {
 	return s, nil
 }
 
-// SumFromHex parses the lowercase hexadecimal form of a
-// fingerprint. The case is not normalized — callers wanting to
-// accept mixed-case input must lowercase first; this matches the
-// "callers pass canonical input" contract the package commits to.
+// SumFromHex parses the lowercase hexadecimal form of a fingerprint.
 func SumFromHex(h string) (Sum, error) {
 	var s Sum
 	if len(h) != 2*Length {
@@ -81,16 +67,10 @@ func SumFromHex(h string) (Sum, error) {
 	return s, nil
 }
 
-// RepoID is the canonical 16-byte form of a Repo row's UUID
-// primary key. The hash domain for NodeFingerprint /
-// EdgeFingerprint is keyed on the raw bytes (RFC 4122
-// network-byte-order layout) so the fingerprint is independent of
-// the textual UUID format the surrounding code happens to use.
+// RepoID is the canonical 16-byte form of a Repo row's UUID primary key.
 type RepoID [16]byte
 
-// String returns the canonical 36-character UUID representation
-// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Bytes are emitted in
-// the standard 8-4-4-4-12 grouping.
+// String returns the canonical 36-character UUID representation.
 func (r RepoID) String() string {
 	var buf [36]byte
 	hex.Encode(buf[0:8], r[0:4])
@@ -108,12 +88,7 @@ func (r RepoID) String() string {
 // IsZero reports whether the RepoID is the all-zeros sentinel.
 func (r RepoID) IsZero() bool { return r == RepoID{} }
 
-// ParseRepoID parses the canonical 36-character UUID form into
-// the raw 16-byte representation. Hyphens are required at the
-// 8/13/18/23 positions per RFC 4122; the variant and version
-// nibbles are NOT validated because PostgreSQL's `gen_random_uuid`
-// emits v4 UUIDs and any tighter check would reject legitimate
-// future variants.
+// ParseRepoID parses the canonical 36-character UUID form.
 func ParseRepoID(s string) (RepoID, error) {
 	var r RepoID
 	if len(s) != 36 {
@@ -124,8 +99,7 @@ func ParseRepoID(s string) (RepoID, error) {
 	}
 	if s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
 		return r, fmt.Errorf(
-			"fingerprint: uuid hyphens malformed in %q "+
-				"(expect 8-4-4-4-12 grouping)",
+			"fingerprint: uuid hyphens malformed in %q",
 			s,
 		)
 	}
@@ -142,8 +116,6 @@ func ParseRepoID(s string) (RepoID, error) {
 }
 
 // MustParseRepoID is the panic-on-error variant of ParseRepoID.
-// Use only for known-good literals (test fixtures, hard-coded
-// constants); never on caller-controlled strings.
 func MustParseRepoID(s string) RepoID {
 	r, err := ParseRepoID(s)
 	if err != nil {
@@ -152,74 +124,23 @@ func MustParseRepoID(s string) RepoID {
 	return r
 }
 
-// ErrEmptyKind is returned when NodeFingerprint or EdgeFingerprint
-// is called with an empty `kind` string. The `kind` field is the
-// closed-set discriminator that prevents a Method node and a Class
-// node sharing the same canonical_signature from colliding on the
-// hash pre-image; allowing the empty string would silently degrade
-// G2.
+// ErrEmptyKind is returned when kind is empty.
 var ErrEmptyKind = errors.New("fingerprint: kind must be non-empty")
 
-// ErrEmptySignature is returned when NodeFingerprint is called
-// with an empty canonical_signature. The signature is the
-// language-stable identifier (e.g. `pkg.Foo#bar(int)`); an empty
-// value is almost always a bug at the dispatcher layer.
+// ErrEmptySignature is returned when canonical_signature is empty.
 var ErrEmptySignature = errors.New(
 	"fingerprint: canonical_signature must be non-empty",
 )
 
-// ErrEmptySHA is returned when NodeFingerprint or EdgeFingerprint
-// is called with an empty `from_sha` (the first SHA at which the
-// entity appeared). The architecture pins from_sha into the hash
-// pre-image precisely so a renamed-or-moved member produces a NEW
-// fingerprint linked to the old by a `renamed_to` Edge.
+// ErrEmptySHA is returned when from_sha is empty.
 var ErrEmptySHA = errors.New("fingerprint: from_sha must be non-empty")
 
-// ErrEmbeddedNUL is returned when NodeFingerprint or
-// EdgeFingerprint is called with a string field that contains a
-// NUL (`\x00`) byte. NUL is reserved as the framing delimiter
-// between variable-length string fields in the hash pre-image
-// (see NodeFingerprint / EdgeFingerprint doc comments); allowing
-// NUL inside a field would re-introduce the ambiguous-pre-image
-// failure mode and silently degrade G2.
-//
-// In practice no valid `kind`, `canonical_signature`, or
-// `from_sha` contains NUL — they are human-readable identifiers
-// and lowercase hex SHAs — so the check is defence-in-depth
-// against a bug at the dispatcher layer feeding raw bytes into
-// these helpers.
+// ErrEmbeddedNUL is returned when a string field contains NUL.
 var ErrEmbeddedNUL = errors.New(
 	"fingerprint: string field contains reserved NUL byte (\\x00)",
 )
 
-// NodeFingerprint computes the 32-byte G2 fingerprint of a Node
-// per architecture.md §1.3.
-//
-// The hash pre-image is:
-//
-//	sha256( repo_id ‖ kind ‖ 0x00 ‖ canonical_signature ‖ 0x00 ‖ from_sha )
-//
-// where `‖` is byte-string concatenation. `repo_id` is the raw
-// 16-byte UUID and needs no separator because its length is
-// fixed. A single NUL byte (`0x00`) terminates each variable-
-// length string field so the (kind, canonical_signature, from_sha)
-// boundaries are unambiguous regardless of the individual field
-// lengths.
-//
-// Without these separators, distinct logical tuples could share a
-// byte-identical pre-image and therefore an identical fingerprint
-// — e.g. (kind="method", sig="pkg.Foo()a", sha="bc") and
-// (kind="method", sig="pkg.Foo()", sha="abc") would both produce
-// the byte string "methodpkg.Foo()abc" and collide on the hash.
-// That class of collision would silently violate G2's
-// "fingerprint uniquely identifies a logical entity" invariant.
-//
-// The function is deterministic: identical inputs always produce
-// byte-identical output. Validation rejects empty `kind`,
-// `canonical_signature`, and `from_sha` (each is a G2 invariant
-// the schema assumes is non-empty) and rejects any string field
-// that contains a NUL byte (NUL is reserved as the framing
-// delimiter; see ErrEmbeddedNUL).
+// NodeFingerprint computes the 32-byte G2 fingerprint of a Node.
 func NodeFingerprint(
 	repoID RepoID,
 	kind string,
@@ -258,29 +179,7 @@ func NodeFingerprint(
 	return out, nil
 }
 
-// EdgeFingerprint computes the 32-byte G2 fingerprint of an Edge
-// per architecture.md §1.3.
-//
-// The hash pre-image is:
-//
-//	sha256( repo_id ‖ kind ‖ 0x00 ‖ src_fingerprint ‖ dst_fingerprint ‖ from_sha )
-//
-// where `‖` is byte-string concatenation. `repo_id` (16 bytes)
-// and `src_fingerprint` / `dst_fingerprint` (32 bytes each) are
-// fixed-length and need no separator; their boundaries are fixed
-// by their known lengths. The single NUL byte after `kind`
-// disambiguates the kind→src boundary (kind is variable-length,
-// so without the separator the same byte string could parse as
-// either a longer kind with shorter following fields or vice
-// versa). `from_sha` appears last so the dst→from_sha boundary is
-// fixed by dst's known length and no trailing separator is
-// required.
-//
-// `src` and `dst` MUST be the fingerprints of the Node rows the
-// edge connects (NOT the node UUIDs) — keying the edge identity
-// by endpoint fingerprints is what makes the edge fingerprint
-// stable across re-ingests of the same commit even when the
-// surrogate node UUIDs change.
+// EdgeFingerprint computes the 32-byte G2 fingerprint of an Edge.
 func EdgeFingerprint(
 	repoID RepoID,
 	kind string,

@@ -327,7 +327,7 @@ storyId: "code-intelligence:REFACTOR-GUIDE"
 - [ ] Refuse to read a `findings.json` whose `schemaVersion` does not match the current binary's version constant; exit 64 with a clear message naming both versions.
 - [ ] Finalise `cleanc version` output: pin the format `"cleanc <semver> (build-tag=<tag>) (parsers=<csv>) (rule-packs=<csv>)"` and assert it in a test.
 - [ ] Add `cleanc help` (with and without sub-command) that prints either the global usage block or the sub-command's `usage` constant; exit 0.
-- [ ] Add a hidden `cleanc internal-self-check` sub-command that runs the dev-policy loader against the embedded packs and exits 0; used by Stage 5.3 e2e tests to verify the prod build excludes the bypass.
+- [ ] Add a build-tag-gated unit test `internal/cli/devpolicy/unsigned_prod_test.go` (with `//go:build prod`) that calls the prod-build constructor `devpolicy.LoadUnsignedBundle(...)` and asserts it returns `devpolicy.ErrDevModeUnavailable` whose `Error()` is `dev-mode policy bypass not available in prod build`; this is the prod-bypass-exclusion guarantee and is exercised via `go test -tags prod ./internal/cli/devpolicy/...` -- NO new CLI subcommand is added because `architecture.md` Sec 3.6 and `tech-spec.md` Sec 4.1 pin the CLI surface to `analyze` / `report` / `version` / reserved `apply` only.
 
 ### Dependencies
 
@@ -338,7 +338,7 @@ storyId: "code-intelligence:REFACTOR-GUIDE"
 - [ ] Scenario: report re-render -- Given a `findings.json` previously written by an analyze run, When `cleanc report findings.json --out replay.md` runs, Then `replay.md` is byte-identical to the markdown that the analyze run emitted.
 - [ ] Scenario: schema mismatch refused -- Given a `findings.json` whose `schemaVersion` is `"v0.0.0"`, When `cleanc report findings.json` runs, Then exit code is 64 and stderr names both schema versions.
 - [ ] Scenario: version format -- Given a built binary, When `cleanc version` runs, Then stdout matches the regex `^cleanc \d+\.\d+\.\d+ \(build-tag=.+\) \(parsers=.+\) \(rule-packs=.+\)$`.
-- [ ] Scenario: prod build self-check refuses -- Given a `-tags prod` build, When `cleanc internal-self-check` runs, Then exit code is 70 and stderr contains `dev-mode policy bypass not available in prod build`.
+- [ ] Scenario: prod build excludes bypass -- Given the `internal/cli/devpolicy` package, When `go test -tags prod ./internal/cli/devpolicy/...` runs, Then the prod-gated test calls `LoadUnsignedBundle(...)` and asserts the returned error equals `devpolicy.ErrDevModeUnavailable` with message `dev-mode policy bypass not available in prod build` (no CLI subcommand is invoked because the upstream CLI surface is fixed at `analyze` / `report` / `version` / reserved `apply`).
 
 ## Stage 3.5: P0 Fixture Corpus And Golden Snapshots
 
@@ -470,7 +470,7 @@ storyId: "code-intelligence:REFACTOR-GUIDE"
 
 - [ ] Add `make build-prod` target invoking `go build -tags prod -o bin/cleanc-prod ./cmd/cleanc`; the existing `make build` continues to produce the no-tag dev binary.
 - [ ] Verify `internal/cli/devpolicy/unsigned_dev.go` and `internal/cli/devpolicy/unsigned_prod.go` mutually exclude via `//go:build !prod` / `//go:build prod` constraints so the bypass cannot be smuggled into a prod build.
-- [ ] Extend `.github/workflows/clean-code-ci.yml` to add a `build-prod` job that runs `make build-prod`, then runs `cleanc-prod internal-self-check` and asserts exit code 70 (the bypass MUST refuse to load).
+- [ ] Extend `.github/workflows/clean-code-ci.yml` to add a `build-prod` job that runs `make build-prod` (verifies the prod binary compiles under `//go:build prod`) and then runs `go test -tags prod -run TestProdBuildExcludesDevBypass ./internal/cli/devpolicy/...` (asserts the prod build excludes the unsigned-policy bypass); the guarantee lives in a build-tag-gated unit test, NOT in a hidden CLI subcommand, because `architecture.md` Sec 3.6 / `tech-spec.md` Sec 4.1 pin the CLI surface to four subcommands only.
 - [ ] Add a `make test-prod` target that runs `go test -tags prod ./...` so the prod-only code paths get unit-test coverage; CI invokes this as a separate matrix entry (`tech-spec.md` Sec 8.9).
 - [ ] Document the build-tag matrix in `services/clean-code/README.md` (one paragraph) so a future maintainer reading the README does not need to chase the tag constraints across files.
 
@@ -481,7 +481,7 @@ storyId: "code-intelligence:REFACTOR-GUIDE"
 ### Test Scenarios
 
 - [ ] Scenario: prod build compiles -- Given the source tree, When CI runs `make build-prod`, Then it exits 0 and produces `bin/cleanc-prod`.
-- [ ] Scenario: prod self-check refuses bypass -- Given the `cleanc-prod` binary, When `cleanc-prod internal-self-check` runs, Then exit code is 70 and stderr contains `dev-mode policy bypass not available in prod build`.
+- [ ] Scenario: prod build excludes bypass via unit test -- Given the `services/clean-code` source tree, When CI runs `go test -tags prod -run TestProdBuildExcludesDevBypass ./internal/cli/devpolicy/...`, Then exit code is 0 and the test asserts `devpolicy.LoadUnsignedBundle(...)` returns `devpolicy.ErrDevModeUnavailable` whose `Error()` contains `dev-mode policy bypass not available in prod build`.
 - [ ] Scenario: prod tests pass -- Given the source tree, When CI runs `make test-prod`, Then it exits 0.
 
 ## Stage 5.2: Custom Lint Rules

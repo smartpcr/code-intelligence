@@ -13,6 +13,11 @@ Feature: CGO build proof for parser coverage verification
     When "make test-cgo" runs from "services/agent-memory"
     Then the make target exits successfully
     And the output includes test results from "internal/repoindexer/ast"
+    And under CGO_ENABLED=1 "parser_treesitter_c_test.go" is compiled in the ast package
+    And under CGO_ENABLED=1 "parser_treesitter_cpp_test.go" is compiled in the ast package
+    And under CGO_ENABLED=1 "parser_treesitter_csharp_test.go" is compiled in the ast package
+    And under CGO_ENABLED=1 "parser_treesitter_go_test.go" is compiled in the ast package
+    And under CGO_ENABLED=1 "parser_treesitter_rust_test.go" is compiled in the ast package
 
   Scenario: nocgo-build-passes
     Given "make" is available on PATH
@@ -25,4 +30,4 @@ Feature: CGO build proof for parser coverage verification
   Scenario: cgo-flag-printed
     Given a host with "gcc" or "clang" on PATH and "make" available
     When "make test-cgo" runs from "services/agent-memory"
-    Then the make output contains a "go env CGO_ENABLED" probe line equal to "1"
+    Then the "go env CGO_ENABLED" value printed after the toolchain echo marker equals "1"

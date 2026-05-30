@@ -129,9 +129,23 @@ func (s *cgoBuildState) outputIncludesTestResultsFrom(pkgSubpath string) error {
 	return nil
 }
 
+func (s *cgoBuildState) underCGO1FileIsCompiledInAstPackage(fileName string) error {
+	// Use `go list` with CGO_ENABLED=1 to verify the named test file
+	// is in the compiled file set for the ast package.
+	goFiles, testFiles, err := s.listASTFiles("1")
+	if err != nil {
+		return err
+	}
+	all := append(goFiles, testFiles...)
+	for _, f := range all {
+		if f == fileName {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s NOT compiled under CGO_ENABLED=1 (should be included); files: %v", fileName, all)
+}
+
 func (s *cgoBuildState) underCGO0FileIsExcluded(fileName string) error {
-	// Use `go list` with CGO_ENABLED=0 to get the actual file lists
-	// compiled for the ast package — this proves build-tag exclusion.
 	goFiles, testFiles, err := s.listASTFiles("0")
 	if err != nil {
 		return err
@@ -159,21 +173,37 @@ func (s *cgoBuildState) underCGO0FileIsIncluded(fileName string) error {
 	return fmt.Errorf("%s NOT compiled under CGO_ENABLED=0 (should be included); files: %v", fileName, all)
 }
 
-func (s *cgoBuildState) makeOutputContainsProbeLineEqualTo(probeDesc, expected string) error {
+func (s *cgoBuildState) goEnvCGOEnabledAfterEchoMarkerEquals(expected string) error {
 	// The Makefile's test-cgo target runs:
 	//   @echo "==> test-cgo: active Go toolchain (CGO_ENABLED=1)"
 	//   @CGO_ENABLED=1 go env CGO_ENABLED CC CXX
 	// `go env CGO_ENABLED CC CXX` prints each value on its own line.
-	// The CGO_ENABLED value appears as the first env line after the echo.
-	// We scan for a line that is exactly "1".
+	// The CGO_ENABLED value is the FIRST line after the echo marker.
+	// We locate the echo marker and assert the immediately following
+	// line equals the expected value, tying the assertion precisely
+	// to the `go env CGO_ENABLED` probe output.
 	lines := strings.Split(s.makeOutput, "\n")
-	for _, line := range lines {
+	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if trimmed == expected {
+		if strings.Contains(trimmed, "==> test-cgo:") && strings.Contains(trimmed, "CGO_ENABLED") {
+			// Found the echo marker — the next line is the CGO_ENABLED value.
+			if i+1 >= len(lines) {
+				return fmt.Errorf("echo marker found at line %d but no subsequent line;\noutput:\n%s", i, s.makeOutput)
+			}
+			actual := strings.TrimSpace(lines[i+1])
+			if actual != expected {
+				return fmt.Errorf(
+					"go env CGO_ENABLED probe (line after echo marker) = %q, want %q;\nmarker line: %q\nprobe line: %q\nfull output:\n%s",
+					actual, expected, trimmed, lines[i+1], s.makeOutput,
+				)
+			}
 			return nil
 		}
 	}
-	return fmt.Errorf("make output does not contain a line equal to %q;\noutput:\n%s", expected, s.makeOutput)
+	return fmt.Errorf(
+		"echo marker line containing '==> test-cgo:' and 'CGO_ENABLED' not found in make output;\noutput:\n%s",
+		s.makeOutput,
+	)
 }
 
 // listASTFiles returns the Go source files and test files compiled for
@@ -223,9 +253,10 @@ func InitializeScenario_parser_coverage_verification_cgo_build_proof(ctx *godog.
 	// Then
 	ctx.Then(`^the make target exits successfully$`, s.makeTargetExitsSuccessfully)
 	ctx.Then(`^the output includes test results from "([^"]*)"$`, s.outputIncludesTestResultsFrom)
+	ctx.Then(`^under CGO_ENABLED=1 "([^"]*)" is compiled in the ast package$`, s.underCGO1FileIsCompiledInAstPackage)
 	ctx.Then(`^under CGO_ENABLED=0 "([^"]*)" is excluded by build tags$`, s.underCGO0FileIsExcluded)
 	ctx.Then(`^under CGO_ENABLED=0 "([^"]*)" is included by build tags$`, s.underCGO0FileIsIncluded)
-	ctx.Then(`^the make output contains a "([^"]*)" probe line equal to "([^"]*)"$`, s.makeOutputContainsProbeLineEqualTo)
+	ctx.Then(`^the "go env CGO_ENABLED" value printed after the toolchain echo marker equals "([^"]*)"$`, s.goEnvCGOEnabledAfterEchoMarkerEquals)
 }
 
 func TestE2E_parser_coverage_verification_cgo_build_proof(t *testing.T) {

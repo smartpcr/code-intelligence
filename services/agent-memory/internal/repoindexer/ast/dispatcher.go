@@ -1164,6 +1164,26 @@ func classAttrs(language string, c ClassDecl) json.RawMessage {
 // the first-class-key-wins rule. Empty optional inputs are
 // omitted so the TS/JS/Python baseline byte-print stays
 // identical to the pre-helper world (rubber-duck #1).
+//
+// calls_raw is a deduped union of m.Calls (bare-name call sites)
+// and m.ReceiverCalls (receiver-qualified `this.foo()` /
+// `self.foo()` / `recv.Foo()` call sites). The union is required
+// by implementation-plan.md Stage 1.3 lines 67, 78-79 because:
+//
+//  1. Pass 2b multimap-collision drops (Stage 1.4): when a bare
+//     or receiver-qualified call name is ambiguous against the
+//     in-file resolver, the dispatcher MUST NOT emit a
+//     static_calls edge but MUST leave the verbatim name on
+//     calls_raw as a debug breadcrumb so operators can inspect
+//     why no edge was produced.
+//  2. The future cross-file resolver (Stage 1.5) re-resolves
+//     receiver-qualified calls whose receiver type lives in a
+//     different file. Without ReceiverCalls on calls_raw the
+//     resolver would have to re-parse every method body.
+//
+// Order is first-occurrence (Calls first, then any ReceiverCalls
+// that didn't already appear in Calls), matching the
+// MergeCallsDeduped contract in method_attrs.go.
 func methodAttrs(language string, m MethodDecl) json.RawMessage {
 	attrs := map[string]any{
 		"language":   language,
@@ -1171,8 +1191,8 @@ func methodAttrs(language string, m MethodDecl) json.RawMessage {
 		"end_line":   m.EndLine,
 		"params_raw": m.ParamSignature,
 	}
-	if len(m.Calls) > 0 {
-		attrs["calls_raw"] = m.Calls
+	if merged := MergeCallsDeduped(m.Calls, m.ReceiverCalls); len(merged) > 0 {
+		attrs["calls_raw"] = merged
 	}
 	if len(m.Modifiers) > 0 {
 		attrs["modifiers"] = m.Modifiers

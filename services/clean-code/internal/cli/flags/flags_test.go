@@ -1,6 +1,8 @@
 package flags
 
 import (
+	"bytes"
+	"flag"
 	"sort"
 	"testing"
 )
@@ -130,4 +132,176 @@ func TestNoDuplicateVerbs(t *testing.T) {
 	if len(sorted) != len(Verbs) {
 		t.Fatalf("sort changed slice length: %d -> %d", len(Verbs), len(sorted))
 	}
+}
+
+// TestPolicyDefaultTopNPinnedToTwenty pins the new
+// `PolicyDefaultTopN` constant added to resolve iter-4
+// evaluator item 7 -- "TOP-N DEFAULT TEXT DOES NOT MATCH
+// SPEC". Tech-spec Sec 8.1 row 6 says the literal CLI value
+// `--top-n 0` means "use policy default of 20", so the
+// renderer substitutes this constant when it sees the
+// default. Renaming or renumbering is a contract change
+// against the e2e renderer scenarios.
+func TestPolicyDefaultTopNPinnedToTwenty(t *testing.T) {
+	t.Parallel()
+
+	if PolicyDefaultTopN != 20 {
+		t.Errorf("PolicyDefaultTopN = %d, want 20 (tech-spec Sec 8.1 row 6)", PolicyDefaultTopN)
+	}
+	if DefaultTopN != 0 {
+		t.Errorf("DefaultTopN = %d, want 0 (tech-spec Sec 8.1 row 6: 0 means use PolicyDefaultTopN)", DefaultTopN)
+	}
+}
+
+// TestRegisterAttachesEverySec81Flag pins the closed
+// flag-name set the Register helper attaches to its target
+// flag-set. Resolves iter-4 evaluator item 4 by giving the
+// helper a single-source-of-truth test, so a regression that
+// drops or renames a flag in Register would fail HERE rather
+// than only in main_test.go where the surface is hidden
+// behind the dispatcher.
+func TestRegisterAttachesEverySec81Flag(t *testing.T) {
+	t.Parallel()
+
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	g := Register(fs)
+	if g == nil {
+		t.Fatal("Register returned nil *Globals")
+	}
+
+	want := []string{
+		"out", "findings", "emit-prompts", "policy",
+		"with-churn", "top-n", "exit-on", "diagnostics",
+		"dev-mode", "telemetry-otlp",
+	}
+	seen := make(map[string]bool, len(want))
+	fs.VisitAll(func(f *flag.Flag) { seen[f.Name] = true })
+
+	for _, name := range want {
+		if !seen[name] {
+			t.Errorf("Register did not attach --%s", name)
+		}
+	}
+	if len(seen) != len(want) {
+		t.Errorf("Register attached %d flags %v, want %d %v", len(seen), seen, len(want), want)
+	}
+}
+
+// TestRegisterUsesPackageDefaultDevMode resolves iter-4
+// evaluator item 6 ("DEV-MODE DEFAULT NOT CENTRALIZED IN
+// FLAGS HELPER"). The `--dev-mode` default MUST come from
+// the build-tag-paired `DefaultDevMode` constant in this
+// package, not from a cmd-local twin -- so a regression
+// that re-introduces `cmd/cleanc/buildtag_default.go`'s
+// `defaultDevMode` would not be silently shadowed.
+func TestRegisterUsesPackageDefaultDevMode(t *testing.T) {
+	t.Parallel()
+
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	g := Register(fs)
+	if g.DevMode == nil {
+		t.Fatal("Globals.DevMode is nil after Register")
+	}
+	if *g.DevMode != DefaultDevMode {
+		t.Errorf("--dev-mode default = %v, want flags.DefaultDevMode = %v",
+			*g.DevMode, DefaultDevMode)
+	}
+
+	// Cross-check via the actual flag's DefValue text.
+	f := fs.Lookup("dev-mode")
+	if f == nil {
+		t.Fatal("--dev-mode flag not found on flag-set")
+	}
+	wantText := "true"
+	if !DefaultDevMode {
+		wantText = "false"
+	}
+	if f.DefValue != wantText {
+		t.Errorf("--dev-mode DefValue = %q, want %q", f.DefValue, wantText)
+	}
+}
+
+// TestGlobalsValidateRejectsReservedFlags walks the three
+// cross-flag rules pinned by e2e-scenarios.md Stage 3.3 /
+// Stage 4.4 (rejected `--telemetry-otlp`, rejected
+// `--with-churn`, rejected `--exit-on banana`) and confirms
+// Validate writes the pinned literal message AND returns a
+// non-nil error so the dispatcher can map the result to
+// ExitUsage.
+func TestGlobalsValidateRejectsReservedFlags(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		mutate     func(g *Globals)
+		wantPhrase string
+	}{
+		{
+			name: "telemetry-otlp",
+			mutate: func(g *Globals) {
+				v := "http://localhost:4317"
+				g.TelemetryOTLP = &v
+			},
+			wantPhrase: "--telemetry-otlp is reserved for a future story",
+		},
+		{
+			name: "with-churn",
+			mutate: func(g *Globals) {
+				v := true
+				g.WithChurn = &v
+			},
+			wantPhrase: "--with-churn is reserved for P2",
+		},
+		{
+			name: "exit-on banana",
+			mutate: func(g *Globals) {
+				v := "banana"
+				g.ExitOn = &v
+			},
+			wantPhrase: "--exit-on must be one of",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fs := flag.NewFlagSet("test", flag.ContinueOnError)
+			g := Register(fs)
+			tc.mutate(g)
+			var buf bytes.Buffer
+			err := g.Validate(VerbAnalyze, &buf)
+			if err == nil {
+				t.Fatalf("Validate returned nil, want non-nil error")
+			}
+			if got := buf.String(); !contains(got, tc.wantPhrase) {
+				t.Errorf("stderr = %q, want substring %q", got, tc.wantPhrase)
+			}
+		})
+	}
+}
+
+// TestGlobalsValidateAcceptsDefaults confirms a freshly-
+// registered Globals passes Validate without writing
+// anything to stderr (the defaults are the happy path).
+func TestGlobalsValidateAcceptsDefaults(t *testing.T) {
+	t.Parallel()
+
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	g := Register(fs)
+	var buf bytes.Buffer
+	if err := g.Validate(VerbAnalyze, &buf); err != nil {
+		t.Errorf("Validate(defaults) error = %v, want nil", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("Validate(defaults) wrote %q to stderr, want empty", buf.String())
+	}
+}
+
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
 }

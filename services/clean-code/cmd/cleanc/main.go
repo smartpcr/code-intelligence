@@ -198,16 +198,14 @@ func runAnalyze(stdout, stderr io.Writer, args []string) int {
 		fs.PrintDefaults()
 	}
 
-	out := fs.String("out", flags.DefaultOut, "markdown report path (empty = stdout)")
-	findings := fs.String("findings", flags.DefaultFindings, "JSON findings artifact path")
-	emitPrompts := fs.String("emit-prompts", flags.DefaultEmitPrompts, "JSONL refactor-prompt path (empty = disabled)")
-	policy := fs.String("policy", flags.DefaultPolicy, "policy-bundle directory (empty = embedded rule packs)")
-	withChurn := fs.Bool("with-churn", flags.DefaultWithChurn, "include git churn (reserved for P2, rejected in P0/P1)")
-	topN := fs.Int("top-n", flags.DefaultTopN, "cap the hot-spot table (0 = no cap)")
-	exitOn := fs.String("exit-on", flags.DefaultExitOn, "severity threshold for exit code 1 (info|warn|block)")
-	diagnostics := fs.String("diagnostics", flags.DefaultDiagnostics, "diagnostics JSON sidecar path (empty = disabled)")
-	devMode := fs.Bool("dev-mode", defaultDevMode, "permit unsigned policy bundles (dev builds only)")
-	telemetryOTLP := fs.String("telemetry-otlp", flags.DefaultTelemetryOTLP, "OTLP collector URL (reserved for a future story)")
+	// Register the full Sec 8.1 global-flag surface in ONE
+	// call so `analyze` and `report` share the exact same
+	// flag set (resolves iter-4 evaluator item 4). The
+	// `--dev-mode` default is sourced from
+	// `flags.DefaultDevMode` (build-tag-paired in the flags
+	// package; resolves item 6), so this dispatcher no
+	// longer reads the cmd-local `defaultDevMode` constant.
+	g := flags.Register(fs)
 
 	positionals, err := parseInterleavedFlags(fs, args)
 	if err != nil {
@@ -217,37 +215,33 @@ func runAnalyze(stdout, stderr io.Writer, args []string) int {
 		return flags.ExitUsage
 	}
 
-	if len(positionals) < 1 {
-		fmt.Fprintln(stderr, analyzeUsage)
-		fs.PrintDefaults()
+	// Surplus-positional rejection (resolves iter-4
+	// evaluator item 5). `cleanc analyze` accepts EXACTLY
+	// one positional argument -- the repo path. Anything
+	// else (zero, two, or more) is an operator-facing usage
+	// error and exits 64.
+	if len(positionals) != 1 {
+		if len(positionals) == 0 {
+			fmt.Fprintln(stderr, analyzeUsage)
+			fs.PrintDefaults()
+		} else {
+			fmt.Fprintf(stderr, "cleanc analyze: expected exactly 1 positional argument (repo-path), got %d: %v\n", len(positionals), positionals)
+			fmt.Fprintln(stderr, analyzeUsage)
+		}
 		return flags.ExitUsage
 	}
 
-	if *telemetryOTLP != "" {
-		fmt.Fprintln(stderr, flags.ReservedTelemetryMessage)
-		return flags.ExitUsage
-	}
-	if *withChurn {
-		fmt.Fprintln(stderr, flags.ReservedWithChurnMessage)
-		return flags.ExitUsage
-	}
-	if !flags.IsValidExitOn(*exitOn) {
-		fmt.Fprintln(stderr, flags.ExitOnUsageMessage)
+	if err := g.Validate(flags.VerbAnalyze, stderr); err != nil {
 		return flags.ExitUsage
 	}
 
-	// Suppress unused-variable warnings: the flag pointers are
-	// declared so the surface is real (the flag-set really
-	// accepts them, `-h` lists them, downstream stages will use
-	// them), but the skeleton body doesn't consume the values
-	// yet. The blank assignment is the canonical Go pattern.
-	_ = out
-	_ = findings
-	_ = emitPrompts
-	_ = policy
-	_ = topN
-	_ = diagnostics
-	_ = devMode
+	// Suppress unused-variable warnings: the Globals struct
+	// owns every flag pointer; the skeleton body doesn't
+	// consume the values yet but the flag-set really
+	// accepts them (the test suite asserts the surface and
+	// `-h` lists them), so downstream stages will read
+	// `g.Out`, `g.Findings`, etc. directly.
+	_ = g
 
 	// Surface stdout writer so unused-import warnings don't
 	// drop the import in tests that don't read stdout.
@@ -258,9 +252,16 @@ func runAnalyze(stdout, stderr io.Writer, args []string) int {
 }
 
 // runReport handles `cleanc report <findings.json> [--out report.md]`.
-// Stage 1.1 wires the flag surface only; Stage 4.1 implements
-// the body (re-render markdown from a previously written
-// findings artifact without re-running the pipeline).
+// Stage 1.1 wires the FULL Sec 8.1 global-flag surface (so
+// `cleanc report -h` lists `--findings`, `--policy`,
+// `--with-churn`, `--top-n`, `--exit-on`, `--diagnostics`,
+// `--dev-mode`, `--telemetry-otlp`, and `--emit-prompts`
+// alongside `--out`); Stage 4.1 implements the body
+// (re-render markdown from a previously written findings
+// artifact without re-running the pipeline). The shared
+// flag surface comes from `flags.Register(fs)` so
+// `analyze` and `report` cannot drift apart (resolves
+// iter-4 evaluator item 4).
 func runReport(stdout, stderr io.Writer, args []string) int {
 	fs := flag.NewFlagSet("cleanc report", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -269,7 +270,7 @@ func runReport(stdout, stderr io.Writer, args []string) int {
 		fs.PrintDefaults()
 	}
 
-	out := fs.String("out", flags.DefaultOut, "markdown report path (empty = stdout)")
+	g := flags.Register(fs)
 
 	positionals, err := parseInterleavedFlags(fs, args)
 	if err != nil {
@@ -278,13 +279,25 @@ func runReport(stdout, stderr io.Writer, args []string) int {
 		}
 		return flags.ExitUsage
 	}
-	if len(positionals) < 1 {
-		fmt.Fprintln(stderr, reportUsage)
-		fs.PrintDefaults()
+	// Surplus-positional rejection (resolves iter-4
+	// evaluator item 5). `cleanc report` accepts EXACTLY one
+	// positional argument -- the findings.json path.
+	if len(positionals) != 1 {
+		if len(positionals) == 0 {
+			fmt.Fprintln(stderr, reportUsage)
+			fs.PrintDefaults()
+		} else {
+			fmt.Fprintf(stderr, "cleanc report: expected exactly 1 positional argument (findings.json), got %d: %v\n", len(positionals), positionals)
+			fmt.Fprintln(stderr, reportUsage)
+		}
 		return flags.ExitUsage
 	}
 
-	_ = out
+	if err := g.Validate(flags.VerbReport, stderr); err != nil {
+		return flags.ExitUsage
+	}
+
+	_ = g
 	_ = stdout
 
 	fmt.Fprintln(stderr, "cleanc report: re-render not yet wired in the Stage 1.1 skeleton; the report renderer lands in Stage 4.1.")

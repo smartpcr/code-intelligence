@@ -10,8 +10,15 @@ package main
 // always defined exactly once.
 //
 // Contract (tech-spec.md Sec 8.9, "Build-tag matrix"):
-//   - dev / no-tag build  -> `buildTag = ""`,    `defaultDevMode = true`
-//   - `-tags prod` build  -> `buildTag = "prod"`, `defaultDevMode = false`
+//   - dev / no-tag build  -> `buildTag = ""`
+//   - `-tags prod` build  -> `buildTag = "prod"`
+//
+// `--dev-mode` defaults are CENTRALISED in
+// `internal/cli/flags/devmode_default.go` /
+// `devmode_prod.go` (`flags.DefaultDevMode`); the
+// dispatcher reads that constant directly and this file
+// no longer owns a sibling `defaultDevMode` (resolves
+// iter-4 evaluator item 6).
 //
 // The dev build defaults `--dev-mode` to true so developers
 // can run `cleanc analyze .` against a local checkout without
@@ -26,7 +33,4 @@ const (
 	// `^cleanc \d+\.\d+\.\d+ \(build-tag=(|prod)\) \(parsers=[^)]+\) \(rule-packs=[^)]+\)$`
 	// explicitly accepts via the alternation `(|prod)`.
 	buildTag = ""
-	// defaultDevMode pins the `--dev-mode` flag default to
-	// true in dev / no-tag builds.
-	defaultDevMode = true
 )

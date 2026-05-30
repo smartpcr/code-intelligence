@@ -16,6 +16,12 @@
 // only emits constants is the tightest possible surface).
 package flags
 
+import (
+	"flag"
+	"fmt"
+	"io"
+)
+
 // Exit codes pinned in tech-spec.md Sec 8.6.
 //
 // The dispatcher in cmd/cleanc/main.go maps each
@@ -67,11 +73,16 @@ var Verbs = []string{VerbAnalyze, VerbReport, VerbVersion, VerbApply}
 
 // Flag default values pinned in tech-spec.md Sec 8.1.
 //
-// `--dev-mode` is intentionally absent from this set because
-// its default flips between dev and prod builds (no-tag -> true,
-// `-tags prod` -> false); the per-build-tag default lives in
-// `cmd/cleanc/buildtag_default.go` / `buildtag_prod.go` to keep
-// the toggle visible to a reader scanning the cmd/ directory.
+// `DefaultDevMode` is intentionally split across the build-tag
+// pair `devmode_default.go` (`//go:build !prod` -> true) and
+// `devmode_prod.go` (`//go:build prod` -> false) so the matrix
+// is enforced at COMPILE time: a prod build that imports this
+// package gets `DefaultDevMode == false` regardless of what
+// `cmd/cleanc/` does. Centralising the constant here means the
+// dispatcher in `cmd/cleanc/main.go` reads `flags.DefaultDevMode`
+// directly and never owns a `defaultDevMode` of its own
+// (resolves iter-4 evaluator item 6 -- "DEV-MODE DEFAULT NOT
+// CENTRALIZED IN FLAGS HELPER").
 const (
 	// DefaultOut for `--out`. Empty string means "write
 	// markdown report to stdout" (tech-spec Sec 8.1 row 1).
@@ -84,16 +95,27 @@ const (
 	DefaultEmitPrompts = ""
 	// DefaultPolicy for `--policy`. Empty string means "use the
 	// embedded YAML rule packs baked into the binary via
-	// go:embed" (the loader lands in Stage 1.4).
+	// `policy/rulepacks/embedded_fs.go` (`//go:embed solid/*.yaml
+	// decoupling/*.yaml`); the dev-mode loader in
+	// `internal/cli/devpolicy/embed.go` re-exports
+	// `rulepacks.EmbeddedFS` to the orchestrator.
 	DefaultPolicy = ""
 	// DefaultWithChurn for `--with-churn`. The default is false
 	// because git history scanning is opt-in for Phase 1
 	// (tech-spec Sec 8.1 row 5; the walker lands in Stage 2.1).
 	DefaultWithChurn = false
-	// DefaultTopN for `--top-n`. Zero means "no cap on the
-	// hotspot table" -- the report renderer treats 0 as "show
-	// every row".
+	// DefaultTopN for `--top-n`. ZERO MEANS "use the policy
+	// default of 20" (PolicyDefaultTopN) -- tech-spec Sec 8.1
+	// row 6 pins this semantic explicitly. The report renderer
+	// substitutes PolicyDefaultTopN when it observes a literal
+	// zero on the CLI, so an operator cannot accidentally
+	// request "no cap" without supplying a very large number
+	// (e.g. `--top-n 999999`).
 	DefaultTopN = 0
+	// PolicyDefaultTopN is the substitute value the renderer
+	// uses when `--top-n` is the literal zero default. Pinned
+	// by tech-spec Sec 8.1 row 6.
+	PolicyDefaultTopN = 20
 	// DefaultExitOn for `--exit-on`. The default is `block`,
 	// meaning only block-severity findings trip exit code 1.
 	DefaultExitOn = "block"
@@ -106,6 +128,86 @@ const (
 	// value with `ExitUsage` (tech-spec Sec 8.6 row 4).
 	DefaultTelemetryOTLP = ""
 )
+
+// Globals collects every global-flag pointer pinned by
+// tech-spec Sec 8.1. `Register` populates one of these from
+// any *flag.FlagSet and `Validate` enforces the closed-set
+// rules (`--exit-on` membership, reserved-flag rejection).
+//
+// Keeping the surface inside this helper guarantees `analyze`
+// and `report` see byte-identical flag sets (resolves iter-4
+// evaluator item 4 -- "REPORT FLAG SURFACE INCOMPLETE").
+type Globals struct {
+	Out           *string
+	Findings      *string
+	EmitPrompts   *string
+	Policy        *string
+	WithChurn     *bool
+	TopN          *int
+	ExitOn        *string
+	Diagnostics   *string
+	DevMode       *bool
+	TelemetryOTLP *string
+}
+
+// Register attaches every global flag pinned by tech-spec
+// Sec 8.1 to `fs` using the per-flag default constants in
+// this package. The `--dev-mode` default comes from the
+// build-tag-paired `DefaultDevMode` constant in this same
+// package -- callers MUST NOT pass their own default; the
+// build matrix is the single source of truth.
+//
+// Returns a populated *Globals whose pointer fields are kept
+// in sync with `fs.Parse(...)` writes. Callers chain
+// `g := flags.Register(fs); ...; if err := g.Validate(verb);
+// err != nil { ... }` after parsing.
+func Register(fs *flag.FlagSet) *Globals {
+	g := &Globals{
+		Out:           fs.String("out", DefaultOut, "markdown report path (empty = stdout)"),
+		Findings:      fs.String("findings", DefaultFindings, "JSON findings artifact path"),
+		EmitPrompts:   fs.String("emit-prompts", DefaultEmitPrompts, "JSONL refactor-prompt path (empty = disabled)"),
+		Policy:        fs.String("policy", DefaultPolicy, "policy-bundle directory (empty = embedded rule packs)"),
+		WithChurn:     fs.Bool("with-churn", DefaultWithChurn, "include git churn (reserved for P2, rejected in P0/P1)"),
+		TopN:          fs.Int("top-n", DefaultTopN, "cap the hot-spot table (0 = use policy default of 20)"),
+		ExitOn:        fs.String("exit-on", DefaultExitOn, "severity threshold for exit code 1 (info|warn|block)"),
+		Diagnostics:   fs.String("diagnostics", DefaultDiagnostics, "diagnostics JSON sidecar path (empty = disabled)"),
+		DevMode:       fs.Bool("dev-mode", DefaultDevMode, "permit unsigned policy bundles (dev builds only)"),
+		TelemetryOTLP: fs.String("telemetry-otlp", DefaultTelemetryOTLP, "OTLP collector URL (reserved for a future story)"),
+	}
+	return g
+}
+
+// Validate runs the cross-flag rules pinned by e2e-scenarios.md
+// Stage 3.3 / Stage 4.4: rejected reserved flags and the
+// closed-set `--exit-on` membership. The `verb` argument lets
+// future stages add verb-scoped checks; the current rules apply
+// equally to `analyze` and `report`.
+//
+// If `stderr` is non-nil and a rule trips, Validate writes the
+// pinned literal message before returning a non-nil error so the
+// dispatcher can exit with `ExitUsage` without duplicating the
+// message strings.
+func (g *Globals) Validate(verb string, stderr io.Writer) error {
+	if g.TelemetryOTLP != nil && *g.TelemetryOTLP != "" {
+		if stderr != nil {
+			fmt.Fprintln(stderr, ReservedTelemetryMessage)
+		}
+		return fmt.Errorf("--telemetry-otlp is reserved")
+	}
+	if g.WithChurn != nil && *g.WithChurn {
+		if stderr != nil {
+			fmt.Fprintln(stderr, ReservedWithChurnMessage)
+		}
+		return fmt.Errorf("--with-churn is reserved")
+	}
+	if g.ExitOn != nil && !IsValidExitOn(*g.ExitOn) {
+		if stderr != nil {
+			fmt.Fprintln(stderr, ExitOnUsageMessage)
+		}
+		return fmt.Errorf("--exit-on out of range")
+	}
+	return nil
+}
 
 // ExitOnLevels is the closed severity set accepted by
 // `--exit-on`. Lower-cased exact match is enforced by

@@ -137,8 +137,8 @@ storyId: "code-intelligence:REPO-SCANNER"
 
 ### Implementation Steps
 - [ ] Create `internal/graphsink/sink.go` declaring the `Sink` interface (`EnsureRepo`, `EnsureCommit`, `InsertNode`, `InsertEdge`, `Flush`, `Close`) per architecture S3.2. `Sink` is a strict superset of `repoindexer.RepoCommitNodeEdgeWriter` (Stage 2.3) -- it adds `Flush` + `Close` only -- so every existing `*graphwriter.Writer` consumer compiles unchanged.
-- [ ] Create `internal/graphsink/reader.go` declaring the `Reader` interface with `ListRepos(ctx, ReaderOptions) ([]RepoSummary, error)`, `ListNodes`, `ListEdgesFrom`, `ListEdgesTo`, `GetNode`, and `LookupBySignature`. `ListRepos` returns the `{RepoID, URL, SHA, GeneratedAt}` tuples that `GET /api/repos` (Stage 7.2) needs, since `internal/graphreader` does not expose a repo-listing method today (the production mgmt-api implements it via direct SQL at `internal/mgmtapi/read.go:803`).
-- [ ] Add a `RepoSummary` value type in `internal/graphsink/types.go` with the four fields plus the textual UUID form `RepoUUID` so the JSON envelope matches the wire shape Stage 7.2 emits.
+- [ ] Create `internal/graphsink/reader.go` declaring the `Reader` interface with `ListRepos(ctx, ReaderOptions) ([]graphreader.RepoSummary, error)`, `ListNodes`, `ListEdgesFrom`, `ListEdgesTo`, `GetNode`, and `LookupBySignature`. The Postgres adapter cannot issue direct SQL (tech-spec C5 / S4.5), so Stage 3.3 lifts `ListRepos` into `internal/graphreader.Reader` itself (the SELECT is currently inlined in `internal/mgmtapi/read.go:803` `handleListRepos`); the Postgres adapter then forwards to that primitive.
+- [ ] Add a `RepoSummary` value type in `internal/graphreader/types.go` (single source of truth) with fields `RepoID`, `URL`, `SHA`, `GeneratedAt`, `RepoUUID` so the JSON envelope matches the wire shape Stage 7.2 emits; `graphsink.Reader` and all three backends return `[]graphreader.RepoSummary` directly.
 - [ ] Add `internal/graphsink/doc.go` summarising the three backends, the snapshot-vs-append rule (S5), and the parity invariant (S2).
 - [ ] Widen `AncestryWriter`'s writer parameter from `repoindexer.RepoCommitNodeEdgeWriter` to `graphsink.Sink` (Stage 2.3 already accepts the narrower shape; `Sink` is a strict superset, so existing call sites compile unchanged).
 
@@ -170,11 +170,13 @@ storyId: "code-intelligence:REPO-SCANNER"
 
 ### Implementation Steps
 - [ ] Create `internal/graphsink/postgres/sink.go` that wraps `*graphwriter.Writer`, forwarding all six `Sink` methods 1:1, calling `EnsureRepoWithID` when `RepoInput.RepoID` is non-zero and falling back to `EnsureRepo` otherwise.
-- [ ] Create `internal/graphsink/postgres/reader.go` that wraps `*graphreader.Reader` for the four signature-identical methods (`ListNodes`, `ListEdgesFrom`, `ListEdgesTo`, `GetNode`) and implements `LookupBySignature` via `ListNodes` + `ListNodesFilter.CanonicalSignature`.
-- [ ] Implement `ListRepos` in the Postgres reader by issuing a parameterised SQL query mirroring the existing `internal/mgmtapi/read.go:handleListRepos` SELECT (line 816) -- it lives inside `internal/graphsink/postgres` (not in the adapter package boundary the lint rule below polices) because it reads from the `repo` + `repo_commit` tables and there is no existing reader-level helper to wrap; cross-reference the mgmt-api handler in a doc comment so the two queries stay in sync.
-- [ ] Add a CI lint rule (or a `go vet`-friendly comment ban) that prohibits direct SQL inside `internal/graphsink/postgres/sink.go` (writes go through `*graphwriter.Writer` per tech-spec C5); the rule explicitly exempts `reader.go::ListRepos` since the production reader has no `ListRepos` helper yet.
+- [ ] Lift `ListRepos` into `internal/graphreader/reader.go`: add `func (r *Reader) ListRepos(ctx context.Context, opts ReaderOptions) ([]RepoSummary, error)` owning the SELECT that mirrors the existing `internal/mgmtapi/read.go:handleListRepos` query (line 816). This keeps tech-spec C5 intact -- graphsink/postgres remains a thin forwarder with zero direct SQL.
+- [ ] Create `internal/graphsink/postgres/reader.go` that wraps `*graphreader.Reader` for ALL six methods (`ListRepos`, `ListNodes`, `ListEdgesFrom`, `ListEdgesTo`, `GetNode`, `LookupBySignature`) -- pure forwarding, no SQL anywhere in the adapter package.
+- [ ] Implement `LookupBySignature` in the postgres adapter via `ListNodes` + `ListNodesFilter.CanonicalSignature` -- still forwards to `*graphreader.Reader`, no direct SQL.
+- [ ] Add a CI lint rule (or a `go vet`-friendly comment ban) that prohibits any direct `*sql.DB` / `database/sql` import inside `internal/graphsink/postgres/` (sink.go AND reader.go) per tech-spec C5 / S4.5. No exemptions -- all SQL lives in `graphwriter` (writes) or `graphreader` (reads).
+- [ ] Add `internal/graphreader/listrepos_test.go` (sqlmock) verifying `ListRepos` returns the expected `RepoSummary` tuples ordered by `created_at DESC`, matching the mgmt-api semantics; cross-reference `mgmtapi/read.go:816` so a follow-up story can refactor `handleListRepos` to call the new primitive.
 - [ ] Add `postgres_sink_test.go` (sqlmock) verifying every `Sink` method delegates to the underlying writer and propagates `WriteContractViolation` (SQLSTATE 42501) verbatim.
-- [ ] Add `postgres_reader_test.go` (sqlmock) verifying `ListRepos` returns the expected `RepoSummary` tuples and orders results by `created_at DESC` to match the mgmt-api semantics.
+- [ ] Add `internal/graphsink/postgres/reader_test.go` as a pure forwarding test: a `fakeGraphReader` records each call and asserts the postgres adapter delegates 1:1 with no SQL of its own (verified by `go list -deps` showing the adapter package does not import `database/sql`).
 
 ### Dependencies
 - phase-graphsink-storage-abstraction/stage-sink-interface-skeleton
@@ -184,6 +186,9 @@ storyId: "code-intelligence:REPO-SCANNER"
 - [ ] Scenario: postgres-forwarding -- Given a sqlmock-backed `*graphwriter.Writer`, When each `Sink` method runs, Then the corresponding writer method is invoked exactly once with the same arguments.
 - [ ] Scenario: write-contract-violation-propagates -- Given a SQL error with SQLSTATE 42501, When `InsertNode` runs, Then the returned error is a typed `WriteContractViolation` and the user-facing message includes the role hint.
 - [ ] Scenario: lookupbysignature-uses-filter -- Given an existing Node with kind `method` and canonical signature `S`, When `LookupBySignature(repoID, "method", S)` runs, Then it returns that Node via `ListNodes` with `ListNodesFilter.CanonicalSignature=S`.
+- [ ] Scenario: postgres-adapter-no-database-sql-import -- Given the `internal/graphsink/postgres/` package source, When `go list -deps -f '{{join .Deps "\n"}}' ./internal/graphsink/postgres/...` runs, Then `database/sql` does NOT appear in the dependency list (proves C5 / S4.5 thin-forwarder invariant -- all SQL lives in `graphwriter` or `graphreader`).
+- [ ] Scenario: listrepos-forwards-to-graphreader -- Given a fake `*graphreader.Reader` that records calls, When the postgres adapter's `ListRepos(ctx, opts)` runs, Then exactly one delegated call is recorded with the same args and the returned `[]graphreader.RepoSummary` is returned unmodified.
+- [ ] Scenario: graphreader-listrepos-matches-mgmtapi -- Given the same fixture rows in the `repo` + `repo_commit` tables, When `graphreader.Reader.ListRepos` runs AND the existing `mgmtapi.handleListRepos` runs, Then the two return identical ordered `[]RepoSummary` slices (validates the lifted SELECT preserves mgmt-api semantics).
 
 ## Stage 3.4: SQLite sink backend
 

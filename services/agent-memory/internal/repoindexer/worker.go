@@ -3,7 +3,6 @@ package repoindexer
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1031,20 +1030,32 @@ type fullModeAttrs struct {
 // re-running it against the same SHA produces zero net new rows
 // (Stage 2.1 dedupe path).
 func (w *Worker) runFull(ctx context.Context, job Job) (FullSummary, error) {
-	// 1. Resolve repo URL + language_hints. The worker is the
-	// only caller that needs this read on the `repo` table;
-	// the app role has SELECT (per migration 0016 USAGE +
-	// per-table grants). `language_hints` flows through to
-	// EmitFileEvent so each per-file dispatcher invocation
-	// receives the repo's own hint set -- the evaluator-
-	// flagged correctness gate (Stage 3.2 iter-2 finding #4).
+	// 1. Resolve repo URL + default_branch + current_head_sha +
+	// language_hints. The worker is the only caller that needs
+	// this read on the `repo` table; the app role has SELECT
+	// (per migration 0016 USAGE + per-table grants).
+	// `language_hints` flows through to EmitFileEvent so each
+	// per-file dispatcher invocation receives the repo's own
+	// hint set -- the evaluator-flagged correctness gate (Stage
+	// 3.2 iter-2 finding #4). `default_branch` and
+	// `current_head_sha` are round-tripped through
+	// AncestryWriter's EnsureRepo upsert so the worker's adopt-
+	// AncestryWriter refactor keeps the `repo` row's column
+	// values byte-identical to the pre-refactor handler (which
+	// never wrote the row); without round-tripping
+	// `current_head_sha` a delayed re-ingest of a historical
+	// SHA would silently rewind the operator-facing head
+	// pointer.
 	var (
-		repoURL  string
-		repoLang []string
+		repoURL        string
+		repoBranch     string
+		repoHeadSHA    string
+		repoLang       []string
 	)
 	if err := w.db.QueryRowContext(ctx,
-		`SELECT url, language_hints FROM repo WHERE repo_id = $1`, job.RepoID.String(),
-	).Scan(&repoURL, pq.Array(&repoLang)); err != nil {
+		`SELECT url, default_branch, current_head_sha, language_hints FROM repo WHERE repo_id = $1`,
+		job.RepoID.String(),
+	).Scan(&repoURL, &repoBranch, &repoHeadSHA, pq.Array(&repoLang)); err != nil {
 		return FullSummary{}, fmt.Errorf("repoindexer: lookup repo url: %w", err)
 	}
 
@@ -1068,126 +1079,63 @@ func (w *Worker) runFull(ctx context.Context, job Job) (FullSummary, error) {
 		}
 	}()
 
-	// 3. EnsureCommit so the commit ancestry is in place. Only
-	// reached after Materialize confirmed the SHA exists.
-	commitRec, err := w.writer.EnsureCommit(ctx, graphwriter.CommitInput{
-		RepoID:      job.RepoID,
-		SHA:         job.ToSHA,
-		ParentSHA:   job.FromSHA,
-		CommittedAt: w.now().UTC(),
-	})
+	// 3. Pre-walk ancestry: EnsureRepo (idempotent self-upsert
+	// to round-trip the existing default_branch / current_head_sha
+	// / language_hints values), EnsureCommit, and the root Repo
+	// Node insertion are all driven by AncestryWriter so the
+	// queue-worker path and the future CLI path cannot drift
+	// (architecture S3.4 / impl-plan "Worker adopts
+	// AncestryWriter"). The writer's `now` clock is pinned to
+	// the worker's so test-time clock pinning continues to
+	// produce reproducible `repo_commit.committed_at`
+	// timestamps; the `ParentSHA` and `CurrentHeadSHA` overrides
+	// preserve the pre-refactor channel through `Job.FromSHA`
+	// and the existing `repo.current_head_sha` value
+	// respectively.
+	aw := NewAncestryWriter(w.writer, repoURL, job.ToSHA)
+	aw.now = w.now
+	aw.SetParentSHA(job.FromSHA)
+	aw.SetCurrentHeadSHA(repoHeadSHA)
+	ancestry, err := aw.EnsureRepoAndCommit(ctx, repoBranch, repoLang)
 	if err != nil {
-		return FullSummary{}, fmt.Errorf("repoindexer: ensure commit: %w", err)
-	}
-
-	// 4. Ensure the root Repo Node.
-	repoAttrs, err := json.Marshal(fullModeAttrs{Producer: "repoindexer.full"})
-	if err != nil {
-		return FullSummary{}, fmt.Errorf("repoindexer: marshal repo attrs: %w", err)
-	}
-	repoNode, err := w.writer.InsertNode(ctx, graphwriter.NodeInput{
-		RepoID:             job.RepoID,
-		Kind:               "repo",
-		CanonicalSignature: CanonicalRepoSig(repoURL),
-		FromSHA:            job.ToSHA,
-		AttrsJSON:          repoAttrs,
-	})
-	if err != nil {
-		return FullSummary{}, fmt.Errorf("repoindexer: insert repo node: %w", err)
+		return FullSummary{}, fmt.Errorf("repoindexer: ancestry pre-walk: %w", err)
 	}
 
 	summary := FullSummary{
-		RepoNodeID:     repoNode.NodeID,
-		CommitInserted: commitRec.Inserted,
+		RepoNodeID:     ancestry.RepoNodeID,
+		CommitInserted: ancestry.CommitInserted,
 	}
 
-	// 5. Walk files. We keep one cache keyed by package
-	// directory so each unique dir only triggers one
-	// InsertNode + one Repo→Package contains-edge.
-	type pkgEntry struct {
-		nodeID string
-	}
-	packages := make(map[string]pkgEntry)
+	// 4. Walk files. The package-dedupe cache lives inside
+	// AncestryWriter; we maintain a parallel worker-local set
+	// keyed on canonical-package-dir purely to drive the
+	// `PackagesEnsured` counter, which the integration test
+	// asserts on. `FileAncestry.PackageNewlyInserted` +
+	// `PackageEdgeInserted` + `NewlyInserted` + `FileEdgeInserted`
+	// already give us insert-only signals, so the per-file
+	// `*Inserted` counters fall out of those booleans directly.
+	pkgDirSeen := make(map[string]struct{})
 
 	walkErr := ws.Walk(func(file WalkFile) error {
-		dir := CanonicalPackageDir(file.RelPath)
-		pkg, ok := packages[dir]
-		if !ok {
-			pkgAttrs, mErr := json.Marshal(fullModeAttrs{
-				RelPath: dir, Producer: "repoindexer.full",
-			})
-			if mErr != nil {
-				return fmt.Errorf("repoindexer: marshal pkg attrs: %w", mErr)
-			}
-			pkgRec, pErr := w.writer.InsertNode(ctx, graphwriter.NodeInput{
-				RepoID:             job.RepoID,
-				Kind:               "package",
-				CanonicalSignature: CanonicalPackageSig(repoURL, dir),
-				ParentNodeID:       repoNode.NodeID,
-				FromSHA:            job.ToSHA,
-				AttrsJSON:          pkgAttrs,
-			})
-			if pErr != nil {
-				return fmt.Errorf("repoindexer: insert package node (%s): %w", dir, pErr)
-			}
-			pkg = pkgEntry{nodeID: pkgRec.NodeID}
-			packages[dir] = pkg
-
-			// Repo→Package contains edge.
-			edgeRec, eErr := w.writer.InsertEdge(ctx, graphwriter.EdgeInput{
-				RepoID:    job.RepoID,
-				Kind:      "contains",
-				SrcNodeID: repoNode.NodeID,
-				DstNodeID: pkg.nodeID,
-				FromSHA:   job.ToSHA,
-			})
-			if eErr != nil {
-				return fmt.Errorf("repoindexer: insert repo->pkg edge: %w", eErr)
-			}
+		fa, eErr := aw.EnsureFile(ctx, file)
+		if eErr != nil {
+			return fmt.Errorf("repoindexer: ancestry per-file (%s): %w", file.RelPath, eErr)
+		}
+		if _, seen := pkgDirSeen[fa.PackageDir]; !seen {
+			pkgDirSeen[fa.PackageDir] = struct{}{}
 			summary.PackagesEnsured++
-			if pkgRec.Inserted {
-				summary.PackagesInserted++
-			}
-			if edgeRec.Inserted {
-				summary.ContainsEdgesInserted++
-			}
 		}
-
-		// File Node.
-		fileAttrs, mErr := json.Marshal(fullModeAttrs{
-			RelPath: file.RelPath, Producer: "repoindexer.full",
-		})
-		if mErr != nil {
-			return fmt.Errorf("repoindexer: marshal file attrs: %w", mErr)
+		if fa.PackageNewlyInserted {
+			summary.PackagesInserted++
 		}
-		fileRec, fErr := w.writer.InsertNode(ctx, graphwriter.NodeInput{
-			RepoID:             job.RepoID,
-			Kind:               "file",
-			CanonicalSignature: CanonicalFileSig(repoURL, file.RelPath),
-			ParentNodeID:       pkg.nodeID,
-			FromSHA:            job.ToSHA,
-			AttrsJSON:          fileAttrs,
-		})
-		if fErr != nil {
-			return fmt.Errorf("repoindexer: insert file node (%s): %w", file.RelPath, fErr)
+		if fa.PackageEdgeInserted {
+			summary.ContainsEdgesInserted++
 		}
 		summary.FilesEnsured++
-		if fileRec.Inserted {
+		if fa.NewlyInserted {
 			summary.FilesInserted++
 		}
-
-		// Package→File contains edge.
-		edgeRec, eErr := w.writer.InsertEdge(ctx, graphwriter.EdgeInput{
-			RepoID:    job.RepoID,
-			Kind:      "contains",
-			SrcNodeID: pkg.nodeID,
-			DstNodeID: fileRec.NodeID,
-			FromSHA:   job.ToSHA,
-		})
-		if eErr != nil {
-			return fmt.Errorf("repoindexer: insert pkg->file edge: %w", eErr)
-		}
-		if edgeRec.Inserted {
+		if fa.FileEdgeInserted {
 			summary.ContainsEdgesInserted++
 		}
 
@@ -1199,8 +1147,8 @@ func (w *Worker) runFull(ctx context.Context, job Job) (FullSummary, error) {
 			RepoID:        job.RepoID,
 			RepoURL:       repoURL,
 			SHA:           job.ToSHA,
-			FileNodeID:    fileRec.NodeID,
-			RepoNodeID:    repoNode.NodeID,
+			FileNodeID:    fa.FileNodeID,
+			RepoNodeID:    ancestry.RepoNodeID,
 			RelPath:       file.RelPath,
 			AbsPath:       file.AbsPath,
 			LanguageHints: repoLang,

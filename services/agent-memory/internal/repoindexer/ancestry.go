@@ -108,6 +108,32 @@ type AncestryWriter struct {
 	// so the `node.repo_id REFERENCES repo (repo_id)` foreign
 	// key in migration 0003 still resolves.
 	assignedRepoID fingerprint.RepoID
+
+	// parentSHA is the value forwarded to
+	// `CommitInput.ParentSHA` on the EnsureCommit step.
+	// Defaults to "" (root commit) so the existing unit-test
+	// shape of `EnsureRepoAndCommit(ctx, branch, hints)`
+	// continues to behave identically. Worker callers that
+	// derive the parent SHA from `Job.FromSHA` set this via
+	// `SetParentSHA` before invoking EnsureRepoAndCommit; the
+	// pre-refactor worker.runFull passed `job.FromSHA`
+	// through directly, so preserving that channel keeps the
+	// repo_commit rows byte-identical across the refactor.
+	parentSHA string
+
+	// currentHeadSHA overrides the value AncestryWriter
+	// forwards to `RepoInput.CurrentHeadSHA` on EnsureRepo.
+	// When `currentHeadSHAOverridden` is false the writer
+	// falls back to `a.sha` (the scan SHA) so the existing
+	// unit-test shape remains green. Worker callers preserve
+	// the pre-existing `repo.current_head_sha` column by
+	// reading the value out of the repo row up-front and
+	// calling `SetCurrentHeadSHA` before EnsureRepoAndCommit
+	// runs; without that step a scan with `job.ToSHA` older
+	// than the live tip would silently rewind the operator-
+	// facing head pointer.
+	currentHeadSHA           string
+	currentHeadSHAOverridden bool
 }
 
 // RepoAncestry is the cached state of a single (repoURL, sha)
@@ -289,10 +315,21 @@ func (a *AncestryWriter) EnsureRepoAndCommit(ctx context.Context, defaultBranch 
 	// not set, Postgres allocates the column default. The
 	// returned RepoRecord.ID is the random UUID we use for
 	// subsequent FK-bound inserts.
+	//
+	// `CurrentHeadSHA` defaults to the scan SHA so the
+	// stand-alone scan path (CLI / unit-test surface) stays
+	// idempotent; the worker rewires this via
+	// `SetCurrentHeadSHA` to round-trip the value already in
+	// the `repo` row, preserving the operator-facing head
+	// pointer.
+	currentHead := a.sha
+	if a.currentHeadSHAOverridden {
+		currentHead = a.currentHeadSHA
+	}
 	repoRec, err := a.w.EnsureRepo(ctx, graphwriter.RepoInput{
 		URL:            a.repoURL,
 		DefaultBranch:  defaultBranch,
-		CurrentHeadSHA: a.sha,
+		CurrentHeadSHA: currentHead,
 		LanguageHints:  hints,
 	})
 	if err != nil {
@@ -305,10 +342,14 @@ func (a *AncestryWriter) EnsureRepoAndCommit(ctx context.Context, defaultBranch 
 	// upserted above. CommittedAt is now() for full scans —
 	// the SHA is the source of truth for ordering; the
 	// timestamp is operator-facing observability only.
+	// `ParentSHA` defaults to "" (root commit) for the
+	// stand-alone scan surface and is overridden by the
+	// worker via `SetParentSHA` so multi-commit pushes record
+	// the real predecessor SHA.
 	commitRec, err := a.w.EnsureCommit(ctx, graphwriter.CommitInput{
 		RepoID:      a.assignedRepoID,
 		SHA:         a.sha,
-		ParentSHA:   "",
+		ParentSHA:   a.parentSHA,
 		CommittedAt: a.now().UTC(),
 	})
 	if err != nil {
@@ -476,3 +517,38 @@ func (a *AncestryWriter) Ancestry() RepoAncestry { return a.ancestry }
 // successful call; never reset (a fresh scan needs a fresh
 // AncestryWriter).
 func (a *AncestryWriter) Ready() bool { return a.ready }
+
+// SetParentSHA overrides the `ParentSHA` value AncestryWriter
+// forwards to `EnsureCommit` when `EnsureRepoAndCommit` runs.
+// MUST be invoked BEFORE `EnsureRepoAndCommit` — calling it
+// afterwards has no effect on the already-committed row.
+//
+// The pre-refactor worker.runFull passed `Job.FromSHA` directly
+// to `EnsureCommit.ParentSHA`; preserving that channel through
+// the AncestryWriter keeps `repo_commit` rows byte-identical
+// after the worker rewires to this type. The default ("") is
+// the right value for the stand-alone scan surface (CLI /
+// unit-test path) where there is no parent SHA to thread.
+func (a *AncestryWriter) SetParentSHA(s string) { a.parentSHA = s }
+
+// SetCurrentHeadSHA overrides the `CurrentHeadSHA` value
+// AncestryWriter forwards to `EnsureRepo` when
+// `EnsureRepoAndCommit` runs. MUST be invoked BEFORE
+// `EnsureRepoAndCommit` — calling it afterwards has no effect
+// on the already-upserted row.
+//
+// Without the override, `EnsureRepo` falls back to the scan SHA
+// (`a.sha`), which would silently rewind the operator-facing
+// `repo.current_head_sha` column whenever the scan SHA is older
+// than the live tip (e.g. a delayed full-mode re-ingest, or a
+// manual operator re-scan of a historical commit). Worker
+// callers preserve the pre-existing value by reading the
+// `current_head_sha` column out of the `repo` row up front and
+// calling this setter before `EnsureRepoAndCommit`. The
+// stand-alone scan surface (CLI / unit-test path) leaves the
+// override unset and accepts the scan-SHA default because it is
+// the first writer to populate the row.
+func (a *AncestryWriter) SetCurrentHeadSHA(s string) {
+	a.currentHeadSHA = s
+	a.currentHeadSHAOverridden = true
+}

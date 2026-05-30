@@ -1,17 +1,12 @@
 # Tech Spec -- code-intelligence:REFACTOR-GUIDE
 
-> Story: `code-intelligence:REFACTOR-GUIDE` -- 21 points
-> Title: refactor guide
-> Branch: `story/code-intelligence-REFACTOR-GUIDE/plan-tech-spec`
-> Sibling plan docs (read in parallel):
->   - `architecture.md` -- components, data model, interfaces, sequence flows
->   - `implementation-plan.md` -- phased build order, milestones
->   - `e2e-scenarios.md` -- end-to-end walkthroughs
+> Story: `code-intelligence:REFACTOR-GUIDE` -- 21 points.
+> Title: refactor guide.
 >
 > This document owns: **problem statement, in/out-of-scope, non-goals,
-> hard constraints, parameter pins, and risks.** It does NOT redefine
-> component boundaries, data shapes, or interface contracts -- those
-> live in `architecture.md` (REFACTOR-GUIDE arch) and the upstream
+> hard constraints, parameter pins, and risks.** Component boundaries,
+> data shapes, and interface contracts live in this story's
+> `architecture.md` (REFACTOR-GUIDE arch) and the upstream
 > `docs/stories/code-intelligence-CLEAN-CODE/architecture.md`
 > (CLEAN-CODE arch). When this doc and `architecture.md` disagree,
 > the operator arbitrates and the resolution is recorded in Sec 10.
@@ -64,10 +59,10 @@ Concretely it owns:
   `Sample`, `PolicyVersionInMemory`, `RefactorPromptRecord`,
   `RunArtifact`).
 - **End-to-end sequence diagrams** -- owned by REFACTOR-GUIDE
-  arch Sec 6 (P0 analyze, P1 prompt emission, P3 apply preview)
-  and elaborated in `e2e-scenarios.md`.
-- **Phased build order, ticket breakdown, dates** -- owned by
-  `implementation-plan.md`.
+  arch Sec 6 (P0 analyze, P1 prompt emission, P3 apply preview).
+- **Phased build order, ticket breakdown, dates** -- not owned
+  by this doc; this tech-spec only locks the scope and constraints
+  the build order must respect.
 - **Metric catalogue, rule-pack DDL, signed-policy DDL,
   active-row uniqueness** -- owned by CLEAN-CODE arch and the
   CLEAN-CODE tech-spec; the CLI consumes those outputs and
@@ -1254,8 +1249,6 @@ The four story-brief-named questions and their resolutions:
 | "Where does the CLI binary live in the deployed surface?" | `services/clean-code/cmd/cleanc/main.go`, sibling to the six existing service binaries | D1, Sec 4.1 |
 | "Rule pack distribution." | Embedded via `//go:embed`; `--policy <path>` override permitted in dev builds, forbidden in `-tags prod` builds | D2, Sec 8.4 |
 
-No `open-questions` JSON block follows.
-
 ---
 
 ## 12. References
@@ -1299,64 +1292,3 @@ No `open-questions` JSON block follows.
 - `services/clean-code/cmd/clean-code-indexer/main.go:12-30` --
   the `/healthz`-only stub the story brief cites as evidence
   that L1 is missing.
-
----
-
-## Iteration Summary
-
-- **Path written:** `docs/stories/code-intelligence-REFACTOR-GUIDE/tech-spec.md`
-- **Byte count:** see `Get-Item` post-write verification below.
-- **Coverage of the story-brief brief for this file (problem
-  statement, in/out-of-scope, non-goals, hard constraints,
-  identified risks):**
-  - **Problem statement** -> Sec 2 (gap-analysis verbatim,
-    engineering restatement, why a CLI exists, why a tech-spec).
-  - **In-scope items** -> Sec 4 (twelve sub-sections, one per
-    L-layer plus stable identity + determinism).
-  - **Out-of-scope items (deferred)** -> Sec 5 (eight sub-
-    sections with named future homes).
-  - **Non-goals (forever)** -> Sec 6 (six sub-sections covering
-    no re-implementation, no G-invariant amendment, no new
-    interface, no YAML edits, no ONNX re-implementation, no
-    patch generation in P0/P1).
-  - **Hard constraints** -> Sec 7 (fifteen constraints C1 - C15,
-    each anchored to a story-brief L-cell or a G-invariant or
-    an arch section).
-  - **Identified risks** -> Sec 9 (four story-brief cross-cutting
-    risks R1 - R4 restated verbatim with mitigation + residual
-    exposure, plus two CLI-specific risks R5 - R6 surfaced by
-    the Sec 3 choices).
-  - **Parameter pins** the architecture defers to this doc ->
-    Sec 8 (flags, caps, formula, exit codes, dark-metric
-    taxonomy, build-tag matrix, lint rules).
-  - **Locked-decisions roll-up** for operator sign-off -> Sec 10
-    (fourteen rows D1 - D14).
-- **Anchoring back to the story brief.** Every constraint in
-  Sec 7 carries an "Anchor:" line citing the story-brief L-cell
-  it derives from. Every risk in Sec 9 either reproduces the
-  story brief's "cross-cutting risk" prose verbatim or names the
-  Sec 3 choice that surfaced it.
-- **Sibling-doc alignment.** The architecture doc already exists
-  (74 KB, Sec 3 - Sec 11 fully populated). This tech-spec cites
-  arch sections by number so the operator can cross-reference
-  without prose duplication. Sibling `implementation-plan.md`
-  and `e2e-scenarios.md` are not yet created on iter 1; their
-  authors should treat this Sec 10 roll-up as their input
-  contract.
-- **No inconsistencies spotted** between this doc and the
-  existing architecture doc. The pin re-statements in Sec 10
-  preserve the architecture's pin IDs verbatim
-  (`cli-binary-location`, `cli-policy-distribution`,
-  `cli-l7-authority`, `cli-language-priority`,
-  `cli-dev-policy-signature`, `cli-effort-fallback-formula`).
-- **No open questions this iteration.** All four story-brief-
-  named open questions are resolved by the operator pins in
-  arch Sec 1.3 and re-stated in Sec 11 above.
-
-### Prior feedback resolution
-
-This is iteration 1; the evaluator has produced no prior
-checkbox list yet. The Sec 7 constraint list, the Sec 9 risk
-list, and the Sec 10 roll-up are written with future iterations
-in mind: every numbered item (Cn / Rn / Dn) is a stable anchor
-the next iteration can refer to without renumbering.

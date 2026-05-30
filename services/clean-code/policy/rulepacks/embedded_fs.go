@@ -8,5 +8,5 @@ package rulepacks
 
 import "embed"
 
-//go:embed solid decoupling
-var EmbeddedRulePacks embed.FS
+//go:embed solid/*.yaml decoupling/*.yaml
+var EmbeddedFS embed.FS

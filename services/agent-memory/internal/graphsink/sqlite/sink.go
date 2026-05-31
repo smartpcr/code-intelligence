@@ -157,9 +157,15 @@ func Open(ctx context.Context, dsn string) (*Sink, error) {
 	if err != nil {
 		return nil, fmt.Errorf("graphsink/sqlite: open %q: %w", dsn, err)
 	}
-	// SQLite serialises writers; bound the pool small so we don't
-	// fan out and immediately collide on SQLITE_BUSY. Reads will
-	// be served from the same handle in Stage 3.6.
+	// SQLite serialises writers; bound the pool to a single
+	// connection so the write-only Sink can't fan out and
+	// immediately collide on SQLITE_BUSY. NOTE for Stage 3.6:
+	// when a Reader is wired onto this same *sql.DB, max-open=1
+	// will serialise reads behind writes at the Go pool layer
+	// and negate the read/write concurrency WAL mode (see L43-45)
+	// is configured to provide. Stage 3.6 MUST either raise the
+	// pool (and make it configurable) or open a separate *sql.DB
+	// for reads before relying on concurrent read throughput.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 

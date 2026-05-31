@@ -297,11 +297,16 @@ func containsKey(q, key string) bool {
 // contract. After Close returns, every other method on the Sink
 // yields `ErrSinkClosed` (which wraps `sql.ErrConnDone`).
 func (s *Sink) Close() error {
+	var firstCall bool
 	s.closeOnce.Do(func() {
+		firstCall = true
 		s.closed.Store(true)
 		s.closeErr = s.db.Close()
 	})
-	return s.closeErr
+	if firstCall {
+		return s.closeErr
+	}
+	return nil
 }
 
 // Flush is a no-op for the SQLite backend: every Sink method

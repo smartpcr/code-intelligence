@@ -101,9 +101,9 @@ func newRootCmd(out, errOut io.Writer) *cobra.Command {
 		"opt in to the embedding publisher (requires the recall stack)")
 
 	cmd.AddCommand(
-		newScanCmd(&flags),
+		newScanCmdReal(&flags),
 		newScanManyCmd(&flags),
-		newDiagramCmd(&flags),
+		newDiagramCmdReal(&flags),
 		newServeCmd(&flags),
 		newVersionCmd(),
 	)
@@ -136,10 +136,12 @@ func notImplemented(name string) error {
 	return errNotImplemented
 }
 
+// newScanCmd is the stub kept for reference; production wiring
+// uses newScanCmdReal in scan.go.
 func newScanCmd(_ *rootFlags) *cobra.Command {
 	return &cobra.Command{
-		Use:   "scan <path|git-url>",
-		Short: "Scan a single repository (local path or git URL)",
+		Use:   "scan-stub <path|git-url>",
+		Short: "Scan a single repository (stub — see scan.go)",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return notImplemented("scan")
@@ -158,10 +160,12 @@ func newScanManyCmd(_ *rootFlags) *cobra.Command {
 	}
 }
 
+// newDiagramCmd is the stub kept for reference; production wiring
+// uses newDiagramCmdReal in diagram.go.
 func newDiagramCmd(_ *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "diagram",
-		Short: "Project diagrams from a previously-scanned store",
+		Use:   "diagram-stub",
+		Short: "Project diagrams (stub — see diagram.go)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return notImplemented("diagram")
 		},

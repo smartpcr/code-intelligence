@@ -30,10 +30,10 @@ func TestRootHelpListsSubcommands(t *testing.T) {
 }
 
 func TestSubcommandsReturnErrNotImplemented(t *testing.T) {
+	// Only scan-many, diagram calls, and serve are still stubbed.
+	// scan and diagram module have real implementations now.
 	cases := [][]string{
-		{"scan"},
 		{"scan-many"},
-		{"diagram", "module"},
 		{"diagram", "calls"},
 		{"serve"},
 	}
@@ -51,15 +51,32 @@ func TestSubcommandsReturnErrNotImplemented(t *testing.T) {
 	}
 }
 
+func TestScanRequiresArg(t *testing.T) {
+	_, _, err := execute(t, "scan")
+	if err == nil {
+		t.Fatalf("expected error when scan called without arg")
+	}
+}
+
+func TestDiagramModuleRequiresDB(t *testing.T) {
+	_, _, err := execute(t, "diagram", "module")
+	if err == nil {
+		t.Fatalf("expected error when diagram module called without --db")
+	}
+	if !strings.Contains(err.Error(), "--db is required") {
+		t.Fatalf("expected --db required error, got %v", err)
+	}
+}
+
 func TestInvalidLogFormatRejected(t *testing.T) {
-	_, _, err := execute(t, "--log", "xml", "scan")
+	_, _, err := execute(t, "--log", "xml", "scan-many")
 	if err == nil || !strings.Contains(err.Error(), "invalid --log") {
 		t.Fatalf("expected --log validation error, got %v", err)
 	}
 }
 
 func TestInvalidStoreRejected(t *testing.T) {
-	_, _, err := execute(t, "--store", "mysql", "scan")
+	_, _, err := execute(t, "--store", "mysql", "scan-many")
 	if err == nil || !strings.Contains(err.Error(), "invalid --store") {
 		t.Fatalf("expected --store validation error, got %v", err)
 	}
@@ -93,15 +110,13 @@ func TestTextLogHandlerDefault(t *testing.T) {
 func TestSubcommandJSONLogIsValidJSON(t *testing.T) {
 	var out, errOut bytes.Buffer
 	root := newRootCmd(&out, &errOut)
-	root.SetArgs([]string{"--log", "json", "scan"})
-	_ = root.Execute() // scan returns errNotImplemented; that's expected.
+	root.SetArgs([]string{"--log", "json", "scan-many"})
+	_ = root.Execute() // scan-many returns errNotImplemented; that's expected.
 
 	line := strings.TrimSpace(errOut.String())
 	if line == "" {
 		t.Fatalf("expected a JSON log line on stderr, got empty output")
 	}
-	// Subcommand emits exactly one line in the scaffold; tolerate
-	// trailing newlines by taking the first non-empty line.
 	firstLine := line
 	if i := strings.Index(line, "\n"); i >= 0 {
 		firstLine = line[:i]
@@ -113,8 +128,8 @@ func TestSubcommandJSONLogIsValidJSON(t *testing.T) {
 	if decoded["msg"] != "codeintel subcommand invoked" {
 		t.Errorf("expected msg field present, got %v", decoded["msg"])
 	}
-	if decoded["subcommand"] != "scan" {
-		t.Errorf("expected subcommand=scan, got %v", decoded["subcommand"])
+	if decoded["subcommand"] != "scan-many" {
+		t.Errorf("expected subcommand=scan-many, got %v", decoded["subcommand"])
 	}
 }
 

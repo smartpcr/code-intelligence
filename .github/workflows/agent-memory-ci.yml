@@ -357,3 +357,44 @@ jobs:
         if: always()
         working-directory: .
         run: docker compose -f tests/e2e/phase-3-graphsink-storage-abstraction/docker-compose.yml down -v
+
+  # ── E2E: BuildModuleDiagram (phase diagram-projector, stage buildmodulediagram) ──
+  # Builds the codeintel CLI binary, attempts the `codeintel scan`
+  # bootstrap (falls back while scan is stubbed), then exercises
+  # BuildModuleDiagram at package and file granularity against a
+  # self-provisioned SQLite store. No external services required.
+  e2e-buildmodulediagram:
+    name: "E2E BuildModuleDiagram (${{ matrix.os }})"
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CGO_ENABLED: "1"
+    defaults:
+      run:
+        working-directory: services/agent-memory
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/agent-memory/go.mod
+          cache: true
+
+      - name: Verify CGO toolchain
+        run: go env CGO_ENABLED CC CXX
+
+      - name: Download Go dependencies
+        run: go mod download
+
+      - name: Build codeintel binary
+        run: go build -o ./bin/codeintel ./cmd/codeintel
+
+      - name: Run E2E BuildModuleDiagram (gate: internal/diagram)
+        run: |
+          go test -v -count=1 -timeout 180s \
+            -run TestE2E_diagram_projector_buildmodulediagram \
+            ./internal/diagram/...

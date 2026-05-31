@@ -4,9 +4,11 @@ package sqlite_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -323,14 +325,226 @@ func TestCloseIdempotent(t *testing.T) {
 	}
 }
 
-func TestFlushNoBuffering(t *testing.T) {
+func TestEnsureRepoDeterministicRepoIDPersisted(t *testing.T) {
+	// Item 1 from evaluator feedback: when the caller supplies a
+	// deterministic RepoID (the fingerprint.RepoIDFromURL path
+	// the codeintel CLI uses), the SQLite Sink must persist that
+	// exact UUID as the row's repo_id so node / edge fingerprints
+	// match across backends.
 	ctx := context.Background()
 	sink := openTempSink(t)
-	// Repeated Flush is harmless and returns nil; no buffered
-	// state to drain since each Sink method commits inline.
-	for i := 0; i < 3; i++ {
-		if err := sink.Flush(ctx); err != nil {
-			t.Fatalf("Flush #%d: %v", i, err)
+
+	url := "https://example.invalid/deterministic.git"
+	wantID, err := fingerprint.RepoIDFromURL(url)
+	if err != nil {
+		t.Fatalf("RepoIDFromURL: %v", err)
+	}
+
+	rec, err := sink.EnsureRepo(ctx, graphwriter.RepoInput{
+		URL:            url,
+		DefaultBranch:  "main",
+		CurrentHeadSHA: "deadbeef",
+		RepoID:         wantID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureRepo: %v", err)
+	}
+	if !rec.Inserted {
+		t.Fatalf("first EnsureRepo: want Inserted=true")
+	}
+	if rec.ID != wantID {
+		t.Fatalf("repo_id drift: got %s, want %s (deterministic)", rec.ID, wantID)
+	}
+	if rec.RepoID != wantID.String() {
+		t.Fatalf("repo_id text drift: got %q, want %q", rec.RepoID, wantID.String())
+	}
+
+	// Second EnsureRepo with the same URL but a different
+	// (zero) supplied RepoID must still return the previously
+	// persisted deterministic ID; the legacy-collision rule
+	// keeps the PK stable on conflict.
+	rec2, err := sink.EnsureRepo(ctx, graphwriter.RepoInput{
+		URL:            url,
+		DefaultBranch:  "main",
+		CurrentHeadSHA: "cafebabe",
+	})
+	if err != nil {
+		t.Fatalf("second EnsureRepo: %v", err)
+	}
+	if rec2.Inserted {
+		t.Fatalf("second EnsureRepo: want Inserted=false")
+	}
+	if rec2.ID != wantID {
+		t.Fatalf("repo_id drift on conflict: got %s, want %s", rec2.ID, wantID)
+	}
+}
+
+func TestNodeFingerprintParityWithDeterministicRepoID(t *testing.T) {
+	// Item 2 from evaluator feedback: a node inserted into SQLite
+	// with a deterministic RepoID must carry the SAME fingerprint
+	// an outside re-computation (the canonical helper) produces,
+	// because Postgres uses that same helper. If the SQLite Sink
+	// silently substituted a random repo_id, fingerprints would
+	// diverge and cross-backend dedupe would break.
+	ctx := context.Background()
+	sink := openTempSink(t)
+
+	url := "https://example.invalid/parity.git"
+	repoID, err := fingerprint.RepoIDFromURL(url)
+	if err != nil {
+		t.Fatalf("RepoIDFromURL: %v", err)
+	}
+
+	repo, err := sink.EnsureRepo(ctx, graphwriter.RepoInput{
+		URL:            url,
+		DefaultBranch:  "main",
+		CurrentHeadSHA: "shaParity",
+		RepoID:         repoID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureRepo: %v", err)
+	}
+	if repo.ID != repoID {
+		t.Fatalf("EnsureRepo did not persist deterministic RepoID: got %s want %s",
+			repo.ID, repoID)
+	}
+
+	const (
+		kind = "method"
+		sig  = "pkg.Mod.Func()"
+		sha  = "shaParity"
+	)
+	want, err := fingerprint.NodeFingerprint(repoID, kind, sig, sha)
+	if err != nil {
+		t.Fatalf("NodeFingerprint: %v", err)
+	}
+
+	rec, err := sink.InsertNode(ctx, graphwriter.NodeInput{
+		RepoID:             repoID,
+		Kind:               kind,
+		CanonicalSignature: sig,
+		FromSHA:            sha,
+	})
+	if err != nil {
+		t.Fatalf("InsertNode: %v", err)
+	}
+	if rec.Fingerprint != want {
+		t.Fatalf("fingerprint parity broken: got %x, want %x", rec.Fingerprint, want)
+	}
+
+	// Also verify the row landed under the deterministic
+	// repo_id, not under a synthesised UUID: the unique key
+	// (repo_id, fingerprint) is the cross-backend dedupe primitive.
+	var storedRepoID string
+	var storedFP []byte
+	if err := sqlQueryOne(ctx, sink,
+		`SELECT repo_id, fingerprint FROM node WHERE node_id = ?`,
+		rec.NodeID,
+	).Scan(&storedRepoID, &storedFP); err != nil {
+		t.Fatalf("verify node: %v", err)
+	}
+	if storedRepoID != repoID.String() {
+		t.Fatalf("node.repo_id drift: got %q, want %q", storedRepoID, repoID.String())
+	}
+	if len(storedFP) != 32 {
+		t.Fatalf("node.fingerprint length: got %d, want 32", len(storedFP))
+	}
+	for i := range want {
+		if storedFP[i] != want[i] {
+			t.Fatalf("stored fingerprint mismatch at byte %d", i)
 		}
 	}
+}
+
+func TestEdgeFingerprintParityWithDeterministicRepoID(t *testing.T) {
+	// Edge fingerprints also embed the repo_id (via the src/dst
+	// node fingerprints, which embed it themselves). The parity
+	// check below builds the fingerprint the same way an
+	// out-of-process verifier would and asserts SQLite stored it
+	// unchanged.
+	ctx := context.Background()
+	sink := openTempSink(t)
+
+	url := "https://example.invalid/edge-parity.git"
+	repoID, err := fingerprint.RepoIDFromURL(url)
+	if err != nil {
+		t.Fatalf("RepoIDFromURL: %v", err)
+	}
+	if _, err := sink.EnsureRepo(ctx, graphwriter.RepoInput{
+		URL: url, DefaultBranch: "main", CurrentHeadSHA: "s", RepoID: repoID,
+	}); err != nil {
+		t.Fatalf("EnsureRepo: %v", err)
+	}
+
+	src, err := sink.InsertNode(ctx, graphwriter.NodeInput{
+		RepoID: repoID, Kind: "method", CanonicalSignature: "A.a()", FromSHA: "s",
+	})
+	if err != nil {
+		t.Fatalf("InsertNode src: %v", err)
+	}
+	dst, err := sink.InsertNode(ctx, graphwriter.NodeInput{
+		RepoID: repoID, Kind: "method", CanonicalSignature: "A.b()", FromSHA: "s",
+	})
+	if err != nil {
+		t.Fatalf("InsertNode dst: %v", err)
+	}
+
+	want, err := fingerprint.EdgeFingerprint(
+		repoID, "static_calls", src.Fingerprint, dst.Fingerprint, "s",
+	)
+	if err != nil {
+		t.Fatalf("EdgeFingerprint: %v", err)
+	}
+
+	got, err := sink.InsertEdge(ctx, graphwriter.EdgeInput{
+		RepoID:    repoID,
+		Kind:      "static_calls",
+		SrcNodeID: src.NodeID,
+		DstNodeID: dst.NodeID,
+		FromSHA:   "s",
+	})
+	if err != nil {
+		t.Fatalf("InsertEdge: %v", err)
+	}
+	if got.Fingerprint != want {
+		t.Fatalf("edge fingerprint parity broken: got %x, want %x", got.Fingerprint, want)
+	}
+}
+
+func TestMergeDefaultPragmasPreservesCallerQuery(t *testing.T) {
+	// Item 3 from evaluator feedback: when the caller supplies a
+	// DSN with their own query string (e.g. `?cache=shared`),
+	// our default pragmas must still be applied. The prior
+	// iteration dropped them entirely.
+	got := sqlite.MergeDefaultPragmasForTest("graph.db?cache=shared")
+	wantSubstrings := []string{
+		"cache=shared",
+		"_foreign_keys=on",
+		"_journal_mode=WAL",
+		"_busy_timeout=5000",
+	}
+	for _, sub := range wantSubstrings {
+		if !strings.Contains(got, sub) {
+			t.Fatalf("merged DSN %q missing %q", got, sub)
+		}
+	}
+
+	// Caller-supplied pragmas must override our defaults.
+	got2 := sqlite.MergeDefaultPragmasForTest("graph.db?_journal_mode=DELETE")
+	if strings.Contains(got2, "_journal_mode=WAL") {
+		t.Fatalf("caller override lost: %q still contains _journal_mode=WAL", got2)
+	}
+	if !strings.Contains(got2, "_journal_mode=DELETE") {
+		t.Fatalf("caller override stripped: %q", got2)
+	}
+	if !strings.Contains(got2, "_foreign_keys=on") {
+		t.Fatalf("absent-key default missing: %q", got2)
+	}
+}
+
+// sqlQueryOne is a tiny test helper that runs a single-row
+// query against the Sink's underlying *sql.DB through the
+// package-private accessor declared in `export_test.go`.
+func sqlQueryOne(ctx context.Context, s *sqlite.Sink, q string, args ...any) *sql.Row {
+	return sqlite.DBForTest(s).QueryRowContext(ctx, q, args...)
 }

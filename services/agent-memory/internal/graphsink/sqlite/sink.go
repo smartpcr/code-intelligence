@@ -64,7 +64,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -101,13 +103,13 @@ type Sink struct {
 
 	closeOnce sync.Once
 	closeErr  error
-	// closed is set to true inside closeOnce.Do BEFORE the
-	// underlying db.Close is invoked, so checkOpen can
-	// distinguish "Close has been called" from "Close returned
-	// a non-nil error" -- a successful Close (the common case)
-	// leaves closeErr == nil, and we still need to refuse
-	// further operations.
-	closed bool
+	// closed is set atomically inside closeOnce.Do BEFORE the
+	// underlying db.Close is invoked, so checkOpen can read it
+	// from any goroutine without holding a mutex. A successful
+	// Close (the common case) leaves closeErr == nil, so the
+	// flag is needed as a distinct signal from "closeErr is
+	// non-nil".
+	closed atomic.Bool
 }
 
 // compile-time assertion: *Sink satisfies the graphsink.Sink
@@ -134,17 +136,19 @@ var _ graphsink.Sink = (*Sink)(nil)
 // underlying `*sql.DB` (if it was opened) is closed before the
 // function returns so no leak occurs.
 func Open(ctx context.Context, dsn string) (*Sink, error) {
-	// _foreign_keys=on enables FK enforcement on every connection
-	// the pool hands out (mattn/go-sqlite3 honours the
-	// underscore-prefixed query parameters).
-	// _journal_mode=WAL flips the journaling mode the first time
-	// the file is opened; subsequent opens see the existing mode.
-	// _busy_timeout gives concurrent writers a short retry window
-	// instead of failing immediately with SQLITE_BUSY.
-	openDSN := dsn
-	if !containsQuery(dsn) {
-		openDSN = dsn + "?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000"
-	}
+	// We MERGE our default pragmas into whatever the caller
+	// supplied rather than dropping them when a query string is
+	// present. Each pragma is only appended when the caller has
+	// NOT already set it -- that respects an explicit override
+	// (e.g. `?_journal_mode=DELETE` for a read-only snapshot
+	// scenario) while still enforcing FK / busy_timeout / WAL
+	// for the common `graph.db?cache=shared` case the prior
+	// iteration silently disabled.
+	openDSN := mergeDefaultPragmas(dsn, [][2]string{
+		{"_foreign_keys", "on"},
+		{"_journal_mode", "WAL"},
+		{"_busy_timeout", "5000"},
+	})
 
 	db, err := sql.Open(driverName, openDSN)
 	if err != nil {
@@ -167,16 +171,63 @@ func Open(ctx context.Context, dsn string) (*Sink, error) {
 	return &Sink{db: db}, nil
 }
 
-// containsQuery reports whether the DSN already carries a query
-// string. `:memory:` and bare paths do not; users passing a
-// pre-built DSN with their own pragmas suppress our defaults.
-func containsQuery(dsn string) bool {
-	for i := 0; i < len(dsn); i++ {
-		if dsn[i] == '?' {
-			return true
-		}
+// mergeDefaultPragmas appends each (key, value) pair from
+// `defaults` to `dsn` only when `dsn`'s existing query string
+// does NOT already contain that key. The check is a literal
+// "key=" substring scan after the first '?' -- mattn/go-sqlite3
+// accepts pragmas as standard URL query parameters, so this
+// reproduces the driver's own parameter parsing closely enough
+// for the override detection we need. Caller-supplied keys
+// always win; absent keys get our defaults.
+//
+// Examples:
+//
+//	mergeDefaultPragmas(":memory:", defaults)
+//	    -> ":memory:?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000"
+//
+//	mergeDefaultPragmas("graph.db?cache=shared", defaults)
+//	    -> "graph.db?cache=shared&_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000"
+//
+//	mergeDefaultPragmas("graph.db?_journal_mode=DELETE", defaults)
+//	    -> "graph.db?_journal_mode=DELETE&_foreign_keys=on&_busy_timeout=5000"
+func mergeDefaultPragmas(dsn string, defaults [][2]string) string {
+	q := ""
+	idx := strings.IndexByte(dsn, '?')
+	if idx >= 0 {
+		q = dsn[idx+1:]
 	}
-	return false
+	var b strings.Builder
+	b.WriteString(dsn)
+	first := idx < 0
+	for _, kv := range defaults {
+		if containsKey(q, kv[0]) {
+			continue
+		}
+		if first {
+			b.WriteByte('?')
+			first = false
+		} else {
+			b.WriteByte('&')
+		}
+		b.WriteString(kv[0])
+		b.WriteByte('=')
+		b.WriteString(kv[1])
+	}
+	return b.String()
+}
+
+// containsKey reports whether the URL query string `q` already
+// binds `key` (i.e. contains a `key=` token at the start of `q`
+// or immediately after a '&').
+func containsKey(q, key string) bool {
+	if q == "" {
+		return false
+	}
+	needle := key + "="
+	if strings.HasPrefix(q, needle) {
+		return true
+	}
+	return strings.Contains(q, "&"+needle)
 }
 
 // Close releases the underlying database handle. Idempotent: the
@@ -185,7 +236,7 @@ func containsQuery(dsn string) bool {
 // yields `ErrSinkClosed` (which wraps `sql.ErrConnDone`).
 func (s *Sink) Close() error {
 	s.closeOnce.Do(func() {
-		s.closed = true
+		s.closed.Store(true)
 		s.closeErr = s.db.Close()
 	})
 	return s.closeErr
@@ -206,12 +257,13 @@ func (s *Sink) Flush(ctx context.Context) error {
 // Otherwise returns nil. Cheaper than re-pinging the DB on
 // every call.
 func (s *Sink) checkOpen() error {
-	// closeOnce.Do publishes a happens-before edge to the writes
-	// of s.closed and s.closeErr; reading s.closed here without
-	// the mutex therefore returns the post-Close value once any
-	// caller has finished Close, and the zero value (false)
-	// otherwise -- both correct.
-	if s.closed {
+	// atomic.Bool.Load synchronises with the Store inside
+	// closeOnce.Do, so a concurrent Close-then-Insert race sees
+	// either "open" (Store not yet observed; Insert proceeds and
+	// either succeeds against the still-live handle or fails
+	// with sql.ErrConnDone propagated from the pool) or "closed"
+	// (ErrSinkClosed returned cleanly). No data race either way.
+	if s.closed.Load() {
 		return ErrSinkClosed
 	}
 	return nil
@@ -242,24 +294,29 @@ func (s *Sink) runInTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 
 // ----- EnsureRepo --------------------------------------------------
 
-// EnsureRepo upserts a Repo row keyed by URL. Semantics mirror
-// `*graphwriter.Writer.EnsureRepo`:
+// EnsureRepo upserts a Repo row keyed by URL.
 //
-//   - Fresh insert: a new UUID `repo_id` is generated (`uuid.NewString()`
-//     -- SQLite has no `gen_random_uuid()`), the row is written, and
-//     `Inserted = true` is returned.
-//   - URL collision: the mutable columns (`default_branch`,
-//     `current_head_sha`, `language_hints`) are overwritten and the
-//     pre-existing `repo_id` is returned with `Inserted = false`. The
-//     `repo_id` PK is NEVER re-keyed on a conflict, matching the
-//     Postgres adapter.
+// IDENTITY POLICY (cross-backend parity, S3.4):
 //
-// `in.RepoID` is IGNORED on the EnsureRepo path so the surface
-// matches `*graphwriter.Writer.EnsureRepo` byte-for-byte (the
-// Writer also ignores it; only the Postgres-specific
-// EnsureRepoWithID honours a precomputed RepoID). A Stage 3.5
-// `EnsureRepoWithID`-equivalent can be added separately once the
-// CLI demands strict cross-backend identity.
+//   - When `in.RepoID` is the zero value, a fresh insert
+//     synthesises a new UUID via `uuid.NewString()`. This
+//     matches `*graphwriter.Writer.EnsureRepo`'s
+//     `gen_random_uuid()` default and preserves the pre-Stage-3.4
+//     CLI behaviour.
+//   - When `in.RepoID` is non-zero (the deterministic
+//     `fingerprint.RepoIDFromURL(URL)` path), the SQLite Sink
+//     PERSISTS that exact UUID as the row's `repo_id` on a fresh
+//     insert. This matches the Postgres `EnsureRepoWithID`
+//     contract and is the path the `codeintel scan` CLI uses so
+//     a repo scanned to SQLite carries the SAME `repo_id` as the
+//     same repo scanned to Postgres -- a prerequisite for node /
+//     edge fingerprint parity, because fingerprints embed
+//     `repo_id` (see `fingerprint.NodeFingerprint`).
+//   - On a URL conflict the mutable columns are overwritten and
+//     the PRE-EXISTING `repo_id` is returned with
+//     `Inserted = false`; the `repo_id` PK is NEVER re-keyed,
+//     matching the Postgres adapter's documented
+//     "legacy-collision" caveat.
 //
 // Returns `ErrSinkClosed` (wrapping `sql.ErrConnDone`) if Close
 // has been called.
@@ -292,8 +349,16 @@ func (s *Sink) EnsureRepo(ctx context.Context, in graphwriter.RepoInput) (graphw
 		var existingID string
 		switch err := tx.QueryRowContext(ctx, selQ, in.URL).Scan(&existingID); {
 		case errors.Is(err, sql.ErrNoRows):
-			// Fresh insert.
-			newID := uuid.NewString()
+			// Fresh insert. Honour caller-supplied deterministic
+			// RepoID when non-zero so SQLite / Postgres backends
+			// agree on the row's PK -- the cross-backend identity
+			// invariant the story documents under S3.4.
+			var newID string
+			if in.RepoID.IsZero() {
+				newID = uuid.NewString()
+			} else {
+				newID = in.RepoID.String()
+			}
 			const insQ = `
 				INSERT INTO repo (repo_id, url, default_branch, current_head_sha, language_hints, created_at)
 				VALUES (?, ?, ?, ?, ?, ?)

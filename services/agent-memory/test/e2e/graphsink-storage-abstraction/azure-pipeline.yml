@@ -69,6 +69,13 @@ steps:
       AGENT_MEMORY_PG_URL: $(AGENT_MEMORY_PG_URL)
 
   - script: |
+      cd services/agent-memory
+      CGO_ENABLED=1 go test -tags e2e -v -count=1 -timeout 120s \
+        -run TestE2E_graphsink_storage_abstraction_sqlite_sink_backend \
+        ./test/e2e/code-intelligence-REPO-SCANNER/...
+    displayName: "Run E2E scenarios — sqlite-sink-backend"
+
+  - script: |
       docker compose -f $(COMPOSE_FILE) down -v
     displayName: "Tear down compose stack"
     condition: always()

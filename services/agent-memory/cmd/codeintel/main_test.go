@@ -33,7 +33,6 @@ func TestSubcommandsReturnErrNotImplemented(t *testing.T) {
 	// diagram module is implemented in diagram.go;
 	// scan is implemented in scan.go.
 	cases := [][]string{
-		{"scan-many"},
 		{"diagram", "calls"},
 		{"serve"},
 	}
@@ -109,14 +108,15 @@ func TestTextLogHandlerDefault(t *testing.T) {
 // `log-flag-respected`: when --log=json is set, the log line a
 // scaffolded subcommand emits must be parseable by
 // encoding/json. We capture stderr (where slog writes) and feed
-// it to json.Unmarshal. Uses `scan-many` because it still routes
-// through the `notImplemented` scaffold log line; `scan` is now
-// fully implemented and emits its own log/summary instead.
+// it to json.Unmarshal. Uses `serve` because it still routes
+// through the `notImplemented` scaffold log line; `scan` and
+// `scan-many` are now fully implemented and emit their own
+// log/summary lines instead.
 func TestSubcommandJSONLogIsValidJSON(t *testing.T) {
 	var out, errOut bytes.Buffer
 	root := newRootCmd(&out, &errOut)
-	root.SetArgs([]string{"--log", "json", "scan-many"})
-	_ = root.Execute() // scan-many returns errNotImplemented; that's expected.
+	root.SetArgs([]string{"--log", "json", "serve"})
+	_ = root.Execute() // serve returns errNotImplemented; that's expected.
 
 	line := strings.TrimSpace(errOut.String())
 	if line == "" {
@@ -135,8 +135,8 @@ func TestSubcommandJSONLogIsValidJSON(t *testing.T) {
 	if decoded["msg"] != "codeintel subcommand invoked" {
 		t.Errorf("expected msg field present, got %v", decoded["msg"])
 	}
-	if decoded["subcommand"] != "scan-many" {
-		t.Errorf("expected subcommand=scan-many, got %v", decoded["subcommand"])
+	if decoded["subcommand"] != "serve" {
+		t.Errorf("expected subcommand=serve, got %v", decoded["subcommand"])
 	}
 }
 

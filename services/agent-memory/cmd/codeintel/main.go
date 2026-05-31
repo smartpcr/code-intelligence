@@ -136,15 +136,8 @@ func notImplemented(name string) error {
 	return errNotImplemented
 }
 
-func newScanManyCmd(_ *rootFlags) *cobra.Command {
-	return &cobra.Command{
-		Use:   "scan-many <manifest>",
-		Short: "Scan many repositories listed in a manifest file",
-		Args:  cobra.ArbitraryArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return notImplemented("scan-many")
-		},
-	}
+func newScanManyCmd(root *rootFlags) *cobra.Command {
+	return newScanManyCmdImpl(root)
 }
 
 func newServeCmd(_ *rootFlags) *cobra.Command {

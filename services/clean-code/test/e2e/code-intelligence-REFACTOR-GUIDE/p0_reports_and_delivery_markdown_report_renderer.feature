@@ -1,8 +1,8 @@
 @story-code-intelligence:REFACTOR-GUIDE @phase-p0-reports-and-delivery @stage-markdown-report-renderer @setup-inline
 Feature: Markdown report renderer
   Stage 3.1: the Markdown renderer converts a RunArtifact into a
-  human-readable report with header, verdict, and diagnostic
-  sections per architecture Sec 3.7.1.
+  human-readable report with header, verdict, dark-metric details,
+  and finding excerpts per architecture Sec 3.7.1.
 
   Scenario: empty corpus renders pass
     Given a RunArtifact with zero findings and verdict "pass"
@@ -18,9 +18,9 @@ Feature: Markdown report renderer
   Scenario: dark-metric surfaced
     Given a RunArtifact whose DarkMetrics includes a "cyclo" row for language "go"
     When Markdown.Render runs
-    Then the output surfaces the dark-metric diagnostic with count 1
+    Then the rendered output contains the literal tag "metric dark: cyclo"
 
   Scenario: suggested refactor excerpt
-    Given a RunArtifact with a finding whose rule DescriptionMD contains "Suggested refactor: split the class along the cohesion boundaries (SRP)"
+    Given a RunArtifact with a finding whose ExplanationMD contains "Suggested refactor: split the class along the cohesion boundaries (SRP)"
     When Markdown.Render runs
-    Then the artifact finding carries the suffix "split the class"
+    Then the rendered output finding row contains the excerpt "split the class"

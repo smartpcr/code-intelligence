@@ -91,10 +91,11 @@ func (s *markdownRendererState) aRepresentativeRunArtifactWithFindingsAndDarkMet
 		},
 		Findings: []rule_engine.Finding{
 			{
-				FindingID: uuid.Must(uuid.NewV4()),
-				RuleID:    "solid.srp.lcom4",
-				Severity:  steward.SeverityWarn,
-				Delta:     rule_engine.DeltaNew,
+				FindingID:     uuid.Must(uuid.NewV4()),
+				RuleID:        "solid.srp.lcom4",
+				Severity:      steward.SeverityWarn,
+				Delta:         rule_engine.DeltaNew,
+				ExplanationMD: "Suggested refactor: extract cohesion boundary",
 			},
 		},
 	}
@@ -130,7 +131,12 @@ func (s *markdownRendererState) aRunArtifactWhoseDarkMetricsIncludesRowForLangua
 	return nil
 }
 
-func (s *markdownRendererState) aRunArtifactWithFindingWhoseRuleDescriptionMDContains(descMD string) error {
+// aRunArtifactWithFindingWhoseExplanationMDContains models the
+// pipeline data flow: Rule.DescriptionMD → Finding.ExplanationMD.
+// The engine populates ExplanationMD from the rule's DescriptionMD;
+// the renderer extracts the "Suggested refactor:" excerpt from
+// ExplanationMD for display.
+func (s *markdownRendererState) aRunArtifactWithFindingWhoseExplanationMDContains(explanationMD string) error {
 	s.artifact = report.RunArtifact{
 		Context: repocontext.RepoContext{
 			RootPath: "/repos/refactor-excerpt",
@@ -152,7 +158,7 @@ func (s *markdownRendererState) aRunArtifactWithFindingWhoseRuleDescriptionMDCon
 				RuleID:        "solid.srp.lcom4",
 				Severity:      steward.SeverityBlock,
 				Delta:         rule_engine.DeltaNew,
-				ExplanationMD: descMD,
+				ExplanationMD: explanationMD,
 			},
 		},
 	}
@@ -208,8 +214,6 @@ func (s *markdownRendererState) theOutputContainsNonEmptyDiagnosticsBlock() erro
 	if len(s.output) == 0 {
 		return fmt.Errorf("output is empty; want non-empty diagnostics block")
 	}
-	// The diagnostics block at this stage is the header section
-	// which includes at minimum the "Dark metrics:" row.
 	if !strings.Contains(s.output, "Dark metrics:") {
 		return fmt.Errorf("output missing diagnostics row 'Dark metrics:'\n---output---\n%s\n---", s.output)
 	}
@@ -225,38 +229,42 @@ func (s *markdownRendererState) theTwoOutputsAreByteIdentical() error {
 	return nil
 }
 
-func (s *markdownRendererState) theOutputSurfacesDarkMetricDiagnosticWithCount(count int) error {
+// theRenderedOutputContainsLiteralTag asserts the RENDERED
+// markdown output contains the given literal tag string.
+// For dark-metric surfaced, this checks that the per-metric
+// detail line (e.g. "metric dark: cyclo") appears in the
+// output — a genuine metric-specific assertion, not just a
+// count.
+func (s *markdownRendererState) theRenderedOutputContainsLiteralTag(tag string) error {
 	if s.renderErr != nil {
 		return fmt.Errorf("Render returned error: %w", s.renderErr)
 	}
-	// The Markdown renderer header emits "- **Dark metrics:** N"
-	// as the unambiguous dark-metric diagnostic tag per
-	// architecture Sec 3.7.1 step 1.
-	expected := fmt.Sprintf("**Dark metrics:** %d", count)
-	if !strings.Contains(s.output, expected) {
-		return fmt.Errorf("output does not contain dark-metric tag %q\n---output---\n%s\n---", expected, s.output)
+	if !strings.Contains(s.output, tag) {
+		return fmt.Errorf("rendered output does not contain literal tag %q\n---output---\n%s\n---",
+			tag, s.output)
 	}
 	return nil
 }
 
-func (s *markdownRendererState) theArtifactFindingCarriesTheSuffix(suffix string) error {
+// theRenderedOutputFindingRowContainsExcerpt asserts the
+// RENDERED markdown output contains a finding row with the
+// given excerpt. The renderer extracts the "Suggested
+// refactor:" excerpt from Finding.ExplanationMD (which the
+// engine populates from Rule.DescriptionMD) and includes it
+// in the finding's output line.
+func (s *markdownRendererState) theRenderedOutputFindingRowContainsExcerpt(excerpt string) error {
 	if s.renderErr != nil {
 		return fmt.Errorf("Render returned error: %w", s.renderErr)
 	}
-	// At this stage (3.1), the Markdown renderer emits header +
-	// verdict only; the findings section is a downstream stage.
-	// We verify the RunArtifact carries the excerpt through
-	// Finding.ExplanationMD so the future findings renderer can
-	// surface it. This tests the data-flow contract.
-	if len(s.artifact.Findings) == 0 {
-		return fmt.Errorf("artifact has no findings")
+	if !strings.Contains(s.output, excerpt) {
+		return fmt.Errorf("rendered output does not contain finding excerpt %q\n---output---\n%s\n---",
+			excerpt, s.output)
 	}
-	for _, f := range s.artifact.Findings {
-		if strings.Contains(f.ExplanationMD, suffix) {
-			return nil
-		}
+	// Also verify the excerpt appears within a Findings section.
+	if !strings.Contains(s.output, "## Findings") {
+		return fmt.Errorf("rendered output has no '## Findings' section\n---output---\n%s\n---", s.output)
 	}
-	return fmt.Errorf("no finding ExplanationMD contains suffix %q", suffix)
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -280,8 +288,8 @@ func InitializeScenario_p0_reports_and_delivery_markdown_report_renderer(ctx *go
 		s.aRunArtifactWhoseDarkMetricsIncludesRowForLanguage,
 	)
 	ctx.Step(
-		`^a RunArtifact with a finding whose rule DescriptionMD contains "([^"]*)"$`,
-		s.aRunArtifactWithFindingWhoseRuleDescriptionMDContains,
+		`^a RunArtifact with a finding whose ExplanationMD contains "([^"]*)"$`,
+		s.aRunArtifactWithFindingWhoseExplanationMDContains,
 	)
 
 	// When
@@ -292,8 +300,8 @@ func InitializeScenario_p0_reports_and_delivery_markdown_report_renderer(ctx *go
 	ctx.Step(`^the output contains "([^"]*)"$`, s.theOutputContains)
 	ctx.Step(`^the output contains a non-empty diagnostics block$`, s.theOutputContainsNonEmptyDiagnosticsBlock)
 	ctx.Step(`^the two outputs are byte-identical$`, s.theTwoOutputsAreByteIdentical)
-	ctx.Step(`^the output surfaces the dark-metric diagnostic with count (\d+)$`, s.theOutputSurfacesDarkMetricDiagnosticWithCount)
-	ctx.Step(`^the artifact finding carries the suffix "([^"]*)"$`, s.theArtifactFindingCarriesTheSuffix)
+	ctx.Step(`^the rendered output contains the literal tag "([^"]*)"$`, s.theRenderedOutputContainsLiteralTag)
+	ctx.Step(`^the rendered output finding row contains the excerpt "([^"]*)"$`, s.theRenderedOutputFindingRowContainsExcerpt)
 }
 
 func TestE2E_p0_reports_and_delivery_markdown_report_renderer(t *testing.T) {

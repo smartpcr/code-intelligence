@@ -50,7 +50,7 @@ func newJSONLEmitterState() *jsonlEmitterState {
 
 // buildArtifact constructs a RunArtifact with n tasks, each
 // sharing a distinct ScopeID in the binding table.
-func (s *jsonlEmitterState) buildArtifact(n int) {
+func (s *jsonlEmitterState) buildArtifact(n int) error {
 	s.tbl = scopebinding.NewTable()
 
 	repoID := uuid.Must(uuid.NewV4())
@@ -80,7 +80,7 @@ func (s *jsonlEmitterState) buildArtifact(n int) {
 		scopeID := uuid.Must(uuid.NewV4())
 		taskID := uuid.Must(uuid.NewV4())
 
-		_ = s.tbl.Insert(scopebinding.ScopeBinding{
+		if err := s.tbl.Insert(scopebinding.ScopeBinding{
 			ScopeID:   scopeID,
 			ScopeKind: "class",
 			FilePath:  fmt.Sprintf("pkg/file%d.go", i),
@@ -88,7 +88,9 @@ func (s *jsonlEmitterState) buildArtifact(n int) {
 			EndLine:   10,
 			Signature: fmt.Sprintf("pkg.Class%d", i),
 			Language:  "go",
-		})
+		}); err != nil {
+			return fmt.Errorf("insert scope binding %d: %w", i, err)
+		}
 
 		s.art.Tasks = append(s.art.Tasks, refactor.RefactorTask{
 			TaskID:        taskID,
@@ -105,6 +107,7 @@ func (s *jsonlEmitterState) buildArtifact(n int) {
 		Bindings:              s.tbl,
 		DisableSnippetDefault: true,
 	}
+	return nil
 }
 
 // --- helpers (shared) ---
@@ -120,12 +123,13 @@ func stewardPolicyVersion(id uuid.UUID) steward.PolicyVersion {
 // --- Given steps ---------------------------------------------------------
 
 func (s *jsonlEmitterState) aRunArtifactWithNTasks(n int) error {
-	s.buildArtifact(n)
-	return nil
+	return s.buildArtifact(n)
 }
 
 func (s *jsonlEmitterState) aRunArtifactWithATaskOfKind(kind string) error {
-	s.buildArtifact(1)
+	if err := s.buildArtifact(1); err != nil {
+		return fmt.Errorf("build artifact: %w", err)
+	}
 	s.taskKind = kind
 	s.badTask = s.art.Tasks[0].TaskID
 	s.art.Tasks[0].Kind = refactor.TaskKind(kind)

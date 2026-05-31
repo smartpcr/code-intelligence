@@ -376,15 +376,17 @@ func (s *parseAndRecipeFanoutState) scopeBindingGetScopeIDForFooReturnsFooBindin
 		return fmt.Errorf("scopebinding.Table.Get(%v) returned false — no binding for Foo's scope ID", scopeID)
 	}
 
-	// Step 3: Signature ends with "::Foo" — the BuildMethod format is
+	// Step 3: Signature ends with "#Foo" — the BuildMethod format is
 	// <repoURL>::method::<relPath>#<qualifiedName>(<params>); we strip the
 	// trailing parameter list and verify the method-name tail is "Foo".
+	// The qualified name may be bare ("Foo") or package-qualified ("mypkg.Foo"),
+	// so we accept both "#Foo" and ".Foo" as valid suffixes.
 	sigNoParams := b.Signature
 	if parenIdx := strings.LastIndex(sigNoParams, "("); parenIdx >= 0 {
 		sigNoParams = sigNoParams[:parenIdx]
 	}
 	if !strings.HasSuffix(sigNoParams, ".Foo") && !strings.HasSuffix(sigNoParams, "#Foo") {
-		return fmt.Errorf("signature %q (sans params: %q) does not end with ::Foo — expected method-name tail to be Foo", b.Signature, sigNoParams)
+		return fmt.Errorf("signature %q (sans params: %q) does not end with #Foo — expected method-name tail to be Foo", b.Signature, sigNoParams)
 	}
 
 	// Verify structural invariants
@@ -486,7 +488,7 @@ func InitializeScenario_pipeline_parse_and_recipe_fanout(ctx *godog.ScenarioCont
 	ctx.Step(`^a MetricSampleDraft with MetricKind "loc" and Value exactly 6 is collected$`, s.aMetricSampleDraftWithLocAndValueExactly6)
 	ctx.Step(`^Recipe\.AppliesTo returns false for the cyclo recipe on every parsed AstFile$`, s.recipeAppliesToReturnsFalseForCycloOnEveryParsedAstFile)
 	ctx.Step(`^zero MetricSampleDraft rows for metric_kind "cyclo" are emitted$`, s.zeroMetricSampleDraftRowsForCyclo)
-	ctx.Step(`^scopebinding\.Table\.Get\(scopeIDFor\("Foo"\)\) returns a row whose Signature ends with "::Foo" and whose StartLine is 3 and EndLine is 5$`, s.scopeBindingGetScopeIDForFooReturnsFooBinding)
+	ctx.Step(`^scopebinding\.Table\.Get\(scopeIDFor\("Foo"\)\) returns a row whose Signature ends with "#Foo" and whose StartLine is 3 and EndLine is 5$`, s.scopeBindingGetScopeIDForFooReturnsFooBinding)
 	ctx.Step(`^a WalkSkip with reason "parser_panic" is emitted for "boom\.go"$`, s.aWalkSkipWithParserPanicForBoomGo)
 	ctx.Step(`^"clean\.go" appears in the parsed AstFile results$`, s.cleanGoAppearsInTheParsedAstFileResults)
 	ctx.Step(`^the orchestrator exits cleanly$`, s.theOrchestratorExitsCleanly)

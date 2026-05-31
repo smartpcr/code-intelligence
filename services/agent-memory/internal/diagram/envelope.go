@@ -71,6 +71,21 @@ type Node struct {
 	Attrs    json.RawMessage `json:"attrs"`
 }
 
+// MarshalJSON renders Node with `attrs` always present as `{}` rather
+// than `null` when the projector hasn't attached per-language
+// LangMeta. Architecture S4.4 specifies `attrs` as a JSON object, and
+// the UI's single-parser contract assumes the field is indexable
+// without a nil-guard -- matching the defensive normalisation already
+// applied to Nodes/Edges/Stats.Skipped above.
+func (n Node) MarshalJSON() ([]byte, error) {
+	type alias Node
+	a := alias(n)
+	if len(a.Attrs) == 0 {
+		a.Attrs = json.RawMessage("{}")
+	}
+	return json.Marshal(a)
+}
+
 // Edge is one rendered relationship. `kind` is the persisted edge
 // kind verbatim (e.g. `contains`, `imports`, `static_calls`,
 // `observed_calls`, `extends`, `implements`, `overrides`, `reads`,

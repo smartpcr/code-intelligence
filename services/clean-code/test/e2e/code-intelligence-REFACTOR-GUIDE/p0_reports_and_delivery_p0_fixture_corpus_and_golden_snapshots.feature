@@ -15,7 +15,7 @@ Feature: P0 fixture corpus and golden snapshots
   Scenario: cycle detected
     Given the Go fixture is loaded
     When runAnalyze runs against the Go fixture
-    Then findings.json Findings contains at least one row with RuleID matching "cycle_member"
+    Then findings.json Findings contains at least one row with RuleID matching "decoupling.cycle_member"
     And at least one RefactorTask has Kind "break_cycle"
 
   Scenario: cross-language coverage

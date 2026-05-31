@@ -114,7 +114,7 @@
     {
       "path": "src/alpha/index.ts",
       "language": "typescript",
-      "size_bytes": 63,
+      "size_bytes": 61,
       "parse_status": "parsed"
     },
     {
@@ -126,7 +126,7 @@
     {
       "path": "src/beta/index.ts",
       "language": "typescript",
-      "size_bytes": 62,
+      "size_bytes": 60,
       "parse_status": "parsed"
     },
     {

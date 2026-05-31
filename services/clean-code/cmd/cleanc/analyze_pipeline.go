@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/devpolicy"
@@ -131,9 +132,13 @@ func lookupRunAndVerdict(store *rule_engine.InMemoryStore, res rule_engine.RunRe
 //   - `skipped`       -- any other walker / orchestrator skip
 //     reason.
 //
-// The slice is sorted by path ASC (the
-// orchestrator already sorted both inputs by path; the merge
-// preserves that order).
+// The returned slice is sorted by path ASC across BOTH
+// partitions. The orchestrator sorts `result.Files` and
+// `result.Skips` independently, but concatenating two
+// independently-sorted subsequences does NOT yield a sorted
+// whole; the final `sort.Slice` guarantees the merged
+// invariant so downstream consumers can binary-search or
+// diff against a prior sorted snapshot safely.
 func buildFileSummaries(result *orchestrator.Result) []report.WalkedFileSummary {
 	if result == nil {
 		return nil
@@ -154,6 +159,7 @@ func buildFileSummaries(result *orchestrator.Result) []report.WalkedFileSummary 
 			ParseStatus: status,
 		})
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out
 }
 

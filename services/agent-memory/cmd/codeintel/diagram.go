@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
 
@@ -89,22 +88,4 @@ func newDiagramCmdReal(flags *rootFlags) *cobra.Command {
 		newDiagramCallsCmd(flags),
 	)
 	return cmd
-}
-
-// writeJSON writes the encoded JSON to the given file, or stdout if path is "-".
-func writeJSON(path string, v interface{}) error {
-	var w *os.File
-	if path == "" || path == "-" {
-		w = os.Stdout
-	} else {
-		var err error
-		w, err = os.Create(path)
-		if err != nil {
-			return err
-		}
-		defer w.Close()
-	}
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	return enc.Encode(v)
 }

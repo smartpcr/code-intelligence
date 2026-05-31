@@ -57,7 +57,7 @@ PROTO_FILES         ?= ast/v1/ast.proto
 PG_URL ?= postgres://clean_code_admin:e2e_test_password@localhost:5432/clean_code?sslmode=disable
 COMPOSE_FILE ?= ../../tests/e2e/phase-09-audit-wal/docker-compose.yml
 
-.PHONY: build build-prod test test-cgo test-nocgo test-race lint vet tidy clean proto proto-tools docker-build compose-up compose-down update-cli-golden
+.PHONY: build build-prod test test-prod test-cgo test-nocgo test-race lint vet tidy clean proto proto-tools docker-build compose-up compose-down update-cli-golden
 .PHONY: migrate-up migrate-down seed-phase-09 test-phase-09
 .PHONY: test-e2e
 
@@ -94,6 +94,29 @@ build-prod:
 	done
 	@echo "$(GO) build -tags prod -o $(BIN_DIR)/cleanc-prod ./cmd/cleanc"
 	@$(GO) build -tags prod -o $(BIN_DIR)/cleanc-prod ./cmd/cleanc
+
+## test-prod: run the prod-gated unit tests. Only the test
+## functions that carry `//go:build prod` are exercised; the
+## dev-mode tests in `cmd/cleanc` (e.g. TestAnalyzeHappyPath*)
+## assume `flags.DefaultDevMode == true` and fail correctly
+## under `-tags prod`, so they are excluded via `-run`.
+##
+## Packages covered:
+##   - cmd/cleanc          (TestBuildTagIsProd*, TestFlagsDefault*)
+##   - internal/cli/devpolicy (TestProdBuildExcludesDevBypass,
+##                             TestLoadUnsignedBundle_Prod*,
+##                             TestProdNewLoader*)
+##   - internal/cli/flags  (TestFlagsDefaultDevMode*)
+##
+## Referenced by `implementation-plan.md` Stage 5.1 acceptance
+## scenario "prod tests pass" and the CI matrix entry on
+## `ubuntu-latest`.
+test-prod:
+	$(GO) test -tags prod $(TEST_FLAGS) \
+		-run 'TestProdBuildExcludesDevBypass|TestLoadUnsignedBundle_Prod|TestBuildTagIsProd|TestFlagsDefaultDevMode|TestProdNewLoader' \
+		./cmd/cleanc/... \
+		./internal/cli/devpolicy/... \
+		./internal/cli/flags/...
 
 ## test: run the full Go test suite. CI overrides via
 ## `test-nocgo` / `test-cgo` for explicit CGO mode pinning.

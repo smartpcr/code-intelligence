@@ -402,7 +402,7 @@ func (a *darkMetricAccumulator) finalize() Diagnostics {
 	return out
 }
 
-// ValidateBogusAttrRow exercises the production
+// validateBogusAttrRow exercises the production
 // [validateMetricAttrRequirements] function with a single row
 // whose Attrs contains "bogus_attr" — a value NOT in the
 // closed [allowedDarkAttrs] set. Returns the error from the
@@ -411,8 +411,8 @@ func (a *darkMetricAccumulator) finalize() Diagnostics {
 // tech-spec Sec 8.7 error string without mirroring the
 // validation logic.
 //
-// Exported for E2E testing only.
-func ValidateBogusAttrRow() error {
+// Re-exported for test builds via export_test.go.
+func validateBogusAttrRow() error {
 	return validateMetricAttrRequirements([]metricAttrRow{{
 		Kind:               "bogus_metric",
 		Attrs:              []string{"bogus_attr"},

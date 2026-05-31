@@ -132,10 +132,15 @@ func (s *scanSubcommandState) cleanup() {
 	}
 }
 
-func (s *scanSubcommandState) ensureTmpDir() {
+func (s *scanSubcommandState) ensureTmpDir() error {
 	if s.tmpDir == "" {
-		s.tmpDir, _ = os.MkdirTemp("", "scan-e2e-*")
+		var err error
+		s.tmpDir, err = os.MkdirTemp("", "scan-e2e-*")
+		if err != nil {
+			return fmt.Errorf("ensureTmpDir: %w", err)
+		}
 	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -143,7 +148,9 @@ func (s *scanSubcommandState) ensureTmpDir() {
 // ---------------------------------------------------------------------------
 
 func (s *scanSubcommandState) aSmallLocalFixtureRepo() error {
-	s.ensureTmpDir()
+	if err := s.ensureTmpDir(); err != nil {
+		return err
+	}
 	s.fixture = filepath.Join(s.tmpDir, "fixture")
 	if err := os.MkdirAll(s.fixture, 0o755); err != nil {
 		return err
@@ -164,7 +171,9 @@ func (s *scanSubcommandState) aBuiltCodeintelBinary() error {
 }
 
 func (s *scanSubcommandState) aGitRepoServedOverHTTP() error {
-	s.ensureTmpDir()
+	if err := s.ensureTmpDir(); err != nil {
+		return err
+	}
 
 	srcDir := filepath.Join(s.tmpDir, "git-src")
 	if err := os.MkdirAll(srcDir, 0o755); err != nil {
@@ -221,7 +230,9 @@ func (s *scanSubcommandState) aGitRepoServedOverHTTP() error {
 }
 
 func (s *scanSubcommandState) aFixtureWithCAndPy() error {
-	s.ensureTmpDir()
+	if err := s.ensureTmpDir(); err != nil {
+		return err
+	}
 	s.fixture = filepath.Join(s.tmpDir, "fixture")
 	if err := os.MkdirAll(s.fixture, 0o755); err != nil {
 		return err

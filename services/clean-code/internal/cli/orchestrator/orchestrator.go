@@ -391,10 +391,42 @@ func (o *Orchestrator) Run(ctx context.Context, repoCtx repocontext.RepoContext,
 				// missing parser-attr capability when
 				// the recipe's metric_kind is in the
 				// [metricAttrRequirements] table.
-				// Recipes that returned false for
-				// reasons OUTSIDE the dark-metric
-				// taxonomy (degraded AST, nil input)
-				// are silently ignored by `observe`.
+				// Recipes whose MetricKind is NOT in
+				// the table (e.g. `loc`, which gates
+				// only on degraded-not-set) are
+				// silently dropped by `observe`'s
+				// [metricAttrIndex] lookup.
+				//
+				// The degraded-AST guard below is
+				// load-bearing: every gated recipe's
+				// `AppliesTo` checks its parser-attr
+				// capability FIRST and the degraded
+				// gate SECOND (see
+				// `cyclo.AppliesTo` etc. in
+				// `internal/metrics/recipes`). Today's
+				// fleet stamps no decision_blocks /
+				// call_edges / field_accesses, so the
+				// degraded branch is unreachable and
+				// the only path into this `if` body
+				// is the capability gap. Once a
+				// future parser starts stamping a
+				// capability on a file that is ALSO
+				// degraded, `AppliesTo` would return
+				// false at the degraded gate and the
+				// file would otherwise reach
+				// `observe` -- falsely inflating
+				// `AffectedScopeCount` for a row
+				// whose cause is degradation, not a
+				// dark metric. Degraded files surface
+				// via the skip-row path (parser-
+				// returned degraded sentinel /
+				// [SkipReasonParserError]); the dark-
+				// metric taxonomy (tech-spec Sec 8.7
+				// line 1000) covers ONLY unstamped
+				// parser-attr capabilities.
+				if ast.GetDegradedReason() != "" {
+					continue
+				}
 				dark.observe(recipe.MetricKind(), ast)
 				continue
 			}

@@ -891,9 +891,21 @@ func TestReportRegistersFullGlobalFlagSurface(t *testing.T) {
 // TestReportAcceptsAllSec81Flags is the positive twin of
 // TestReportRegistersFullGlobalFlagSurface: every Sec 8.1
 // global flag MUST parse successfully when passed to
-// `report` (the stub still exits 70 once parsing succeeds,
-// so the test only asserts the flag parser did NOT reject
-// the value with exit 64).
+// `report` (the report body then fails at the
+// `os.ReadFile(findingsPath)` step because we point it at a
+// guaranteed-missing path under `t.TempDir()`; that failure
+// is mapped to `flags.ExitInternalError`, which is what this
+// test asserts).
+//
+// Iter-3 evaluator item 1: the iter-1/2 versions passed the
+// bare relative path `"findings.json"` so the test was
+// implicitly coupled to the absence of any such file in the
+// package's working directory. A future test or build
+// artifact that drops a `findings.json` into `cmd/cleanc/`
+// would make the report body succeed (exit 0) and silently
+// break this assertion. Using `filepath.Join(t.TempDir(),
+// "missing.json")` decouples the contract: the path is
+// guaranteed not to exist regardless of cwd or sibling tests.
 func TestReportAcceptsAllSec81Flags(t *testing.T) {
 	t.Parallel()
 
@@ -911,7 +923,11 @@ func TestReportAcceptsAllSec81Flags(t *testing.T) {
 		extra := extra
 		t.Run(strings.Join(extra, " "), func(t *testing.T) {
 			t.Parallel()
-			args := append([]string{"report", "findings.json"}, extra...)
+			// Guaranteed-missing positional path -- decoupled
+			// from the package working directory so a leaked
+			// sibling `findings.json` cannot flip exit 70 to 0.
+			missing := filepath.Join(t.TempDir(), "missing.json")
+			args := append([]string{"report", missing}, extra...)
 			_, stderr, code := captureRun(args...)
 			if code != flags.ExitInternalError {
 				t.Errorf("exit code = %d, want %d (pipeline stub); stderr=%s",

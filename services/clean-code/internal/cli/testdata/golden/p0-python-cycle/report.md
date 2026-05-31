@@ -25,3 +25,8 @@ Verdict: block
 - decoupling.cycle_member_present [block]
 - decoupling.cycle_member_present [block]
 
+
+## Diagnostics
+
+- **Effort source:** fallback
+- **Refactor prompts emitted:** 0

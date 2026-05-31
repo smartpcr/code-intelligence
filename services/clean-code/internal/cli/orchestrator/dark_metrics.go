@@ -279,6 +279,22 @@ type Diagnostics struct {
 	//
 	// Anchor: tech-spec Sec 9.3 ("Effort model fallback").
 	EffortSource string `json:"effort_source"`
+
+	// PromptCount is the number of refactor-prompt JSONL
+	// rows the `--emit-prompts` writer produced during this
+	// run. Zero when `--emit-prompts` was not requested OR
+	// the run produced no refactor tasks. The composition
+	// root in `cmd/cleanc/main.go` stamps this field from
+	// the JSONL emitter's row count after the prompt
+	// writer completes; the markdown / JSON renderers
+	// surface the value in the diagnostics block so the
+	// operator (and downstream CI) can correlate the
+	// emitted prompt artifact size against the engine's
+	// task count.
+	//
+	// Anchor: workstream brief Stage 4.3 ("Emit Prompts
+	// Flag Wiring").
+	PromptCount int `json:"prompt_count"`
 }
 
 // darkMetricKey is the dedup key the orchestrator uses

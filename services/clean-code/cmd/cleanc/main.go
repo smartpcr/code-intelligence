@@ -267,6 +267,23 @@ func runAnalyze(stdout, stderr io.Writer, args []string) int {
 		}
 	}
 
+	// Bare `--emit-prompts` pre-scan (workstream brief
+	// Stage 4.3). The stdlib `flag.String` parser would
+	// otherwise EITHER consume the next CLI token as the
+	// value (silently mis-binding `--findings foo.json` to
+	// `EmitPrompts`) OR emit the generic stdlib
+	// "flag needs an argument" message. Both surfaces are
+	// wrong for this contract: the brief pins the literal
+	// stderr line `--emit-prompts requires a path or '-' for
+	// stdout` with exit 64. We detect "bare" as either the
+	// last positional token OR a token whose successor begins
+	// with `-` (and therefore looks like another flag rather
+	// than a path / dash sentinel).
+	if msg, bare := detectBareEmitPrompts(args); bare {
+		fmt.Fprintln(stderr, msg)
+		return flags.ExitUsage
+	}
+
 	fs := flag.NewFlagSet("cleanc analyze", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
@@ -324,6 +341,28 @@ func runAnalyze(stdout, stderr io.Writer, args []string) int {
 	if g.DevMode != nil && !*g.DevMode {
 		fmt.Fprintln(stderr, "cleanc analyze: --dev-mode=false requires a signed-policy loader, which is not available in this build; pass --dev-mode (or omit the flag) to proceed with the unsigned dev policy bundle.")
 		return flags.ExitUsage
+	}
+
+	// `--emit-prompts -` (stdout) is mutually exclusive
+	// with the markdown report ALSO going to stdout, because
+	// the operator's stdout cannot carry both the markdown
+	// bytes and the JSONL bytes interleaved without
+	// corrupting both artifacts. The brief pins the literal
+	// stderr line and exit 64 (BSD EX_USAGE) so an operator
+	// who attempts the conflicting combination sees a clean
+	// usage error rather than a partially mangled report.
+	// `--out` is "unset" when its value is the empty default
+	// (which means "write markdown to stdout" per tech-spec
+	// Sec 8.1 row 1).
+	if g.EmitPrompts != nil && *g.EmitPrompts == "-" {
+		outPath := ""
+		if g.Out != nil {
+			outPath = *g.Out
+		}
+		if outPath == "" {
+			fmt.Fprintln(stderr, emitPromptsStdoutConflictMessage)
+			return flags.ExitUsage
+		}
 	}
 
 	return runAnalyzePipeline(context.Background(), stdout, stderr, g, positionals[0])
@@ -514,6 +553,26 @@ func runAnalyzePipeline(ctx context.Context, stdout, stderr io.Writer, g *flags.
 		Diagnostics:   result.Diagnostics,
 	}
 
+	// Pre-stamp `Diagnostics.PromptCount` from the task
+	// count BEFORE the markdown / JSON renderers run. The
+	// JSONL emitter's contract is one record per
+	// [refactor.RefactorTask] (one task per (ScopeID, RuleID)
+	// pair, per `suggest.JSONL.Emit` doc), so the count is
+	// known without executing the emitter. This pre-stamp
+	// lets the markdown / JSON diagnostics block surface the
+	// value (workstream brief) while still emitting the
+	// JSONL artifact AFTER the report + findings writers
+	// complete (the brief's explicit ordering: "call
+	// Emit(ctx, art, w) after the report + findings writers
+	// complete"). The post-emit verification below asserts
+	// the predicted count equals the bytes the emitter
+	// actually wrote so a contract drift in the emitter
+	// (e.g. a future skip-row patch) cannot silently desync
+	// the stamped value from the artifact on disk.
+	if g.EmitPrompts != nil && *g.EmitPrompts != "" {
+		art.Diagnostics.PromptCount = len(art.Tasks)
+	}
+
 	// Stage 9: dispatch to renderers. `--out` defaults to
 	// stdout when empty (tech-spec Sec 8.1 row 1); the JSON
 	// sidecars are only emitted when their flag carries a
@@ -530,6 +589,28 @@ func runAnalyzePipeline(ctx context.Context, stdout, stderr io.Writer, g *flags.
 	}
 	if err := dispatchDiagnostics(stderr, *g.Diagnostics, art.Diagnostics); err != nil {
 		return flags.ExitInternalError
+	}
+
+	// Stage 9 (post): emit the JSONL refactor-prompt
+	// artifact AFTER the report + findings writers complete
+	// (workstream brief ordering). The emitter writes
+	// directly to the destination writer (file via
+	// `os.Create` + `defer Close()` OR `stdout` when the
+	// flag value is the literal `-`); the predicted row
+	// count stamped above is verified against the actual
+	// bytes written so a future emitter contract drift
+	// cannot silently desync the stamp from the on-disk
+	// artifact.
+	if g.EmitPrompts != nil && *g.EmitPrompts != "" {
+		actual, err := emitPromptsDirect(ctx, stdout, stderr, *g.EmitPrompts, orch, bundle, art)
+		if err != nil {
+			return flags.ExitInternalError
+		}
+		if actual != art.Diagnostics.PromptCount {
+			fmt.Fprintf(stderr, "cleanc analyze: --emit-prompts: emitter wrote %d rows but stamped Diagnostics.PromptCount=%d; please report this drift\n",
+				actual, art.Diagnostics.PromptCount)
+			return flags.ExitInternalError
+		}
 	}
 
 	// Stage 10: exit code. The verdict + per-finding

@@ -1098,6 +1098,7 @@
         "closure_phase": "P2"
       }
     ],
-    "effort_source": "fallback"
+    "effort_source": "fallback",
+    "prompt_count": 0
   }
 }

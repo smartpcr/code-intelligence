@@ -4,8 +4,11 @@ package e2e
 
 import (
 	"context"
+	"fmt"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/cucumber/godog"
@@ -18,80 +21,93 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// stubSink — minimal Sink implementation for compile-time proof
+// stubSink — minimal Sink implementation for compile-time proof.
+// The var _ assertion below this block is the canonical Go idiom
+// that proves stubSink satisfies graphsink.Sink at compile time.
 // ---------------------------------------------------------------------------
 
-type stubSink struct{}
+type stubSinkGraphsink struct{}
 
-func (s *stubSink) EnsureRepo(_ context.Context, _ graphwriter.RepoInput) (graphwriter.RepoRecord, error) {
+func (s *stubSinkGraphsink) EnsureRepo(_ context.Context, _ graphwriter.RepoInput) (graphwriter.RepoRecord, error) {
 	return graphwriter.RepoRecord{}, nil
 }
 
-func (s *stubSink) EnsureCommit(_ context.Context, _ graphwriter.CommitInput) (graphwriter.CommitRecord, error) {
+func (s *stubSinkGraphsink) EnsureCommit(_ context.Context, _ graphwriter.CommitInput) (graphwriter.CommitRecord, error) {
 	return graphwriter.CommitRecord{}, nil
 }
 
-func (s *stubSink) InsertNode(_ context.Context, _ graphwriter.NodeInput) (graphwriter.NodeRecord, error) {
+func (s *stubSinkGraphsink) InsertNode(_ context.Context, _ graphwriter.NodeInput) (graphwriter.NodeRecord, error) {
 	return graphwriter.NodeRecord{}, nil
 }
 
-func (s *stubSink) InsertEdge(_ context.Context, _ graphwriter.EdgeInput) (graphwriter.EdgeRecord, error) {
+func (s *stubSinkGraphsink) InsertEdge(_ context.Context, _ graphwriter.EdgeInput) (graphwriter.EdgeRecord, error) {
 	return graphwriter.EdgeRecord{}, nil
 }
 
-func (s *stubSink) Flush(_ context.Context) error { return nil }
-func (s *stubSink) Close() error                  { return nil }
+func (s *stubSinkGraphsink) Flush(_ context.Context) error { return nil }
+func (s *stubSinkGraphsink) Close() error                  { return nil }
 
-// Compile-time assertion: stubSink satisfies graphsink.Sink.
-var _ graphsink.Sink = (*stubSink)(nil)
+// Compile-time assertion: stubSinkGraphsink satisfies graphsink.Sink.
+var _ graphsink.Sink = (*stubSinkGraphsink)(nil)
 
 // ---------------------------------------------------------------------------
-// stubReader — minimal Reader implementation for compile-time proof
+// stubReaderGraphsink — minimal Reader implementation for compile-time proof.
 // ---------------------------------------------------------------------------
 
-type stubReader struct{}
+type stubReaderGraphsink struct{}
 
-func (r *stubReader) ListRepos(_ context.Context, _ graphreader.ReaderOptions) ([]graphreader.RepoSummary, error) {
+func (r *stubReaderGraphsink) ListRepos(_ context.Context, _ graphreader.ReaderOptions) ([]graphreader.RepoSummary, error) {
 	return nil, nil
 }
 
-func (r *stubReader) ListNodes(_ context.Context, _ fingerprint.RepoID, _ []string, _ graphreader.ListNodesFilter, _ graphreader.ReaderOptions) ([]graphreader.Node, error) {
+func (r *stubReaderGraphsink) ListNodes(_ context.Context, _ fingerprint.RepoID, _ []string, _ graphreader.ListNodesFilter, _ graphreader.ReaderOptions) ([]graphreader.Node, error) {
 	return nil, nil
 }
 
-func (r *stubReader) ListEdgesFrom(_ context.Context, _ string, _ []string, _ graphreader.ReaderOptions) ([]graphreader.Edge, error) {
+func (r *stubReaderGraphsink) ListEdgesFrom(_ context.Context, _ string, _ []string, _ graphreader.ReaderOptions) ([]graphreader.Edge, error) {
 	return nil, nil
 }
 
-func (r *stubReader) ListEdgesTo(_ context.Context, _ string, _ []string, _ graphreader.ReaderOptions) ([]graphreader.Edge, error) {
+func (r *stubReaderGraphsink) ListEdgesTo(_ context.Context, _ string, _ []string, _ graphreader.ReaderOptions) ([]graphreader.Edge, error) {
 	return nil, nil
 }
 
-func (r *stubReader) GetNode(_ context.Context, _ string, _ graphreader.ReaderOptions) (graphreader.Node, error) {
+func (r *stubReaderGraphsink) GetNode(_ context.Context, _ string, _ graphreader.ReaderOptions) (graphreader.Node, error) {
 	return graphreader.Node{}, nil
 }
 
-func (r *stubReader) LookupBySignature(_ context.Context, _ fingerprint.RepoID, _ string, _ string, _ graphreader.ReaderOptions) (graphreader.Node, error) {
+func (r *stubReaderGraphsink) LookupBySignature(_ context.Context, _ fingerprint.RepoID, _ string, _ string, _ graphreader.ReaderOptions) (graphreader.Node, error) {
 	return graphreader.Node{}, nil
 }
 
-// Compile-time assertion: stubReader satisfies graphsink.Reader.
-var _ graphsink.Reader = (*stubReader)(nil)
+// Compile-time assertion: stubReaderGraphsink satisfies graphsink.Reader.
+var _ graphsink.Reader = (*stubReaderGraphsink)(nil)
 
-// Compile-time assertion: *graphwriter.Writer satisfies
+// Compile-time assertion: *graphwriter.Writer still satisfies
 // repoindexer.RepoCommitNodeEdgeWriter (unchanged from the
 // existing ancestry_writer_iface.go assertion — this scenario
 // proves the Phase-3 interface addition did NOT break it).
 var _ repoindexer.RepoCommitNodeEdgeWriter = (*graphwriter.Writer)(nil)
+
+// sinkSkeletonModuleRoot returns the services/agent-memory directory
+// (the Go module root, 3 levels up from this file's directory) so
+// exec.Command can set its working directory for `go vet` / `go build`.
+func sinkSkeletonModuleRoot() string {
+	_, thisFile, _, _ := runtime.Caller(0)
+	// thisFile is <mod>/test/e2e/code-intelligence-REPO-SCANNER/<file>.go
+	// module root is three directories up from the file's directory.
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..")
+}
 
 // ---------------------------------------------------------------------------
 // Scenario state
 // ---------------------------------------------------------------------------
 
 type sinkSkeletonState struct {
-	sinkSatisfied         bool
-	readerSatisfied       bool
-	writerStillSatisfied  bool
+	goVetExitCode int
+	goVetOutput   string
+	buildExitCode int
+	buildOutput   string
 }
 
 // ---------------------------------------------------------------------------
@@ -99,22 +115,26 @@ type sinkSkeletonState struct {
 // ---------------------------------------------------------------------------
 
 func (st *sinkSkeletonState) anEmptyStubSinkImpl() error {
-	// The compile-time var _ assertion above already proved this.
-	// If the file compiles, the stub satisfies Sink.
-	st.sinkSatisfied = true
+	// Precondition: stubSinkGraphsink is defined above with all
+	// required methods AND the var _ assertion compiles. The Given
+	// step simply confirms the precondition holds (which it does
+	// if this test binary was built successfully).
+	var _ graphsink.Sink = (*stubSinkGraphsink)(nil)
 	return nil
 }
 
 func (st *sinkSkeletonState) aStubReaderImplIncludingListRepos() error {
-	// Same reasoning: compile-time var _ assertion covers this.
-	st.readerSatisfied = true
+	// Precondition: stubReaderGraphsink is defined above with
+	// ListRepos + all other methods AND the var _ assertion
+	// compiles.
+	var _ graphsink.Reader = (*stubReaderGraphsink)(nil)
 	return nil
 }
 
 func (st *sinkSkeletonState) theUnchangedGraphwriterWriter() error {
-	// The compile-time var _ assertion proves *graphwriter.Writer
-	// still satisfies the narrow interface.
-	st.writerStillSatisfied = true
+	// Precondition: *graphwriter.Writer is unchanged and the
+	// var _ assertion above compiles.
+	var _ repoindexer.RepoCommitNodeEdgeWriter = (*graphwriter.Writer)(nil)
 	return nil
 }
 
@@ -122,16 +142,44 @@ func (st *sinkSkeletonState) theUnchangedGraphwriterWriter() error {
 // When steps
 // ---------------------------------------------------------------------------
 
+// goVetGraphsinkRuns executes `go vet ./internal/graphsink/...`
+// against the module root. This is the real executable proof: if
+// the graphsink package (including its _test files) has any type
+// error or vet diagnostic, the step fails.
 func (st *sinkSkeletonState) goVetGraphsinkRuns() error {
-	// The fact that this test file compiled means go vet would
-	// pass for interface satisfaction. The compile-time assertions
-	// (var _ Interface = (*Concrete)(nil)) are the canonical Go
-	// idiom; if they fail, the build fails before tests run.
+	modRoot := sinkSkeletonModuleRoot()
+	cmd := exec.Command("go", "vet", "./internal/graphsink/...")
+	cmd.Dir = modRoot
+	out, err := cmd.CombinedOutput()
+	st.goVetOutput = strings.TrimSpace(string(out))
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			st.goVetExitCode = exitErr.ExitCode()
+		} else {
+			return fmt.Errorf("go vet exec error: %w", err)
+		}
+	}
 	return nil
 }
 
+// aTestAssignsToRepoCommitNodeEdgeWriter executes `go build`
+// against the graphsink and repoindexer packages to prove the
+// *graphwriter.Writer assignment compiles. The compile-time var _
+// assertion in ancestry_writer_iface.go is the canonical proof;
+// go build will fail if the shape drifts.
 func (st *sinkSkeletonState) aTestAssignsToRepoCommitNodeEdgeWriter() error {
-	// Already proven by the compile-time var _ assertion above.
+	modRoot := sinkSkeletonModuleRoot()
+	cmd := exec.Command("go", "build", "./internal/repoindexer/...")
+	cmd.Dir = modRoot
+	out, err := cmd.CombinedOutput()
+	st.buildOutput = strings.TrimSpace(string(out))
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			st.buildExitCode = exitErr.ExitCode()
+		} else {
+			return fmt.Errorf("go build exec error: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -140,36 +188,33 @@ func (st *sinkSkeletonState) aTestAssignsToRepoCommitNodeEdgeWriter() error {
 // ---------------------------------------------------------------------------
 
 func (st *sinkSkeletonState) theImplSatisfiesSink() error {
-	if !st.sinkSatisfied {
-		return errInterfaceNotSatisfied("graphsink.Sink")
+	if st.goVetExitCode != 0 {
+		return fmt.Errorf(
+			"go vet ./internal/graphsink/... failed (exit %d): %s",
+			st.goVetExitCode, st.goVetOutput,
+		)
 	}
 	return nil
 }
 
 func (st *sinkSkeletonState) theStubSatisfiesReader() error {
-	if !st.readerSatisfied {
-		return errInterfaceNotSatisfied("graphsink.Reader")
+	if st.goVetExitCode != 0 {
+		return fmt.Errorf(
+			"go vet ./internal/graphsink/... failed (exit %d): %s",
+			st.goVetExitCode, st.goVetOutput,
+		)
 	}
 	return nil
 }
 
 func (st *sinkSkeletonState) theAssignmentCompilesWithoutModification() error {
-	if !st.writerStillSatisfied {
-		return errInterfaceNotSatisfied("repoindexer.RepoCommitNodeEdgeWriter")
+	if st.buildExitCode != 0 {
+		return fmt.Errorf(
+			"go build ./internal/repoindexer/... failed (exit %d): %s",
+			st.buildExitCode, st.buildOutput,
+		)
 	}
 	return nil
-}
-
-func errInterfaceNotSatisfied(iface string) error {
-	// This path is unreachable if the file compiled, but kept for
-	// godog step completeness.
-	return &interfaceError{iface: iface}
-}
-
-type interfaceError struct{ iface string }
-
-func (e *interfaceError) Error() string {
-	return "compile-time assertion failed: type does not satisfy " + e.iface
 }
 
 // ---------------------------------------------------------------------------

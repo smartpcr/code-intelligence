@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -198,7 +199,7 @@ func openPSAEphemeralPG() (*psaPGInstance, error) {
 	if _, err := rand.Read(buf[:]); err != nil {
 		return nil, err
 	}
-	port := 15532 + int(buf[0])%100
+	port := 15532 + int(binary.BigEndian.Uint16(buf[:2]))%10000
 
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().

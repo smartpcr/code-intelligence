@@ -46,11 +46,13 @@ tests/e2e/cleanc/
 ## Running locally
 
 ```bash
-# from repo root:
-./tests/e2e/cleanc/run_all.sh
+# from repo root (invoke via `bash` so the executable bit on
+# run.sh / run_all.sh does not need to survive a git checkout
+# on systems where umask or core.fileMode drops it):
+bash ./tests/e2e/cleanc/run_all.sh
 
 # or one scenario at a time:
-./tests/e2e/cleanc/scenarios/p0-go-cycle/run.sh
+bash ./tests/e2e/cleanc/scenarios/p0-go-cycle/run.sh
 ```
 
 `run_all.sh` aborts on the first failing scenario and exits

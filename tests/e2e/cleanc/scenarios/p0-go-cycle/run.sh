@@ -77,11 +77,23 @@ done
 #          placeholder so report.md / findings.json can byte-match
 #          a golden whose Context.RootPath is `/fixtures/go`.
 # ---------------------------------------------------------------
+# `$ABS_REPO` is interpolated into a `sed s|...|...|` expression,
+# so we must escape any of `|`, `&`, `\` that may appear in the
+# pathname (e.g. a workspace under a directory whose name
+# contains `&`).  sed treats `&` on the replacement side as the
+# matched text and `\` as an escape, so unescaped paths can
+# corrupt the substitution and silently bend the diff.
+sed_escape () {
+    # Escape `\`, `|`, and `&` for both pattern and replacement.
+    printf '%s' "$1" | sed -e 's/[\\|&]/\\&/g'
+}
+ABS_REPO_ESC="$(sed_escape "$ABS_REPO")"
+SYN_PATH_ESC="$(sed_escape "$SYNTHETIC_PATH")"
 # sed -i syntax differs between BSD (macOS) and GNU. Use a temp
 # file so the script is portable across both.
 sed_in_place () {
     local file="$1"
-    sed -e "s|$ABS_REPO|$SYNTHETIC_PATH|g" "$file" > "$file.tmp"
+    sed -e "s|$ABS_REPO_ESC|$SYN_PATH_ESC|g" "$file" > "$file.tmp"
     mv "$file.tmp" "$file"
 }
 sed_in_place "$OUT_DIR/report.md"
@@ -94,22 +106,39 @@ jq -f "$NORMALIZER" "$OUT_DIR/findings.json" > "$OUT_DIR/findings.normalised.jso
 mv "$OUT_DIR/findings.normalised.json" "$OUT_DIR/findings.json"
 
 # ---------------------------------------------------------------
-# Step 4b: canonicalise report.md bullet ordering. The markdown
+# Step 4b: canonicalise report.md bullet ordering.  The markdown
 #          renderer emits findings / dark-metric bullets in the
 #          engine's insertion order, which is non-deterministic
 #          across runs.  normalize-md.sh sorts any contiguous
-#          block of `- ` bullets alphabetically; both the
-#          produced report and the checked-in golden are passed
-#          through the same filter so the diff is stable.
+#          block of `- ` bullet lines alphabetically.  We run it
+#          via `bash` rather than as an executable so the
+#          scenario does not depend on the script's file mode
+#          surviving git checkout (some CI runners and the
+#          Windows worktree drop the +x bit).
+#
+#          Both the produced report and a private copy of the
+#          checked-in golden are passed through the same filter
+#          before the diff -- normalising the golden too is
+#          idempotent (sort is stable, the mask is a no-op when
+#          no UUIDs / timestamps are present) and guarantees the
+#          diff stays accurate even if a future golden update
+#          forgets to pre-sort.
 # ---------------------------------------------------------------
-"$E2E_ROOT/lib/normalize-md.sh" "$OUT_DIR/report.md"
+bash "$E2E_ROOT/lib/normalize-md.sh" "$OUT_DIR/report.md"
+
+cp "$GOLDEN_DIR/report.md"     "$OUT_DIR/golden.report.md"
+cp "$GOLDEN_DIR/findings.json" "$OUT_DIR/golden.findings.json"
+cp "$GOLDEN_DIR/diag.json"     "$OUT_DIR/golden.diag.json"
+bash "$E2E_ROOT/lib/normalize-md.sh" "$OUT_DIR/golden.report.md"
+jq -f "$NORMALIZER" "$OUT_DIR/golden.findings.json" > "$OUT_DIR/golden.findings.normalised.json"
+mv "$OUT_DIR/golden.findings.normalised.json" "$OUT_DIR/golden.findings.json"
 
 # ---------------------------------------------------------------
 # Step 5: byte-diff against golden.
 # ---------------------------------------------------------------
 echo "[p0-go-cycle] diffing against $GOLDEN_DIR"
-diff -u "$GOLDEN_DIR/report.md"     "$OUT_DIR/report.md"
-diff -u "$GOLDEN_DIR/findings.json" "$OUT_DIR/findings.json"
-diff -u "$GOLDEN_DIR/diag.json"     "$OUT_DIR/diag.json"
+diff -u "$OUT_DIR/golden.report.md"     "$OUT_DIR/report.md"
+diff -u "$OUT_DIR/golden.findings.json" "$OUT_DIR/findings.json"
+diff -u "$OUT_DIR/golden.diag.json"     "$OUT_DIR/diag.json"
 
 echo "[p0-go-cycle] PASS"

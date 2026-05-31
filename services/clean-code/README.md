@@ -158,7 +158,7 @@ with no `docker compose up` in front of it.
 Run all scenarios locally:
 
 ```bash
-./tests/e2e/cleanc/run_all.sh
+bash ./tests/e2e/cleanc/run_all.sh
 ```
 
 The two P0 scenarios shipped today are:

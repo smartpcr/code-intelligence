@@ -28,7 +28,7 @@ ran=0
 for scenario_dir in "$SCENARIO_ROOT"/*/; do
     scenario="$(basename "$scenario_dir")"
     runner="$scenario_dir/run.sh"
-    if [[ ! -x "$runner" && ! -f "$runner" ]]; then
+    if [[ ! -f "$runner" ]]; then
         echo "run_all.sh: skipping $scenario (no run.sh)"
         continue
     fi
@@ -37,6 +37,10 @@ for scenario_dir in "$SCENARIO_ROOT"/*/; do
     echo "scenario: $scenario"
     echo "===================================================================="
     ran=$((ran + 1))
+    # Always invoke via `bash` rather than executing the script
+    # directly so the +x file mode on run.sh does not need to
+    # survive a git checkout (Windows worktrees and CI runners
+    # that ignore core.fileMode lose the executable bit).
     if bash "$runner"; then
         echo "scenario PASS: $scenario"
     else

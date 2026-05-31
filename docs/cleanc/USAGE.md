@@ -1,12 +1,13 @@
 # `cleanc` — operator usage guide
 
-> **Stage:** Phase 1 / Stage 1.1 (CLI binary skeleton).
 > **Scope:** the sub-command dispatcher, global-flag surface,
-> exit-code contract, and reserved-surface rejections shipped
-> in this stage.  The walker, parser-fan-out, rule engine,
-> planner, and report renderer land in Stages 2.1 – 3.x and are
-> intentionally stubbed here (any verb that would touch them
-> exits `70 EX_SOFTWARE` with a "not yet wired" stderr line).
+> exit-code contract, reserved-surface rejections, and the
+> full `analyze` pipeline (walker, parser fan-out, rule
+> engine, refactor planner, report renderer + JSON sidecars,
+> JSONL prompt emitter). The `report` re-render verb is
+> wired and shares its flag set with `analyze`; the `apply`
+> verb is reserved and rejected at the dispatcher pending
+> operator pin `cli-l7-authority`.
 >
 > **Authority order** (per repository `README.md`): when this
 > document and the source disagree, the **specs win** —
@@ -24,10 +25,10 @@ cleanc <subcommand> [flags]
 
 Canonical sub-commands (the dispatcher's closed set):
 
-| Verb      | Status (Stage 1.1) | Purpose                                                              |
+| Verb      | Status             | Purpose                                                              |
 | --------- | ------------------ | -------------------------------------------------------------------- |
-| `analyze` | stub (exit 70)     | Walk a repo, evaluate the rule engine, write a markdown report.      |
-| `report`  | stub (exit 70)     | Re-render markdown from a previously written `findings.json`.        |
+| `analyze` | implemented        | Walk a repo, evaluate the rule engine, write a markdown report + JSON sidecars (+ optional `--emit-prompts` JSONL). |
+| `report`  | implemented        | Re-render markdown from a previously written `findings.json`.        |
 | `version` | implemented        | Print binary version + build tag + parser set + rule-pack set.       |
 | `apply`   | reserved (exit 64) | Apply a refactor task; pending operator pin `cli-l7-authority`.      |
 | `help`    | implemented        | Print global usage (no arg) or per-verb usage (`cleanc help <verb>`).|
@@ -81,7 +82,7 @@ of any dispatcher-side overrides.
 | `1`  | (find)        | Clean run; maximum finding severity met or exceeded `--exit-on` (one of `info`/`warn`/`block`).   |
 | `2`  | (walker)      | Walker failure — missing root path, permission denied on a traversed directory, etc.              |
 | `64` | `EX_USAGE`    | Operator-facing usage error: unknown sub-command, malformed flag, missing/surplus positional, reserved verb (`apply`), or reserved flag (`--telemetry-otlp` / `--with-churn` / `--snippet-cap-lines`). |
-| `70` | `EX_SOFTWARE` | Internal engine error (parser panic, planner crash). The Stage 1.1 skeleton also emits `70` for unwired sub-command bodies so a successful exit is never claimed for unimplemented behaviour. |
+| `70` | `EX_SOFTWARE` | Internal engine error (parser panic, planner crash, renderer I/O failure). |
 
 ## 4. Reserved surface (tech-spec Sec 8.1 + e2e Stage 4.4)
 
@@ -141,7 +142,10 @@ cleanc version
 cleanc help analyze
 cleanc analyze -h
 
-# Stage 1.1 stub — exits 70 with "pipeline not yet wired".
+# Stage 5.x — full analyze pipeline (walker, rule engine,
+# planner, report + JSON sidecars). Exits 0 on a clean run,
+# 1 when a finding crosses --exit-on, or a >=64 BSD code
+# on usage / internal failures (see §3).
 cleanc analyze .
 cleanc analyze . --out report.md --findings findings.json --exit-on warn
 
@@ -168,11 +172,13 @@ scenario is a plain `bash run.sh` with no `docker compose up`
 in front of it.
 
 ```bash
-# Run every scenario sequentially.
-./tests/e2e/cleanc/run_all.sh
+# Run every scenario sequentially.  Invoke via `bash` so the
+# executable bit on run.sh / run_all.sh does not need to
+# survive a git checkout where core.fileMode drops it.
+bash ./tests/e2e/cleanc/run_all.sh
 
 # Or run one scenario in isolation.
-./tests/e2e/cleanc/scenarios/p0-go-cycle/run.sh
+bash ./tests/e2e/cleanc/scenarios/p0-go-cycle/run.sh
 ```
 
 Per-scenario layout:

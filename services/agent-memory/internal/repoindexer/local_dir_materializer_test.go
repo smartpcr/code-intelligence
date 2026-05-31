@@ -7,12 +7,17 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
 )
 
 // TestLocalDirMaterializer_nonGitDirYieldsStableMTimeSHA covers
-// brief case (a): scanning a plain on-disk directory (no `.git/`)
-// resolves the SHA via `fingerprint.MTimeTreeSHA`, and the digest
-// is stable across re-invocations on the unchanged tree.
+// brief case (a) and implementation-plan scenario
+// `local-non-git-sha`: scanning a plain on-disk directory (no
+// `.git/`) resolves the SHA to EXACTLY
+// `fingerprint.MTimeTreeSHA(rootDir, defaultExcludeDirs)`. The
+// equality assertion pins the contract so accidental changes to
+// either the exclude set or the hash helper break the test.
 func TestLocalDirMaterializer_nonGitDirYieldsStableMTimeSHA(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -30,16 +35,20 @@ func TestLocalDirMaterializer_nonGitDirYieldsStableMTimeSHA(t *testing.T) {
 		t.Fatalf("Materialize #1: %v", err)
 	}
 	defer ws1.Close()
-	ldw1, ok := ws1.(*localDirWorkspace)
-	if !ok {
-		t.Fatalf("expected *localDirWorkspace, got %T", ws1)
+
+	// EXACT equality with the pinned helper output -- this is
+	// what implementation-plan.md:310 requires.
+	absRoot, _ := filepath.Abs(root)
+	wantSHA, err := fingerprint.MTimeTreeSHA(absRoot, defaultExcludeDirs)
+	if err != nil {
+		t.Fatalf("MTimeTreeSHA: %v", err)
 	}
-	if ldw1.SHA() == "" {
-		t.Fatalf("synthesised SHA must be non-empty for a non-git dir")
+	if ws1.SHA() != wantSHA {
+		t.Errorf("SHA: got %q, want fingerprint.MTimeTreeSHA(root, defaultExcludeDirs)=%q",
+			ws1.SHA(), wantSHA)
 	}
-	// MTimeTreeSHA returns 32 lowercase hex chars.
-	if len(ldw1.SHA()) != 32 {
-		t.Errorf("MTimeTreeSHA length: got %d, want 32 (sha=%q)", len(ldw1.SHA()), ldw1.SHA())
+	if len(ws1.SHA()) != 32 {
+		t.Errorf("MTimeTreeSHA length: got %d, want 32 (sha=%q)", len(ws1.SHA()), ws1.SHA())
 	}
 
 	ws2, err := m.Materialize(context.Background(), root, "")
@@ -47,31 +56,72 @@ func TestLocalDirMaterializer_nonGitDirYieldsStableMTimeSHA(t *testing.T) {
 		t.Fatalf("Materialize #2: %v", err)
 	}
 	defer ws2.Close()
-	ldw2 := ws2.(*localDirWorkspace)
-	if ldw1.SHA() != ldw2.SHA() {
+	if ws1.SHA() != ws2.SHA() {
 		t.Errorf("SHA must be stable across runs on unchanged tree:\n  #1=%s\n  #2=%s",
-			ldw1.SHA(), ldw2.SHA())
+			ws1.SHA(), ws2.SHA())
 	}
 
 	wantPrefix := "file://"
-	if !strings.HasPrefix(ldw1.URL(), wantPrefix) {
-		t.Errorf("URL prefix: got %q, want prefix %q", ldw1.URL(), wantPrefix)
+	if !strings.HasPrefix(ws1.URL(), wantPrefix) {
+		t.Errorf("URL prefix: got %q, want prefix %q", ws1.URL(), wantPrefix)
 	}
 	// URL must use forward slashes regardless of host OS.
-	if strings.ContainsRune(ldw1.URL(), '\\') {
-		t.Errorf("URL must use forward slashes: %q", ldw1.URL())
+	if strings.ContainsRune(ws1.URL(), '\\') {
+		t.Errorf("URL must use forward slashes: %q", ws1.URL())
 	}
 	if runtime.GOOS == "windows" {
 		// e.g. file:///c:/...   drive letter must be lowercase.
 		// Expect a colon at position 9 (file:/// + 'x' + ':').
-		if len(ldw1.URL()) < 11 || ldw1.URL()[9] != ':' {
-			t.Errorf("Windows URL shape unexpected: %q", ldw1.URL())
+		if len(ws1.URL()) < 11 || ws1.URL()[9] != ':' {
+			t.Errorf("Windows URL shape unexpected: %q", ws1.URL())
 		} else {
-			drive := ldw1.URL()[8]
+			drive := ws1.URL()[8]
 			if drive < 'a' || drive > 'z' {
-				t.Errorf("Windows drive letter must be lowercase in URL: %q", ldw1.URL())
+				t.Errorf("Windows drive letter must be lowercase in URL: %q", ws1.URL())
 			}
 		}
+	}
+}
+
+// TestLocalDirMaterializer_acceptsFileURLInput pins the
+// implementation-plan.md:310 scenario shape `Materialize("file:///path", "")`:
+// the materializer MUST accept a `file://` URL as `rootDir`,
+// decode it back to a filesystem path, and behave identically to
+// the plain-path call.
+func TestLocalDirMaterializer_acceptsFileURLInput(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	if err := writeTextFile(filepath.Join(root, "a.go"), "package a\n"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	absRoot, _ := filepath.Abs(root)
+	fileURL := synthesizeFileURL(absRoot) // exact shape the CLI will hand us
+
+	m := &LocalDirMaterializer{}
+	ws, err := m.Materialize(context.Background(), fileURL, "")
+	if err != nil {
+		t.Fatalf("Materialize(file://): %v", err)
+	}
+	defer ws.Close()
+
+	// Walk must surface the same single file -- proof the URL
+	// was decoded and rooted at the right directory.
+	var got []string
+	if err := ws.Walk(func(f WalkFile) error {
+		got = append(got, f.RelPath)
+		return nil
+	}); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if !sliceEqual(got, []string{"a.go"}) {
+		t.Errorf("Walk on file:// URL got %v, want [a.go]", got)
+	}
+
+	// And the synthesised URL on the workspace round-trips:
+	// scanning via `file://X` produces a workspace whose URL()
+	// equals synthesizeFileURL(X) -- decoding was lossless.
+	if ws.URL() != fileURL {
+		t.Errorf("URL round-trip: got %q, want %q", ws.URL(), fileURL)
 	}
 }
 
@@ -83,7 +133,7 @@ func TestLocalDirMaterializer_nonGitDirYieldsStableMTimeSHA(t *testing.T) {
 func TestLocalDirMaterializer_gitDirYieldsRevParseHEAD(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	// `.git/` must exist (and be a directory) for the materializer
+	// `.git/` must exist (as a directory) for the materializer
 	// to take the git-rev-parse branch.
 	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o755); err != nil {
 		t.Fatalf("mkdir .git: %v", err)
@@ -111,9 +161,8 @@ func TestLocalDirMaterializer_gitDirYieldsRevParseHEAD(t *testing.T) {
 		t.Fatalf("Materialize: %v", err)
 	}
 	defer ws.Close()
-	ldw := ws.(*localDirWorkspace)
-	if ldw.SHA() != headSHA {
-		t.Errorf("SHA: got %q, want %q", ldw.SHA(), headSHA)
+	if ws.SHA() != headSHA {
+		t.Errorf("SHA: got %q, want %q", ws.SHA(), headSHA)
 	}
 	wantArgs := []string{"rev-parse", "HEAD"}
 	if !sliceEqual(seenArgs, wantArgs) {
@@ -127,6 +176,47 @@ func TestLocalDirMaterializer_gitDirYieldsRevParseHEAD(t *testing.T) {
 	absRoot, _ := filepath.Abs(root)
 	if seenDir != absRoot {
 		t.Errorf("runGitCmd dir: got %q, want %q", seenDir, absRoot)
+	}
+}
+
+// TestLocalDirMaterializer_gitFileTriggersRevParse covers the
+// linked-worktree / submodule case: `.git` may be a FILE (a
+// `gitdir:` pointer) rather than a directory. The materializer
+// must still invoke `git rev-parse HEAD` instead of falling
+// through to the mtime fingerprint, since git itself understands
+// both forms.
+func TestLocalDirMaterializer_gitFileTriggersRevParse(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	// Worktree-style `.git` is a regular file containing a
+	// `gitdir:` pointer. Content is not parsed by the
+	// materializer -- existence + non-dir is enough.
+	if err := os.WriteFile(filepath.Join(root, ".git"),
+		[]byte("gitdir: /elsewhere/.git/worktrees/wt\n"), 0o644); err != nil {
+		t.Fatalf("write .git file: %v", err)
+	}
+	if err := writeTextFile(filepath.Join(root, "main.go"), "package x\n"); err != nil {
+		t.Fatalf("seed main.go: %v", err)
+	}
+
+	const headSHA = "abcdef0123456789abcdef0123456789abcdef01"
+	called := false
+	m := &LocalDirMaterializer{
+		runGitCmd: func(_ context.Context, _, _ string, _ ...string) (string, error) {
+			called = true
+			return headSHA + "\n", nil
+		},
+	}
+	ws, err := m.Materialize(context.Background(), root, "")
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	defer ws.Close()
+	if !called {
+		t.Fatal("git rev-parse HEAD must be invoked when .git is a file (linked worktree); was not called")
+	}
+	if ws.SHA() != headSHA {
+		t.Errorf("SHA: got %q, want %q", ws.SHA(), headSHA)
 	}
 }
 
@@ -159,9 +249,8 @@ func TestLocalDirMaterializer_operatorSuppliedSHAOverrides(t *testing.T) {
 		t.Fatalf("Materialize: %v", err)
 	}
 	defer ws.Close()
-	ldw := ws.(*localDirWorkspace)
-	if ldw.SHA() != override {
-		t.Errorf("SHA: got %q, want override %q", ldw.SHA(), override)
+	if ws.SHA() != override {
+		t.Errorf("SHA: got %q, want override %q", ws.SHA(), override)
 	}
 }
 
@@ -280,5 +369,53 @@ func TestLocalDirMaterializer_notADirectoryRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not a directory") {
 		t.Errorf("error message: %v", err)
+	}
+}
+
+// TestDecodeFileURL_roundTrips covers the small URL <-> path
+// helper directly so we catch shape regressions independent of
+// the full Materialize path. Covers POSIX, Windows, and
+// passthrough-of-plain-paths.
+func TestDecodeFileURL_roundTrips(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		input string
+		want  string
+		onOS  string // "" for all
+	}{
+		{name: "plain-passthrough-posix", input: "/foo/bar", want: "/foo/bar"},
+		{name: "plain-passthrough-windows", input: `C:\code\repo`, want: `C:\code\repo`},
+		{name: "posix-file-url", input: "file:///foo/bar", want: "/foo/bar", onOS: "linux"},
+		{name: "windows-file-url", input: "file:///c:/code/repo", want: "c:/code/repo", onOS: "windows"},
+		{name: "windows-uppercase-drive", input: "file:///C:/code/repo", want: "C:/code/repo", onOS: "windows"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if tc.onOS != "" && runtime.GOOS != tc.onOS {
+				t.Skipf("os-specific: %s", tc.onOS)
+			}
+			got, err := decodeFileURL(tc.input)
+			if err != nil {
+				t.Fatalf("decodeFileURL(%q): %v", tc.input, err)
+			}
+			if got != tc.want {
+				t.Errorf("decodeFileURL(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDecodeFileURL_rejectsRemoteHost guards against the
+// `file://server/share/path` shape silently being treated as a
+// local path. UNC-style remote file URLs are out of scope for
+// the local-dir materializer.
+func TestDecodeFileURL_rejectsRemoteHost(t *testing.T) {
+	t.Parallel()
+	_, err := decodeFileURL("file://remote-host/share/repo")
+	if err == nil {
+		t.Fatal("expected error for remote host in file URL; got nil")
 	}
 }

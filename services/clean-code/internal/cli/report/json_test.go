@@ -260,9 +260,129 @@ func TestJSON_WriterErrorSurfaced(t *testing.T) {
 	}
 }
 
+// TestJSON_RenderFromBytes_RoundTrip verifies the
+// Stage 3.4 happy path: a [RunArtifact] rendered by
+// [JSON.Render] and then fed through
+// [JSON.RenderFromBytes] produces a non-empty markdown
+// document that mentions the artifact's RootPath +
+// Verdict tokens (proof that the unmarshal->markdown
+// pipeline executed end-to-end).
+func TestJSON_RenderFromBytes_RoundTrip(t *testing.T) {
+	art := report.RunArtifact{
+		SchemaVersion: report.SchemaVersionCurrent,
+		Context:       repocontext.RepoContext{RootPath: "/repos/example"},
+		Verdict:       rule_engine.EvaluationVerdict{Verdict: rule_engine.VerdictPass},
+	}
+	var jsonBuf bytes.Buffer
+	if err := (report.JSON{}).Render(context.Background(), art, &jsonBuf); err != nil {
+		t.Fatalf("Render returned %v", err)
+	}
+	var mdBuf bytes.Buffer
+	if err := (report.JSON{}).RenderFromBytes(jsonBuf.Bytes(), &mdBuf); err != nil {
+		t.Fatalf("RenderFromBytes returned %v", err)
+	}
+	md := mdBuf.String()
+	for _, want := range []string{"/repos/example", "Verdict:"} {
+		if !strings.Contains(md, want) {
+			t.Errorf("markdown missing %q\n---\n%s", want, md)
+		}
+	}
+}
+
+// TestJSON_RenderFromBytes_SchemaMismatch pins the
+// Stage 3.4 refusal contract: a findings.json whose
+// schemaVersion does not match [SchemaVersionCurrent]
+// returns a typed [*SchemaVersionMismatchError] carrying
+// BOTH versions verbatim. The composition root in
+// `cmd/cleanc/main.go` uses [errors.As] on this type to
+// map to [flags.ExitUsage] (64) with a clear stderr line.
+func TestJSON_RenderFromBytes_SchemaMismatch(t *testing.T) {
+	const staleVersion = "v0.0.0"
+	body := []byte(`{"schemaVersion":"` + staleVersion + `","Context":{"RootPath":"/x"}}`)
+
+	var buf bytes.Buffer
+	err := (report.JSON{}).RenderFromBytes(body, &buf)
+	if err == nil {
+		t.Fatal("RenderFromBytes(stale schema) returned nil error; want non-nil")
+	}
+	var smErr *report.SchemaVersionMismatchError
+	if !errors.As(err, &smErr) {
+		t.Fatalf("expected error to wrap *SchemaVersionMismatchError; got %T: %v",
+			err, err)
+	}
+	if smErr.Got != staleVersion {
+		t.Errorf("Got = %q, want %q", smErr.Got, staleVersion)
+	}
+	if smErr.Want != report.SchemaVersionCurrent {
+		t.Errorf("Want = %q, want %q", smErr.Want, report.SchemaVersionCurrent)
+	}
+	// Defensive: no bytes written when refusal fires.
+	if buf.Len() != 0 {
+		t.Errorf("expected no bytes written on schema mismatch; wrote %d bytes",
+			buf.Len())
+	}
+	// The error string itself must mention both versions
+	// so log lines / crash dumps surface the skew even if
+	// the dispatcher's stderr line is lost.
+	for _, want := range []string{staleVersion, report.SchemaVersionCurrent} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error string missing %q: %v", want, err)
+		}
+	}
+}
+
+// TestJSON_RenderFromBytes_EmptySchemaIsMismatch asserts
+// that a findings.json missing the `schemaVersion` tag
+// entirely is treated as a mismatch (Got == "") -- the
+// [JSON.Render] path auto-stamps the current version on
+// every emitted document, so a missing tag necessarily
+// means the bytes did not come from any released cleanc
+// build.
+func TestJSON_RenderFromBytes_EmptySchemaIsMismatch(t *testing.T) {
+	var buf bytes.Buffer
+	err := (report.JSON{}).RenderFromBytes([]byte(`{"Context":{"RootPath":"/x"}}`), &buf)
+	var smErr *report.SchemaVersionMismatchError
+	if !errors.As(err, &smErr) {
+		t.Fatalf("expected *SchemaVersionMismatchError; got %T: %v", err, err)
+	}
+	if smErr.Got != "" {
+		t.Errorf("Got = %q, want empty string", smErr.Got)
+	}
+}
+
+// TestJSON_RenderFromBytes_InvalidJSON asserts a parse
+// failure is surfaced verbatim (wrapped) so the
+// composition root's stderr line points at the offending
+// path rather than a generic "render failed".
+func TestJSON_RenderFromBytes_InvalidJSON(t *testing.T) {
+	var buf bytes.Buffer
+	err := (report.JSON{}).RenderFromBytes([]byte("{not json"), &buf)
+	if err == nil {
+		t.Fatal("RenderFromBytes(garbage) returned nil error; want non-nil")
+	}
+	if !strings.Contains(err.Error(), "unmarshal previous findings") {
+		t.Errorf("expected error to mention unmarshal step; got %v", err)
+	}
+}
+
+// TestJSON_RenderFromBytes_RejectsNilWriter pins the
+// nil-writer guard parity with [JSON.Render] -- a CLI
+// caller that mis-wires a nil writer gets a clear error
+// rather than a panic from the markdown renderer.
+func TestJSON_RenderFromBytes_RejectsNilWriter(t *testing.T) {
+	err := (report.JSON{}).RenderFromBytes([]byte(`{}`), nil)
+	if err == nil {
+		t.Fatal("RenderFromBytes(..., nil writer) returned nil error; want non-nil")
+	}
+	if !strings.Contains(err.Error(), "non-nil writer") {
+		t.Errorf("expected error to mention `non-nil writer`; got %v", err)
+	}
+}
+
 type failingWriter struct{ err error }
 
 func (f *failingWriter) Write(p []byte) (int, error) { return 0, f.err }
+
 
 // TestJSON_RejectsNilWriter pins the iter-1 evaluator's
 // hardening ask: the renderer MUST surface a clear error for

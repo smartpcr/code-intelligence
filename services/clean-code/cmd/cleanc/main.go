@@ -17,12 +17,14 @@
 //     `internal/cli/flags`).
 //   - Process exit codes pinned in `tech-spec.md` Sec 8.6
 //     (`0`/`1`/`2`/`64`/`70`).
-//   - The `version` body, which emits a line matching the
-//     e2e-scenarios.md regex
+//   - The `version` body, which emits a SINGLE line
+//     matching the e2e-scenarios.md regex
 //     `^cleanc \d+\.\d+\.\d+ \(build-tag=(|prod)\) \(parsers=[^)]+\) \(rule-packs=[^)]+\)$`
-//     followed by implementation-plan substring lines
-//     (`version=`, `parsers=[go,python,typescript,java]`,
-//     ...).
+//     terminated by exactly one `\n` (Stage 3.4 finalised
+//     format; the earlier follow-on `version=` / `commit=` /
+//     `build_time=` / bracketed `parsers=[...]` diagnostic
+//     lines were dropped to keep CI consumers from pinning
+//     non-contract substrings).
 //
 // Subsequent stages replace the `analyze` / `report` /
 // `apply` bodies with their real implementations:
@@ -42,6 +44,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -50,14 +53,17 @@ import (
 	"strings"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/flags"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/report"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/version"
 )
 
-// skeletonParsers is the hard-coded list of language tags the
-// skeleton emits in the `cleanc version` output. The order
-// matters: implementation-plan.md Stage 1.1 line 41 pins the
-// literal substring `parsers=[go,python,typescript,java]`, so
-// changing the order requires updating the impl-plan check too.
+// skeletonParsers is the hard-coded list of language tags
+// the dispatcher emits in the `cleanc version` output's
+// `(parsers=<csv>)` segment. The order matters: the CSV
+// is byte-stable across builds and the
+// `TestVersionContainsImplPlanSubstrings` test pins the
+// literal substring `(parsers=go,python,typescript,java)`,
+// so reordering requires updating the test too.
 //
 // Stage 1.4 replaces this with a dynamic lookup against
 // `parser.DefaultRegistry().Languages()` once the policy
@@ -130,23 +136,31 @@ func writeGlobalUsage(w io.Writer) {
 	fmt.Fprintln(w, "run `cleanc help <subcommand>` for per-sub-command flag documentation.")
 }
 
-// runVersion prints the binary version, the parser set, and
-// the rule-pack set. Output format is pinned by:
+// runVersion prints the binary version, the parser set,
+// and the rule-pack set on a SINGLE line, terminated by
+// exactly one `\n`. Stage 3.4 (implementation-plan.md
+// line 328) finalises the output to the format:
 //
+//	cleanc <semver> (build-tag=<tag>) (parsers=<csv>) (rule-packs=<csv>)
+//
+// pinned by:
+//
+//   - the workstream brief (Stage 3.4) -- the single-line
+//     format is the contract;
 //   - e2e-scenarios.md line 146 (regex):
-//     `^cleanc \d+\.\d+\.\d+ \(build-tag=(|prod)\) \(parsers=[^)]+\) \(rule-packs=[^)]+\)$`
-//   - e2e-scenarios.md line 147 (set check):
-//     stdout contains `parsers=` whose CSV value is exactly the
-//     set `{go, python, typescript, java}`.
-//   - implementation-plan.md Stage 1.1 line 41 (substrings):
-//     stdout includes `version=` and
-//     `parsers=[go,python,typescript,java]`.
+//     `^cleanc \d+\.\d+\.\d+ \(build-tag=(|prod)\) \(parsers=[^)]+\) \(rule-packs=[^)]+\)$`;
+//   - e2e-scenarios.md line 147 (CSV set check): the
+//     `parsers=` CSV value is exactly the set
+//     `{go, python, typescript, java}`.
 //
-// To satisfy all three, the first line is the strict-regex
-// header (CSV value, no brackets), and the subsequent lines
-// carry the impl-plan substrings (`version=`, bracketed
-// `parsers=[...]`, etc.) plus operator-debug stamps (commit,
-// build_time).
+// The earlier Stage 1.1 skeleton body also emitted
+// follow-on diagnostic lines (`version=`, `commit=`,
+// `build_time=`, bracketed `parsers=[...]` /
+// `rule-packs=[...]`); those were dropped at Stage 3.4
+// because they would let a CI consumer accidentally pin a
+// non-contract substring. The full-stdout pin lives in
+// `TestVersionFormatExact` and the single-line guard in
+// `TestVersionFormatIsExactlyOneLine`.
 func runVersion(stdout, stderr io.Writer, args []string) int {
 	fs := flag.NewFlagSet("cleanc version", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -168,11 +182,6 @@ func runVersion(stdout, stderr io.Writer, args []string) int {
 
 	fmt.Fprintf(stdout, "cleanc %s (build-tag=%s) (parsers=%s) (rule-packs=%s)\n",
 		semver, buildTag, parserCSV, rulePackCSV)
-	fmt.Fprintf(stdout, "version=%s\n", version.Version)
-	fmt.Fprintf(stdout, "commit=%s\n", version.Commit)
-	fmt.Fprintf(stdout, "build_time=%s\n", version.BuildTime)
-	fmt.Fprintf(stdout, "parsers=[%s]\n", parserCSV)
-	fmt.Fprintf(stdout, "rule-packs=[%s]\n", rulePackCSV)
 	return flags.ExitOK
 }
 
@@ -324,11 +333,96 @@ func runReport(stdout, stderr io.Writer, args []string) int {
 		return flags.ExitUsage
 	}
 
-	_ = g
-	_ = stdout
+	// Stage 3.4: re-render markdown from the supplied
+	// findings.json artifact without re-running the
+	// pipeline. The helper [report.JSON.RenderFromBytes]
+	// is the single re-render seam (implementation-plan.md
+	// Stage 3.2 line 285); a schemaVersion mismatch
+	// short-circuits to ExitUsage (64) with both versions
+	// named so a stale CLI invoked against a newer artifact
+	// fails loudly rather than producing a partial render.
+	//
+	// Iter-2 evaluator item 2: render into an in-memory
+	// buffer FIRST and only open / write to `--out` after a
+	// successful render. The iter-1 ordering created or
+	// truncated the destination file before validating
+	// `schemaVersion`, so a refused artifact would still
+	// destroy an existing report file before the dispatcher
+	// returned. With a staged buffer, a schema-mismatch
+	// refusal (exit 64) leaves the destination file
+	// untouched.
+	findingsPath := positionals[0]
+	data, err := os.ReadFile(findingsPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "cleanc report: read %s: %v\n", findingsPath, err)
+		return flags.ExitInternalError
+	}
 
-	fmt.Fprintln(stderr, "cleanc report: re-render not yet wired in the Stage 1.1 skeleton; the report renderer lands in Stage 4.1.")
-	return flags.ExitInternalError
+	var buf bytes.Buffer
+	if err := (report.JSON{}).RenderFromBytes(data, &buf); err != nil {
+		var smErr *report.SchemaVersionMismatchError
+		if errors.As(err, &smErr) {
+			// Both versions are named verbatim so the operator
+			// can pin the artifact-vs-binary skew without
+			// re-reading either file. Stage 3.4 brief: "exit
+			// 64 with a clear message naming both versions".
+			fmt.Fprintf(stderr,
+				"cleanc report: refusing to read %s: schemaVersion %q does not match this binary's %q (rebuild or re-run analyze with a matching cleanc version)\n",
+				findingsPath, smErr.Got, smErr.Want)
+			return flags.ExitUsage
+		}
+		fmt.Fprintf(stderr, "cleanc report: render failed: %v\n", err)
+		return flags.ExitInternalError
+	}
+
+	// Render succeeded -- now stage the bytes to the
+	// destination. Empty `--out` writes to stdout; any
+	// non-empty value opens / truncates the named file.
+	if g.Out != nil && *g.Out != "" {
+		// Iter-2 evaluator item 3: surface Close failures.
+		// A delayed flush failure on the file handle MUST
+		// not be silently swallowed -- otherwise a "render
+		// succeeded" report can still arrive truncated /
+		// missing on disk. Both the Write and Close paths
+		// map to ExitInternalError (70).
+		if err := writeOutputFile(*g.Out, buf.Bytes()); err != nil {
+			fmt.Fprintf(stderr, "cleanc report: write %s: %v\n", *g.Out, err)
+			return flags.ExitInternalError
+		}
+		return flags.ExitOK
+	}
+
+	if _, err := stdout.Write(buf.Bytes()); err != nil {
+		fmt.Fprintf(stderr, "cleanc report: write stdout: %v\n", err)
+		return flags.ExitInternalError
+	}
+	return flags.ExitOK
+}
+
+// writeOutputFile creates (or truncates) `path`, writes
+// `data` to it, and explicitly surfaces a Close failure.
+// Iter-2 evaluator item 3: a deferred `_ = f.Close()` would
+// silently swallow a delayed flush / network-FS failure
+// after Write succeeded; the dispatcher MUST surface that
+// case with ExitInternalError so the operator does not see
+// "success" while the report on disk is truncated.
+//
+// The helper deliberately does NOT use `defer f.Close()`:
+// when Write returns an error we close eagerly to release
+// the handle but return the Write error (the more
+// actionable cause); when Write succeeds we return Close's
+// error verbatim so a flush failure is visible to the
+// caller.
+func writeOutputFile(path string, data []byte) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	if _, werr := f.Write(data); werr != nil {
+		_ = f.Close()
+		return werr
+	}
+	return f.Close()
 }
 
 // parseInterleavedFlags runs the supplied flag-set against

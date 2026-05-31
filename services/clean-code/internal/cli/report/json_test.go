@@ -64,6 +64,7 @@ func TestJSON_RoundTripsRunArtifact(t *testing.T) {
 	findingID := uuid.Must(uuid.NewV4())
 
 	want := report.RunArtifact{
+		SchemaVersion: report.SchemaVersionCurrent,
 		Context: repocontext.RepoContext{
 			RootPath:   "/repos/example",
 			RepoID:     repoID,

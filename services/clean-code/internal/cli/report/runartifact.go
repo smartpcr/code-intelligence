@@ -72,7 +72,21 @@ type Renderer interface {
 // downstream stages; [Markdown] tolerates their zero values
 // today and will gain per-section renderers in subsequent
 // reports-and-delivery stages without rewriting the container.
+// SchemaVersionCurrent is the canonical schema version stamp
+// the JSON renderer writes into every emitted document. The
+// acceptance scenario pins this as `"v1.2026.05"`. Bumping this
+// constant is a breaking-change signal to downstream consumers
+// and MUST be paired with a brief amendment.
+const SchemaVersionCurrent = "v1.2026.05"
+
 type RunArtifact struct {
+	// SchemaVersion is the version tag stamped on every JSON
+	// artifact so downstream consumers can detect format drift.
+	// The [JSON] renderer auto-stamps this to
+	// [SchemaVersionCurrent] when the field is empty, so the
+	// composition root does not need to set it explicitly.
+	SchemaVersion string `json:"schemaVersion"`
+
 	// Context is the repo-root identity stamped by the
 	// composition root -- `repo_id`, `head_sha`, `module_path`
 	// -- per architecture Sec 4.1. The renderer reads

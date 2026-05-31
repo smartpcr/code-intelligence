@@ -373,23 +373,47 @@ func writeManyAggregate(w io.Writer, a *manyAggregate, format string) error {
 			Failures:  a.failures,
 		})
 	}
-	fmt.Fprintln(w, "scan-many aggregate:")
-	fmt.Fprintf(w, "  succeeded: %d\n", a.succeeded)
-	fmt.Fprintf(w, "  failed:    %d\n", a.failed)
-	fmt.Fprintf(w, "  walked:    %d\n", a.walked)
-	fmt.Fprintf(w, "  parsed:    %d\n", a.parsed)
-	fmt.Fprintf(w, "  nodes:     %s\n", formatKindMap(a.nodes))
-	fmt.Fprintf(w, "  edges:     %s\n", formatKindMap(a.edges))
+	ew := &errWriter{w: w}
+	fmt.Fprintln(ew, "scan-many aggregate:")
+	fmt.Fprintf(ew, "  succeeded: %d\n", a.succeeded)
+	fmt.Fprintf(ew, "  failed:    %d\n", a.failed)
+	fmt.Fprintf(ew, "  walked:    %d\n", a.walked)
+	fmt.Fprintf(ew, "  parsed:    %d\n", a.parsed)
+	fmt.Fprintf(ew, "  nodes:     %s\n", formatKindMap(a.nodes))
+	fmt.Fprintf(ew, "  edges:     %s\n", formatKindMap(a.edges))
 	if len(a.failures) > 0 {
 		// Stable order: by manifest line number.
 		sorted := append([]manyFailure(nil), a.failures...)
 		sort.Slice(sorted, func(i, j int) bool { return sorted[i].Line < sorted[j].Line })
-		fmt.Fprintln(w, "  failures:")
+		fmt.Fprintln(ew, "  failures:")
 		for _, f := range sorted {
-			fmt.Fprintf(w, "    line %d: %s -- %s\n", f.Line, f.Input, f.Reason)
+			fmt.Fprintf(ew, "    line %d: %s -- %s\n", f.Line, f.Input, f.Reason)
 		}
 	}
-	return nil
+	return ew.err
+}
+
+// errWriter wraps an io.Writer and latches the first write
+// error, letting callers issue a series of fmt.Fprintf calls
+// and check a single error at the end. Subsequent writes after
+// an error are dropped so a broken pipe / full disk surfaces
+// once instead of being silently swallowed (reviewer feedback
+// on scan_many.go: text path must propagate writer errors the
+// same way the JSON path's enc.Encode does).
+type errWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (e *errWriter) Write(p []byte) (int, error) {
+	if e.err != nil {
+		return 0, e.err
+	}
+	n, err := e.w.Write(p)
+	if err != nil {
+		e.err = err
+	}
+	return n, err
 }
 
 // writeManyFailureLine emits the per-repo `failed: <reason>`

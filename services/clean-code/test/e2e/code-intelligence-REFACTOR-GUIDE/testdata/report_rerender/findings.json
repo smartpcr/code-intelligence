@@ -1,0 +1,62 @@
+{
+  "schemaVersion": "v1.2026.05",
+  "Context": {
+    "RootPath": "/repos/example",
+    "RepoID": "00000000-0000-0000-0000-000000000000",
+    "HeadSHA": "deadbeef",
+    "ModulePath": "",
+    "IsGitRepo": false
+  },
+  "Policy": {
+    "policy_version_id": "00000000-0000-0000-0000-000000000000",
+    "name": "",
+    "rule_refs": null,
+    "threshold_refs": null,
+    "refactor_weights": {
+      "alpha": 0,
+      "beta": 0,
+      "gamma": 0,
+      "delta": 0,
+      "effort_model_version": "",
+      "window_days": 0
+    },
+    "signature": null,
+    "created_at": "0001-01-01T00:00:00Z"
+  },
+  "Files": null,
+  "Skips": null,
+  "DarkMetrics": null,
+  "Samples": null,
+  "Run": {
+    "EvaluationRunID": "00000000-0000-0000-0000-000000000000",
+    "RepoID": "00000000-0000-0000-0000-000000000000",
+    "SHA": "",
+    "PolicyVersionID": "00000000-0000-0000-0000-000000000000",
+    "Caller": "",
+    "ScopeID": null,
+    "CreatedAt": "0001-01-01T00:00:00Z"
+  },
+  "Verdict": {
+    "VerdictID": "00000000-0000-0000-0000-000000000000",
+    "EvaluationRunID": "00000000-0000-0000-0000-000000000000",
+    "Verdict": "pass",
+    "Degraded": false,
+    "DegradedReason": "",
+    "CreatedAt": "0001-01-01T00:00:00Z"
+  },
+  "Findings": null,
+  "HotSpots": null,
+  "Plan": {
+    "PlanID": "00000000-0000-0000-0000-000000000000",
+    "RepoID": "00000000-0000-0000-0000-000000000000",
+    "SHA": "",
+    "HotspotIDs": null,
+    "SummaryMD": "",
+    "CreatedAt": "0001-01-01T00:00:00Z"
+  },
+  "Tasks": null,
+  "Diagnostics": {
+    "dark_metrics": null,
+    "effort_source": ""
+  }
+}

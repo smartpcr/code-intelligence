@@ -219,16 +219,18 @@ func findEnclosingFile(pass *analysis.Pass, n ast.Node) *ast.File {
 // ends with `stewardPackagePathSuffix` and whose name matches
 // `stewardPolicyVersionTypeName`.
 func isUnsignedStewardPolicyVersion(pass *analysis.Pass, cl *ast.CompositeLit) bool {
-	if cl.Type == nil {
-		// Elided composite literal (e.g. `[]PolicyVersion{{...}}`);
-		// the outer literal carries the type for our purposes.
+	// We deliberately do NOT short-circuit on `cl.Type == nil`:
+	// for an elided inner literal such as
+	// `[]steward.PolicyVersion{{Signature: nil}}` the inner
+	// CompositeLit has no explicit `Type` AST node, but the
+	// type checker still records the inferred element type
+	// in `pass.TypesInfo.Types[cl].Type` -- so we resolve via
+	// that map for both forms.
+	tv, ok := pass.TypesInfo.Types[cl]
+	if !ok || tv.Type == nil {
 		return false
 	}
-	t := pass.TypesInfo.TypeOf(cl)
-	if t == nil {
-		return false
-	}
-	named := namedFromType(t)
+	named := namedFromType(tv.Type)
 	if named == nil {
 		return false
 	}

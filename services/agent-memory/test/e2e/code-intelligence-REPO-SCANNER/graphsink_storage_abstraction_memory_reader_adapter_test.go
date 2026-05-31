@@ -492,6 +492,7 @@ func (s *memLookupFastPathState) thenNodeReturnedInO1(ctx context.Context) error
 	// ---- Benchmark: lookup on 1-node sink vs 1000-node sink ----
 	// Build a large sink with 1000 method nodes.
 	largeSink := memory.New(memory.Options{})
+	defer largeSink.Close()
 	repoID := s.repoID
 	if _, err := largeSink.EnsureRepo(context.Background(), graphwriter.RepoInput{
 		URL: memReaderRepoURL, DefaultBranch: "main",
@@ -536,8 +537,6 @@ func (s *memLookupFastPathState) thenNodeReturnedInO1(ctx context.Context) error
 		return fmt.Errorf("large LookupBySignature returned sig %q, want %q",
 			largeNode.CanonicalSignature, targetSig)
 	}
-
-	_ = largeSink.Close()
 
 	return nil
 }

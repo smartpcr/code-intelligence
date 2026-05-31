@@ -75,27 +75,46 @@ var callChainEdgeKinds = []string{"static_calls", "observed_calls"}
 
 // BuildCallChain projects a left-right call-chain diagram by
 // performing a bounded BFS around the resolved `seed` Node up to
-// `depth` hops. Seed resolution tries two forms in order:
+// `depth` hops. Seed resolution follows the brief's contract --
+// "first via LookupBySignature then via GetNode if it parses as
+// a UUID" -- and accepts THREE concrete seed shapes the CLI /
+// HTTP handler / React UI synthesize:
 //
-//  1. ENCODED TRIPLE -- `<repoID>|<kind>|<canonical-signature>`,
-//     forwarded to `reader.LookupBySignature`. This is the form
-//     the `codeintel diagram calls --seed <sig>` CLI and the
-//     `GET /api/diagram/calls?seed=...` handler synthesize when
-//     the user passes a human-readable signature (architecture
-//     S5.6). The `ParseRepoID` strictness rejects any seed where
-//     the first segment is not a 36-character canonical UUID,
-//     which falls through to form 2.
+//  1. BARE CANONICAL SIGNATURE -- e.g.
+//     `com.example.Greeter#greet(java.lang.String)`. The CLI
+//     `codeintel diagram calls --seed <sig>` and the HTTP
+//     `GET /api/diagram/calls?seed=<sig>` paths pass the bare
+//     signature without an explicit kind. resolveSeed enumerates
+//     `ListRepos` x `callChainSeedKinds` and returns the first
+//     matching Node (architecture S4.4 / S5.6, "BFS rooted at a
+//     chosen symbol resolved by `canonical_signature`"). First
+//     match wins; ordering of `callChainSeedKinds` pins
+//     determinism across runs.
 //
-//  2. BARE NODE ID -- forwarded to `reader.GetNode`. This is the
-//     form the `<CallChainNav>` React component re-issues when
-//     the user clicks a node (architecture S6.5: "re-seed the
-//     BFS with the clicked node id"). Works for any backend
-//     because Postgres uses UUIDs and the memory/SQLite backends
-//     use synthetic IDs -- `GetNode` is opaque to the format.
+//  2. ENCODED TRIPLE -- `<repoID>|<kind>|<canonical-signature>`
+//     (the `|` separator is `CallChainSeedSeparator`). A future
+//     handler that already knows the (repo, kind) pair can pin
+//     resolution to a single LookupBySignature call. Useful when
+//     the same `canonical_signature` collides across kinds /
+//     repos. This is a convenience over form 1, not a contract
+//     requirement.
 //
-// Both forms map an unresolved seed onto `ErrSeedNotFound` with
-// a zero-value Diagram, satisfying e2e-scenarios.md
-// `callchain-unresolved-seed-returns-error-envelope`.
+//  3. CANONICAL UUID NODE ID -- forwarded to `reader.GetNode`
+//     ONLY when the seed parses as a 36-character canonical
+//     UUID via `fingerprint.ParseRepoID`. This is the
+//     `<CallChainNav>` re-seed path (architecture S6.5: the UI
+//     re-issues `?seed=<node-id>` with the clicked Node's id,
+//     and Postgres `gen_random_uuid()` produces UUID node ids
+//     per migration 0003). NON-UUID strings are NOT forwarded
+//     to GetNode -- the brief's "if it parses as a UUID" gate
+//     keeps synthetic ids (e.g. `n-0000001` from the memory /
+//     SQLite backends) from accidentally resolving here. Memory
+//     / SQLite scans must reach their nodes through form 1 or 2.
+//
+// An unresolved seed surfaces `ErrSeedNotFound` (sentinel,
+// `errors.Is` compatible; carries the literal string
+// `"seed_not_found"`) and a zero-value Diagram, satisfying
+// e2e-scenarios.md `callchain-unresolved-seed-returns-error-envelope`.
 //
 // BFS semantics:
 //   - `direction = "callees"` walks `ListEdgesFrom` only.

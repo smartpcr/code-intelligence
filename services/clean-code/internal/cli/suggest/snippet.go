@@ -163,13 +163,16 @@ func ExtractSnippet(absFilePath string, startLine, endLine int, maxLines int) (s
 		if len(s) > 0 && s[len(s)-1] != '\n' {
 			b.WriteByte('\n')
 		}
-		// Suppressed count = total available - cap. From the
-		// caller's perspective, "I asked for N, the cap was M,
-		// (N - M) lines are missing from the snippet." The
-		// sentinel itself occupies one of the M displayed
-		// slots; that displacement is implicit and not added
-		// to the count.
-		suppressed := availableInRange - maxLines
+		// Suppressed count = available source lines minus the
+		// (maxLines-1) source lines actually shown. The
+		// sentinel occupies one of the M displayed slots, so
+		// only (M-1) source lines survive; every other source
+		// line in the requested range is suppressed and MUST
+		// be counted. This matches the docstring formula
+		// N = requested - (maxLines - 1) and the caller-facing
+		// promise that the sentinel reports the true number of
+		// source lines absent from the snippet.
+		suppressed := availableInRange - (maxLines - 1)
 		fmt.Fprintf(&b, "%s%d lines]", truncationSentinelPrefix, suppressed)
 		truncated = true
 	} else {

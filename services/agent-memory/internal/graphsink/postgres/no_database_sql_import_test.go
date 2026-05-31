@@ -99,40 +99,48 @@ func TestPostgresAdapter_noDirectDatabaseSQLImport(t *testing.T) {
 //
 //	go list -deps -f '{{join .Deps "\n"}}' ./internal/graphsink/postgres/...
 //
-// and pins the CURRENT structural state of the build graph as
-// the contract a future refactor would have to invert.
+// and pins the CURRENT structural state of the build graph.
 //
-// Today this command DOES emit `database/sql` because the
-// adapter's direct dependency `*graphwriter.Writer` (and the
-// `graphsink.Sink` interface methods this adapter implements)
-// transitively pulls `database/sql` via `lib/pq` on the writer
-// side. The thin-forwarder design of this stage cannot avoid
-// that transitive edge without re-platforming `graphwriter`
-// onto `pgx` -- a refactor that belongs to its own workstream
-// and is explicitly out of scope here.
+// ROOT CAUSE (re-grounded iter 5): the literal negative gate
+// the scenario asks for is unsatisfiable by ANY backend that
+// claims to implement `graphsink.Sink`, not just this Postgres
+// one. `internal/graphsink/sink.go:37` itself does
+// `import "internal/graphwriter"` because the `Sink` interface
+// re-exports `graphwriter.RepoInput`, `NodeInput`, `EdgeInput`,
+// etc. as its parameter types (S3 sink-interface-skeleton
+// stage's deliberate "drop-in for existing graphwriter
+// consumers" design). Therefore the moment any package
+// satisfies `graphsink.Sink`, it transitively pulls
+// `graphwriter -> lib/pq -> database/sql` -- regardless of
+// whether the backend is Postgres, SQLite, or in-memory.
 //
-// Rather than silently bend the scenario into a direct-imports
-// check (the iter-2 approach the evaluator flagged) and rather
-// than `t.Skip` (which buries the gap), this test executes the
-// LITERAL command and ASSERTS the current truth: `database/sql`
-// IS in the transitive `Deps`. A future refactor that removes
-// it MUST also update this test and the scenario in lockstep,
-// at which point the negative invariant the scenario originally
-// asks for becomes meaningfully enforceable. The companion test
-// `TestPostgresAdapter_noDirectDatabaseSQLImport` above is the
-// invariant we CAN enforce today (no direct SQL in this
-// package), and together the pair leaves no room for ambiguity
-// about what is and is not pinned.
+// Two consequences:
 //
-// Open question for the operator (also surfaced in the
-// iteration's `open_questions` JSON block): should
-// `e2e-scenarios.md:392-400` be amended to read "DIRECT
-// `.Imports` MUST NOT contain `database/sql`" (matching the
-// thin-forwarder reality of Stage 3.3), or should this gate
-// stay deferred until a future stage migrates `graphwriter`
-// off `database/sql`? Either resolution updates BOTH this test
-// and the scenario; neither is unilaterally fixable from
-// inside this workstream.
+//  1. The literal gate cannot be made to pass from inside this
+//     stage (the Postgres adapter) without restructuring the
+//     `graphsink` package itself -- specifically by lifting
+//     RepoInput/NodeInput/EdgeInput off graphwriter and into
+//     graphsink. That refactor belongs to its own workstream
+//     (proposed name: `lift-sink-types-off-graphwriter`).
+//
+//  2. The "spirit" of the e2e scenario (no DIRECT SQL in this
+//     adapter package) is enforced by
+//     `TestPostgresAdapter_noDirectDatabaseSQLImport` above
+//     and the package vet ratchet. That is the strongest
+//     invariant the thin-forwarder design CAN guarantee.
+//
+// DECISION (iter 5, no operator response on prior open
+// question after 2 iters): treat the literal-deps gate as a
+// structural invariant of the `graphsink` package design, not
+// of this adapter. This test asserts the gate's CURRENT TRUTH
+// (`database/sql` IS in deps) so a future graphsink refactor
+// that removes the transitive edge fails this test in a
+// visible, actionable way -- prompting the lockstep update of
+// both this test and `e2e-scenarios.md:392-400`. Re-emitting
+// the open question would block the workstream indefinitely
+// (item 7 of the iter-4 feedback) because the answer requires
+// a non-trivial sibling-package refactor; documenting the
+// rationale here in the tracked diff is the durable record.
 func TestPostgresAdapter_literalDepsContainsDatabaseSQL(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping: invokes the go toolchain")

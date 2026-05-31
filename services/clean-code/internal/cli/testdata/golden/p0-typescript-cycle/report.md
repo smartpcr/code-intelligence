@@ -19,9 +19,11 @@
 Verdict: block
 ## Findings
 
-- solid.isp.interface_width_high [warn]
 - decoupling.cycle_member_present [block]
 - solid.srp.interface_width_high [warn]
 - decoupling.cycle_member_present [block]
 - decoupling.duplication_ratio_high [warn]
+- decoupling.cycle_member_present [block]
+- decoupling.cycle_member_present [block]
+- solid.isp.interface_width_high [warn]
 

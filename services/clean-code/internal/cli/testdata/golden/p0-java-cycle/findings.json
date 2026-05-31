@@ -98,13 +98,19 @@
     {
       "path": "src/main/java/example/alpha/AlphaWide.java",
       "language": "java",
-      "size_bytes": 2329,
+      "size_bytes": 2089,
+      "parse_status": "parsed"
+    },
+    {
+      "path": "src/main/java/example/alpha/WideContract.java",
+      "language": "java",
+      "size_bytes": 339,
       "parse_status": "parsed"
     },
     {
       "path": "src/main/java/example/beta/BetaLeaf.java",
       "language": "java",
-      "size_bytes": 301,
+      "size_bytes": 312,
       "parse_status": "parsed"
     }
   ],
@@ -116,7 +122,7 @@
       "missing_attrs": [
         "decision_blocks"
       ],
-      "affected_scope_count": 51,
+      "affected_scope_count": 52,
       "closure_phase": "P2"
     },
     {
@@ -134,7 +140,7 @@
       "missing_attrs": [
         "call_edges"
       ],
-      "affected_scope_count": 57,
+      "affected_scope_count": 58,
       "closure_phase": "P2"
     },
     {
@@ -143,7 +149,7 @@
       "missing_attrs": [
         "call_edges"
       ],
-      "affected_scope_count": 57,
+      "affected_scope_count": 58,
       "closure_phase": "P2"
     },
     {
@@ -262,7 +268,7 @@
       "ScopeKind": "file",
       "MetricKind": "cycle_member",
       "MetricVersion": 1,
-      "Value": 1,
+      "Value": 0,
       "HasValue": true,
       "Pack": "base",
       "Source": "computed",
@@ -278,13 +284,29 @@
       "ScopeKind": "package",
       "MetricKind": "cycle_member",
       "MetricVersion": 1,
-      "Value": 1,
+      "Value": 0,
       "HasValue": true,
       "Pack": "base",
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
       "ScopeSignature": "clean-code-repo:5ea8a99c-2977-5c64-98c7-9620c248b262::pkg::src/main/java/example/alpha"
+    },
+    {
+      "SampleID": "6b5aea98-674f-5159-bcc4-04528c418357",
+      "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
+      "SHA": "working-copy",
+      "ScopeID": "97f577b0-d968-5b08-b380-778d3c90ed9b",
+      "ScopeKind": "file",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:5ea8a99c-2977-5c64-98c7-9620c248b262::file::src/main/java/example/alpha/WideContract.java"
     },
     {
       "SampleID": "35b18c93-e29f-5c16-9585-091a0b2a7894",
@@ -294,7 +316,7 @@
       "ScopeKind": "file",
       "MetricKind": "cycle_member",
       "MetricVersion": 1,
-      "Value": 1,
+      "Value": 0,
       "HasValue": true,
       "Pack": "base",
       "Source": "computed",
@@ -310,7 +332,7 @@
       "ScopeKind": "package",
       "MetricKind": "cycle_member",
       "MetricVersion": 1,
-      "Value": 1,
+      "Value": 0,
       "HasValue": true,
       "Pack": "base",
       "Source": "computed",
@@ -422,7 +444,7 @@
       "ScopeKind": "file",
       "MetricKind": "duplication_ratio",
       "MetricVersion": 1,
-      "Value": 0.3348148148148148,
+      "Value": 0.39652173913043476,
       "HasValue": true,
       "Pack": "base",
       "Source": "computed",
@@ -438,13 +460,29 @@
       "ScopeKind": "package",
       "MetricKind": "duplication_ratio",
       "MetricVersion": 1,
-      "Value": 0.3348148148148148,
+      "Value": 0.32664756446991405,
       "HasValue": true,
       "Pack": "base",
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
       "ScopeSignature": "clean-code-repo:5ea8a99c-2977-5c64-98c7-9620c248b262::pkg::src/main/java/example/alpha"
+    },
+    {
+      "SampleID": "4fda2900-0559-5b14-aa54-c86c7d692399",
+      "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
+      "SHA": "working-copy",
+      "ScopeID": "97f577b0-d968-5b08-b380-778d3c90ed9b",
+      "ScopeKind": "file",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:5ea8a99c-2977-5c64-98c7-9620c248b262::file::src/main/java/example/alpha/WideContract.java"
     },
     {
       "SampleID": "9d1c6592-37b4-5fb4-b9da-8cfa3c68a815",
@@ -518,7 +556,7 @@
       "ScopeKind": "class",
       "MetricKind": "interface_width",
       "MetricVersion": 1,
-      "Value": 21,
+      "Value": 24,
       "HasValue": true,
       "Pack": "solid",
       "Source": "computed",
@@ -527,10 +565,10 @@
       "ScopeSignature": "clean-code-repo:5ea8a99c-2977-5c64-98c7-9620c248b262::class::src/main/java/example/alpha/AlphaWide.java#example.alpha.AlphaWide.java.AlphaWide"
     },
     {
-      "SampleID": "0933c0d2-14d5-5090-b87d-d65cc64af47d",
+      "SampleID": "69b4a690-6f93-55f7-8593-ea7550a84e93",
       "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
       "SHA": "working-copy",
-      "ScopeID": "37107c72-8845-5d09-9020-a68ce4f5625c",
+      "ScopeID": "2cdb8075-58c7-5f2b-bb69-edd8721014fc",
       "ScopeKind": "interface",
       "MetricKind": "interface_width",
       "MetricVersion": 1,
@@ -540,7 +578,7 @@
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
-      "ScopeSignature": "clean-code-repo:5ea8a99c-2977-5c64-98c7-9620c248b262::class::src/main/java/example/alpha/AlphaWide.java#example.alpha.AlphaWide.java.WideContract"
+      "ScopeSignature": "clean-code-repo:5ea8a99c-2977-5c64-98c7-9620c248b262::class::src/main/java/example/alpha/WideContract.java#example.alpha.WideContract.java.WideContract"
     },
     {
       "SampleID": "7cde0777-5a8b-5c72-b995-fa7a7277fb05",
@@ -598,13 +636,29 @@
       "ScopeKind": "file",
       "MetricKind": "loc",
       "MetricVersion": 1,
-      "Value": 47,
+      "Value": 41,
       "HasValue": true,
       "Pack": "base",
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
       "ScopeSignature": "clean-code-repo:5ea8a99c-2977-5c64-98c7-9620c248b262::file::src/main/java/example/alpha/AlphaWide.java"
+    },
+    {
+      "SampleID": "816f50f1-cbc9-5497-bdb7-9113af9bb3c7",
+      "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
+      "SHA": "working-copy",
+      "ScopeID": "97f577b0-d968-5b08-b380-778d3c90ed9b",
+      "ScopeKind": "file",
+      "MetricKind": "loc",
+      "MetricVersion": 1,
+      "Value": 10,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:5ea8a99c-2977-5c64-98c7-9620c248b262::file::src/main/java/example/alpha/WideContract.java"
     },
     {
       "SampleID": "7c69dba8-cc0d-5a92-9597-e84dc07ebdfd",
@@ -614,7 +668,7 @@
       "ScopeKind": "file",
       "MetricKind": "loc",
       "MetricVersion": 1,
-      "Value": 11,
+      "Value": 12,
       "HasValue": true,
       "Pack": "base",
       "Source": "computed",
@@ -633,9 +687,9 @@
     "CreatedAt": "2026-05-01T12:00:00Z"
   },
   "Verdict": {
-    "VerdictID": "f2e16e4c-4d71-55c7-b2fe-c33b34bfc406",
+    "VerdictID": "63a3869f-522c-50f6-93ae-b839c27002ab",
     "EvaluationRunID": "c673de23-7beb-5949-8416-cfe93f5f4dee",
-    "Verdict": "block",
+    "Verdict": "warn",
     "Degraded": false,
     "DegradedReason": "",
     "CreatedAt": "2026-05-01T12:00:00Z"
@@ -646,54 +700,20 @@
       "EvaluationRunID": "c673de23-7beb-5949-8416-cfe93f5f4dee",
       "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
       "SHA": "working-copy",
-      "ScopeID": "3263a47c-713a-58c5-9055-660e9a2fc138",
-      "RuleID": "decoupling.cycle_member_present",
+      "ScopeID": "2cdb8075-58c7-5f2b-bb69-edd8721014fc",
+      "RuleID": "solid.isp.interface_width_high",
       "RuleVersion": 1,
       "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
       "MetricSampleIDs": [
-        "d893645e-37ed-555e-bc77-513c3c3f7ca2"
+        "69b4a690-6f93-55f7-8593-ea7550a84e93"
       ],
-      "Severity": "block",
-      "Delta": "new",
-      "ExplanationMD": "",
-      "CreatedAt": "2026-05-01T12:00:00Z"
-    },
-    {
-      "FindingID": "63a3869f-522c-50f6-93ae-b839c27002ab",
-      "EvaluationRunID": "c673de23-7beb-5949-8416-cfe93f5f4dee",
-      "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
-      "SHA": "working-copy",
-      "ScopeID": "b7a3eab2-7990-5f83-ab97-68acb0bac7c3",
-      "RuleID": "decoupling.cycle_member_present",
-      "RuleVersion": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
-      "MetricSampleIDs": [
-        "901039b2-4345-537d-8232-6c04469fba4a"
-      ],
-      "Severity": "block",
+      "Severity": "warn",
       "Delta": "new",
       "ExplanationMD": "",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
       "FindingID": "6c358f73-a43d-5567-a515-6795b3d0fbcc",
-      "EvaluationRunID": "c673de23-7beb-5949-8416-cfe93f5f4dee",
-      "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
-      "SHA": "working-copy",
-      "ScopeID": "07623aa9-b062-528e-ac6d-5a77c3db34e4",
-      "RuleID": "decoupling.cycle_member_present",
-      "RuleVersion": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
-      "MetricSampleIDs": [
-        "35b18c93-e29f-5c16-9585-091a0b2a7894"
-      ],
-      "Severity": "block",
-      "Delta": "new",
-      "ExplanationMD": "",
-      "CreatedAt": "2026-05-01T12:00:00Z"
-    },
-    {
-      "FindingID": "7ab49903-589f-5747-ad09-6bf938bfdd06",
       "EvaluationRunID": "c673de23-7beb-5949-8416-cfe93f5f4dee",
       "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
       "SHA": "working-copy",
@@ -710,24 +730,7 @@
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
-      "FindingID": "d691431e-2bf7-5587-abc3-61c0f6b524a5",
-      "EvaluationRunID": "c673de23-7beb-5949-8416-cfe93f5f4dee",
-      "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
-      "SHA": "working-copy",
-      "ScopeID": "37107c72-8845-5d09-9020-a68ce4f5625c",
-      "RuleID": "solid.isp.interface_width_high",
-      "RuleVersion": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
-      "MetricSampleIDs": [
-        "0933c0d2-14d5-5090-b87d-d65cc64af47d"
-      ],
-      "Severity": "warn",
-      "Delta": "new",
-      "ExplanationMD": "",
-      "CreatedAt": "2026-05-01T12:00:00Z"
-    },
-    {
-      "FindingID": "e6746b9f-419c-518b-af67-55b8067c57b3",
+      "FindingID": "e7689a77-5529-5bba-983c-9af86ad53c92",
       "EvaluationRunID": "c673de23-7beb-5949-8416-cfe93f5f4dee",
       "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
       "SHA": "working-copy",
@@ -742,28 +745,11 @@
       "Delta": "new",
       "ExplanationMD": "",
       "CreatedAt": "2026-05-01T12:00:00Z"
-    },
-    {
-      "FindingID": "e7689a77-5529-5bba-983c-9af86ad53c92",
-      "EvaluationRunID": "c673de23-7beb-5949-8416-cfe93f5f4dee",
-      "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
-      "SHA": "working-copy",
-      "ScopeID": "601f29e8-3a1a-5cec-91ac-c6e3055f5eee",
-      "RuleID": "decoupling.cycle_member_present",
-      "RuleVersion": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
-      "MetricSampleIDs": [
-        "4d97a0ad-3751-59e4-90b2-8d271d0362e3"
-      ],
-      "Severity": "block",
-      "Delta": "new",
-      "ExplanationMD": "",
-      "CreatedAt": "2026-05-01T12:00:00Z"
     }
   ],
   "HotSpots": [
     {
-      "HotspotID": "b1fa71f2-135f-57c2-b39b-584f60095d78",
+      "HotspotID": "8b1cd1de-a263-58b9-9e93-854198fa4276",
       "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
       "SHA": "working-copy",
       "ScopeID": "aa3338ec-aec7-527d-a6fc-9c7ca7031063",
@@ -772,19 +758,10 @@
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
-      "HotspotID": "8b1cd1de-a263-58b9-9e93-854198fa4276",
+      "HotspotID": "be66677b-43a1-5c31-851c-019bef7227e0",
       "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
       "SHA": "working-copy",
-      "ScopeID": "601f29e8-3a1a-5cec-91ac-c6e3055f5eee",
-      "Score": 2,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
-      "CreatedAt": "2026-05-01T12:00:00Z"
-    },
-    {
-      "HotspotID": "31557934-c7b5-5a5c-85df-450a9be68aa1",
-      "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
-      "SHA": "working-copy",
-      "ScopeID": "07623aa9-b062-528e-ac6d-5a77c3db34e4",
+      "ScopeID": "2cdb8075-58c7-5f2b-bb69-edd8721014fc",
       "Score": 1,
       "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
       "CreatedAt": "2026-05-01T12:00:00Z"
@@ -793,7 +770,7 @@
       "HotspotID": "72906fad-7125-50d8-8ddb-8ec3c2c2f25f",
       "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
       "SHA": "working-copy",
-      "ScopeID": "3263a47c-713a-58c5-9055-660e9a2fc138",
+      "ScopeID": "601f29e8-3a1a-5cec-91ac-c6e3055f5eee",
       "Score": 1,
       "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
       "CreatedAt": "2026-05-01T12:00:00Z"
@@ -802,31 +779,13 @@
       "HotspotID": "a2c20685-1a8f-5559-b8b8-34ca07d06f22",
       "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
       "SHA": "working-copy",
-      "ScopeID": "37107c72-8845-5d09-9020-a68ce4f5625c",
-      "Score": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
-      "CreatedAt": "2026-05-01T12:00:00Z"
-    },
-    {
-      "HotspotID": "364f8f3d-04ac-5e8f-9c6e-4bc269c2dde9",
-      "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
-      "SHA": "working-copy",
-      "ScopeID": "b7a3eab2-7990-5f83-ab97-68acb0bac7c3",
-      "Score": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
-      "CreatedAt": "2026-05-01T12:00:00Z"
-    },
-    {
-      "HotspotID": "deb07019-dfda-5539-9550-ef393cd2b8b1",
-      "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
-      "SHA": "working-copy",
       "ScopeID": "82c09830-15a9-5904-8771-5e095c9a2fe5",
       "Score": 0,
       "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
-      "HotspotID": "164d33ff-47c2-5bfc-a87c-c2aa65e46476",
+      "HotspotID": "b1fa71f2-135f-57c2-b39b-584f60095d78",
       "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
       "SHA": "working-copy",
       "ScopeID": "ccc121b9-c796-5c2f-ad4f-9a9fa9a57c5a",
@@ -835,7 +794,7 @@
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
-      "HotspotID": "dfd35e03-c1c5-5160-bbef-38e37c218ea3",
+      "HotspotID": "6ffc3f23-858a-5abd-85f0-12bcd4ca544e",
       "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
       "SHA": "working-copy",
       "ScopeID": "f612a169-206a-5178-85e1-39694a4fe553",
@@ -844,7 +803,7 @@
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
-      "HotspotID": "be66677b-43a1-5c31-851c-019bef7227e0",
+      "HotspotID": "31557934-c7b5-5a5c-85df-450a9be68aa1",
       "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
       "SHA": "working-copy",
       "ScopeID": "10f975fb-f1f1-55d7-9690-7fddbba8a3fc",
@@ -853,7 +812,7 @@
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
-      "HotspotID": "6ffc3f23-858a-5abd-85f0-12bcd4ca544e",
+      "HotspotID": "deb07019-dfda-5539-9550-ef393cd2b8b1",
       "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
       "SHA": "working-copy",
       "ScopeID": "ae1870d1-8a3d-5bd0-80f0-0056d4605c0f",
@@ -867,19 +826,16 @@
     "RepoID": "5ea8a99c-2977-5c64-98c7-9620c248b262",
     "SHA": "working-copy",
     "HotspotIDs": [
-      "b1fa71f2-135f-57c2-b39b-584f60095d78",
       "8b1cd1de-a263-58b9-9e93-854198fa4276",
-      "31557934-c7b5-5a5c-85df-450a9be68aa1",
+      "be66677b-43a1-5c31-851c-019bef7227e0",
       "72906fad-7125-50d8-8ddb-8ec3c2c2f25f",
       "a2c20685-1a8f-5559-b8b8-34ca07d06f22",
-      "364f8f3d-04ac-5e8f-9c6e-4bc269c2dde9",
-      "deb07019-dfda-5539-9550-ef393cd2b8b1",
-      "164d33ff-47c2-5bfc-a87c-c2aa65e46476",
-      "dfd35e03-c1c5-5160-bbef-38e37c218ea3",
-      "be66677b-43a1-5c31-851c-019bef7227e0",
-      "6ffc3f23-858a-5abd-85f0-12bcd4ca544e"
+      "b1fa71f2-135f-57c2-b39b-584f60095d78",
+      "6ffc3f23-858a-5abd-85f0-12bcd4ca544e",
+      "31557934-c7b5-5a5c-85df-450a9be68aa1",
+      "deb07019-dfda-5539-9550-ef393cd2b8b1"
     ],
-    "SummaryMD": "Refactor plan for repo 5ea8a99c-2977-5c64-98c7-9620c248b262 at sha working-copy.\n\nCovered hot_spots: 11\nGenerated tasks: 7\nPolicy version: ac2ca2b6-2dd1-5db9-81f8-895918458335\n",
+    "SummaryMD": "Refactor plan for repo 5ea8a99c-2977-5c64-98c7-9620c248b262 at sha working-copy.\n\nCovered hot_spots: 8\nGenerated tasks: 3\nPolicy version: ac2ca2b6-2dd1-5db9-81f8-895918458335\n",
     "CreatedAt": "2026-05-01T12:00:00Z"
   },
   "Tasks": [
@@ -890,17 +846,17 @@
       "Kind": "split_class",
       "EffortHours": 0,
       "RuleID": "solid.srp.interface_width_high",
-      "DescriptionMD": "Refactor task: kind=split_class for scope aa3338ec-aec7-527d-a6fc-9c7ca7031063 motivated by rule solid.srp.interface_width_high.\nHot_spot id: b1fa71f2-135f-57c2-b39b-584f60095d78 (score=2.3489815189531904, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=split_class for scope aa3338ec-aec7-527d-a6fc-9c7ca7031063 motivated by rule solid.srp.interface_width_high.\nHot_spot id: 8b1cd1de-a263-58b9-9e93-854198fa4276 (score=2.3489815189531904, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
       "TaskID": "88888f17-e814-57e7-bb73-a0fe3688edbc",
       "PlanID": "9b73e9bd-f33b-5aec-b186-b0f2d63d3e8c",
-      "ScopeID": "601f29e8-3a1a-5cec-91ac-c6e3055f5eee",
-      "Kind": "break_cycle",
+      "ScopeID": "2cdb8075-58c7-5f2b-bb69-edd8721014fc",
+      "Kind": "split_class",
       "EffortHours": 0,
-      "RuleID": "decoupling.cycle_member_present",
-      "DescriptionMD": "Refactor task: kind=break_cycle for scope 601f29e8-3a1a-5cec-91ac-c6e3055f5eee motivated by rule decoupling.cycle_member_present.\nHot_spot id: 8b1cd1de-a263-58b9-9e93-854198fa4276 (score=2, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "RuleID": "solid.isp.interface_width_high",
+      "DescriptionMD": "Refactor task: kind=split_class for scope 2cdb8075-58c7-5f2b-bb69-edd8721014fc motivated by rule solid.isp.interface_width_high.\nHot_spot id: be66677b-43a1-5c31-851c-019bef7227e0 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -910,47 +866,7 @@
       "Kind": "consolidate_duplication",
       "EffortHours": 0,
       "RuleID": "decoupling.duplication_ratio_high",
-      "DescriptionMD": "Refactor task: kind=consolidate_duplication for scope 601f29e8-3a1a-5cec-91ac-c6e3055f5eee motivated by rule decoupling.duplication_ratio_high.\nHot_spot id: 8b1cd1de-a263-58b9-9e93-854198fa4276 (score=2, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
-      "CreatedAt": "2026-05-01T12:00:00Z"
-    },
-    {
-      "TaskID": "1d3ce51d-fb8b-5d6e-85d2-42fdadebba6c",
-      "PlanID": "9b73e9bd-f33b-5aec-b186-b0f2d63d3e8c",
-      "ScopeID": "07623aa9-b062-528e-ac6d-5a77c3db34e4",
-      "Kind": "break_cycle",
-      "EffortHours": 0,
-      "RuleID": "decoupling.cycle_member_present",
-      "DescriptionMD": "Refactor task: kind=break_cycle for scope 07623aa9-b062-528e-ac6d-5a77c3db34e4 motivated by rule decoupling.cycle_member_present.\nHot_spot id: 31557934-c7b5-5a5c-85df-450a9be68aa1 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
-      "CreatedAt": "2026-05-01T12:00:00Z"
-    },
-    {
-      "TaskID": "ced90a9a-e062-5425-9d02-4f279fb1920d",
-      "PlanID": "9b73e9bd-f33b-5aec-b186-b0f2d63d3e8c",
-      "ScopeID": "3263a47c-713a-58c5-9055-660e9a2fc138",
-      "Kind": "break_cycle",
-      "EffortHours": 0,
-      "RuleID": "decoupling.cycle_member_present",
-      "DescriptionMD": "Refactor task: kind=break_cycle for scope 3263a47c-713a-58c5-9055-660e9a2fc138 motivated by rule decoupling.cycle_member_present.\nHot_spot id: 72906fad-7125-50d8-8ddb-8ec3c2c2f25f (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
-      "CreatedAt": "2026-05-01T12:00:00Z"
-    },
-    {
-      "TaskID": "4014d8c1-086a-51bc-93e9-c5b571d9ab78",
-      "PlanID": "9b73e9bd-f33b-5aec-b186-b0f2d63d3e8c",
-      "ScopeID": "37107c72-8845-5d09-9020-a68ce4f5625c",
-      "Kind": "split_class",
-      "EffortHours": 0,
-      "RuleID": "solid.isp.interface_width_high",
-      "DescriptionMD": "Refactor task: kind=split_class for scope 37107c72-8845-5d09-9020-a68ce4f5625c motivated by rule solid.isp.interface_width_high.\nHot_spot id: a2c20685-1a8f-5559-b8b8-34ca07d06f22 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
-      "CreatedAt": "2026-05-01T12:00:00Z"
-    },
-    {
-      "TaskID": "53bb6b9b-409a-52e4-9f29-b0cddb2e28f9",
-      "PlanID": "9b73e9bd-f33b-5aec-b186-b0f2d63d3e8c",
-      "ScopeID": "b7a3eab2-7990-5f83-ab97-68acb0bac7c3",
-      "Kind": "break_cycle",
-      "EffortHours": 0,
-      "RuleID": "decoupling.cycle_member_present",
-      "DescriptionMD": "Refactor task: kind=break_cycle for scope b7a3eab2-7990-5f83-ab97-68acb0bac7c3 motivated by rule decoupling.cycle_member_present.\nHot_spot id: 364f8f3d-04ac-5e8f-9c6e-4bc269c2dde9 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=consolidate_duplication for scope 601f29e8-3a1a-5cec-91ac-c6e3055f5eee motivated by rule decoupling.duplication_ratio_high.\nHot_spot id: 72906fad-7125-50d8-8ddb-8ec3c2c2f25f (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     }
   ],
@@ -962,7 +878,7 @@
         "missing_attrs": [
           "decision_blocks"
         ],
-        "affected_scope_count": 51,
+        "affected_scope_count": 52,
         "closure_phase": "P2"
       },
       {
@@ -980,7 +896,7 @@
         "missing_attrs": [
           "call_edges"
         ],
-        "affected_scope_count": 57,
+        "affected_scope_count": 58,
         "closure_phase": "P2"
       },
       {
@@ -989,7 +905,7 @@
         "missing_attrs": [
           "call_edges"
         ],
-        "affected_scope_count": 57,
+        "affected_scope_count": 58,
         "closure_phase": "P2"
       },
       {

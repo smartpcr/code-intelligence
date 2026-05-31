@@ -6,7 +6,7 @@
       "missing_attrs": [
         "decision_blocks"
       ],
-      "affected_scope_count": 52,
+      "affected_scope_count": 54,
       "closure_phase": "P2"
     },
     {
@@ -24,7 +24,7 @@
       "missing_attrs": [
         "call_edges"
       ],
-      "affected_scope_count": 58,
+      "affected_scope_count": 60,
       "closure_phase": "P2"
     },
     {
@@ -33,7 +33,7 @@
       "missing_attrs": [
         "call_edges"
       ],
-      "affected_scope_count": 58,
+      "affected_scope_count": 60,
       "closure_phase": "P2"
     },
     {

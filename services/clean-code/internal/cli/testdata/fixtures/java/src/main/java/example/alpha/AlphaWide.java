@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 package example.alpha;
 
-import example.beta;
-
-public interface WideContract {
-    int m01(); int m02(); int m03(); int m04(); int m05();
-    int m06(); int m07(); int m08(); int m09(); int m10();
-    int m11(); int m12(); int m13(); int m14(); int m15();
-    int m16(); int m17(); int m18(); int m19(); int m20();
-}
+import example.beta.BetaLeaf;
 
 class Root { public int root() { return 1; } }
 class Mid extends Root { public int mid() { return 2; } }
@@ -26,19 +19,19 @@ public class AlphaWide extends Mid implements WideContract {
     public int m19() { return duplicateOne(19); } public int m20() { return duplicateOne(20); }
     public int useBeta() { return new BetaLeaf().leaf(); }
 
-    static int duplicateOne(int seed) {
+    public static int duplicateOne(int seed) {
         int total = seed;
         for (int index = 0; index < 8; index++) { total += index * 2; total -= index / 2; total += 3; }
         if (total % 2 == 0) { total += 11; } else { total += 17; }
         return total;
     }
-    static int duplicateTwo(int seed) {
+    public static int duplicateTwo(int seed) {
         int total = seed;
         for (int index = 0; index < 8; index++) { total += index * 2; total -= index / 2; total += 3; }
         if (total % 2 == 0) { total += 11; } else { total += 17; }
         return total;
     }
-    static int duplicateThree(int seed) {
+    public static int duplicateThree(int seed) {
         int total = seed;
         for (int index = 0; index < 8; index++) { total += index * 2; total -= index / 2; total += 3; }
         if (total % 2 == 0) { total += 11; } else { total += 17; }

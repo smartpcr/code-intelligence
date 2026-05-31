@@ -108,15 +108,37 @@
       "parse_status": "parsed"
     },
     {
+      "path": "src/alpha/index.ts",
+      "language": "typescript",
+      "size_bytes": 63,
+      "parse_status": "parsed"
+    },
+    {
       "path": "src/beta/beta.ts",
       "language": "typescript",
       "size_bytes": 353,
       "parse_status": "parsed"
+    },
+    {
+      "path": "src/beta/index.ts",
+      "language": "typescript",
+      "size_bytes": 62,
+      "parse_status": "parsed"
+    },
+    {
+      "path": "tsconfig.json",
+      "language": "",
+      "size_bytes": 0,
+      "parse_status": "skipped"
     }
   ],
   "Skips": [
     {
       "Path": "package.json",
+      "Reason": "unsupported_language"
+    },
+    {
+      "Path": "tsconfig.json",
       "Reason": "unsupported_language"
     }
   ],
@@ -127,7 +149,7 @@
       "missing_attrs": [
         "decision_blocks"
       ],
-      "affected_scope_count": 52,
+      "affected_scope_count": 54,
       "closure_phase": "P2"
     },
     {
@@ -145,7 +167,7 @@
       "missing_attrs": [
         "call_edges"
       ],
-      "affected_scope_count": 58,
+      "affected_scope_count": 60,
       "closure_phase": "P2"
     },
     {
@@ -154,7 +176,7 @@
       "missing_attrs": [
         "call_edges"
       ],
-      "affected_scope_count": 58,
+      "affected_scope_count": 60,
       "closure_phase": "P2"
     },
     {
@@ -282,6 +304,22 @@
       "ScopeSignature": "clean-code-repo:3c8339d3-0d6b-5ef6-9cc4-0feca496adec::file::src/alpha/alpha.ts"
     },
     {
+      "SampleID": "4dbafe9a-bf85-51eb-b093-e7661003775a",
+      "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
+      "SHA": "working-copy",
+      "ScopeID": "ad97b3b3-8700-57c3-aa9a-e1a36a44a4e1",
+      "ScopeKind": "file",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3c8339d3-0d6b-5ef6-9cc4-0feca496adec::file::src/alpha/index.ts"
+    },
+    {
       "SampleID": "0fe5877c-13cb-5b16-8460-9925f79a158d",
       "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
       "SHA": "working-copy",
@@ -296,6 +334,22 @@
       "Degraded": false,
       "DegradedReason": "",
       "ScopeSignature": "clean-code-repo:3c8339d3-0d6b-5ef6-9cc4-0feca496adec::file::src/beta/beta.ts"
+    },
+    {
+      "SampleID": "0426a89f-611b-50f4-b6f2-095190309da2",
+      "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
+      "SHA": "working-copy",
+      "ScopeID": "8ba1719d-ff24-5a77-995f-76677c5126d1",
+      "ScopeKind": "file",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3c8339d3-0d6b-5ef6-9cc4-0feca496adec::file::src/beta/index.ts"
     },
     {
       "SampleID": "5441ee0b-a2eb-5b6e-a4c1-d4ffda87d517",
@@ -410,6 +464,22 @@
       "ScopeSignature": "clean-code-repo:3c8339d3-0d6b-5ef6-9cc4-0feca496adec::file::src/alpha/alpha.ts"
     },
     {
+      "SampleID": "e074af15-c47d-5470-9579-39debd7b181e",
+      "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
+      "SHA": "working-copy",
+      "ScopeID": "ad97b3b3-8700-57c3-aa9a-e1a36a44a4e1",
+      "ScopeKind": "file",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3c8339d3-0d6b-5ef6-9cc4-0feca496adec::file::src/alpha/index.ts"
+    },
+    {
       "SampleID": "8f601bfe-cb25-53ce-98f1-1735bafd4749",
       "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
       "SHA": "working-copy",
@@ -424,6 +494,22 @@
       "Degraded": false,
       "DegradedReason": "",
       "ScopeSignature": "clean-code-repo:3c8339d3-0d6b-5ef6-9cc4-0feca496adec::file::src/beta/beta.ts"
+    },
+    {
+      "SampleID": "5e6f5355-79b6-5728-8b2a-23057be67ec3",
+      "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
+      "SHA": "working-copy",
+      "ScopeID": "8ba1719d-ff24-5a77-995f-76677c5126d1",
+      "ScopeKind": "file",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3c8339d3-0d6b-5ef6-9cc4-0feca496adec::file::src/beta/index.ts"
     },
     {
       "SampleID": "0de6ae9d-d6ec-51db-99f8-266fac5ec90d",
@@ -554,6 +640,22 @@
       "ScopeSignature": "clean-code-repo:3c8339d3-0d6b-5ef6-9cc4-0feca496adec::file::src/alpha/alpha.ts"
     },
     {
+      "SampleID": "2562c64d-3248-5209-be60-3e9b692002bb",
+      "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
+      "SHA": "working-copy",
+      "ScopeID": "ad97b3b3-8700-57c3-aa9a-e1a36a44a4e1",
+      "ScopeKind": "file",
+      "MetricKind": "loc",
+      "MetricVersion": 1,
+      "Value": 3,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3c8339d3-0d6b-5ef6-9cc4-0feca496adec::file::src/alpha/index.ts"
+    },
+    {
       "SampleID": "2af27752-adf9-5f45-bb8e-dede9658fe60",
       "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
       "SHA": "working-copy",
@@ -568,6 +670,22 @@
       "Degraded": false,
       "DegradedReason": "",
       "ScopeSignature": "clean-code-repo:3c8339d3-0d6b-5ef6-9cc4-0feca496adec::file::src/beta/beta.ts"
+    },
+    {
+      "SampleID": "bf97d427-8261-5669-98b7-faa4f7f0cf54",
+      "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
+      "SHA": "working-copy",
+      "ScopeID": "8ba1719d-ff24-5a77-995f-76677c5126d1",
+      "ScopeKind": "file",
+      "MetricKind": "loc",
+      "MetricVersion": 1,
+      "Value": 3,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3c8339d3-0d6b-5ef6-9cc4-0feca496adec::file::src/beta/index.ts"
     }
   ],
   "Run": {
@@ -580,7 +698,7 @@
     "CreatedAt": "2026-05-01T12:00:00Z"
   },
   "Verdict": {
-    "VerdictID": "e887908e-092f-5fbc-ae55-b80c66399283",
+    "VerdictID": "e12327e2-6b4b-5277-946a-0c0e49584026",
     "EvaluationRunID": "86899bc6-ef41-5bbe-9785-3767eadfb169",
     "Verdict": "block",
     "Degraded": false,
@@ -593,12 +711,29 @@
       "EvaluationRunID": "86899bc6-ef41-5bbe-9785-3767eadfb169",
       "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
       "SHA": "working-copy",
-      "ScopeID": "fbd05f08-7304-5130-a9a8-51d408f8dc45",
-      "RuleID": "solid.isp.interface_width_high",
+      "ScopeID": "ad97b3b3-8700-57c3-aa9a-e1a36a44a4e1",
+      "RuleID": "decoupling.cycle_member_present",
       "RuleVersion": 1,
       "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
       "MetricSampleIDs": [
-        "5cd34d63-3287-59e4-9cab-5e80826a22cc"
+        "4dbafe9a-bf85-51eb-b093-e7661003775a"
+      ],
+      "Severity": "block",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "FindingID": "306e6085-6849-51dd-9524-c303f0344169",
+      "EvaluationRunID": "86899bc6-ef41-5bbe-9785-3767eadfb169",
+      "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
+      "SHA": "working-copy",
+      "ScopeID": "ee0f2d2a-b00e-5160-b6b3-e5633e0f2e4f",
+      "RuleID": "solid.srp.interface_width_high",
+      "RuleVersion": 1,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "MetricSampleIDs": [
+        "23136039-e0c9-5176-8e7b-210164342127"
       ],
       "Severity": "warn",
       "Delta": "new",
@@ -627,12 +762,12 @@
       "EvaluationRunID": "86899bc6-ef41-5bbe-9785-3767eadfb169",
       "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
       "SHA": "working-copy",
-      "ScopeID": "ee0f2d2a-b00e-5160-b6b3-e5633e0f2e4f",
-      "RuleID": "solid.srp.interface_width_high",
+      "ScopeID": "4da7085b-de3f-56e0-a47a-68f7b82ba985",
+      "RuleID": "decoupling.duplication_ratio_high",
       "RuleVersion": 1,
       "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
       "MetricSampleIDs": [
-        "23136039-e0c9-5176-8e7b-210164342127"
+        "258fa581-d878-5271-b7b6-e137e22569b5"
       ],
       "Severity": "warn",
       "Delta": "new",
@@ -641,6 +776,23 @@
     },
     {
       "FindingID": "9dfa2b4d-45ca-5efb-89f9-8305c31c0f15",
+      "EvaluationRunID": "86899bc6-ef41-5bbe-9785-3767eadfb169",
+      "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
+      "SHA": "working-copy",
+      "ScopeID": "8ba1719d-ff24-5a77-995f-76677c5126d1",
+      "RuleID": "decoupling.cycle_member_present",
+      "RuleVersion": 1,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "MetricSampleIDs": [
+        "0426a89f-611b-50f4-b6f2-095190309da2"
+      ],
+      "Severity": "block",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "FindingID": "bc7a0615-1253-5eef-a3a6-00a76883c42c",
       "EvaluationRunID": "86899bc6-ef41-5bbe-9785-3767eadfb169",
       "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
       "SHA": "working-copy",
@@ -657,16 +809,16 @@
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
-      "FindingID": "bc7a0615-1253-5eef-a3a6-00a76883c42c",
+      "FindingID": "e887908e-092f-5fbc-ae55-b80c66399283",
       "EvaluationRunID": "86899bc6-ef41-5bbe-9785-3767eadfb169",
       "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
       "SHA": "working-copy",
-      "ScopeID": "4da7085b-de3f-56e0-a47a-68f7b82ba985",
-      "RuleID": "decoupling.duplication_ratio_high",
+      "ScopeID": "fbd05f08-7304-5130-a9a8-51d408f8dc45",
+      "RuleID": "solid.isp.interface_width_high",
       "RuleVersion": 1,
       "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
       "MetricSampleIDs": [
-        "258fa581-d878-5271-b7b6-e137e22569b5"
+        "5cd34d63-3287-59e4-9cab-5e80826a22cc"
       ],
       "Severity": "warn",
       "Delta": "new",
@@ -676,7 +828,7 @@
   ],
   "HotSpots": [
     {
-      "HotspotID": "fee4ce49-0eb6-5502-ae02-ec8ec45f02b5",
+      "HotspotID": "8a30998a-6d40-59c4-b294-b7b2326fcbbf",
       "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
       "SHA": "working-copy",
       "ScopeID": "ee0f2d2a-b00e-5160-b6b3-e5633e0f2e4f",
@@ -697,13 +849,31 @@
       "HotspotID": "18b950da-d80e-5c8a-9d1f-10efa5dab0d6",
       "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
       "SHA": "working-copy",
+      "ScopeID": "8ba1719d-ff24-5a77-995f-76677c5126d1",
+      "Score": 1,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "2d4ef6fa-ee6f-52ca-811d-7b5f5f8d8c94",
+      "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
+      "SHA": "working-copy",
       "ScopeID": "8feb7f54-39d9-57d9-8dd4-72ce40ff321e",
       "Score": 1,
       "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
-      "HotspotID": "b92a4dbd-a8b7-5500-b009-559cfbefef01",
+      "HotspotID": "fee4ce49-0eb6-5502-ae02-ec8ec45f02b5",
+      "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
+      "SHA": "working-copy",
+      "ScopeID": "ad97b3b3-8700-57c3-aa9a-e1a36a44a4e1",
+      "Score": 1,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "db4de943-f7f3-5e31-9d15-3d718a802310",
       "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
       "SHA": "working-copy",
       "ScopeID": "fbd05f08-7304-5130-a9a8-51d408f8dc45",
@@ -748,7 +918,7 @@
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
-      "HotspotID": "2d4ef6fa-ee6f-52ca-811d-7b5f5f8d8c94",
+      "HotspotID": "b92a4dbd-a8b7-5500-b009-559cfbefef01",
       "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
       "SHA": "working-copy",
       "ScopeID": "d190ef55-c74d-524c-a6aa-e051b7558ec6",
@@ -762,17 +932,19 @@
     "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
     "SHA": "working-copy",
     "HotspotIDs": [
-      "fee4ce49-0eb6-5502-ae02-ec8ec45f02b5",
+      "8a30998a-6d40-59c4-b294-b7b2326fcbbf",
       "5f8aec5e-8459-5355-91c4-d801e62589ce",
       "18b950da-d80e-5c8a-9d1f-10efa5dab0d6",
-      "b92a4dbd-a8b7-5500-b009-559cfbefef01",
+      "2d4ef6fa-ee6f-52ca-811d-7b5f5f8d8c94",
+      "fee4ce49-0eb6-5502-ae02-ec8ec45f02b5",
+      "db4de943-f7f3-5e31-9d15-3d718a802310",
       "272fbb28-91a2-5c00-9b9d-1c8d7e19f5e5",
       "e3de3b6d-4c80-58c9-964d-9031dcb5d8cd",
       "e51e255f-6207-5a4a-8fbb-8d97fbc24e68",
       "02c959b4-acf9-53b5-99fb-b0de4178ea9d",
-      "2d4ef6fa-ee6f-52ca-811d-7b5f5f8d8c94"
+      "b92a4dbd-a8b7-5500-b009-559cfbefef01"
     ],
-    "SummaryMD": "Refactor plan for repo 3c8339d3-0d6b-5ef6-9cc4-0feca496adec at sha working-copy.\n\nCovered hot_spots: 9\nGenerated tasks: 5\nPolicy version: ac2ca2b6-2dd1-5db9-81f8-895918458335\n",
+    "SummaryMD": "Refactor plan for repo 3c8339d3-0d6b-5ef6-9cc4-0feca496adec at sha working-copy.\n\nCovered hot_spots: 11\nGenerated tasks: 7\nPolicy version: ac2ca2b6-2dd1-5db9-81f8-895918458335\n",
     "CreatedAt": "2026-05-01T12:00:00Z"
   },
   "Tasks": [
@@ -783,7 +955,7 @@
       "Kind": "split_class",
       "EffortHours": 0,
       "RuleID": "solid.srp.interface_width_high",
-      "DescriptionMD": "Refactor task: kind=split_class for scope ee0f2d2a-b00e-5160-b6b3-e5633e0f2e4f motivated by rule solid.srp.interface_width_high.\nHot_spot id: fee4ce49-0eb6-5502-ae02-ec8ec45f02b5 (score=2.3489815189531904, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=split_class for scope ee0f2d2a-b00e-5160-b6b3-e5633e0f2e4f motivated by rule solid.srp.interface_width_high.\nHot_spot id: 8a30998a-6d40-59c4-b294-b7b2326fcbbf (score=2.3489815189531904, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -809,21 +981,41 @@
     {
       "TaskID": "9aebab63-22c7-547c-b113-20bd13aa9462",
       "PlanID": "12d924d5-8d11-5028-b7fc-fce35cf00eb2",
-      "ScopeID": "8feb7f54-39d9-57d9-8dd4-72ce40ff321e",
+      "ScopeID": "8ba1719d-ff24-5a77-995f-76677c5126d1",
       "Kind": "break_cycle",
       "EffortHours": 0,
       "RuleID": "decoupling.cycle_member_present",
-      "DescriptionMD": "Refactor task: kind=break_cycle for scope 8feb7f54-39d9-57d9-8dd4-72ce40ff321e motivated by rule decoupling.cycle_member_present.\nHot_spot id: 18b950da-d80e-5c8a-9d1f-10efa5dab0d6 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope 8ba1719d-ff24-5a77-995f-76677c5126d1 motivated by rule decoupling.cycle_member_present.\nHot_spot id: 18b950da-d80e-5c8a-9d1f-10efa5dab0d6 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
       "TaskID": "b5234f5f-6b0b-5176-87df-ac17fa3d5e1d",
       "PlanID": "12d924d5-8d11-5028-b7fc-fce35cf00eb2",
+      "ScopeID": "8feb7f54-39d9-57d9-8dd4-72ce40ff321e",
+      "Kind": "break_cycle",
+      "EffortHours": 0,
+      "RuleID": "decoupling.cycle_member_present",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope 8feb7f54-39d9-57d9-8dd4-72ce40ff321e motivated by rule decoupling.cycle_member_present.\nHot_spot id: 2d4ef6fa-ee6f-52ca-811d-7b5f5f8d8c94 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "TaskID": "e7701274-fa05-53b4-aa4b-b20da3f56965",
+      "PlanID": "12d924d5-8d11-5028-b7fc-fce35cf00eb2",
+      "ScopeID": "ad97b3b3-8700-57c3-aa9a-e1a36a44a4e1",
+      "Kind": "break_cycle",
+      "EffortHours": 0,
+      "RuleID": "decoupling.cycle_member_present",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope ad97b3b3-8700-57c3-aa9a-e1a36a44a4e1 motivated by rule decoupling.cycle_member_present.\nHot_spot id: fee4ce49-0eb6-5502-ae02-ec8ec45f02b5 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "TaskID": "9180c29e-0ec9-5f38-a583-ac1bd2ef14f9",
+      "PlanID": "12d924d5-8d11-5028-b7fc-fce35cf00eb2",
       "ScopeID": "fbd05f08-7304-5130-a9a8-51d408f8dc45",
       "Kind": "split_class",
       "EffortHours": 0,
       "RuleID": "solid.isp.interface_width_high",
-      "DescriptionMD": "Refactor task: kind=split_class for scope fbd05f08-7304-5130-a9a8-51d408f8dc45 motivated by rule solid.isp.interface_width_high.\nHot_spot id: b92a4dbd-a8b7-5500-b009-559cfbefef01 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=split_class for scope fbd05f08-7304-5130-a9a8-51d408f8dc45 motivated by rule solid.isp.interface_width_high.\nHot_spot id: db4de943-f7f3-5e31-9d15-3d718a802310 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     }
   ],
@@ -835,7 +1027,7 @@
         "missing_attrs": [
           "decision_blocks"
         ],
-        "affected_scope_count": 52,
+        "affected_scope_count": 54,
         "closure_phase": "P2"
       },
       {
@@ -853,7 +1045,7 @@
         "missing_attrs": [
           "call_edges"
         ],
-        "affected_scope_count": 58,
+        "affected_scope_count": 60,
         "closure_phase": "P2"
       },
       {
@@ -862,7 +1054,7 @@
         "missing_attrs": [
           "call_edges"
         ],
-        "affected_scope_count": 58,
+        "affected_scope_count": 60,
         "closure_phase": "P2"
       },
       {

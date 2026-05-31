@@ -13,6 +13,7 @@ Feature: Worker adopts AncestryWriter
     And a recording RepoCommitNodeEdgeWriter
     When worker.runFull executes through AncestryWriter with parentSHA "aaa111" and headSHA "bbb222"
     Then the Go AST of worker.go confirms runFull delegates to AncestryWriter in the correct call order with summary wiring
+    And worker.runFull executes through the sqlmock bridge and the FullSummary matches
     And the captured node tuples match the committed golden snapshot
     And the captured edge tuples match the committed golden snapshot
     And the FullSummary counters match the expected values

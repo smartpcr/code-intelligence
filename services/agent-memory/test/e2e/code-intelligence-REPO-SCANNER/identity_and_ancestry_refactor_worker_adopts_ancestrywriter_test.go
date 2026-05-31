@@ -5,10 +5,13 @@ package e2e
 import (
 	"bufio"
 	"context"
+	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/cucumber/godog"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
@@ -176,6 +180,12 @@ func (w *runFullRecordingWriter) InsertEdge(_ context.Context, in graphwriter.Ed
 	})
 	return rec, nil
 }
+
+type noopEventPublisher struct{}
+
+func (noopEventPublisher) Publish(context.Context, repoindexer.Event) error { return nil }
+
+func (noopEventPublisher) PublishTx(context.Context, *sql.Tx, repoindexer.Event) error { return nil }
 
 // ---------------------------------------------------------------------------
 // COMMITTED GOLDEN SNAPSHOT
@@ -352,9 +362,10 @@ func astAssignmentCollector(node ast.Node) []string {
 // ---------------------------------------------------------------------------
 
 type workerAdoptsState struct {
-	writer  *runFullRecordingWriter
-	files   []string
-	summary workerRunFullSummary
+	writer        *runFullRecordingWriter
+	files         []string
+	summary       workerRunFullSummary
+	bridgeSummary repoindexer.FullSummary
 
 	// worker.go source content for structural check
 	workerSource string
@@ -471,6 +482,155 @@ func (s *workerAdoptsState) workerRunFullThroughAncestryWriter(parentSHA, headSH
 		}
 	}
 	return nil
+}
+
+func (s *workerAdoptsState) workerRunFullViaBridge() error {
+	ctx := context.Background()
+	workerDB, workerMock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		return fmt.Errorf("sqlmock worker db: %w", err)
+	}
+	defer workerDB.Close()
+	gwDB, gwMock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		return fmt.Errorf("sqlmock graphwriter db: %w", err)
+	}
+	defer gwDB.Close()
+
+	repoID := fingerprint.RepoID{0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAA}
+	repoIDStr := repoID.String()
+	fixedNow := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+
+	nodes := []struct {
+		id     string
+		kind   string
+		sig    string
+		parent string
+	}{
+		{id: "node-0001", kind: "repo", sig: repoindexer.CanonicalRepoSig(goldenRepoURL)},
+		{id: "node-0002", kind: "package", sig: repoindexer.CanonicalPackageSig(goldenRepoURL, ""), parent: "node-0001"},
+		{id: "node-0003", kind: "file", sig: repoindexer.CanonicalFileSig(goldenRepoURL, "README.md"), parent: "node-0002"},
+		{id: "node-0004", kind: "package", sig: repoindexer.CanonicalPackageSig(goldenRepoURL, "pkg"), parent: "node-0001"},
+		{id: "node-0005", kind: "file", sig: repoindexer.CanonicalFileSig(goldenRepoURL, "pkg/foo.go"), parent: "node-0004"},
+		{id: "node-0006", kind: "package", sig: repoindexer.CanonicalPackageSig(goldenRepoURL, "pkg/sub"), parent: "node-0001"},
+		{id: "node-0007", kind: "file", sig: repoindexer.CanonicalFileSig(goldenRepoURL, "pkg/sub/bar.go"), parent: "node-0006"},
+	}
+	nodeFPs := make(map[string]fingerprint.Sum, len(nodes))
+	for i, node := range nodes {
+		fp, fpErr := fingerprint.NodeFingerprint(repoID, node.kind, node.sig, goldenSHA)
+		if fpErr != nil {
+			return fmt.Errorf("node fingerprint %s: %w", node.id, fpErr)
+		}
+		nodeFPs[node.id] = fp
+		if gotHex := hex.EncodeToString(fp.Bytes()); gotHex != goldenCommittedNodes[i].FingerprintHex {
+			return fmt.Errorf("node fingerprint drift for %s: got %s, want %s", node.id, gotHex, goldenCommittedNodes[i].FingerprintHex)
+		}
+	}
+
+	edges := []struct {
+		id  string
+		src string
+		dst string
+	}{
+		{id: "edge-0001", src: "node-0001", dst: "node-0002"},
+		{id: "edge-0002", src: "node-0002", dst: "node-0003"},
+		{id: "edge-0003", src: "node-0001", dst: "node-0004"},
+		{id: "edge-0004", src: "node-0004", dst: "node-0005"},
+		{id: "edge-0005", src: "node-0001", dst: "node-0006"},
+		{id: "edge-0006", src: "node-0006", dst: "node-0007"},
+	}
+
+	workerMock.ExpectQuery(`SELECT .* FROM repo WHERE`).
+		WithArgs(repoIDStr).
+		WillReturnRows(sqlmock.NewRows([]string{"url", "default_branch", "current_head_sha", "language_hints"}).
+			AddRow(goldenRepoURL, "main", goldenHead, "{go}"))
+
+	gwMock.ExpectBegin()
+	gwMock.ExpectQuery(`INSERT INTO repo`).
+		WithArgs(goldenRepoURL, "main", goldenHead, sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"repo_id", "inserted"}).AddRow(repoIDStr, true))
+	gwMock.ExpectCommit()
+
+	gwMock.ExpectBegin()
+	gwMock.ExpectQuery(`INSERT INTO repo_commit`).
+		WithArgs(repoIDStr, goldenSHA, sqlmock.AnyArg(), fixedNow.UTC()).
+		WillReturnRows(sqlmock.NewRows([]string{"repo_id", "sha"}).AddRow(repoIDStr, goldenSHA))
+	gwMock.ExpectCommit()
+
+	gwMock.ExpectBegin()
+	gwMock.ExpectQuery(`INSERT INTO node`).
+		WithArgs(sqlmock.AnyArg(), repoIDStr, "repo", nodes[0].sig, sqlmock.AnyArg(), goldenSHA, sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow(nodes[0].id))
+	gwMock.ExpectCommit()
+
+	expectInsertNodeWithParent := func(nodeIndex int) {
+		node := nodes[nodeIndex]
+		gwMock.ExpectBegin()
+		gwMock.ExpectQuery(`SELECT repo_id.*FROM node WHERE node_id`).
+			WithArgs(node.parent).
+			WillReturnRows(sqlmock.NewRows([]string{"repo_id"}).AddRow(repoIDStr))
+		gwMock.ExpectQuery(`INSERT INTO node`).
+			WithArgs(sqlmock.AnyArg(), repoIDStr, node.kind, node.sig, sqlmock.AnyArg(), goldenSHA, sqlmock.AnyArg()).
+			WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow(node.id))
+		gwMock.ExpectCommit()
+	}
+	expectInsertEdge := func(edgeIndex int) {
+		edge := edges[edgeIndex]
+		gwMock.ExpectBegin()
+		gwMock.ExpectQuery(`SELECT repo_id.*fingerprint FROM node WHERE node_id`).
+			WithArgs(edge.src).
+			WillReturnRows(sqlmock.NewRows([]string{"repo_id", "fingerprint"}).AddRow(repoIDStr, nodeFPs[edge.src].Bytes()))
+		gwMock.ExpectQuery(`SELECT repo_id.*fingerprint FROM node WHERE node_id`).
+			WithArgs(edge.dst).
+			WillReturnRows(sqlmock.NewRows([]string{"repo_id", "fingerprint"}).AddRow(repoIDStr, nodeFPs[edge.dst].Bytes()))
+		gwMock.ExpectQuery(`INSERT INTO edge`).
+			WithArgs(sqlmock.AnyArg(), repoIDStr, "contains", edge.src, edge.dst, goldenSHA, sqlmock.AnyArg()).
+			WillReturnRows(sqlmock.NewRows([]string{"edge_id"}).AddRow(edge.id))
+		gwMock.ExpectCommit()
+	}
+
+	expectInsertNodeWithParent(1)
+	expectInsertEdge(0)
+	expectInsertNodeWithParent(2)
+	expectInsertEdge(1)
+	expectInsertNodeWithParent(3)
+	expectInsertEdge(2)
+	expectInsertNodeWithParent(4)
+	expectInsertEdge(3)
+	expectInsertNodeWithParent(5)
+	expectInsertEdge(4)
+	expectInsertNodeWithParent(6)
+	expectInsertEdge(5)
+
+	gw := graphwriter.New(gwDB, slog.Default())
+	worker := repoindexer.NewWorker(workerDB, gw, repoindexer.WorkerOptions{
+		Materializer: &repoindexer.InMemoryMaterializer{Files: []repoindexer.InMemoryFile{
+			{RelPath: "README.md", Content: []byte("# readme")},
+			{RelPath: "pkg/foo.go", Content: []byte("package pkg")},
+			{RelPath: "pkg/sub/bar.go", Content: []byte("package sub")},
+		}},
+		Publisher: noopEventPublisher{},
+		Now:       func() time.Time { return fixedNow },
+	})
+
+	bridgeSummary, err := repoindexer.RunFullForE2E(ctx, worker, repoindexer.Job{
+		RepoID:  repoID,
+		ToSHA:   goldenSHA,
+		FromSHA: goldenParent,
+		Mode:    repoindexer.ModeFull,
+	})
+	if err != nil {
+		return fmt.Errorf("RunFullForE2E: %w", err)
+	}
+	s.bridgeSummary = bridgeSummary
+
+	if err := workerMock.ExpectationsWereMet(); err != nil {
+		return fmt.Errorf("worker sqlmock expectations: %w", err)
+	}
+	if err := gwMock.ExpectationsWereMet(); err != nil {
+		return fmt.Errorf("graphwriter sqlmock expectations: %w", err)
+	}
+	return s.bridgeFullSummaryMatches()
 }
 
 func (s *workerAdoptsState) theIntegrationSuiteRunsAgainstPG() error {
@@ -778,6 +938,37 @@ func (s *workerAdoptsState) fullSummaryCountersMatch() error {
 	return nil
 }
 
+func (s *workerAdoptsState) bridgeFullSummaryMatches() error {
+	checks := []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"PackagesEnsured", s.bridgeSummary.PackagesEnsured, 3},
+		{"PackagesInserted", s.bridgeSummary.PackagesInserted, 3},
+		{"FilesEnsured", s.bridgeSummary.FilesEnsured, 3},
+		{"FilesInserted", s.bridgeSummary.FilesInserted, 3},
+		{"ContainsEdgesInserted", s.bridgeSummary.ContainsEdgesInserted, 6},
+		{"EmitterCalls", s.bridgeSummary.EmitterCalls, 3},
+	}
+	var errs []string
+	for _, c := range checks {
+		if c.got != c.want {
+			errs = append(errs, fmt.Sprintf("%s: got %d, want %d", c.name, c.got, c.want))
+		}
+	}
+	if !s.bridgeSummary.CommitInserted {
+		errs = append(errs, "CommitInserted: got false, want true")
+	}
+	if s.bridgeSummary.RepoNodeID != "node-0001" {
+		errs = append(errs, fmt.Sprintf("RepoNodeID: got %q, want %q", s.bridgeSummary.RepoNodeID, "node-0001"))
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("bridge FullSummary mismatch:\n  %s", strings.Join(errs, "\n  "))
+	}
+	return nil
+}
+
 func (s *workerAdoptsState) fingerprintsStableAcrossSecondRun() error {
 	w2 := newRunFullRecordingWriter()
 	ctx := context.Background()
@@ -868,6 +1059,8 @@ func InitializeScenario_identity_and_ancestry_refactor_worker_adopts_ancestrywri
 	// Then
 	ctx.Then(`^the Go AST of worker\.go confirms runFull delegates to AncestryWriter in the correct call order with summary wiring$`,
 		s.workerGoConfirmsWiringAST)
+	ctx.Then(`^worker\.runFull executes through the sqlmock bridge and the FullSummary matches$`,
+		s.workerRunFullViaBridge)
 	ctx.Then(`^the captured node tuples match the committed golden snapshot$`,
 		s.capturedNodeTuplesMatchCommittedSnapshot)
 	ctx.Then(`^the captured edge tuples match the committed golden snapshot$`,

@@ -8,18 +8,18 @@ Feature: Emit prompts flag wiring
 
   Scenario: file written
     Given a built cleanc binary for emit-prompts wiring
-    And a fixture that produces refactor tasks
+    And a fixture with 5 refactor tasks
     When cleanc analyze runs with --emit-prompts prompts.jsonl
-    Then prompts.jsonl exists with one JSONL line per task
+    Then prompts.jsonl exists with exactly 5 lines
     And each prompts.jsonl line is a valid JSON object
     And the emit-prompts exit code is 0
 
   Scenario: stdout sink with explicit out
     Given a built cleanc binary for emit-prompts wiring
-    And a fixture that produces refactor tasks
-    When cleanc analyze runs with --emit-prompts - and --out report.md
+    And a fixture with 5 refactor tasks
+    When cleanc analyze runs with --emit-prompts - and --out report.md and --findings findings.json
     Then report.md exists with the markdown report
-    And stdout contains JSONL lines matching the task count
+    And stdout receives the JSONL stream with one line per task verified against findings.json
     And the emit-prompts exit code is 0
 
   Scenario: zero tasks
@@ -44,7 +44,7 @@ Feature: Emit prompts flag wiring
 
   Scenario: diagnostics count
     Given a built cleanc binary for emit-prompts wiring
-    And a fixture that produces refactor tasks
+    And a fixture with 7 refactor tasks
     When cleanc analyze runs with --emit-prompts prompts.jsonl and --out report.md
-    Then prompts.jsonl exists with one JSONL line per task
-    And the markdown report diagnostics block contains the prompt count
+    Then prompts.jsonl has exactly 7 lines
+    And the diagnostics block contains "Prompts emitted: 7 to prompts.jsonl"

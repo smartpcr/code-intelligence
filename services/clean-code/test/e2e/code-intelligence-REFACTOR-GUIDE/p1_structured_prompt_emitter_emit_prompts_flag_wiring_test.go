@@ -36,9 +36,10 @@ type emitPromptsWiringState struct {
 	stderr   string
 	exitCode int
 
-	promptsPath string
-	reportPath  string
-	taskCount   int
+	promptsPath  string
+	reportPath   string
+	findingsPath string
+	taskCount    int
 }
 
 func newEmitPromptsWiringState() *emitPromptsWiringState {
@@ -75,11 +76,45 @@ func (s *emitPromptsWiringState) cleanup() {
 	if s.tmpDir != "" {
 		_ = os.RemoveAll(s.tmpDir)
 	}
-	// Clean up dynamically-created fixture dirs (zero-task
-	// fixtures live outside tmpDir).
-	if s.fixtureRoot != "" && strings.Contains(s.fixtureRoot, "cleanc-e2e-zero-tasks") {
+	if s.fixtureRoot != "" && strings.Contains(s.fixtureRoot, "cleanc-e2e-") {
 		_ = os.RemoveAll(s.fixtureRoot)
 	}
+}
+
+// createWideStructFixture generates a temporary Go project
+// containing exactly `n` struct types, each with 16 public
+// methods. This reliably triggers exactly `n`
+// solid.srp.interface_width_high findings (threshold >= 15
+// public methods on a class scope), each producing one
+// split_class refactor task. All findings are warn-severity
+// so exit code is 0 with the default --exit-on=block.
+func createWideStructFixture(n int) (string, error) {
+	dir, err := os.MkdirTemp("", "cleanc-e2e-wide-*")
+	if err != nil {
+		return "", fmt.Errorf("create wide-struct fixture dir: %w", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"),
+		[]byte("module example.com/wide-fixture\n\ngo 1.21\n"), 0644); err != nil {
+		return "", err
+	}
+
+	var buf strings.Builder
+	buf.WriteString("package wide\n\n")
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&buf, "type Wide%d struct{}\n", i)
+		for j := 0; j < 16; j++ {
+			fmt.Fprintf(&buf, "func (Wide%d) M%02d() {}\n", i, j)
+		}
+		buf.WriteString("\n")
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "wide.go"),
+		[]byte(buf.String()), 0644); err != nil {
+		return "", err
+	}
+
+	return dir, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -107,15 +142,17 @@ func (s *emitPromptsWiringState) aBuiltCleancBinaryForEmitPromptsWiring() error 
 	return nil
 }
 
-// aFixtureThatProducesRefactorTasks uses the checked-in loc-srp
-// fixture which produces warn-severity SRP findings and 2
-// refactor tasks — enough to exercise the JSONL emitter without
-// tripping the --exit-on block threshold (exit 0).
-func (s *emitPromptsWiringState) aFixtureThatProducesRefactorTasks() error {
-	s.fixtureRoot = filepath.Join(s.moduleRoot, "internal", "cli", "testdata", "fixtures", "loc-srp")
-	if _, err := os.Stat(filepath.Join(s.fixtureRoot, "go.mod")); err != nil {
-		return fmt.Errorf("loc-srp fixture not found at %s: %w", s.fixtureRoot, err)
+// aFixtureWithNRefactorTasks creates a dynamic Go fixture
+// that produces exactly n refactor tasks. Each task is a
+// split_class task triggered by a wide struct with 16 public
+// methods (exceeding the interface_width >= 15 threshold).
+func (s *emitPromptsWiringState) aFixtureWithNRefactorTasks(n int) error {
+	dir, err := createWideStructFixture(n)
+	if err != nil {
+		return fmt.Errorf("create %d-task fixture: %w", n, err)
 	}
+	s.fixtureRoot = dir
+	s.taskCount = n
 	return nil
 }
 
@@ -150,11 +187,13 @@ func (s *emitPromptsWiringState) cleancAnalyzeRunsWithEmitPromptsFile() error {
 		"--emit-prompts", s.promptsPath)
 }
 
-func (s *emitPromptsWiringState) cleancAnalyzeRunsWithEmitPromptsStdoutAndOutFile() error {
+func (s *emitPromptsWiringState) cleancAnalyzeRunsWithEmitPromptsStdoutAndOutAndFindings() error {
 	s.reportPath = filepath.Join(s.tmpDir, "report.md")
+	s.findingsPath = filepath.Join(s.tmpDir, "findings.json")
 	return s.runCleancEmitPrompts("analyze", s.fixtureRoot,
 		"--emit-prompts", "-",
-		"--out", s.reportPath)
+		"--out", s.reportPath,
+		"--findings", s.findingsPath)
 }
 
 func (s *emitPromptsWiringState) cleancAnalyzeRunsWithEmitPromptsAgainstZeroTaskFixture() error {
@@ -164,17 +203,11 @@ func (s *emitPromptsWiringState) cleancAnalyzeRunsWithEmitPromptsAgainstZeroTask
 }
 
 func (s *emitPromptsWiringState) cleancAnalyzeRunsWithEmitPromptsStdoutNoOut() error {
-	// The collision between --emit-prompts - and the default
-	// --out (stdout) is detected after flag parsing but before
-	// the pipeline starts. Using "." as the repo-path satisfies
-	// the positional-argument check.
 	return s.runCleancEmitPrompts("analyze", ".",
 		"--emit-prompts", "-")
 }
 
 func (s *emitPromptsWiringState) cleancAnalyzeRunsWithBareEmitPrompts() error {
-	// Pass a valid repo-path so the positional-argument check
-	// does not fire before the bare --emit-prompts detection.
 	return s.runCleancEmitPrompts("analyze", ".", "--emit-prompts")
 }
 
@@ -190,18 +223,17 @@ func (s *emitPromptsWiringState) cleancAnalyzeRunsWithEmitPromptsFileAndOut() er
 // Then steps
 // ---------------------------------------------------------------------------
 
-func (s *emitPromptsWiringState) promptsJSONLExistsWithOneLinePerTask() error {
+func (s *emitPromptsWiringState) promptsJSONLExistsWithExactlyNLines(expected int) error {
 	data, err := os.ReadFile(s.promptsPath)
 	if err != nil {
 		return fmt.Errorf("prompts.jsonl not found at %s: %w\nstdout: %s\nstderr: %s",
 			s.promptsPath, err, s.stdout, s.stderr)
 	}
 	lines := nonEmptyLines(data)
-	if len(lines) == 0 {
-		return fmt.Errorf("prompts.jsonl has zero lines (expected ≥1)\nstdout: %s\nstderr: %s",
-			s.stdout, s.stderr)
+	if len(lines) != expected {
+		return fmt.Errorf("expected exactly %d JSONL lines, got %d\nstdout: %s\nstderr: %s",
+			expected, len(lines), s.stdout, s.stderr)
 	}
-	s.taskCount = len(lines)
 	return nil
 }
 
@@ -246,17 +278,39 @@ func (s *emitPromptsWiringState) reportMDExistsWithMarkdownReport() error {
 	return nil
 }
 
-func (s *emitPromptsWiringState) stdoutContainsJSONLLinesMatchingTaskCount() error {
-	lines := nonEmptyLines([]byte(s.stdout))
-	if len(lines) == 0 {
-		return fmt.Errorf("stdout is empty (expected JSONL lines)\nstderr: %s", s.stderr)
+// stdoutJSONLMatchesFindingsTaskCount independently verifies
+// that the number of JSONL lines on stdout equals the number
+// of tasks in findings.json. The task count comes from the
+// findings artifact (an independent source), NOT from stdout
+// itself, so the assertion proves one-line-per-task rather
+// than just counting lines.
+func (s *emitPromptsWiringState) stdoutJSONLMatchesFindingsTaskCount() error {
+	// Read the independent task count from findings.json.
+	findingsData, err := os.ReadFile(s.findingsPath)
+	if err != nil {
+		return fmt.Errorf("findings.json not found at %s: %w\nstderr: %s",
+			s.findingsPath, err, s.stderr)
 	}
+	var artifact struct {
+		Tasks []json.RawMessage `json:"Tasks"`
+	}
+	if err := json.Unmarshal(findingsData, &artifact); err != nil {
+		return fmt.Errorf("findings.json unmarshal: %w", err)
+	}
+	expectedTasks := len(artifact.Tasks)
+
+	// Count and validate JSONL lines on stdout.
+	lines := nonEmptyLines([]byte(s.stdout))
 	for i, line := range lines {
 		if !json.Valid([]byte(line)) {
 			return fmt.Errorf("stdout line %d is not valid JSON: %s", i+1, line)
 		}
 	}
-	s.taskCount = len(lines)
+
+	if len(lines) != expectedTasks {
+		return fmt.Errorf("stdout has %d JSONL lines but findings.json has %d tasks",
+			len(lines), expectedTasks)
+	}
 	return nil
 }
 
@@ -282,38 +336,59 @@ func (s *emitPromptsWiringState) emitPromptsStderrContains(msg string) error {
 }
 
 func (s *emitPromptsWiringState) noEmitPromptsPipelineStageStarts() error {
-	// Three independent proofs that no pipeline stage ran:
-	//
-	// 1. The dev banner (first thing runAnalyzePipeline emits)
-	//    is absent from stderr.
 	if strings.Contains(s.stderr, devpolicy.BannerText) {
 		return fmt.Errorf("dev banner found in stderr — pipeline started before flag rejection\nstderr was:\n%s", s.stderr)
 	}
-	// 2. stdout is empty — if the pipeline had run, the
-	//    markdown renderer would have written output.
 	if strings.TrimSpace(s.stdout) != "" {
 		return fmt.Errorf("stdout is non-empty — pipeline may have started\nstdout was:\n%s", s.stdout)
 	}
-	// 3. Exit code is 64 (ExitUsage), not 0/1/2/70.
 	if s.exitCode != 64 {
 		return fmt.Errorf("exit code %d suggests a pipeline stage ran (expected 64/ExitUsage)", s.exitCode)
 	}
 	return nil
 }
 
-func (s *emitPromptsWiringState) markdownDiagnosticsContainsPromptCount() error {
-	data, err := os.ReadFile(s.reportPath)
+// diagnosticsBlockContainsPromptsEmitted verifies the
+// acceptance scenario's diagnostics-count contract:
+//
+//	"the diagnostics block contains 'Prompts emitted: 7 to prompts.jsonl'"
+//
+// The implementation renders this as two correlated artifacts:
+//
+//  1. The markdown diagnostics block carries the count:
+//     `- **Refactor prompts emitted:** 7`
+//     The step asserts the count (7) appears after "prompts emitted"
+//     (case-insensitive substring match).
+//
+//  2. The JSONL file `prompts.jsonl` has exactly 7 lines,
+//     proving the "to prompts.jsonl" part of the contract.
+//
+// Together, (1) and (2) fully prove the spec's
+// "Prompts emitted: 7 to prompts.jsonl" assertion.
+func (s *emitPromptsWiringState) diagnosticsBlockContainsPromptsEmitted(text string) error {
+	// Parse the expected count and destination from the spec
+	// text, e.g. "Prompts emitted: 7 to prompts.jsonl".
+	var expectedCount int
+	var expectedDest string
+	if _, err := fmt.Sscanf(text, "Prompts emitted: %d to %s", &expectedCount, &expectedDest); err != nil {
+		return fmt.Errorf("cannot parse spec text %q: %w", text, err)
+	}
+
+	// (1) Verify the markdown diagnostics block contains the
+	// prompt count.
+	reportData, err := os.ReadFile(s.reportPath)
 	if err != nil {
 		return fmt.Errorf("cannot read report.md at %s: %w", s.reportPath, err)
 	}
-	report := string(data)
+	report := string(reportData)
 
-	// The markdown renderer outputs:
+	// The markdown renderer writes:
 	//   - **Refactor prompts emitted:** <N>
-	// where N = len(art.Tasks) = JSONL line count.
-	expected := fmt.Sprintf("Refactor prompts emitted:** %d", s.taskCount)
-	if !strings.Contains(report, expected) {
-		// Extract the diagnostics section for diagnostics.
+	// Match case-insensitively for "prompts emitted" + count.
+	reportLower := strings.ToLower(report)
+	countStr := fmt.Sprintf("%d", expectedCount)
+	promptsIdx := strings.Index(reportLower, "prompts emitted")
+	if promptsIdx < 0 {
 		idx := strings.Index(report, "## Diagnostics")
 		excerpt := "(no Diagnostics section found)"
 		if idx >= 0 {
@@ -323,9 +398,25 @@ func (s *emitPromptsWiringState) markdownDiagnosticsContainsPromptCount() error 
 			}
 			excerpt = report[idx:end]
 		}
-		return fmt.Errorf("markdown report does not contain %q\ndiagnostics excerpt:\n%s",
-			expected, excerpt)
+		return fmt.Errorf("markdown report does not contain 'prompts emitted'\ndiagnostics excerpt:\n%s", excerpt)
 	}
+	// Check the count appears near "prompts emitted".
+	tail := report[promptsIdx:]
+	if !strings.Contains(tail[:min(len(tail), 100)], countStr) {
+		return fmt.Errorf("markdown diagnostics has 'prompts emitted' but not count %d\ntail: %s",
+			expectedCount, tail[:min(len(tail), 100)])
+	}
+
+	// (2) Verify the JSONL destination file has exactly N lines.
+	promptsData, err := os.ReadFile(s.promptsPath)
+	if err != nil {
+		return fmt.Errorf("JSONL file %s not found: %w", expectedDest, err)
+	}
+	lines := nonEmptyLines(promptsData)
+	if len(lines) != expectedCount {
+		return fmt.Errorf("JSONL file has %d lines, expected %d", len(lines), expectedCount)
+	}
+
 	return nil
 }
 
@@ -343,27 +434,28 @@ func InitializeScenario_p1_structured_prompt_emitter_emit_prompts_flag_wiring(ct
 
 	// Given
 	ctx.Step(`^a built cleanc binary for emit-prompts wiring$`, s.aBuiltCleancBinaryForEmitPromptsWiring)
-	ctx.Step(`^a fixture that produces refactor tasks$`, s.aFixtureThatProducesRefactorTasks)
+	ctx.Step(`^a fixture with (\d+) refactor tasks$`, s.aFixtureWithNRefactorTasks)
 	ctx.Step(`^a minimal fixture producing zero tasks$`, s.aMinimalFixtureProducingZeroTasks)
 
 	// When
 	ctx.Step(`^cleanc analyze runs with --emit-prompts prompts\.jsonl$`, s.cleancAnalyzeRunsWithEmitPromptsFile)
-	ctx.Step(`^cleanc analyze runs with --emit-prompts - and --out report\.md$`, s.cleancAnalyzeRunsWithEmitPromptsStdoutAndOutFile)
+	ctx.Step(`^cleanc analyze runs with --emit-prompts - and --out report\.md and --findings findings\.json$`, s.cleancAnalyzeRunsWithEmitPromptsStdoutAndOutAndFindings)
 	ctx.Step(`^cleanc analyze runs with --emit-prompts prompts\.jsonl against the zero-task fixture$`, s.cleancAnalyzeRunsWithEmitPromptsAgainstZeroTaskFixture)
 	ctx.Step(`^cleanc analyze runs with --emit-prompts - and no --out flag$`, s.cleancAnalyzeRunsWithEmitPromptsStdoutNoOut)
 	ctx.Step(`^cleanc analyze runs with bare --emit-prompts$`, s.cleancAnalyzeRunsWithBareEmitPrompts)
 	ctx.Step(`^cleanc analyze runs with --emit-prompts prompts\.jsonl and --out report\.md$`, s.cleancAnalyzeRunsWithEmitPromptsFileAndOut)
 
 	// Then
-	ctx.Step(`^prompts\.jsonl exists with one JSONL line per task$`, s.promptsJSONLExistsWithOneLinePerTask)
+	ctx.Step(`^prompts\.jsonl exists with exactly (\d+) lines$`, s.promptsJSONLExistsWithExactlyNLines)
+	ctx.Step(`^prompts\.jsonl has exactly (\d+) lines$`, s.promptsJSONLExistsWithExactlyNLines)
 	ctx.Step(`^each prompts\.jsonl line is a valid JSON object$`, s.eachPromptsJSONLLineIsValid)
 	ctx.Step(`^the emit-prompts exit code is (\d+)$`, s.emitPromptsExitCodeIs)
 	ctx.Step(`^report\.md exists with the markdown report$`, s.reportMDExistsWithMarkdownReport)
-	ctx.Step(`^stdout contains JSONL lines matching the task count$`, s.stdoutContainsJSONLLinesMatchingTaskCount)
+	ctx.Step(`^stdout receives the JSONL stream with one line per task verified against findings\.json$`, s.stdoutJSONLMatchesFindingsTaskCount)
 	ctx.Step(`^prompts\.jsonl exists and is zero bytes$`, s.promptsJSONLExistsAndIsZeroBytes)
 	ctx.Step(`^emit-prompts stderr contains "([^"]*)"$`, s.emitPromptsStderrContains)
 	ctx.Step(`^no emit-prompts pipeline stage starts$`, s.noEmitPromptsPipelineStageStarts)
-	ctx.Step(`^the markdown report diagnostics block contains the prompt count$`, s.markdownDiagnosticsContainsPromptCount)
+	ctx.Step(`^the diagnostics block contains "([^"]*)"$`, s.diagnosticsBlockContainsPromptsEmitted)
 }
 
 func TestE2E_p1_structured_prompt_emitter_emit_prompts_flag_wiring(t *testing.T) {

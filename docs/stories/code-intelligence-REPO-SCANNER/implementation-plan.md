@@ -118,15 +118,16 @@ storyId: "code-intelligence:REPO-SCANNER"
 ### Implementation Steps
 - [ ] Refactor `worker.runFull` to construct an `AncestryWriter` and call `EnsureRepoAndCommit` + per-file `EnsureFile` instead of inlining the repo/package/file insert loop.
 - [ ] Delete the now-dead inline blocks at `worker.go` lines 1084-1219 (the loop body), keeping the `EmitFile` call and the `EmitResult.TouchedNodes` retire path intact.
-- [ ] Run `go test ./internal/repoindexer/...` and update `worker_unit_test.go` mocks where the call shape changes; keep `worker_integration_test.go` assertions identical (the on-disk graph must be byte-identical to the pre-refactor run).
+- [ ] Run `go test ./internal/repoindexer/...` and update `worker_unit_test.go` mocks where the call shape changes.
+- [ ] Prove graph preservation IN-PROCESS via a GOLDEN SNAPSHOT: drive `worker.runFull` over an in-memory fixture with a recording `RepoCommitNodeEdgeWriter` (the Stage 2.3 interface) that captures every `(canonical_signature, kind, parent_node_id, fingerprint)` node/edge tuple; commit the tuples captured from the PRE-refactor implementation as a golden fixture and assert the post-refactor run reproduces them byte-for-byte. No Postgres in the gate. The Postgres-backed `worker_integration_test.go` stays as a CI regression guard (provided DSN), not a gate requirement.
 
 ### Dependencies
 - phase-identity-and-ancestry-refactor/stage-ancestrywriter-factored-from-worker
 
 ### Test Scenarios
-- [ ] Scenario: worker-graph-byte-identical -- Given the same fixture repo, When `worker.runFull` runs before and after the refactor, Then the resulting `node` / `edge` rows (canonical_signature, kind, parent_node_id, fingerprint) are byte-identical.
-- [ ] Scenario: worker-integration-still-passes -- Given the existing `worker_integration_test.go`, When the suite runs after the refactor, Then all tests pass without assertion edits to graph contents.
-- [ ] Scenario: helpers-no-internal-callers -- Given the refactor, When `grep -RIn "canonicalRepoSig\|canonicalPackageDir\|canonicalPackageSig\|canonicalFileSig" services/agent-memory/internal/` runs, Then no hits remain (only the exported names appear).
+- [ ] Scenario: worker-graph-byte-identical -- Given an in-memory fixture repo and a recording `RepoCommitNodeEdgeWriter`, When `worker.runFull` runs through `AncestryWriter`, Then the captured `(canonical_signature, kind, parent_node_id, fingerprint)` node/edge tuples are byte-identical to the committed pre-refactor golden fixture. [proof: golden; deps: none]
+- [ ] Scenario: worker-integration-still-passes -- Given the existing `worker_integration_test.go`, When the suite runs against a provided Postgres on CI, Then all tests pass without assertion edits to graph contents. [proof: service:postgres; deps: provided DSN on the CI runner; not a gate-required scenario]
+- [ ] Scenario: helpers-no-internal-callers -- Given the refactor, When `grep -RIn "canonicalRepoSig\|canonicalPackageDir\|canonicalPackageSig\|canonicalFileSig" services/agent-memory/internal/` runs, Then no hits remain (only the exported names appear). [proof: in-process; deps: none]
 
 # Phase 3: graphsink storage abstraction
 

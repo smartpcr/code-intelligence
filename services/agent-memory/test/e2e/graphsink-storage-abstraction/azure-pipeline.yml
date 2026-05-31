@@ -102,6 +102,14 @@ steps:
     condition: succeededOrFailed()
 
   - script: |
+      cd services/agent-memory
+      CGO_ENABLED=1 go test -tags e2e -v -count=1 -timeout 300s \
+        -run TestE2E_graphsink_storage_abstraction_sqlite_reader_adapter \
+        ./test/e2e/code-intelligence-REPO-SCANNER/...
+    displayName: "Run E2E scenarios — sqlite-reader-adapter"
+    condition: succeededOrFailed()
+
+  - script: |
       docker compose -f $(COMPOSE_FILE) down -v
     displayName: "Tear down compose stack"
     condition: always()

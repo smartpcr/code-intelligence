@@ -55,6 +55,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -287,7 +288,18 @@ func (s *Sink) ListNodes(
 		args = append(args, f.CanonicalSignature)
 	}
 	b.WriteString(" ORDER BY kind ASC, canonical_signature ASC, node_id ASC LIMIT ?")
-	args = append(args, normaliseLimit(f.Limit))
+	effective := normaliseLimit(f.Limit)
+	// Only log when the caller explicitly exceeded the cap. The <= 0
+	// path is the normal "no limit specified" default and is intentionally
+	// silent to avoid noise — callers routinely omit Limit.
+	if f.Limit > graphreader.MaxListLimit {
+		slog.InfoContext(ctx, "graphsink.reader.limit_clamped",
+			slog.Int("requested", f.Limit),
+			slog.Int("effective", effective),
+			slog.Bool("clamped", true),
+		)
+	}
+	args = append(args, effective)
 
 	rows, err := s.db.QueryContext(ctx, b.String(), args...)
 	if err != nil {

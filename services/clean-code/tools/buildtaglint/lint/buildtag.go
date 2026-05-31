@@ -21,6 +21,7 @@ package lint
 
 import (
 	"go/ast"
+	"go/build/constraint"
 	"go/types"
 	"strings"
 
@@ -278,25 +279,37 @@ func isNilExpr(e ast.Expr) bool {
 }
 
 // fileExcludesProd returns true when the file carries a
-// `//go:build` constraint that excludes the `prod` tag.
+// LEADING `//go:build` constraint (one that appears in a
+// comment group BEFORE the package clause, which is the
+// only position Go's toolchain recognises as a build
+// constraint) whose semantic evaluation guarantees the
+// file is excluded from any build that sets the `prod`
+// tag.
 //
-// We deliberately avoid `go/build/constraint` to keep the
-// rule's accepted-expression set narrow: the repo only
-// uses simple conjunctions for bypass files (`!prod`,
-// `!prod && cgo`), and a stricter "exclusion required"
-// posture is safer than a fully general SAT-style check
-// that might accept exotic disjunctions where a prod build
-// could slip through.
+// The leading-position check (`cg.End() < file.Package`)
+// closes the iter-3 evaluator gap where a `//go:build !prod`
+// comment placed anywhere in the file (including after the
+// package clause) was accepted -- the Go toolchain ignores
+// such comments as build constraints, so a prod build
+// would still pick the file up.
 func fileExcludesProd(file *ast.File) bool {
 	for _, cg := range file.Comments {
+		// `file.Package` is the token.Pos of the
+		// `package` keyword. Only comment groups that
+		// end strictly before it can be honoured as
+		// build constraints by the Go toolchain.
+		if cg.End() >= file.Package {
+			continue
+		}
 		for _, c := range cg.List {
-			text := strings.TrimSpace(c.Text)
-			const prefix = "//go:build"
-			if !strings.HasPrefix(text, prefix) {
+			if !constraint.IsGoBuild(c.Text) {
 				continue
 			}
-			expr := strings.TrimSpace(strings.TrimPrefix(text, prefix))
-			if buildExprExcludesProd(expr) {
+			expr, err := constraint.Parse(c.Text)
+			if err != nil {
+				continue
+			}
+			if exprExcludesProd(expr) {
 				return true
 			}
 		}
@@ -304,48 +317,95 @@ func fileExcludesProd(file *ast.File) bool {
 	return false
 }
 
-// buildExprExcludesProd returns true when the build-tag
-// expression `expr` is satisfied ONLY by builds that do NOT
-// set the `prod` tag.
+// exprExcludesProd returns true when there is NO satisfying
+// assignment of build tags with `prod = true` that makes
+// `expr` evaluate to true. In other words: every config
+// that builds the file has `prod` unset.
 //
-// Accepted: `!prod`, `!prod && X`, `X && !prod && Y`.
-// Rejected (conservative): anything containing `||`, any
-// positive `prod` token, the empty constraint.
-func buildExprExcludesProd(expr string) bool {
-	tokens := tokenizeBuildExpr(expr)
-	for _, t := range tokens {
-		if t == "||" {
-			return false
-		}
+// We avoid the iter-3 token-heuristic gap (which accepted
+// `!!prod` and `!(!prod)` as "excludes prod") by parsing
+// the constraint with `go/build/constraint` and evaluating
+// it semantically. Since the build-tag expression only
+// references a handful of tags in practice (typically
+// ≤4), we enumerate all assignments of the non-prod tags
+// with `prod=true`. If any such assignment satisfies the
+// expression, the file is reachable under a prod build
+// and we reject.
+//
+// Examples (all correctly handled):
+//
+//   - `!prod`            -> excludes (no satisfying assignment with prod=true)
+//   - `!prod && cgo`     -> excludes
+//   - `!(prod)`          -> excludes (semantically `!prod`)
+//   - `!!prod`           -> NOT excluded
+//   - `!(!prod)`         -> NOT excluded
+//   - `!prod || cgo`     -> NOT excluded (cgo-on prod builds compile)
+//   - `!cgo`             -> NOT excluded (cgo-off prod builds compile)
+func exprExcludesProd(expr constraint.Expr) bool {
+	if expr == nil {
+		return false
 	}
-	sawNotProd := false
-	for i, t := range tokens {
+	tags := collectBuildTags(expr)
+	others := make([]string, 0, len(tags))
+	for t := range tags {
 		if t != prodBuildTag {
-			continue
+			others = append(others, t)
 		}
-		if i == 0 || tokens[i-1] != "!" {
+	}
+	n := len(others)
+	limit := 1 << n
+	for mask := 0; mask < limit; mask++ {
+		assign := map[string]bool{prodBuildTag: true}
+		for i, t := range others {
+			assign[t] = (mask>>i)&1 == 1
+		}
+		if expr.Eval(func(tag string) bool { return assign[tag] }) {
+			// Found a build config with prod=true that
+			// satisfies the constraint -> bypass possible.
 			return false
 		}
-		sawNotProd = true
 	}
-	return sawNotProd
+	return true
 }
 
-// tokenizeBuildExpr splits a `//go:build` expression into
-// the minimal set of tokens needed by
-// `buildExprExcludesProd`. `!` is split off the front of
-// any tag (`!prod` -> `!`, `prod`).
-func tokenizeBuildExpr(expr string) []string {
-	expr = strings.ReplaceAll(expr, "(", " ( ")
-	expr = strings.ReplaceAll(expr, ")", " ) ")
-	fields := strings.Fields(expr)
-	out := make([]string, 0, len(fields))
-	for _, f := range fields {
-		for strings.HasPrefix(f, "!") && len(f) > 1 {
-			out = append(out, "!")
-			f = f[1:]
+// collectBuildTags walks a parsed build-constraint
+// expression tree and returns the set of tag identifiers
+// it references. Used to bound the enumeration in
+// `exprExcludesProd`.
+func collectBuildTags(expr constraint.Expr) map[string]struct{} {
+	out := map[string]struct{}{}
+	var walk func(e constraint.Expr)
+	walk = func(e constraint.Expr) {
+		switch v := e.(type) {
+		case *constraint.TagExpr:
+			out[v.Tag] = struct{}{}
+		case *constraint.NotExpr:
+			walk(v.X)
+		case *constraint.AndExpr:
+			walk(v.X)
+			walk(v.Y)
+		case *constraint.OrExpr:
+			walk(v.X)
+			walk(v.Y)
 		}
-		out = append(out, f)
 	}
+	walk(expr)
 	return out
+}
+
+// buildExprExcludesProd is a string-level convenience
+// wrapper around `exprExcludesProd` used by unit tests. It
+// returns false for any expression that does not parse
+// cleanly as a `//go:build` constraint (including the
+// empty string).
+func buildExprExcludesProd(expr string) bool {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return false
+	}
+	parsed, err := constraint.Parse("//go:build " + expr)
+	if err != nil {
+		return false
+	}
+	return exprExcludesProd(parsed)
 }

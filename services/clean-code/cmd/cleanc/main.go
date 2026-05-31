@@ -501,11 +501,13 @@ func runAnalyzePipeline(ctx context.Context, stdout, stderr io.Writer, g *flags.
 		return flags.ExitInternalError
 	}
 	evalRun, verdict := lookupRunAndVerdict(store, runRes)
-	findings := store.Findings()
-	// Sort findings by (RuleID, ScopeID, Severity) so the
-	// rendered report is deterministic across runs. Without
-	// this the engine orders findings by random FindingID
-	// (uuid.NewV4), making golden byte-comparison impossible.
+	// Sort a defensive copy of findings by (RuleID, ScopeID,
+	// Severity) so the rendered report is deterministic across
+	// runs. We copy to avoid mutating the store's internal
+	// slice — downstream callers may rely on insertion order.
+	storeFindings := store.Findings()
+	findings := make([]finding.Finding, len(storeFindings))
+	copy(findings, storeFindings)
 	sort.Slice(findings, func(i, j int) bool {
 		a, b := findings[i], findings[j]
 		if a.RuleID != b.RuleID {

@@ -88,7 +88,7 @@ codeintel scan https://github.com/example/repo.git --sha 1234567890abcdef --out 
 Scan to memory and export a JSON graph for the diagram UI:
 
 ```powershell
-codeintel --store memory codeintel scan E:\src\my-repo --out graph.json
+codeintel --store memory scan E:\src\my-repo --out graph.json
 ```
 
 Restrict the dispatcher to a hint list of languages:

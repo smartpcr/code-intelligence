@@ -59,7 +59,7 @@ COMPOSE_FILE ?= ../../tests/e2e/phase-09-audit-wal/docker-compose.yml
 
 .PHONY: build build-prod test test-prod test-cgo test-nocgo test-race lint lint-cli vet tidy clean proto proto-tools docker-build compose-up compose-down update-cli-golden
 .PHONY: migrate-up migrate-down seed-phase-09 test-phase-09
-.PHONY: test-e2e
+.PHONY: test-e2e e2e-cleanc
 
 build:
 	@mkdir -p $(BIN_DIR)
@@ -261,3 +261,9 @@ test-phase-09:
 # Pre-requisite: `make build` (wired as a dependency).
 test-e2e: build
 	go test -tags e2e ./test/e2e/... -count=1
+
+## e2e-cleanc: run only the end-to-end golden-tests stage
+## (hardening_and_release_end_to_end_golden_tests).
+## Pre-requisite: `make build`.
+e2e-cleanc: build
+	go test -tags e2e -count=1 -run TestE2E_hardening_and_release_end_to_end_golden_tests ./test/e2e/code-intelligence-REFACTOR-GUIDE/...

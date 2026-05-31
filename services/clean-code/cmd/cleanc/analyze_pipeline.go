@@ -71,8 +71,19 @@ func buildRepoContext(absPath string) repocontext.RepoContext {
 			break
 		}
 	}
+	rootPath := repocontext.NormalisePath(absPath)
+	// CLEANC_DISPLAY_ROOT overrides the displayed repo path
+	// in the report artifact. This is display-only: RepoID,
+	// HeadSHA, and ModulePath are still derived from the real
+	// absPath so walking and scope-binding are unaffected.
+	// Used by e2e golden tests to produce machine-independent
+	// report.md that can byte-match a committed golden file.
+	if override := os.Getenv("CLEANC_DISPLAY_ROOT"); override != "" {
+		fmt.Fprintln(os.Stderr, "warn: CLEANC_DISPLAY_ROOT is set — report paths are overridden")
+		rootPath = override
+	}
 	return repocontext.RepoContext{
-		RootPath:   repocontext.NormalisePath(absPath),
+		RootPath:   rootPath,
 		RepoID:     repoID,
 		HeadSHA:    headSHA,
 		ModulePath: modulePath,

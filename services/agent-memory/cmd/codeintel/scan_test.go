@@ -144,7 +144,7 @@ func TestScanLocalMemoryStore(t *testing.T) {
 			t.Errorf("summary missing %q line; got:\n%s", want, s)
 		}
 	}
-	// The fixture has one Python file -> walked should be 1,
+	// The fixture has one Go file -> walked should be 1,
 	// parsed should be 1.
 	if !strings.Contains(s, "walked: 1") {
 		t.Errorf("expected walked: 1, got:\n%s", s)

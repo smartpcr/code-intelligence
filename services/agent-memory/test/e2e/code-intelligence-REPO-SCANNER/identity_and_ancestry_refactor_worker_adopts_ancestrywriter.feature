@@ -12,7 +12,7 @@ Feature: Worker adopts AncestryWriter
     Given an in-memory fixture repo with files "README.md,pkg/foo.go,pkg/sub/bar.go"
     And a recording RepoCommitNodeEdgeWriter
     When worker.runFull executes through AncestryWriter with parentSHA "aaa111" and headSHA "bbb222"
-    Then worker.go source confirms runFull calls NewAncestryWriter and SetParentSHA and SetCurrentHeadSHA and EnsureRepoAndCommit and EnsureFile
+    Then the Go AST of worker.go confirms runFull delegates to AncestryWriter in the correct call order with summary wiring
     And the captured node tuples match the committed golden snapshot
     And the captured edge tuples match the committed golden snapshot
     And the FullSummary counters match the expected values

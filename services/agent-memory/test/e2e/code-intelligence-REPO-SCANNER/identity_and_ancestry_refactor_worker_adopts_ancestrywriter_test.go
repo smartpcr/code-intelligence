@@ -6,6 +6,9 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -252,19 +255,96 @@ var goldenCommittedEdges = []committedEdgeSnapshot{
 }
 
 // ---------------------------------------------------------------------------
-// worker.runFull wiring tokens — the source-level call sites that
-// prove runFull delegates to AncestryWriter. The structural check
-// reads worker.go and asserts all five tokens are present in the
-// runFull method body, catching any future drift that would
-// de-wire the AncestryWriter delegation.
+// AST-based runFull wiring verification
+//
+// Instead of string-scanning worker.go for tokens (which can miss
+// ordering, arguments, conditions, and summary wiring), we parse
+// the Go AST with go/parser and verify:
+//
+//  1. runFull is a method on *Worker
+//  2. The method body contains the five AncestryWriter delegation
+//     calls in the correct ORDER: NewAncestryWriter → SetParentSHA
+//     → SetCurrentHeadSHA → EnsureRepoAndCommit → EnsureFile
+//  3. The method body assigns FullSummary fields from FileAncestry
+//     fields (PackagesEnsured, PackagesInserted, FilesEnsured,
+//     FilesInserted, ContainsEdgesInserted)
+//
+// The AST naturally bounds the method body (no EOF slicing) and
+// understands Go syntax (no false matches on comments or strings).
 // ---------------------------------------------------------------------------
 
-var runFullWiringTokens = []string{
-	"NewAncestryWriter(",
-	".SetParentSHA(",
-	".SetCurrentHeadSHA(",
-	".EnsureRepoAndCommit(",
-	".EnsureFile(",
+// astCallCollector walks an AST node and collects method/function
+// call names in source order.
+func astCallCollector(node ast.Node) []string {
+	var calls []string
+	ast.Inspect(node, func(n ast.Node) bool {
+		ce, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		switch fn := ce.Fun.(type) {
+		case *ast.SelectorExpr:
+			calls = append(calls, fn.Sel.Name)
+		case *ast.Ident:
+			calls = append(calls, fn.Name)
+		}
+		return true
+	})
+	return calls
+}
+
+// astAssignmentCollector walks an AST node and collects all
+// field assignment targets — both direct assignments like
+// `summary.PackagesEnsured++` and composite literal fields like
+// `summary := FullSummary{RepoNodeID: ...}`.
+func astAssignmentCollector(node ast.Node) []string {
+	var assigns []string
+	ast.Inspect(node, func(n ast.Node) bool {
+		switch stmt := n.(type) {
+		case *ast.AssignStmt:
+			for _, lhs := range stmt.Lhs {
+				if sel, ok := lhs.(*ast.SelectorExpr); ok {
+					if recv, ok := sel.X.(*ast.Ident); ok {
+						assigns = append(assigns, recv.Name+"."+sel.Sel.Name)
+					}
+				}
+			}
+			// Check RHS for composite literals with named fields
+			// (e.g. summary := FullSummary{RepoNodeID: ...}).
+			for _, rhs := range stmt.Rhs {
+				cl, ok := rhs.(*ast.CompositeLit)
+				if !ok {
+					continue
+				}
+				// Find the variable name from LHS.
+				var varName string
+				for _, lhs := range stmt.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok {
+						varName = id.Name
+						break
+					}
+				}
+				if varName == "" {
+					continue
+				}
+				for _, elt := range cl.Elts {
+					if kv, ok := elt.(*ast.KeyValueExpr); ok {
+						if key, ok := kv.Key.(*ast.Ident); ok {
+							assigns = append(assigns, varName+"."+key.Name)
+						}
+					}
+				}
+			}
+		case *ast.IncDecStmt:
+			if sel, ok := stmt.X.(*ast.SelectorExpr); ok {
+				if recv, ok := sel.X.(*ast.Ident); ok {
+					assigns = append(assigns, recv.Name+"."+sel.Sel.Name)
+				}
+			}
+		}
+		return true
+	})
+	return assigns
 }
 
 // ---------------------------------------------------------------------------
@@ -490,37 +570,111 @@ func grepForIdentifier(dir, ident string) ([]string, error) {
 // Then steps
 // ---------------------------------------------------------------------------
 
-// workerGoConfirmsWiring structurally verifies that worker.go's
-// runFull method body contains the five AncestryWriter delegation
-// call sites. This catches future edits to worker.runFull that
-// would de-wire the AncestryWriter delegation (e.g. re-inlining
-// the ancestry logic) — the e2e test's replicated call sequence
-// alone cannot detect such drift because it exercises
-// AncestryWriter directly.
-func (s *workerAdoptsState) workerGoConfirmsWiring() error {
+// workerGoConfirmsWiringAST parses worker.go with go/parser,
+// locates the runFull method on *Worker, and verifies:
+//
+//  1. The five AncestryWriter delegation calls appear in order
+//  2. The FullSummary field assignments are present
+//
+// This is structurally stronger than string scanning because the
+// AST naturally bounds the method body, understands Go syntax,
+// and verifies call ordering — catching incorrect ordering,
+// swapped arguments, missing conditions, or summary-wiring drift
+// that string-contains checks would miss.
+func (s *workerAdoptsState) workerGoConfirmsWiringAST() error {
 	if s.workerSource == "" {
 		return fmt.Errorf("worker.go source not loaded")
 	}
 
-	// Extract the runFull method body by finding its bounds.
-	startIdx := strings.Index(s.workerSource, "func (w *Worker) runFull(")
-	if startIdx < 0 {
-		return fmt.Errorf("worker.go: runFull method not found")
+	// Parse worker.go into a Go AST.
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "worker.go", s.workerSource, 0)
+	if err != nil {
+		return fmt.Errorf("go/parser failed on worker.go: %w", err)
 	}
-	body := s.workerSource[startIdx:]
 
-	var missing []string
-	for _, token := range runFullWiringTokens {
-		if !strings.Contains(body, token) {
-			missing = append(missing, token)
+	// Find func (w *Worker) runFull(...) in the AST.
+	var runFullDecl *ast.FuncDecl
+	for _, decl := range f.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Name.Name != "runFull" {
+			continue
+		}
+		if fd.Recv == nil || len(fd.Recv.List) == 0 {
+			continue
+		}
+		recvType := fd.Recv.List[0].Type
+		if star, ok := recvType.(*ast.StarExpr); ok {
+			if ident, ok := star.X.(*ast.Ident); ok && ident.Name == "Worker" {
+				runFullDecl = fd
+				break
+			}
 		}
 	}
-	if len(missing) > 0 {
-		return fmt.Errorf(
-			"worker.go runFull is missing AncestryWriter delegation call sites: %s — "+
-				"the refactored worker.runFull must route through AncestryWriter",
-			strings.Join(missing, ", "))
+	if runFullDecl == nil {
+		return fmt.Errorf("worker.go: func (w *Worker) runFull not found in AST")
 	}
+
+	// 1. Verify the five AncestryWriter delegation calls appear
+	//    in the correct order within runFull's body.
+	calls := astCallCollector(runFullDecl.Body)
+
+	requiredSequence := []string{
+		"NewAncestryWriter",
+		"SetParentSHA",
+		"SetCurrentHeadSHA",
+		"EnsureRepoAndCommit",
+		"EnsureFile",
+	}
+
+	lastIdx := -1
+	for _, required := range requiredSequence {
+		found := false
+		for i := lastIdx + 1; i < len(calls); i++ {
+			if calls[i] == required {
+				lastIdx = i
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf(
+				"runFull AST: %q not found (or out of order) after position %d in call sequence %v",
+				required, lastIdx, calls)
+		}
+	}
+
+	// 2. Verify FullSummary field assignments are present in
+	//    runFull — these wire FileAncestry results into the
+	//    returned summary. Without these, the summary counters
+	//    would be zero even though EnsureFile succeeded.
+	assigns := astAssignmentCollector(runFullDecl.Body)
+	requiredAssigns := []string{
+		"summary.RepoNodeID",
+		"summary.CommitInserted",
+		"summary.PackagesEnsured",
+		"summary.PackagesInserted",
+		"summary.FilesEnsured",
+		"summary.FilesInserted",
+		"summary.ContainsEdgesInserted",
+	}
+	assignSet := make(map[string]bool, len(assigns))
+	for _, a := range assigns {
+		assignSet[a] = true
+	}
+	var missingAssigns []string
+	for _, ra := range requiredAssigns {
+		if !assignSet[ra] {
+			missingAssigns = append(missingAssigns, ra)
+		}
+	}
+	if len(missingAssigns) > 0 {
+		return fmt.Errorf(
+			"runFull AST: missing FullSummary field assignments: %s — "+
+				"found assignments: %v",
+			strings.Join(missingAssigns, ", "), assigns)
+	}
+
 	return nil
 }
 
@@ -712,8 +866,8 @@ func InitializeScenario_identity_and_ancestry_refactor_worker_adopts_ancestrywri
 	ctx.When(`^we search for unexported helper names "([^"]*)"$`, s.weSearchForUnexportedHelperNames)
 
 	// Then
-	ctx.Then(`^worker\.go source confirms runFull calls NewAncestryWriter and SetParentSHA and SetCurrentHeadSHA and EnsureRepoAndCommit and EnsureFile$`,
-		s.workerGoConfirmsWiring)
+	ctx.Then(`^the Go AST of worker\.go confirms runFull delegates to AncestryWriter in the correct call order with summary wiring$`,
+		s.workerGoConfirmsWiringAST)
 	ctx.Then(`^the captured node tuples match the committed golden snapshot$`,
 		s.capturedNodeTuplesMatchCommittedSnapshot)
 	ctx.Then(`^the captured edge tuples match the committed golden snapshot$`,

@@ -37,7 +37,7 @@ func newWiredSteward(t *testing.T) (*steward.Steward, steward.Store) {
 	return st, store
 }
 
-// TestBootstrap_PublishesFivePacksAndNineRules is the
+// TestBootstrap_PublishesFivePacksAndTenRules is the
 // implementation-plan Stage 5.5 e2e scenario
 // `solid-rulepacks-load`: "Given the five SOLID rulepack
 // files, When the Steward loads them, Then `pack='solid'`
@@ -46,7 +46,13 @@ func newWiredSteward(t *testing.T) (*steward.Steward, steward.Store) {
 // We construct a real [steward.Steward] against an
 // in-memory KMS+Store, invoke [Bootstrap], and assert that
 // every canonical pack + rule landed in the store.
-func TestBootstrap_PublishesFivePacksAndNineRules(t *testing.T) {
+//
+// Iter-3 of the P0 fixture-corpus stage added
+// `solid.srp.loc_high` to srp.yaml so the high-LOC fixture
+// drives a loc-rooted SRP finding (in addition to the
+// pre-existing interface_width signal); the rule total is
+// now 10.
+func TestBootstrap_PublishesFivePacksAndTenRules(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	st, store := newWiredSteward(t)
@@ -60,9 +66,9 @@ func TestBootstrap_PublishesFivePacksAndNineRules(t *testing.T) {
 	if result.PublishedPacks != 5 {
 		t.Errorf("PublishedPacks = %d; want 5", result.PublishedPacks)
 	}
-	// srp=2, ocp=2, lsp=2, isp=1, dip=2 -> 9 rules.
-	if result.PublishedRules != 9 {
-		t.Errorf("PublishedRules = %d; want 9", result.PublishedRules)
+	// srp=3, ocp=2, lsp=2, isp=1, dip=2 -> 10 rules.
+	if result.PublishedRules != 10 {
+		t.Errorf("PublishedRules = %d; want 10", result.PublishedRules)
 	}
 
 	// Each canonical pack is now in the store.

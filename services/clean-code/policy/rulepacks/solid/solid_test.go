@@ -66,7 +66,7 @@ var expectedPackIDs = map[string]string{
 // and the architecture / implementation-plan references need
 // updating in lockstep.
 var expectedRuleCounts = map[string]int{
-	"srp.yaml": 2, // lcom4_high + interface_width_high
+	"srp.yaml": 3, // lcom4_high + interface_width_high + loc_high
 	"ocp.yaml": 2, // fan_in_high + modification_count_high
 	"lsp.yaml": 2, // depth_of_inheritance_high + override_violation
 	"isp.yaml": 1, // interface_width_high
@@ -171,7 +171,7 @@ func TestLoadAll_PackShape(t *testing.T) {
 		}
 		totalRules += len(p.Rules)
 	}
-	const wantTotal = 9
+	const wantTotal = 10
 	if totalRules != wantTotal {
 		t.Errorf("total Stage 5.5 SOLID rules = %d; want %d", totalRules, wantTotal)
 	}

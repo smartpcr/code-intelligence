@@ -1,0 +1,912 @@
+{
+  "schemaVersion": "v1.2026.05",
+  "Context": {
+    "RootPath": "/fixtures/python",
+    "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+    "HeadSHA": "working-copy",
+    "ModulePath": "",
+    "IsGitRepo": false
+  },
+  "Policy": {
+    "policy_version_id": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+    "name": "cleanc.devpolicy",
+    "rule_refs": [
+      {
+        "rule_id": "decoupling.fan_in_high",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.fan_out_high",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.cbo_high",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.cycle_member_present",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.duplication_ratio_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.dip.fan_out_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.dip.coupling_between_objects_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.isp.interface_width_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.lsp.depth_of_inheritance_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.lsp.override_violation",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.ocp.fan_in_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.ocp.modification_count_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.srp.lcom4_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.srp.interface_width_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.srp.loc_high",
+        "version": 1
+      }
+    ],
+    "threshold_refs": [
+      {
+        "threshold_id": "1e105766-3e02-5b49-b5be-49a787fd8e04"
+      },
+      {
+        "threshold_id": "d3a40d02-4b95-54c6-98fa-22793b425346"
+      },
+      {
+        "threshold_id": "fd6a0f05-ecbf-56cb-9e97-e6a83cc6a13e"
+      },
+      {
+        "threshold_id": "04d9f035-5183-5cb7-86bb-b582f85d3241"
+      }
+    ],
+    "refactor_weights": {
+      "alpha": 1,
+      "beta": 1,
+      "gamma": 1,
+      "delta": 1,
+      "effort_model_version": "dev",
+      "window_days": 90,
+      "top_n": 20
+    },
+    "signature": null,
+    "created_at": "2026-05-01T12:00:00Z"
+  },
+  "Files": [
+    {
+      "path": "pkg/__init__.py",
+      "language": "python",
+      "size_bytes": 134,
+      "parse_status": "parsed"
+    },
+    {
+      "path": "pkg/module_a.py",
+      "language": "python",
+      "size_bytes": 1820,
+      "parse_status": "parsed"
+    },
+    {
+      "path": "pkg/module_b.py",
+      "language": "python",
+      "size_bytes": 318,
+      "parse_status": "parsed"
+    }
+  ],
+  "Skips": [],
+  "DarkMetrics": [
+    {
+      "metric_kind": "cognitive_complexity",
+      "language": "python",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 33,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "cyclo",
+      "language": "python",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 30,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_in",
+      "language": "python",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 39,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_out",
+      "language": "python",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 39,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "lcom4",
+      "language": "python",
+      "missing_attrs": [
+        "call_edges",
+        "field_accesses"
+      ],
+      "affected_scope_count": 6,
+      "closure_phase": "P2"
+    }
+  ],
+  "Samples": [
+    {
+      "SampleID": "f9f5d3f4-b67a-5aba-9f8f-1d2a5cfc9970",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "c9614c0d-e4d2-5a2b-bf7f-69fba9a80f27",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_a.py#module_a.Root"
+    },
+    {
+      "SampleID": "d0445e68-7f33-57b5-990b-434f30ef75cc",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "ac59f432-c1c7-5bf1-b5be-0c84f1dc6a1b",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_a.py#module_a.Mid"
+    },
+    {
+      "SampleID": "0f4e0f3b-718a-53c1-bbc4-5dce4aa35326",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "07981176-f77c-506a-8d0a-c15f261c4073",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_a.py#module_a.AlphaWide"
+    },
+    {
+      "SampleID": "acb0cf5c-bf17-5c0b-b4d3-13aa1ba4d023",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "5a3ad11f-3e9f-508b-a462-a5c4b037b232",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_b.py#module_b.BetaBase"
+    },
+    {
+      "SampleID": "85dc8247-49db-50f4-8748-9a72b471a54b",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "88316185-3e66-5762-ac7b-24eda2b59097",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_b.py#module_b.BetaMid"
+    },
+    {
+      "SampleID": "d7e1df55-6079-5392-a66d-ff64390ff54f",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "b4a1e076-a8a7-5e19-adb7-3ceffc6b5244",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_b.py#module_b.BetaLeaf"
+    },
+    {
+      "SampleID": "4879bd12-2656-5d77-a738-56d731f02352",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "1ab22bab-387b-5a5a-85a5-d0323468c39d",
+      "ScopeKind": "file",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::file::pkg/__init__.py"
+    },
+    {
+      "SampleID": "d6180b1f-dcb0-5e91-81b4-fa24b63bfd39",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "760fafda-5630-5c36-bf3d-24350b60395f",
+      "ScopeKind": "file",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::file::pkg/module_a.py"
+    },
+    {
+      "SampleID": "00cb06e0-bb62-5c8b-a24d-18b304e79321",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "575f853b-6034-5407-a2e1-57cc030f5b98",
+      "ScopeKind": "file",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::file::pkg/module_b.py"
+    },
+    {
+      "SampleID": "4fe689d7-e979-5cb5-89ff-740be7c22bd2",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "c9614c0d-e4d2-5a2b-bf7f-69fba9a80f27",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_a.py#module_a.Root"
+    },
+    {
+      "SampleID": "63f29700-4de0-5ca4-8370-574456472af8",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "ac59f432-c1c7-5bf1-b5be-0c84f1dc6a1b",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_a.py#module_a.Mid"
+    },
+    {
+      "SampleID": "84b26ad5-d03d-56f5-b9b6-fd0d82ca1fc6",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "07981176-f77c-506a-8d0a-c15f261c4073",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_a.py#module_a.AlphaWide"
+    },
+    {
+      "SampleID": "4d00c79f-817d-551a-b7b4-ec730b2d0e0b",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "5a3ad11f-3e9f-508b-a462-a5c4b037b232",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_b.py#module_b.BetaBase"
+    },
+    {
+      "SampleID": "499c107a-3d9c-5c12-b290-a2d11bdafa97",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "88316185-3e66-5762-ac7b-24eda2b59097",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_b.py#module_b.BetaMid"
+    },
+    {
+      "SampleID": "72209c7c-532b-538e-bc26-71631682cba1",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "b4a1e076-a8a7-5e19-adb7-3ceffc6b5244",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_b.py#module_b.BetaLeaf"
+    },
+    {
+      "SampleID": "481e75e9-ca7c-5ad7-b69b-103f49680e45",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "1ab22bab-387b-5a5a-85a5-d0323468c39d",
+      "ScopeKind": "file",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::file::pkg/__init__.py"
+    },
+    {
+      "SampleID": "50d7dda8-411d-5299-9e8d-d66db1757335",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "760fafda-5630-5c36-bf3d-24350b60395f",
+      "ScopeKind": "file",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0.35585585585585583,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::file::pkg/module_a.py"
+    },
+    {
+      "SampleID": "6b7a340f-4728-593c-ac3c-1f30e33a9332",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "575f853b-6034-5407-a2e1-57cc030f5b98",
+      "ScopeKind": "file",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::file::pkg/module_b.py"
+    },
+    {
+      "SampleID": "a41ec9da-d3b3-5271-a520-ed18664a9566",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "c9614c0d-e4d2-5a2b-bf7f-69fba9a80f27",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_a.py#module_a.Root"
+    },
+    {
+      "SampleID": "efcfd10e-b089-546a-aefb-998e042c9ff9",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "ac59f432-c1c7-5bf1-b5be-0c84f1dc6a1b",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_a.py#module_a.Mid"
+    },
+    {
+      "SampleID": "c9d93032-b627-5048-b932-56ed479c5930",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "07981176-f77c-506a-8d0a-c15f261c4073",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 20,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_a.py#module_a.AlphaWide"
+    },
+    {
+      "SampleID": "26ad7704-a20f-56dd-a464-2ee716c02e16",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "5a3ad11f-3e9f-508b-a462-a5c4b037b232",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_b.py#module_b.BetaBase"
+    },
+    {
+      "SampleID": "aea9a447-3a57-54f1-9ed6-72e1c5528f17",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "88316185-3e66-5762-ac7b-24eda2b59097",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_b.py#module_b.BetaMid"
+    },
+    {
+      "SampleID": "9e22680b-068e-56f3-8d77-2aa0e5befcb4",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "b4a1e076-a8a7-5e19-adb7-3ceffc6b5244",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::class::pkg/module_b.py#module_b.BetaLeaf"
+    },
+    {
+      "SampleID": "4045ab09-e938-530f-8f9f-0caca50b8da0",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "1ab22bab-387b-5a5a-85a5-d0323468c39d",
+      "ScopeKind": "file",
+      "MetricKind": "loc",
+      "MetricVersion": 1,
+      "Value": 5,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::file::pkg/__init__.py"
+    },
+    {
+      "SampleID": "b4ef2a0c-6240-57da-8e09-1c255d3d0562",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "760fafda-5630-5c36-bf3d-24350b60395f",
+      "ScopeKind": "file",
+      "MetricKind": "loc",
+      "MetricVersion": 1,
+      "Value": 71,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::file::pkg/module_a.py"
+    },
+    {
+      "SampleID": "b552e797-63f8-5e3e-8df6-56c9779b95d0",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "575f853b-6034-5407-a2e1-57cc030f5b98",
+      "ScopeKind": "file",
+      "MetricKind": "loc",
+      "MetricVersion": 1,
+      "Value": 17,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:1fcca858-7a26-5141-8e8c-f26b641294b4::file::pkg/module_b.py"
+    }
+  ],
+  "Run": {
+    "EvaluationRunID": "4075a8d4-17cb-5426-a874-545400d07dec",
+    "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+    "SHA": "working-copy",
+    "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+    "Caller": "batch_refresh",
+    "ScopeID": null,
+    "CreatedAt": "2026-05-01T12:00:00Z"
+  },
+  "Verdict": {
+    "VerdictID": "c897d519-4008-54d2-abaa-88dce353d268",
+    "EvaluationRunID": "4075a8d4-17cb-5426-a874-545400d07dec",
+    "Verdict": "block",
+    "Degraded": false,
+    "DegradedReason": "",
+    "CreatedAt": "2026-05-01T12:00:00Z"
+  },
+  "Findings": [
+    {
+      "FindingID": "1c1d61ff-7770-5e68-9ae3-9762be3dea0c",
+      "EvaluationRunID": "4075a8d4-17cb-5426-a874-545400d07dec",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "1ab22bab-387b-5a5a-85a5-d0323468c39d",
+      "RuleID": "decoupling.cycle_member_present",
+      "RuleVersion": 1,
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+      "MetricSampleIDs": [
+        "4879bd12-2656-5d77-a738-56d731f02352"
+      ],
+      "Severity": "block",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "FindingID": "2d4047fc-1098-550f-a7bd-0fd5e3fd5087",
+      "EvaluationRunID": "4075a8d4-17cb-5426-a874-545400d07dec",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "760fafda-5630-5c36-bf3d-24350b60395f",
+      "RuleID": "decoupling.duplication_ratio_high",
+      "RuleVersion": 1,
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+      "MetricSampleIDs": [
+        "50d7dda8-411d-5299-9e8d-d66db1757335"
+      ],
+      "Severity": "warn",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "FindingID": "4133d9ef-82ca-5878-b051-4de4e4917423",
+      "EvaluationRunID": "4075a8d4-17cb-5426-a874-545400d07dec",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "07981176-f77c-506a-8d0a-c15f261c4073",
+      "RuleID": "solid.srp.interface_width_high",
+      "RuleVersion": 1,
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+      "MetricSampleIDs": [
+        "c9d93032-b627-5048-b932-56ed479c5930"
+      ],
+      "Severity": "warn",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "FindingID": "8a009ada-e663-5c6f-bce1-d728966ef2b5",
+      "EvaluationRunID": "4075a8d4-17cb-5426-a874-545400d07dec",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "760fafda-5630-5c36-bf3d-24350b60395f",
+      "RuleID": "decoupling.cycle_member_present",
+      "RuleVersion": 1,
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+      "MetricSampleIDs": [
+        "d6180b1f-dcb0-5e91-81b4-fa24b63bfd39"
+      ],
+      "Severity": "block",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "FindingID": "b8378e54-c52a-5be8-9735-a87f3757b486",
+      "EvaluationRunID": "4075a8d4-17cb-5426-a874-545400d07dec",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "575f853b-6034-5407-a2e1-57cc030f5b98",
+      "RuleID": "decoupling.cycle_member_present",
+      "RuleVersion": 1,
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+      "MetricSampleIDs": [
+        "00cb06e0-bb62-5c8b-a24d-18b304e79321"
+      ],
+      "Severity": "block",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    }
+  ],
+  "HotSpots": [
+    {
+      "HotspotID": "b0612420-83e5-5956-a22f-106dc527b5b0",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "760fafda-5630-5c36-bf3d-24350b60395f",
+      "Score": 2,
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "9f29fe91-b5c8-5a0b-b519-2f66b93604fb",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "07981176-f77c-506a-8d0a-c15f261c4073",
+      "Score": 1.7071067811865475,
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "f5ddeb14-7207-5581-9674-d8e79d3c70d9",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "1ab22bab-387b-5a5a-85a5-d0323468c39d",
+      "Score": 1,
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "f32d4b8e-8c72-5486-b2f4-14f571d9e59b",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "575f853b-6034-5407-a2e1-57cc030f5b98",
+      "Score": 1,
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "57202650-1bc3-59d8-92a2-14d98675873f",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "88316185-3e66-5762-ac7b-24eda2b59097",
+      "Score": 0.7071067811865476,
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "4bac256f-ccb2-5ba1-b9f3-8f636d4b7e27",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "ac59f432-c1c7-5bf1-b5be-0c84f1dc6a1b",
+      "Score": 0.7071067811865476,
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "df9dddf3-0cc0-530b-9325-a8250b9a1e87",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "b4a1e076-a8a7-5e19-adb7-3ceffc6b5244",
+      "Score": 0.7071067811865476,
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "2cb4024a-95e5-53d7-9a80-3cc60e0a7869",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "5a3ad11f-3e9f-508b-a462-a5c4b037b232",
+      "Score": -1.414213562373095,
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "df6129df-db0a-5009-9bd3-63aa12299266",
+      "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+      "SHA": "working-copy",
+      "ScopeID": "c9614c0d-e4d2-5a2b-bf7f-69fba9a80f27",
+      "Score": -1.414213562373095,
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    }
+  ],
+  "Plan": {
+    "PlanID": "8673b214-37d4-51f1-8688-f4e90ef31340",
+    "RepoID": "1fcca858-7a26-5141-8e8c-f26b641294b4",
+    "SHA": "working-copy",
+    "HotspotIDs": [
+      "b0612420-83e5-5956-a22f-106dc527b5b0",
+      "9f29fe91-b5c8-5a0b-b519-2f66b93604fb",
+      "f5ddeb14-7207-5581-9674-d8e79d3c70d9",
+      "f32d4b8e-8c72-5486-b2f4-14f571d9e59b",
+      "57202650-1bc3-59d8-92a2-14d98675873f",
+      "4bac256f-ccb2-5ba1-b9f3-8f636d4b7e27",
+      "df9dddf3-0cc0-530b-9325-a8250b9a1e87",
+      "2cb4024a-95e5-53d7-9a80-3cc60e0a7869",
+      "df6129df-db0a-5009-9bd3-63aa12299266"
+    ],
+    "SummaryMD": "Refactor plan for repo 1fcca858-7a26-5141-8e8c-f26b641294b4 at sha working-copy.\n\nCovered hot_spots: 9\nGenerated tasks: 5\nPolicy version: 2b8b672e-2c5c-5891-ad9a-394921e95273\n",
+    "CreatedAt": "2026-05-01T12:00:00Z"
+  },
+  "Tasks": [
+    {
+      "TaskID": "da486829-0578-5cc8-aad8-32e8310eafe4",
+      "PlanID": "8673b214-37d4-51f1-8688-f4e90ef31340",
+      "ScopeID": "760fafda-5630-5c36-bf3d-24350b60395f",
+      "Kind": "break_cycle",
+      "EffortHours": 0,
+      "RuleID": "decoupling.cycle_member_present",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope 760fafda-5630-5c36-bf3d-24350b60395f motivated by rule decoupling.cycle_member_present.\nHot_spot id: b0612420-83e5-5956-a22f-106dc527b5b0 (score=2, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "TaskID": "1ef59bf3-a73c-53ff-8c0d-466ba0c977e4",
+      "PlanID": "8673b214-37d4-51f1-8688-f4e90ef31340",
+      "ScopeID": "760fafda-5630-5c36-bf3d-24350b60395f",
+      "Kind": "consolidate_duplication",
+      "EffortHours": 0,
+      "RuleID": "decoupling.duplication_ratio_high",
+      "DescriptionMD": "Refactor task: kind=consolidate_duplication for scope 760fafda-5630-5c36-bf3d-24350b60395f motivated by rule decoupling.duplication_ratio_high.\nHot_spot id: b0612420-83e5-5956-a22f-106dc527b5b0 (score=2, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "TaskID": "4ea585d3-0afb-5903-abaf-d6fd7b6ccaff",
+      "PlanID": "8673b214-37d4-51f1-8688-f4e90ef31340",
+      "ScopeID": "07981176-f77c-506a-8d0a-c15f261c4073",
+      "Kind": "split_class",
+      "EffortHours": 0,
+      "RuleID": "solid.srp.interface_width_high",
+      "DescriptionMD": "Refactor task: kind=split_class for scope 07981176-f77c-506a-8d0a-c15f261c4073 motivated by rule solid.srp.interface_width_high.\nHot_spot id: 9f29fe91-b5c8-5a0b-b519-2f66b93604fb (score=1.7071067811865475, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "TaskID": "75b66f0b-0ebc-5f3a-9cb5-a7641eab2072",
+      "PlanID": "8673b214-37d4-51f1-8688-f4e90ef31340",
+      "ScopeID": "1ab22bab-387b-5a5a-85a5-d0323468c39d",
+      "Kind": "break_cycle",
+      "EffortHours": 0,
+      "RuleID": "decoupling.cycle_member_present",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope 1ab22bab-387b-5a5a-85a5-d0323468c39d motivated by rule decoupling.cycle_member_present.\nHot_spot id: f5ddeb14-7207-5581-9674-d8e79d3c70d9 (score=1, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "TaskID": "979d290e-a83f-5047-a783-79a8cd1453a6",
+      "PlanID": "8673b214-37d4-51f1-8688-f4e90ef31340",
+      "ScopeID": "575f853b-6034-5407-a2e1-57cc030f5b98",
+      "Kind": "break_cycle",
+      "EffortHours": 0,
+      "RuleID": "decoupling.cycle_member_present",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope 575f853b-6034-5407-a2e1-57cc030f5b98 motivated by rule decoupling.cycle_member_present.\nHot_spot id: f32d4b8e-8c72-5486-b2f4-14f571d9e59b (score=1, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    }
+  ],
+  "Diagnostics": {
+    "dark_metrics": [
+      {
+        "metric_kind": "cognitive_complexity",
+        "language": "python",
+        "missing_attrs": [
+          "decision_blocks"
+        ],
+        "affected_scope_count": 33,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "cyclo",
+        "language": "python",
+        "missing_attrs": [
+          "decision_blocks"
+        ],
+        "affected_scope_count": 30,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "fan_in",
+        "language": "python",
+        "missing_attrs": [
+          "call_edges"
+        ],
+        "affected_scope_count": 39,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "fan_out",
+        "language": "python",
+        "missing_attrs": [
+          "call_edges"
+        ],
+        "affected_scope_count": 39,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "lcom4",
+        "language": "python",
+        "missing_attrs": [
+          "call_edges",
+          "field_accesses"
+        ],
+        "affected_scope_count": 6,
+        "closure_phase": "P2"
+      }
+    ],
+    "effort_source": "fallback"
+  }
+}

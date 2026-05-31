@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"io"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"

@@ -139,6 +139,21 @@ func TestVersionSubcommandPrintsBuildMetadata(t *testing.T) {
 	}
 }
 
+// TestVersionBypassesFlagValidation guards the documented
+// contract that `codeintel version` answers even when other
+// persistent-flag validators (e.g. an unknown --store) would
+// otherwise abort the command. Without the version-cmd's own
+// PersistentPreRunE the root's validator runs first and aborts.
+func TestVersionBypassesFlagValidation(t *testing.T) {
+	out, _, err := execute(t, "--store", "mysql", "version")
+	if err != nil {
+		t.Fatalf("version with invalid --store should still succeed, got %v", err)
+	}
+	if !strings.Contains(out, "codeintel") {
+		t.Fatalf("expected version output, got %q", out)
+	}
+}
+
 func TestUnknownSubcommandFails(t *testing.T) {
 	_, _, err := execute(t, "bogus")
 	if err == nil {

@@ -24,13 +24,6 @@ import (
 // implementation and stop returning this sentinel.
 var errNotImplemented = errors.New("not implemented")
 
-// metricsPath is the HTTP path the `serve` subcommand will
-// mount for Prometheus scrapes (wired in stage 5.5 alongside
-// obs.SetupTracer). Held as a package constant now so the
-// deploy/cmd_inventory_test observability anchor has a stable
-// reference even while the binary is in scaffold-only state.
-const metricsPath = "/metrics"
-
 type rootFlags struct {
 	store          string
 	db             string
@@ -139,10 +132,7 @@ func notImplemented(name string) error {
 	// configured slog handler (text by default, JSON when
 	// --log=json) actually exercises the wiring. Stage 5.1
 	// scenario `log-flag-respected` covers this.
-	slog.Info("codeintel subcommand invoked",
-		"subcommand", name,
-		"metrics_path", metricsPath,
-	)
+	slog.Info("codeintel subcommand invoked", "subcommand", name)
 	return errNotImplemented
 }
 
@@ -217,11 +207,12 @@ func newVersionCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
 		Short: "Print the codeintel version, commit, and build date",
-		// version is intentionally side-effect-free: no log
-		// line, no validation. It must work even when the
-		// persistent flag validators would otherwise fail
-		// (e.g. unparsable --store) so operators can ask "what
-		// build is this?" on a broken install.
+		// version bypasses the root command's PersistentPreRunE
+		// so it answers "what build is this?" even when --store
+		// or --log have invalid values. Cobra runs the nearest
+		// parent's PersistentPreRunE; defining a no-op here
+		// shadows the root's validator chain.
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error { return nil },
 		RunE: func(cmd *cobra.Command, args []string) error {
 			fmt.Fprintln(cmd.OutOrStdout(), versionString())
 			return nil

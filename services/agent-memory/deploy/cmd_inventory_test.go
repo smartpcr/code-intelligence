@@ -55,6 +55,12 @@ type binaryExpectations struct {
 	// follow-up workstream is responsible for closing the
 	// tracer gap.
 	allowMissingTracer bool
+	// allowMissingMetrics waives the Prometheus /metrics
+	// anchor for binaries that are intentionally scaffold-only
+	// at this point in the story timeline and have a named
+	// follow-up workstream that will wire the metrics surface.
+	// Document the follow-up inline at the call site.
+	allowMissingMetrics bool
 }
 
 func goBinaryExpectations() map[string]binaryExpectations {
@@ -143,17 +149,25 @@ func goBinaryExpectations() map[string]binaryExpectations {
 		"codeintel": {
 			mainPath: "codeintel/main.go",
 			// codeintel is the developer-facing scan CLI added in
-			// stage 5.1 (cobra scaffolding). It exposes the
-			// `/metrics` path as a package constant (`metricsPath`)
-			// in anticipation of the `serve` subcommand wiring the
-			// handler in stage 5.5; OTel tracer setup is also a
-			// stage-5.5 follow-up (`serve`-only, since `scan` /
-			// `scan-many` / `diagram` are one-shot CLIs that don't
-			// run a tracer). Both anchors are waived here with
-			// explicit follow-up ownership, matching the
-			// partition-maintainer precedent above.
-			metricsAnchors:     []string{`"/metrics"`},
-			allowMissingTracer: true,
+			// stage 5.1 (cobra scaffolding). The current binary
+			// is intentionally scaffold-only: every subcommand
+			// returns `errNotImplemented`. Real wiring lands in
+			// later stages of phase-codeintel-cli-binary:
+			//   - stage 5.5 (serve subcommand) mounts the
+			//     Prometheus /metrics handler and calls
+			//     obs.SetupTracer; until then BOTH anchors are
+			//     waived explicitly via allowMissingMetrics /
+			//     allowMissingTracer so the inventory neither
+			//     papers over the gap with a fake substring nor
+			//     blocks the staged rollout. The named follow-up
+			//     workstream is the gate for tightening these
+			//     waivers back to the default (required) state.
+			//   - scan / scan-many / diagram are one-shot CLIs
+			//     with no long-running server, so they would
+			//     never expose /metrics on their own; the
+			//     coverage gap belongs to serve.
+			allowMissingMetrics: true,
+			allowMissingTracer:  true,
 		},
 	}
 }
@@ -214,7 +228,9 @@ func TestEveryBinaryExposesObservability(t *testing.T) {
 				t.Errorf("%s: no %s anchor matched. Tried: %v",
 					path, kind, anchors)
 			}
-			matched(want.metricsAnchors, "Prometheus /metrics")
+			if !want.allowMissingMetrics {
+				matched(want.metricsAnchors, "Prometheus /metrics")
+			}
 			if !want.allowMissingTracer {
 				matched(want.tracerAnchors, "OTel tracer setup")
 			}

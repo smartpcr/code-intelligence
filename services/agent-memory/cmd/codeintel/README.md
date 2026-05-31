@@ -1,9 +1,9 @@
 # codeintel
 
 `codeintel` is the developer-facing command-line driver for the
-`scan-repo` capability described in
-[architecture S3.1](../../../../docs/stories/code-intelligence-REPO-SCANNER/architecture.md#s31-codeintel-cli-binary)
-of the REPO-SCANNER story. It wraps the existing AST dispatcher
+`scan-repo` capability described in §3.1 of the REPO-SCANNER
+[architecture](../../../../docs/stories/code-intelligence-REPO-SCANNER/architecture.md).
+It wraps the existing AST dispatcher
 and graphsink/materializer abstractions so a developer can scan
 external repositories — by local path or by `git URL @ sha` —
 and project module/call-chain diagrams without standing up the

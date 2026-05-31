@@ -102,6 +102,9 @@ func (m Markdown) Render(ctx context.Context, art RunArtifact, w io.Writer) erro
 	if err := m.renderFindings(art, bw); err != nil {
 		return err
 	}
+	if err := m.renderDiagnostics(art, bw); err != nil {
+		return err
+	}
 	if err := bw.Flush(); err != nil {
 		return fmt.Errorf("report: Markdown.Render: flush: %w", err)
 	}
@@ -391,3 +394,34 @@ const (
 	// substitution (see [Markdown.renderVerdict]).
 	emptyHeaderValue = "(unset)"
 )
+
+// renderDiagnostics emits the run-level diagnostics block --
+// a small "## Diagnostics" section that surfaces the
+// orchestrator's effort-source stamp and the
+// `--emit-prompts` row count (workstream brief Stage 4.3).
+//
+// The block is ALWAYS emitted (even when `PromptCount == 0`
+// and `EffortSource == ""`) so downstream consumers can
+// pin a stable byte layout for a run that did not request
+// the prompt JSONL; the rows render with the
+// `(unset)` placeholder so the operator can distinguish
+// "this run wrote zero prompts" from "this binary forgot
+// the diagnostics block".
+func (m Markdown) renderDiagnostics(art RunArtifact, w *bufio.Writer) error {
+	if _, err := fmt.Fprintln(w); err != nil {
+		return wrapWrite(err)
+	}
+	if _, err := fmt.Fprintln(w, "## Diagnostics"); err != nil {
+		return wrapWrite(err)
+	}
+	if _, err := fmt.Fprintln(w); err != nil {
+		return wrapWrite(err)
+	}
+	if _, err := fmt.Fprintf(w, "- **Effort source:** %s\n", headerValue(art.Diagnostics.EffortSource)); err != nil {
+		return wrapWrite(err)
+	}
+	if _, err := fmt.Fprintf(w, "- **Refactor prompts emitted:** %d\n", art.Diagnostics.PromptCount); err != nil {
+		return wrapWrite(err)
+	}
+	return nil
+}

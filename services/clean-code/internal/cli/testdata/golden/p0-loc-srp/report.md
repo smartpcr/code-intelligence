@@ -22,3 +22,8 @@ Verdict: warn
 - solid.srp.interface_width_high [warn]
 - solid.srp.loc_high [warn]
 
+
+## Diagnostics
+
+- **Effort source:** fallback
+- **Refactor prompts emitted:** 0

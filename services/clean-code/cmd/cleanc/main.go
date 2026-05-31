@@ -267,6 +267,23 @@ func runAnalyze(stdout, stderr io.Writer, args []string) int {
 		}
 	}
 
+	// Bare `--emit-prompts` pre-scan (workstream brief
+	// Stage 4.3). The stdlib `flag.String` parser would
+	// otherwise EITHER consume the next CLI token as the
+	// value (silently mis-binding `--findings foo.json` to
+	// `EmitPrompts`) OR emit the generic stdlib
+	// "flag needs an argument" message. Both surfaces are
+	// wrong for this contract: the brief pins the literal
+	// stderr line `--emit-prompts requires a path or '-' for
+	// stdout` with exit 64. We detect "bare" as either the
+	// last positional token OR a token whose successor begins
+	// with `-` (and therefore looks like another flag rather
+	// than a path / dash sentinel).
+	if msg, bare := detectBareEmitPrompts(args); bare {
+		fmt.Fprintln(stderr, msg)
+		return flags.ExitUsage
+	}
+
 	fs := flag.NewFlagSet("cleanc analyze", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
@@ -324,6 +341,28 @@ func runAnalyze(stdout, stderr io.Writer, args []string) int {
 	if g.DevMode != nil && !*g.DevMode {
 		fmt.Fprintln(stderr, "cleanc analyze: --dev-mode=false requires a signed-policy loader, which is not available in this build; pass --dev-mode (or omit the flag) to proceed with the unsigned dev policy bundle.")
 		return flags.ExitUsage
+	}
+
+	// `--emit-prompts -` (stdout) is mutually exclusive
+	// with the markdown report ALSO going to stdout, because
+	// the operator's stdout cannot carry both the markdown
+	// bytes and the JSONL bytes interleaved without
+	// corrupting both artifacts. The brief pins the literal
+	// stderr line and exit 64 (BSD EX_USAGE) so an operator
+	// who attempts the conflicting combination sees a clean
+	// usage error rather than a partially mangled report.
+	// `--out` is "unset" when its value is the empty default
+	// (which means "write markdown to stdout" per tech-spec
+	// Sec 8.1 row 1).
+	if g.EmitPrompts != nil && *g.EmitPrompts == "-" {
+		outPath := ""
+		if g.Out != nil {
+			outPath = *g.Out
+		}
+		if outPath == "" {
+			fmt.Fprintln(stderr, "cleanc analyze: --emit-prompts - requires --out <path>; cannot route both markdown and JSONL to stdout")
+			return flags.ExitUsage
+		}
 	}
 
 	return runAnalyzePipeline(context.Background(), stdout, stderr, g, positionals[0])
@@ -514,6 +553,31 @@ func runAnalyzePipeline(ctx context.Context, stdout, stderr io.Writer, g *flags.
 		Diagnostics:   result.Diagnostics,
 	}
 
+	// Stage 9 (pre): if `--emit-prompts <path>` is non-empty
+	// we run the JSONL emitter into an in-memory buffer FIRST
+	// so the resulting row count can be stamped onto
+	// `art.Diagnostics.PromptCount` BEFORE the markdown / JSON
+	// renderers run. The renderers surface the count in their
+	// diagnostics block (workstream brief Stage 4.3) so the
+	// stamp must precede dispatch. The buffered bytes are
+	// flushed to the destination writer after the markdown /
+	// JSON / diagnostics sidecars complete.
+	//
+	// Note: routing JSONL to stdout (`--emit-prompts -`) is
+	// rejected at flag-parse time when `--out` is also stdout
+	// (see runAnalyze), so by the time we reach this branch
+	// at least one of (markdown destination, JSONL destination)
+	// is a file path.
+	var promptBuf []byte
+	if g.EmitPrompts != nil && *g.EmitPrompts != "" {
+		buf, count, err := emitPromptsBuffer(ctx, stderr, orch, bundle, art)
+		if err != nil {
+			return flags.ExitInternalError
+		}
+		art.Diagnostics.PromptCount = count
+		promptBuf = buf
+	}
+
 	// Stage 9: dispatch to renderers. `--out` defaults to
 	// stdout when empty (tech-spec Sec 8.1 row 1); the JSON
 	// sidecars are only emitted when their flag carries a
@@ -530,6 +594,20 @@ func runAnalyzePipeline(ctx context.Context, stdout, stderr io.Writer, g *flags.
 	}
 	if err := dispatchDiagnostics(stderr, *g.Diagnostics, art.Diagnostics); err != nil {
 		return flags.ExitInternalError
+	}
+
+	// Flush the buffered JSONL prompt rows to the
+	// destination (`--emit-prompts <path>` or stdout when
+	// the value is the literal `-`). Done last so the
+	// markdown / JSON sidecars own their respective writers
+	// without interleaving and so a downstream consumer
+	// that pipes `cleanc analyze ... --emit-prompts -`
+	// sees ONLY the JSONL bytes on stdout (the markdown
+	// went to `--out <file>` per the flag-parse contract).
+	if g.EmitPrompts != nil && *g.EmitPrompts != "" {
+		if err := writePromptBuffer(stdout, stderr, *g.EmitPrompts, promptBuf); err != nil {
+			return flags.ExitInternalError
+		}
 	}
 
 	// Stage 10: exit code. The verdict + per-finding

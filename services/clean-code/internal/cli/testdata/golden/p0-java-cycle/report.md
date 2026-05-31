@@ -28,3 +28,8 @@ Verdict: block
 - decoupling.cycle_member_present [block]
 - solid.srp.interface_width_high [warn]
 
+
+## Diagnostics
+
+- **Effort source:** fallback
+- **Refactor prompts emitted:** 0

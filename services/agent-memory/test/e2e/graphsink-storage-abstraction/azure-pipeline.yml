@@ -79,3 +79,4 @@ steps:
         -run TestE2E_graphsink_storage_abstraction_memory_sink_and_json_export \
         ./test/e2e/code-intelligence-REPO-SCANNER/...
     displayName: "Run E2E scenarios — memory-sink-and-json-export"
+    condition: succeededOrFailed()

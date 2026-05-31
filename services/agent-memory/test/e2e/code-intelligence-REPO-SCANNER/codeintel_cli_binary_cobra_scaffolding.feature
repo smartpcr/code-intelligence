@@ -7,21 +7,21 @@ Feature: Cobra scaffolding for the codeintel CLI
   format.
 
   Scenario: cli-help-lists-subcommands
-    Given a built codeintel root command
-    When the user runs codeintel with "--help"
-    Then the stdout output names the subcommand "scan"
-    And the stdout output names the subcommand "scan-many"
-    And the stdout output names the subcommand "diagram"
-    And the stdout output names the subcommand "serve"
-    And the stdout output names the subcommand "version"
+    Given a built codeintel binary
+    When codeintel runs with "--help"
+    Then stdout names the subcommand "scan"
+    And stdout names the subcommand "scan-many"
+    And stdout names the subcommand "diagram"
+    And stdout names the subcommand "serve"
+    And stdout names the subcommand "version"
 
   Scenario: unknown-subcommand-errors
-    Given a built codeintel root command
-    When the user runs codeintel with "bogus"
+    Given a built codeintel binary
+    When codeintel runs with "bogus"
     Then the exit code is non-zero
-    And the error output names the offending subcommand "bogus"
+    And stderr names the offending subcommand "bogus"
 
   Scenario: log-flag-respected
-    Given a built codeintel root command
-    When the user runs codeintel with "--log=json scan"
-    Then the stderr contains a line that is valid JSON parseable by encoding/json
+    Given a built codeintel binary
+    When codeintel runs with "--log=json scan"
+    Then stderr contains a line that is valid JSON parseable by encoding/json

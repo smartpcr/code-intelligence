@@ -283,7 +283,6 @@ func (st *repoIDExtState) ensureRepoWithIDRuns() error {
 }
 
 func (st *repoIDExtState) theRowRepoIDEqualsTheSuppliedUUID() error {
-	defer st.teardown()
 	if st.err != nil {
 		return st.err
 	}
@@ -335,7 +334,6 @@ func (st *repoIDExtState) ensureRepoRunsLegacyPath() error {
 }
 
 func (st *repoIDExtState) theRowRepoIDIsAllocatedByGenRandomUUIDAndIsNonZero() error {
-	defer st.teardown()
 	if st.err != nil {
 		return st.err
 	}
@@ -410,7 +408,6 @@ func (st *repoIDExtState) ensureRepoWithIDRunsWithSameURLAndDifferentRepoID() er
 }
 
 func (st *repoIDExtState) theReturnedRepoIDEqualsAAndLogRecordsParityGap() error {
-	defer st.teardown()
 	if st.err != nil {
 		return st.err
 	}
@@ -460,6 +457,13 @@ func (st *repoIDExtState) theReturnedRepoIDEqualsAAndLogRecordsParityGap() error
 
 func InitializeScenario_graphsink_storage_abstraction_repoid_extension_to_repoinput(ctx *godog.ScenarioContext) {
 	st := &repoIDExtState{}
+
+	// Ensure Postgres resources are cleaned up even if a Given/When step fails
+	// before the Then step runs.
+	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
+		st.teardown()
+		return ctx, nil
+	})
 
 	// Scenario: ensurerepowithid-deterministic-insert
 	ctx.Given(`^an empty "repo" table and a non-zero "RepoInput\.RepoID"$`, st.anEmptyRepoTableAndANonZeroRepoID)

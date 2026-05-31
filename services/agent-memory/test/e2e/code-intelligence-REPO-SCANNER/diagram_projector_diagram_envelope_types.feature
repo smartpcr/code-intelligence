@@ -8,7 +8,7 @@ Feature: Diagram envelope types
 
   Scenario: envelope-marshal-key-order
     Given an envelope value matching the golden fixture
-    When encoding/json.Marshal runs with two-space indentation
+    When encoding/json.Marshal runs
     Then the resulting bytes match the stored golden file byte-for-byte
 
   Scenario: envelope-unmarshal-roundtrip

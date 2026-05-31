@@ -157,6 +157,54 @@ cleanc apply 00000000-0000-0000-0000-000000000000
 cleanc not-a-verb
 ```
 
+## 6.1 End-to-end golden tests
+
+The shell-driven harness at `tests/e2e/cleanc/` exercises the
+binary end-to-end against checked-in sample repos and diffs the
+produced artifacts against checked-in golden files. The harness
+is **compose-less** because `cleanc` is a single static binary
+with no PostgreSQL / HTTP / docker-stack dependencies, so each
+scenario is a plain `bash run.sh` with no `docker compose up`
+in front of it.
+
+```bash
+# Run every scenario sequentially.
+./tests/e2e/cleanc/run_all.sh
+
+# Or run one scenario in isolation.
+./tests/e2e/cleanc/scenarios/p0-go-cycle/run.sh
+```
+
+Per-scenario layout:
+
+```text
+tests/e2e/cleanc/scenarios/<name>/
+  repo/        # tarball-able sample repo (the cleanc input)
+  golden/      # checked-in expected artifacts
+  run.sh       # builds cleanc, runs analyze, normalises outputs,
+               # diffs against golden/
+```
+
+The two P0 scenarios shipped today are:
+
+| Scenario          | Sample repo                             | Assertion                                                  |
+| ----------------- | --------------------------------------- | ---------------------------------------------------------- |
+| `p0-go-cycle`     | Go module with a `pkg/a ↔ pkg/b` cycle  | byte-match against golden `report.md`, `findings.json`, `diag.json` |
+| `p0-mixed-langs`  | one source file each of Go/Py/TS/Java   | `RunArtifact.Files[].language` contains all four languages  |
+
+`findings.json` byte-match goes through `lib/normalize.jq`, which
+masks the random `EvaluationRunID` / `VerdictID` / `FindingID` /
+`HotSpotID` / `RefactorPlanID` / `RefactorTaskID` UUIDs to
+`"<uuid>"`, every ISO-8601 timestamp to `"<timestamp>"`, and
+canonicalises array order via `sort_by(tojson)`. `report.md`
+byte-match goes through `lib/normalize-md.sh`, which sorts any
+contiguous block of `- ` bullet lines so the engine's
+non-deterministic insertion order doesn't bleed into the diff.
+
+`diag.json` carries no UUIDs and no timestamps -- only
+dark-metric counts and the effort-source tag -- so it is
+byte-matched as-is.
+
 ## 7. Cross-references
 
 - `docs/stories/code-intelligence-REFACTOR-GUIDE/tech-spec.md`

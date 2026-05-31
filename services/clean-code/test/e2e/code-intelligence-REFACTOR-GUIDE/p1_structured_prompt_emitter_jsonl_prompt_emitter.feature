@@ -18,8 +18,9 @@ Feature: JSONL prompt emitter
 
   Scenario: rejected task kind
     Given a RunArtifact with a task of kind "refactor_everything"
-    When JSONL.Emit runs
-    Then the emitter returns an InvalidTaskKindError naming the offending task id
+    When the composition root runs the emitter and maps the result
+    Then exit code is 70
+    And stderr names the offending task id
 
   Scenario: byte-stable emission
     Given a RunArtifact with 5 tasks

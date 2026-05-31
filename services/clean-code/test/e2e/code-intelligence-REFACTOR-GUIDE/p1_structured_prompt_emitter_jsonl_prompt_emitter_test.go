@@ -12,7 +12,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -20,6 +19,7 @@ import (
 	"github.com/cucumber/godog"
 	"github.com/gofrs/uuid"
 
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/flags"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/orchestrator"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/report"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/repocontext"
@@ -40,6 +40,8 @@ type jsonlEmitterState struct {
 	emitErr  error
 	taskKind string
 	badTask  uuid.UUID
+	exitCode int
+	stderr   string
 }
 
 func newJSONLEmitterState() *jsonlEmitterState {
@@ -139,6 +141,28 @@ func (s *jsonlEmitterState) jsonlEmitRuns() error {
 	return nil
 }
 
+// compositionRootRunsEmitter simulates the CLI composition
+// root's emit-prompts dispatch: call JSONL.Emit, map the
+// error to an exit code (flags.ExitInternalError = 70 on
+// error, flags.ExitOK = 0 on success), and write the error
+// to a stderr buffer -- exactly as runAnalyzePipeline does
+// in cmd/cleanc/main.go.
+func (s *jsonlEmitterState) compositionRootRunsEmitter() error {
+	var stdout bytes.Buffer
+	var stderrBuf bytes.Buffer
+	err := s.emitter.Emit(context.Background(), s.art, &stdout)
+	if err != nil {
+		fmt.Fprintf(&stderrBuf, "cleanc analyze: emit prompts: %v\n", err)
+		s.exitCode = flags.ExitInternalError
+	} else {
+		s.exitCode = flags.ExitOK
+	}
+	s.emitErr = err
+	s.output = stdout.Bytes()
+	s.stderr = stderrBuf.String()
+	return nil
+}
+
 func (s *jsonlEmitterState) jsonlEmitRunsTwice() error {
 	var buf1 bytes.Buffer
 	if err := s.emitter.Emit(context.Background(), s.art, &buf1); err != nil {
@@ -199,19 +223,17 @@ func (s *jsonlEmitterState) everyEmittedRecordHasPromptFormatVersion(want string
 	return nil
 }
 
-func (s *jsonlEmitterState) theEmitterReturnsInvalidTaskKindErrorNamingTask() error {
-	if s.emitErr == nil {
-		return fmt.Errorf("expected Emit to fail, but it succeeded")
+func (s *jsonlEmitterState) exitCodeIs(want int) error {
+	if s.exitCode != want {
+		return fmt.Errorf("exit code = %d, want %d\nstderr: %s", s.exitCode, want, s.stderr)
 	}
-	var iae *suggest.InvalidTaskKindError
-	if !errors.As(s.emitErr, &iae) {
-		return fmt.Errorf("expected *InvalidTaskKindError, got %T: %v", s.emitErr, s.emitErr)
-	}
-	if iae.TaskID != s.badTask {
-		return fmt.Errorf("InvalidTaskKindError.TaskID = %s, want %s", iae.TaskID, s.badTask)
-	}
-	if string(iae.Kind) != s.taskKind {
-		return fmt.Errorf("InvalidTaskKindError.Kind = %q, want %q", iae.Kind, s.taskKind)
+	return nil
+}
+
+func (s *jsonlEmitterState) stderrNamesTheOffendingTaskID() error {
+	taskIDStr := s.badTask.String()
+	if !strings.Contains(s.stderr, taskIDStr) {
+		return fmt.Errorf("stderr does not contain task id %s\nstderr: %s", taskIDStr, s.stderr)
 	}
 	return nil
 }
@@ -260,12 +282,14 @@ func InitializeScenario_p1_structured_prompt_emitter_jsonl_prompt_emitter(ctx *g
 	// When
 	ctx.Step(`^JSONL\.Emit runs$`, s.jsonlEmitRuns)
 	ctx.Step(`^JSONL\.Emit runs twice on the same artifact$`, s.jsonlEmitRunsTwice)
+	ctx.Step(`^the composition root runs the emitter and maps the result$`, s.compositionRootRunsEmitter)
 
 	// Then
 	ctx.Step(`^the output has exactly (\d+) lines$`, s.theOutputHasExactlyNLines)
 	ctx.Step(`^each line is parseable as a standalone JSON object$`, s.eachLineIsParseableAsStandaloneJSON)
 	ctx.Step(`^every emitted record has prompt_format_version "([^"]*)"$`, s.everyEmittedRecordHasPromptFormatVersion)
-	ctx.Step(`^the emitter returns an InvalidTaskKindError naming the offending task id$`, s.theEmitterReturnsInvalidTaskKindErrorNamingTask)
+	ctx.Step(`^exit code is (\d+)$`, s.exitCodeIs)
+	ctx.Step(`^stderr names the offending task id$`, s.stderrNamesTheOffendingTaskID)
 	ctx.Step(`^the two outputs are byte-identical$`, s.theTwoOutputsAreByteIdentical)
 }
 

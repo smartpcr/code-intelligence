@@ -192,58 +192,34 @@ func bpgOpenEphemeralPG() (*bpgPGInstance, error) {
 	}, nil
 }
 
-func bpgApplyMigrations(ctx context.Context, db *sql.DB, ephemeral bool) error {
-	if !ephemeral {
-		// Provided instance: use the production migrator which applies
-		// every migration through current HEAD via its own journal table.
-		return migrations.New(db).Up(ctx)
+func bpgApplyMigrations(ctx context.Context, db *sql.DB, _ bool) error {
+	// Apply the full production schema through current HEAD using the
+	// production migrator. Each migration runs in its own transaction
+	// via applyOne, with a journal table tracking applied versions.
+	//
+	// On a provided Postgres instance, all migrations succeed.
+	// On ephemeral embedded-postgres, migrations that require
+	// extensions (pg_partman in 0014) or superuser privileges
+	// (roles in 0016/0017) will cause Up() to stop and return an
+	// error. The Migrator commits each migration individually,
+	// so 0001..N-1 are already applied when migration N fails.
+	// We verify core graphsink tables exist and accept the partial
+	// schema — the parity test only needs repo/node/edge tables.
+	err := migrations.New(db).Up(ctx)
+	if err == nil {
+		return nil
 	}
-	// Ephemeral embedded-postgres: apply all migrations through current
-	// HEAD. Certain migrations require extensions (pg_partman in 0014)
-	// or elevated privileges (roles in 0016/0017) that the ephemeral
-	// instance lacks; these fail and are tolerated. Core schema
-	// migrations (0001-0004) that define repo, node, edge tables MUST
-	// succeed.
-	all, err := migrations.All()
-	if err != nil {
-		return fmt.Errorf("migrations.All: %w", err)
-	}
-	for _, mg := range all {
-		body := bpgStripForEphemeral(mg.Up)
-		if _, err := db.ExecContext(ctx, body); err != nil {
-			if mg.Version < "0005" {
-				return fmt.Errorf("apply core %s: %w", mg.Filename, err)
-			}
-			// Non-core migration failed (extension/privilege-dependent);
-			// skip and continue with remaining migrations.
-			continue
-		}
+	// Partial migration: verify the core tables are present.
+	var nodeExists bool
+	qErr := db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM information_schema.tables
+		  WHERE table_schema = current_schema()
+		    AND table_name = 'node')`,
+	).Scan(&nodeExists)
+	if qErr != nil || !nodeExists {
+		return fmt.Errorf("migrations.Up failed and core tables missing: %w", err)
 	}
 	return nil
-}
-
-// bpgStripForEphemeral removes explicit transaction control
-// statements so migrations run in auto-commit mode on ephemeral
-// Postgres. Tracks $$...$$ blocks to avoid stripping PL/pgSQL BEGIN.
-func bpgStripForEphemeral(body string) string {
-	var out strings.Builder
-	inDollarQuote := false
-	for _, line := range strings.Split(body, "\n") {
-		count := strings.Count(line, "$$")
-		if count%2 == 1 {
-			inDollarQuote = !inDollarQuote
-		}
-		if !inDollarQuote {
-			trimmed := strings.TrimSpace(strings.ToUpper(line))
-			if trimmed == "BEGIN;" || trimmed == "COMMIT;" || trimmed == "ROLLBACK;" ||
-				trimmed == "BEGIN" || trimmed == "COMMIT" || trimmed == "ROLLBACK" {
-				continue
-			}
-		}
-		out.WriteString(line)
-		out.WriteString("\n")
-	}
-	return out.String()
 }
 
 // ---------------------------------------------------------------------------

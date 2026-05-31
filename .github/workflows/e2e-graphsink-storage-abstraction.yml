@@ -259,12 +259,33 @@ jobs:
         if: always()
         run: docker compose -f $COMPOSE_FILE down -v
 
+  # ── backend-parity-golden-test ──────────────────────────────
+  # Runs TestE2E_graphsink_storage_abstraction_backend_parity_golden_test
+  # against all three backends (memory, SQLite, Postgres).
+  # Postgres is provisioned via GitHub Actions native services
+  # (mirroring tests/e2e/phase-3-graphsink-storage-abstraction/docker-compose.yml).
   backend-parity-golden-test:
-    name: "backend-parity-golden-test"
+    name: "E2E — backend-parity-golden-test"
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: agent_memory
+          POSTGRES_PASSWORD: agent_memory
+          POSTGRES_DB: agent_memory
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_memory -d agent_memory"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+          --health-start-period 10s
     env:
       COMPOSE_FILE: tests/e2e/phase-3-graphsink-storage-abstraction/docker-compose.yml
       AGENT_MEMORY_PG_URL: "postgres://agent_memory:agent_memory@localhost:5432/agent_memory?sslmode=disable"
+      CGO_ENABLED: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -275,39 +296,13 @@ jobs:
           go-version-file: services/agent-memory/go.mod
           cache: true
 
-      - name: Start compose stack (postgres)
-        run: docker compose -f $COMPOSE_FILE up -d
-
-      - name: Wait for postgres
-        run: |
-          deadline=$(( $(date +%s) + 90 ))
-          while :; do
-            status=$(docker compose -f $COMPOSE_FILE ps --format json \
-              | jq -r 'select(.Service=="postgres") | .Health // .State' 2>/dev/null || echo "unknown")
-            echo "  postgres -> $status"
-            if [ "$status" = "healthy" ]; then echo "Postgres ready"; break; fi
-            if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "::error::Postgres did not become healthy within 90s"
-              docker compose -f $COMPOSE_FILE logs --tail=100
-              exit 1
-            fi
-            sleep 3
-          done
-
       - name: Download Go dependencies
         working-directory: services/agent-memory
         run: go mod download
 
-      - name: Run E2E scenarios
+      - name: Run TestE2E_graphsink_storage_abstraction_backend_parity_golden_test
         working-directory: services/agent-memory
-        env:
-          AGENT_MEMORY_PG_URL: ${{ env.AGENT_MEMORY_PG_URL }}
-          CGO_ENABLED: "1"
         run: |
           go test -tags e2e -v -count=1 -timeout 180s \
             -run TestE2E_graphsink_storage_abstraction_backend_parity_golden_test \
             ./test/e2e/code-intelligence-REPO-SCANNER/...
-
-      - name: Tear down compose stack
-        if: always()
-        run: docker compose -f $COMPOSE_FILE down -v

@@ -130,22 +130,48 @@ func TestOrchestrator_Run_DarkMetrics_EmittedForDarkRecipes(t *testing.T) {
 				t.Errorf("(%q,%q).ClosurePhase = %q, want %q",
 					metricKind, lang, dm.ClosurePhase, "P2")
 			}
-			if dm.AffectedScopeCount < 0 {
-				t.Errorf("(%q,%q).AffectedScopeCount = %d, must be >= 0",
+			// The fixture deliberately authors a class
+			// (`Widget`) + a method + a top-level function
+			// + a file scope for BOTH Go and Python, so
+			// every metric in [metricAttrRequirements] --
+			// whose AffectedScopeKinds is a non-empty
+			// subset of {method, class, file} -- MUST have
+			// at least one matching scope on every
+			// observed language. A zero here is a real bug
+			// (the orchestrator emitted a dark-metric row
+			// for a recipe that, by construction, had
+			// scopes to evaluate).
+			if dm.AffectedScopeCount < 1 {
+				t.Errorf("(%q,%q).AffectedScopeCount = %d, want >= 1 (fixture has class + method + file scopes that intersect every metric's AffectedScopeKinds)",
 					metricKind, lang, dm.AffectedScopeCount)
 			}
 		}
 	}
 
-	// Specifically assert AffectedScopeCount > 0 for cyclo on
-	// the Go file (we authored two methods + a file scope, so
-	// the count must be at least 3 for kinds={method, file}).
+	// Pin EXACT-floor expectations on the Go file to cover
+	// both branches of countAffectedScopes:
+	//   * cyclo  -> AffectedScopeKinds = {method, file}
+	//              fixture: 2 methods (Widget.Run, TopLevel)
+	//              + 1 file scope == at least 3.
+	//   * lcom4  -> AffectedScopeKinds = {class}
+	//              fixture: 1 struct (Widget) == at least 1.
+	// Together these guarantee both the multi-kind and the
+	// single-kind code paths in countAffectedScopes are
+	// exercised with a non-trivial count (not just `>= 1`).
 	cycloGo, ok := got[key{"cyclo", "go"}]
 	if !ok {
 		t.Fatalf("expected (cyclo, go) row, got rows=%+v", res.Diagnostics.DarkMetrics)
 	}
-	if cycloGo.AffectedScopeCount < 1 {
-		t.Errorf("(cyclo,go).AffectedScopeCount = %d, want >= 1 (fixture has at least one method + one file scope)", cycloGo.AffectedScopeCount)
+	if cycloGo.AffectedScopeCount < 3 {
+		t.Errorf("(cyclo,go).AffectedScopeCount = %d, want >= 3 (fixture has two methods + one file scope; cyclo's AffectedScopeKinds = {method, file})", cycloGo.AffectedScopeCount)
+	}
+
+	lcom4Go, ok := got[key{"lcom4", "go"}]
+	if !ok {
+		t.Fatalf("expected (lcom4, go) row, got rows=%+v", res.Diagnostics.DarkMetrics)
+	}
+	if lcom4Go.AffectedScopeCount < 1 {
+		t.Errorf("(lcom4,go).AffectedScopeCount = %d, want >= 1 (fixture has one struct scope; lcom4's AffectedScopeKinds = {class})", lcom4Go.AffectedScopeCount)
 	}
 }
 

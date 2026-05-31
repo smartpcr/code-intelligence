@@ -1,0 +1,54 @@
+name: "E2E — Graphsink Storage Abstraction"
+
+on:
+  pull_request:
+    branches:
+      - feature/scanner
+      - "ws/code-intelligence-REPO-SCANNER/**"
+    paths:
+      - "services/agent-memory/internal/graphsink/**"
+      - "services/agent-memory/test/e2e/code-intelligence-REPO-SCANNER/graphsink_storage_abstraction_*"
+      - "tests/e2e/phase-3-graphsink-storage-abstraction/**"
+      - ".github/workflows/e2e-graphsink-storage-abstraction.yml"
+  push:
+    branches:
+      - feature/scanner
+      - "ws/code-intelligence-REPO-SCANNER/**"
+    paths:
+      - "services/agent-memory/internal/graphsink/**"
+      - "services/agent-memory/test/e2e/code-intelligence-REPO-SCANNER/graphsink_storage_abstraction_*"
+      - "tests/e2e/phase-3-graphsink-storage-abstraction/**"
+      - ".github/workflows/e2e-graphsink-storage-abstraction.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-graphsink-storage-abstraction-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sink-interface-skeleton:
+    name: "sink-interface-skeleton"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/agent-memory/go.mod
+          cache: true
+
+      - name: Download Go dependencies
+        working-directory: services/agent-memory
+        run: go mod download
+
+      - name: Run E2E scenarios
+        working-directory: services/agent-memory
+        run: |
+          go test -tags e2e -v -count=1 -timeout 120s \
+            -run TestE2E_graphsink_storage_abstraction_sink_interface_skeleton \
+            ./test/e2e/code-intelligence-REPO-SCANNER/...

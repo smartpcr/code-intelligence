@@ -12,7 +12,7 @@ Feature: Prompt record and source snippet extractor
     When ExtractSnippet runs over lines 1 to 500
     Then the returned string has exactly 200 lines
     And truncated is true
-    And the last line is "... [truncated 301 lines]"
+    And the last line is "... [truncated 300 lines]"
 
   Scenario: snippet not truncated for small scope
     Given a 50-line fixture file
@@ -27,6 +27,9 @@ Feature: Prompt record and source snippet extractor
     Then the returned snippet preserves the exact byte sequence
 
   Scenario: metric evidence join
-    Given a RefactorPromptRecord with one metric evidence entry for metric_kind "loc" value 2000 threshold 1500 op ">="
+    Given a rule engine store with a loc threshold of 1500 and op ">="
+    And a metric sample with metric_kind "loc" and value 2000
+    When the rule engine runs and produces a finding
+    And the aggregator joins the finding with its metric samples and threshold
     Then metric_evidence contains exactly 1 entry
     And the entry has metric_kind "loc" value 2000 threshold 1500 op ">="

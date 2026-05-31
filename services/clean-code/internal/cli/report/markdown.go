@@ -358,6 +358,9 @@ func (m Markdown) renderFindings(art RunArtifact, w *bufio.Writer) error {
 			return wrapWrite(err)
 		}
 	}
+	if _, err := fmt.Fprintln(w); err != nil {
+		return wrapWrite(err)
+	}
 	return nil
 }
 

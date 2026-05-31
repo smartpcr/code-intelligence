@@ -1,0 +1,818 @@
+{
+  "schemaVersion": "v1.2026.05",
+  "Context": {
+    "RootPath": "E:/forge/code-intelligence/.worktree/stage-5.3-end-to-end-golden-tests-e2e/services/clean-code/tests/e2e/cleanc/scenarios/p0-mixed-langs/corpus",
+    "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+    "HeadSHA": "working-copy",
+    "ModulePath": "",
+    "IsGitRepo": false
+  },
+  "Policy": {
+    "policy_version_id": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+    "name": "cleanc.devpolicy",
+    "rule_refs": [
+      {
+        "rule_id": "decoupling.fan_in_high",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.fan_out_high",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.cbo_high",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.cycle_member_present",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.duplication_ratio_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.dip.fan_out_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.dip.coupling_between_objects_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.isp.interface_width_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.lsp.depth_of_inheritance_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.lsp.override_violation",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.ocp.fan_in_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.ocp.modification_count_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.srp.lcom4_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.srp.interface_width_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.srp.loc_high",
+        "version": 1
+      }
+    ],
+    "threshold_refs": [
+      {
+        "threshold_id": "1e105766-3e02-5b49-b5be-49a787fd8e04"
+      },
+      {
+        "threshold_id": "d3a40d02-4b95-54c6-98fa-22793b425346"
+      },
+      {
+        "threshold_id": "fd6a0f05-ecbf-56cb-9e97-e6a83cc6a13e"
+      },
+      {
+        "threshold_id": "04d9f035-5183-5cb7-86bb-b582f85d3241"
+      }
+    ],
+    "refactor_weights": {
+      "alpha": 1,
+      "beta": 1,
+      "gamma": 1,
+      "delta": 1,
+      "effort_model_version": "dev",
+      "window_days": 90,
+      "top_n": 20
+    },
+    "signature": null,
+    "created_at": "2026-05-31T12:06:43.886453Z"
+  },
+  "Files": [
+    {
+      "path": "Main.java",
+      "language": "java",
+      "size_bytes": 15,
+      "parse_status": "parsed"
+    },
+    {
+      "path": "app.py",
+      "language": "python",
+      "size_bytes": 7,
+      "parse_status": "parsed"
+    },
+    {
+      "path": "index.ts",
+      "language": "typescript",
+      "size_bytes": 22,
+      "parse_status": "parsed"
+    },
+    {
+      "path": "main.go",
+      "language": "go",
+      "size_bytes": 32,
+      "parse_status": "parsed"
+    }
+  ],
+  "Skips": [],
+  "DarkMetrics": [
+    {
+      "metric_kind": "cognitive_complexity",
+      "language": "go",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 2,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "cognitive_complexity",
+      "language": "java",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 1,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "cognitive_complexity",
+      "language": "python",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 1,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "cognitive_complexity",
+      "language": "typescript",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 1,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "cyclo",
+      "language": "go",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 1,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "cyclo",
+      "language": "java",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 0,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "cyclo",
+      "language": "python",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 0,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "cyclo",
+      "language": "typescript",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 0,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_in",
+      "language": "go",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 2,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_in",
+      "language": "java",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 2,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_in",
+      "language": "python",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 1,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_in",
+      "language": "typescript",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 1,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_out",
+      "language": "go",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 2,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_out",
+      "language": "java",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 2,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_out",
+      "language": "python",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 1,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_out",
+      "language": "typescript",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 1,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "lcom4",
+      "language": "go",
+      "missing_attrs": [
+        "call_edges",
+        "field_accesses"
+      ],
+      "affected_scope_count": 0,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "lcom4",
+      "language": "java",
+      "missing_attrs": [
+        "call_edges",
+        "field_accesses"
+      ],
+      "affected_scope_count": 1,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "lcom4",
+      "language": "python",
+      "missing_attrs": [
+        "call_edges",
+        "field_accesses"
+      ],
+      "affected_scope_count": 0,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "lcom4",
+      "language": "typescript",
+      "missing_attrs": [
+        "call_edges",
+        "field_accesses"
+      ],
+      "affected_scope_count": 0,
+      "closure_phase": "P2"
+    }
+  ],
+  "Samples": [
+    {
+      "SampleID": "c93721a6-1954-5a70-8451-e452e7b74a86",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "c160da1d-c64f-5e32-8dfd-37faae74109d",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:0dea7aec-51f8-5c9a-a50f-e49a878d146b::class::Main.java#Main.java.Main"
+    },
+    {
+      "SampleID": "11875d63-52a3-5131-9fff-20f54b6cf754",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "aa3e6953-b076-5776-82d0-0229df2d50ec",
+      "ScopeKind": "file",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:0dea7aec-51f8-5c9a-a50f-e49a878d146b::file::Main.java"
+    },
+    {
+      "SampleID": "78e9246d-2e6f-50ce-8d96-5a599244e732",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "f55587c3-33f2-5d02-b40c-6ad20077caa5",
+      "ScopeKind": "file",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:0dea7aec-51f8-5c9a-a50f-e49a878d146b::file::app.py"
+    },
+    {
+      "SampleID": "895818ad-402d-5bd0-86b7-efad1654d8cc",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "3967e93e-5ae2-5441-bb99-e88465d1c351",
+      "ScopeKind": "file",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:0dea7aec-51f8-5c9a-a50f-e49a878d146b::file::index.ts"
+    },
+    {
+      "SampleID": "5060dc1c-0c57-5ac7-8fa3-a8dd55eff1d1",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "b895b970-fa9a-5d39-a402-201e95a87f04",
+      "ScopeKind": "file",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:0dea7aec-51f8-5c9a-a50f-e49a878d146b::file::main.go"
+    },
+    {
+      "SampleID": "5e495b3b-ea31-5062-87ff-8cac11bc7108",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "ebb2ec93-d8e8-5ae3-9112-59b4524cceaa",
+      "ScopeKind": "package",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:0dea7aec-51f8-5c9a-a50f-e49a878d146b::pkg::."
+    },
+    {
+      "SampleID": "b9a39208-bfd1-5049-afcd-272bb43772a7",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "c160da1d-c64f-5e32-8dfd-37faae74109d",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:0dea7aec-51f8-5c9a-a50f-e49a878d146b::class::Main.java#Main.java.Main"
+    },
+    {
+      "SampleID": "c3c653cd-6a1b-59fd-a9a0-ea446606e751",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "aa3e6953-b076-5776-82d0-0229df2d50ec",
+      "ScopeKind": "file",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:0dea7aec-51f8-5c9a-a50f-e49a878d146b::file::Main.java"
+    },
+    {
+      "SampleID": "499921a5-ef3d-568e-976e-d450df8dc961",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "f55587c3-33f2-5d02-b40c-6ad20077caa5",
+      "ScopeKind": "file",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:0dea7aec-51f8-5c9a-a50f-e49a878d146b::file::app.py"
+    },
+    {
+      "SampleID": "f46746c0-d0da-5b82-86d4-8257b24eda9d",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "3967e93e-5ae2-5441-bb99-e88465d1c351",
+      "ScopeKind": "file",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:0dea7aec-51f8-5c9a-a50f-e49a878d146b::file::index.ts"
+    },
+    {
+      "SampleID": "440f9448-c97c-5fdc-adcd-78ff5131d950",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "b895b970-fa9a-5d39-a402-201e95a87f04",
+      "ScopeKind": "file",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:0dea7aec-51f8-5c9a-a50f-e49a878d146b::file::main.go"
+    },
+    {
+      "SampleID": "9f3c0076-a977-5e5d-b788-6db4b953c82c",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "ebb2ec93-d8e8-5ae3-9112-59b4524cceaa",
+      "ScopeKind": "package",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:0dea7aec-51f8-5c9a-a50f-e49a878d146b::pkg::."
+    },
+    {
+      "SampleID": "6aca8e69-e2a6-551a-ad12-07216e0f7222",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "c160da1d-c64f-5e32-8dfd-37faae74109d",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:0dea7aec-51f8-5c9a-a50f-e49a878d146b::class::Main.java#Main.java.Main"
+    },
+    {
+      "SampleID": "f1b8cb6c-7efb-5b42-927e-6186c5205ba9",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "aa3e6953-b076-5776-82d0-0229df2d50ec",
+      "ScopeKind": "file",
+      "MetricKind": "loc",
+      "MetricVersion": 1,
+      "Value": 2,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:0dea7aec-51f8-5c9a-a50f-e49a878d146b::file::Main.java"
+    },
+    {
+      "SampleID": "509a286d-2f7f-596d-ab70-c15b4a44ca8d",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "f55587c3-33f2-5d02-b40c-6ad20077caa5",
+      "ScopeKind": "file",
+      "MetricKind": "loc",
+      "MetricVersion": 1,
+      "Value": 2,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:0dea7aec-51f8-5c9a-a50f-e49a878d146b::file::app.py"
+    },
+    {
+      "SampleID": "9742ae3d-795a-538e-82cf-0d5e770ba6fd",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "3967e93e-5ae2-5441-bb99-e88465d1c351",
+      "ScopeKind": "file",
+      "MetricKind": "loc",
+      "MetricVersion": 1,
+      "Value": 2,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:0dea7aec-51f8-5c9a-a50f-e49a878d146b::file::index.ts"
+    },
+    {
+      "SampleID": "2dd697bf-5f1c-5267-8876-3fe0a0976359",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "b895b970-fa9a-5d39-a402-201e95a87f04",
+      "ScopeKind": "file",
+      "MetricKind": "loc",
+      "MetricVersion": 1,
+      "Value": 4,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:0dea7aec-51f8-5c9a-a50f-e49a878d146b::file::main.go"
+    }
+  ],
+  "Run": {
+    "EvaluationRunID": "87adee80-0045-4631-8b05-b7fe59daa1aa",
+    "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+    "SHA": "working-copy",
+    "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+    "Caller": "batch_refresh",
+    "ScopeID": null,
+    "CreatedAt": "2026-05-31T12:06:43.8890643Z"
+  },
+  "Verdict": {
+    "VerdictID": "9ad0a9e9-0cf8-4c33-a532-f20fd9e825ae",
+    "EvaluationRunID": "87adee80-0045-4631-8b05-b7fe59daa1aa",
+    "Verdict": "pass",
+    "Degraded": false,
+    "DegradedReason": "",
+    "CreatedAt": "2026-05-31T12:06:43.8890643Z"
+  },
+  "Findings": [],
+  "HotSpots": [
+    {
+      "HotspotID": "4ea62c4d-5eef-4418-9928-41a70f5a1c77",
+      "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+      "SHA": "working-copy",
+      "ScopeID": "c160da1d-c64f-5e32-8dfd-37faae74109d",
+      "Score": 0,
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+      "CreatedAt": "2026-05-31T05:06:43.8890643-07:00"
+    }
+  ],
+  "Plan": {
+    "PlanID": "b41dc162-cd25-4cb5-bae1-7d225fd3607a",
+    "RepoID": "0dea7aec-51f8-5c9a-a50f-e49a878d146b",
+    "SHA": "working-copy",
+    "HotspotIDs": [
+      "4ea62c4d-5eef-4418-9928-41a70f5a1c77"
+    ],
+    "SummaryMD": "Refactor plan for repo 0dea7aec-51f8-5c9a-a50f-e49a878d146b at sha working-copy.\n\nCovered hot_spots: 1\nGenerated tasks: 0\nPolicy version: 2b8b672e-2c5c-5891-ad9a-394921e95273\n",
+    "CreatedAt": "2026-05-31T05:06:43.8890643-07:00"
+  },
+  "Tasks": [],
+  "Diagnostics": {
+    "dark_metrics": [
+      {
+        "metric_kind": "cognitive_complexity",
+        "language": "go",
+        "missing_attrs": [
+          "decision_blocks"
+        ],
+        "affected_scope_count": 2,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "cognitive_complexity",
+        "language": "java",
+        "missing_attrs": [
+          "decision_blocks"
+        ],
+        "affected_scope_count": 1,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "cognitive_complexity",
+        "language": "python",
+        "missing_attrs": [
+          "decision_blocks"
+        ],
+        "affected_scope_count": 1,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "cognitive_complexity",
+        "language": "typescript",
+        "missing_attrs": [
+          "decision_blocks"
+        ],
+        "affected_scope_count": 1,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "cyclo",
+        "language": "go",
+        "missing_attrs": [
+          "decision_blocks"
+        ],
+        "affected_scope_count": 1,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "cyclo",
+        "language": "java",
+        "missing_attrs": [
+          "decision_blocks"
+        ],
+        "affected_scope_count": 0,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "cyclo",
+        "language": "python",
+        "missing_attrs": [
+          "decision_blocks"
+        ],
+        "affected_scope_count": 0,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "cyclo",
+        "language": "typescript",
+        "missing_attrs": [
+          "decision_blocks"
+        ],
+        "affected_scope_count": 0,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "fan_in",
+        "language": "go",
+        "missing_attrs": [
+          "call_edges"
+        ],
+        "affected_scope_count": 2,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "fan_in",
+        "language": "java",
+        "missing_attrs": [
+          "call_edges"
+        ],
+        "affected_scope_count": 2,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "fan_in",
+        "language": "python",
+        "missing_attrs": [
+          "call_edges"
+        ],
+        "affected_scope_count": 1,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "fan_in",
+        "language": "typescript",
+        "missing_attrs": [
+          "call_edges"
+        ],
+        "affected_scope_count": 1,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "fan_out",
+        "language": "go",
+        "missing_attrs": [
+          "call_edges"
+        ],
+        "affected_scope_count": 2,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "fan_out",
+        "language": "java",
+        "missing_attrs": [
+          "call_edges"
+        ],
+        "affected_scope_count": 2,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "fan_out",
+        "language": "python",
+        "missing_attrs": [
+          "call_edges"
+        ],
+        "affected_scope_count": 1,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "fan_out",
+        "language": "typescript",
+        "missing_attrs": [
+          "call_edges"
+        ],
+        "affected_scope_count": 1,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "lcom4",
+        "language": "go",
+        "missing_attrs": [
+          "call_edges",
+          "field_accesses"
+        ],
+        "affected_scope_count": 0,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "lcom4",
+        "language": "java",
+        "missing_attrs": [
+          "call_edges",
+          "field_accesses"
+        ],
+        "affected_scope_count": 1,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "lcom4",
+        "language": "python",
+        "missing_attrs": [
+          "call_edges",
+          "field_accesses"
+        ],
+        "affected_scope_count": 0,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "lcom4",
+        "language": "typescript",
+        "missing_attrs": [
+          "call_edges",
+          "field_accesses"
+        ],
+        "affected_scope_count": 0,
+        "closure_phase": "P2"
+      }
+    ],
+    "effort_source": "fallback",
+    "prompt_count": 0
+  }
+}

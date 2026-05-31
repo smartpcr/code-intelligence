@@ -360,7 +360,7 @@ func runAnalyze(stdout, stderr io.Writer, args []string) int {
 			outPath = *g.Out
 		}
 		if outPath == "" {
-			fmt.Fprintln(stderr, "cleanc analyze: --emit-prompts - requires --out <path>; cannot route both markdown and JSONL to stdout")
+			fmt.Fprintln(stderr, emitPromptsStdoutConflictMessage)
 			return flags.ExitUsage
 		}
 	}
@@ -553,29 +553,24 @@ func runAnalyzePipeline(ctx context.Context, stdout, stderr io.Writer, g *flags.
 		Diagnostics:   result.Diagnostics,
 	}
 
-	// Stage 9 (pre): if `--emit-prompts <path>` is non-empty
-	// we run the JSONL emitter into an in-memory buffer FIRST
-	// so the resulting row count can be stamped onto
-	// `art.Diagnostics.PromptCount` BEFORE the markdown / JSON
-	// renderers run. The renderers surface the count in their
-	// diagnostics block (workstream brief Stage 4.3) so the
-	// stamp must precede dispatch. The buffered bytes are
-	// flushed to the destination writer after the markdown /
-	// JSON / diagnostics sidecars complete.
-	//
-	// Note: routing JSONL to stdout (`--emit-prompts -`) is
-	// rejected at flag-parse time when `--out` is also stdout
-	// (see runAnalyze), so by the time we reach this branch
-	// at least one of (markdown destination, JSONL destination)
-	// is a file path.
-	var promptBuf []byte
+	// Pre-stamp `Diagnostics.PromptCount` from the task
+	// count BEFORE the markdown / JSON renderers run. The
+	// JSONL emitter's contract is one record per
+	// [refactor.RefactorTask] (one task per (ScopeID, RuleID)
+	// pair, per `suggest.JSONL.Emit` doc), so the count is
+	// known without executing the emitter. This pre-stamp
+	// lets the markdown / JSON diagnostics block surface the
+	// value (workstream brief) while still emitting the
+	// JSONL artifact AFTER the report + findings writers
+	// complete (the brief's explicit ordering: "call
+	// Emit(ctx, art, w) after the report + findings writers
+	// complete"). The post-emit verification below asserts
+	// the predicted count equals the bytes the emitter
+	// actually wrote so a contract drift in the emitter
+	// (e.g. a future skip-row patch) cannot silently desync
+	// the stamped value from the artifact on disk.
 	if g.EmitPrompts != nil && *g.EmitPrompts != "" {
-		buf, count, err := emitPromptsBuffer(ctx, stderr, orch, bundle, art)
-		if err != nil {
-			return flags.ExitInternalError
-		}
-		art.Diagnostics.PromptCount = count
-		promptBuf = buf
+		art.Diagnostics.PromptCount = len(art.Tasks)
 	}
 
 	// Stage 9: dispatch to renderers. `--out` defaults to
@@ -596,16 +591,24 @@ func runAnalyzePipeline(ctx context.Context, stdout, stderr io.Writer, g *flags.
 		return flags.ExitInternalError
 	}
 
-	// Flush the buffered JSONL prompt rows to the
-	// destination (`--emit-prompts <path>` or stdout when
-	// the value is the literal `-`). Done last so the
-	// markdown / JSON sidecars own their respective writers
-	// without interleaving and so a downstream consumer
-	// that pipes `cleanc analyze ... --emit-prompts -`
-	// sees ONLY the JSONL bytes on stdout (the markdown
-	// went to `--out <file>` per the flag-parse contract).
+	// Stage 9 (post): emit the JSONL refactor-prompt
+	// artifact AFTER the report + findings writers complete
+	// (workstream brief ordering). The emitter writes
+	// directly to the destination writer (file via
+	// `os.Create` + `defer Close()` OR `stdout` when the
+	// flag value is the literal `-`); the predicted row
+	// count stamped above is verified against the actual
+	// bytes written so a future emitter contract drift
+	// cannot silently desync the stamp from the on-disk
+	// artifact.
 	if g.EmitPrompts != nil && *g.EmitPrompts != "" {
-		if err := writePromptBuffer(stdout, stderr, *g.EmitPrompts, promptBuf); err != nil {
+		actual, err := emitPromptsDirect(ctx, stdout, stderr, *g.EmitPrompts, orch, bundle, art)
+		if err != nil {
+			return flags.ExitInternalError
+		}
+		if actual != art.Diagnostics.PromptCount {
+			fmt.Fprintf(stderr, "cleanc analyze: --emit-prompts: emitter wrote %d rows but stamped Diagnostics.PromptCount=%d; please report this drift\n",
+				actual, art.Diagnostics.PromptCount)
 			return flags.ExitInternalError
 		}
 	}

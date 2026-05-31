@@ -178,21 +178,24 @@ func Register(fs *flag.FlagSet) *Globals {
 }
 
 // Validate runs the cross-flag rules pinned by e2e-scenarios.md
-// Stage 3.3 / Stage 4.4: rejected reserved flags and the
-// closed-set `--exit-on` membership. The `verb` argument is woven
-// into the literal stderr messages so an operator invoking
-// `cleanc report --with-churn=true findings.json` sees a
-// `cleanc report: --with-churn is reserved ...` prefix rather
-// than the misleading `cleanc analyze:` baked into the const
-// form -- the substring assertions in e2e-scenarios.md Stage 4.4
-// (`--with-churn is reserved`) still match in either case.
+// Stage 4.4 (reserved-flag rejection) plus the closed-set
+// `--exit-on` membership check. The reserved-flag messages are
+// the byte-exact bodies quoted by the workstream brief
+// ("Reserved Verbs And Flags"); they are intentionally
+// verb-agnostic so the printed text matches the brief
+// regardless of whether the rejection fires under `analyze` or
+// `report`. The e2e substrings (`--telemetry-otlp is reserved`,
+// `--with-churn is reserved`) remain strict prefixes of the
+// messages either way.
 //
 // If `stderr` is non-nil and a rule trips, Validate writes the
-// verb-prefixed literal message before returning a non-nil error
-// so the dispatcher can exit with `ExitUsage` without duplicating
-// the message strings. An empty `verb` falls back to the legacy
-// `cleanc analyze:` prefix held in the exported message constants
-// so callers that pre-date this helper keep working unchanged.
+// literal message before returning a non-nil error so the
+// dispatcher can exit with `ExitUsage` without duplicating the
+// message strings. The `verb` argument is accepted for
+// source-compatibility with callers that thread it through but
+// is no longer woven into the reserved-flag messages -- the
+// brief's exact bodies do not carry a `cleanc <verb>:` prefix
+// (iter-2 of Stage 4.4 fix for the exact-print contract).
 func (g *Globals) Validate(verb string, stderr io.Writer) error {
 	if g.TelemetryOTLP != nil && *g.TelemetryOTLP != "" {
 		if stderr != nil {
@@ -216,27 +219,35 @@ func (g *Globals) Validate(verb string, stderr io.Writer) error {
 }
 
 // ReservedTelemetryMessageFor returns the literal stderr line
-// emitted when `--telemetry-otlp` is set on a P0/P1 build,
-// prefixed with the invoking verb so `cleanc report
-// --telemetry-otlp=...` does not mislead operators with an
-// `analyze` tag. Pass an empty `verb` to get the legacy
-// `cleanc analyze:` prefix held in [ReservedTelemetryMessage].
+// emitted when `--telemetry-otlp` is set on a P0/P1 build.
+//
+// The workstream brief ("Reserved Verbs And Flags") quotes the
+// operator-facing body byte-for-byte
+// (`--telemetry-otlp is reserved for a future story; rejected
+// in P0/P1`) and does NOT include a `cleanc <verb>:` prefix --
+// the prefix was an iter-4 cosmetic addition that softened the
+// exact-print contract. iter-2 of Stage 4.4 strips it back so
+// the printed text matches the brief and the e2e contract
+// without verb-dependent variance. `verb` is therefore ignored;
+// the parameter is retained for source-compatibility with
+// existing callers.
 func ReservedTelemetryMessageFor(verb string) string {
-	if verb == "" {
-		return ReservedTelemetryMessage
-	}
-	return fmt.Sprintf("cleanc %s: --telemetry-otlp is reserved for a future story (not implemented in P0/P1)", verb)
+	_ = verb
+	return ReservedTelemetryMessage
 }
 
 // ReservedWithChurnMessageFor returns the literal stderr line
-// emitted when `--with-churn` is set on a P0/P1 build, prefixed
-// with the invoking verb. Pass an empty `verb` to get the legacy
-// `cleanc analyze:` prefix held in [ReservedWithChurnMessage].
+// emitted when `--with-churn` is set on a P0/P1 build.
+//
+// The workstream brief quotes the body byte-for-byte
+// (`--with-churn is reserved for P2 and rejected in P0/P1;
+// modification_count_in_window will not light up until the
+// parser-attr extension ships`) without a verb prefix. iter-2
+// of Stage 4.4 strips the prefix so the printed text matches
+// the brief. `verb` is retained but ignored.
 func ReservedWithChurnMessageFor(verb string) string {
-	if verb == "" {
-		return ReservedWithChurnMessage
-	}
-	return fmt.Sprintf("cleanc %s: --with-churn is reserved for P2 and rejected in P0/P1", verb)
+	_ = verb
+	return ReservedWithChurnMessage
 }
 
 // ReservedSnippetCapLinesMessageFor returns the literal stderr
@@ -303,17 +314,24 @@ func IsValidExitOn(v string) bool {
 // (architecture.md Sec 1.3) gates whether `apply` is ever
 // implemented; until then the sub-command is reserved.
 //
+// The workstream brief ("Reserved Verbs And Flags") quotes
+// this body byte-for-byte and does NOT include a `cleanc
+// apply: ` prefix -- the prefix was an iter-4 cosmetic
+// addition that softened the exact-print contract. iter-2 of
+// Stage 4.4 strips it back so the printed text matches the
+// brief.
+//
 // The string MUST contain BOTH substrings:
 //
 //   - `not implemented; pending operator pin cli-l7-authority`
-//     (NOTE: no backticks around the pin id — `e2e-scenarios.md`
+//     (NOTE: no backticks around the pin id -- `e2e-scenarios.md`
 //     Stage 4.4 line 1050 asserts the literal phrase with the
 //     bare identifier, so wrapping the id in backticks would
 //     fail the e2e contract).
 //   - `docs/stories/code-intelligence-REFACTOR-GUIDE/architecture.md Sec 6.3`
 //     (the operator-facing pointer required by
 //     `e2e-scenarios.md` Stage 4.4 line 1051).
-const ReservedApplyMessage = "cleanc apply: not implemented; pending operator pin cli-l7-authority (see docs/stories/code-intelligence-REFACTOR-GUIDE/architecture.md Sec 6.3)"
+const ReservedApplyMessage = "not implemented; pending operator pin cli-l7-authority (see docs/stories/code-intelligence-REFACTOR-GUIDE/architecture.md Sec 6.3)"
 
 // ReservedSnippetCapLinesMessage is the literal stderr line
 // emitted when the (currently unrecognised) `--snippet-cap-lines`
@@ -332,18 +350,32 @@ const ReservedSnippetCapLinesMessage = "cleanc analyze: --snippet-cap-lines is r
 
 // ReservedTelemetryMessage is the literal stderr line the
 // dispatcher writes when `--telemetry-otlp` is set on a
-// P0/P1 build. The exact phrase `--telemetry-otlp is reserved
-// for a future story` is pinned by `e2e-scenarios.md` Stage 4.4
-// (line 1061), so this string MUST contain that substring
-// verbatim.
-const ReservedTelemetryMessage = "cleanc analyze: --telemetry-otlp is reserved for a future story (not implemented in P0/P1)"
+// P0/P1 build. The workstream brief ("Reserved Verbs And
+// Flags") quotes the body byte-for-byte and uses the
+// semicolon form `is reserved for a future story; rejected
+// in P0/P1` -- iter-2 of Stage 4.4 adopted the brief's
+// exact wording (replacing the iter-1 parenthetical form
+// `(not implemented in P0/P1)`) so the printed text matches
+// the operator-facing contract. The e2e substring
+// `--telemetry-otlp is reserved for a future story`
+// (`e2e-scenarios.md` Stage 4.4 line 1061) remains a strict
+// prefix of this message.
+const ReservedTelemetryMessage = "--telemetry-otlp is reserved for a future story; rejected in P0/P1"
 
 // ReservedWithChurnMessage is the literal stderr line the
 // dispatcher writes when `--with-churn` is set on a P0/P1
-// build. The exact phrase `--with-churn is reserved for P2
-// and rejected in P0/P1` is pinned by `e2e-scenarios.md`
-// Stage 4.4 (line 1067).
-const ReservedWithChurnMessage = "cleanc analyze: --with-churn is reserved for P2 and rejected in P0/P1"
+// build. The workstream brief quotes the body byte-for-byte;
+// iter-2 of Stage 4.4 strips the `cleanc analyze:` prefix
+// (which the iter-1 form carried) so the printed text matches
+// the brief verbatim. The e2e substring `--with-churn is
+// reserved for P2 and rejected in P0/P1`
+// (`e2e-scenarios.md` Stage 4.4 line 1067) remains a strict
+// prefix; the trailing
+// `; modification_count_in_window will not light up until the
+// parser-attr extension ships` clause is the operator-facing
+// hint mandated by the brief so an operator who reaches for
+// `--with-churn` understands WHY it's dark in P0/P1.
+const ReservedWithChurnMessage = "--with-churn is reserved for P2 and rejected in P0/P1; modification_count_in_window will not light up until the parser-attr extension ships"
 
 // ExitOnUsageMessage is the literal stderr line the dispatcher
 // writes when `--exit-on <sev>` carries a value outside the

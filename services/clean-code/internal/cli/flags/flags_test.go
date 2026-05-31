@@ -297,19 +297,16 @@ func TestGlobalsValidateAcceptsDefaults(t *testing.T) {
 	}
 }
 
-// TestValidateUsesVerbInReservedFlagMessage confirms the
-// `verb` argument threaded through Validate is actually woven
-// into the literal stderr prefix -- i.e. calling Validate("report",
-// stderr) emits `cleanc report: --with-churn is reserved ...`
-// rather than the legacy `cleanc analyze:` baked into the const
-// form. Without this guard the iter-4 fix for item 4 (REPORT
-// FLAG SURFACE INCOMPLETE) is half-done: the flag surface lights
-// up but the error text still misleads operators into thinking
-// the rejection came from `analyze`. The substring assertions
-// the e2e scenarios pin (`--with-churn is reserved`) remain
-// satisfied either way; this test covers the cosmetic accuracy
-// gap that wasn't otherwise observable.
-func TestValidateUsesVerbInReservedFlagMessage(t *testing.T) {
+// TestValidateReservedFlagMessageIsBriefBodyExact confirms
+// Validate writes the byte-exact message body quoted by the
+// workstream brief ("Reserved Verbs And Flags"). iter-2 of
+// Stage 4.4 dropped the verb-dependent `cleanc <verb>:` prefix
+// (an iter-4 cosmetic addition that softened the exact-print
+// contract): the printed text is now identical for every verb
+// and matches the brief verbatim. The e2e substring
+// `--with-churn is reserved for P2 and rejected in P0/P1`
+// remains a strict prefix of the message either way.
+func TestValidateReservedFlagMessageIsBriefBodyExact(t *testing.T) {
 	t.Parallel()
 
 	verbs := []string{VerbAnalyze, VerbReport}
@@ -327,51 +324,85 @@ func TestValidateUsesVerbInReservedFlagMessage(t *testing.T) {
 				t.Fatalf("Validate(%q) returned nil, want non-nil error", verb)
 			}
 			got := buf.String()
-			wantPrefix := "cleanc " + verb + ":"
-			if !contains(got, wantPrefix) {
-				t.Errorf("stderr = %q, want substring %q", got, wantPrefix)
+			// The printed line is the brief-quoted body + a
+			// single trailing newline (Fprintln adds the \n).
+			want := ReservedWithChurnMessage + "\n"
+			if got != want {
+				t.Errorf("stderr = %q, want byte-exact %q", got, want)
 			}
-			if !contains(got, "--with-churn is reserved") {
-				t.Errorf("stderr = %q lost the e2e substring %q", got, "--with-churn is reserved")
+			// The e2e substring contract still holds.
+			if !contains(got, "--with-churn is reserved for P2 and rejected in P0/P1") {
+				t.Errorf("stderr = %q lost the e2e substring", got)
+			}
+			// And the verb prefix MUST NOT leak back into the
+			// message (regression guard for the iter-1 form).
+			if contains(got, "cleanc "+verb+":") {
+				t.Errorf("stderr = %q regressed to verb-prefixed form `cleanc %s:` -- brief quotes the body without a verb prefix", got, verb)
 			}
 		})
 	}
 }
 
 // TestReservedTelemetryMessageForRoundTrip confirms the helper
-// builds the verb-prefixed line for non-empty verbs and falls
-// back to the legacy `ReservedTelemetryMessage` constant when
-// verb is empty, so older callers (and any test still anchored
-// on the constant) keep working unchanged.
+// returns the brief-quoted body verbatim for every verb.
+// iter-2 of Stage 4.4 made the helper verb-agnostic (the brief
+// quotes the message body without a `cleanc <verb>:` prefix),
+// so this test pins byte-exact equality with the constant.
 func TestReservedTelemetryMessageForRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	if got := ReservedTelemetryMessageFor(""); got != ReservedTelemetryMessage {
-		t.Errorf("ReservedTelemetryMessageFor(\"\") = %q, want fallback %q", got, ReservedTelemetryMessage)
+		t.Errorf("ReservedTelemetryMessageFor(\"\") = %q, want %q", got, ReservedTelemetryMessage)
+	}
+	if got := ReservedTelemetryMessageFor(VerbAnalyze); got != ReservedTelemetryMessage {
+		t.Errorf("ReservedTelemetryMessageFor(analyze) = %q, want %q (brief-quoted body, no verb prefix)", got, ReservedTelemetryMessage)
 	}
 	got := ReservedTelemetryMessageFor(VerbReport)
-	if !contains(got, "cleanc report:") {
-		t.Errorf("ReservedTelemetryMessageFor(report) = %q, want `cleanc report:` prefix", got)
+	if got != ReservedTelemetryMessage {
+		t.Errorf("ReservedTelemetryMessageFor(report) = %q, want %q (brief-quoted body, no verb prefix)", got, ReservedTelemetryMessage)
 	}
 	if !contains(got, "--telemetry-otlp is reserved for a future story") {
 		t.Errorf("ReservedTelemetryMessageFor(report) = %q dropped e2e substring", got)
 	}
+	// Regression guard: the brief uses the semicolon form
+	// `; rejected in P0/P1`, NOT the iter-1 parenthetical form
+	// `(not implemented in P0/P1)`.
+	if !contains(got, "; rejected in P0/P1") {
+		t.Errorf("ReservedTelemetryMessageFor(report) = %q dropped brief-quoted clause `; rejected in P0/P1`", got)
+	}
+	if contains(got, "cleanc report:") || contains(got, "cleanc analyze:") {
+		t.Errorf("ReservedTelemetryMessageFor(report) = %q regressed to verb-prefixed form", got)
+	}
 }
 
-// TestReservedWithChurnMessageForRoundTrip mirrors the telemetry
-// helper test for the `--with-churn` reservation message.
+// TestReservedWithChurnMessageForRoundTrip pins the brief-
+// quoted body byte-for-byte (verb-agnostic, no `cleanc <verb>:`
+// prefix) and asserts the operator-facing parser-attr hint.
 func TestReservedWithChurnMessageForRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	if got := ReservedWithChurnMessageFor(""); got != ReservedWithChurnMessage {
-		t.Errorf("ReservedWithChurnMessageFor(\"\") = %q, want fallback %q", got, ReservedWithChurnMessage)
+		t.Errorf("ReservedWithChurnMessageFor(\"\") = %q, want %q", got, ReservedWithChurnMessage)
+	}
+	if got := ReservedWithChurnMessageFor(VerbAnalyze); got != ReservedWithChurnMessage {
+		t.Errorf("ReservedWithChurnMessageFor(analyze) = %q, want %q (brief-quoted body, no verb prefix)", got, ReservedWithChurnMessage)
 	}
 	got := ReservedWithChurnMessageFor(VerbReport)
-	if !contains(got, "cleanc report:") {
-		t.Errorf("ReservedWithChurnMessageFor(report) = %q, want `cleanc report:` prefix", got)
+	if got != ReservedWithChurnMessage {
+		t.Errorf("ReservedWithChurnMessageFor(report) = %q, want %q (brief-quoted body, no verb prefix)", got, ReservedWithChurnMessage)
 	}
 	if !contains(got, "--with-churn is reserved for P2 and rejected in P0/P1") {
 		t.Errorf("ReservedWithChurnMessageFor(report) = %q dropped e2e substring", got)
+	}
+	// The workstream brief (Stage 4.4: "Reserved Verbs And Flags")
+	// pins the operator-facing hint that explains WHY --with-churn
+	// is dark in P0/P1. Lose this clause and operators just see
+	// "rejected" with no path forward to understand the gap.
+	if !contains(got, "modification_count_in_window will not light up until the parser-attr extension ships") {
+		t.Errorf("ReservedWithChurnMessageFor(report) = %q dropped operator-facing parser-attr hint", got)
+	}
+	if contains(got, "cleanc report:") || contains(got, "cleanc analyze:") {
+		t.Errorf("ReservedWithChurnMessageFor(report) = %q regressed to verb-prefixed form", got)
 	}
 }
 

@@ -142,7 +142,12 @@ func fixtureRepoID(t *testing.T) fingerprint.RepoID {
 }
 
 // methodNode is a tiny helper that builds a graphreader.Node
-// representing a method with the supplied canonical signature.
+// representing a method whose canonical_signature equals the
+// supplied `sig` and whose NodeID equals `nodeID`. Test
+// fixtures pass the same string for both (e.g. `"M"`) so the
+// seed value `"M"` exercises the bare-signature
+// LookupBySignature enumeration path documented on
+// `resolveSeed` (architecture S4.4 / S5.6 `--seed <sig-or-id>`).
 func methodNode(repoID fingerprint.RepoID, nodeID, sig string) graphreader.Node {
 	return graphreader.Node{
 		NodeID:             nodeID,
@@ -192,13 +197,13 @@ func fixtureMWithCallees(t *testing.T) (*fakeReader, fingerprint.RepoID) {
 		URL:    fixtureRepoURL,
 		SHA:    "deadbeef",
 	})
-	r.addNode(methodNode(rid, "M", "pkg.M#m()"))
+	r.addNode(methodNode(rid, "M", "M"))
 	for _, c := range []string{"C1", "C2"} {
-		r.addNode(methodNode(rid, c, "pkg.M#"+c+"()"))
+		r.addNode(methodNode(rid, c, c))
 		r.addEdge(staticCall(rid, "M", c))
 	}
 	for _, c := range []string{"P1", "P2", "P3"} {
-		r.addNode(methodNode(rid, c, "pkg.M#"+c+"()"))
+		r.addNode(methodNode(rid, c, c))
 		r.addEdge(staticCall(rid, c, "M"))
 	}
 	return r, rid
@@ -216,7 +221,7 @@ func fixtureChainABCD(t *testing.T) (*fakeReader, fingerprint.RepoID) {
 		SHA:    "deadbeef",
 	})
 	for _, n := range []string{"A", "B", "C", "D"} {
-		r.addNode(methodNode(rid, n, "pkg.chain#"+n+"()"))
+		r.addNode(methodNode(rid, n, n))
 	}
 	r.addEdge(staticCall(rid, "A", "B"))
 	r.addEdge(staticCall(rid, "B", "C"))
@@ -387,10 +392,10 @@ func TestBuildCallChain_seedNotFound(t *testing.T) {
 
 // TestBuildCallChain_seedEncodedSignature exercises the
 // `<repoID>|<kind>|<sig>` form so the LookupBySignature path is
-// covered.
+// covered through the explicit encoded-triple resolver branch.
 func TestBuildCallChain_seedEncodedSignature(t *testing.T) {
 	r, rid := fixtureMWithCallees(t)
-	seed := rid.String() + "|method|pkg.M#m()"
+	seed := rid.String() + "|method|M"
 	d, err := BuildCallChain(
 		context.Background(), r, seed, 1, DirectionCallees,
 	)
@@ -402,6 +407,175 @@ func TestBuildCallChain_seedEncodedSignature(t *testing.T) {
 	}
 }
 
+// TestBuildCallChain_seedBareSignature is the explicit regression
+// test the evaluator iter-1 review asked for: a raw canonical
+// signature `seed` MUST resolve through LookupBySignature via
+// the ListRepos x kinds enumeration documented on resolveSeed.
+// This is the form architecture S5.6 and the `--seed <sig-or-id>`
+// CLI flag pass when the user does not know the node id.
+func TestBuildCallChain_seedBareSignature(t *testing.T) {
+	rid := fixtureRepoID(t)
+	r := newFakeReader()
+	r.addRepo(graphreader.RepoSummary{
+		RepoID: rid.String(),
+		URL:    fixtureRepoURL,
+		SHA:    "deadbeef",
+	})
+	// Use a realistic Java-shaped canonical signature so the
+	// test is not a tautology against the simplified fixtures.
+	const realSig = "com.example.Greeter#greet(java.lang.String)"
+	r.addNode(graphreader.Node{
+		NodeID:             "node-greeter-greet",
+		RepoID:             rid.String(),
+		Kind:               "method",
+		CanonicalSignature: realSig,
+		FromSHA:             "deadbeef",
+		AttrsJSON:           json.RawMessage(`{"language":"java"}`),
+	})
+	r.addNode(graphreader.Node{
+		NodeID:             "node-formatter-fmt",
+		RepoID:             rid.String(),
+		Kind:               "method",
+		CanonicalSignature: "com.example.Formatter#fmt(java.lang.String)",
+		FromSHA:             "deadbeef",
+		AttrsJSON:           json.RawMessage(`{"language":"java"}`),
+	})
+	r.addEdge(staticCall(rid, "node-greeter-greet", "node-formatter-fmt"))
+
+	d, err := BuildCallChain(
+		context.Background(), r, realSig, 1, DirectionCallees,
+	)
+	if err != nil {
+		t.Fatalf("BuildCallChain(bare sig): %v", err)
+	}
+	if got, want := len(d.Nodes), 2; got != want {
+		t.Errorf("nodes count = %d, want %d (seed + callee)", got, want)
+	}
+	if got, want := len(d.Edges), 1; got != want {
+		t.Errorf("edges count = %d, want %d", got, want)
+	}
+	if d.Nodes[0].ID != "node-greeter-greet" {
+		t.Errorf("seed node id = %q, want node-greeter-greet",
+			d.Nodes[0].ID)
+	}
+}
+
+// TestBuildCallChain_seedUUIDFallback covers the Step 2 path:
+// a seed that parses as a canonical UUID is forwarded to
+// GetNode (the Postgres-backend path; node.node_id is a UUID
+// per migration 0003). Non-UUID seeds MUST NOT reach GetNode --
+// that is asserted by TestBuildCallChain_seedNotFound (where
+// `"does-not-exist"` is not a UUID and resolves to
+// ErrSeedNotFound without a GetNode call).
+func TestBuildCallChain_seedUUIDFallback(t *testing.T) {
+	rid := fixtureRepoID(t)
+	r := newFakeReader()
+	r.addRepo(graphreader.RepoSummary{
+		RepoID: rid.String(),
+		URL:    fixtureRepoURL,
+		SHA:    "deadbeef",
+	})
+	const uuidID = "11111111-2222-3333-4444-555555555555"
+	r.addNode(graphreader.Node{
+		NodeID:             uuidID,
+		RepoID:             rid.String(),
+		Kind:               "method",
+		CanonicalSignature: "com.example.Foo#bar()",
+		FromSHA:             "deadbeef",
+		AttrsJSON:           json.RawMessage(`{}`),
+	})
+
+	d, err := BuildCallChain(
+		context.Background(), r, uuidID, 0, DirectionBoth,
+	)
+	if err != nil {
+		t.Fatalf("BuildCallChain(UUID seed): %v", err)
+	}
+	if got, want := len(d.Nodes), 1; got != want {
+		t.Fatalf("nodes = %d, want %d", got, want)
+	}
+	if d.Nodes[0].ID != uuidID {
+		t.Errorf("seed node id = %q, want %q", d.Nodes[0].ID, uuidID)
+	}
+}
+
+// TestBuildCallChain_seedNonUUIDNoGetNode confirms that a seed
+// which is neither an encoded triple, nor a known canonical
+// signature, nor a canonical UUID, returns ErrSeedNotFound
+// WITHOUT having reached GetNode (impl-plan Stage 6.3 brief:
+// "GetNode only if it parses as a UUID"). The fakeReader's
+// GetNode would return a found Node for `"M"` (a stored node
+// id in the fixture); if the gate were missing, that lookup
+// would succeed and the test would fail.
+func TestBuildCallChain_seedNonUUIDNoGetNode(t *testing.T) {
+	rid := fixtureRepoID(t)
+	r := newFakeReader()
+	r.addRepo(graphreader.RepoSummary{RepoID: rid.String(), URL: fixtureRepoURL})
+	// Store a node whose NodeID is `"some-id"` and whose
+	// canonical signature differs from the seed string we
+	// will pass below. If the resolver wrongly called GetNode
+	// for the non-UUID seed `"some-id"`, this lookup would
+	// succeed. With the UUID gate in place, the seed cannot
+	// reach GetNode and must surface ErrSeedNotFound.
+	r.addNode(graphreader.Node{
+		NodeID:             "some-id",
+		RepoID:             rid.String(),
+		Kind:               "method",
+		CanonicalSignature: "a.distinct.canonical.signature",
+		FromSHA:             "deadbeef",
+		AttrsJSON:           json.RawMessage(`{}`),
+	})
+	_, err := BuildCallChain(
+		context.Background(), r, "some-id", 1, DirectionBoth,
+	)
+	if !errors.Is(err, ErrSeedNotFound) {
+		t.Fatalf("expected ErrSeedNotFound for non-UUID non-sig "+
+			"seed, got %v", err)
+	}
+}
+
+// TestBuildCallChain_danglingEdgeDropped pins the iter-1
+// evaluator finding: an edge whose opposite endpoint cannot
+// be resolved (retired, missing, or otherwise dangling) MUST
+// NOT appear in the envelope; the BFS resolves the endpoint
+// BEFORE appending the edge so the envelope never carries an
+// orphan reference (architecture S4.4 single-parser invariant).
+func TestBuildCallChain_danglingEdgeDropped(t *testing.T) {
+	rid := fixtureRepoID(t)
+	r := newFakeReader()
+	r.addRepo(graphreader.RepoSummary{RepoID: rid.String(), URL: fixtureRepoURL})
+	r.addNode(methodNode(rid, "M", "M"))
+	r.addNode(methodNode(rid, "OK", "OK"))
+	// Two outbound edges from M: one resolves, one points at
+	// a node that does NOT exist in the store.
+	r.addEdge(staticCall(rid, "M", "OK"))
+	r.addEdge(staticCall(rid, "M", "GHOST"))
+
+	d, err := BuildCallChain(context.Background(), r, "M", 1, DirectionCallees)
+	if err != nil {
+		t.Fatalf("BuildCallChain: %v", err)
+	}
+	if got, want := len(d.Nodes), 2; got != want {
+		t.Errorf("nodes = %d, want %d (M + OK only)", got, want)
+	}
+	if got, want := len(d.Edges), 1; got != want {
+		t.Errorf("edges = %d, want %d (only the resolvable edge)", got, want)
+	}
+	// Confirm no edge references the missing endpoint.
+	for _, e := range d.Edges {
+		if e.To == "GHOST" || e.From == "GHOST" {
+			t.Errorf("envelope contains dangling edge %s -> %s",
+				e.From, e.To)
+		}
+	}
+	// Confirm no node references the missing endpoint either.
+	for _, n := range d.Nodes {
+		if n.ID == "GHOST" {
+			t.Errorf("envelope contains ghost node %q", n.ID)
+		}
+	}
+}
+
 // TestBuildCallChain_observedAndStaticMixed asserts that both
 // edge kinds are walked and tagged correctly so the UI styling
 // rule (architecture S4.4.1) sees them as distinct.
@@ -409,9 +583,9 @@ func TestBuildCallChain_observedAndStaticMixed(t *testing.T) {
 	rid := fixtureRepoID(t)
 	r := newFakeReader()
 	r.addRepo(graphreader.RepoSummary{RepoID: rid.String(), URL: fixtureRepoURL})
-	r.addNode(methodNode(rid, "M", "pkg.M#m()"))
-	r.addNode(methodNode(rid, "S", "pkg.M#s()"))
-	r.addNode(methodNode(rid, "O", "pkg.M#o()"))
+	r.addNode(methodNode(rid, "M", "M"))
+	r.addNode(methodNode(rid, "S", "S"))
+	r.addNode(methodNode(rid, "O", "O"))
 	r.addEdge(staticCall(rid, "M", "S"))
 	r.addEdge(observedCall(rid, "M", "O"))
 
@@ -433,8 +607,8 @@ func TestBuildCallChain_cycleTerminates(t *testing.T) {
 	rid := fixtureRepoID(t)
 	r := newFakeReader()
 	r.addRepo(graphreader.RepoSummary{RepoID: rid.String(), URL: fixtureRepoURL})
-	r.addNode(methodNode(rid, "A", "pkg.cycle#A()"))
-	r.addNode(methodNode(rid, "B", "pkg.cycle#B()"))
+	r.addNode(methodNode(rid, "A", "A"))
+	r.addNode(methodNode(rid, "B", "B"))
 	r.addEdge(staticCall(rid, "A", "B"))
 	r.addEdge(staticCall(rid, "B", "A"))
 

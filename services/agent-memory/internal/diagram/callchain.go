@@ -176,27 +176,37 @@ func BuildCallChain(
 					if _, dup := visitedEdges[e.EdgeID]; dup {
 						continue
 					}
+					// Resolve the opposite endpoint FIRST. If
+					// it does not exist (retired, missing,
+					// dangling reference), skip the entire
+					// edge -- emitting an edge whose endpoint
+					// is absent would leave the UI's NVL
+					// renderer with an orphan relationship and
+					// break the single-parser envelope
+					// invariant (architecture S4.4).
+					if _, seen := visitedNodes[e.DstNodeID]; !seen {
+						dst, derr := reader.GetNode(
+							ctx, e.DstNodeID,
+							graphreader.ReaderOptions{},
+						)
+						if derr != nil {
+							if errors.Is(derr, graphreader.ErrNotFound) {
+								// Drop the edge entirely so
+								// the envelope never contains
+								// a dangling reference.
+								continue
+							}
+							return Diagram{}, fmt.Errorf(
+								"diagram: BuildCallChain: GetNode(dst=%s): %w",
+								e.DstNodeID, derr,
+							)
+						}
+						visitedNodes[dst.NodeID] = struct{}{}
+						env.Nodes = append(env.Nodes, toEnvelopeNode(dst))
+						next = append(next, dst)
+					}
 					visitedEdges[e.EdgeID] = struct{}{}
 					env.Edges = append(env.Edges, toEnvelopeEdge(e))
-					if _, seen := visitedNodes[e.DstNodeID]; seen {
-						continue
-					}
-					dst, derr := reader.GetNode(
-						ctx, e.DstNodeID,
-						graphreader.ReaderOptions{},
-					)
-					if derr != nil {
-						if errors.Is(derr, graphreader.ErrNotFound) {
-							continue
-						}
-						return Diagram{}, fmt.Errorf(
-							"diagram: BuildCallChain: GetNode(dst=%s): %w",
-							e.DstNodeID, derr,
-						)
-					}
-					visitedNodes[dst.NodeID] = struct{}{}
-					env.Nodes = append(env.Nodes, toEnvelopeNode(dst))
-					next = append(next, dst)
 				}
 			}
 
@@ -215,27 +225,26 @@ func BuildCallChain(
 					if _, dup := visitedEdges[e.EdgeID]; dup {
 						continue
 					}
+					if _, seen := visitedNodes[e.SrcNodeID]; !seen {
+						src, serr := reader.GetNode(
+							ctx, e.SrcNodeID,
+							graphreader.ReaderOptions{},
+						)
+						if serr != nil {
+							if errors.Is(serr, graphreader.ErrNotFound) {
+								continue
+							}
+							return Diagram{}, fmt.Errorf(
+								"diagram: BuildCallChain: GetNode(src=%s): %w",
+								e.SrcNodeID, serr,
+							)
+						}
+						visitedNodes[src.NodeID] = struct{}{}
+						env.Nodes = append(env.Nodes, toEnvelopeNode(src))
+						next = append(next, src)
+					}
 					visitedEdges[e.EdgeID] = struct{}{}
 					env.Edges = append(env.Edges, toEnvelopeEdge(e))
-					if _, seen := visitedNodes[e.SrcNodeID]; seen {
-						continue
-					}
-					src, serr := reader.GetNode(
-						ctx, e.SrcNodeID,
-						graphreader.ReaderOptions{},
-					)
-					if serr != nil {
-						if errors.Is(serr, graphreader.ErrNotFound) {
-							continue
-						}
-						return Diagram{}, fmt.Errorf(
-							"diagram: BuildCallChain: GetNode(src=%s): %w",
-							e.SrcNodeID, serr,
-						)
-					}
-					visitedNodes[src.NodeID] = struct{}{}
-					env.Nodes = append(env.Nodes, toEnvelopeNode(src))
-					next = append(next, src)
 				}
 			}
 		}
@@ -248,10 +257,49 @@ func BuildCallChain(
 	return env, nil
 }
 
-// resolveSeed implements the two-form seed resolution documented
-// on BuildCallChain. Returns ErrSeedNotFound for the
-// "neither form matched" terminal state so the handler can map
-// onto HTTP 404 with `errors.Is`.
+// callChainSeedKinds is the ordered list of node kinds the bare-
+// signature seed-resolution path probes via LookupBySignature.
+// Methods/functions are by far the most common call-chain seed
+// (architecture S4.4 "BFS rooted at a chosen symbol") so they
+// come first; classes/files/packages/blocks/repos follow so
+// less-common seeds still resolve. The order also pins the
+// "first match wins" deterministic resolution rule -- a
+// canonical signature collision across kinds is decided in
+// favour of the earliest kind in this slice.
+var callChainSeedKinds = []string{
+	"method", "class", "file", "package", "block", "repo",
+}
+
+// resolveSeed implements the seed-resolution contract documented
+// on BuildCallChain. The brief mandates "first via
+// LookupBySignature then via GetNode if it parses as a UUID";
+// the implementation follows that order exactly:
+//
+//  1. LookupBySignature path -- accepts EITHER:
+//     a) the explicit `<repoID>|<kind>|<signature>` triple the
+//        Stage 7.4 HTTP handler synthesizes when it can route
+//        the `?repo=<id>` query parameter into the seed, OR
+//     b) the bare canonical signature `<signature>` form
+//        documented in architecture S5.6 and the
+//        `--seed <sig-or-id>` CLI flag, resolved by enumerating
+//        `ListRepos` x `callChainSeedKinds` and returning the
+//        first match (architecture S4.4 "BFS rooted at a chosen
+//        symbol resolved by `canonical_signature`").
+//
+//  2. GetNode fallback -- ONLY when the seed parses as a
+//     canonical 36-character UUID via `fingerprint.ParseRepoID`
+//     (the project's standard UUID parser; node ids in the
+//     Postgres backend share the UUID namespace with repo ids
+//     so the same parser validates both shapes). Synthetic
+//     ids from the memory/SQLite backends (e.g. `n-0000001`)
+//     do not parse as UUIDs, so the bare-signature path above
+//     is the only resolution they support for the CLI form
+//     `--seed <sig>` -- which is correct: the memory backend
+//     is single-repo by construction, so enumeration is O(1).
+//
+// Returns `ErrSeedNotFound` (sentinel; `errors.Is` compatible)
+// when none of the above resolves -- the Stage 7.4 handler maps
+// this onto HTTP 404 with body `{"error":"seed_not_found"}`.
 func resolveSeed(
 	ctx context.Context,
 	reader graphsink.Reader,
@@ -261,7 +309,7 @@ func resolveSeed(
 		return graphreader.Node{}, ErrSeedNotFound
 	}
 
-	// Form 1: encoded triple `repoID|kind|signature`.
+	// Step 1a: explicit `repoID|kind|signature` encoded triple.
 	if strings.Contains(seed, CallChainSeedSeparator) {
 		parts := strings.SplitN(seed, CallChainSeedSeparator, 3)
 		if len(parts) == 3 && parts[0] != "" && parts[1] != "" && parts[2] != "" {
@@ -276,17 +324,70 @@ func resolveSeed(
 				}
 				if !errors.Is(lerr, graphreader.ErrNotFound) {
 					return graphreader.Node{}, fmt.Errorf(
-						"diagram: BuildCallChain: LookupBySignature: %w", lerr,
+						"diagram: BuildCallChain: LookupBySignature(encoded): %w",
+						lerr,
 					)
 				}
-				// Fall through to form 2 on not-found so a
-				// caller that accidentally encoded a node-id
-				// with separators still resolves.
+				// Fall through to the bare-signature path so a
+				// signature that accidentally contains the
+				// separator can still resolve via enumeration.
 			}
 		}
 	}
 
-	// Form 2: bare node id forwarded to GetNode.
+	// Step 1b: bare canonical signature -- enumerate the repos
+	// we know about, probing each (repo, kind) pair in order.
+	// First match wins. The architecture S4.4 contract for
+	// `--seed <sig>` does not pass a repo, so enumeration is
+	// the only LookupBySignature path that satisfies the
+	// documented CLI/API form.
+	summaries, lerr := reader.ListRepos(ctx, graphreader.ReaderOptions{})
+	if lerr != nil {
+		// Surface listing errors; the caller decides whether to
+		// treat them as 5xx. Do NOT silently fall through to
+		// GetNode because a partial-result fallback would hide
+		// the real backend failure.
+		return graphreader.Node{}, fmt.Errorf(
+			"diagram: BuildCallChain: ListRepos: %w", lerr,
+		)
+	}
+	for _, s := range summaries {
+		rid, perr := fingerprint.ParseRepoID(s.RepoID)
+		if perr != nil {
+			// Best-effort: backends whose RepoID is not a UUID
+			// (none today, but the contract leaves it as a
+			// natural-key string) skip the enumeration step
+			// instead of failing the whole resolve.
+			continue
+		}
+		for _, kind := range callChainSeedKinds {
+			n, kerr := reader.LookupBySignature(
+				ctx, rid, kind, seed,
+				graphreader.ReaderOptions{},
+			)
+			if kerr == nil {
+				return n, nil
+			}
+			if !errors.Is(kerr, graphreader.ErrNotFound) {
+				return graphreader.Node{}, fmt.Errorf(
+					"diagram: BuildCallChain: LookupBySignature"+
+						"(%s, %s): %w",
+					rid.String(), kind, kerr,
+				)
+			}
+		}
+	}
+
+	// Step 2: GetNode fallback, gated on canonical-UUID seed.
+	// `fingerprint.ParseRepoID` accepts the 36-character form
+	// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` -- the same shape
+	// Postgres `gen_random_uuid()` emits for `node.node_id`,
+	// per migration 0003. Non-UUID seeds (memory/SQLite
+	// synthetic ids like `n-0000001`) short-circuit to
+	// seed_not_found instead of issuing a doomed GetNode.
+	if _, perr := fingerprint.ParseRepoID(seed); perr != nil {
+		return graphreader.Node{}, ErrSeedNotFound
+	}
 	n, gerr := reader.GetNode(ctx, seed, graphreader.ReaderOptions{})
 	if gerr == nil {
 		return n, nil

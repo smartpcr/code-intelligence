@@ -87,3 +87,11 @@ steps:
         ./test/e2e/code-intelligence-REPO-SCANNER/...
     displayName: "Run E2E scenarios — memory-sink-and-json-export"
     condition: succeededOrFailed()
+
+  - script: |
+      cd services/agent-memory
+      CGO_ENABLED=1 go test -tags e2e -v -count=1 -timeout 120s \
+        -run TestE2E_graphsink_storage_abstraction_memory_reader_adapter \
+        ./test/e2e/code-intelligence-REPO-SCANNER/...
+    displayName: "Run E2E scenarios — memory-reader-adapter"
+    condition: succeededOrFailed()

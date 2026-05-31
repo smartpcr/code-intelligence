@@ -123,13 +123,38 @@ func TestWithEmbeddingsRequiresPostgresInDefaultFactory(t *testing.T) {
 	// factory still requires --store=postgres because the
 	// embedding Publisher needs a real *sql.DB for the durable
 	// event log; assert that error wording surfaces clearly.
+	//
+	// Per evaluator iter-1 feedback #1+#2: the preflight MUST
+	// run before sink creation so a misconfigured run leaves no
+	// .codeintel.db on disk. We redirect the auto-derived sqlite
+	// path into a t.TempDir() (so even a regression that opened
+	// the sink would not litter the package cwd) AND we assert
+	// the temp dir is empty after the failing run -- a positive
+	// proof that no persistent state was created.
 	dir := writeFixtureRepo(t)
+	dbDir := t.TempDir()
+	t.Setenv(defaultSqliteDirEnv, dbDir)
+
 	_, _, err := execute(t, "--with-embeddings", "scan", dir)
 	if err == nil {
 		t.Fatalf("expected an error from --with-embeddings on the default sqlite store, got nil")
 	}
 	if !strings.Contains(err.Error(), "with-embeddings") || !strings.Contains(err.Error(), "postgres") {
 		t.Fatalf("expected error to mention --with-embeddings + postgres requirement, got %v", err)
+	}
+	// Assert the failing preflight created NO sqlite store on
+	// disk. Any *.db / *.codeintel.db file in dbDir means the
+	// sink was opened before the embedding precondition was
+	// checked (regression of iter-1 feedback #1).
+	entries, derr := os.ReadDir(dbDir)
+	if derr != nil {
+		t.Fatalf("read dbDir: %v", derr)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".db") {
+			t.Errorf("preflight regression: --with-embeddings failure left %q in dbDir; "+
+				"sink must not open before embedding preconditions are validated", e.Name())
+		}
 	}
 }
 

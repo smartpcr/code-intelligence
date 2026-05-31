@@ -112,6 +112,23 @@ type Bundle struct {
 	// returned (mirrors the per-family loaders in
 	// `services/clean-code/policy/rulepacks/{solid,decoupling}`).
 	RulePacks []steward.RulePack
+
+	// Thresholds is the set of [steward.Threshold] rows the
+	// dev-mode loader seeds so any rule whose `predicate_dsl`
+	// uses the `threshold('<uuid>')` atom can compile cleanly
+	// at engine `RunBatch` time. Without this, the dev loader
+	// would silently break the `decoupling.*` rule pack family
+	// (every decoupling predicate references a threshold UUID
+	// per `policy/rulepacks/decoupling/coupling.yaml`); the
+	// engine's predicate compiler rejects unknown threshold
+	// ids with `ErrPredicateCompile` (engine.go:407-410).
+	//
+	// The slice is the canonical
+	// [decoupling.ListCanonicalThresholds] set in dev builds;
+	// the SOLID family ships zero threshold dependencies (its
+	// predicates use literal numeric cut-offs) so this slice
+	// is only populated when the decoupling family is loaded.
+	Thresholds []steward.Threshold
 }
 
 // ErrMissingPolicyDir is returned by [LoaderSource.FS] when the

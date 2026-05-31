@@ -50,6 +50,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/devpolicy"
@@ -61,6 +62,12 @@ import (
 	rule_engine "github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/version"
 )
+
+// runtimeStack proxies [runtime.Stack] so the panic-recover
+// dispatcher in [runWithRecover] can capture a stack trace
+// without dragging the `runtime` import into a per-function
+// scope where it would be unused on the happy path.
+func runtimeStack(buf []byte, all bool) int { return runtime.Stack(buf, all) }
 
 // skeletonParsers is the hard-coded list of language tags the
 // skeleton emits in the `cleanc version` output. The order
@@ -86,8 +93,37 @@ var skeletonParsers = []string{"go", "python", "typescript", "java"}
 var skeletonRulePacks = []string{"decoupling", "solid"}
 
 func main() {
-	code := run(os.Args[1:], os.Stdout, os.Stderr)
+	code := runWithRecover(os.Args[1:], os.Stdout, os.Stderr)
 	os.Exit(code)
+}
+
+// runWithRecover wraps the dispatcher in a `recover()`
+// frame so an unexpected panic anywhere inside the analyze
+// pipeline (or any other sub-command) surfaces as a
+// canonical exit code 70 with the panic value + Go stack
+// trace written to stderr (implementation-plan Stage 3.3
+// line 304 / tech-spec Sec 8.6 C9 panic contract). Without
+// the wrapper, a panic would bypass the OS exit-code mapping
+// the operator's CI relies on (`go run` exits 2 by default
+// for an uncaught panic, which would conflate "panic" with
+// "walker failure").
+//
+// The wrapper is deliberately the SINGLE recover frame in
+// the binary so each sub-command body can stay panic-free
+// without per-verb recover scaffolding; any panic raised
+// below this line surfaces here.
+func runWithRecover(args []string, stdout, stderr io.Writer) (code int) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(stderr, "cleanc: panic: %v\n", r)
+			stack := make([]byte, 8<<10)
+			n := runtimeStack(stack, false)
+			_, _ = stderr.Write(stack[:n])
+			fmt.Fprintln(stderr)
+			code = flags.ExitInternalError
+		}
+	}()
+	return run(args, stdout, stderr)
 }
 
 // run is the testable dispatcher. Each sub-command body is a
@@ -257,6 +293,20 @@ func runAnalyze(stdout, stderr io.Writer, args []string) int {
 	}
 
 	if err := g.Validate(flags.VerbAnalyze, stderr); err != nil {
+		return flags.ExitUsage
+	}
+
+	// --dev-mode=false guard (resolves iter-1 evaluator
+	// item 4). The CLI's policy-loader surface is the
+	// dev-mode unsigned bypass (architecture Sec 3.8). A
+	// signed-policy loader is not yet wired, so an operator
+	// who explicitly opted OUT of dev mode cannot proceed --
+	// refuse the run with `ExitUsage` (BSD EX_USAGE 64) so
+	// the operator sees a usage diagnostic rather than a
+	// confusing "loader returned ErrDevModeUnavailable"
+	// internal error.
+	if g.DevMode != nil && !*g.DevMode {
+		fmt.Fprintln(stderr, "cleanc analyze: --dev-mode=false but the signed-policy loader is not yet wired; pass --dev-mode (or omit the flag) to proceed with the unsigned dev policy bundle.")
 		return flags.ExitUsage
 	}
 
@@ -471,9 +521,14 @@ func runAnalyzePipeline(ctx context.Context, stdout, stderr io.Writer, g *flags.
 		return flags.ExitInternalError
 	}
 
-	// Stage 10: exit code. The verdict + `--exit-on`
-	// threshold collapse into a single 0/1 decision.
-	if verdictTriggersExit(verdict.Verdict, *g.ExitOn) {
+	// Stage 10: exit code. The verdict + per-finding
+	// severities + `--exit-on` threshold collapse into a
+	// single 0/1 decision. The engine collapses info-only
+	// findings to `VerdictPass`, so a verdict-only check
+	// would miss the `--exit-on=info` case (resolves
+	// iter-1 evaluator item 3); we therefore consult the
+	// individual finding severities as well.
+	if findingsTriggerExit(verdict.Verdict, findings, *g.ExitOn) {
 		return flags.ExitFindingTriggered
 	}
 	return flags.ExitOK

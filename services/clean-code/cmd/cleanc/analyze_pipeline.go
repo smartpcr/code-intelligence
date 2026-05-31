@@ -31,6 +31,7 @@ import (
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/repocontext"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/report"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/walk"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/refactor"
 	rule_engine "github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
 )
@@ -312,6 +313,61 @@ func dispatchDiagnostics(stderr io.Writer, path string, diag orchestrator.Diagno
 	return nil
 }
 
+// findingsTriggerExit collapses the engine's canonical
+// [rule_engine.Verdict], the per-finding severities the
+// engine produced, and the operator's `--exit-on <sev>`
+// threshold into a single boolean: true when EITHER the
+// verdict rank or ANY finding's severity rank meets or
+// exceeds the threshold rank.
+//
+// Why both inputs: the engine collapses info-only findings
+// to [rule_engine.VerdictPass] (the canonical "no
+// gate-tripping finding"). An `--exit-on=info` operator
+// who relied on the verdict alone would silently exit 0
+// even when info findings exist (regression item 3 in the
+// iter-1 evaluator review). Considering the per-finding
+// severity slice lets `--exit-on=info` honour the literal
+// "any finding meets the info threshold" semantics
+// tech-spec Sec 8.6 C9 pins.
+//
+// Mapping:
+//
+//   - `--exit-on=info`  -> trigger on any finding (info,
+//     warn, or block).
+//   - `--exit-on=warn`  -> trigger on any warn-or-higher
+//     finding OR verdict in {warn, block}.
+//   - `--exit-on=block` -> trigger on any block finding OR
+//     verdict block.
+func findingsTriggerExit(verdict rule_engine.Verdict, findings []rule_engine.Finding, threshold string) bool {
+	tRank := thresholdRank(threshold)
+	if verdictRank(verdict) >= tRank && verdictRank(verdict) > 0 {
+		return true
+	}
+	for _, f := range findings {
+		if findingSeverityRank(f.Severity) >= tRank {
+			return true
+		}
+	}
+	return false
+}
+
+// findingSeverityRank assigns the canonical numeric rank for
+// a per-finding [steward.Severity] value. Mirrors
+// [verdictRank] for the closed `{info, warn, block}` set
+// the engine stamps onto every finding.
+func findingSeverityRank(s steward.Severity) int {
+	switch s {
+	case steward.SeverityBlock:
+		return 2
+	case steward.SeverityWarn:
+		return 1
+	case steward.SeverityInfo:
+		return 1
+	default:
+		return 0
+	}
+}
+
 // verdictTriggersExit collapses the engine's canonical
 // [rule_engine.Verdict] and the `--exit-on <sev>` operator
 // threshold into a single boolean: true when the verdict
@@ -332,6 +388,12 @@ func dispatchDiagnostics(stderr io.Writer, path string, diag orchestrator.Diagno
 // An unrecognised threshold (the flag-set validator already
 // rejects these) falls back to the default `block` semantics
 // so a future enum widening is fail-safe.
+//
+// Deprecated: use [findingsTriggerExit] -- this helper does
+// not consult per-finding severities so it misses
+// `--exit-on=info` cases when the engine collapses info-only
+// findings to `VerdictPass`. Kept for unit-test coverage of
+// the verdict-only path.
 func verdictTriggersExit(verdict rule_engine.Verdict, threshold string) bool {
 	vRank := verdictRank(verdict)
 	tRank := thresholdRank(threshold)

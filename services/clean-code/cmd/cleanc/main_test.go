@@ -225,9 +225,11 @@ func TestAnalyzeRejectsBadExitOn(t *testing.T) {
 }
 
 // TestAnalyzeAcceptsAllValidExitOnLevels validates that each
-// severity in the closed set parses successfully (the
-// pipeline still stubs out at the end with exit 70, so the
-// test only asserts the flag parser accepts the value).
+// severity in the closed set parses successfully and reaches
+// the pipeline. The pipeline now runs end-to-end against an
+// empty temp directory, so an unrecognised level surfaces as
+// `must be one of` (ExitUsage) -- the test pins that no such
+// usage-rejection text appears for valid levels.
 func TestAnalyzeAcceptsAllValidExitOnLevels(t *testing.T) {
 	t.Parallel()
 
@@ -235,10 +237,10 @@ func TestAnalyzeAcceptsAllValidExitOnLevels(t *testing.T) {
 		lvl := lvl
 		t.Run(lvl, func(t *testing.T) {
 			t.Parallel()
-			_, stderr, code := captureRun("analyze", ".", "--exit-on", lvl)
-			if code != flags.ExitInternalError {
-				t.Errorf("exit code = %d, want %d (pipeline stub); stderr=%s",
-					code, flags.ExitInternalError, stderr)
+			dir := t.TempDir()
+			_, stderr, code := captureRun("analyze", dir, "--exit-on", lvl)
+			if code == flags.ExitUsage {
+				t.Errorf("exit code = %d (ExitUsage) for valid level %q; stderr=%s", code, lvl, stderr)
 			}
 			if strings.Contains(stderr, "must be one of") {
 				t.Errorf("stderr unexpectedly contains exit-on usage phrase for valid level %q\nstderr=%s", lvl, stderr)
@@ -247,20 +249,39 @@ func TestAnalyzeAcceptsAllValidExitOnLevels(t *testing.T) {
 	}
 }
 
-// TestAnalyzeStubExitsInternalError validates that an
-// otherwise-valid `cleanc analyze <path>` invocation in the
-// Stage 1.1 skeleton exits with EX_SOFTWARE (70) and an
-// explicit "not yet wired" stderr line -- the skeleton must
-// not claim success for unimplemented behaviour.
-func TestAnalyzeStubExitsInternalError(t *testing.T) {
+// TestAnalyzeHappyPathExitsCleanOnEmptyRepo validates the
+// Stage 3.3 end-to-end pipeline reaches the renderer phase
+// against an empty repo path and exits 0 (no findings, no
+// `--exit-on` trigger). Resolves iter-1 evaluator item 1
+// + item 2: the pipeline is no longer blocked on the
+// devpolicy loader stub, and the test no longer pins the
+// stub-era `not yet wired` substring.
+func TestAnalyzeHappyPathExitsCleanOnEmptyRepo(t *testing.T) {
 	t.Parallel()
 
-	_, stderr, code := captureRun("analyze", ".")
-	if code != flags.ExitInternalError {
-		t.Errorf("exit code = %d, want %d", code, flags.ExitInternalError)
+	dir := t.TempDir()
+	_, stderr, code := captureRun("analyze", dir)
+	if code != flags.ExitOK {
+		t.Errorf("exit code = %d, want %d (clean run, no findings); stderr=%s", code, flags.ExitOK, stderr)
 	}
-	if !strings.Contains(stderr, "not yet wired") {
-		t.Errorf("stderr missing 'not yet wired' notice\nstderr=%s", stderr)
+	if strings.Contains(stderr, "not yet wired") {
+		t.Errorf("stderr still mentions the stub-era 'not yet wired' substring; the loader should be functional now.\nstderr=%s", stderr)
+	}
+}
+
+// TestAnalyzeRejectsDevModeDisabled validates iter-1
+// evaluator item 4: `--dev-mode=false` refuses to start with
+// `ExitUsage` (64) and a signed-policy-loader diagnostic.
+func TestAnalyzeRejectsDevModeDisabled(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	_, stderr, code := captureRun("analyze", dir, "--dev-mode=false")
+	if code != flags.ExitUsage {
+		t.Errorf("exit code = %d, want %d (ExitUsage)\nstderr=%s", code, flags.ExitUsage, stderr)
+	}
+	if !strings.Contains(stderr, "signed-policy loader") {
+		t.Errorf("stderr missing 'signed-policy loader' diagnostic\nstderr=%s", stderr)
 	}
 }
 

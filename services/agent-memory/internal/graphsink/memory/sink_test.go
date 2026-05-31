@@ -302,9 +302,9 @@ func TestLoadExport_Roundtrip(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	loaded, err := LoadExport(path)
+	loaded, err := loadExportToSink(path)
 	if err != nil {
-		t.Fatalf("LoadExport: %v", err)
+		t.Fatalf("loadExportToSink: %v", err)
 	}
 	if got := len(loaded.nodes); got != wantNodes {
 		t.Errorf("loaded nodes len=%d, want %d", got, wantNodes)
@@ -313,17 +313,46 @@ func TestLoadExport_Roundtrip(t *testing.T) {
 		t.Errorf("loaded edges len=%d, want %d", got, wantEdges)
 	}
 
+	// Public LoadExport returns the 3-value contract required
+	// by the workstream brief: (graphsink.Sink, graphsink.Reader, error).
+	sink, reader, err := LoadExport(path)
+	if err != nil {
+		t.Fatalf("LoadExport: %v", err)
+	}
+	if sink == nil || reader == nil {
+		t.Fatalf("LoadExport: nil sink/reader (sink=%v reader=%v)", sink, reader)
+	}
 	// Reader surface: ListNodes returns the same count.
-	gotNodes, err := loaded.ListNodes(ctx, repoID, nil, graphreader.ListNodesFilter{}, graphreader.ReaderOptions{})
+	gotNodes, err := reader.ListNodes(ctx, repoID, nil, graphreader.ListNodesFilter{}, graphreader.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("loaded ListNodes: %v", err)
 	}
 	if len(gotNodes) != wantNodes {
 		t.Errorf("ListNodes returned %d, want %d", len(gotNodes), wantNodes)
 	}
+	// Sink surface: a re-insert of an existing node returns
+	// cached id (no growth).
+	cached, err := sink.InsertNode(ctx, graphwriter.NodeInput{
+		RepoID:             repoID,
+		Kind:               "file",
+		CanonicalSignature: "file://example/foo.go",
+		ParentNodeID:       pkgNode.NodeID,
+		FromSHA:            "deadbeef",
+	})
+	if err != nil {
+		t.Fatalf("rehydrated InsertNode: %v", err)
+	}
+	if cached.Inserted {
+		t.Errorf("rehydrated InsertNode should return Inserted=false (cache hit)")
+	}
+	if cached.NodeID != fileNode.NodeID {
+		t.Errorf("rehydrated InsertNode returned NodeID %s, want %s (original)",
+			cached.NodeID, fileNode.NodeID)
+	}
+
 	// ListEdgesFrom on the repo node should return the
 	// contains-edge to the package node.
-	outbound, err := loaded.ListEdgesFrom(ctx, repoNode.NodeID, nil, graphreader.ReaderOptions{})
+	outbound, err := reader.ListEdgesFrom(ctx, repoNode.NodeID, nil, graphreader.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("loaded ListEdgesFrom: %v", err)
 	}
@@ -331,7 +360,7 @@ func TestLoadExport_Roundtrip(t *testing.T) {
 		t.Errorf("repo outbound edges = %d, want 1", len(outbound))
 	}
 	// ListRepos surfaces the SHA from the original export.
-	repos, err := loaded.ListRepos(ctx, graphreader.ReaderOptions{})
+	repos, err := reader.ListRepos(ctx, graphreader.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("loaded ListRepos: %v", err)
 	}
@@ -345,7 +374,7 @@ func TestLoadExport_Roundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NodeFingerprint: %v", err)
 	}
-	got, err := loaded.LookupBySignature(ctx, repoID, "file", "file://example/foo.go", graphreader.ReaderOptions{})
+	got, err := reader.LookupBySignature(ctx, repoID, "file", "file://example/foo.go", graphreader.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("LookupBySignature: %v", err)
 	}
@@ -401,6 +430,197 @@ func TestClose_ReturnsErrClosedAfterClose(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatalf("InsertNode after Close should error")
+	}
+}
+
+// ListNodes / ListEdges reject invalid kind strings before
+// scanning, matching the graphreader.Reader's pre-flight
+// validation (architecture C5: same kind semantics across
+// backends).
+func TestListNodes_RejectsInvalidKind(t *testing.T) {
+	s := New(Options{})
+	ensureFixtureRepo(t, s)
+	_, err := s.ListNodes(context.Background(), mustRepoID(t),
+		[]string{"function"}, graphreader.ListNodesFilter{}, graphreader.ReaderOptions{})
+	if err == nil {
+		t.Fatalf("ListNodes with invalid kind should error")
+	}
+	if !strings.Contains(err.Error(), "invalid node kind") {
+		t.Errorf("error %q should mention invalid node kind", err)
+	}
+}
+
+func TestListEdgesFrom_RejectsInvalidKind(t *testing.T) {
+	s := New(Options{})
+	ensureFixtureRepo(t, s)
+	_, err := s.ListEdgesFrom(context.Background(), "n-0000000001",
+		[]string{"observes"}, graphreader.ReaderOptions{})
+	if err == nil {
+		t.Fatalf("ListEdgesFrom with invalid kind should error")
+	}
+	if !strings.Contains(err.Error(), "invalid edge kind") {
+		t.Errorf("error %q should mention invalid edge kind", err)
+	}
+}
+
+func TestListEdgesTo_RejectsInvalidKind(t *testing.T) {
+	s := New(Options{})
+	ensureFixtureRepo(t, s)
+	_, err := s.ListEdgesTo(context.Background(), "n-0000000001",
+		[]string{"bogus"}, graphreader.ReaderOptions{})
+	if err == nil {
+		t.Fatalf("ListEdgesTo with invalid kind should error")
+	}
+}
+
+// LoadExport rejects an export whose per-node RepoID disagrees
+// with the top-level repo.id (corrupt / stitched export).
+func TestLoadExport_RejectsNodeRepoIDMismatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "graph.json")
+	writeRoundtripExport(t, path)
+	// Mutate a node's repo_id to a syntactically-valid but
+	// different UUID.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	original := mustRepoID(t).String()
+	other := "00000000-0000-0000-0000-000000000001"
+	bad := strings.Replace(string(data), `"repo_id": "`+original+`"`,
+		`"repo_id": "`+other+`"`, 1) // first match = first node entry
+	// First match could be the top-level repo.id (it's also
+	// written first); skip past the `"repo": {` block by
+	// finding the second occurrence.
+	bad = string(data)
+	idx := strings.Index(bad, `"nodes"`)
+	if idx < 0 {
+		t.Fatalf("nodes block not found in export")
+	}
+	rest := bad[idx:]
+	rest = strings.Replace(rest, original, other, 1)
+	bad = bad[:idx] + rest
+	if err := os.WriteFile(path, []byte(bad), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, _, err = LoadExport(path)
+	if err == nil {
+		t.Fatalf("LoadExport should reject mismatched node repo_id")
+	}
+	if !strings.Contains(err.Error(), "does not match export repo.id") {
+		t.Errorf("error %q should mention repo.id mismatch", err)
+	}
+}
+
+// LoadExport rejects an export whose edge points at a missing
+// node (truncated export).
+func TestLoadExport_RejectsDanglingEdgeEndpoint(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "graph.json")
+	writeRoundtripExport(t, path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	// Repoint an edge's src_node_id at a non-existent id.
+	bad := strings.Replace(string(data),
+		`"src_node_id": "n-0000000001"`,
+		`"src_node_id": "n-9999999999"`, 1)
+	if bad == string(data) {
+		t.Fatalf("could not find src_node_id to mutate in: %s", string(data))
+	}
+	if err := os.WriteFile(path, []byte(bad), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, _, err = LoadExport(path)
+	if err == nil {
+		t.Fatalf("LoadExport should reject dangling edge endpoint")
+	}
+	if !strings.Contains(err.Error(), "not present in export") {
+		t.Errorf("error %q should mention missing endpoint", err)
+	}
+}
+
+// LoadExport rejects an export whose declared node fingerprint
+// disagrees with the canonical re-derivation -- guards hand-
+// edited exports whose identity drifts from the inputs.
+func TestLoadExport_RejectsFingerprintMismatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "graph.json")
+	writeRoundtripExport(t, path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	// Mutate the first node's CanonicalSignature so the
+	// declared fingerprint no longer matches the re-derived
+	// one.
+	bad := strings.Replace(string(data),
+		`"canonical_signature": "`+repoURL+`"`,
+		`"canonical_signature": "https://other.invalid/repo"`, 1)
+	if bad == string(data) {
+		t.Fatalf("could not find canonical_signature to mutate")
+	}
+	if err := os.WriteFile(path, []byte(bad), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, _, err = LoadExport(path)
+	if err == nil {
+		t.Fatalf("LoadExport should reject fingerprint/canonical mismatch")
+	}
+	if !strings.Contains(err.Error(), "declared fingerprint") {
+		t.Errorf("error %q should mention declared fingerprint mismatch", err)
+	}
+}
+
+// The literal idempotent cache shape required by architecture
+// S3.2.4 is `map[fingerprint.Sum]string`. Static-typing check
+// via runtime assertion.
+func TestSink_IdempotentCacheShape(t *testing.T) {
+	s := New(Options{})
+	if _, ok := any(s.nodeIDByFP).(map[fingerprint.Sum]string); !ok {
+		t.Errorf("nodeIDByFP should be map[fingerprint.Sum]string, got %T", s.nodeIDByFP)
+	}
+	if _, ok := any(s.edgeIDByFP).(map[fingerprint.Sum]string); !ok {
+		t.Errorf("edgeIDByFP should be map[fingerprint.Sum]string, got %T", s.edgeIDByFP)
+	}
+}
+
+// writeRoundtripExport materialises a small fixture export to
+// disk and returns. Shared scaffolding for the LoadExport-
+// rejection tests.
+func writeRoundtripExport(t *testing.T, path string) {
+	t.Helper()
+	s := New(Options{ExportPath: path})
+	ensureFixtureRepo(t, s)
+	ctx := context.Background()
+	repoID := mustRepoID(t)
+	repoNode, err := s.InsertNode(ctx, graphwriter.NodeInput{
+		RepoID: repoID, Kind: "repo",
+		CanonicalSignature: repoURL, FromSHA: "deadbeef",
+	})
+	if err != nil {
+		t.Fatalf("InsertNode repo: %v", err)
+	}
+	pkgNode, err := s.InsertNode(ctx, graphwriter.NodeInput{
+		RepoID:             repoID,
+		Kind:               "package",
+		CanonicalSignature: "pkg://example",
+		ParentNodeID:       repoNode.NodeID,
+		FromSHA:            "deadbeef",
+	})
+	if err != nil {
+		t.Fatalf("InsertNode pkg: %v", err)
+	}
+	if _, err := s.InsertEdge(ctx, graphwriter.EdgeInput{
+		RepoID: repoID, Kind: "contains",
+		SrcNodeID: repoNode.NodeID, DstNodeID: pkgNode.NodeID,
+		FromSHA: "deadbeef",
+	}); err != nil {
+		t.Fatalf("InsertEdge: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }
 

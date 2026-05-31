@@ -82,10 +82,22 @@ type Sink struct {
 	commits    []commitEntry
 	commitIdx  map[commitKey]int
 	nodes      []nodeEntry
-	nodesByFP  map[fingerprint.Sum]int // fingerprint -> index in `nodes`
-	nodeFPByID map[string]fingerprint.Sum
-	edges      []edgeEntry
-	edgesByFP  map[fingerprint.Sum]int // fingerprint -> index in `edges`
+	// nodeIDByFP is the load-bearing idempotent-re-emit cache
+	// the workstream brief (and architecture S3.2.4) names
+	// literally: `map[fingerprint.Sum]string` -- the node's
+	// G2 fingerprint maps to the synthetic NodeID a previous
+	// InsertNode minted. Second-and-subsequent calls with the
+	// same fingerprint short-circuit through this map without
+	// touching the `nodes` slice.
+	nodeIDByFP  map[fingerprint.Sum]string
+	nodeIdxByID map[string]int           // NodeID -> index in `nodes`
+	nodeFPByID  map[string]fingerprint.Sum
+	edges       []edgeEntry
+	// edgeIDByFP is the edge analogue of nodeIDByFP. Same
+	// literal `map[fingerprint.Sum]string` shape so the two
+	// caches are parallel.
+	edgeIDByFP  map[fingerprint.Sum]string
+	edgeIdxByID map[string]int // EdgeID -> index in `edges`
 
 	// nextNodeID / nextEdgeID are the monotonic counters
 	// behind the synthetic ids the memory backend mints.
@@ -115,12 +127,14 @@ func New(opts Options) *Sink {
 		now = time.Now
 	}
 	return &Sink{
-		exportPath: opts.ExportPath,
-		now:        now,
-		commitIdx:  make(map[commitKey]int),
-		nodesByFP:  make(map[fingerprint.Sum]int),
-		nodeFPByID: make(map[string]fingerprint.Sum),
-		edgesByFP:  make(map[fingerprint.Sum]int),
+		exportPath:  opts.ExportPath,
+		now:         now,
+		commitIdx:   make(map[commitKey]int),
+		nodeIDByFP:  make(map[fingerprint.Sum]string),
+		nodeIdxByID: make(map[string]int),
+		nodeFPByID:  make(map[string]fingerprint.Sum),
+		edgeIDByFP:  make(map[fingerprint.Sum]string),
+		edgeIdxByID: make(map[string]int),
 	}
 }
 
@@ -290,8 +304,8 @@ func (s *Sink) InsertNode(ctx context.Context, in graphwriter.NodeInput) (graphw
 			ErrRepoMismatch, in.RepoID, s.repo.record.ID,
 		)
 	}
-	if idx, ok := s.nodesByFP[fp]; ok {
-		rec := s.nodes[idx].record
+	if id, ok := s.nodeIDByFP[fp]; ok {
+		rec := s.nodes[s.nodeIdxByID[id]].record
 		rec.Inserted = false
 		return rec, nil
 	}
@@ -311,7 +325,9 @@ func (s *Sink) InsertNode(ctx context.Context, in graphwriter.NodeInput) (graphw
 		Inserted:    true,
 	}
 	s.nodes = append(s.nodes, nodeEntry{record: rec, input: in})
-	s.nodesByFP[fp] = len(s.nodes) - 1
+	idx := len(s.nodes) - 1
+	s.nodeIDByFP[fp] = nodeID
+	s.nodeIdxByID[nodeID] = idx
 	s.nodeFPByID[nodeID] = fp
 	return rec, nil
 }
@@ -369,8 +385,8 @@ func (s *Sink) InsertEdge(ctx context.Context, in graphwriter.EdgeInput) (graphw
 			"graphsink/memory: InsertEdge fingerprint: %w", err,
 		)
 	}
-	if idx, ok := s.edgesByFP[fp]; ok {
-		rec := s.edges[idx].record
+	if id, ok := s.edgeIDByFP[fp]; ok {
+		rec := s.edges[s.edgeIdxByID[id]].record
 		rec.Inserted = false
 		return rec, nil
 	}
@@ -384,7 +400,9 @@ func (s *Sink) InsertEdge(ctx context.Context, in graphwriter.EdgeInput) (graphw
 		Inserted:    true,
 	}
 	s.edges = append(s.edges, edgeEntry{record: rec, input: in})
-	s.edgesByFP[fp] = len(s.edges) - 1
+	idx := len(s.edges) - 1
+	s.edgeIDByFP[fp] = edgeID
+	s.edgeIdxByID[edgeID] = idx
 	return rec, nil
 }
 
@@ -486,6 +504,9 @@ func (s *Sink) ListNodes(
 	if repoID.IsZero() {
 		return nil, errors.New("graphsink/memory: ListNodes: zero repo_id")
 	}
+	if err := validateNodeKinds(kinds); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -545,6 +566,9 @@ func (s *Sink) listEdges(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := validateEdgeKinds(kinds); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -592,10 +616,11 @@ func (s *Sink) GetNode(ctx context.Context, nodeID string, opts graphreader.Read
 	if !ok {
 		return graphreader.Node{}, graphreader.ErrNotFound
 	}
-	idx, ok := s.nodesByFP[fp]
+	idx, ok := s.nodeIdxByID[nodeID]
 	if !ok || s.repo == nil {
 		return graphreader.Node{}, graphreader.ErrNotFound
 	}
+	_ = fp
 	return nodeToReader(s.nodes[idx], s.repo.record.ID), nil
 }
 
@@ -764,17 +789,48 @@ func (s *Sink) encodeExportLocked() ([]byte, error) {
 }
 
 // LoadExport reads a memory-backend JSON export previously
-// written by `*Sink.Close` and returns a rehydrated *Sink. The
-// returned value satisfies BOTH `graphsink.Sink` (write side
-// -- though writes after load are uncommon) and
-// `graphsink.Reader` (the surface the `codeintel diagram
-// --from-export <file>` path consumes).
+// written by `*Sink.Close` and returns a rehydrated sink, typed
+// as the writer half (`graphsink.Sink`) and the reader half
+// (`graphsink.Reader`) so callers wiring `codeintel diagram
+// --from-export <file>` get both contracts without an interface
+// assertion.
+//
+// Validation performed before the returned value is usable:
+//
+//   - `repo.id` parses as a UUID.
+//   - Every node's `repo_id` field matches `repo.id` (rejects
+//     truncated or stitched exports).
+//   - Every node's `fingerprint` decodes to 32 bytes AND
+//     re-deriving `NodeFingerprint(repoID, kind, canonical,
+//     fromSHA)` produces the same value (guards against
+//     hand-edited exports whose declared identity disagrees
+//     with the canonical inputs).
+//   - Every edge's `repo_id` matches `repo.id`.
+//   - Every edge's `src_node_id` / `dst_node_id` exists in the
+//     loaded node set (rejects dangling edges).
+//   - Every edge's declared `src_fingerprint` / `dst_fingerprint`
+//     matches the loaded node's fingerprint.
+//   - Every edge's `fingerprint` decodes AND re-deriving
+//     `EdgeFingerprint(repoID, kind, srcFP, dstFP, fromSHA)`
+//     matches (rejects forged edge identities).
 //
 // The rehydrated sink preserves the original synthetic node /
 // edge ids and re-populates the fingerprint maps. Repo / node /
 // edge records carry `Inserted = false` because nothing was
 // newly inserted by the load.
-func LoadExport(path string) (*Sink, error) {
+func LoadExport(path string) (graphsink.Sink, graphsink.Reader, error) {
+	s, err := loadExportToSink(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return s, s, nil
+}
+
+// loadExportToSink is the concrete-typed variant LoadExport
+// delegates to. Internal callers (the diagram package, tests)
+// that need the concrete *Sink can call this directly without
+// an interface assertion.
+func loadExportToSink(path string) (*Sink, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("graphsink/memory: read export %s: %w", path, err)
@@ -827,11 +883,43 @@ func LoadExport(path string) (*Sink, error) {
 	}
 
 	maxNodeID := 0
-	for _, n := range exp.Nodes {
+	for i, n := range exp.Nodes {
+		if n.RepoID != "" && n.RepoID != exp.Repo.ID {
+			return nil, fmt.Errorf(
+				"graphsink/memory: node[%d] %s: repo_id %q does not match export repo.id %q",
+				i, n.NodeID, n.RepoID, exp.Repo.ID,
+			)
+		}
+		if n.NodeID == "" {
+			return nil, fmt.Errorf("graphsink/memory: node[%d] missing node_id", i)
+		}
+		if _, dup := s.nodeIdxByID[n.NodeID]; dup {
+			return nil, fmt.Errorf(
+				"graphsink/memory: node[%d]: duplicate node_id %q in export", i, n.NodeID,
+			)
+		}
 		fp, err := fingerprint.SumFromHex(n.Fingerprint)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"graphsink/memory: decode node fingerprint %s: %w", n.Fingerprint, err)
+				"graphsink/memory: node[%d] %s: decode fingerprint %s: %w",
+				i, n.NodeID, n.Fingerprint, err,
+			)
+		}
+		// Re-derive the fingerprint from the canonical inputs
+		// and confirm the export's declared identity matches.
+		// A mismatch signals a hand-edited / corrupt export.
+		derived, err := fingerprint.NodeFingerprint(repoID, n.Kind, n.CanonicalSignature, n.FromSHA)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"graphsink/memory: node[%d] %s: re-derive fingerprint: %w",
+				i, n.NodeID, err,
+			)
+		}
+		if derived != fp {
+			return nil, fmt.Errorf(
+				"graphsink/memory: node[%d] %s: declared fingerprint %s != re-derived %s",
+				i, n.NodeID, fp.Hex(), derived.Hex(),
+			)
 		}
 		input := graphwriter.NodeInput{
 			RepoID:             repoID,
@@ -847,30 +935,105 @@ func LoadExport(path string) (*Sink, error) {
 			Inserted:    false,
 		}
 		s.nodes = append(s.nodes, nodeEntry{record: rec, input: input})
-		s.nodesByFP[fp] = len(s.nodes) - 1
+		idx := len(s.nodes) - 1
+		s.nodeIDByFP[fp] = n.NodeID
+		s.nodeIdxByID[n.NodeID] = idx
 		s.nodeFPByID[n.NodeID] = fp
 		if seq := parseSyntheticID(n.NodeID, "n-"); seq > maxNodeID {
 			maxNodeID = seq
 		}
 	}
+	// Second pass: every ParentNodeID must resolve. Done after
+	// the full set is loaded so out-of-order export rows still
+	// rehydrate cleanly.
+	for i, n := range exp.Nodes {
+		if n.ParentNodeID == "" {
+			continue
+		}
+		if _, ok := s.nodeIdxByID[n.ParentNodeID]; !ok {
+			return nil, fmt.Errorf(
+				"graphsink/memory: node[%d] %s: parent_node_id %q not present in export",
+				i, n.NodeID, n.ParentNodeID,
+			)
+		}
+	}
 	s.nextNodeID = maxNodeID
 
 	maxEdgeID := 0
-	for _, e := range exp.Edges {
+	for i, e := range exp.Edges {
+		if e.RepoID != "" && e.RepoID != exp.Repo.ID {
+			return nil, fmt.Errorf(
+				"graphsink/memory: edge[%d] %s: repo_id %q does not match export repo.id %q",
+				i, e.EdgeID, e.RepoID, exp.Repo.ID,
+			)
+		}
+		if e.EdgeID == "" {
+			return nil, fmt.Errorf("graphsink/memory: edge[%d] missing edge_id", i)
+		}
+		if _, dup := s.edgeIdxByID[e.EdgeID]; dup {
+			return nil, fmt.Errorf(
+				"graphsink/memory: edge[%d]: duplicate edge_id %q in export", i, e.EdgeID,
+			)
+		}
+		srcFP, ok := s.nodeFPByID[e.SrcNodeID]
+		if !ok {
+			return nil, fmt.Errorf(
+				"graphsink/memory: edge[%d] %s: src_node_id %q not present in export",
+				i, e.EdgeID, e.SrcNodeID,
+			)
+		}
+		dstFP, ok := s.nodeFPByID[e.DstNodeID]
+		if !ok {
+			return nil, fmt.Errorf(
+				"graphsink/memory: edge[%d] %s: dst_node_id %q not present in export",
+				i, e.EdgeID, e.DstNodeID,
+			)
+		}
+		declSrcFP, err := fingerprint.SumFromHex(e.SrcFingerprint)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"graphsink/memory: edge[%d] %s: decode src_fingerprint %s: %w",
+				i, e.EdgeID, e.SrcFingerprint, err,
+			)
+		}
+		if declSrcFP != srcFP {
+			return nil, fmt.Errorf(
+				"graphsink/memory: edge[%d] %s: declared src_fingerprint %s != node %s fingerprint %s",
+				i, e.EdgeID, declSrcFP.Hex(), e.SrcNodeID, srcFP.Hex(),
+			)
+		}
+		declDstFP, err := fingerprint.SumFromHex(e.DstFingerprint)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"graphsink/memory: edge[%d] %s: decode dst_fingerprint %s: %w",
+				i, e.EdgeID, e.DstFingerprint, err,
+			)
+		}
+		if declDstFP != dstFP {
+			return nil, fmt.Errorf(
+				"graphsink/memory: edge[%d] %s: declared dst_fingerprint %s != node %s fingerprint %s",
+				i, e.EdgeID, declDstFP.Hex(), e.DstNodeID, dstFP.Hex(),
+			)
+		}
 		fp, err := fingerprint.SumFromHex(e.Fingerprint)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"graphsink/memory: decode edge fingerprint %s: %w", e.Fingerprint, err)
+				"graphsink/memory: edge[%d] %s: decode fingerprint %s: %w",
+				i, e.EdgeID, e.Fingerprint, err,
+			)
 		}
-		srcFP, err := fingerprint.SumFromHex(e.SrcFingerprint)
+		derived, err := fingerprint.EdgeFingerprint(repoID, e.Kind, srcFP, dstFP, e.FromSHA)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"graphsink/memory: decode edge src fingerprint %s: %w", e.SrcFingerprint, err)
+				"graphsink/memory: edge[%d] %s: re-derive fingerprint: %w",
+				i, e.EdgeID, err,
+			)
 		}
-		dstFP, err := fingerprint.SumFromHex(e.DstFingerprint)
-		if err != nil {
+		if derived != fp {
 			return nil, fmt.Errorf(
-				"graphsink/memory: decode edge dst fingerprint %s: %w", e.DstFingerprint, err)
+				"graphsink/memory: edge[%d] %s: declared fingerprint %s != re-derived %s",
+				i, e.EdgeID, fp.Hex(), derived.Hex(),
+			)
 		}
 		input := graphwriter.EdgeInput{
 			RepoID:    repoID,
@@ -888,7 +1051,9 @@ func LoadExport(path string) (*Sink, error) {
 			Inserted:    false,
 		}
 		s.edges = append(s.edges, edgeEntry{record: rec, input: input})
-		s.edgesByFP[fp] = len(s.edges) - 1
+		idx := len(s.edges) - 1
+		s.edgeIDByFP[fp] = e.EdgeID
+		s.edgeIdxByID[e.EdgeID] = idx
 		if seq := parseSyntheticID(e.EdgeID, "e-"); seq > maxEdgeID {
 			maxEdgeID = seq
 		}
@@ -1004,4 +1169,61 @@ func normaliseLimit(requested int) int {
 		return graphreader.MaxListLimit
 	}
 	return requested
+}
+
+// nodeKindsAllowed mirrors graphreader's closed node_kind set
+// (architecture.md §5.2.1 / migration 0001). Memory backend
+// keeps its own copy because graphreader's set is unexported;
+// when a future migration appends a kind, update BOTH lists.
+var nodeKindsAllowed = map[string]struct{}{
+	"repo":    {},
+	"package": {},
+	"file":    {},
+	"class":   {},
+	"method":  {},
+	"block":   {},
+}
+
+// edgeKindsAllowed mirrors graphreader's closed edge_kind set
+// (migration 0001 + 0022 overrides).
+var edgeKindsAllowed = map[string]struct{}{
+	"contains":       {},
+	"imports":        {},
+	"static_calls":   {},
+	"observed_calls": {},
+	"extends":        {},
+	"implements":     {},
+	"reads":          {},
+	"writes":         {},
+	"renamed_to":     {},
+	"overrides":      {},
+}
+
+// validateNodeKinds returns an error when any element of kinds
+// is not a member of the node_kind ENUM. An empty slice passes
+// -- callers use that to mean "all kinds". Same contract as
+// `graphreader.validateNodeKinds` so the memory backend rejects
+// the same set of invalid inputs the Postgres backend would
+// (otherwise a `--store=memory` scan could swallow a typo that
+// `--store=postgres` would reject).
+func validateNodeKinds(kinds []string) error {
+	for _, k := range kinds {
+		if _, ok := nodeKindsAllowed[k]; !ok {
+			return fmt.Errorf("graphsink/memory: invalid node kind %q "+
+				"(allowed: repo/package/file/class/method/block)", k)
+		}
+	}
+	return nil
+}
+
+// validateEdgeKinds is the edge analogue of validateNodeKinds.
+func validateEdgeKinds(kinds []string) error {
+	for _, k := range kinds {
+		if _, ok := edgeKindsAllowed[k]; !ok {
+			return fmt.Errorf("graphsink/memory: invalid edge kind %q "+
+				"(allowed: contains/imports/static_calls/observed_calls/"+
+				"extends/implements/reads/writes/renamed_to/overrides)", k)
+		}
+	}
+	return nil
 }

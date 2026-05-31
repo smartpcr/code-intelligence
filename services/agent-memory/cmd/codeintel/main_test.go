@@ -30,8 +30,8 @@ func TestRootHelpListsSubcommands(t *testing.T) {
 }
 
 func TestSubcommandsReturnErrNotImplemented(t *testing.T) {
-	// Only scan-many, diagram calls, and serve are still stubbed.
-	// scan and diagram module have real implementations now.
+	// diagram module is implemented in diagram.go;
+	// scan is implemented in scan.go.
 	cases := [][]string{
 		{"scan-many"},
 		{"diagram", "calls"},
@@ -51,13 +51,6 @@ func TestSubcommandsReturnErrNotImplemented(t *testing.T) {
 	}
 }
 
-func TestScanRequiresArg(t *testing.T) {
-	_, _, err := execute(t, "scan")
-	if err == nil {
-		t.Fatalf("expected error when scan called without arg")
-	}
-}
-
 func TestDiagramModuleRequiresDB(t *testing.T) {
 	_, _, err := execute(t, "diagram", "module")
 	if err == nil {
@@ -68,15 +61,25 @@ func TestDiagramModuleRequiresDB(t *testing.T) {
 	}
 }
 
+func TestScanRequiresArgument(t *testing.T) {
+	_, _, err := execute(t, "scan")
+	if err == nil {
+		t.Fatalf("expected error when scan invoked without an argument, got nil")
+	}
+	if !strings.Contains(err.Error(), "requires exactly 1 argument") {
+		t.Fatalf("expected an arg-count error from scan, got %v", err)
+	}
+}
+
 func TestInvalidLogFormatRejected(t *testing.T) {
-	_, _, err := execute(t, "--log", "xml", "scan-many")
+	_, _, err := execute(t, "--log", "xml", "scan")
 	if err == nil || !strings.Contains(err.Error(), "invalid --log") {
 		t.Fatalf("expected --log validation error, got %v", err)
 	}
 }
 
 func TestInvalidStoreRejected(t *testing.T) {
-	_, _, err := execute(t, "--store", "mysql", "scan-many")
+	_, _, err := execute(t, "--store", "mysql", "scan")
 	if err == nil || !strings.Contains(err.Error(), "invalid --store") {
 		t.Fatalf("expected --store validation error, got %v", err)
 	}
@@ -119,6 +122,8 @@ func TestSubcommandJSONLogIsValidJSON(t *testing.T) {
 	if line == "" {
 		t.Fatalf("expected a JSON log line on stderr, got empty output")
 	}
+	// Subcommand emits exactly one line in the scaffold; tolerate
+	// trailing newlines by taking the first non-empty line.
 	firstLine := line
 	if i := strings.Index(line, "\n"); i >= 0 {
 		firstLine = line[:i]

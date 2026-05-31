@@ -194,10 +194,11 @@ func (c *buildModuleDiagramCtx) theCodeintelCLIBinaryCompilesAndItsSubcommandsAr
 	}
 
 	// 1. Exercise codeintel scan against the polyglot fixture directory.
-	//    This writes a scan-smoke.db via the real CLI scan path.
+	//    This writes a scan-smoke.db via the real CLI scan path,
+	//    matching the declared bootstrap: codeintel scan <path> --store sqlite --out <db>.
 	fixtureDir := filepath.Join(root, "internal", "repoindexer", "ast", "testdata", "polyglot")
 	scanDB := filepath.Join(c.tempDir, "scan-smoke.db")
-	scanCmd := exec.Command(binPath, "scan", fixtureDir, "--store", "sqlite", "--db", scanDB)
+	scanCmd := exec.Command(binPath, "scan", fixtureDir, "--store", "sqlite", "--out", scanDB)
 	scanOut, scanErr := scanCmd.CombinedOutput()
 	if scanErr != nil {
 		return fmt.Errorf("codeintel scan failed: %v\n%s", scanErr, string(scanOut))

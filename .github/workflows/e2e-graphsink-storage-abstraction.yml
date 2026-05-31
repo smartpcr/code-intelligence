@@ -32,9 +32,6 @@ jobs:
   sink-interface-skeleton:
     name: "sink-interface-skeleton"
     runs-on: ubuntu-latest
-    env:
-      COMPOSE_FILE: tests/e2e/phase-3-graphsink-storage-abstraction/docker-compose.yml
-      AGENT_MEMORY_PG_URL: "postgres://agent_memory:agent_memory@localhost:5432/agent_memory?sslmode=disable"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,26 +41,6 @@ jobs:
         with:
           go-version-file: services/agent-memory/go.mod
           cache: true
-
-      - name: Start compose stack (postgres)
-        run: docker compose -f $COMPOSE_FILE up -d
-
-      - name: Wait for postgres
-        run: |
-          set -euo pipefail
-          deadline=$(( $(date +%s) + 90 ))
-          while :; do
-            status=$(docker compose -f $COMPOSE_FILE ps --format json \
-              | jq -r 'select(.Service=="postgres") | .Health // .State' 2>/dev/null || echo "unknown")
-            echo "  postgres -> $status"
-            if [ "$status" = "healthy" ]; then echo "Postgres ready"; break; fi
-            if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "::error::Postgres did not become healthy within 90s"
-              docker compose -f $COMPOSE_FILE logs --tail=100
-              exit 1
-            fi
-            sleep 3
-          done
 
       - name: Download Go dependencies
         working-directory: services/agent-memory
@@ -75,7 +52,3 @@ jobs:
           go test -tags e2e -v -count=1 -timeout 120s \
             -run TestE2E_graphsink_storage_abstraction_sink_interface_skeleton \
             ./test/e2e/code-intelligence-REPO-SCANNER/...
-
-      - name: Tear down compose stack
-        if: always()
-        run: docker compose -f $COMPOSE_FILE down -v

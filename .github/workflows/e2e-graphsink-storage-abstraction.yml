@@ -302,6 +302,7 @@ jobs:
         working-directory: services/agent-memory
         env:
           AGENT_MEMORY_PG_URL: ${{ env.AGENT_MEMORY_PG_URL }}
+          CGO_ENABLED: "1"
         run: |
           go test -tags e2e -v -count=1 -timeout 180s \
             -run TestE2E_graphsink_storage_abstraction_backend_parity_golden_test \

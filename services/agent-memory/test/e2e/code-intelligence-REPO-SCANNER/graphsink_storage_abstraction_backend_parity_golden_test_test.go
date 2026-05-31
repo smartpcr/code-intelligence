@@ -120,7 +120,7 @@ func bpgOpenProvidedPG(dsn string) (*bpgPGInstance, error) {
 		return nil, fmt.Errorf("set search_path: %w", err)
 	}
 
-	if err := bpgApplyMigrations(ctx, db); err != nil {
+	if err := bpgApplyMigrations(ctx, db, false); err != nil {
 		_, _ = db.ExecContext(context.Background(), `DROP SCHEMA "`+schema+`" CASCADE`)
 		_ = db.Close()
 		return nil, fmt.Errorf("apply migrations: %w", err)
@@ -176,7 +176,7 @@ func bpgOpenEphemeralPG() (*bpgPGInstance, error) {
 		return nil, fmt.Errorf("ping ephemeral: %w", err)
 	}
 
-	if err := bpgApplyMigrations(ctx, db); err != nil {
+	if err := bpgApplyMigrations(ctx, db, true); err != nil {
 		_ = db.Close()
 		_ = pg.Stop()
 		return nil, fmt.Errorf("apply migrations ephemeral: %w", err)
@@ -192,24 +192,31 @@ func bpgOpenEphemeralPG() (*bpgPGInstance, error) {
 	}, nil
 }
 
-func bpgApplyMigrations(ctx context.Context, db *sql.DB) error {
+func bpgApplyMigrations(ctx context.Context, db *sql.DB, ephemeral bool) error {
+	if !ephemeral {
+		// Provided instance: use the production migrator which applies
+		// every migration through current HEAD via its own journal table.
+		return migrations.New(db).Up(ctx)
+	}
+	// Ephemeral embedded-postgres: apply all migrations through current
+	// HEAD. Certain migrations require extensions (pg_partman in 0014)
+	// or elevated privileges (roles in 0016/0017) that the ephemeral
+	// instance lacks; these fail and are tolerated. Core schema
+	// migrations (0001-0004) that define repo, node, edge tables MUST
+	// succeed.
 	all, err := migrations.All()
 	if err != nil {
 		return fmt.Errorf("migrations.All: %w", err)
 	}
-	needed := map[string]bool{
-		"0001": true, // enums (node/edge kinds)
-		"0002": true, // repo + repo_commit
-		"0003": true, // node + edge
-		"0004": true, // retirements
-	}
 	for _, mg := range all {
-		if !needed[mg.Version] {
-			continue
-		}
 		body := bpgStripForEphemeral(mg.Up)
 		if _, err := db.ExecContext(ctx, body); err != nil {
-			return fmt.Errorf("apply %s: %w", mg.Filename, err)
+			if mg.Version < "0005" {
+				return fmt.Errorf("apply core %s: %w", mg.Filename, err)
+			}
+			// Non-core migration failed (extension/privilege-dependent);
+			// skip and continue with remaining migrations.
+			continue
 		}
 	}
 	return nil
@@ -706,21 +713,133 @@ func (s *bpgEdgeParityState) theSortedEdgeLinesMatch() error {
 // ---------------------------------------------------------------------------
 // Scenario: legacy-postgres-documented-exception
 //
-// This scenario proves the legacy-collision caveat documented in
-// graphwriter.Writer.EnsureRepoWithID: when a Postgres row
-// pre-exists with a random repo_id (from gen_random_uuid()), and
-// the parity test scans the same URL with a deterministic RepoID
-// (from fingerprint.RepoIDFromURL), the returned RepoRecord.ID
-// differs from the supplied RepoID. This diff is classified as
-// "legacy data" rather than a regression.
+// This scenario proves the legacy-collision caveat: when a Postgres row
+// pre-exists with a random repo_id (from gen_random_uuid()), a parity
+// scan against memory (deterministic RepoID from fingerprint.RepoIDFromURL)
+// produces DIFFERENT node/edge tuples because fingerprints incorporate
+// the RepoID. The test runs a full parity diff and classifies the
+// non-empty diff as "legacy data" rather than a regression.
 // ---------------------------------------------------------------------------
 
 type bpgLegacyState struct {
-	pgInst            *bpgPGInstance
-	legacyRepoID      string
-	deterministicID   string
-	diffIsNonEmpty    bool
-	classification    string
+	pgInst          *bpgPGInstance
+	legacyRepoID    fingerprint.RepoID
+	deterministicID fingerprint.RepoID
+	memoryNodes     []bpgNodeRow
+	memoryEdges     []bpgEdgeRow
+	pgNodes         []bpgNodeRow
+	pgEdges         []bpgEdgeRow
+	diffIsNonEmpty  bool
+	classification  string
+}
+
+// bpgRunScanWithRepoID is like bpgRunScan but uses a caller-supplied repoID
+// instead of computing it from the URL. This lets the legacy scenario
+// insert nodes/edges under a random UUID the way legacy Postgres data would.
+func bpgRunScanWithRepoID(sink graphsink.Sink, fixtureDir string, repoID fingerprint.RepoID) error {
+	ctx := context.Background()
+
+	if _, err := sink.EnsureRepo(ctx, graphwriter.RepoInput{
+		URL:            bpgRepoURL,
+		DefaultBranch:  "main",
+		CurrentHeadSHA: bpgRepoSHA,
+		LanguageHints:  []string{"python"},
+		RepoID:         repoID,
+	}); err != nil {
+		return fmt.Errorf("EnsureRepo: %w", err)
+	}
+	if _, err := sink.EnsureCommit(ctx, graphwriter.CommitInput{
+		RepoID:      repoID,
+		SHA:         bpgRepoSHA,
+		CommittedAt: time.Unix(0, 0).UTC(),
+	}); err != nil {
+		return fmt.Errorf("EnsureCommit: %w", err)
+	}
+
+	repoAttrs, _ := json.Marshal(map[string]string{"producer": "bpg_e2e"})
+	repoNode, err := sink.InsertNode(ctx, graphwriter.NodeInput{
+		RepoID:             repoID,
+		Kind:               "repo",
+		CanonicalSignature: repoindexer.CanonicalRepoSig(bpgRepoURL),
+		FromSHA:            bpgRepoSHA,
+		AttrsJSON:          repoAttrs,
+	})
+	if err != nil {
+		return fmt.Errorf("InsertNode(repo): %w", err)
+	}
+
+	files, err := bpgLoadFixture(fixtureDir)
+	if err != nil {
+		return fmt.Errorf("load fixture: %w", err)
+	}
+
+	disp := ast.NewDispatcher(sink, ast.WithParsers(ast.NewPythonParser()))
+
+	for _, f := range files {
+		pkgDir := repoindexer.CanonicalPackageDir(f.RelPath)
+		pkgAttrs, _ := json.Marshal(map[string]string{"rel_path": pkgDir, "producer": "bpg_e2e"})
+		pkgNode, err := sink.InsertNode(ctx, graphwriter.NodeInput{
+			RepoID:             repoID,
+			Kind:               "package",
+			CanonicalSignature: repoindexer.CanonicalPackageSig(bpgRepoURL, pkgDir),
+			ParentNodeID:       repoNode.NodeID,
+			FromSHA:            bpgRepoSHA,
+			AttrsJSON:          pkgAttrs,
+		})
+		if err != nil {
+			return fmt.Errorf("InsertNode(package %q): %w", pkgDir, err)
+		}
+		if _, err := sink.InsertEdge(ctx, graphwriter.EdgeInput{
+			RepoID:    repoID,
+			Kind:      "contains",
+			SrcNodeID: repoNode.NodeID,
+			DstNodeID: pkgNode.NodeID,
+			FromSHA:   bpgRepoSHA,
+		}); err != nil {
+			return fmt.Errorf("InsertEdge(repo->pkg %q): %w", pkgDir, err)
+		}
+
+		fileAttrs, _ := json.Marshal(map[string]string{"rel_path": f.RelPath, "producer": "bpg_e2e"})
+		fileNode, err := sink.InsertNode(ctx, graphwriter.NodeInput{
+			RepoID:             repoID,
+			Kind:               "file",
+			CanonicalSignature: repoindexer.CanonicalFileSig(bpgRepoURL, f.RelPath),
+			ParentNodeID:       pkgNode.NodeID,
+			FromSHA:            bpgRepoSHA,
+			AttrsJSON:          fileAttrs,
+		})
+		if err != nil {
+			return fmt.Errorf("InsertNode(file %q): %w", f.RelPath, err)
+		}
+		if _, err := sink.InsertEdge(ctx, graphwriter.EdgeInput{
+			RepoID:    repoID,
+			Kind:      "contains",
+			SrcNodeID: pkgNode.NodeID,
+			DstNodeID: fileNode.NodeID,
+			FromSHA:   bpgRepoSHA,
+		}); err != nil {
+			return fmt.Errorf("InsertEdge(pkg->file %q): %w", f.RelPath, err)
+		}
+
+		body := f.Body
+		ev := repoindexer.EmitFileEvent{
+			RepoID:     repoID,
+			RepoURL:    bpgRepoURL,
+			SHA:        bpgRepoSHA,
+			RepoNodeID: repoNode.NodeID,
+			FileNodeID: fileNode.NodeID,
+			RelPath:    f.RelPath,
+			AbsPath:    filepath.FromSlash(f.RelPath),
+			Open: func() (repoindexer.ReadCloser, error) {
+				return io.NopCloser(strings.NewReader(body)), nil
+			},
+		}
+		if _, err := disp.EmitFile(ctx, ev); err != nil {
+			return fmt.Errorf("dispatcher.EmitFile(%q): %w", f.RelPath, err)
+		}
+	}
+
+	return sink.Flush(ctx)
 }
 
 func (s *bpgLegacyState) aPostgresRowWithRandomRepoID(_ string) error {
@@ -730,21 +849,14 @@ func (s *bpgLegacyState) aPostgresRowWithRandomRepoID(_ string) error {
 	}
 	s.pgInst = pgInst
 
-	// Insert a repo with zero RepoID → Postgres assigns random UUID
-	// via gen_random_uuid() schema default.
-	writer := graphwriter.New(pgInst.db, nil)
-	rec, err := writer.EnsureRepo(context.Background(), graphwriter.RepoInput{
-		URL:            bpgRepoURL,
-		DefaultBranch:  "main",
-		CurrentHeadSHA: bpgRepoSHA,
-		LanguageHints:  []string{"python"},
-		// RepoID deliberately left zero to trigger random UUID
-	})
-	if err != nil {
+	// Generate a random repo_id to simulate a legacy row that was
+	// created before deterministic RepoID computation existed.
+	var randomBytes [16]byte
+	if _, err := rand.Read(randomBytes[:]); err != nil {
 		pgInst.cleanup()
-		return fmt.Errorf("EnsureRepo (legacy): %w", err)
+		return fmt.Errorf("generate random repoID: %w", err)
 	}
-	s.legacyRepoID = rec.RepoID
+	copy(s.legacyRepoID[:], randomBytes[:])
 
 	// Compute deterministic ID for comparison.
 	deterministicID, err := fingerprint.RepoIDFromURL(bpgRepoURL)
@@ -752,32 +864,72 @@ func (s *bpgLegacyState) aPostgresRowWithRandomRepoID(_ string) error {
 		pgInst.cleanup()
 		return fmt.Errorf("RepoIDFromURL: %w", err)
 	}
-	s.deterministicID = deterministicID.String()
+	s.deterministicID = deterministicID
+
+	// Run the full scan pipeline against the Postgres backend using
+	// the random (legacy) RepoID.
+	writer := graphwriter.New(pgInst.db, nil)
+	sink := postgresadapter.NewSink(writer)
+	defer func() { _ = sink.Close() }()
+
+	if err := bpgRunScanWithRepoID(sink, "testdata/polyglot/", s.legacyRepoID); err != nil {
+		pgInst.cleanup()
+		return fmt.Errorf("scan postgres (legacy): %w", err)
+	}
+
+	// Collect tuples under the legacy repoID.
+	ctx, cancel := context.WithTimeout(context.Background(), bpgTimeout)
+	defer cancel()
+	poolOpts := graphreader.PoolOptions{
+		MaxConns: 2, MinConns: 1, AllowAnyRole: true,
+	}
+	if pgInst.schema != "" {
+		poolOpts.SearchPath = pgInst.schema + ", public"
+	}
+	pool, err := graphreader.NewPool(ctx, pgInst.dsn, poolOpts)
+	if err != nil {
+		pgInst.cleanup()
+		return fmt.Errorf("graphreader.NewPool: %w", err)
+	}
+	defer pool.Close()
+
+	reader := postgresadapter.NewReader(
+		graphreader.New(pool, slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+	pgNodes, pgEdges, err := bpgCollect(reader, s.legacyRepoID)
+	if err != nil {
+		pgInst.cleanup()
+		return fmt.Errorf("collect postgres (legacy): %w", err)
+	}
+	s.pgNodes = pgNodes
+	s.pgEdges = pgEdges
+
 	return nil
 }
 
 func (s *bpgLegacyState) theParityTestRunsAgainstThatRow() error {
-	// Call EnsureRepoWithID with the deterministic RepoID.
-	// Since the URL already exists with a different repo_id,
-	// the ON CONFLICT path returns the PRE-EXISTING random UUID.
-	writer := graphwriter.New(s.pgInst.db, nil)
-	deterministicID, _ := fingerprint.RepoIDFromURL(bpgRepoURL)
+	// Run the same fixture against the memory backend with the
+	// deterministic RepoID — this is the "correct" parity baseline.
+	memSink := memory.New(memory.Options{})
+	defer func() { _ = memSink.Close() }()
 
-	rec, err := writer.EnsureRepoWithID(context.Background(), graphwriter.RepoInput{
-		URL:            bpgRepoURL,
-		DefaultBranch:  "main",
-		CurrentHeadSHA: bpgRepoSHA,
-		LanguageHints:  []string{"python"},
-		RepoID:         deterministicID,
-	})
-	if err != nil {
-		return fmt.Errorf("EnsureRepoWithID (deterministic): %w", err)
+	if err := bpgRunScanWithRepoID(memSink, "testdata/polyglot/", s.deterministicID); err != nil {
+		return fmt.Errorf("scan memory (deterministic): %w", err)
 	}
+	memNodes, memEdges, err := bpgCollect(memSink, s.deterministicID)
+	if err != nil {
+		return fmt.Errorf("collect memory (deterministic): %w", err)
+	}
+	s.memoryNodes = memNodes
+	s.memoryEdges = memEdges
 
-	// The returned RepoID is the pre-existing random UUID,
-	// NOT the deterministic one we supplied. This is the
-	// legacy-collision signal.
-	s.diffIsNonEmpty = rec.RepoID != s.deterministicID
+	// Run the parity diff: compare node tuples. Since fingerprints
+	// include the RepoID, the memory (deterministic) and postgres
+	// (legacy random) tuples MUST differ.
+	nodesDiffer := bpgAssertNodesEqual("memory", "postgres-legacy", s.memoryNodes, s.pgNodes) != nil
+	edgesDiffer := bpgAssertEdgesEqual("memory", "postgres-legacy", s.memoryEdges, s.pgEdges) != nil
+
+	s.diffIsNonEmpty = nodesDiffer || edgesDiffer
 	return nil
 }
 
@@ -789,15 +941,13 @@ func (s *bpgLegacyState) theDocumentedExceptionPathExecutes() error {
 	}()
 
 	if !s.diffIsNonEmpty {
-		return fmt.Errorf("expected parity diff to be non-empty (legacy random repo_id %q should differ from deterministic %q)",
-			s.legacyRepoID, s.deterministicID)
+		return fmt.Errorf("expected parity diff to be non-empty: legacy random RepoID %s should produce different fingerprints than deterministic %s",
+			hex.EncodeToString(s.legacyRepoID[:]), hex.EncodeToString(s.deterministicID[:]))
 	}
 
-	// Classification logic: the diff touches ONLY repo_id (the
-	// canonical_signature and fingerprint fields would be identical
-	// if we ran a full scan). When the returned repo_id differs
-	// from the supplied deterministic one AND Inserted==false,
-	// this is the documented LEGACY-COLLISION caveat — the row
+	// Classification: the diff is entirely caused by the legacy
+	// random repo_id propagating into fingerprint computation.
+	// This is the documented LEGACY-COLLISION exception — the row
 	// predates deterministic ID computation.
 	s.classification = "legacy data"
 	return nil

@@ -111,7 +111,7 @@ steps:
 
   - script: |
       cd services/agent-memory
-      go test -tags e2e -v -count=1 -timeout 180s \
+      CGO_ENABLED=1 go test -tags e2e -v -count=1 -timeout 180s \
         -run TestE2E_graphsink_storage_abstraction_backend_parity_golden_test \
         ./test/e2e/code-intelligence-REPO-SCANNER/...
     displayName: "Run E2E scenarios — backend-parity-golden-test"

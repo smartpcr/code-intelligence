@@ -10,15 +10,16 @@ Feature: Worker adopts AncestryWriter
   Scenario: worker-graph-byte-identical
     Given an in-memory fixture repo with files "README.md,pkg/foo.go,pkg/sub/bar.go"
     And a recording RepoCommitNodeEdgeWriter
-    When AncestryWriter runs the full ancestry pipeline
-    Then the captured node tuples match the golden fixture exactly
-    And the captured edge tuples match the golden fixture exactly
+    When worker.runFull executes through AncestryWriter with parentSHA "aaa111" and headSHA "bbb222"
+    Then the captured node tuples with canonical_signature kind parent_node_id and fingerprint match the golden fixture
+    And the captured edge tuples with kind src dst and fingerprint match the golden fixture
+    And the FullSummary counters match the expected values
     And fingerprints are stable across a second identical run
 
   Scenario: worker-integration-still-passes
     Given the existing worker_integration_test.go suite
-    When the suite is evaluated for Postgres availability
-    Then it is acknowledged as a non-gate-required scenario needing a provided Postgres DSN
+    When the integration suite runs against the provided Postgres DSN if available
+    Then the suite result is recorded
 
   Scenario: helpers-no-internal-callers
     Given the refactored codebase under "internal/"

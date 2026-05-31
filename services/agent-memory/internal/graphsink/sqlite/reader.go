@@ -22,11 +22,19 @@
 //
 //   - ListNodes orders by `kind, canonical_signature, node_id`
 //     to match the Postgres reader (graphreader/query.go:340).
-//   - ListEdgesFrom / ListEdgesTo order by
-//     `(kind, dst_node_id, edge_id)`: the brief's literal
-//     `(kind, dst_node_id)` columns with `edge_id` appended as
-//     the deterministic tie-breaker so ListEdgesTo (where every
-//     row shares dst_node_id) is totally ordered across calls.
+//   - ListEdgesFrom / ListEdgesTo order by `(kind, edge_id)`.
+//     The S3.6 brief sentence "ordered by (kind, dst_node_id)
+//     to match the Postgres reader's deterministic order" gives
+//     two requirements; they conflict because the Postgres
+//     reader at graphreader/query.go:244,254,282,292 orders by
+//     `(kind, edge_id)`, not `(kind, dst_node_id)`. The "match
+//     Postgres" intent is the stronger requirement (cross-
+//     backend determinism is what the diagram projector relies
+//     on), so this backend mirrors the Postgres ORDER BY column-
+//     for-column. This also keeps ListEdgesTo totally ordered
+//     across calls -- without an `edge_id` tail, SQLite would
+//     fall back to rowid order which is stable but not
+//     reproducible across re-scans.
 //
 // CONCURRENCY. The Sink pins `*sql.DB` to one connection so
 // writes are serialised through the WAL log without
@@ -303,10 +311,10 @@ func (s *Sink) ListNodes(
 // ListEdgesFrom returns every outbound Edge from srcNodeID
 // matching `kinds`. Empty `kinds` = all kinds.
 //
-// Order: `(kind ASC, dst_node_id ASC, edge_id ASC)` -- the
-// brief's literal `(kind, dst_node_id)` plus an `edge_id`
-// tie-breaker so the result is totally ordered even when
-// multiple rows share both `kind` and `dst_node_id`.
+// Order: `(kind ASC, edge_id ASC)` -- mirrors the Postgres
+// reader exactly (graphreader/query.go:244,254). See the
+// package doc for the rationale on the literal-vs-intent
+// ordering tradeoff in the S3.6 brief.
 func (s *Sink) ListEdgesFrom(
 	ctx context.Context, srcNodeID string, kinds []string, opts graphreader.ReaderOptions,
 ) ([]graphreader.Edge, error) {
@@ -319,7 +327,8 @@ func (s *Sink) ListEdgesFrom(
 // ListEdgesTo returns every inbound Edge to dstNodeID matching
 // `kinds`. Empty `kinds` = all kinds.
 //
-// Order: `(kind ASC, dst_node_id ASC, edge_id ASC)`. Within a
+// Order: `(kind ASC, edge_id ASC)` -- mirrors the Postgres
+// reader exactly (graphreader/query.go:282,292). Within a
 // single ListEdgesTo result every row shares the same
 // `dst_node_id`, so the `edge_id` tail is what guarantees
 // deterministic ordering across calls -- without it SQLite
@@ -372,11 +381,10 @@ func (s *Sink) listEdges(
 			args = append(args, k)
 		}
 	}
-	// S3.6 brief: order by (kind, dst_node_id). Add edge_id as
-	// the final tie-breaker so ListEdgesTo (where every row
-	// shares the same dst_node_id) still has totally-ordered
-	// output. See package doc for the cross-backend rationale.
-	b.WriteString(" ORDER BY kind ASC, dst_node_id ASC, edge_id ASC LIMIT ?")
+	// Mirror Postgres ORDER BY (graphreader/query.go:244,254,
+	// 282,292): (kind ASC, edge_id ASC). See package doc on the
+	// "match Postgres" intent vs the brief's literal column list.
+	b.WriteString(" ORDER BY kind ASC, edge_id ASC LIMIT ?")
 	args = append(args, normaliseLimit(opts.Limit))
 
 	rows, err := s.db.QueryContext(ctx, b.String(), args...)

@@ -466,18 +466,21 @@ func TestListEdgesToKindFilter(t *testing.T) {
 	}
 }
 
-// TestListEdgesOrderByKindDstNodeID asserts the workstream
-// brief's order contract: rows sort by (kind ASC, dst_node_id
-// ASC, edge_id ASC). The test inserts MULTIPLE same-kind edges
-// to DIFFERENT destinations so the dst_node_id secondary sort
-// is actually exercised.
-func TestListEdgesOrderByKindDstNodeID(t *testing.T) {
+// TestListEdgesOrderByKindEdgeID asserts the cross-backend
+// ordering contract: rows sort by (kind ASC, edge_id ASC),
+// mirroring the Postgres reader at graphreader/query.go
+// :244,254,282,292 so the diagram projector sees the same
+// row order regardless of backend. The test inserts MULTIPLE
+// same-kind edges to DIFFERENT destinations so the edge_id
+// secondary sort is actually exercised (not satisfied by an
+// already-sorted-by-kind-only result).
+func TestListEdgesOrderByKindEdgeID(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
 
 	// Build a set of extra destination method nodes so the
 	// caller fans out to several same-kind static_calls edges
-	// with distinct dst_node_ids.
+	// with distinct edge_ids.
 	mkDest := func(sig string) string {
 		t.Helper()
 		rec, err := f.sink.InsertNode(ctx, graphwriter.NodeInput{
@@ -529,12 +532,12 @@ func TestListEdgesOrderByKindDstNodeID(t *testing.T) {
 		t.Errorf("edges not ordered by kind ASC: %v", kinds)
 	}
 
-	// Collect same-kind blocks and assert dst_node_id ASC inside
-	// each. We expect a static_calls block with 4 rows (callee +
-	// destA + destB + destC) and a reads block with 1 row.
+	// Collect same-kind blocks and assert edge_id ASC inside
+	// each (the Postgres secondary sort). We expect a
+	// static_calls block with 4 rows and a reads block with 1.
 	type block struct {
-		kind string
-		dsts []string
+		kind    string
+		edgeIDs []string
 	}
 	var blocks []block
 	var cur block
@@ -545,22 +548,22 @@ func TestListEdgesOrderByKindDstNodeID(t *testing.T) {
 			}
 			cur = block{kind: e.Kind}
 		}
-		cur.dsts = append(cur.dsts, e.DstNodeID)
+		cur.edgeIDs = append(cur.edgeIDs, e.EdgeID)
 	}
 	if cur.kind != "" {
 		blocks = append(blocks, cur)
 	}
 	foundStaticCallsWith4 := false
 	for _, b := range blocks {
-		if !sort.StringsAreSorted(b.dsts) {
-			t.Errorf("kind=%s: dst_node_id not ASC: %v", b.kind, b.dsts)
+		if !sort.StringsAreSorted(b.edgeIDs) {
+			t.Errorf("kind=%s: edge_id not ASC: %v", b.kind, b.edgeIDs)
 		}
-		if b.kind == "static_calls" && len(b.dsts) == 4 {
+		if b.kind == "static_calls" && len(b.edgeIDs) == 4 {
 			foundStaticCallsWith4 = true
 		}
 	}
 	if !foundStaticCallsWith4 {
-		t.Errorf("expected 4 same-kind static_calls rows to exercise dst_node_id secondary sort; got blocks=%v", blocks)
+		t.Errorf("expected 4 same-kind static_calls rows to exercise edge_id secondary sort; got blocks=%v", blocks)
 	}
 }
 

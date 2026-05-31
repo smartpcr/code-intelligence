@@ -508,15 +508,5 @@ func TestE2E_pipeline_parse_and_recipe_fanout(t *testing.T) {
 	}
 }
 
-// requireEnv skips the test when the named environment variable is unset.
-func requireEnv_pipeline_parse_and_recipe_fanout(t *testing.T, name string) string {
-	t.Helper()
-	v := os.Getenv(name)
-	if v == "" {
-		t.Skipf("env %q not set", name)
-	}
-	return v
-}
-
 // Ensure uuid import is used (the type appears in orchestrator.Result.ScopeIDs key comparisons).
 var _ = uuid.Nil

@@ -283,7 +283,6 @@ jobs:
           --health-retries 10
           --health-start-period 10s
     env:
-      COMPOSE_FILE: tests/e2e/phase-3-graphsink-storage-abstraction/docker-compose.yml
       AGENT_MEMORY_PG_URL: "postgres://agent_memory:agent_memory@localhost:5432/agent_memory?sslmode=disable"
       CGO_ENABLED: "1"
     steps:

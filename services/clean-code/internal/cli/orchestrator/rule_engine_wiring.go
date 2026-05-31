@@ -16,6 +16,7 @@ import (
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/scopebinding"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/metrics/recipes"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/dsl"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
 )
 
@@ -155,51 +156,33 @@ func MintSampleID(repoID uuid.UUID, headSHA string, scopeID uuid.UUID, metricKin
 // pipeline cannot discover the wiring bug after the fact.
 var ErrLoadStoreNilSamples = fmt.Errorf("orchestrator: LoadStore: samples slice is nil (wiring bug); cleanc exits 70 before engine invocation")
 
-// loadStore is the brief-shape helper the workstream pins:
-//
-//	loadStore(bundle devpolicy.Bundle, samples []rule_engine.Sample) *rule_engine.InMemoryStore
-//
-// It seeds a fresh [rule_engine.InMemoryStore] with
-// `architecture.md` Sec 3.4 steps 1 and 2 -- one
-// [rule_engine.InMemoryStore.InsertPolicyVersion] call for
-// `bundle.PolicyVersion` and one
-// [rule_engine.InMemoryStore.InsertRule] per entry in
-// `bundle.Rules`. It returns the store unconditionally
-// (the underlying constructor and Insert* methods are void;
-// they cannot fail).
-//
-// Step 3 (`store.InsertSamples(repoID, sha, samples)`)
-// requires a [repocontext.RepoContext] for the
-// `(repoID, sha)` coordinates and so cannot be performed
-// inside this signature -- callers either invoke
-// [LoadStore] (which wraps `loadStore` and adds step 3 with
-// the nil-samples precondition guard) or invoke
-// `store.InsertSamples` themselves. The `samples` argument
-// is accepted here to honor the brief literally; the
-// returned store does NOT yet contain those samples.
-//
-// A nil `samples` argument is accepted by this helper
-// (callers that want the wiring-bug guard MUST go through
-// [LoadStore] instead). An empty (zero-length) slice is
-// also valid and reflects a clean repo with no metric
-// drafts -- the policy and rules are still seeded so the
-// engine can `RunBatch` and emit zero findings.
-func loadStore(bundle devpolicy.Bundle, samples []rule_engine.Sample) *rule_engine.InMemoryStore {
-	_ = samples // accepted for brief-contract parity; see godoc.
+// StoreSeeder abstracts the void seed methods on
+// [rule_engine.InMemoryStore] so that e2e test doubles can
+// intercept [StoreSeeder.InsertSamples] calls and verify
+// the batch-insert calling pattern. [rule_engine.InMemoryStore]
+// satisfies this interface implicitly.
+type StoreSeeder interface {
+	InsertPolicyVersion(steward.PolicyVersion)
+	InsertRule(steward.Rule)
+	InsertSamples(uuid.UUID, string, []rule_engine.Sample)
+}
 
-	store := rule_engine.NewInMemoryStore()
-
-	// Sec 3.4 step 1: register the policy version.
+// SeedStore populates store with the policy version, rules,
+// and metric samples from bundle. It is the seeding logic
+// extracted from [LoadStore], exported to allow test doubles
+// that verify the InsertSamples calling pattern (exactly one
+// batch call, never per-row).
+//
+// The seed sequence follows architecture Sec 3.4 steps 1-3:
+//  1. One [StoreSeeder.InsertPolicyVersion] call.
+//  2. One [StoreSeeder.InsertRule] per bundle rule.
+//  3. One [StoreSeeder.InsertSamples] with the full batch.
+func SeedStore(store StoreSeeder, bundle devpolicy.Bundle, samples []rule_engine.Sample, repoCtx repocontext.RepoContext) {
 	store.InsertPolicyVersion(bundle.PolicyVersion)
-
-	// Sec 3.4 step 2: register every rule the bundle's
-	// YAML loader emitted. One InsertRule call per entry
-	// per the workstream brief.
 	for _, r := range bundle.Rules {
 		store.InsertRule(r)
 	}
-
-	return store
+	store.InsertSamples(repoCtx.RepoID, repoCtx.HeadSHA, samples)
 }
 
 // LoadStore builds a [rule_engine.InMemoryStore] seeded
@@ -230,7 +213,7 @@ func LoadStore(bundle devpolicy.Bundle, samples []rule_engine.Sample, repoCtx re
 		return nil, ErrLoadStoreNilSamples
 	}
 
-	store := loadStore(bundle, samples)
+	store := rule_engine.NewInMemoryStore()
 	if store == nil {
 		// Defensive: NewInMemoryStore is documented as
 		// always returning a non-nil value, but the
@@ -241,13 +224,10 @@ func LoadStore(bundle devpolicy.Bundle, samples []rule_engine.Sample, repoCtx re
 		return nil, fmt.Errorf("orchestrator: LoadStore: rule_engine.NewInMemoryStore returned nil")
 	}
 
-	// Sec 3.4 step 3: seed the measurement mirror with the
-	// CLI-synthesised samples. The canonical plural /
-	// batched API at inmem_store.go:146-151 returns no
-	// value -- the nil-samples guard above is the only
-	// pre-flight check that can reject a wiring bug
-	// without a panic.
-	store.InsertSamples(repoCtx.RepoID, repoCtx.HeadSHA, samples)
+	// Delegate seeding to SeedStore which performs
+	// architecture Sec 3.4 steps 1-3 (policy, rules,
+	// samples) through the StoreSeeder interface.
+	SeedStore(store, bundle, samples, repoCtx)
 
 	return store, nil
 }

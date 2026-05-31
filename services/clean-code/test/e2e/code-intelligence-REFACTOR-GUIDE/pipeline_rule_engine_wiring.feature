@@ -24,13 +24,12 @@ Feature: Rule engine wiring
     Given a dev-mode bundle with rule "solid.srp.loc_high" predicate "metric_kind == 'loc' AND value >= 1500" severity "block"
     And 3 metric samples for different scopes
     And a spy store recording InsertSamples calls
-    When the engine stage loads and runs with the spy store
+    When the orchestrator seeds the store with the samples
     Then InsertSamples was called exactly 1 time with 3 samples
 
   Scenario: engine error surfaces
     Given a dev-mode bundle with rule "solid.srp.loc_high" predicate "metric_kind == 'loc' AND value >= 1500" severity "block"
     And a metric sample for scope "BigClass" kind "class" metric "loc" value 2000
-    And a store whose AppendEvaluation returns error "injected append failure"
-    When the engine stage runs as the composition root with the failing store
+    When the engine stage binary runs with AppendEvaluation error "injected append failure"
     Then exit code is 70
     And stderr contains "injected append failure"

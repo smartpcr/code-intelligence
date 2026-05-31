@@ -12,23 +12,16 @@ import (
 	"github.com/gofrs/uuid"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/devpolicy"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/repocontext"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
 )
 
-// TestLoadStoreHelper_BriefSignatureSeedsPolicyAndRules
-// pins the brief-shape contract:
-//
-//	loadStore(bundle devpolicy.Bundle, samples []rule_engine.Sample) *rule_engine.InMemoryStore
-//
-// Steps 1 and 2 from `architecture.md` Sec 3.4 (policy
-// version + rules) MUST be observable on the returned
-// store. Step 3 (samples insertion) is intentionally
-// deferred to the exported [LoadStore] wrapper because it
-// requires `repoCtx` for the `(repoID, sha)` coordinates,
-// so this test only asserts that `samples` is accepted
-// (not lost) and that the seeding side-effects happened.
-func TestLoadStoreHelper_BriefSignatureSeedsPolicyAndRules(t *testing.T) {
+// TestSeedStore_SeedsPolicyRulesAndSamples pins the Sec 3.4
+// contract: SeedStore must insert the policy version (step 1),
+// every rule (step 2), and the full sample batch (step 3) into
+// the provided StoreSeeder.
+func TestSeedStore_SeedsPolicyRulesAndSamples(t *testing.T) {
 	t.Parallel()
 
 	pvID := uuid.Must(uuid.FromString("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"))
@@ -42,13 +35,18 @@ func TestLoadStoreHelper_BriefSignatureSeedsPolicyAndRules(t *testing.T) {
 			{RuleID: "r.two", Version: 2, PackID: "base", PredicateDSL: "metric_kind == 'loc' AND value >= 2", SeverityDefault: steward.SeverityWarn},
 		},
 	}
-
-	// Brief-shape call: no repoCtx, no error return.
-	var fn func(devpolicy.Bundle, []rule_engine.Sample) *rule_engine.InMemoryStore = loadStore
-	store := fn(bundle, nil)
-	if store == nil {
-		t.Fatalf("loadStore returned nil store")
+	repoCtx := repocontext.RepoContext{
+		RootPath: "/tmp/test-seed-store",
+		RepoID:   uuid.Must(uuid.FromString("11111111-1111-4111-8111-111111111111")),
+		HeadSHA:  "abcdef1234567890abcdef1234567890abcdef12",
 	}
+
+	store := rule_engine.NewInMemoryStore()
+	if store == nil {
+		t.Fatalf("NewInMemoryStore returned nil store")
+	}
+
+	SeedStore(store, bundle, nil, repoCtx)
 
 	if _, err := store.GetPolicyVersion(t.Context(), pvID); err != nil {
 		t.Errorf("GetPolicyVersion: %v", err)
@@ -60,13 +58,10 @@ func TestLoadStoreHelper_BriefSignatureSeedsPolicyAndRules(t *testing.T) {
 		t.Errorf("GetRule(r.two, 2): %v", err)
 	}
 
-	// Accepts non-nil empty and non-empty `samples` too --
-	// the helper must not panic on either shape, even
-	// though it does not insert them itself.
-	if got := loadStore(bundle, []rule_engine.Sample{}); got == nil {
-		t.Errorf("loadStore(bundle, []) returned nil store")
-	}
-	if got := loadStore(bundle, []rule_engine.Sample{{ScopeSignature: "x"}}); got == nil {
-		t.Errorf("loadStore(bundle, [{...}]) returned nil store")
-	}
+	// Accepts empty and non-empty sample slices without panicking.
+	store2 := rule_engine.NewInMemoryStore()
+	SeedStore(store2, bundle, []rule_engine.Sample{}, repoCtx)
+
+	store3 := rule_engine.NewInMemoryStore()
+	SeedStore(store3, bundle, []rule_engine.Sample{{ScopeSignature: "x"}}, repoCtx)
 }

@@ -332,9 +332,16 @@ func TestBuildModuleDiagram_TreeShape(t *testing.T) {
 }
 
 // TestBuildModuleDiagram_ImportsRollupWeight covers the
-// implementation-plan scenario `imports-rollup-weight`: 3 files
-// in pkg/a each import 2 files in pkg/b yields exactly one
-// `imports` edge pkg:a -> pkg:b with weight=6.
+// implementation-plan scenario `imports-rollup-weight` using
+// the ACTUAL graph shape the AST dispatcher produces: 3 files
+// in pkg/a each import 2 distinct external packages registered
+// under the repo as their own `package` Nodes (mirroring
+// `services/agent-memory/internal/repoindexer/ast/dispatcher.go`'s
+// imports pass, which emits `imports` Edges with
+// `SrcNodeID=<file>`, `DstNodeID=<package>`). Because the 3
+// source files all import the SAME pair of dst packages, the
+// roll-up yields exactly TWO pkg -> pkg edges, each with
+// weight=3.
 func TestBuildModuleDiagram_ImportsRollupWeight(t *testing.T) {
 	restore := fixedTime(t)
 	defer restore()
@@ -346,12 +353,21 @@ func TestBuildModuleDiagram_ImportsRollupWeight(t *testing.T) {
 	nodes := []graphreader.Node{
 		{NodeID: repoNodeID, RepoID: repoIDStr, Kind: "repo",
 			CanonicalSignature: "https://example.com/example/rollup::repo"},
+		// First-party source package.
 		{NodeID: "node-pkg-a", RepoID: repoIDStr, Kind: "package",
-			CanonicalSignature: "rollup/pkg/a", ParentNodeID: repoNodeID},
-		{NodeID: "node-pkg-b", RepoID: repoIDStr, Kind: "package",
-			CanonicalSignature: "rollup/pkg/b", ParentNodeID: repoNodeID},
+			CanonicalSignature: "https://example.com/example/rollup::package::rollup/pkg/a",
+			ParentNodeID:       repoNodeID},
+		// External / imported packages registered under the
+		// repo by the dispatcher's `insertNode(kind=package)` on
+		// each non-relative import (lines 407-414 of dispatcher.go).
+		{NodeID: "node-pkg-fmt", RepoID: repoIDStr, Kind: "package",
+			CanonicalSignature: "https://example.com/example/rollup::package::fmt",
+			ParentNodeID:       repoNodeID},
+		{NodeID: "node-pkg-log", RepoID: repoIDStr, Kind: "package",
+			CanonicalSignature: "https://example.com/example/rollup::package::log",
+			ParentNodeID:       repoNodeID},
 	}
-	// 3 files in pkg/a, 2 files in pkg/b
+	// 3 files in pkg/a.
 	for i := 1; i <= 3; i++ {
 		nodes = append(nodes, graphreader.Node{
 			NodeID: fmt.Sprintf("node-file-a%d", i),
@@ -360,25 +376,18 @@ func TestBuildModuleDiagram_ImportsRollupWeight(t *testing.T) {
 			ParentNodeID:       "node-pkg-a",
 		})
 	}
-	for i := 1; i <= 2; i++ {
-		nodes = append(nodes, graphreader.Node{
-			NodeID: fmt.Sprintf("node-file-b%d", i),
-			RepoID: repoIDStr, Kind: "file",
-			CanonicalSignature: fmt.Sprintf("rollup/pkg/b/f%d.go", i),
-			ParentNodeID:       "node-pkg-b",
-		})
-	}
 
-	// 3 * 2 = 6 imports edges (file a_i -> file b_j).
+	// Each of the 3 files emits 2 imports edges with
+	// DstNodeID = package node id (dispatcher shape).
 	var edges []graphreader.Edge
 	for i := 1; i <= 3; i++ {
-		for j := 1; j <= 2; j++ {
+		for _, dstPkg := range []string{"node-pkg-fmt", "node-pkg-log"} {
 			edges = append(edges, graphreader.Edge{
-				EdgeID:    fmt.Sprintf("e-a%d-b%d", i, j),
+				EdgeID:    fmt.Sprintf("e-a%d-%s", i, dstPkg),
 				RepoID:    repoIDStr,
 				Kind:      "imports",
 				SrcNodeID: fmt.Sprintf("node-file-a%d", i),
-				DstNodeID: fmt.Sprintf("node-file-b%d", j),
+				DstNodeID: dstPkg,
 			})
 		}
 	}
@@ -394,7 +403,104 @@ func TestBuildModuleDiagram_ImportsRollupWeight(t *testing.T) {
 		t.Fatalf("BuildModuleDiagram: %v", err)
 	}
 
-	// Exactly ONE imports edge: pkg:a -> pkg:b with weight=6.
+	// Two distinct (src_pkg, dst_pkg) pairs => two imports edges,
+	// each with weight=3 (one contribution from each of the 3
+	// source files).
+	var importsEdges []Edge
+	for _, e := range d.Edges {
+		if e.Kind == "imports" {
+			importsEdges = append(importsEdges, e)
+		}
+	}
+	if len(importsEdges) != 2 {
+		t.Fatalf("expected exactly 2 rolled-up imports edges (a->fmt, a->log), got %d: %+v",
+			len(importsEdges), importsEdges)
+	}
+
+	srcSyn := "pkg:https://example.com/example/rollup::package::rollup/pkg/a"
+	wantPairs := map[string]int{
+		srcSyn + "->" + "pkg:https://example.com/example/rollup::package::fmt": 3,
+		srcSyn + "->" + "pkg:https://example.com/example/rollup::package::log": 3,
+	}
+	gotPairs := make(map[string]int)
+	for _, e := range importsEdges {
+		gotPairs[e.From+"->"+e.To] = e.Weight
+		if e.Label != "imports" {
+			t.Errorf("imports edge label = %q, want %q", e.Label, "imports")
+		}
+	}
+	for want, weight := range wantPairs {
+		got, ok := gotPairs[want]
+		if !ok {
+			t.Errorf("missing rolled-up imports edge %s; got pairs=%v", want, gotPairs)
+			continue
+		}
+		if got != weight {
+			t.Errorf("edge %s weight = %d, want %d", want, got, weight)
+		}
+	}
+}
+
+// TestBuildModuleDiagram_ImportsRollupSingleEdgeFullWeight pins
+// the original implementation-plan scenario wording -- "3 files
+// in pkg/a each import 2 files in pkg/b yields exactly one
+// edge with weight=6" -- by giving every importing file the
+// SAME destination package, so all 3*2=6 import statements
+// collapse onto one (src_pkg, dst_pkg) pair.
+func TestBuildModuleDiagram_ImportsRollupSingleEdgeFullWeight(t *testing.T) {
+	restore := fixedTime(t)
+	defer restore()
+
+	repoID, summary := newFixtureRepo(t, "https://example.com/example/rollup6")
+	repoIDStr := repoID.String()
+	const repoNodeID = "node-repo"
+
+	nodes := []graphreader.Node{
+		{NodeID: repoNodeID, RepoID: repoIDStr, Kind: "repo",
+			CanonicalSignature: "https://example.com/example/rollup6::repo"},
+		{NodeID: "node-pkg-a", RepoID: repoIDStr, Kind: "package",
+			CanonicalSignature: "https://example.com/example/rollup6::package::pkg/a",
+			ParentNodeID:       repoNodeID},
+		{NodeID: "node-pkg-b", RepoID: repoIDStr, Kind: "package",
+			CanonicalSignature: "https://example.com/example/rollup6::package::pkg/b",
+			ParentNodeID:       repoNodeID},
+	}
+	for i := 1; i <= 3; i++ {
+		nodes = append(nodes, graphreader.Node{
+			NodeID: fmt.Sprintf("node-file-a%d", i),
+			RepoID: repoIDStr, Kind: "file",
+			CanonicalSignature: fmt.Sprintf("pkg/a/f%d.go", i),
+			ParentNodeID:       "node-pkg-a",
+		})
+	}
+	// 2 imports per file, BOTH targeting pkg-b (so 3*2=6
+	// edges all collapse onto one (a, b) pair after roll-up).
+	// We emit two distinct edge rows per file so the projector
+	// has to count each one rather than deduping at the source.
+	var edges []graphreader.Edge
+	for i := 1; i <= 3; i++ {
+		for j := 1; j <= 2; j++ {
+			edges = append(edges, graphreader.Edge{
+				EdgeID:    fmt.Sprintf("e-a%d-b-%d", i, j),
+				RepoID:    repoIDStr,
+				Kind:      "imports",
+				SrcNodeID: fmt.Sprintf("node-file-a%d", i),
+				DstNodeID: "node-pkg-b",
+			})
+		}
+	}
+
+	f := &fakeReader{
+		repos: []graphreader.RepoSummary{summary},
+		nodes: nodes,
+		edges: edges,
+	}
+
+	d, err := BuildModuleDiagram(context.Background(), f, repoID, GranularityPackage)
+	if err != nil {
+		t.Fatalf("BuildModuleDiagram: %v", err)
+	}
+
 	var importsEdges []Edge
 	for _, e := range d.Edges {
 		if e.Kind == "imports" {
@@ -405,25 +511,25 @@ func TestBuildModuleDiagram_ImportsRollupWeight(t *testing.T) {
 		t.Fatalf("expected exactly 1 rolled-up imports edge, got %d: %+v",
 			len(importsEdges), importsEdges)
 	}
-	got := importsEdges[0]
-	wantFrom := "pkg:rollup/pkg/a"
-	wantTo := "pkg:rollup/pkg/b"
-	if got.From != wantFrom || got.To != wantTo {
-		t.Errorf("imports edge endpoints = %s -> %s, want %s -> %s",
-			got.From, got.To, wantFrom, wantTo)
+	if importsEdges[0].Weight != 6 {
+		t.Errorf("imports edge weight = %d, want 6", importsEdges[0].Weight)
 	}
-	if got.Weight != 6 {
-		t.Errorf("imports edge weight = %d, want 6", got.Weight)
-	}
-	if got.Label != "imports" {
-		t.Errorf("imports edge label = %q, want %q", got.Label, "imports")
+	wantFrom := "pkg:https://example.com/example/rollup6::package::pkg/a"
+	wantTo := "pkg:https://example.com/example/rollup6::package::pkg/b"
+	if importsEdges[0].From != wantFrom || importsEdges[0].To != wantTo {
+		t.Errorf("imports edge = %s -> %s, want %s -> %s",
+			importsEdges[0].From, importsEdges[0].To, wantFrom, wantTo)
 	}
 }
 
 // TestBuildModuleDiagram_GranularityFile covers the
 // implementation-plan scenario `granularity-file`: same fixture,
 // granularity="file" surfaces file Nodes AND preserves per-file
-// imports edges (NOT rolled up).
+// imports edges (NOT rolled up). The fixture uses the
+// dispatcher's actual file -> package imports shape; the
+// projector rewrites each edge's destination to the synthetic
+// `pkg:<canonical_signature>` id so the endpoint resolves to a
+// Node present in the envelope.
 func TestBuildModuleDiagram_GranularityFile(t *testing.T) {
 	restore := fixedTime(t)
 	defer restore()
@@ -436,35 +542,32 @@ func TestBuildModuleDiagram_GranularityFile(t *testing.T) {
 		{NodeID: repoNodeID, RepoID: repoIDStr, Kind: "repo",
 			CanonicalSignature: "https://example.com/example/rollup::repo"},
 		{NodeID: "node-pkg-a", RepoID: repoIDStr, Kind: "package",
-			CanonicalSignature: "rollup/pkg/a", ParentNodeID: repoNodeID},
-		{NodeID: "node-pkg-b", RepoID: repoIDStr, Kind: "package",
-			CanonicalSignature: "rollup/pkg/b", ParentNodeID: repoNodeID},
+			CanonicalSignature: "https://example.com/example/rollup::package::pkg/a",
+			ParentNodeID:       repoNodeID},
+		{NodeID: "node-pkg-fmt", RepoID: repoIDStr, Kind: "package",
+			CanonicalSignature: "https://example.com/example/rollup::package::fmt",
+			ParentNodeID:       repoNodeID},
+		{NodeID: "node-pkg-log", RepoID: repoIDStr, Kind: "package",
+			CanonicalSignature: "https://example.com/example/rollup::package::log",
+			ParentNodeID:       repoNodeID},
 	}
 	for i := 1; i <= 3; i++ {
 		nodes = append(nodes, graphreader.Node{
 			NodeID: fmt.Sprintf("node-file-a%d", i),
 			RepoID: repoIDStr, Kind: "file",
-			CanonicalSignature: fmt.Sprintf("rollup/pkg/a/f%d.go", i),
+			CanonicalSignature: fmt.Sprintf("pkg/a/f%d.go", i),
 			ParentNodeID:       "node-pkg-a",
-		})
-	}
-	for i := 1; i <= 2; i++ {
-		nodes = append(nodes, graphreader.Node{
-			NodeID: fmt.Sprintf("node-file-b%d", i),
-			RepoID: repoIDStr, Kind: "file",
-			CanonicalSignature: fmt.Sprintf("rollup/pkg/b/f%d.go", i),
-			ParentNodeID:       "node-pkg-b",
 		})
 	}
 	var edges []graphreader.Edge
 	for i := 1; i <= 3; i++ {
-		for j := 1; j <= 2; j++ {
+		for _, dst := range []string{"node-pkg-fmt", "node-pkg-log"} {
 			edges = append(edges, graphreader.Edge{
-				EdgeID:    fmt.Sprintf("e-a%d-b%d", i, j),
+				EdgeID:    fmt.Sprintf("e-a%d-%s", i, dst),
 				RepoID:    repoIDStr,
 				Kind:      "imports",
 				SrcNodeID: fmt.Sprintf("node-file-a%d", i),
-				DstNodeID: fmt.Sprintf("node-file-b%d", j),
+				DstNodeID: dst,
 			})
 		}
 	}
@@ -486,21 +589,24 @@ func TestBuildModuleDiagram_GranularityFile(t *testing.T) {
 		t.Errorf("LayoutHint = %q, want %q", d.LayoutHint, LayoutHierarchicalTopDown)
 	}
 
-	// File Nodes MUST appear in the diagram.
+	// File Nodes MUST appear in the diagram (3 source files).
 	var fileNodeCount int
 	for _, n := range d.Nodes {
 		if n.Kind == "file" {
 			fileNodeCount++
 		}
 	}
-	if fileNodeCount != 5 {
-		t.Errorf("file-Node count = %d, want 5 (3 in pkg/a + 2 in pkg/b)", fileNodeCount)
+	if fileNodeCount != 3 {
+		t.Errorf("file-Node count = %d, want 3", fileNodeCount)
 	}
 
-	// Imports edges MUST be preserved per-file (file -> file), NOT
-	// rolled up to pkg -> pkg. Expect exactly 6 imports edges,
-	// each weight 1, and each referencing its original file
-	// endpoints.
+	// Imports edges MUST be preserved per-file (NOT rolled up):
+	// 3 files * 2 imports = 6 edges, each weight=1, dst pointing
+	// at the synthetic `pkg:` id present in the diagram.
+	pkgSyns := map[string]bool{
+		"pkg:https://example.com/example/rollup::package::fmt": true,
+		"pkg:https://example.com/example/rollup::package::log": true,
+	}
 	importsEdges := 0
 	for _, e := range d.Edges {
 		if e.Kind != "imports" {
@@ -510,17 +616,23 @@ func TestBuildModuleDiagram_GranularityFile(t *testing.T) {
 		if e.Weight != 1 {
 			t.Errorf("per-file imports edge weight = %d, want 1: %+v", e.Weight, e)
 		}
-		if strings.HasPrefix(e.From, "pkg:") || strings.HasPrefix(e.To, "pkg:") {
-			t.Errorf("file-granularity edge wired to a pkg-synthetic id (roll-up leaked): %+v", e)
+		if !pkgSyns[e.To] {
+			t.Errorf("file-granularity imports edge dst = %q, want one of %v: %+v",
+				e.To, pkgSyns, e)
+		}
+		if e.From == "" {
+			t.Errorf("file-granularity imports edge missing src: %+v", e)
 		}
 	}
 	if importsEdges != 6 {
 		t.Errorf("imports-edge count at granularity=file = %d, want 6", importsEdges)
 	}
 
-	// Contains edges: 2 (repo -> pkg) + 5 (pkg -> file) = 7.
-	if got := countByKind(d.Edges)["contains"]; got != 7 {
-		t.Errorf("contains-edge count = %d, want 7 (repo->pkg + pkg->file)", got)
+	// Contains edges: 3 (repo -> pkg) + 3 (pkg-a -> 3 files) = 6.
+	// External packages (pkg-fmt, pkg-log) are NOT given file
+	// children, so the only pkg->file edges come from pkg-a.
+	if got := countByKind(d.Edges)["contains"]; got != 6 {
+		t.Errorf("contains-edge count = %d, want 6 (repo->pkg*3 + pkg-a->file*3)", got)
 	}
 }
 

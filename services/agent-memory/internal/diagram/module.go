@@ -276,15 +276,48 @@ func BuildModuleDiagram(
 
 	// 7. Imports.
 	//
-	// At granularity=package we roll file -> file imports up to
-	// pkg -> pkg with a weight count and dedupe-by-(src, dst).
-	// Intra-package edges (a file in pkg A importing another
-	// file in pkg A) are suppressed -- they are noise on a
-	// component-level diagram.
+	// The AST dispatcher emits one `imports` Edge per import
+	// statement with `SrcNodeID = <file>` and
+	// `DstNodeID = <package>` -- the package Node is registered
+	// under the same repo with canonical_signature
+	// `<repoURL>::package::<module>` (see
+	// `services/agent-memory/internal/repoindexer/ast/dispatcher.go`
+	// imports pass, ~lines 400-428). The roll-up therefore
+	// resolves the destination via `pkgIDToSyn` FIRST (the common
+	// case), falling back to `fileToPkgSyn` so a hypothetical
+	// alternate writer that emits file -> file imports still
+	// projects correctly. Targets that resolve to neither are
+	// dropped (external / unsurfaced packages -- e.g. an import
+	// the dispatcher skipped because it could not register a
+	// package row).
 	//
-	// At granularity=file or class we preserve the file -> file
-	// imports verbatim (the underlying Node ids are already in
-	// the diagram so the edges resolve).
+	// At granularity=package we aggregate to pkg -> pkg with a
+	// weight count and dedupe-by-(src, dst). Intra-package
+	// self-loops (a file in pkg A importing another file in
+	// pkg A) are suppressed -- they are noise on a component-
+	// level diagram.
+	//
+	// At granularity=file or class we preserve the imports
+	// verbatim, rewriting the destination Node id to the
+	// synthetic `pkg:<canonical_signature>` when the dispatcher
+	// pointed it at a package Node, so every edge endpoint
+	// matches a Node id present in the diagram.
+
+	// resolvePkgID returns the synthetic package id for an
+	// imports edge destination, honouring the file -> package
+	// shape the dispatcher emits AND the file -> file shape an
+	// alternate writer might produce. The boolean reports
+	// whether the destination resolved to a surfaced package.
+	resolvePkgID := func(dstNodeID string) (string, bool) {
+		if syn, ok := pkgIDToSyn[dstNodeID]; ok {
+			return syn, true
+		}
+		if syn, ok := fileToPkgSyn[dstNodeID]; ok {
+			return syn, true
+		}
+		return "", false
+	}
+
 	if granularity == GranularityPackage {
 		type pair struct{ from, to string }
 		weights := make(map[pair]int)
@@ -301,12 +334,12 @@ func BuildModuleDiagram(
 				truncated = true
 			}
 			for _, e := range imps {
-				dstPkg, ok := fileToPkgSyn[e.DstNodeID]
+				dstPkg, ok := resolvePkgID(e.DstNodeID)
 				if !ok {
-					// Import target is not a file under any
-					// surfaced package (e.g. an unresolved or
-					// external import). Skip rather than emit
-					// a dangling edge.
+					// Target is neither a surfaced package
+					// nor a file under one (external /
+					// unresolved). Skip rather than emit a
+					// dangling edge.
 					continue
 				}
 				if dstPkg == fe.pkgSyn {
@@ -350,10 +383,18 @@ func BuildModuleDiagram(
 				truncated = true
 			}
 			for _, e := range imps {
+				toID := e.DstNodeID
+				if syn, ok := pkgIDToSyn[e.DstNodeID]; ok {
+					// Dispatcher emitted file -> package;
+					// rewrite to the synthetic package id
+					// already present in the diagram so the
+					// UI's edge endpoint resolves.
+					toID = syn
+				}
 				d.Edges = append(d.Edges, Edge{
 					ID:     e.EdgeID,
 					From:   e.SrcNodeID,
-					To:     e.DstNodeID,
+					To:     toID,
 					Kind:   "imports",
 					Weight: 1,
 					Label:  "imports",

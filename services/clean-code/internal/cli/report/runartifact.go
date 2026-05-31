@@ -83,16 +83,18 @@ type RunArtifact struct {
 	// Policy is the in-memory [steward.PolicyVersion] the
 	// rule engine evaluated against -- minted by the
 	// dev-policy loader (architecture Sec 3.8). The renderer
-	// reads `Policy.PolicyVersionID` (architecture row
-	// "policy id") and `Policy.Name` (architecture row
-	// "version") into the header block.
+	// reads `Policy.PolicyVersionID` (the architecture-pinned
+	// "policy id" cell, Sec 4.5 row 1) and
+	// `Policy.RefactorWeights.EffortModelVersion` (the
+	// architecture-pinned "version" cell, Sec 4.5 row 6 /
+	// Sec 9.3) into the header block.
 	//
-	// The architecture-pinned header label "policy id +
-	// version" maps to the `(PolicyVersionID, Name)` pair
-	// because v1 policy versions are identity-keyed by UUID
-	// and human-tagged by Name (`policy_version.name`,
-	// steward types Sec 5.3.3) -- v1 deliberately does NOT
-	// carry an integer version column on `policy_version`.
+	// `Policy.Name` is the dev-mode identity tag
+	// (`"cleanc-dev-policy"`, architecture Sec 4.5 row 2);
+	// it is NOT a version signal and the renderer
+	// deliberately does NOT use it for the "policy id +
+	// version" cell -- the iter-1 evaluator flagged that
+	// pairing.
 	Policy steward.PolicyVersion
 
 	// Files is one [WalkedFileSummary] per file the walker

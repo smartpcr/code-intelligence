@@ -16,31 +16,35 @@ import (
 	"github.com/gofrs/uuid"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
 )
 
 // Markdown is the [Renderer] implementation that produces the
 // human-readable `report.md` surface (architecture Sec 3.7.1).
 //
-// The zero value is usable: every knob falls back to the
-// architecture-pinned default ([parser.DefaultRegistry] for the
-// active parser fleet). Tests inject a custom [Markdown.Parsers]
-// to assert against a known language set without depending on
-// the process-wide default.
-type Markdown struct {
-	// Parsers is the parser registry consulted for the
-	// header's "active parser fleet" row. When nil, the
-	// renderer falls back to [parser.DefaultRegistry] as
-	// architecture Sec 3.7.1 step 1 mandates ("active parser
-	// fleet from `parser.DefaultRegistry().Languages()`").
-	//
-	// Exposed as a struct field (rather than a function-level
-	// override) so the composition root can thread the SAME
-	// registry instance the orchestrator used; tests use it
-	// to inject a deterministic fleet without racing the
-	// package-level default.
-	Parsers *parser.Registry
-}
+// The struct intentionally has NO fields: the workstream brief
+// pins `type Markdown struct{}` verbatim and architecture
+// Sec 3.7.1 step 1 pins the parser fleet source to
+// [parser.DefaultRegistry] -- exposing a registry override
+// would let a caller render a non-canonical fleet, which the
+// iter-1 evaluator flagged. The package-level
+// [DefaultRegistry] indirection below is the single seam tests
+// use to inject a deterministic fleet without mutating
+// `Markdown` itself.
+type Markdown struct{}
+
+// DefaultRegistry is the package-level indirection through
+// which [Markdown.Render] resolves the active parser fleet.
+// In production it returns [parser.DefaultRegistry]; tests
+// MAY swap it via [SetDefaultRegistryForTest] to assert
+// against a known language set without racing the global
+// registry.
+//
+// The variable is unexported as a function value (rather than
+// a registry pointer) so a future "registry constructor"
+// refactor stays a one-line swap; the public surface remains
+// the literal `parser.DefaultRegistry()` the architecture
+// pins.
+var defaultRegistry = parser.DefaultRegistry
 
 // Compile-time assertion that *Markdown satisfies [Renderer].
 // The vet-friendly form (`var _ Renderer = (*Markdown)(nil)`)
@@ -103,7 +107,8 @@ func (m Markdown) Render(ctx context.Context, art RunArtifact, w io.Writer) erro
 //   - "Head SHA"           -- from `RunArtifact.Context.HeadSHA`
 //   - "Policy"             -- the architecture-pinned
 //     "policy id + version" pair (`Policy.PolicyVersionID`
-//     and `Policy.Name`)
+//     and `Policy.RefactorWeights.EffortModelVersion`; see
+//     [formatPolicyHeader])
 //   - "Active parser fleet" -- the registry's `Languages()`
 //     slice joined as a comma-separated value
 //   - "Dark metrics"       -- the integer count of distinct
@@ -133,7 +138,7 @@ func (m Markdown) renderHeader(ctx context.Context, art RunArtifact, w *bufio.Wr
 	if _, err := fmt.Fprintf(w, "- **Policy:** %s\n", formatPolicyHeader(art)); err != nil {
 		return wrapWrite(err)
 	}
-	if _, err := fmt.Fprintf(w, "- **Active parser fleet:** %s\n", formatParserFleet(m.parserRegistry())); err != nil {
+	if _, err := fmt.Fprintf(w, "- **Active parser fleet:** %s\n", formatParserFleet(defaultRegistry())); err != nil {
 		return wrapWrite(err)
 	}
 	if _, err := fmt.Fprintf(w, "- **Dark metrics:** %d\n", len(art.DarkMetrics)); err != nil {
@@ -147,18 +152,22 @@ func (m Markdown) renderHeader(ctx context.Context, art RunArtifact, w *bufio.Wr
 
 // renderVerdict emits architecture Sec 3.7.1 step 2: the
 // LITERAL single-line `Verdict: <pass|warn|block>` echoing
-// `RunArtifact.Verdict.Verdict`.
+// `RunArtifact.Verdict.Verdict` verbatim.
 //
-// The architecture and tech-spec pin the lowercase canonical
-// labels [rule_engine.VerdictPass] / [rule_engine.VerdictWarn]
-// / [rule_engine.VerdictBlock] -- the renderer emits the
-// literal underlying string verbatim. When the verdict has
-// not been stamped yet (the zero value, i.e. the rule engine
-// has not yet executed against this artifact), the renderer
-// emits the architecture-mandated "unknown" placeholder so
-// the line never disappears from the report -- the operator
-// always sees a Verdict line even if the engine bailed
-// before stamping one.
+// The renderer is a STRICT ECHO of the artifact field; it
+// does NOT rewrite, normalise, or substitute a placeholder
+// for a non-canonical value. The iter-1 review flagged the
+// earlier `unknown` fallback as a contract drift -- the
+// architecture pins the renderer to echo what the engine
+// stamped, and the engine alone is responsible for stamping a
+// canonical [rule_engine.Verdict]. A non-canonical value
+// surfacing into the report is therefore an engine bug the
+// operator MUST see verbatim, not a renderer concern to mask.
+//
+// Concretely, the line is always
+// `Verdict: <string(art.Verdict.Verdict)>` -- including the
+// empty string when the engine has not yet stamped a verdict
+// (the line then reads `Verdict: ` with a trailing space).
 func (m Markdown) renderVerdict(art RunArtifact, w *bufio.Writer) error {
 	if _, err := fmt.Fprintln(w, "## Verdict"); err != nil {
 		return wrapWrite(err)
@@ -166,45 +175,62 @@ func (m Markdown) renderVerdict(art RunArtifact, w *bufio.Writer) error {
 	if _, err := fmt.Fprintln(w); err != nil {
 		return wrapWrite(err)
 	}
-	if _, err := fmt.Fprintf(w, "Verdict: %s\n", verdictLabel(art.Verdict.Verdict)); err != nil {
+	if _, err := fmt.Fprintf(w, "Verdict: %s\n", string(art.Verdict.Verdict)); err != nil {
 		return wrapWrite(err)
 	}
 	return nil
 }
 
-// parserRegistry returns the registry the renderer reads for
-// the active parser fleet row. Defaults to
-// [parser.DefaultRegistry] per architecture Sec 3.7.1 step 1
-// when [Markdown.Parsers] is nil.
-func (m Markdown) parserRegistry() *parser.Registry {
-	if m.Parsers != nil {
-		return m.Parsers
-	}
-	return parser.DefaultRegistry()
-}
+// parserRegistry is removed in iter-2; the active parser
+// fleet is now read directly from the package-level
+// [defaultRegistry] indirection (which itself resolves to
+// [parser.DefaultRegistry] per architecture Sec 3.7.1 step 1).
+// The earlier per-`Markdown` override field is gone because
+// the iter-1 evaluator flagged that callers could substitute
+// a non-canonical fleet through it.
 
 // formatPolicyHeader produces the "policy id + version" cell
-// per architecture Sec 3.7.1 step 1. v1 [steward.PolicyVersion]
-// carries the identity-only `PolicyVersionID` UUID and a
-// human-tagged `Name` string; the renderer joins them with
-// the literal " name=" separator so a grep against the
-// rendered report can pull the id back out independent of the
-// name's contents.
+// per architecture Sec 3.7.1 step 1.
 //
-// When `Policy.PolicyVersionID` is the zero UUID (a CLI run
-// that has not loaded a dev policy yet, or a test fixture
-// that omits the field), the renderer emits the
-// [emptyHeaderValue] placeholder so the row is never blank.
+// v1 [steward.PolicyVersion] (architecture Sec 4.5) does NOT
+// carry an integer version column; the schema's two
+// version-bearing identifiers are:
+//
+//   - `PolicyVersionID` -- the UUID-v5 minted by the
+//     dev-policy loader over `(rule pack hash ||
+//     effort_model_version)`; stable per
+//     `(loaded packs, effort model)` so a re-run with the
+//     same inputs yields the same id (architecture Sec 4.5
+//     row 1).
+//   - `RefactorWeights.EffortModelVersion` -- the canonical
+//     "version" string the dev loader stamps
+//     (`"fallback-2026.05"` per architecture Sec 4.5 row 6 /
+//     Sec 9.3) and the only field whose name carries
+//     "version" semantics.
+//
+// The iter-1 evaluator flagged the prior `Policy.Name`
+// pairing because `Name` is the dev-mode identity tag
+// (`cleanc-dev-policy`, architecture Sec 4.5 row 2), NOT a
+// version signal. The renderer now pairs the UUID with the
+// effort-model version so the operator sees both required
+// signals on the same line:
+//
+//	policy_id=<UUID> version=<EffortModelVersion>
+//
+// When `PolicyVersionID` is the zero UUID (no dev policy
+// loaded) or `EffortModelVersion` is empty (a fixture that
+// omits it), the renderer emits the [emptyHeaderValue]
+// placeholder for that cell so the row is never blank.
 func formatPolicyHeader(art RunArtifact) string {
 	id := art.Policy.PolicyVersionID.String()
 	if art.Policy.PolicyVersionID == uuid.Nil {
 		id = emptyHeaderValue
 	}
-	name := strings.TrimSpace(art.Policy.Name)
-	if name == "" {
-		name = emptyHeaderValue
+	version := strings.TrimSpace(art.Policy.RefactorWeights.EffortModelVersion)
+	if version == "" {
+		version = emptyHeaderValue
 	}
-	return fmt.Sprintf("%s name=%s", id, name)
+	return fmt.Sprintf("policy_id=%s version=%s", id, version)
 }
 
 // formatParserFleet renders the registry's `Languages()`
@@ -228,18 +254,13 @@ func formatParserFleet(reg *parser.Registry) string {
 	return strings.Join(langs, ", ")
 }
 
-// verdictLabel returns the lowercase canonical verdict label
-// for `v`. The valid set is pinned by [rule_engine.Verdict.IsValid];
-// any other value (including the zero "" -- the engine has
-// not stamped a verdict yet) renders as the
-// [unknownVerdictLabel] placeholder so the single-line
-// Verdict block is never empty.
-func verdictLabel(v rule_engine.Verdict) string {
-	if v.IsValid() {
-		return string(v)
-	}
-	return unknownVerdictLabel
-}
+// verdictLabel is removed in iter-2; the renderer now emits
+// `string(art.Verdict.Verdict)` verbatim from
+// [Markdown.renderVerdict] (the iter-1 review flagged
+// `unknown` rewriting as a contract drift). The closed
+// canonical set remains [rule_engine.Verdict.IsValid]'s
+// `{pass, warn, block}` but enforcing it is the engine's
+// responsibility, not the renderer's.
 
 // headerValue returns `v` verbatim or the [emptyHeaderValue]
 // placeholder when `v` is empty. Centralised so every header
@@ -265,15 +286,8 @@ const (
 	// empty (zero UUID, empty string). Pinned as a constant
 	// so the empty-value glyph is consistent across rows
 	// and so a future operator-facing change lands in one
-	// place.
+	// place. Applies ONLY to header rows -- the Verdict
+	// block strictly echoes the engine's stamp without
+	// substitution (see [Markdown.renderVerdict]).
 	emptyHeaderValue = "(unset)"
-
-	// unknownVerdictLabel is the placeholder emitted in the
-	// Verdict block when the rule engine has not stamped a
-	// canonical verdict on the [RunArtifact]. The verdict
-	// closed set per architecture Sec 5.4.3 is
-	// `{pass, warn, block}`; anything else (including the
-	// empty zero value) is the "engine has not run /
-	// degraded short-circuit before stamping" case.
-	unknownVerdictLabel = "unknown"
 )

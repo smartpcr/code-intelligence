@@ -199,8 +199,9 @@ architecture Sec 6.3).
   rule but may change across rule-pack revisions (a `rule_version`
   bump).
 - **Do NOT assume any particular value for `head_sha` on a non-git
-  checkout.** The field can be the empty string; consumers should
-  fall back to `repo_id` for cache keys.
+  checkout.** The field can be the literal `"working-copy"`
+  sentinel on non-git checkouts (never the empty string); consumers
+  should fall back to `repo_id` for cache keys.
 - **Treat empty `metric_evidence: []` as semantically equivalent
   to absent supporting metrics**, not as a wiring bug.
 

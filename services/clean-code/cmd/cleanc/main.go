@@ -17,12 +17,14 @@
 //     `internal/cli/flags`).
 //   - Process exit codes pinned in `tech-spec.md` Sec 8.6
 //     (`0`/`1`/`2`/`64`/`70`).
-//   - The `version` body, which emits a line matching the
-//     e2e-scenarios.md regex
+//   - The `version` body, which emits a SINGLE line
+//     matching the e2e-scenarios.md regex
 //     `^cleanc \d+\.\d+\.\d+ \(build-tag=(|prod)\) \(parsers=[^)]+\) \(rule-packs=[^)]+\)$`
-//     followed by implementation-plan substring lines
-//     (`version=`, `parsers=[go,python,typescript,java]`,
-//     ...).
+//     terminated by exactly one `\n` (Stage 3.4 finalised
+//     format; the earlier follow-on `version=` / `commit=` /
+//     `build_time=` / bracketed `parsers=[...]` diagnostic
+//     lines were dropped to keep CI consumers from pinning
+//     non-contract substrings).
 //
 // Subsequent stages replace the `analyze` / `report` /
 // `apply` bodies with their real implementations:
@@ -55,11 +57,13 @@ import (
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/version"
 )
 
-// skeletonParsers is the hard-coded list of language tags the
-// skeleton emits in the `cleanc version` output. The order
-// matters: implementation-plan.md Stage 1.1 line 41 pins the
-// literal substring `parsers=[go,python,typescript,java]`, so
-// changing the order requires updating the impl-plan check too.
+// skeletonParsers is the hard-coded list of language tags
+// the dispatcher emits in the `cleanc version` output's
+// `(parsers=<csv>)` segment. The order matters: the CSV
+// is byte-stable across builds and the
+// `TestVersionContainsImplPlanSubstrings` test pins the
+// literal substring `(parsers=go,python,typescript,java)`,
+// so reordering requires updating the test too.
 //
 // Stage 1.4 replaces this with a dynamic lookup against
 // `parser.DefaultRegistry().Languages()` once the policy
@@ -132,23 +136,31 @@ func writeGlobalUsage(w io.Writer) {
 	fmt.Fprintln(w, "run `cleanc help <subcommand>` for per-sub-command flag documentation.")
 }
 
-// runVersion prints the binary version, the parser set, and
-// the rule-pack set. Output format is pinned by:
+// runVersion prints the binary version, the parser set,
+// and the rule-pack set on a SINGLE line, terminated by
+// exactly one `\n`. Stage 3.4 (implementation-plan.md
+// line 328) finalises the output to the format:
 //
+//	cleanc <semver> (build-tag=<tag>) (parsers=<csv>) (rule-packs=<csv>)
+//
+// pinned by:
+//
+//   - the workstream brief (Stage 3.4) -- the single-line
+//     format is the contract;
 //   - e2e-scenarios.md line 146 (regex):
-//     `^cleanc \d+\.\d+\.\d+ \(build-tag=(|prod)\) \(parsers=[^)]+\) \(rule-packs=[^)]+\)$`
-//   - e2e-scenarios.md line 147 (set check):
-//     stdout contains `parsers=` whose CSV value is exactly the
-//     set `{go, python, typescript, java}`.
-//   - implementation-plan.md Stage 1.1 line 41 (substrings):
-//     stdout includes `version=` and
-//     `parsers=[go,python,typescript,java]`.
+//     `^cleanc \d+\.\d+\.\d+ \(build-tag=(|prod)\) \(parsers=[^)]+\) \(rule-packs=[^)]+\)$`;
+//   - e2e-scenarios.md line 147 (CSV set check): the
+//     `parsers=` CSV value is exactly the set
+//     `{go, python, typescript, java}`.
 //
-// To satisfy all three, the first line is the strict-regex
-// header (CSV value, no brackets), and the subsequent lines
-// carry the impl-plan substrings (`version=`, bracketed
-// `parsers=[...]`, etc.) plus operator-debug stamps (commit,
-// build_time).
+// The earlier Stage 1.1 skeleton body also emitted
+// follow-on diagnostic lines (`version=`, `commit=`,
+// `build_time=`, bracketed `parsers=[...]` /
+// `rule-packs=[...]`); those were dropped at Stage 3.4
+// because they would let a CI consumer accidentally pin a
+// non-contract substring. The full-stdout pin lives in
+// `TestVersionFormatExact` and the single-line guard in
+// `TestVersionFormatIsExactlyOneLine`.
 func runVersion(stdout, stderr io.Writer, args []string) int {
 	fs := flag.NewFlagSet("cleanc version", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -168,19 +180,6 @@ func runVersion(stdout, stderr io.Writer, args []string) int {
 	rulePackCSV := strings.Join(skeletonRulePacks, ",")
 	semver := semverPrefix(version.Version)
 
-	// Stage 3.4 finalised format -- the ONLY line emitted by
-	// `cleanc version`. The skeleton's iter-1 body printed
-	// follow-on diagnostic lines (`version=`, `commit=`,
-	// `build_time=`, bracketed parsers / rule-packs); those
-	// are removed here because the workstream brief pins the
-	// single-line format:
-	//
-	//   cleanc <semver> (build-tag=<tag>) (parsers=<csv>) (rule-packs=<csv>)
-	//
-	// followed by exactly one trailing `\n`. Keeping any
-	// additional diagnostic lines would let a CI consumer
-	// accidentally pin a non-contract substring (the
-	// evaluator's iter-1 finding).
 	fmt.Fprintf(stdout, "cleanc %s (build-tag=%s) (parsers=%s) (rule-packs=%s)\n",
 		semver, buildTag, parserCSV, rulePackCSV)
 	return flags.ExitOK

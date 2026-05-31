@@ -166,29 +166,31 @@ func (s *e2eGoldenState) runShExecutesForScenario() error {
 	}
 
 	// Fix CRLF/BOM — git on Windows may check out with CRLF which breaks bash.
+	// Write the cleaned script to a temp file so we never mutate tracked source.
 	scriptBytes, err := os.ReadFile(runSh)
 	if err != nil {
 		return fmt.Errorf("read run.sh: %w", err)
 	}
-	modified := false
 	if len(scriptBytes) >= 3 && scriptBytes[0] == 0xEF && scriptBytes[1] == 0xBB && scriptBytes[2] == 0xBF {
 		scriptBytes = scriptBytes[3:]
-		modified = true
 	}
-	if bytes.Contains(scriptBytes, []byte("\r")) {
-		scriptBytes = bytes.ReplaceAll(scriptBytes, []byte("\r"), nil)
-		modified = true
+	scriptBytes = bytes.ReplaceAll(scriptBytes, []byte("\r"), nil)
+
+	tmpScript, err := os.CreateTemp("", "run-*.sh")
+	if err != nil {
+		return fmt.Errorf("create temp run.sh: %w", err)
 	}
-	if modified {
-		if err := os.WriteFile(runSh, scriptBytes, 0o755); err != nil {
-			return fmt.Errorf("fix run.sh line endings: %w", err)
-		}
+	defer os.Remove(tmpScript.Name())
+	if _, err := tmpScript.Write(scriptBytes); err != nil {
+		tmpScript.Close()
+		return fmt.Errorf("write temp run.sh: %w", err)
 	}
+	tmpScript.Close()
 
 	binaryPathForBash := strings.ReplaceAll(s.binaryPath, `\`, "/")
-	runShForBash := strings.ReplaceAll(runSh, `\`, "/")
+	tmpShForBash := strings.ReplaceAll(tmpScript.Name(), `\`, "/")
 
-	cmd := exec.Command(bashPath, runShForBash)
+	cmd := exec.Command(bashPath, tmpShForBash)
 	cmd.Dir = s.scenarioDir
 	cmd.Env = append(os.Environ(), "CLEANC_BINARY_PATH="+binaryPathForBash)
 	var stdoutBuf, stderrBuf bytes.Buffer

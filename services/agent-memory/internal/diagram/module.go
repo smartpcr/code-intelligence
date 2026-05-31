@@ -486,6 +486,10 @@ func repoLabel(url, sig string) string {
 	return tailSegment(sig)
 }
 
+// extractLanguage is defined in callchain.go; both files share the
+// same helper and the callchain version is the canonical one
+// (also recognises the `lang` key alias per its unit tests).
+
 // nonEmptyAttrs returns the supplied attrs verbatim when non-
 // empty, and `nil` otherwise so Node.MarshalJSON's nil-guard
 // can substitute the `{}` placeholder.

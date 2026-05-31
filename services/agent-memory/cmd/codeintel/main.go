@@ -101,7 +101,7 @@ func newRootCmd(out, errOut io.Writer) *cobra.Command {
 		"opt in to the embedding publisher (requires the recall stack)")
 
 	cmd.AddCommand(
-		newScanCmd(&flags),
+		newScanCmdImpl(&flags),
 		newScanManyCmd(&flags),
 		newDiagramCmd(&flags),
 		newServeCmd(&flags),
@@ -134,17 +134,6 @@ func notImplemented(name string) error {
 	// scenario `log-flag-respected` covers this.
 	slog.Info("codeintel subcommand invoked", "subcommand", name)
 	return errNotImplemented
-}
-
-func newScanCmd(_ *rootFlags) *cobra.Command {
-	return &cobra.Command{
-		Use:   "scan <path|git-url>",
-		Short: "Scan a single repository (local path or git URL)",
-		Args:  cobra.ArbitraryArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return notImplemented("scan")
-		},
-	}
 }
 
 func newScanManyCmd(_ *rootFlags) *cobra.Command {

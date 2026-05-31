@@ -14,7 +14,7 @@ import (
 	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
 )
 
-// fakeReader is an in-memory `graphsink.Reader` test double. It
+// moduleFakeReader is an in-memory `graphsink.Reader` test double. It
 // holds explicit slices of Nodes + Edges and filters them on
 // each call, so a test can assemble a fixture graph row by row
 // without standing up SQLite or the in-process memory sink (and
@@ -23,7 +23,7 @@ import (
 // (ListRepos, ListNodes, ListEdgesFrom); the call-chain
 // methods are stubbed to return an error so a misuse surfaces
 // loudly.
-type fakeReader struct {
+type moduleFakeReader struct {
 	repos []graphreader.RepoSummary
 	nodes []graphreader.Node
 	edges []graphreader.Edge
@@ -37,13 +37,13 @@ type fakeReader struct {
 	edgeLimitOverride map[string]int // key: srcNodeID
 }
 
-func (f *fakeReader) ListRepos(_ context.Context, _ graphreader.ReaderOptions) ([]graphreader.RepoSummary, error) {
+func (f *moduleFakeReader) ListRepos(_ context.Context, _ graphreader.ReaderOptions) ([]graphreader.RepoSummary, error) {
 	out := make([]graphreader.RepoSummary, len(f.repos))
 	copy(out, f.repos)
 	return out, nil
 }
 
-func (f *fakeReader) ListNodes(
+func (f *moduleFakeReader) ListNodes(
 	_ context.Context,
 	repoID fingerprint.RepoID,
 	kinds []string,
@@ -98,7 +98,7 @@ func (f *fakeReader) ListNodes(
 	return out, nil
 }
 
-func (f *fakeReader) ListEdgesFrom(
+func (f *moduleFakeReader) ListEdgesFrom(
 	_ context.Context, srcNodeID string, kinds []string, _ graphreader.ReaderOptions,
 ) ([]graphreader.Edge, error) {
 	wantKinds := stringSet(kinds)
@@ -135,22 +135,22 @@ func (f *fakeReader) ListEdgesFrom(
 	return out, nil
 }
 
-func (f *fakeReader) ListEdgesTo(
+func (f *moduleFakeReader) ListEdgesTo(
 	_ context.Context, _ string, _ []string, _ graphreader.ReaderOptions,
 ) ([]graphreader.Edge, error) {
-	return nil, errors.New("fakeReader: ListEdgesTo not implemented")
+	return nil, errors.New("moduleFakeReader: ListEdgesTo not implemented")
 }
 
-func (f *fakeReader) GetNode(
+func (f *moduleFakeReader) GetNode(
 	_ context.Context, _ string, _ graphreader.ReaderOptions,
 ) (graphreader.Node, error) {
-	return graphreader.Node{}, errors.New("fakeReader: GetNode not implemented")
+	return graphreader.Node{}, errors.New("moduleFakeReader: GetNode not implemented")
 }
 
-func (f *fakeReader) LookupBySignature(
+func (f *moduleFakeReader) LookupBySignature(
 	_ context.Context, _ fingerprint.RepoID, _ string, _ string, _ graphreader.ReaderOptions,
 ) (graphreader.Node, error) {
-	return graphreader.Node{}, errors.New("fakeReader: LookupBySignature not implemented")
+	return graphreader.Node{}, errors.New("moduleFakeReader: LookupBySignature not implemented")
 }
 
 func stringSet(ss []string) map[string]bool {
@@ -233,7 +233,7 @@ func TestBuildModuleDiagram_TreeShape(t *testing.T) {
 	repoIDStr := repoID.String()
 	const repoNodeID = "node-repo"
 
-	f := &fakeReader{
+	f := &moduleFakeReader{
 		repos: []graphreader.RepoSummary{summary},
 		nodes: []graphreader.Node{
 			// repo
@@ -392,7 +392,7 @@ func TestBuildModuleDiagram_ImportsRollupWeight(t *testing.T) {
 		}
 	}
 
-	f := &fakeReader{
+	f := &moduleFakeReader{
 		repos: []graphreader.RepoSummary{summary},
 		nodes: nodes,
 		edges: edges,
@@ -490,7 +490,7 @@ func TestBuildModuleDiagram_ImportsRollupSingleEdgeFullWeight(t *testing.T) {
 		}
 	}
 
-	f := &fakeReader{
+	f := &moduleFakeReader{
 		repos: []graphreader.RepoSummary{summary},
 		nodes: nodes,
 		edges: edges,
@@ -572,7 +572,7 @@ func TestBuildModuleDiagram_GranularityFile(t *testing.T) {
 		}
 	}
 
-	f := &fakeReader{
+	f := &moduleFakeReader{
 		repos: []graphreader.RepoSummary{summary},
 		nodes: nodes,
 		edges: edges,
@@ -649,7 +649,7 @@ func TestBuildModuleDiagram_IntraPackageImportsSuppressed(t *testing.T) {
 	repoIDStr := repoID.String()
 	const repoNodeID = "node-repo"
 
-	f := &fakeReader{
+	f := &moduleFakeReader{
 		repos: []graphreader.RepoSummary{summary},
 		nodes: []graphreader.Node{
 			{NodeID: repoNodeID, RepoID: repoIDStr, Kind: "repo",
@@ -690,7 +690,7 @@ func TestBuildModuleDiagram_UnresolvedImportSkipped(t *testing.T) {
 	repoIDStr := repoID.String()
 	const repoNodeID = "node-repo"
 
-	f := &fakeReader{
+	f := &moduleFakeReader{
 		repos: []graphreader.RepoSummary{summary},
 		nodes: []graphreader.Node{
 			{NodeID: repoNodeID, RepoID: repoIDStr, Kind: "repo",
@@ -721,7 +721,7 @@ func TestBuildModuleDiagram_UnresolvedImportSkipped(t *testing.T) {
 // validation guard for unknown `--granularity` flag values.
 func TestBuildModuleDiagram_InvalidGranularity(t *testing.T) {
 	repoID, summary := newFixtureRepo(t, "https://example.com/example/bad")
-	f := &fakeReader{repos: []graphreader.RepoSummary{summary}}
+	f := &moduleFakeReader{repos: []graphreader.RepoSummary{summary}}
 	_, err := BuildModuleDiagram(context.Background(), f, repoID, "module")
 	if err == nil {
 		t.Fatalf("expected error on invalid granularity, got nil")
@@ -731,7 +731,7 @@ func TestBuildModuleDiagram_InvalidGranularity(t *testing.T) {
 // TestBuildModuleDiagram_ZeroRepoIDRejected confirms the input
 // validation guard against an uninitialised RepoID.
 func TestBuildModuleDiagram_ZeroRepoIDRejected(t *testing.T) {
-	f := &fakeReader{}
+	f := &moduleFakeReader{}
 	_, err := BuildModuleDiagram(context.Background(), f, fingerprint.RepoID{}, GranularityPackage)
 	if err == nil {
 		t.Fatalf("expected error on zero RepoID, got nil")
@@ -745,7 +745,7 @@ func TestBuildModuleDiagram_ZeroRepoIDRejected(t *testing.T) {
 // surface a hard error instead of silently dropping packages.
 func TestBuildModuleDiagram_RepoNodeMissing(t *testing.T) {
 	repoID, summary := newFixtureRepo(t, "https://example.com/example/nonode")
-	f := &fakeReader{
+	f := &moduleFakeReader{
 		repos: []graphreader.RepoSummary{summary},
 		nodes: nil, // no repo Node materialised yet
 	}
@@ -768,7 +768,7 @@ func TestBuildModuleDiagram_TruncationFlag(t *testing.T) {
 	repoIDStr := repoID.String()
 	const repoNodeID = "node-repo"
 
-	f := &fakeReader{
+	f := &moduleFakeReader{
 		repos: []graphreader.RepoSummary{summary},
 		nodes: []graphreader.Node{
 			{NodeID: repoNodeID, RepoID: repoIDStr, Kind: "repo",
@@ -802,7 +802,7 @@ func TestBuildModuleDiagram_GranularityClass(t *testing.T) {
 	repoIDStr := repoID.String()
 	const repoNodeID = "node-repo"
 
-	f := &fakeReader{
+	f := &moduleFakeReader{
 		repos: []graphreader.RepoSummary{summary},
 		nodes: []graphreader.Node{
 			{NodeID: repoNodeID, RepoID: repoIDStr, Kind: "repo",

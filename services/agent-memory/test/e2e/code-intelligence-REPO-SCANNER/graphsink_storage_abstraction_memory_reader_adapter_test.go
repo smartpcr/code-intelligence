@@ -4,13 +4,19 @@ package e2e
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/cucumber/godog"
+	_ "github.com/mattn/go-sqlite3" // register sqlite3 driver for direct SQL queries
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphreader"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphsink/memory"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphsink/sqlite"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
 )
@@ -33,22 +39,28 @@ type nodeProjection struct {
 }
 
 // ---------------------------------------------------------------------------
-// Fixture insertion helper — populates a memory Sink with a
-// deterministic small graph: 1 repo, 3 nodes (repo, file, method),
-// 2 edges (contains, static_calls).
+// Fixture insertion — writes the identical graph into any
+// graphsink.Sink (memory OR sqlite) so the two backends start
+// from the same data.
 // ---------------------------------------------------------------------------
 
-type memReaderFixtureIDs struct {
+type sinkFixtureIDs struct {
 	repoNodeID   string
 	fileNodeID   string
 	methodNodeID string
 }
 
-func insertMemReaderFixture(sink *memory.Sink) (memReaderFixtureIDs, error) {
+func insertParityFixture(sink interface {
+	EnsureRepo(context.Context, graphwriter.RepoInput) (graphwriter.RepoRecord, error)
+	EnsureCommit(context.Context, graphwriter.CommitInput) (graphwriter.CommitRecord, error)
+	InsertNode(context.Context, graphwriter.NodeInput) (graphwriter.NodeRecord, error)
+	InsertEdge(context.Context, graphwriter.EdgeInput) (graphwriter.EdgeRecord, error)
+	Flush(context.Context) error
+}) (sinkFixtureIDs, error) {
 	ctx := context.Background()
 	repoID, err := memReaderRepoID()
 	if err != nil {
-		return memReaderFixtureIDs{}, fmt.Errorf("RepoIDFromURL: %w", err)
+		return sinkFixtureIDs{}, fmt.Errorf("RepoIDFromURL: %w", err)
 	}
 
 	if _, err := sink.EnsureRepo(ctx, graphwriter.RepoInput{
@@ -58,13 +70,14 @@ func insertMemReaderFixture(sink *memory.Sink) (memReaderFixtureIDs, error) {
 		LanguageHints:  []string{"go"},
 		RepoID:         repoID,
 	}); err != nil {
-		return memReaderFixtureIDs{}, fmt.Errorf("EnsureRepo: %w", err)
+		return sinkFixtureIDs{}, fmt.Errorf("EnsureRepo: %w", err)
 	}
 	if _, err := sink.EnsureCommit(ctx, graphwriter.CommitInput{
-		RepoID: repoID,
-		SHA:    "aabbccdd",
+		RepoID:      repoID,
+		SHA:         "aabbccdd",
+		CommittedAt: time.Now().UTC(),
 	}); err != nil {
-		return memReaderFixtureIDs{}, fmt.Errorf("EnsureCommit: %w", err)
+		return sinkFixtureIDs{}, fmt.Errorf("EnsureCommit: %w", err)
 	}
 
 	repoNode, err := sink.InsertNode(ctx, graphwriter.NodeInput{
@@ -74,7 +87,7 @@ func insertMemReaderFixture(sink *memory.Sink) (memReaderFixtureIDs, error) {
 		FromSHA:            "aabbccdd",
 	})
 	if err != nil {
-		return memReaderFixtureIDs{}, fmt.Errorf("InsertNode repo: %w", err)
+		return sinkFixtureIDs{}, fmt.Errorf("InsertNode repo: %w", err)
 	}
 
 	fileNode, err := sink.InsertNode(ctx, graphwriter.NodeInput{
@@ -85,7 +98,7 @@ func insertMemReaderFixture(sink *memory.Sink) (memReaderFixtureIDs, error) {
 		FromSHA:            "aabbccdd",
 	})
 	if err != nil {
-		return memReaderFixtureIDs{}, fmt.Errorf("InsertNode file: %w", err)
+		return sinkFixtureIDs{}, fmt.Errorf("InsertNode file: %w", err)
 	}
 
 	methodNode, err := sink.InsertNode(ctx, graphwriter.NodeInput{
@@ -96,7 +109,7 @@ func insertMemReaderFixture(sink *memory.Sink) (memReaderFixtureIDs, error) {
 		FromSHA:            "aabbccdd",
 	})
 	if err != nil {
-		return memReaderFixtureIDs{}, fmt.Errorf("InsertNode method: %w", err)
+		return sinkFixtureIDs{}, fmt.Errorf("InsertNode method: %w", err)
 	}
 
 	if _, err := sink.InsertEdge(ctx, graphwriter.EdgeInput{
@@ -106,7 +119,7 @@ func insertMemReaderFixture(sink *memory.Sink) (memReaderFixtureIDs, error) {
 		DstNodeID: fileNode.NodeID,
 		FromSHA:   "aabbccdd",
 	}); err != nil {
-		return memReaderFixtureIDs{}, fmt.Errorf("InsertEdge contains: %w", err)
+		return sinkFixtureIDs{}, fmt.Errorf("InsertEdge contains: %w", err)
 	}
 
 	if _, err := sink.InsertEdge(ctx, graphwriter.EdgeInput{
@@ -116,14 +129,14 @@ func insertMemReaderFixture(sink *memory.Sink) (memReaderFixtureIDs, error) {
 		DstNodeID: fileNode.NodeID,
 		FromSHA:   "aabbccdd",
 	}); err != nil {
-		return memReaderFixtureIDs{}, fmt.Errorf("InsertEdge static_calls: %w", err)
+		return sinkFixtureIDs{}, fmt.Errorf("InsertEdge static_calls: %w", err)
 	}
 
 	if err := sink.Flush(ctx); err != nil {
-		return memReaderFixtureIDs{}, fmt.Errorf("Flush: %w", err)
+		return sinkFixtureIDs{}, fmt.Errorf("Flush: %w", err)
 	}
 
-	return memReaderFixtureIDs{
+	return sinkFixtureIDs{
 		repoNodeID:   repoNode.NodeID,
 		fileNodeID:   fileNode.NodeID,
 		methodNodeID: methodNode.NodeID,
@@ -131,40 +144,106 @@ func insertMemReaderFixture(sink *memory.Sink) (memReaderFixtureIDs, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Golden projections — the canonical expected output for the
-// fixture graph above. The memory reader and the SQLite reader
-// share the same stable sort contract (kind ASC, canonical_signature
-// ASC, node_id ASC) so these projections are the single source
-// of truth for both backends.
+// SQLite direct-SQL reader helpers — the SQLite sink has no
+// graphsink.Reader implementation yet (that's Stage 3.6), so we
+// query the database directly using the same ORDER BY contract
+// the memory reader enforces.
 // ---------------------------------------------------------------------------
 
-var goldenNodeProjections = []nodeProjection{
-	{Kind: "file", CanonicalSignature: "file://parity/main.go"},
-	{Kind: "method", CanonicalSignature: "func://parity.Run"},
-	{Kind: "repo", CanonicalSignature: memReaderRepoURL},
+func sqliteListNodeProjections(db *sql.DB, repoID string) ([]nodeProjection, error) {
+	rows, err := db.Query(
+		`SELECT kind, canonical_signature FROM node
+		 WHERE repo_id = ?
+		 ORDER BY kind, canonical_signature, node_id`,
+		repoID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []nodeProjection
+	for rows.Next() {
+		var p nodeProjection
+		if err := rows.Scan(&p.Kind, &p.CanonicalSignature); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
-// goldenEdgesFromRepoKinds: the repo node has one outbound
-// `contains` edge to the file node.
-var goldenEdgesFromRepoKinds = []string{"contains"}
+func sqliteListEdgeKindsFrom(db *sql.DB, srcNodeID string) ([]string, error) {
+	rows, err := db.Query(
+		`SELECT kind FROM edge
+		 WHERE src_node_id = ?
+		 ORDER BY kind, edge_id`,
+		srcNodeID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
 
-// goldenEdgesToFileKinds: the file node has two inbound edges:
-// `contains` (from repo) and `static_calls` (from method).
-// Sorted by kind ASC: contains < static_calls.
-var goldenEdgesToFileKinds = []string{"contains", "static_calls"}
+func sqliteListEdgeKindsTo(db *sql.DB, dstNodeID string) ([]string, error) {
+	rows, err := db.Query(
+		`SELECT kind FROM edge
+		 WHERE dst_node_id = ?
+		 ORDER BY kind, edge_id`,
+		dstNodeID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
 
 // ---------------------------------------------------------------------------
 // Scenario: memory-reader-parity
+//
+// Inserts the same fixture graph into BOTH the memory sink AND
+// the SQLite sink. Queries the memory sink via its Reader
+// interface (ListNodes / ListEdgesFrom / ListEdgesTo) and the
+// SQLite sink via direct SQL (the SQLite backend has no Reader
+// yet — Stage 3.6). Asserts the projections are identical.
 // ---------------------------------------------------------------------------
 
 type memReaderParityState struct {
-	sink   *memory.Sink
-	ids    memReaderFixtureIDs
-	repoID fingerprint.RepoID
+	memSink  *memory.Sink
+	sqlSink  *sqlite.Sink
+	sqlDB    *sql.DB // separate read connection for direct SQL
+	memIDs   sinkFixtureIDs
+	sqlIDs   sinkFixtureIDs
+	dbDir    string
+	repoID   fingerprint.RepoID
 
-	nodes     []graphreader.Node
-	edgesFrom []graphreader.Edge
-	edgesTo   []graphreader.Edge
+	// memory reader results
+	memNodes     []graphreader.Node
+	memEdgesFrom []graphreader.Edge
+	memEdgesTo   []graphreader.Edge
+
+	// sqlite direct-SQL results
+	sqlNodeProj     []nodeProjection
+	sqlEdgeFromKinds []string
+	sqlEdgeToKinds   []string
 }
 
 func (s *memReaderParityState) givenFixtureGraphInserted(ctx context.Context) error {
@@ -174,16 +253,38 @@ func (s *memReaderParityState) givenFixtureGraphInserted(ctx context.Context) er
 	}
 	s.repoID = repoID
 
-	// Insert the same fixture into two independent memory sinks.
-	// The second sink acts as the "SQLite" role: both are
-	// memory-backed but the golden projections represent the
-	// canonical output any correct Reader must produce.
-	s.sink = memory.New(memory.Options{})
-	ids, err := insertMemReaderFixture(s.sink)
+	// --- Memory sink ---
+	s.memSink = memory.New(memory.Options{})
+	memIDs, err := insertParityFixture(s.memSink)
 	if err != nil {
-		return fmt.Errorf("memory: %w", err)
+		return fmt.Errorf("memory fixture: %w", err)
 	}
-	s.ids = ids
+	s.memIDs = memIDs
+
+	// --- SQLite sink ---
+	dir, err := os.MkdirTemp("", "mem-reader-parity-*")
+	if err != nil {
+		return err
+	}
+	s.dbDir = dir
+	dbPath := filepath.Join(dir, "parity.db")
+	sqlSink, err := sqlite.Open(context.Background(), dbPath)
+	if err != nil {
+		return fmt.Errorf("sqlite.Open: %w", err)
+	}
+	s.sqlSink = sqlSink
+	sqlIDs, err := insertParityFixture(s.sqlSink)
+	if err != nil {
+		return fmt.Errorf("sqlite fixture: %w", err)
+	}
+	s.sqlIDs = sqlIDs
+
+	// Open a separate read connection for direct SQL queries.
+	s.sqlDB, err = sql.Open("sqlite3", dbPath+"?_foreign_keys=on&mode=ro")
+	if err != nil {
+		return fmt.Errorf("sql.Open for read: %w", err)
+	}
+
 	return nil
 }
 
@@ -191,62 +292,101 @@ func (s *memReaderParityState) whenBothReadersQuery(ctx context.Context) error {
 	bgCtx := context.Background()
 	opts := graphreader.ReaderOptions{}
 
+	// --- Query memory sink via Reader interface ---
 	var err error
-	s.nodes, err = s.sink.ListNodes(bgCtx, s.repoID, nil,
+	s.memNodes, err = s.memSink.ListNodes(bgCtx, s.repoID, nil,
 		graphreader.ListNodesFilter{}, opts)
 	if err != nil {
-		return fmt.Errorf("ListNodes: %w", err)
+		return fmt.Errorf("memory ListNodes: %w", err)
 	}
 
-	s.edgesFrom, err = s.sink.ListEdgesFrom(bgCtx, s.ids.repoNodeID, nil, opts)
+	s.memEdgesFrom, err = s.memSink.ListEdgesFrom(bgCtx, s.memIDs.repoNodeID, nil, opts)
 	if err != nil {
-		return fmt.Errorf("ListEdgesFrom: %w", err)
+		return fmt.Errorf("memory ListEdgesFrom: %w", err)
 	}
 
-	s.edgesTo, err = s.sink.ListEdgesTo(bgCtx, s.ids.fileNodeID, nil, opts)
+	s.memEdgesTo, err = s.memSink.ListEdgesTo(bgCtx, s.memIDs.fileNodeID, nil, opts)
 	if err != nil {
-		return fmt.Errorf("ListEdgesTo: %w", err)
+		return fmt.Errorf("memory ListEdgesTo: %w", err)
+	}
+
+	// --- Query SQLite sink via direct SQL ---
+	s.sqlNodeProj, err = sqliteListNodeProjections(s.sqlDB, s.repoID.String())
+	if err != nil {
+		return fmt.Errorf("sqlite ListNodes SQL: %w", err)
+	}
+
+	s.sqlEdgeFromKinds, err = sqliteListEdgeKindsFrom(s.sqlDB, s.sqlIDs.repoNodeID)
+	if err != nil {
+		return fmt.Errorf("sqlite ListEdgesFrom SQL: %w", err)
+	}
+
+	s.sqlEdgeToKinds, err = sqliteListEdgeKindsTo(s.sqlDB, s.sqlIDs.fileNodeID)
+	if err != nil {
+		return fmt.Errorf("sqlite ListEdgesTo SQL: %w", err)
 	}
 
 	return nil
 }
 
 func (s *memReaderParityState) thenSlicesMatch(ctx context.Context) error {
-	defer func() { _ = s.sink.Close() }()
+	defer func() {
+		_ = s.memSink.Close()
+		_ = s.sqlSink.Close()
+		if s.sqlDB != nil {
+			_ = s.sqlDB.Close()
+		}
+		if s.dbDir != "" {
+			_ = os.RemoveAll(s.dbDir)
+		}
+	}()
 
-	// ListNodes parity against golden projections
-	if len(s.nodes) != len(goldenNodeProjections) {
-		return fmt.Errorf("ListNodes length mismatch: got=%d want=%d",
-			len(s.nodes), len(goldenNodeProjections))
+	// --- ListNodes parity: memory Reader vs SQLite SQL ---
+	memNodeProj := make([]nodeProjection, len(s.memNodes))
+	for i, n := range s.memNodes {
+		memNodeProj[i] = nodeProjection{n.Kind, n.CanonicalSignature}
 	}
-	for i, want := range goldenNodeProjections {
-		got := nodeProjection{s.nodes[i].Kind, s.nodes[i].CanonicalSignature}
-		if got != want {
-			return fmt.Errorf("ListNodes[%d] projection mismatch: got=%+v want=%+v", i, got, want)
+
+	if len(memNodeProj) != len(s.sqlNodeProj) {
+		return fmt.Errorf("ListNodes length mismatch: memory=%d sqlite=%d",
+			len(memNodeProj), len(s.sqlNodeProj))
+	}
+	for i := range memNodeProj {
+		if memNodeProj[i] != s.sqlNodeProj[i] {
+			return fmt.Errorf("ListNodes[%d] projection mismatch: memory=%+v sqlite=%+v",
+				i, memNodeProj[i], s.sqlNodeProj[i])
 		}
 	}
 
-	// ListEdgesFrom parity
-	if len(s.edgesFrom) != len(goldenEdgesFromRepoKinds) {
-		return fmt.Errorf("ListEdgesFrom length mismatch: got=%d want=%d",
-			len(s.edgesFrom), len(goldenEdgesFromRepoKinds))
+	// --- ListEdgesFrom parity ---
+	memEdgeFromKinds := make([]string, len(s.memEdgesFrom))
+	for i, e := range s.memEdgesFrom {
+		memEdgeFromKinds[i] = e.Kind
 	}
-	for i, wantKind := range goldenEdgesFromRepoKinds {
-		if s.edgesFrom[i].Kind != wantKind {
-			return fmt.Errorf("ListEdgesFrom[%d] kind mismatch: got=%s want=%s",
-				i, s.edgesFrom[i].Kind, wantKind)
+	if len(memEdgeFromKinds) != len(s.sqlEdgeFromKinds) {
+		return fmt.Errorf("ListEdgesFrom length mismatch: memory=%d sqlite=%d",
+			len(memEdgeFromKinds), len(s.sqlEdgeFromKinds))
+	}
+	for i := range memEdgeFromKinds {
+		if memEdgeFromKinds[i] != s.sqlEdgeFromKinds[i] {
+			return fmt.Errorf("ListEdgesFrom[%d] kind mismatch: memory=%s sqlite=%s",
+				i, memEdgeFromKinds[i], s.sqlEdgeFromKinds[i])
 		}
 	}
 
-	// ListEdgesTo parity
-	if len(s.edgesTo) != len(goldenEdgesToFileKinds) {
-		return fmt.Errorf("ListEdgesTo length mismatch: got=%d want=%d",
-			len(s.edgesTo), len(goldenEdgesToFileKinds))
+	// --- ListEdgesTo parity ---
+	memEdgeToKinds := make([]string, len(s.memEdgesTo))
+	for i, e := range s.memEdgesTo {
+		memEdgeToKinds[i] = e.Kind
 	}
-	for i, wantKind := range goldenEdgesToFileKinds {
-		if s.edgesTo[i].Kind != wantKind {
-			return fmt.Errorf("ListEdgesTo[%d] kind mismatch: got=%s want=%s",
-				i, s.edgesTo[i].Kind, wantKind)
+	if len(memEdgeToKinds) != len(s.sqlEdgeToKinds) {
+		return fmt.Errorf("ListEdgesTo length mismatch: memory=%d sqlite=%d",
+			len(memEdgeToKinds), len(s.sqlEdgeToKinds))
+	}
+	for i := range memEdgeToKinds {
+		if memEdgeToKinds[i] != s.sqlEdgeToKinds[i] {
+			return fmt.Errorf("ListEdgesTo[%d] kind mismatch: memory=%s sqlite=%s",
+				i, memEdgeToKinds[i], s.sqlEdgeToKinds[i])
 		}
 	}
 
@@ -255,11 +395,20 @@ func (s *memReaderParityState) thenSlicesMatch(ctx context.Context) error {
 
 // ---------------------------------------------------------------------------
 // Scenario: memory-lookup-fast-path
+//
+// Inserts a Node with a known signature, runs LookupBySignature,
+// asserts correctness, then proves O(1) behaviour by:
+//   1. Confirming the sigIndex map is populated (via the exported
+//      SigIndexLenForTest helper).
+//   2. Running a timing comparison: lookup latency on a sink with
+//      1 node vs a sink with 1000 nodes must not scale with N.
+//      The 1000-node lookup must complete within 10× the 1-node
+//      baseline (generous factor absorbing noise).
 // ---------------------------------------------------------------------------
 
 type memLookupFastPathState struct {
-	sink     *memory.Sink
-	repoID   fingerprint.RepoID
+	sink           *memory.Sink
+	repoID         fingerprint.RepoID
 	insertedNodeID string
 	lookupNode     graphreader.Node
 	lookupErr      error
@@ -326,13 +475,80 @@ func (s *memLookupFastPathState) thenNodeReturnedInO1(ctx context.Context) error
 			s.lookupNode.CanonicalSignature, "func://parity.FastLookup")
 	}
 
-	// Verify the sigIndex fast-path: the sink's internal sigIndex
-	// must contain our entry. We access it via the exported
-	// SigIndexLen method (or by re-running the lookup on a sink
-	// with N nodes and confirming it doesn't degrade). For the
-	// e2e acceptance, the existence of the correct result from
-	// LookupBySignature is sufficient proof; the unit test in
-	// reader_test.go directly inspects the map.
+	// ---- Assert sigIndex is populated (proves map-backed O(1)) ----
+	sigLen := memory.SigIndexLenForTest(s.sink)
+	if sigLen < 1 {
+		return fmt.Errorf("sigIndex length = %d after InsertNode; want >= 1 "+
+			"(proves the map[sigKey]nodeID fast-path is populated)", sigLen)
+	}
+
+	// ---- Benchmark: lookup on 1-node sink vs 1000-node sink ----
+	// Build a large sink with 1000 method nodes.
+	largeSink := memory.New(memory.Options{})
+	repoID := s.repoID
+	if _, err := largeSink.EnsureRepo(context.Background(), graphwriter.RepoInput{
+		URL: memReaderRepoURL, DefaultBranch: "main",
+		CurrentHeadSHA: "aabbccdd", LanguageHints: []string{"go"},
+		RepoID: repoID,
+	}); err != nil {
+		return fmt.Errorf("large EnsureRepo: %w", err)
+	}
+	const N = 1000
+	var targetSig string
+	for i := 0; i < N; i++ {
+		sig := fmt.Sprintf("func://parity.Method%04d", i)
+		if _, err := largeSink.InsertNode(context.Background(), graphwriter.NodeInput{
+			RepoID:             repoID,
+			Kind:               "method",
+			CanonicalSignature: sig,
+			FromSHA:            "aabbccdd",
+		}); err != nil {
+			return fmt.Errorf("InsertNode %d: %w", i, err)
+		}
+		if i == N/2 {
+			targetSig = sig // lookup a node in the middle
+		}
+	}
+
+	largeSigLen := memory.SigIndexLenForTest(largeSink)
+	if largeSigLen != N {
+		return fmt.Errorf("large sigIndex length = %d, want %d "+
+			"(proves InsertNode populates the index for every node)", largeSigLen, N)
+	}
+
+	// Time the lookup on the small sink (1 node).
+	const iters = 500
+	smallStart := time.Now()
+	for i := 0; i < iters; i++ {
+		if _, err := s.sink.LookupBySignature(context.Background(),
+			repoID, "method", "func://parity.FastLookup",
+			graphreader.ReaderOptions{}); err != nil {
+			return fmt.Errorf("small lookup iter %d: %w", i, err)
+		}
+	}
+	smallDur := time.Since(smallStart)
+
+	// Time the lookup on the large sink (1000 nodes).
+	largeStart := time.Now()
+	for i := 0; i < iters; i++ {
+		if _, err := largeSink.LookupBySignature(context.Background(),
+			repoID, "method", targetSig,
+			graphreader.ReaderOptions{}); err != nil {
+			return fmt.Errorf("large lookup iter %d: %w", i, err)
+		}
+	}
+	largeDur := time.Since(largeStart)
+
+	_ = largeSink.Close()
+
+	// O(1) means the large lookup should not scale linearly with N.
+	// We allow 10× tolerance to absorb noise and lock contention.
+	if smallDur > 0 && largeDur > 10*smallDur {
+		return fmt.Errorf("LookupBySignature scales with N: "+
+			"small(%d nodes)=%v large(%d nodes)=%v ratio=%.1f (max 10×)",
+			1, smallDur, N, largeDur, float64(largeDur)/float64(smallDur))
+	}
+
 	return nil
 }
 

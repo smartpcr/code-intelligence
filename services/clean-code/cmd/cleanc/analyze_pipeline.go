@@ -242,7 +242,7 @@ func runTaskPlanner(
 // Returns the underlying error after writing an
 // operator-facing line to `stderr`; the dispatcher maps the
 // non-nil return to [flags.ExitInternalError].
-func dispatchMarkdown(ctx context.Context, stdout, stderr io.Writer, outPath string, art report.RunArtifact) error {
+func dispatchMarkdown(ctx context.Context, stdout, stderr io.Writer, outPath string, art report.RunArtifact) (retErr error) {
 	r := report.Markdown{}
 	if outPath == "" {
 		if err := r.Render(ctx, art, stdout); err != nil {
@@ -256,7 +256,20 @@ func dispatchMarkdown(ctx context.Context, stdout, stderr io.Writer, outPath str
 		fmt.Fprintf(stderr, "cleanc analyze: --out %s: %v\n", outPath, err)
 		return err
 	}
-	defer func() { _ = f.Close() }()
+	// Close() is the LAST chance to surface a buffered-flush
+	// failure (disk full, NFS disconnect). Discarding it would
+	// let the caller see nil and exit 0 even though the file on
+	// disk is short -- silent data loss. The deferred close
+	// promotes a close error to retErr ONLY when the render
+	// itself succeeded; a render failure already owns the
+	// terminal error and the partial file is expected.
+	defer func() {
+		cerr := f.Close()
+		if cerr != nil && retErr == nil {
+			fmt.Fprintf(stderr, "cleanc analyze: --out %s: %v\n", outPath, cerr)
+			retErr = cerr
+		}
+	}()
 	if err := r.Render(ctx, art, f); err != nil {
 		fmt.Fprintf(stderr, "cleanc analyze: --out %s: %v\n", outPath, err)
 		return err
@@ -275,7 +288,7 @@ type jsonRenderer func(ctx context.Context, art report.RunArtifact, w io.Writer)
 // sidecar). The `flagName` argument is the literal `--<flag>`
 // label woven into the stderr diagnostic so the operator
 // sees the offending flag on a failed write.
-func dispatchJSONFile(ctx context.Context, stderr io.Writer, path, flagName string, render jsonRenderer, art report.RunArtifact) error {
+func dispatchJSONFile(ctx context.Context, stderr io.Writer, path, flagName string, render jsonRenderer, art report.RunArtifact) (retErr error) {
 	if path == "" {
 		return nil
 	}
@@ -284,7 +297,15 @@ func dispatchJSONFile(ctx context.Context, stderr io.Writer, path, flagName stri
 		fmt.Fprintf(stderr, "cleanc analyze: %s %s: %v\n", flagName, path, err)
 		return err
 	}
-	defer func() { _ = f.Close() }()
+	// See dispatchMarkdown for why Close() errors are promoted
+	// to retErr when the render path succeeded.
+	defer func() {
+		cerr := f.Close()
+		if cerr != nil && retErr == nil {
+			fmt.Fprintf(stderr, "cleanc analyze: %s %s: %v\n", flagName, path, cerr)
+			retErr = cerr
+		}
+	}()
 	if err := render(ctx, art, f); err != nil {
 		fmt.Fprintf(stderr, "cleanc analyze: %s %s: %v\n", flagName, path, err)
 		return err
@@ -299,7 +320,7 @@ func dispatchJSONFile(ctx context.Context, stderr io.Writer, path, flagName stri
 // carries only the dark-metric inventory + effort-source
 // stamp, so it is a small operator-facing diagnostic
 // sidecar suitable for "why did `cyclo` go dark?" queries.
-func dispatchDiagnostics(stderr io.Writer, path string, diag orchestrator.Diagnostics) error {
+func dispatchDiagnostics(stderr io.Writer, path string, diag orchestrator.Diagnostics) (retErr error) {
 	if path == "" {
 		return nil
 	}
@@ -308,7 +329,15 @@ func dispatchDiagnostics(stderr io.Writer, path string, diag orchestrator.Diagno
 		fmt.Fprintf(stderr, "cleanc analyze: --diagnostics %s: %v\n", path, err)
 		return err
 	}
-	defer func() { _ = f.Close() }()
+	// See dispatchMarkdown for why Close() errors are promoted
+	// to retErr when the encode path succeeded.
+	defer func() {
+		cerr := f.Close()
+		if cerr != nil && retErr == nil {
+			fmt.Fprintf(stderr, "cleanc analyze: --diagnostics %s: %v\n", path, cerr)
+			retErr = cerr
+		}
+	}()
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
 	enc.SetEscapeHTML(false)

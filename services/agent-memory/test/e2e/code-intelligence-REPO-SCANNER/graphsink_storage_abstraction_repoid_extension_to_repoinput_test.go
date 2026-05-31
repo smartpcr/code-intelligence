@@ -5,60 +5,250 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/cucumber/godog"
+	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
+	_ "github.com/lib/pq"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/migrations"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
 )
+
+// ---------------------------------------------------------------------------
+// Postgres provisioning — provided instance or embedded ephemeral
+// ---------------------------------------------------------------------------
+
+const (
+	repoIDExtEnvPGURL = "AGENT_MEMORY_PG_URL"
+	repoIDExtTimeout  = 60 * time.Second
+)
+
+// pgInstance holds a Postgres connection (provided or ephemeral)
+// and a cleanup function that tears it down.
+type pgInstance struct {
+	db      *sql.DB
+	cleanup func()
+}
+
+// openRepoIDExtPG returns a *sql.DB connected to a Postgres
+// instance with the repo table schema applied. It tries:
+//  1. AGENT_MEMORY_PG_URL (provided / compose stack)
+//  2. embedded-postgres (ephemeral, no docker)
+func openRepoIDExtPG() (*pgInstance, error) {
+	if dsn := os.Getenv(repoIDExtEnvPGURL); dsn != "" {
+		return openProvidedPG(dsn)
+	}
+	return openEphemeralPG()
+}
+
+// openProvidedPG connects to the provided Postgres and creates a
+// per-test schema with migrations applied.
+func openProvidedPG(dsn string) (*pgInstance, error) {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("sql.Open provided: %w", err)
+	}
+	db.SetMaxOpenConns(2)
+	ctx, cancel := context.WithTimeout(context.Background(), repoIDExtTimeout)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping provided PG: %w", err)
+	}
+
+	schema, err := createTestSchema(ctx, db)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
+	if err := applyRepoMigrations(ctx, db); err != nil {
+		dropTestSchema(db, schema)
+		_ = db.Close()
+		return nil, err
+	}
+
+	return &pgInstance{
+		db: db,
+		cleanup: func() {
+			dropTestSchema(db, schema)
+			_ = db.Close()
+		},
+	}, nil
+}
+
+// openEphemeralPG starts an embedded Postgres process, applies
+// the repo table schema, and returns a handle.
+func openEphemeralPG() (*pgInstance, error) {
+	var buf [4]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return nil, err
+	}
+	port := 15432 + int(buf[0])%100
+
+	pg := embeddedpostgres.NewDatabase(
+		embeddedpostgres.DefaultConfig().
+			Port(uint32(port)).
+			Database("repoid_e2e_test").
+			Username("test").
+			Password("test").
+			Logger(nil),
+	)
+	if err := pg.Start(); err != nil {
+		return nil, fmt.Errorf("embedded-postgres start: %w", err)
+	}
+
+	dsn := fmt.Sprintf(
+		"postgres://test:test@localhost:%d/repoid_e2e_test?sslmode=disable",
+		port,
+	)
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		_ = pg.Stop()
+		return nil, fmt.Errorf("sql.Open ephemeral: %w", err)
+	}
+	db.SetMaxOpenConns(2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), repoIDExtTimeout)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		_ = pg.Stop()
+		return nil, fmt.Errorf("ping ephemeral: %w", err)
+	}
+
+	if err := applyRepoMigrations(ctx, db); err != nil {
+		_ = db.Close()
+		_ = pg.Stop()
+		return nil, fmt.Errorf("apply migrations ephemeral: %w", err)
+	}
+
+	return &pgInstance{
+		db: db,
+		cleanup: func() {
+			_ = db.Close()
+			_ = pg.Stop()
+		},
+	}, nil
+}
+
+func createTestSchema(ctx context.Context, db *sql.DB) (string, error) {
+	var buf [6]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", err
+	}
+	schema := "repoid_e2e_" + hex.EncodeToString(buf[:])
+	if _, err := db.ExecContext(ctx,
+		`CREATE SCHEMA `+quoteIdentRepoID(schema),
+	); err != nil {
+		return "", fmt.Errorf("create schema: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(
+		`SET search_path TO %s, public`, quoteIdentRepoID(schema),
+	)); err != nil {
+		return "", fmt.Errorf("set search_path: %w", err)
+	}
+	return schema, nil
+}
+
+func dropTestSchema(db *sql.DB, schema string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, _ = db.ExecContext(ctx, `DROP SCHEMA `+quoteIdentRepoID(schema)+` CASCADE`)
+}
+
+func quoteIdentRepoID(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// applyRepoMigrations applies the subset of migrations needed
+// for the repo table: 0001 (enums) and 0002 (repo + repo_commit).
+// Full migration set may fail on ephemeral PG without pg_partman.
+func applyRepoMigrations(ctx context.Context, db *sql.DB) error {
+	all, err := migrations.All()
+	if err != nil {
+		return fmt.Errorf("migrations.All: %w", err)
+	}
+	needed := map[string]bool{
+		"0001": true, // enums (some later migrations reference them)
+		"0002": true, // repo + repo_commit tables
+	}
+	for _, mg := range all {
+		if !needed[mg.Version] {
+			continue
+		}
+		body := stripTxnStatements(mg.Up)
+		if _, err := db.ExecContext(ctx, body); err != nil {
+			return fmt.Errorf("apply %s: %w", mg.Filename, err)
+		}
+	}
+	return nil
+}
+
+// stripTxnStatements removes BEGIN/COMMIT/ROLLBACK lines so the
+// migration SQL runs outside an explicit transaction block.
+func stripTxnStatements(body string) string {
+	var out strings.Builder
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(strings.ToUpper(line))
+		if trimmed == "BEGIN;" || trimmed == "COMMIT;" || trimmed == "ROLLBACK;" ||
+			trimmed == "BEGIN" || trimmed == "COMMIT" || trimmed == "ROLLBACK" {
+			continue
+		}
+		out.WriteString(line)
+		out.WriteString("\n")
+	}
+	return out.String()
+}
 
 // ---------------------------------------------------------------------------
 // Scenario state
 // ---------------------------------------------------------------------------
 
 type repoIDExtState struct {
-	// Writer and mock wired per-scenario.
-	writer  *graphwriter.Writer
-	mock    sqlmock.Sqlmock
-	closeFn func()
-
-	// Log buffer captures structured logs for parity-gap assertion.
+	pg     *pgInstance
+	writer *graphwriter.Writer
 	logBuf *bytes.Buffer
 
-	// Inputs computed in Given steps.
 	suppliedID fingerprint.RepoID
 	legacyID   fingerprint.RepoID
 	url        string
 
-	// Output captured in When steps.
 	rec graphwriter.RepoRecord
 	err error
 }
 
-func newRepoIDExtState() *repoIDExtState {
-	return &repoIDExtState{}
-}
-
-// initWriter creates a fresh sqlmock-backed Writer with a log
-// buffer that captures structured output.
-func (st *repoIDExtState) initWriter() {
-	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(
-		sqlmock.QueryMatcherRegexp,
-	))
+// initPG provisions a Postgres connection and Writer. Called once
+// per scenario via the Given step.
+func (st *repoIDExtState) initPG() error {
+	pg, err := openRepoIDExtPG()
 	if err != nil {
-		panic("sqlmock.New: " + err.Error())
+		return fmt.Errorf("provision Postgres: %w", err)
 	}
-	st.mock = mock
+	st.pg = pg
 	st.logBuf = &bytes.Buffer{}
 	logger := slog.New(slog.NewTextHandler(st.logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	st.writer = graphwriter.New(db, logger)
-	st.closeFn = func() { _ = db.Close() }
+	st.writer = graphwriter.New(pg.db, logger)
+	return nil
+}
+
+func (st *repoIDExtState) teardown() {
+	if st.pg != nil {
+		st.pg.cleanup()
+		st.pg = nil
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -66,7 +256,9 @@ func (st *repoIDExtState) initWriter() {
 // ---------------------------------------------------------------------------
 
 func (st *repoIDExtState) anEmptyRepoTableAndANonZeroRepoID() error {
-	st.initWriter()
+	if err := st.initPG(); err != nil {
+		return err
+	}
 	st.url = "https://example.com/acme/widgets.git"
 	var err error
 	st.suppliedID, err = fingerprint.RepoIDFromURL(st.url)
@@ -74,16 +266,8 @@ func (st *repoIDExtState) anEmptyRepoTableAndANonZeroRepoID() error {
 		return err
 	}
 	if st.suppliedID.IsZero() {
-		return godog.ErrPending
+		return fmt.Errorf("RepoIDFromURL returned zero for %q", st.url)
 	}
-
-	// Mock: fresh insert returns the supplied UUID, inserted=true.
-	st.mock.ExpectBegin()
-	st.mock.ExpectQuery(`INSERT\s+INTO\s+repo`).
-		WithArgs(st.suppliedID.String(), st.url, "main", "deadbeef", sqlmock.AnyArg()).
-		WillReturnRows(sqlmock.NewRows([]string{"repo_id", "inserted"}).
-			AddRow(st.suppliedID.String(), true))
-	st.mock.ExpectCommit()
 	return nil
 }
 
@@ -99,7 +283,7 @@ func (st *repoIDExtState) ensureRepoWithIDRuns() error {
 }
 
 func (st *repoIDExtState) theRowRepoIDEqualsTheSuppliedUUID() error {
-	defer st.closeFn()
+	defer st.teardown()
 	if st.err != nil {
 		return st.err
 	}
@@ -112,8 +296,16 @@ func (st *repoIDExtState) theRowRepoIDEqualsTheSuppliedUUID() error {
 	if !st.rec.Inserted {
 		return fmt.Errorf("Inserted = false, want true on fresh insert")
 	}
-	if err := st.mock.ExpectationsWereMet(); err != nil {
-		return fmt.Errorf("unmet sqlmock expectations: %w", err)
+	// Verify persisted row in the database.
+	var dbRepoID string
+	err := st.pg.db.QueryRowContext(context.Background(),
+		`SELECT repo_id::text FROM repo WHERE url = $1`, st.url,
+	).Scan(&dbRepoID)
+	if err != nil {
+		return fmt.Errorf("readback repo row: %w", err)
+	}
+	if dbRepoID != st.suppliedID.String() {
+		return fmt.Errorf("persisted repo_id = %q, want %q", dbRepoID, st.suppliedID.String())
 	}
 	return nil
 }
@@ -123,21 +315,11 @@ func (st *repoIDExtState) theRowRepoIDEqualsTheSuppliedUUID() error {
 // ---------------------------------------------------------------------------
 
 func (st *repoIDExtState) aZeroValueRepoID() error {
-	st.initWriter()
+	if err := st.initPG(); err != nil {
+		return err
+	}
 	st.url = "https://example.com/legacy/path.git"
-	// RepoID deliberately left as zero value.
-	st.suppliedID = fingerprint.RepoID{}
-
-	// The server assigns a UUID via gen_random_uuid().
-	serverAssigned := "99999999-8888-7777-6666-555555555555"
-
-	// Mock: EnsureRepo (legacy path) omits repo_id from INSERT columns.
-	st.mock.ExpectBegin()
-	st.mock.ExpectQuery(`INSERT\s+INTO\s+repo\s*\(\s*url`).
-		WithArgs(st.url, "main", "feedface", sqlmock.AnyArg()).
-		WillReturnRows(sqlmock.NewRows([]string{"repo_id", "inserted"}).
-			AddRow(serverAssigned, true))
-	st.mock.ExpectCommit()
+	st.suppliedID = fingerprint.RepoID{} // zero
 	return nil
 }
 
@@ -153,7 +335,7 @@ func (st *repoIDExtState) ensureRepoRunsLegacyPath() error {
 }
 
 func (st *repoIDExtState) theRowRepoIDIsAllocatedByGenRandomUUIDAndIsNonZero() error {
-	defer st.closeFn()
+	defer st.teardown()
 	if st.err != nil {
 		return st.err
 	}
@@ -161,15 +343,22 @@ func (st *repoIDExtState) theRowRepoIDIsAllocatedByGenRandomUUIDAndIsNonZero() e
 		return fmt.Errorf("RepoID is empty, want server-assigned UUID")
 	}
 	if st.rec.ID.IsZero() {
-		return fmt.Errorf("ID is zero, want non-zero server-assigned UUID")
+		return fmt.Errorf("ID is zero, want non-zero server-assigned UUID via gen_random_uuid()")
 	}
-	// EnsureRepo must not use the (zero) RepoInput.RepoID.
-	expected := "99999999-8888-7777-6666-555555555555"
-	if st.rec.RepoID != expected {
-		return fmt.Errorf("RepoID = %q, want server-assigned %q", st.rec.RepoID, expected)
+	// Verify the persisted row exists and its repo_id matches.
+	var dbRepoID string
+	err := st.pg.db.QueryRowContext(context.Background(),
+		`SELECT repo_id::text FROM repo WHERE url = $1`, st.url,
+	).Scan(&dbRepoID)
+	if err != nil {
+		return fmt.Errorf("readback repo row: %w", err)
 	}
-	if err := st.mock.ExpectationsWereMet(); err != nil {
-		return fmt.Errorf("unmet sqlmock expectations: %w", err)
+	if dbRepoID != st.rec.RepoID {
+		return fmt.Errorf("persisted repo_id = %q, want %q", dbRepoID, st.rec.RepoID)
+	}
+	// Ensure the allocated UUID is valid (36-char UUID format).
+	if len(st.rec.RepoID) != 36 {
+		return fmt.Errorf("RepoID length = %d, want 36 (UUID format)", len(st.rec.RepoID))
 	}
 	return nil
 }
@@ -179,37 +368,37 @@ func (st *repoIDExtState) theRowRepoIDIsAllocatedByGenRandomUUIDAndIsNonZero() e
 // ---------------------------------------------------------------------------
 
 func (st *repoIDExtState) anExistingRowWithURLAndRepoIDA() error {
-	st.initWriter()
+	if err := st.initPG(); err != nil {
+		return err
+	}
 	st.url = "https://x/y"
 
-	var err error
-	// "B" — the precomputed ID the caller supplies.
+	// Insert a legacy row using EnsureRepo (gen_random_uuid() assigns its PK).
+	legacyRec, err := st.writer.EnsureRepo(context.Background(), graphwriter.RepoInput{
+		URL:            st.url,
+		DefaultBranch:  "main",
+		CurrentHeadSHA: "aaa111",
+		LanguageHints:  []string{"go"},
+	})
+	if err != nil {
+		return fmt.Errorf("seed legacy row: %w", err)
+	}
+	st.legacyID = legacyRec.ID
+
+	// Compute the deterministic RepoID the caller would supply.
 	st.suppliedID, err = fingerprint.RepoIDFromURL(st.url)
 	if err != nil {
 		return err
 	}
-
-	// "A" — the legacy UUID that already sits on the row.
-	st.legacyID, err = fingerprint.ParseRepoID("11111111-2222-3333-4444-555555555555")
-	if err != nil {
-		return err
-	}
 	if st.legacyID == st.suppliedID {
-		return fmt.Errorf("test bug: legacyID == suppliedID")
+		return fmt.Errorf("test precondition failed: legacy UUID == deterministic UUID; collision scenario is not exercisable")
 	}
-
-	// Mock: ON CONFLICT fires; RETURNING surfaces the PRE-EXISTING
-	// repo_id and inserted=false.
-	st.mock.ExpectBegin()
-	st.mock.ExpectQuery(`INSERT\s+INTO\s+repo`).
-		WithArgs(st.suppliedID.String(), st.url, "main", "cafebabe", sqlmock.AnyArg()).
-		WillReturnRows(sqlmock.NewRows([]string{"repo_id", "inserted"}).
-			AddRow(st.legacyID.String(), false))
-	st.mock.ExpectCommit()
 	return nil
 }
 
 func (st *repoIDExtState) ensureRepoWithIDRunsWithSameURLAndDifferentRepoID() error {
+	// Reset log buffer to capture only this call's output.
+	st.logBuf.Reset()
 	st.rec, st.err = st.writer.EnsureRepoWithID(context.Background(), graphwriter.RepoInput{
 		URL:            st.url,
 		DefaultBranch:  "main",
@@ -221,7 +410,7 @@ func (st *repoIDExtState) ensureRepoWithIDRunsWithSameURLAndDifferentRepoID() er
 }
 
 func (st *repoIDExtState) theReturnedRepoIDEqualsAAndLogRecordsParityGap() error {
-	defer st.closeFn()
+	defer st.teardown()
 	if st.err != nil {
 		return st.err
 	}
@@ -241,21 +430,26 @@ func (st *repoIDExtState) theReturnedRepoIDEqualsAAndLogRecordsParityGap() error
 		return fmt.Errorf("ID should diverge from supplied RepoID on legacy collision")
 	}
 
+	// Verify the persisted row still has the legacy repo_id.
+	var dbRepoID string
+	err := st.pg.db.QueryRowContext(context.Background(),
+		`SELECT repo_id::text FROM repo WHERE url = $1`, st.url,
+	).Scan(&dbRepoID)
+	if err != nil {
+		return fmt.Errorf("readback repo row: %w", err)
+	}
+	if dbRepoID != st.legacyID.String() {
+		return fmt.Errorf("persisted repo_id = %q, want legacy %q (row must not be re-keyed)",
+			dbRepoID, st.legacyID.String())
+	}
+
 	// Verify structured log records the parity gap.
 	logOutput := st.logBuf.String()
-	if logOutput == "" {
-		return fmt.Errorf("no structured log output captured")
-	}
-	// The Writer logs legacy_collision=true when !rec.Inserted && rec.ID != in.RepoID.
 	if !bytes.Contains(st.logBuf.Bytes(), []byte("legacy_collision")) {
 		return fmt.Errorf(
 			"structured log does not contain 'legacy_collision'; got:\n%s",
 			logOutput,
 		)
-	}
-
-	if err := st.mock.ExpectationsWereMet(); err != nil {
-		return fmt.Errorf("unmet sqlmock expectations: %w", err)
 	}
 	return nil
 }
@@ -265,7 +459,7 @@ func (st *repoIDExtState) theReturnedRepoIDEqualsAAndLogRecordsParityGap() error
 // ---------------------------------------------------------------------------
 
 func InitializeScenario_graphsink_storage_abstraction_repoid_extension_to_repoinput(ctx *godog.ScenarioContext) {
-	st := newRepoIDExtState()
+	st := &repoIDExtState{}
 
 	// Scenario: ensurerepowithid-deterministic-insert
 	ctx.Given(`^an empty "repo" table and a non-zero "RepoInput\.RepoID"$`, st.anEmptyRepoTableAndANonZeroRepoID)

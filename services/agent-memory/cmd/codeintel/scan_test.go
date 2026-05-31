@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphsink"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphsink/memory"
@@ -484,5 +487,80 @@ func TestScanRescanIdempotentReportsSameGraph(t *testing.T) {
 		if first.Edges[k] != second.Edges[k] {
 			t.Errorf("rescan edges[%q]: first=%d, second=%d (must match)", k, first.Edges[k], second.Edges[k])
 		}
+	}
+}
+
+// TestScanPropagatesSinkCloseError verifies the iter-3 fix: a
+// sink.Close() failure (e.g. memory backend's --out write failing)
+// must cause runScan to return a non-zero error, not be silently
+// logged via the deferred close.
+func TestScanPropagatesSinkCloseError(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "x.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	root := defaultRootFlags()
+	root.store = "memory"
+	root.logFormat = "text"
+	flags := &scanFlags{}
+	var buf bytes.Buffer
+	closeCalls := 0
+	wantErr := os.ErrPermission
+	runner := scanRunner{
+		stdout: &buf,
+		openSink: func(_ context.Context, _, _ string) (graphsink.Sink, func() error, error) {
+			return memory.New(memory.Options{}), func() error {
+				closeCalls++
+				return wantErr
+			}, nil
+		},
+	}
+	err := runScan(context.Background(), &root, flags, dir, runner)
+	if err == nil {
+		t.Fatalf("expected runScan to return sink-close error, got nil")
+	}
+	if !strings.Contains(err.Error(), "sink close") {
+		t.Errorf("error should mention sink close, got: %v", err)
+	}
+	if closeCalls != 1 {
+		t.Errorf("expected sinkClose called exactly once, got %d", closeCalls)
+	}
+	// Summary should still have been written before the error.
+	if !strings.Contains(buf.String(), "walked:") {
+		t.Errorf("summary should be rendered before close-error propagation; got:\n%s", buf.String())
+	}
+}
+
+// TestSkipTallyConcurrentSafe verifies the iter-3 fix: skipTally
+// is safe under concurrent slog.Handler.Handle calls. The race
+// detector (`go test -race`) flags the unsynchronised map write.
+func TestSkipTallyConcurrentSafe(t *testing.T) {
+	tally := newSkipTally()
+	h := tally.tee(nil)
+	const goroutines = 16
+	const iters = 200
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				r := slog.NewRecord(time.Time{}, slog.LevelInfo, "ast.dispatch.skip", 0)
+				r.AddAttrs(
+					slog.String("reason", "no_parser"),
+					slog.String("file", "fixture.c"),
+				)
+				_ = h.Handle(context.Background(), r)
+				_ = tally.totalCount()
+			}
+		}()
+	}
+	wg.Wait()
+	got := tally.snapshot()
+	if want := goroutines * iters; got.ByReason["no_parser"] != want {
+		t.Errorf("ByReason[no_parser]: got %d, want %d", got.ByReason["no_parser"], want)
+	}
+	if got.ByExt[".c"] != goroutines*iters {
+		t.Errorf("ByExt[.c]: got %d, want %d", got.ByExt[".c"], goroutines*iters)
 	}
 }

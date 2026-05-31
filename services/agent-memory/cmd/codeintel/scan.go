@@ -109,8 +109,8 @@ func newScanCmdImpl(root *rootFlags) *cobra.Command {
 	cmd.Flags().StringVar(&flags.out, "out", "",
 		"Output path. For --store=sqlite the .db file path; for --store=memory the "+
 			"JSON export file path (omit to skip the export). When omitted and --store=sqlite, "+
-			"the persistent --db value is used; if neither is set the scan fails with a "+
-			"clear error.")
+			"the persistent --db value is used; if both are omitted a SQLite path is "+
+			"synthesised from the input (see scan.default_sqlite_path log line).")
 	cmd.Flags().StringSliceVar(&flags.langHints, "lang-hints", nil,
 		"Comma-separated language hints (e.g. --lang-hints=python,typescript). "+
 			"Forwarded to AncestryWriter.EnsureRepo and to the dispatcher as a "+
@@ -196,12 +196,24 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 		return fmt.Errorf("scan: open store %q: %w", root.store, err)
 	}
 	// sinkCloseErr captures a deferred export/close failure so
-	// it can be surfaced as the scan's overall result. Without
-	// this the memory backend's JSON write error (see
-	// graphsink/memory/sink.go) would be silently logged.
-	var sinkCloseErr error
+	// it can be surfaced as the scan's overall result. The happy
+	// path below calls sinkClose() explicitly (so its error is
+	// part of the return value); the defer is a safety net that
+	// fires on early-return paths and is a no-op once closed is
+	// flipped.
+	var (
+		sinkCloseErr error
+		sinkClosed   bool
+	)
+	closeSink := func() error {
+		if sinkClosed {
+			return nil
+		}
+		sinkClosed = true
+		return sinkClose()
+	}
 	defer func() {
-		if cerr := sinkClose(); cerr != nil {
+		if cerr := closeSink(); cerr != nil {
 			sinkCloseErr = cerr
 			slog.Warn("scan.sink_close_failed", "error", cerr.Error())
 		}
@@ -313,6 +325,14 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 		return fmt.Errorf("scan: flush: %w", ferr)
 	}
 
+	// Close the sink BEFORE writing the summary so its export
+	// error (e.g. memory backend's --out JSON write) reaches
+	// the operator as a non-zero exit instead of a deferred log
+	// line. The deferred closeSink() above becomes a no-op.
+	if cerr := closeSink(); cerr != nil {
+		sinkCloseErr = cerr
+	}
+
 	// 9. Render the summary. JSON when --log=json so the line
 	// is mechanically parseable; text otherwise.
 	sum := scanSummary{
@@ -333,7 +353,7 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 	if sinkCloseErr != nil {
 		// Propagate a failed --out / sink.Close so an
 		// unwritable export does not look like a clean scan
-		// (per evaluator iter-1 feedback item 6).
+		// (per evaluator iter-1 feedback item 6 / iter-3 item 1).
 		return fmt.Errorf("scan: sink close: %w", sinkCloseErr)
 	}
 	return nil
@@ -622,7 +642,14 @@ func (c *countingSink) snapshotEdges() map[string]int {
 // dispatcher's `ast.dispatch.skip` events and groups them by
 // reason. The wrapped handler still receives the record so the
 // operator's structured log stream is unchanged.
+//
+// The handler contract allows concurrent Handle calls from
+// multiple goroutines; the tally is therefore mutex-guarded.
+// The current scan walk is sequential, but the dispatcher's
+// future parallel walk (architecture S7.4) would race without
+// this lock.
 type skipTally struct {
+	mu     sync.Mutex
 	counts map[string]int
 	byExt  map[string]int
 }
@@ -665,6 +692,7 @@ func (h *skipHandler) Handle(ctx context.Context, r slog.Record) error {
 		if reason == "" {
 			reason = "unknown"
 		}
+		h.tally.mu.Lock()
 		h.tally.counts[reason]++
 		if reason == "no_parser" && file != "" {
 			ext := strings.ToLower(filepath.Ext(file))
@@ -673,6 +701,7 @@ func (h *skipHandler) Handle(ctx context.Context, r slog.Record) error {
 			}
 			h.tally.byExt[ext]++
 		}
+		h.tally.mu.Unlock()
 	}
 	return h.inner.Handle(ctx, r)
 }
@@ -691,6 +720,8 @@ type skipSnapshot struct {
 }
 
 func (t *skipTally) snapshot() skipSnapshot {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	br := make(map[string]int, len(t.counts))
 	for k, v := range t.counts {
 		br[k] = v
@@ -707,6 +738,8 @@ func (t *skipTally) snapshot() skipSnapshot {
 // as a skip (no_parser, pwsh_not_available, ...) and avoid
 // counting it as parsed.
 func (t *skipTally) totalCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	n := 0
 	for _, v := range t.counts {
 		n += v

@@ -173,7 +173,7 @@ The two P0 scenarios shipped today are:
 See [`tests/e2e/cleanc/README.md`](../../tests/e2e/cleanc/README.md)
 for the normalisation strategy and how to add new scenarios.
 
-## `cleanc` CLI
+## cleanc CLI
 
 `bin/cleanc` is the single-binary, no-server developer-laptop CLI
 delivered for the `code-intelligence:REFACTOR-GUIDE` story. It walks a

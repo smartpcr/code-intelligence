@@ -7,7 +7,7 @@ Feature: Documentation and Release Notes
 
   Scenario: README has cleanc section
     Given the updated "services/clean-code/README.md"
-    When grep -F "cleanc` CLI" runs against it
+    When grep -F "## cleanc CLI" runs against it
     Then it returns at least one match
 
   Scenario: usage doc references flags

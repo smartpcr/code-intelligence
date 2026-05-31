@@ -157,15 +157,24 @@ func OpenSchema(t *testing.T) *Fixture {
 		_ = owner.Close()
 		t.Fatalf("pgtest: CREATE SCHEMA %q: %v", schema, err)
 	}
+	// From here on, the per-test schema EXISTS on the cluster.
+	// Every failure path below MUST drop it before closing
+	// `owner` (dropSchema needs a live connection), otherwise
+	// the schema + its partman.part_config rows leak. The
+	// previous shape only registered the cleanup AFTER the
+	// pool succeeded, so SET search_path / migrations.Up /
+	// NewPool failures leaked the freshly-created schema.
 
 	if _, err := owner.ExecContext(ctx, fmt.Sprintf(
 		`SET search_path TO %s, public, partman`, quoteIdent(schema),
 	)); err != nil {
+		dropSchema(owner, schema)
 		_ = owner.Close()
 		t.Fatalf("pgtest: SET search_path: %v", err)
 	}
 
 	if err := migrations.New(owner).Up(ctx); err != nil {
+		dropSchema(owner, schema)
 		_ = owner.Close()
 		t.Fatalf("pgtest: migrations.Up: %v", err)
 	}
@@ -188,11 +197,23 @@ func OpenSchema(t *testing.T) *Fixture {
 		Schema: schema,
 		DSN:    dsn,
 	}
-	fx.cleanups = append(fx.cleanups, func() { pool.Close() })
+	// Cleanup registration order is APPEND-order; `Fixture.Close`
+	// runs the slice in LIFO. The required real-world order is:
+	//   1. close the pgxpool (release any open pg backends)
+	//   2. drop the schema CASCADE + scrub partman rows
+	//      (REQUIRES `owner` to still be open)
+	//   3. close the owner *sql.DB
+	// To get that LIFO playback the appends below must run in
+	// REVERSE: owner.Close first, dropSchema second,
+	// pool.Close last. The previous shape appended in forward
+	// order and `Close` happily closed `owner` BEFORE
+	// `dropSchema` ran, after which dropSchema's swallowed
+	// errors silently no-op'd and the schema leaked.
+	fx.cleanups = append(fx.cleanups, func() { _ = owner.Close() })
 	fx.cleanups = append(fx.cleanups, func() {
 		dropSchema(owner, schema)
 	})
-	fx.cleanups = append(fx.cleanups, func() { _ = owner.Close() })
+	fx.cleanups = append(fx.cleanups, func() { pool.Close() })
 
 	t.Cleanup(fx.Close)
 	return fx

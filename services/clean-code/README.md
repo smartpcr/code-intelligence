@@ -67,6 +67,7 @@ services/clean-code/
 ```
 cd services/clean-code
 make build      # builds bin/<cmd> for every cmd/*/main.go (see CMD_DIRS in Makefile)
+make build-prod # same fleet built with `-tags prod`, plus bin/cleanc-prod alias
 make test       # go test -count=1 ./... (portable; no -race)
 make test-race  # go test -race -count=1 ./... (CGO; Linux CI only)
 make lint       # golangci-lint run ./...
@@ -75,6 +76,30 @@ make lint       # golangci-lint run ./...
 `make test` is the portable target invoked from any developer laptop.
 `make test-race` is the same suite with the race detector on and is
 what CI runs on Linux runners where CGO is available.
+
+### Build-tag matrix (dev vs. prod)
+
+The `cleanc` CLI ships in two flavours selected at compile time via
+Go build tags. `make build` emits the **dev** binary (no build tag);
+`make build-prod` emits the **prod** binary (`-tags prod`) and an
+explicit `bin/cleanc-prod` alias. The two flavours differ only in
+`internal/cli/devpolicy`: `unsigned_dev.go` carries `//go:build !prod`
+and ships the YAML-decoding unsigned-policy loader the dev mode
+needs, while `unsigned_prod.go` carries `//go:build prod` and ships
+a sentinel loader whose `Load` always returns
+`devpolicy.ErrDevModeUnavailable` (`"devpolicy: dev-mode policy
+bypass not available in prod build"`) at the earliest reachable
+layer (architecture Sec 7.2). The mutual-exclusion is compile-time
+fused -- a prod binary literally does not link the YAML decoder, so
+the unsigned-policy bypass cannot be smuggled in via a flag, env
+var, or hidden subcommand. The `build-prod` job in
+`.github/workflows/clean-code-ci.yml` enforces both halves: it runs
+`make build-prod` (proving the prod binary compiles) and then
+`go test -tags prod -run TestProdBuildExcludesDevBypass
+./internal/cli/devpolicy/...` (proving the sentinel ships in place
+of the loader). The guarantee lives in a build-tag-gated unit
+test, NOT in a hidden CLI subcommand, because architecture Sec 3.6
+and tech-spec Sec 4.1 pin the CLI surface to four subcommands only.
 
 The local dependency stack (PostgreSQL 16 with `pgcrypto`, Prometheus
 scrape target, OTel Collector, plus the clean-code service container

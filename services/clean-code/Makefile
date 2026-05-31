@@ -68,20 +68,32 @@ build:
 	    $(GO) build -o $(BIN_DIR)/$$cmd ./cmd/$$cmd || exit $$?; \
 	done
 
-## build-prod: compile every `cmd/` binary with `-tags prod`.
+## build-prod: compile every `cmd/` binary with `-tags prod`,
+## then emit the spec-pinned `bin/cleanc-prod` alias for the
+## `cmd/cleanc` entrypoint.
+##
 ## The prod build tag flips `flags.DefaultDevMode` to false and
 ## activates the `prodSentinelLoader` in `internal/cli/devpolicy`
 ## so that unsigned rule-pack bypass is excluded at compile time
 ## (architecture.md Sec 1.6, "policy-signing-required"; tech-spec
 ## Sec 8.9, "Build-tag matrix"). Referenced by USAGE.md §2.1 and
 ## by the `build-prod` job in `.github/workflows/clean-code-ci.yml`
-## (implementation-plan.md Stage 1.4).
+## (implementation-plan.md Stage 1.4 and Stage 5.1
+## "Build Tag Matrix"). The Stage 5.1 workstream brief pins the
+## artifact name `bin/cleanc-prod`; the explicit second invocation
+## below produces exactly that path so downstream tooling
+## (release packaging, docker contexts) can locate the prod
+## CLI artifact at the spec-literal location while the loop
+## above keeps every other `cmd/*` package honest under
+## `//go:build prod`.
 build-prod:
 	@mkdir -p $(BIN_DIR)
 	@for cmd in $(CMD_DIRS); do \
 	    echo "$(GO) build -tags prod -o $(BIN_DIR)/$$cmd ./cmd/$$cmd"; \
 	    $(GO) build -tags prod -o $(BIN_DIR)/$$cmd ./cmd/$$cmd || exit $$?; \
 	done
+	@echo "$(GO) build -tags prod -o $(BIN_DIR)/cleanc-prod ./cmd/cleanc"
+	@$(GO) build -tags prod -o $(BIN_DIR)/cleanc-prod ./cmd/cleanc
 
 ## test: run the full Go test suite. CI overrides via
 ## `test-nocgo` / `test-cgo` for explicit CGO mode pinning.

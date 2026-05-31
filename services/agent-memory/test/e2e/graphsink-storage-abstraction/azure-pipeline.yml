@@ -55,7 +55,16 @@ steps:
       go test -tags e2e -v -count=1 -timeout 120s \
         -run TestE2E_graphsink_storage_abstraction_sink_interface_skeleton \
         ./test/e2e/code-intelligence-REPO-SCANNER/...
-    displayName: "Run E2E scenarios"
+    displayName: "Run E2E scenarios — sink-interface-skeleton"
+    env:
+      AGENT_MEMORY_PG_URL: $(AGENT_MEMORY_PG_URL)
+
+  - script: |
+      cd services/agent-memory
+      go test -tags e2e -v -count=1 -timeout 120s \
+        -run TestE2E_graphsink_storage_abstraction_repoid_extension_to_repoinput \
+        ./test/e2e/code-intelligence-REPO-SCANNER/...
+    displayName: "Run E2E scenarios — repoid-extension-to-repoinput"
     env:
       AGENT_MEMORY_PG_URL: $(AGENT_MEMORY_PG_URL)
 

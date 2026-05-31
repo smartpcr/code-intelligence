@@ -173,7 +173,99 @@ The two P0 scenarios shipped today are:
 See [`tests/e2e/cleanc/README.md`](../../tests/e2e/cleanc/README.md)
 for the normalisation strategy and how to add new scenarios.
 
-## Stage 1.1 -- `cleanc` CLI binary
+## `cleanc` CLI
+
+`bin/cleanc` is the single-binary, no-server developer-laptop CLI
+delivered for the `code-intelligence:REFACTOR-GUIDE` story. It walks a
+local repo, evaluates the embedded rule packs, and writes a markdown
+report + JSON sidecars (+ an optional JSONL refactor-prompt stream for
+AI coders). There is no PostgreSQL, no HTTP gateway, and no docker
+stack -- everything ships in one statically-linked Go binary.
+
+End-user docs:
+
+- [`docs/cleanc/USAGE.md`](../../docs/cleanc/USAGE.md) -- operator
+  walkthrough: P0 (`analyze` + report), P1 (`--emit-prompts` workflow
+  with an AI coder), dev-mode banner, build-tag matrix.
+- [`docs/cleanc/PROMPT-FORMAT.md`](../../docs/cleanc/PROMPT-FORMAT.md)
+  -- the `RefactorPromptRecord` JSONL contract consumed by AI coders.
+
+### Install
+
+```bash
+cd services/clean-code
+make build            # emits bin/cleanc (dev build, --dev-mode default true)
+make build-prod       # emits bin/cleanc-prod (-tags prod, --dev-mode default false)
+```
+
+`make build` writes one binary per `cmd/*/main.go` under `bin/`; the
+`cleanc` entry lives at `bin/cleanc`. The prod variant additionally
+emits `bin/cleanc-prod` so the two flavours can coexist in the same
+working tree.
+
+### Basic usage
+
+```bash
+bin/cleanc analyze <repo-path>                          # report to stdout
+bin/cleanc analyze . --out report.md                    # report to file
+bin/cleanc analyze . --out report.md --findings findings.json
+bin/cleanc analyze . --emit-prompts prompts.jsonl       # P1 AI-coder hand-off
+bin/cleanc version                                      # version + parsers + rule-packs
+bin/cleanc help analyze                                 # per-verb usage
+```
+
+Sub-command surface (the dispatcher's closed set):
+
+| Verb      | Status             | Purpose                                                                                |
+| --------- | ------------------ | -------------------------------------------------------------------------------------- |
+| `analyze` | implemented        | Walk a repo, evaluate the rule engine, write a markdown report + JSON sidecars (+ optional `--emit-prompts` JSONL). |
+| `report`  | implemented        | Re-render markdown from a previously written `findings.json`.                          |
+| `version` | implemented        | Print binary version + build tag + parser set + rule-pack set.                         |
+| `apply`   | reserved (exit 64) | Apply a refactor task; pending operator pin `cli-l7-authority` (architecture Sec 6.3). |
+| `help`    | implemented        | Print global usage (no arg) or per-verb usage (`cleanc help <verb>`).                  |
+
+### Flag table (tech-spec Sec 8.1)
+
+Every flag below is registered on **both** `analyze` and `report` so
+the two verbs share a byte-identical surface. The defaults are pinned
+in `services/clean-code/internal/cli/flags` and asserted by
+`flags_test.go` -- the source mirrors this contract; any drift is a
+bug in the source, not in this document (per the repo / story
+"docs win" authority rule).
+
+| Flag                     | Default          | Purpose                                                                                          |
+| ------------------------ | ---------------- | ------------------------------------------------------------------------------------------------ |
+| `--out <path>`           | stdout (`""`)    | Markdown report path.                                                                            |
+| `--findings <path>`      | `findings.json`  | Machine-readable run artifact (JSON sidecar).                                                    |
+| `--emit-prompts <path>`  | unset (`""`)     | L7 Option A JSONL refactor-prompt emitter; empty disables emission.                              |
+| `--policy <path>`        | embedded (`""`)  | Override the embedded rule packs with a directory of YAML files.                                 |
+| `--with-churn`           | `false`          | Reserved for P2; rejected in P0/P1 with exit 64.                                                 |
+| `--top-n <int>`          | `0`              | Hot-spot table cap; `0` means "use policy default of 20" (`PolicyDefaultTopN`).                  |
+| `--exit-on <sev>`        | `block`          | Severity threshold for exit 1; closed set `{info, warn, block}`.                                 |
+| `--diagnostics <path>`   | unset (`""`)     | Dark-metric inventory + effort-source JSON sidecar; empty disables emission.                     |
+| `--dev-mode`             | build-tag paired | `true` on `make build`, `false` on `make build-prod` (`-tags prod`).                             |
+| `--telemetry-otlp <url>` | unset (`""`)     | Reserved for a future story; rejected in P0/P1 with exit 64.                                     |
+
+The `--snippet-cap-lines <int>` flag is **reserved** for a future minor
+release (tech-spec Sec 8.2) and is not registered today; the
+dispatcher pre-scans argv for it and exits 64 with a literal
+`reserved for a future minor release` stderr substring.
+
+### Exit-code matrix (tech-spec Sec 8.6)
+
+| Code | BSD name      | When the dispatcher returns it                                                                   |
+| ---- | ------------- | ------------------------------------------------------------------------------------------------ |
+| `0`  | (success)     | Clean run; no `--exit-on` severity threshold tripped.                                            |
+| `1`  | (find)        | Clean run; maximum finding severity met or exceeded `--exit-on`.                                 |
+| `2`  | (walker)      | Walker failure -- missing root path, permission denied, non-readable directory.                   |
+| `64` | `EX_USAGE`    | Invalid usage: bad/unknown flag, missing/surplus positional, reserved verb (`apply`) or reserved flag (`--telemetry-otlp`, `--with-churn`, `--snippet-cap-lines`). |
+| `70` | `EX_SOFTWARE` | Internal engine error: parser panic, rule-engine internal error, non-canonical TaskKind reached the emitter, renderer I/O failure. |
+
+No other codes are emitted in P0/P1. Codes `3`-`63` and `65`-`69` are
+reserved for forward compatibility (P3 may add `3` for "patch apply
+conflict"); the dispatcher MUST NOT alias them today.
+
+### Stage 1.1 -- `cleanc` CLI binary
 
 `bin/cleanc` is the Stage 1.1 deliverable -- a single-binary, no-server
 dev-laptop CLI for `cleanc analyze <repo-path>` (see workstream

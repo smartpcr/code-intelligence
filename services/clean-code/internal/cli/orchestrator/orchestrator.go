@@ -235,6 +235,17 @@ type Result struct {
 	// reason [SkipReasonScopeBindingError] and does NOT
 	// appear here).
 	ScopeIDs map[ScopeBindingKey]uuid.UUID
+
+	// Diagnostics carries the run's dark-metric (Stage 2.5)
+	// and future diagnostic rows. Always non-nil:
+	// [Diagnostics.DarkMetrics] is `[]DarkMetric{}` when
+	// every recipe lit up. The CLI's `--diagnostics` JSON
+	// sidecar serialises this struct directly and the
+	// report writer's diagnostics section reads it
+	// verbatim. Per tech-spec REFACTOR-GUIDE Sec 8.7 the
+	// orchestrator is the sole producer; downstream layers
+	// MUST NOT add or rewrite rows after Run returns.
+	Diagnostics Diagnostics
 }
 
 // Run executes the Stage 2.2 pipeline against `rootPath`:
@@ -278,7 +289,10 @@ func (o *Orchestrator) Run(ctx context.Context, repoCtx repocontext.RepoContext,
 		return nil, fmt.Errorf("orchestrator: repoCtx.HeadSHA must not be empty")
 	}
 
-	result := &Result{ScopeIDs: map[ScopeBindingKey]uuid.UUID{}}
+	result := &Result{
+		ScopeIDs:    map[ScopeBindingKey]uuid.UUID{},
+		Diagnostics: Diagnostics{DarkMetrics: []DarkMetric{}},
+	}
 
 	filesCh, skipsCh, errsCh := o.walker.Walk(ctx, rootPath)
 
@@ -368,15 +382,26 @@ func (o *Orchestrator) Run(ctx context.Context, repoCtx repocontext.RepoContext,
 		o.mintBindings(ast, repoCtx, result, appendSkip)
 	}
 
+	dark := newDarkMetricAccumulator()
 	var drafts []recipes.MetricSampleDraft
 	for _, ast := range asts {
 		for _, recipe := range o.recipeReg.Recipes() {
 			if !recipe.AppliesTo(ast) {
+				// Stage 2.5: attribute the no-op to a
+				// missing parser-attr capability when
+				// the recipe's metric_kind is in the
+				// [metricAttrRequirements] table.
+				// Recipes that returned false for
+				// reasons OUTSIDE the dark-metric
+				// taxonomy (degraded AST, nil input)
+				// are silently ignored by `observe`.
+				dark.observe(recipe.MetricKind(), ast)
 				continue
 			}
 			drafts = append(drafts, recipe.Compute(ast)...)
 		}
 	}
+	result.Diagnostics = dark.finalize()
 
 	for _, projectRecipe := range o.projectRecReg.All() {
 		drafts = append(drafts, projectRecipe.ComputeProject(asts)...)

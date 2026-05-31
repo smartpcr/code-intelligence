@@ -106,7 +106,9 @@ func TestTextLogHandlerDefault(t *testing.T) {
 // `log-flag-respected`: when --log=json is set, the log line a
 // scaffolded subcommand emits must be parseable by
 // encoding/json. We capture stderr (where slog writes) and feed
-// it to json.Unmarshal.
+// it to json.Unmarshal. Uses `scan-many` because it still routes
+// through the `notImplemented` scaffold log line; `scan` is now
+// fully implemented and emits its own log/summary instead.
 func TestSubcommandJSONLogIsValidJSON(t *testing.T) {
 	var out, errOut bytes.Buffer
 	root := newRootCmd(&out, &errOut)

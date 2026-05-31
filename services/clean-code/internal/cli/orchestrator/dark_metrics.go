@@ -90,9 +90,12 @@ type metricAttrRow struct {
 	// evaluated had the attr been stamped").
 	//
 	// Mirroring the recipe Compute bodies:
-	//   - cyclo / cognitive_complexity: every method +
-	//     the file-level scope (one file-level draft per
-	//     method-bearing file).
+	//   - cyclo: every method scope (file-level scope
+	//     excluded -- cyclo evaluates per-function
+	//     complexity, not file-aggregated totals).
+	//   - cognitive_complexity: every method + the file-
+	//     level scope (one file-level draft per method-
+	//     bearing file).
 	//   - fan_in / fan_out: every method, class, and the
 	//     file-level scope.
 	//   - lcom4: every class scope (one draft per class).
@@ -115,7 +118,7 @@ var metricAttrRequirements = []metricAttrRow{
 	{
 		Kind:               "cyclo",
 		Attrs:              []string{darkAttrDecisionBlocks},
-		AffectedScopeKinds: []parser.ScopeKind{parser.ScopeKindMethod, parser.ScopeKindFile},
+		AffectedScopeKinds: []parser.ScopeKind{parser.ScopeKindMethod},
 	},
 	{
 		Kind:               "cognitive_complexity",
@@ -253,9 +256,9 @@ type DarkMetric struct {
 // rather than at top-level on `Result` so the
 // `--diagnostics` JSON sidecar has a single root.
 //
-// Stage 2.5 emits only `DarkMetrics`; the struct is open
-// for additional fields without a breaking change because
-// every consumer reads named fields.
+// Stage 2.5 emits `DarkMetrics` + `EffortSource`; the
+// struct is open for additional fields without a breaking
+// change because every consumer reads named fields.
 type Diagnostics struct {
 	// DarkMetrics is the deduped, sorted slice of
 	// [DarkMetric] rows. One row per `(MetricKind,
@@ -264,6 +267,18 @@ type Diagnostics struct {
 	// determinism (tech-spec D9). Empty slice (NOT nil)
 	// when every recipe lit up for every language.
 	DarkMetrics []DarkMetric `json:"dark_metrics"`
+
+	// EffortSource is the stable, lowercase, snake_case
+	// identifier of the effort estimator the orchestrator
+	// resolved for this run. When the ONNX model is
+	// unavailable (the default offline/dev scenario), the
+	// value is [effort.FallbackEstimatorName] ("fallback").
+	// Stamped by the orchestrator at the end of Run so
+	// the `--diagnostics` JSON sidecar records which
+	// effort source produced the per-task hours values.
+	//
+	// Anchor: tech-spec Sec 9.3 ("Effort model fallback").
+	EffortSource string `json:"effort_source"`
 }
 
 // darkMetricKey is the dedup key the orchestrator uses
@@ -385,4 +400,22 @@ func (a *darkMetricAccumulator) finalize() Diagnostics {
 		return a.Language < b.Language
 	})
 	return out
+}
+
+// validateBogusAttrRow exercises the production
+// [validateMetricAttrRequirements] function with a single row
+// whose Attrs contains "bogus_attr" — a value NOT in the
+// closed [allowedDarkAttrs] set. Returns the error from the
+// production validation path so callers (including the E2E
+// subprocess helper) can assert both the exit code and the
+// tech-spec Sec 8.7 error string without mirroring the
+// validation logic.
+//
+// Re-exported for test builds via export_test.go.
+func validateBogusAttrRow() error {
+	return validateMetricAttrRequirements([]metricAttrRow{{
+		Kind:               "bogus_metric",
+		Attrs:              []string{"bogus_attr"},
+		AffectedScopeKinds: []parser.ScopeKind{parser.ScopeKindMethod},
+	}})
 }

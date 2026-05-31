@@ -21,6 +21,7 @@ import (
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/effort"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/repocontext"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/scopebinding"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/walk"
@@ -133,19 +134,28 @@ type Options struct {
 	// quiet; the CLI composition root injects the
 	// `cleanc`-shaped logger.
 	Logger *slog.Logger
+
+	// EffortEstimator is the effort source the
+	// orchestrator stamps into [Diagnostics.EffortSource].
+	// Defaults to [effort.NewFallbackModel] when nil —
+	// the deterministic linear model that is always
+	// available even when the ONNX runtime is missing
+	// (tech-spec Sec 9.3).
+	EffortEstimator effort.Estimator
 }
 
 // Orchestrator drives the Stage 2.2 parse + recipe pipeline.
 // Construct via [New]; the public surface is the single
 // [Orchestrator.Run] method.
 type Orchestrator struct {
-	walker        walk.Walker
-	parsers       *parser.Registry
-	recipeReg     *recipes.Registry
-	projectRecReg *recipes.ProjectRegistry
-	scopeBindings *scopebinding.Table
-	workers       int
-	logger        *slog.Logger
+	walker          walk.Walker
+	parsers         *parser.Registry
+	recipeReg       *recipes.Registry
+	projectRecReg   *recipes.ProjectRegistry
+	scopeBindings   *scopebinding.Table
+	workers         int
+	logger          *slog.Logger
+	effortEstimator effort.Estimator
 }
 
 // New returns an Orchestrator with the supplied options;
@@ -153,13 +163,14 @@ type Orchestrator struct {
 // documented on [Options].
 func New(opts Options) *Orchestrator {
 	o := &Orchestrator{
-		walker:        opts.Walker,
-		parsers:       opts.Parsers,
-		recipeReg:     opts.Recipes,
-		projectRecReg: opts.ProjectRecipes,
-		scopeBindings: opts.ScopeBindings,
-		workers:       opts.Workers,
-		logger:        opts.Logger,
+		walker:          opts.Walker,
+		parsers:         opts.Parsers,
+		recipeReg:       opts.Recipes,
+		projectRecReg:   opts.ProjectRecipes,
+		scopeBindings:   opts.ScopeBindings,
+		workers:         opts.Workers,
+		logger:          opts.Logger,
+		effortEstimator: opts.EffortEstimator,
 	}
 	if o.walker == nil {
 		o.walker = walk.NewDefaultWalker()
@@ -184,6 +195,9 @@ func New(opts Options) *Orchestrator {
 	}
 	if o.logger == nil {
 		o.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if o.effortEstimator == nil {
+		o.effortEstimator = effort.NewFallbackModel()
 	}
 	return o
 }
@@ -434,6 +448,7 @@ func (o *Orchestrator) Run(ctx context.Context, repoCtx repocontext.RepoContext,
 		}
 	}
 	result.Diagnostics = dark.finalize()
+	result.Diagnostics.EffortSource = o.effortEstimator.Name()
 
 	for _, projectRecipe := range o.projectRecReg.All() {
 		drafts = append(drafts, projectRecipe.ComputeProject(asts)...)

@@ -150,9 +150,9 @@ func TestOrchestrator_Run_DarkMetrics_EmittedForDarkRecipes(t *testing.T) {
 
 	// Pin EXACT-floor expectations on the Go file to cover
 	// both branches of countAffectedScopes:
-	//   * cyclo  -> AffectedScopeKinds = {method, file}
+	//   * cyclo  -> AffectedScopeKinds = {method}
 	//              fixture: 2 methods (Widget.Run, TopLevel)
-	//              + 1 file scope == at least 3.
+	//              == at least 2.
 	//   * lcom4  -> AffectedScopeKinds = {class}
 	//              fixture: 1 struct (Widget) == at least 1.
 	// Together these guarantee both the multi-kind and the
@@ -162,8 +162,8 @@ func TestOrchestrator_Run_DarkMetrics_EmittedForDarkRecipes(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected (cyclo, go) row, got rows=%+v", res.Diagnostics.DarkMetrics)
 	}
-	if cycloGo.AffectedScopeCount < 3 {
-		t.Errorf("(cyclo,go).AffectedScopeCount = %d, want >= 3 (fixture has two methods + one file scope; cyclo's AffectedScopeKinds = {method, file})", cycloGo.AffectedScopeCount)
+	if cycloGo.AffectedScopeCount < 2 {
+		t.Errorf("(cyclo,go).AffectedScopeCount = %d, want >= 2 (fixture has two methods; cyclo's AffectedScopeKinds = {method})", cycloGo.AffectedScopeCount)
 	}
 
 	lcom4Go, ok := got[key{"lcom4", "go"}]

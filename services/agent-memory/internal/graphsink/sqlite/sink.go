@@ -371,20 +371,15 @@ func (s *Sink) runInTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 //
 // IDENTITY POLICY (cross-backend parity, S3.4):
 //
-//   - When `in.RepoID` is the zero value, a fresh insert
-//     synthesises a new UUID via `uuid.NewString()`. This
-//     matches `*graphwriter.Writer.EnsureRepo`'s
-//     `gen_random_uuid()` default and preserves the pre-Stage-3.4
-//     CLI behaviour.
-//   - When `in.RepoID` is non-zero (the deterministic
-//     `fingerprint.RepoIDFromURL(URL)` path), the SQLite Sink
-//     PERSISTS that exact UUID as the row's `repo_id` on a fresh
-//     insert. This matches the Postgres `EnsureRepoWithID`
-//     contract and is the path the `codeintel scan` CLI uses so
-//     a repo scanned to SQLite carries the SAME `repo_id` as the
-//     same repo scanned to Postgres -- a prerequisite for node /
-//     edge fingerprint parity, because fingerprints embed
-//     `repo_id` (see `fingerprint.NodeFingerprint`).
+//   - `in.RepoID` MUST be non-zero. Unlike the Postgres
+//     adapter (which can fall back to `gen_random_uuid()`),
+//     the SQLite Sink has no server-side UUID generation and
+//     requires the caller to precompute a deterministic
+//     RepoID via `fingerprint.RepoIDFromURL(URL)`. A zero
+//     RepoID is rejected at construction time with a clear
+//     error message. This enforces the cross-backend identity
+//     invariant: a repo scanned to SQLite carries the SAME
+//     `repo_id` as the same repo scanned to Postgres.
 //   - On a URL conflict the mutable columns are overwritten and
 //     the PRE-EXISTING `repo_id` is returned with
 //     `Inserted = false`; the `repo_id` PK is NEVER re-keyed,
@@ -399,6 +394,12 @@ func (s *Sink) EnsureRepo(ctx context.Context, in graphwriter.RepoInput) (graphw
 	}
 	if in.URL == "" {
 		return graphwriter.RepoRecord{}, errors.New("graphsink/sqlite: EnsureRepo: empty url")
+	}
+	if in.RepoID.IsZero() {
+		return graphwriter.RepoRecord{}, errors.New(
+			"graphsink/sqlite: EnsureRepo: zero RepoID — " +
+				"caller must precompute via fingerprint.RepoIDFromURL",
+		)
 	}
 
 	hints := in.LanguageHints
@@ -422,16 +423,13 @@ func (s *Sink) EnsureRepo(ctx context.Context, in graphwriter.RepoInput) (graphw
 		var existingID string
 		switch err := tx.QueryRowContext(ctx, selQ, in.URL).Scan(&existingID); {
 		case errors.Is(err, sql.ErrNoRows):
-			// Fresh insert. Honour caller-supplied deterministic
-			// RepoID when non-zero so SQLite / Postgres backends
-			// agree on the row's PK -- the cross-backend identity
-			// invariant the story documents under S3.4.
-			var newID string
-			if in.RepoID.IsZero() {
-				newID = uuid.NewString()
-			} else {
-				newID = in.RepoID.String()
-			}
+			// Fresh insert. The caller has already precomputed the
+			// RepoID (validated above), so persist it verbatim.
+			// This is the path the codeintel CLI uses via
+			// fingerprint.RepoIDFromURL so the SQLite and Postgres
+			// backends agree on the row's PK — the cross-backend
+			// identity invariant documented under S3.4.
+			newID := in.RepoID.String()
 			const insQ = `
 				INSERT INTO repo (repo_id, url, default_branch, current_head_sha, language_hints, created_at)
 				VALUES (?, ?, ?, ?, ?, ?)

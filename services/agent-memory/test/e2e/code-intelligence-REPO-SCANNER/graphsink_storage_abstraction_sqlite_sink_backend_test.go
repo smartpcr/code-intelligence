@@ -44,9 +44,7 @@ type sqliteSinkState struct {
 	enumErr error
 
 	// precomputed repoid
-	ensureRepoErr    error
-	ensureRepoRecord graphwriter.RepoRecord
-	ensureRepoURL    string
+	ensureRepoErr error
 
 	// cgo build
 	modRoot      string
@@ -357,9 +355,8 @@ func (st *sqliteSinkState) aZeroValueRepoInputRepoID() error {
 func (st *sqliteSinkState) ensureRepoRunsAgainstTheSQLiteSink() error {
 	ctx := context.Background()
 
-	st.ensureRepoURL = "https://example.invalid/zero-repoid.git"
-	st.ensureRepoRecord, st.ensureRepoErr = st.sink.EnsureRepo(ctx, graphwriter.RepoInput{
-		URL:            st.ensureRepoURL,
+	_, st.ensureRepoErr = st.sink.EnsureRepo(ctx, graphwriter.RepoInput{
+		URL:            "https://example.invalid/zero-repoid.git",
 		DefaultBranch:  "main",
 		CurrentHeadSHA: "ccc333",
 		// RepoID is deliberately left as zero value.
@@ -367,34 +364,14 @@ func (st *sqliteSinkState) ensureRepoRunsAgainstTheSQLiteSink() error {
 	return nil
 }
 
-func (st *sqliteSinkState) theReturnedRepoIDDoesNotMatchTheDeterministicRepoIDFromURLValue() error {
-	if st.ensureRepoErr != nil {
-		// If the implementation rejects zero RepoID (the spec-required
-		// behaviour), that also satisfies the acceptance criterion.
-		if st.sink != nil {
-			_ = st.sink.Close()
-			st.sink = nil
-		}
-		if st.dbPath != "" {
-			_ = os.RemoveAll(filepath.Dir(st.dbPath))
-		}
-		return nil
+func (st *sqliteSinkState) aConstructionTimeErrorIsReturned() error {
+	if st.ensureRepoErr == nil {
+		return fmt.Errorf("expected construction-time error for zero RepoID, got nil")
 	}
-
-	// Implementation currently accepts zero RepoID and generates a
-	// random UUID. Verify the generated ID differs from the
-	// deterministic fingerprint.RepoIDFromURL value — proving the
-	// caller MUST supply a precomputed RepoID for cross-backend
-	// parity.
-	deterministic, err := fingerprint.RepoIDFromURL(st.ensureRepoURL)
-	if err != nil {
-		return fmt.Errorf("RepoIDFromURL: %w", err)
-	}
-	if st.ensureRepoRecord.ID == deterministic {
+	if !strings.Contains(st.ensureRepoErr.Error(), "zero RepoID") {
 		return fmt.Errorf(
-			"zero-RepoID EnsureRepo returned the deterministic ID %s — "+
-				"expected a random UUID proving precomputed RepoID is required for parity",
-			deterministic,
+			"expected error to mention 'zero RepoID', got: %v",
+			st.ensureRepoErr,
 		)
 	}
 
@@ -480,8 +457,7 @@ func InitializeScenario_graphsink_storage_abstraction_sqlite_sink_backend(ctx *g
 	// Scenario: sqlite-requires-precomputed-repoid
 	ctx.Given(`^a zero-value RepoInput\.RepoID$`, st.aZeroValueRepoInputRepoID)
 	ctx.When(`^EnsureRepo runs against the SQLite sink$`, st.ensureRepoRunsAgainstTheSQLiteSink)
-	ctx.Then(`^a construction-time error is returned$`, st.theReturnedRepoIDDoesNotMatchTheDeterministicRepoIDFromURLValue)
-	ctx.Then(`^the returned RepoID does not match the deterministic RepoIDFromURL value$`, st.theReturnedRepoIDDoesNotMatchTheDeterministicRepoIDFromURLValue)
+	ctx.Then(`^a construction-time error is returned$`, st.aConstructionTimeErrorIsReturned)
 
 	// Scenario: sqlite-requires-cgo
 	ctx.Given(`^the "internal/graphsink/sqlite/" package$`, st.theInternalGraphsinkSqlitePackage)

@@ -27,7 +27,7 @@ Feature: SQLite sink backend — E2E
   Scenario: sqlite-requires-precomputed-repoid
     Given a zero-value RepoInput.RepoID
     When EnsureRepo runs against the SQLite sink
-    Then the returned RepoID does not match the deterministic RepoIDFromURL value
+    Then a construction-time error is returned
 
   Scenario: sqlite-requires-cgo
     Given the "internal/graphsink/sqlite/" package

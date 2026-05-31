@@ -2,7 +2,6 @@ package diagram
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -506,28 +505,5 @@ func deriveLabel(sig string) string {
 	return s
 }
 
-// extractLanguage returns the value of a `language` or `lang`
-// key in the attrs JSON object, or the empty string when the
-// attrs are absent, malformed, or do not name a language. The
-// UI uses this to color-code nodes per the architecture S4.4.1
-// "group by language" rule.
-func extractLanguage(attrs json.RawMessage) string {
-	if len(attrs) == 0 {
-		return ""
-	}
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(attrs, &m); err != nil {
-		return ""
-	}
-	for _, k := range []string{"language", "lang"} {
-		raw, ok := m[k]
-		if !ok {
-			continue
-		}
-		var s string
-		if err := json.Unmarshal(raw, &s); err == nil && s != "" {
-			return s
-		}
-	}
-	return ""
-}
+// extractLanguage is defined in module.go; shared by both the
+// module-diagram and call-chain projectors.

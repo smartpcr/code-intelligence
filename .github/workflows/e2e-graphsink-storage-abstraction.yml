@@ -154,3 +154,29 @@ jobs:
           go test -tags e2e -v -count=1 -timeout 120s \
             -run TestE2E_graphsink_storage_abstraction_sqlite_sink_backend \
             ./test/e2e/code-intelligence-REPO-SCANNER/...
+
+  memory-reader-adapter:
+    name: "memory-reader-adapter"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/agent-memory/go.mod
+          cache: true
+
+      - name: Download Go dependencies
+        working-directory: services/agent-memory
+        run: go mod download
+
+      - name: Run E2E scenarios
+        working-directory: services/agent-memory
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          go test -tags e2e -v -count=1 -timeout 120s \
+            -run TestE2E_graphsink_storage_abstraction_memory_reader_adapter \
+            ./test/e2e/code-intelligence-REPO-SCANNER/...

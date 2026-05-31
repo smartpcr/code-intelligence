@@ -909,7 +909,7 @@ func (s *bpgLegacyState) theParityTestRunsAgainstThatRow() error {
 	return nil
 }
 
-func (s *bpgLegacyState) theDocumentedExceptionPathExecutes() error {
+func (s *bpgLegacyState) theDocumentedExceptionPathExecutes(classification string) error {
 	defer func() {
 		if s.pgInst != nil {
 			s.pgInst.cleanup()
@@ -926,6 +926,10 @@ func (s *bpgLegacyState) theDocumentedExceptionPathExecutes() error {
 	// This is the documented LEGACY-COLLISION exception — the row
 	// predates deterministic ID computation.
 	s.classification = "legacy data"
+
+	if s.classification != classification {
+		return fmt.Errorf("classification mismatch: got %q, want %q", s.classification, classification)
+	}
 	return nil
 }
 

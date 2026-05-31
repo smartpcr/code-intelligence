@@ -192,24 +192,24 @@ func bpgOpenEphemeralPG() (*bpgPGInstance, error) {
 	}, nil
 }
 
-func bpgApplyMigrations(ctx context.Context, db *sql.DB, _ bool) error {
+func bpgApplyMigrations(ctx context.Context, db *sql.DB, ephemeral bool) error {
 	// Apply the full production schema through current HEAD using the
 	// production migrator. Each migration runs in its own transaction
 	// via applyOne, with a journal table tracking applied versions.
-	//
-	// On a provided Postgres instance, all migrations succeed.
-	// On ephemeral embedded-postgres, migrations that require
-	// extensions (pg_partman in 0014) or superuser privileges
-	// (roles in 0016/0017) will cause Up() to stop and return an
-	// error. The Migrator commits each migration individually,
-	// so 0001..N-1 are already applied when migration N fails.
-	// We verify core graphsink tables exist and accept the partial
-	// schema — the parity test only needs repo/node/edge tables.
 	err := migrations.New(db).Up(ctx)
 	if err == nil {
 		return nil
 	}
-	// Partial migration: verify the core tables are present.
+	// Provided instance (CI / compose): full migration MUST succeed.
+	// The production Postgres has all required extensions (pg_partman,
+	// pgcrypto) and roles, so any failure is a real error.
+	if !ephemeral {
+		return fmt.Errorf("migrations.Up (provided): %w", err)
+	}
+	// Ephemeral embedded-postgres: migrations that require extensions
+	// (pg_partman in 0014) or superuser privileges (roles in 0016/0017)
+	// will fail. The Migrator commits each migration individually, so
+	// 0001..N-1 are already applied. Verify core graphsink tables exist.
 	var nodeExists bool
 	qErr := db.QueryRowContext(ctx,
 		`SELECT EXISTS(SELECT 1 FROM information_schema.tables
@@ -217,7 +217,7 @@ func bpgApplyMigrations(ctx context.Context, db *sql.DB, _ bool) error {
 		    AND table_name = 'node')`,
 	).Scan(&nodeExists)
 	if qErr != nil || !nodeExists {
-		return fmt.Errorf("migrations.Up failed and core tables missing: %w", err)
+		return fmt.Errorf("migrations.Up (ephemeral) failed and core tables missing: %w", err)
 	}
 	return nil
 }

@@ -36,6 +36,19 @@ func openTempSink(t *testing.T) *sqlite.Sink {
 	return sink
 }
 
+// mustRepoID computes a deterministic RepoID from the given URL,
+// failing the test on error. Added when EnsureRepo was tightened
+// to reject zero RepoID (the sqlite-requires-precomputed-repoid
+// acceptance scenario).
+func mustRepoID(t *testing.T, url string) fingerprint.RepoID {
+	t.Helper()
+	id, err := fingerprint.RepoIDFromURL(url)
+	if err != nil {
+		t.Fatalf("RepoIDFromURL(%q): %v", url, err)
+	}
+	return id
+}
+
 // TestSinkInterface is a compile-time assertion that *Sink
 // satisfies graphsink.Sink. The package's source already pins
 // this with a `var _ graphsink.Sink = (*Sink)(nil)` declaration;
@@ -49,11 +62,17 @@ func TestEnsureRepoIdempotent(t *testing.T) {
 	ctx := context.Background()
 	sink := openTempSink(t)
 
+	url := "https://example.invalid/repo.git"
+	repoID, err := fingerprint.RepoIDFromURL(url)
+	if err != nil {
+		t.Fatalf("RepoIDFromURL: %v", err)
+	}
 	in := graphwriter.RepoInput{
-		URL:            "https://example.invalid/repo.git",
+		URL:            url,
 		DefaultBranch:  "main",
 		CurrentHeadSHA: "deadbeef",
 		LanguageHints:  []string{"go", "python"},
+		RepoID:         repoID,
 	}
 	first, err := sink.EnsureRepo(ctx, in)
 	if err != nil {
@@ -93,6 +112,7 @@ func TestInsertNodeFingerprintIdentity(t *testing.T) {
 		URL:            "https://example.invalid/repo.git",
 		DefaultBranch:  "main",
 		CurrentHeadSHA: "deadbeef",
+		RepoID:         mustRepoID(t, "https://example.invalid/repo.git"),
 	})
 	if err != nil {
 		t.Fatalf("EnsureRepo: %v", err)
@@ -150,6 +170,7 @@ func TestInsertNodeParentSameRepoGuard(t *testing.T) {
 		URL:            "https://example.invalid/a.git",
 		DefaultBranch:  "main",
 		CurrentHeadSHA: "shaA",
+		RepoID:         mustRepoID(t, "https://example.invalid/a.git"),
 	})
 	if err != nil {
 		t.Fatalf("EnsureRepo A: %v", err)
@@ -158,6 +179,7 @@ func TestInsertNodeParentSameRepoGuard(t *testing.T) {
 		URL:            "https://example.invalid/b.git",
 		DefaultBranch:  "main",
 		CurrentHeadSHA: "shaB",
+		RepoID:         mustRepoID(t, "https://example.invalid/b.git"),
 	})
 	if err != nil {
 		t.Fatalf("EnsureRepo B: %v", err)
@@ -194,6 +216,7 @@ func TestInsertEdgeIdempotent(t *testing.T) {
 		URL:            "https://example.invalid/repo.git",
 		DefaultBranch:  "main",
 		CurrentHeadSHA: "deadbeef",
+		RepoID:         mustRepoID(t, "https://example.invalid/repo.git"),
 	})
 	if err != nil {
 		t.Fatalf("EnsureRepo: %v", err)
@@ -256,6 +279,7 @@ func TestInsertEdgeRejectsUnknownKind(t *testing.T) {
 
 	repo, _ := sink.EnsureRepo(ctx, graphwriter.RepoInput{
 		URL: "u", DefaultBranch: "main", CurrentHeadSHA: "s",
+		RepoID: mustRepoID(t, "u"),
 	})
 	src, _ := sink.InsertNode(ctx, graphwriter.NodeInput{
 		RepoID: repo.ID, Kind: "method", CanonicalSignature: "a", FromSHA: "s",
@@ -279,6 +303,7 @@ func TestEnsureCommit(t *testing.T) {
 
 	repo, err := sink.EnsureRepo(ctx, graphwriter.RepoInput{
 		URL: "u", DefaultBranch: "main", CurrentHeadSHA: "s",
+		RepoID: mustRepoID(t, "u"),
 	})
 	if err != nil {
 		t.Fatalf("EnsureRepo: %v", err)
@@ -359,14 +384,18 @@ func TestEnsureRepoDeterministicRepoIDPersisted(t *testing.T) {
 		t.Fatalf("repo_id text drift: got %q, want %q", rec.RepoID, wantID.String())
 	}
 
-	// Second EnsureRepo with the same URL but a different
-	// (zero) supplied RepoID must still return the previously
-	// persisted deterministic ID; the legacy-collision rule
-	// keeps the PK stable on conflict.
+	// Second EnsureRepo with the same URL but a different supplied
+	// RepoID must still return the previously persisted deterministic
+	// ID; the legacy-collision rule keeps the PK stable on conflict.
+	otherID, err := fingerprint.RepoIDFromURL("https://example.invalid/other.git")
+	if err != nil {
+		t.Fatalf("RepoIDFromURL (other): %v", err)
+	}
 	rec2, err := sink.EnsureRepo(ctx, graphwriter.RepoInput{
 		URL:            url,
 		DefaultBranch:  "main",
 		CurrentHeadSHA: "cafebabe",
+		RepoID:         otherID,
 	})
 	if err != nil {
 		t.Fatalf("second EnsureRepo: %v", err)

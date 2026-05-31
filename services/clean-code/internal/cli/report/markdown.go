@@ -292,8 +292,12 @@ func wrapWrite(err error) error {
 	return fmt.Errorf("report: Markdown.Render: write: %w", err)
 }
 
-// renderDarkMetricDetails emits one line per [DarkMetric] row
-// so the operator can see WHICH metrics stayed dark and why.
+// renderDarkMetricDetails emits a `## Dark Metrics` section
+// with one bullet per [DarkMetric] row so the operator can see
+// WHICH metrics stayed dark and why. The section heading makes
+// the report structure self-describing and lets downstream
+// tooling locate the block reliably.
+//
 // Each line uses the literal `metric dark: <kind>` tag so
 // downstream tooling (and acceptance tests) can grep for a
 // specific metric kind unambiguously. The format is:
@@ -307,6 +311,12 @@ func wrapWrite(err error) error {
 func (m Markdown) renderDarkMetricDetails(art RunArtifact, w *bufio.Writer) error {
 	if len(art.DarkMetrics) == 0 {
 		return nil
+	}
+	if _, err := fmt.Fprintln(w, "## Dark Metrics"); err != nil {
+		return wrapWrite(err)
+	}
+	if _, err := fmt.Fprintln(w); err != nil {
+		return wrapWrite(err)
 	}
 	for _, dm := range art.DarkMetrics {
 		missing := strings.Join(dm.MissingAttrs, ", ")

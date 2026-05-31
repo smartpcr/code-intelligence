@@ -4,9 +4,12 @@ package sqlite_test
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -262,21 +265,140 @@ func TestListNodesByCanonicalSignature(t *testing.T) {
 	}
 }
 
-func TestListNodesLimitClamp(t *testing.T) {
+// TestListNodesLimitClampAtMax inserts more than MaxListLimit
+// real rows and asserts the reader caps at exactly MaxListLimit.
+// Uses the test-only DBForTest helper to bulk-insert via a single
+// transaction with raw SQL -- going through InsertNode would
+// take 30+ seconds for 10k+ rows because each call commits its
+// own tx. The reader cannot tell the difference: it queries the
+// `node` table directly.
+func TestListNodesLimitClampAtMax(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
-	// Negative and zero both clamp to MaxListLimit (=10_000); a
-	// value > MaxListLimit also clamps. Verify the query
-	// produces a usable result without error in all three
-	// shapes.
-	for _, lim := range []int{0, -5, graphreader.MaxListLimit + 100} {
+
+	// Existing fixture has 6 nodes (package/file/file/class/
+	// method/method). Insert (MaxListLimit + 50 - 6) extra
+	// `block` rows so the total exceeds the cap.
+	const overshoot = 50
+	want := graphreader.MaxListLimit
+	extra := graphreader.MaxListLimit + overshoot - 6
+
+	db := sqlite.DBForTest(f.sink)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO node (node_id, fingerprint, repo_id, kind,
+		    canonical_signature, parent_node_id, from_sha, attrs_json)
+		VALUES (?, ?, ?, 'block', ?, ?, ?, '{}')`)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("Prepare: %v", err)
+	}
+	for i := 0; i < extra; i++ {
+		nodeID := fmt.Sprintf("00000000-0000-0000-0000-%012d", i)
+		// 32-byte fingerprint with i encoded so each row is
+		// unique against the (repo_id, fingerprint) UNIQUE index.
+		fp := make([]byte, 32)
+		binary.BigEndian.PutUint64(fp[24:], uint64(i)+1)
+		sig := fmt.Sprintf("bulk/block/%d", i)
+		if _, err := stmt.ExecContext(ctx, nodeID, fp, f.repoIDStr, sig, f.callee, "sha1"); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("Exec %d: %v", i, err)
+		}
+	}
+	_ = stmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	// Caller passes 0 -> clamped to MaxListLimit; an oversize
+	// request must also clamp to MaxListLimit.
+	for _, lim := range []int{0, graphreader.MaxListLimit + 1, graphreader.MaxListLimit * 2} {
 		got, err := f.sink.ListNodes(ctx, f.repoID, nil,
 			graphreader.ListNodesFilter{Limit: lim}, graphreader.ReaderOptions{})
 		if err != nil {
 			t.Fatalf("ListNodes limit=%d: %v", lim, err)
 		}
-		if len(got) == 0 {
-			t.Errorf("ListNodes limit=%d: got 0 rows, want >0", lim)
+		if len(got) != want {
+			t.Errorf("ListNodes limit=%d: got %d rows, want exactly %d (MaxListLimit)",
+				lim, len(got), want)
+		}
+	}
+
+	// An explicit small limit (<MaxListLimit) must be honoured
+	// as-is so callers can paginate manually.
+	const small = 7
+	got, err := f.sink.ListNodes(ctx, f.repoID, nil,
+		graphreader.ListNodesFilter{Limit: small}, graphreader.ReaderOptions{})
+	if err != nil {
+		t.Fatalf("ListNodes small: %v", err)
+	}
+	if len(got) != small {
+		t.Errorf("ListNodes small=%d: got %d rows, want %d", small, len(got), small)
+	}
+}
+
+// TestListEdgesLimitClampAtMax does the same MaxListLimit clamp
+// check for ListEdgesFrom / ListEdgesTo. Both endpoints route
+// through `listEdges` so testing one path proves both, but we
+// also assert ListEdgesTo's tie-breaker stays deterministic
+// when every row shares (kind, dst_node_id).
+func TestListEdgesLimitClampAtMax(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+
+	// Add (MaxListLimit + 50) extra `static_calls` edges from
+	// caller -> callee. They all collide on (kind, dst_node_id)
+	// so ordering reduces entirely to the edge_id tie-breaker.
+	const overshoot = 50
+	want := graphreader.MaxListLimit
+	extra := graphreader.MaxListLimit + overshoot
+
+	db := sqlite.DBForTest(f.sink)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO edge (edge_id, fingerprint, repo_id, kind,
+		    src_node_id, dst_node_id, from_sha, attrs_json)
+		VALUES (?, ?, ?, 'reads', ?, ?, ?, '{}')`)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("Prepare: %v", err)
+	}
+	for i := 0; i < extra; i++ {
+		edgeID := fmt.Sprintf("11111111-1111-1111-1111-%012d", i)
+		fp := make([]byte, 32)
+		binary.BigEndian.PutUint64(fp[24:], uint64(i)+1)
+		if _, err := stmt.ExecContext(ctx, edgeID, fp, f.repoIDStr,
+			f.caller, f.callee, "sha1"); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("Exec %d: %v", i, err)
+		}
+	}
+	_ = stmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	got, err := f.sink.ListEdgesTo(ctx, f.callee, []string{"reads"},
+		graphreader.ReaderOptions{})
+	if err != nil {
+		t.Fatalf("ListEdgesTo: %v", err)
+	}
+	if len(got) != want {
+		t.Errorf("ListEdgesTo: got %d rows, want exactly %d (MaxListLimit)",
+			len(got), want)
+	}
+	// Confirm edge_id tie-breaker ordered the rows ascending.
+	for i := 1; i < len(got); i++ {
+		if got[i-1].EdgeID >= got[i].EdgeID {
+			t.Errorf("edge_id tie-breaker broken at %d: %q >= %q",
+				i, got[i-1].EdgeID, got[i].EdgeID)
+			break
 		}
 	}
 }
@@ -346,37 +468,170 @@ func TestListEdgesToKindFilter(t *testing.T) {
 
 // TestListEdgesOrderByKindDstNodeID asserts the workstream
 // brief's order contract: rows sort by (kind ASC, dst_node_id
-// ASC).
+// ASC, edge_id ASC). The test inserts MULTIPLE same-kind edges
+// to DIFFERENT destinations so the dst_node_id secondary sort
+// is actually exercised (the iter-1 version of this test only
+// added a different-kind edge and so was a no-op for the
+// dst_node_id ordering it claimed to pin).
 func TestListEdgesOrderByKindDstNodeID(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
 
-	// Add a second outbound edge from caller (a `reads` edge to
-	// the callee node so we can verify cross-kind ordering).
-	if _, err := f.sink.InsertEdge(ctx, graphwriter.EdgeInput{
-		RepoID:    f.repoID,
-		Kind:      "reads",
-		SrcNodeID: f.caller,
-		DstNodeID: f.callee,
-		FromSHA:   "sha1",
-	}); err != nil {
-		t.Fatalf("InsertEdge reads: %v", err)
+	// Build a set of extra destination method nodes so the
+	// caller fans out to several same-kind static_calls edges
+	// with distinct dst_node_ids.
+	mkDest := func(sig string) string {
+		t.Helper()
+		rec, err := f.sink.InsertNode(ctx, graphwriter.NodeInput{
+			RepoID:             f.repoID,
+			Kind:               "method",
+			CanonicalSignature: sig,
+			ParentNodeID:       f.classID,
+			FromSHA:            "sha1",
+		})
+		if err != nil {
+			t.Fatalf("InsertNode dest %q: %v", sig, err)
+		}
+		return rec.NodeID
 	}
+	destA := mkDest("pkg/main.Greeter.fnA")
+	destB := mkDest("pkg/main.Greeter.fnB")
+	destC := mkDest("pkg/main.Greeter.fnC")
+
+	mkEdge := func(kind, dst string) {
+		t.Helper()
+		if _, err := f.sink.InsertEdge(ctx, graphwriter.EdgeInput{
+			RepoID:    f.repoID,
+			Kind:      kind,
+			SrcNodeID: f.caller,
+			DstNodeID: dst,
+			FromSHA:   "sha1",
+		}); err != nil {
+			t.Fatalf("InsertEdge %s->%s: %v", kind, dst, err)
+		}
+	}
+	// static_calls fan-out to destA/destB/destC AND the
+	// fixture's existing static_calls edge to f.callee. Also
+	// add a `reads` edge to assert the kind primary sort.
+	mkEdge("static_calls", destA)
+	mkEdge("static_calls", destB)
+	mkEdge("static_calls", destC)
+	mkEdge("reads", f.callee)
+
 	edges, err := f.sink.ListEdgesFrom(ctx, f.caller, nil, graphreader.ReaderOptions{})
 	if err != nil {
 		t.Fatalf("ListEdgesFrom: %v", err)
 	}
-	if len(edges) < 2 {
-		t.Fatalf("want >=2 edges, got %d", len(edges))
+	// Verify primary sort by kind is ascending.
+	kinds := make([]string, len(edges))
+	for i, e := range edges {
+		kinds[i] = e.Kind
 	}
-	for i := 1; i < len(edges); i++ {
-		if edges[i-1].Kind > edges[i].Kind {
-			t.Errorf("edges not ordered by kind ASC: %q before %q",
-				edges[i-1].Kind, edges[i].Kind)
+	if !sort.StringsAreSorted(kinds) {
+		t.Errorf("edges not ordered by kind ASC: %v", kinds)
+	}
+
+	// Collect same-kind blocks and assert dst_node_id ASC inside
+	// each. We expect a static_calls block with 4 rows (callee +
+	// destA + destB + destC) and a reads block with 1 row.
+	type block struct {
+		kind string
+		dsts []string
+	}
+	var blocks []block
+	var cur block
+	for _, e := range edges {
+		if e.Kind != cur.kind {
+			if cur.kind != "" {
+				blocks = append(blocks, cur)
+			}
+			cur = block{kind: e.Kind}
 		}
-		if edges[i-1].Kind == edges[i].Kind &&
-			edges[i-1].DstNodeID > edges[i].DstNodeID {
-			t.Errorf("within kind, edges not ordered by dst_node_id ASC")
+		cur.dsts = append(cur.dsts, e.DstNodeID)
+	}
+	if cur.kind != "" {
+		blocks = append(blocks, cur)
+	}
+	foundStaticCallsWith4 := false
+	for _, b := range blocks {
+		if !sort.StringsAreSorted(b.dsts) {
+			t.Errorf("kind=%s: dst_node_id not ASC: %v", b.kind, b.dsts)
+		}
+		if b.kind == "static_calls" && len(b.dsts) == 4 {
+			foundStaticCallsWith4 = true
+		}
+	}
+	if !foundStaticCallsWith4 {
+		t.Errorf("expected 4 same-kind static_calls rows to exercise dst_node_id secondary sort; got blocks=%v", blocks)
+	}
+}
+
+// TestListEdgesToEdgeIdTieBreaker asserts ListEdgesTo orders
+// deterministically by `edge_id` when every row shares the
+// same (kind, dst_node_id). Without the tie-breaker SQLite
+// would return rows in rowid order, which is not portable
+// across re-scans.
+func TestListEdgesToEdgeIdTieBreaker(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	// Add several inbound `static_calls` edges to the callee
+	// with distinct sources. All rows share (kind, dst_node_id);
+	// only edge_id can distinguish them.
+	mkSrc := func(sig string) string {
+		t.Helper()
+		rec, err := f.sink.InsertNode(ctx, graphwriter.NodeInput{
+			RepoID:             f.repoID,
+			Kind:               "method",
+			CanonicalSignature: sig,
+			ParentNodeID:       f.classID,
+			FromSHA:            "sha1",
+		})
+		if err != nil {
+			t.Fatalf("InsertNode %q: %v", sig, err)
+		}
+		return rec.NodeID
+	}
+	for _, sig := range []string{"src/A", "src/B", "src/C", "src/D"} {
+		src := mkSrc(sig)
+		if _, err := f.sink.InsertEdge(ctx, graphwriter.EdgeInput{
+			RepoID:    f.repoID,
+			Kind:      "static_calls",
+			SrcNodeID: src,
+			DstNodeID: f.callee,
+			FromSHA:   "sha1",
+		}); err != nil {
+			t.Fatalf("InsertEdge: %v", err)
+		}
+	}
+
+	edges, err := f.sink.ListEdgesTo(ctx, f.callee, []string{"static_calls"},
+		graphreader.ReaderOptions{})
+	if err != nil {
+		t.Fatalf("ListEdgesTo: %v", err)
+	}
+	if len(edges) < 4 {
+		t.Fatalf("want >=4 inbound edges, got %d", len(edges))
+	}
+	ids := make([]string, len(edges))
+	for i, e := range edges {
+		ids[i] = e.EdgeID
+		if e.DstNodeID != f.callee {
+			t.Errorf("unexpected dst %q", e.DstNodeID)
+		}
+	}
+	if !sort.StringsAreSorted(ids) {
+		t.Errorf("ListEdgesTo: edge_id tie-breaker broken: %v", ids)
+	}
+	// Two back-to-back calls must return the same order.
+	again, err := f.sink.ListEdgesTo(ctx, f.callee, []string{"static_calls"},
+		graphreader.ReaderOptions{})
+	if err != nil {
+		t.Fatalf("ListEdgesTo 2nd: %v", err)
+	}
+	for i := range edges {
+		if edges[i].EdgeID != again[i].EdgeID {
+			t.Errorf("non-deterministic ListEdgesTo at %d: %q vs %q",
+				i, edges[i].EdgeID, again[i].EdgeID)
 		}
 	}
 }

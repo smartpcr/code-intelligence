@@ -22,17 +22,21 @@
 //
 //   - ListNodes orders by `kind, canonical_signature, node_id`
 //     to match the Postgres reader (graphreader/query.go:340).
-//   - ListEdgesFrom / ListEdgesTo order by `kind, dst_node_id`
-//     per the workstream brief. NOTE: the Postgres reader and
-//     the in-memory reader both order by `kind, edge_id`; the
-//     SQLite reader honours the brief's explicit instruction
-//     ("ordered by `(kind, dst_node_id)`") instead. Within a
-//     single ListEdgesTo result every row already shares the
-//     same `dst_node_id` so the secondary sort there is
-//     effectively a tie-breaker that maps onto SQLite's natural
-//     rowid order. Surfaced as an Open Question for the
-//     operator to confirm before downstream backend-parity
-//     tests are written.
+//   - ListEdgesFrom / ListEdgesTo order by
+//     `(kind, dst_node_id, edge_id)`. The first two columns
+//     are the workstream brief's literal directive
+//     ("ordered by `(kind, dst_node_id)`"); the `edge_id`
+//     tail is the deterministic tie-breaker required because
+//     ListEdgesTo filters on a fixed `dst_node_id`, which
+//     would otherwise leave same-kind rows in undefined order.
+//     With the tie-breaker, every same-kind row in any
+//     ListEdgesTo / ListEdgesFrom call has a totally ordered
+//     position, satisfying the brief's "deterministic order"
+//     intent. The Postgres / memory readers' `(kind, edge_id)`
+//     ordering is a strict refinement of ours when same-kind
+//     rows share dst_node_id, so cross-backend consumers that
+//     only depend on "stable per call" semantics observe
+//     compatible output.
 //
 // CONCURRENCY. The Sink pins `*sql.DB` to one connection so
 // writes are serialised through the WAL log without
@@ -309,9 +313,10 @@ func (s *Sink) ListNodes(
 // ListEdgesFrom returns every outbound Edge from srcNodeID
 // matching `kinds`. Empty `kinds` = all kinds.
 //
-// Order: `kind ASC, dst_node_id ASC` per the workstream brief.
-// See the package-doc note on the discrepancy with the Postgres
-// reader's `kind, edge_id` ordering.
+// Order: `(kind ASC, dst_node_id ASC, edge_id ASC)` -- the
+// brief's literal `(kind, dst_node_id)` plus an `edge_id`
+// tie-breaker so the result is totally ordered even when
+// multiple rows share both `kind` and `dst_node_id`.
 func (s *Sink) ListEdgesFrom(
 	ctx context.Context, srcNodeID string, kinds []string, opts graphreader.ReaderOptions,
 ) ([]graphreader.Edge, error) {
@@ -324,10 +329,13 @@ func (s *Sink) ListEdgesFrom(
 // ListEdgesTo returns every inbound Edge to dstNodeID matching
 // `kinds`. Empty `kinds` = all kinds.
 //
-// Order: `kind ASC, dst_node_id ASC` per the workstream brief.
-// (Within a single ListEdgesTo result every row shares the
-// same `dst_node_id` so the secondary key is effectively
-// a tie-breaker.)
+// Order: `(kind ASC, dst_node_id ASC, edge_id ASC)`. Within a
+// single ListEdgesTo result every row shares the same
+// `dst_node_id`, so the `edge_id` tail is what guarantees
+// deterministic ordering across calls -- without it SQLite
+// returns rows in `rowid` order, which is stable but not
+// reproducible across re-scans (insert order depends on the
+// dispatcher's per-file walk).
 func (s *Sink) ListEdgesTo(
 	ctx context.Context, dstNodeID string, kinds []string, opts graphreader.ReaderOptions,
 ) ([]graphreader.Edge, error) {
@@ -374,10 +382,11 @@ func (s *Sink) listEdges(
 			args = append(args, k)
 		}
 	}
-	// S3.6 brief: order by (kind, dst_node_id). Matches the
-	// brief verbatim; see package-doc note for the discrepancy
-	// with the Postgres / memory readers' `(kind, edge_id)`.
-	b.WriteString(" ORDER BY kind ASC, dst_node_id ASC LIMIT ?")
+	// S3.6 brief: order by (kind, dst_node_id). Add edge_id as
+	// the final tie-breaker so ListEdgesTo (where every row
+	// shares the same dst_node_id) still has totally-ordered
+	// output. See package doc for the cross-backend rationale.
+	b.WriteString(" ORDER BY kind ASC, dst_node_id ASC, edge_id ASC LIMIT ?")
 	args = append(args, normaliseLimit(opts.Limit))
 
 	rows, err := s.db.QueryContext(ctx, b.String(), args...)

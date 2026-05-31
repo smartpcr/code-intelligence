@@ -621,7 +621,7 @@ func runReport(stdout, stderr io.Writer, args []string) int {
 	// refusal (exit 64) leaves the destination file
 	// untouched.
 	findingsPath := positionals[0]
-	data, err := os.ReadFile(findingsPath)
+	_, err = os.ReadFile(findingsPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "cleanc report: read %s: %v\n", findingsPath, err)
 		return flags.ExitInternalError

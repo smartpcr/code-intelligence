@@ -21,6 +21,7 @@ import (
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/scope"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/effort"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/repocontext"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/scopebinding"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/walk"
@@ -133,19 +134,28 @@ type Options struct {
 	// quiet; the CLI composition root injects the
 	// `cleanc`-shaped logger.
 	Logger *slog.Logger
+
+	// EffortEstimator is the effort source the
+	// orchestrator stamps into [Diagnostics.EffortSource].
+	// Defaults to [effort.NewFallbackModel] when nil —
+	// the deterministic linear model that is always
+	// available even when the ONNX runtime is missing
+	// (tech-spec Sec 9.3).
+	EffortEstimator effort.Estimator
 }
 
 // Orchestrator drives the Stage 2.2 parse + recipe pipeline.
 // Construct via [New]; the public surface is the single
 // [Orchestrator.Run] method.
 type Orchestrator struct {
-	walker        walk.Walker
-	parsers       *parser.Registry
-	recipeReg     *recipes.Registry
-	projectRecReg *recipes.ProjectRegistry
-	scopeBindings *scopebinding.Table
-	workers       int
-	logger        *slog.Logger
+	walker          walk.Walker
+	parsers         *parser.Registry
+	recipeReg       *recipes.Registry
+	projectRecReg   *recipes.ProjectRegistry
+	scopeBindings   *scopebinding.Table
+	workers         int
+	logger          *slog.Logger
+	effortEstimator effort.Estimator
 }
 
 // New returns an Orchestrator with the supplied options;
@@ -153,13 +163,14 @@ type Orchestrator struct {
 // documented on [Options].
 func New(opts Options) *Orchestrator {
 	o := &Orchestrator{
-		walker:        opts.Walker,
-		parsers:       opts.Parsers,
-		recipeReg:     opts.Recipes,
-		projectRecReg: opts.ProjectRecipes,
-		scopeBindings: opts.ScopeBindings,
-		workers:       opts.Workers,
-		logger:        opts.Logger,
+		walker:          opts.Walker,
+		parsers:         opts.Parsers,
+		recipeReg:       opts.Recipes,
+		projectRecReg:   opts.ProjectRecipes,
+		scopeBindings:   opts.ScopeBindings,
+		workers:         opts.Workers,
+		logger:          opts.Logger,
+		effortEstimator: opts.EffortEstimator,
 	}
 	if o.walker == nil {
 		o.walker = walk.NewDefaultWalker()
@@ -184,6 +195,9 @@ func New(opts Options) *Orchestrator {
 	}
 	if o.logger == nil {
 		o.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if o.effortEstimator == nil {
+		o.effortEstimator = effort.NewFallbackModel()
 	}
 	return o
 }
@@ -235,6 +249,17 @@ type Result struct {
 	// reason [SkipReasonScopeBindingError] and does NOT
 	// appear here).
 	ScopeIDs map[ScopeBindingKey]uuid.UUID
+
+	// Diagnostics carries the run's dark-metric (Stage 2.5)
+	// and future diagnostic rows. Always non-nil:
+	// [Diagnostics.DarkMetrics] is `[]DarkMetric{}` when
+	// every recipe lit up. The CLI's `--diagnostics` JSON
+	// sidecar serialises this struct directly and the
+	// report writer's diagnostics section reads it
+	// verbatim. Per tech-spec REFACTOR-GUIDE Sec 8.7 the
+	// orchestrator is the sole producer; downstream layers
+	// MUST NOT add or rewrite rows after Run returns.
+	Diagnostics Diagnostics
 }
 
 // Run executes the Stage 2.2 pipeline against `rootPath`:
@@ -278,7 +303,10 @@ func (o *Orchestrator) Run(ctx context.Context, repoCtx repocontext.RepoContext,
 		return nil, fmt.Errorf("orchestrator: repoCtx.HeadSHA must not be empty")
 	}
 
-	result := &Result{ScopeIDs: map[ScopeBindingKey]uuid.UUID{}}
+	result := &Result{
+		ScopeIDs:    map[ScopeBindingKey]uuid.UUID{},
+		Diagnostics: Diagnostics{DarkMetrics: []DarkMetric{}},
+	}
 
 	filesCh, skipsCh, errsCh := o.walker.Walk(ctx, rootPath)
 
@@ -368,15 +396,59 @@ func (o *Orchestrator) Run(ctx context.Context, repoCtx repocontext.RepoContext,
 		o.mintBindings(ast, repoCtx, result, appendSkip)
 	}
 
+	dark := newDarkMetricAccumulator()
 	var drafts []recipes.MetricSampleDraft
 	for _, ast := range asts {
 		for _, recipe := range o.recipeReg.Recipes() {
 			if !recipe.AppliesTo(ast) {
+				// Stage 2.5: attribute the no-op to a
+				// missing parser-attr capability when
+				// the recipe's metric_kind is in the
+				// [metricAttrRequirements] table.
+				// Recipes whose MetricKind is NOT in
+				// the table (e.g. `loc`, which gates
+				// only on degraded-not-set) are
+				// silently dropped by `observe`'s
+				// [metricAttrIndex] lookup.
+				//
+				// The degraded-AST guard below is
+				// load-bearing: every gated recipe's
+				// `AppliesTo` checks its parser-attr
+				// capability FIRST and the degraded
+				// gate SECOND (see
+				// `cyclo.AppliesTo` etc. in
+				// `internal/metrics/recipes`). Today's
+				// fleet stamps no decision_blocks /
+				// call_edges / field_accesses, so the
+				// degraded branch is unreachable and
+				// the only path into this `if` body
+				// is the capability gap. Once a
+				// future parser starts stamping a
+				// capability on a file that is ALSO
+				// degraded, `AppliesTo` would return
+				// false at the degraded gate and the
+				// file would otherwise reach
+				// `observe` -- falsely inflating
+				// `AffectedScopeCount` for a row
+				// whose cause is degradation, not a
+				// dark metric. Degraded files surface
+				// via the skip-row path (parser-
+				// returned degraded sentinel /
+				// [SkipReasonParserError]); the dark-
+				// metric taxonomy (tech-spec Sec 8.7
+				// line 1000) covers ONLY unstamped
+				// parser-attr capabilities.
+				if ast.GetDegradedReason() != "" {
+					continue
+				}
+				dark.observe(recipe.MetricKind(), ast)
 				continue
 			}
 			drafts = append(drafts, recipe.Compute(ast)...)
 		}
 	}
+	result.Diagnostics = dark.finalize()
+	result.Diagnostics.EffortSource = o.effortEstimator.Name()
 
 	for _, projectRecipe := range o.projectRecReg.All() {
 		drafts = append(drafts, projectRecipe.ComputeProject(asts)...)

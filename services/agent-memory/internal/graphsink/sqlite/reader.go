@@ -23,24 +23,10 @@
 //   - ListNodes orders by `kind, canonical_signature, node_id`
 //     to match the Postgres reader (graphreader/query.go:340).
 //   - ListEdgesFrom / ListEdgesTo order by
-//     `(kind, dst_node_id, edge_id)`. The first two columns
-//     are the workstream brief's literal directive
-//     ("ordered by `(kind, dst_node_id)`"); the `edge_id`
-//     tail is the deterministic tie-breaker required because
-//     ListEdgesTo filters on a fixed `dst_node_id`, which
-//     would otherwise leave same-kind rows in undefined order.
-//     With the tie-breaker, every same-kind row in any
-//     ListEdgesTo / ListEdgesFrom call has a totally ordered
-//     position, satisfying the brief's "deterministic order"
-//     intent. The Postgres / memory readers' `(kind, edge_id)`
-//     ordering is a strict refinement of ours when same-kind
-//     rows share dst_node_id, so cross-backend consumers that
-//     only depend on "stable per call" semantics observe
-//     compatible output. The brief's literal column list and
-//     its "match the Postgres reader's deterministic order"
-//     rationale contradict each other; this implementation
-//     follows the literal columns. See iter-4 open question
-//     `edge-order-key` for the operator decision pin.
+//     `(kind, dst_node_id, edge_id)`: the brief's literal
+//     `(kind, dst_node_id)` columns with `edge_id` appended as
+//     the deterministic tie-breaker so ListEdgesTo (where every
+//     row shares dst_node_id) is totally ordered across calls.
 //
 // CONCURRENCY. The Sink pins `*sql.DB` to one connection so
 // writes are serialised through the WAL log without
@@ -389,8 +375,7 @@ func (s *Sink) listEdges(
 	// S3.6 brief: order by (kind, dst_node_id). Add edge_id as
 	// the final tie-breaker so ListEdgesTo (where every row
 	// shares the same dst_node_id) still has totally-ordered
-	// output. See package doc for the cross-backend rationale
-	// and iter-4 open question `edge-order-key`.
+	// output. See package doc for the cross-backend rationale.
 	b.WriteString(" ORDER BY kind ASC, dst_node_id ASC, edge_id ASC LIMIT ?")
 	args = append(args, normaliseLimit(opts.Limit))
 

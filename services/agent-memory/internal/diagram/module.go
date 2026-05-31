@@ -390,6 +390,15 @@ func BuildModuleDiagram(
 					// already present in the diagram so the
 					// UI's edge endpoint resolves.
 					toID = syn
+				} else if _, known := fileToPkgSyn[e.DstNodeID]; !known {
+					// Destination is neither a surfaced
+					// package nor a known file Node in this
+					// diagram (external / unresolved import
+					// the dispatcher could not register).
+					// Skip rather than emit a dangling edge
+					// the UI cannot resolve -- same policy
+					// as the granularity=package roll-up.
+					continue
 				}
 				d.Edges = append(d.Edges, Edge{
 					ID:     e.EdgeID,

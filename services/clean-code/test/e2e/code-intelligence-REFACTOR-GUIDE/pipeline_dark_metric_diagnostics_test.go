@@ -224,7 +224,7 @@ func (s *darkMetricDiagnosticsState) darkMetricsDoesNotIncludeMetricKind(metricK
 	return nil
 }
 
-func (s *darkMetricDiagnosticsState) bogusAttrValidationBinaryExitsCode70WithStderrMatchingTechSpec() error {
+func (s *darkMetricDiagnosticsState) productionValidateRejectsBogusAttrExitCode70() error {
 	if err := s.resolveModuleRoot(); err != nil {
 		return err
 	}
@@ -331,8 +331,8 @@ func InitializeScenario_pipeline_dark_metric_diagnostics(ctx *godog.ScenarioCont
 		s.darkMetricsDoesNotIncludeMetricKind,
 	)
 	ctx.Step(
-		`^the bogus_attr validation binary exits code 70 with stderr matching tech-spec Sec 8\.7$`,
-		s.bogusAttrValidationBinaryExitsCode70WithStderrMatchingTechSpec,
+		`^the production validateMetricAttrRequirements rejects bogus_attr with exit code 70 and stderr matching tech-spec Sec 8\.7$`,
+		s.productionValidateRejectsBogusAttrExitCode70,
 	)
 	ctx.Step(
 		`^Diagnostics\.EffortSource is "([^"]*)"$`,

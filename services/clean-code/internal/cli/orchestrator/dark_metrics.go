@@ -90,9 +90,12 @@ type metricAttrRow struct {
 	// evaluated had the attr been stamped").
 	//
 	// Mirroring the recipe Compute bodies:
-	//   - cyclo / cognitive_complexity: every method +
-	//     the file-level scope (one file-level draft per
-	//     method-bearing file).
+	//   - cyclo: every method scope (file-level scope
+	//     excluded -- cyclo evaluates per-function
+	//     complexity, not file-aggregated totals).
+	//   - cognitive_complexity: every method + the file-
+	//     level scope (one file-level draft per method-
+	//     bearing file).
 	//   - fan_in / fan_out: every method, class, and the
 	//     file-level scope.
 	//   - lcom4: every class scope (one draft per class).
@@ -115,7 +118,7 @@ var metricAttrRequirements = []metricAttrRow{
 	{
 		Kind:               "cyclo",
 		Attrs:              []string{darkAttrDecisionBlocks},
-		AffectedScopeKinds: []parser.ScopeKind{parser.ScopeKindMethod, parser.ScopeKindFile},
+		AffectedScopeKinds: []parser.ScopeKind{parser.ScopeKindMethod},
 	},
 	{
 		Kind:               "cognitive_complexity",
@@ -397,4 +400,22 @@ func (a *darkMetricAccumulator) finalize() Diagnostics {
 		return a.Language < b.Language
 	})
 	return out
+}
+
+// ValidateBogusAttrRow exercises the production
+// [validateMetricAttrRequirements] function with a single row
+// whose Attrs contains "bogus_attr" — a value NOT in the
+// closed [allowedDarkAttrs] set. Returns the error from the
+// production validation path so callers (including the E2E
+// subprocess helper) can assert both the exit code and the
+// tech-spec Sec 8.7 error string without mirroring the
+// validation logic.
+//
+// Exported for E2E testing only.
+func ValidateBogusAttrRow() error {
+	return validateMetricAttrRequirements([]metricAttrRow{{
+		Kind:               "bogus_metric",
+		Attrs:              []string{"bogus_attr"},
+		AffectedScopeKinds: []parser.ScopeKind{parser.ScopeKindMethod},
+	}})
 }

@@ -4,38 +4,48 @@
 
 ## graphsink backend parity (REPO-SCANNER S3.8)
 
-`services/agent-memory/internal/graphsink/parity_test.go` is
+`services/agent-memory/internal/graphsink/parity_*_test.go` is
 the cross-backend identity gate for the REPO-SCANNER pipeline.
 It drives the AST dispatcher against a single fixture file
-once per `graphsink.Sink` backend and asserts the captured
-`(repo_id, fingerprint, kind, canonical_signature)` Node tuples
-and `(kind, src_fingerprint, dst_fingerprint, fingerprint)`
-Edge tuples agree byte-for-byte across all three backends.
+once per `graphsink.Sink` backend, then reads every Node +
+Edge row back through that backend's `graphsink.Reader` view
+(via `collectFromReader`) and asserts the PERSISTED
+`(repo_id, fingerprint, kind, canonical_signature)` Node
+tuples and `(kind, src_fingerprint, dst_fingerprint,
+fingerprint)` Edge tuples agree byte-for-byte across all three
+backends. Reading from the Reader -- rather than recording
+write-call inputs / returns -- is what makes a backend bug
+that mutates `canonical_signature` between accept and persist
+observable.
 
 - **memory** (`graphsink/memory`) -- always exercised; no
-  external services.
-- **sqlite** (`graphsink/sqlite`) -- always exercised; uses a
+  external services. `scanMemory` lives in the no-tag shared
+  file and is reused as the baseline by both other arms.
+- **sqlite** (`graphsink/sqlite`) -- exercised from
+  `parity_test.go` (build tag `//go:build cgo`); uses a
   per-test temp file. Requires `CGO_ENABLED=1` because the
-  backend wraps `mattn/go-sqlite3`. The whole `parity_test.go`
-  is therefore `//go:build cgo`; under `CGO=0` the file
+  backend wraps `mattn/go-sqlite3`; under CGO=0 this file
   vanishes from the build.
-- **postgres** (`graphsink/postgres`) -- exercised from the
-  sibling `parity_postgres_test.go` (build tag `//go:build cgo
-  && integration`), which provisions a per-test schema on the
-  cluster pointed at by `AGENT_MEMORY_PG_URL`, applies every
-  migration via `migrations.New(db).Up(ctx)`, wraps the
-  resulting `*sql.DB` in `graphwriter.New` + the Postgres
-  adapter, and `t.Skip`s cleanly when the DSN is unset. The
-  default `go test ./...` run does NOT compile this file --
-  only the CI integration job (which sets the `integration`
-  tag) does.
+- **postgres** (`graphsink/postgres`) -- exercised from
+  `parity_postgres_test.go` (build tag `//go:build integration`
+  -- **NOT** `cgo && integration`, so a CGO=0
+  `-tags integration` run still picks this test up). The arm
+  provisions a per-test schema via
+  `services/agent-memory/internal/pgtest.OpenSchema(t)`, the
+  shared bootstrap helper (env var `AGENT_MEMORY_PG_URL`,
+  random `pgtest_<hex>` schema, full migrations.Up, automatic
+  CASCADE drop on cleanup, partman.part_config cleanup). It
+  `t.Skip`s cleanly when the DSN is unset.
 
-The shared helpers (the Python fixture, the `recordingSink`
-wrapper that captures Node/Edge tuples without recomputing
-fingerprints, the `runScan` driver, the sort comparator, and
-the `assertNodesEqual` / `assertEdgesEqual` assertion helpers)
-live in `parity_test.go` and are inherited by the integration
-arm because `cgo && integration` is a strict superset of `cgo`.
+The shared scaffolding -- the Python fixture, the `runScan`
+driver that seeds ancestry and calls `dispatcher.EmitFile`,
+the `collectFromReader` projector that reads persisted state
+back through `graphsink.Reader`, the sort comparator, the
+memory arm, and the `assertNodesEqual` /
+`assertEdgesEqual` assertion helpers -- lives in
+`parity_shared_test.go` (no build tag). The cgo arm and the
+integration arm import only the backend they actually need
+and reuse every helper from the shared file.
 
 ### Running the parity test locally
 
@@ -48,22 +58,25 @@ go test -count=1 -run TestBackendParity_MemoryAndSQLite ./internal/graphsink/...
 ```
 
 Integration-tier (adds postgres), against a docker-compose or
-remote cluster:
+remote cluster. **The Postgres arm does NOT require CGO**, so
+either CGO setting works:
 
 ```powershell
 Set-Location services\agent-memory
-$env:CGO_ENABLED='1'
+$env:CGO_ENABLED='1'   # or '0' -- postgres arm is pure Go
 $env:AGENT_MEMORY_PG_URL='postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable'
 go test -count=1 -tags integration -run TestBackendParity ./internal/graphsink/
 ```
 
 Notes:
 
-- Without `AGENT_MEMORY_PG_URL`, the Postgres arm self-skips
+- Without `AGENT_MEMORY_PG_URL`, `pgtest.OpenSchema` self-skips
   with `t.Skipf`; the memory + sqlite arms still run.
 - The Postgres arm provisions and drops a randomly-named
-  schema (`amparity_<hex>`); concurrent runs against the same
-  cluster do not collide.
+  schema (`pgtest_<hex>`) via the shared `internal/pgtest`
+  helper; concurrent runs against the same cluster do not
+  collide and `partman.part_config` rows are cleaned on
+  teardown.
 - The fixture is a small inline Python file
   (`polyglot/greeter.py`) parsed with `ast.NewPythonParser()`
   via `ast.WithParsers(...)`; the choice keeps the assertion

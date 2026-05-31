@@ -258,3 +258,50 @@ jobs:
       - name: Tear down compose stack
         if: always()
         run: docker compose -f $COMPOSE_FILE down -v
+
+  # ── backend-parity-golden-test ──────────────────────────────
+  # Runs TestE2E_graphsink_storage_abstraction_backend_parity_golden_test
+  # against all three backends (memory, SQLite, Postgres).
+  # Postgres is provisioned via GitHub Actions native services
+  # (mirroring tests/e2e/phase-3-graphsink-storage-abstraction/docker-compose.yml).
+  backend-parity-golden-test:
+    name: "E2E — backend-parity-golden-test"
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: agent_memory
+          POSTGRES_PASSWORD: agent_memory
+          POSTGRES_DB: agent_memory
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_memory -d agent_memory"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+          --health-start-period 10s
+    env:
+      AGENT_MEMORY_PG_URL: "postgres://agent_memory:agent_memory@localhost:5432/agent_memory?sslmode=disable"
+      CGO_ENABLED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/agent-memory/go.mod
+          cache: true
+
+      - name: Download Go dependencies
+        working-directory: services/agent-memory
+        run: go mod download
+
+      - name: Run TestE2E_graphsink_storage_abstraction_backend_parity_golden_test
+        working-directory: services/agent-memory
+        run: |
+          go test -tags e2e -v -count=1 -timeout 180s \
+            -run TestE2E_graphsink_storage_abstraction_backend_parity_golden_test \
+            ./test/e2e/code-intelligence-REPO-SCANNER/...

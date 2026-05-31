@@ -298,3 +298,62 @@ jobs:
         if: always()
         working-directory: services/agent-memory/deploy/local
         run: docker compose down -v
+
+  # ── E2E: backend-parity-golden-test (phase-3 graphsink-storage-abstraction) ──
+  # Runs TestE2E_graphsink_storage_abstraction_backend_parity_golden_test
+  # against all three backends (memory, SQLite, Postgres).
+  # Uses the phase-3 compose file to provision Postgres 16.
+  e2e-backend-parity-golden-test:
+    name: "E2E backend-parity-golden-test"
+    runs-on: ubuntu-latest
+    env:
+      COMPOSE_FILE: tests/e2e/phase-3-graphsink-storage-abstraction/docker-compose.yml
+      AGENT_MEMORY_PG_URL: "postgres://agent_memory:agent_memory@localhost:5432/agent_memory?sslmode=disable"
+      CGO_ENABLED: "1"
+    defaults:
+      run:
+        working-directory: services/agent-memory
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/agent-memory/go.mod
+          cache: true
+
+      - name: Start compose stack (phase-3 postgres)
+        working-directory: .
+        run: docker compose -f tests/e2e/phase-3-graphsink-storage-abstraction/docker-compose.yml up -d
+
+      - name: Wait for postgres
+        working-directory: .
+        run: |
+          deadline=$(( $(date +%s) + 90 ))
+          while :; do
+            status=$(docker compose -f tests/e2e/phase-3-graphsink-storage-abstraction/docker-compose.yml ps --format json \
+              | jq -r 'select(.Service=="postgres") | .Health // .State' 2>/dev/null || echo "unknown")
+            echo "  postgres -> $status"
+            if [ "$status" = "healthy" ]; then echo "Postgres ready"; break; fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Postgres did not become healthy within 90s"
+              docker compose -f tests/e2e/phase-3-graphsink-storage-abstraction/docker-compose.yml logs --tail=100
+              exit 1
+            fi
+            sleep 3
+          done
+
+      - name: Download Go dependencies
+        run: go mod download
+
+      - name: Run TestE2E_graphsink_storage_abstraction_backend_parity_golden_test
+        run: |
+          go test -tags e2e -v -count=1 -timeout 180s \
+            -run TestE2E_graphsink_storage_abstraction_backend_parity_golden_test \
+            ./test/e2e/code-intelligence-REPO-SCANNER/...
+
+      - name: Tear down compose stack
+        if: always()
+        working-directory: .
+        run: docker compose -f tests/e2e/phase-3-graphsink-storage-abstraction/docker-compose.yml down -v

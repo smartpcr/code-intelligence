@@ -127,28 +127,31 @@ var _ graphsink.Sink = (*Sink)(nil)
 // ephemeral in-process store (used by the test suite), or any
 // other DSN form the driver accepts.
 //
-// Open turns on WAL mode and `foreign_keys` per connection so
-// the schema's `ON DELETE RESTRICT` clauses are honoured at
-// runtime. Both pragmas are issued through a one-time `Exec` on
-// the pooled connection plus a `Ping` to validate the handle.
+// PRAGMA POLICY (iter-3 tightening):
+//
+//   - `_foreign_keys=on` is ALWAYS forced. The schema declares
+//     `ON DELETE RESTRICT` references between `repo` ->
+//     `repo_commit`, `node`, `edge` and within `node`
+//     (parent_node_id). SQLite's foreign-key enforcement is OFF
+//     by default; if the caller could disable it via a DSN
+//     query (e.g. `graph.db?_foreign_keys=off`), the
+//     hierarchy and cross-repo guards documented on
+//     `InsertNode`/`InsertEdge` would silently weaken. Open
+//     therefore STRIPS any caller-supplied `_foreign_keys=...`
+//     binding and re-appends `_foreign_keys=on` so the
+//     documented FK invariant is unambiguous and tamper-proof.
+//   - `_journal_mode=WAL` and `_busy_timeout=5000` are DEFAULTS
+//     the caller may override (a read-only snapshot scan might
+//     reasonably want `_journal_mode=DELETE`, and a CI run with
+//     no concurrent writers can lower the busy timeout).
+//   - All other DSN parameters (e.g. `?cache=shared`,
+//     `?mode=ro`) pass through unchanged.
 //
 // Returns a usable `*Sink` or a non-nil error. On error the
 // underlying `*sql.DB` (if it was opened) is closed before the
 // function returns so no leak occurs.
 func Open(ctx context.Context, dsn string) (*Sink, error) {
-	// We MERGE our default pragmas into whatever the caller
-	// supplied rather than dropping them when a query string is
-	// present. Each pragma is only appended when the caller has
-	// NOT already set it -- that respects an explicit override
-	// (e.g. `?_journal_mode=DELETE` for a read-only snapshot
-	// scenario) while still enforcing FK / busy_timeout / WAL
-	// for the common `graph.db?cache=shared` case the prior
-	// iteration silently disabled.
-	openDSN := mergeDefaultPragmas(dsn, [][2]string{
-		{"_foreign_keys", "on"},
-		{"_journal_mode", "WAL"},
-		{"_busy_timeout", "5000"},
-	})
+	openDSN := buildDSN(dsn)
 
 	db, err := sql.Open(driverName, openDSN)
 	if err != nil {
@@ -171,25 +174,84 @@ func Open(ctx context.Context, dsn string) (*Sink, error) {
 	return &Sink{db: db}, nil
 }
 
+// buildDSN applies the iter-3 PRAGMA policy: caller's DSN is
+// preserved verbatim except that any `_foreign_keys=...` binding
+// is dropped (FK enforcement is non-negotiable), and the
+// soft-default pragmas (`_journal_mode=WAL`, `_busy_timeout=5000`)
+// are appended only when the caller has NOT supplied them. The
+// mandatory `_foreign_keys=on` is always appended last so it
+// wins regardless of upstream parsing order.
+func buildDSN(dsn string) string {
+	// Step 1: strip any caller-supplied _foreign_keys binding.
+	stripped := stripQueryKey(dsn, "_foreign_keys")
+
+	// Step 2: merge soft defaults (caller may override these).
+	merged := mergeDefaultPragmas(stripped, [][2]string{
+		{"_journal_mode", "WAL"},
+		{"_busy_timeout", "5000"},
+	})
+
+	// Step 3: forcibly append _foreign_keys=on.
+	if strings.ContainsRune(merged, '?') {
+		return merged + "&_foreign_keys=on"
+	}
+	return merged + "?_foreign_keys=on"
+}
+
+// stripQueryKey returns `dsn` with every `key=<value>` binding
+// removed from its query string. Used to enforce the
+// non-negotiable `_foreign_keys=on` pragma: the caller's value
+// (if any) is discarded so a misconfigured DSN cannot silently
+// disable FK enforcement and weaken the documented hierarchy
+// and cross-repo guards.
+//
+// Returns `dsn` unchanged when the query string is empty or
+// contains no binding for `key`. When stripping the last binding
+// also empties the query string, the trailing '?' is removed so
+// the returned DSN is canonical.
+func stripQueryKey(dsn, key string) string {
+	idx := strings.IndexByte(dsn, '?')
+	if idx < 0 {
+		return dsn
+	}
+	prefix := dsn[:idx]
+	q := dsn[idx+1:]
+	needle := key + "="
+	var kept []string
+	for _, part := range strings.Split(q, "&") {
+		if part == "" {
+			continue
+		}
+		if strings.HasPrefix(part, needle) {
+			continue
+		}
+		kept = append(kept, part)
+	}
+	if len(kept) == 0 {
+		return prefix
+	}
+	return prefix + "?" + strings.Join(kept, "&")
+}
+
 // mergeDefaultPragmas appends each (key, value) pair from
 // `defaults` to `dsn` only when `dsn`'s existing query string
-// does NOT already contain that key. The check is a literal
-// "key=" substring scan after the first '?' -- mattn/go-sqlite3
-// accepts pragmas as standard URL query parameters, so this
-// reproduces the driver's own parameter parsing closely enough
-// for the override detection we need. Caller-supplied keys
-// always win; absent keys get our defaults.
+// does NOT already contain that key. Caller-supplied keys win;
+// absent keys get our defaults. Used for SOFT defaults only --
+// pragmas the caller is allowed to override (currently
+// `_journal_mode` and `_busy_timeout`). The mandatory
+// `_foreign_keys=on` enforcement lives in `buildDSN` and goes
+// through `stripQueryKey` instead.
 //
 // Examples:
 //
 //	mergeDefaultPragmas(":memory:", defaults)
-//	    -> ":memory:?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000"
+//	    -> ":memory:?_journal_mode=WAL&_busy_timeout=5000"
 //
 //	mergeDefaultPragmas("graph.db?cache=shared", defaults)
-//	    -> "graph.db?cache=shared&_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000"
+//	    -> "graph.db?cache=shared&_journal_mode=WAL&_busy_timeout=5000"
 //
 //	mergeDefaultPragmas("graph.db?_journal_mode=DELETE", defaults)
-//	    -> "graph.db?_journal_mode=DELETE&_foreign_keys=on&_busy_timeout=5000"
+//	    -> "graph.db?_journal_mode=DELETE&_busy_timeout=5000"
 func mergeDefaultPragmas(dsn string, defaults [][2]string) string {
 	q := ""
 	idx := strings.IndexByte(dsn, '?')

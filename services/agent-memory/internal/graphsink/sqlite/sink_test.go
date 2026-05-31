@@ -512,14 +512,14 @@ func TestEdgeFingerprintParityWithDeterministicRepoID(t *testing.T) {
 }
 
 func TestMergeDefaultPragmasPreservesCallerQuery(t *testing.T) {
-	// Item 3 from evaluator feedback: when the caller supplies a
-	// DSN with their own query string (e.g. `?cache=shared`),
-	// our default pragmas must still be applied. The prior
-	// iteration dropped them entirely.
+	// Item 3 from iter-1 feedback (soft-default behaviour after
+	// iter-3 split): MergeDefaultPragmasForTest covers ONLY the
+	// soft defaults (`_journal_mode`, `_busy_timeout`). The
+	// mandatory `_foreign_keys=on` enforcement is verified by
+	// TestBuildDSNForcesForeignKeysOn / TestForeignKeysEnforcedRuntime.
 	got := sqlite.MergeDefaultPragmasForTest("graph.db?cache=shared")
 	wantSubstrings := []string{
 		"cache=shared",
-		"_foreign_keys=on",
 		"_journal_mode=WAL",
 		"_busy_timeout=5000",
 	}
@@ -529,7 +529,7 @@ func TestMergeDefaultPragmasPreservesCallerQuery(t *testing.T) {
 		}
 	}
 
-	// Caller-supplied pragmas must override our defaults.
+	// Caller-supplied SOFT-default pragmas must override.
 	got2 := sqlite.MergeDefaultPragmasForTest("graph.db?_journal_mode=DELETE")
 	if strings.Contains(got2, "_journal_mode=WAL") {
 		t.Fatalf("caller override lost: %q still contains _journal_mode=WAL", got2)
@@ -537,8 +537,106 @@ func TestMergeDefaultPragmasPreservesCallerQuery(t *testing.T) {
 	if !strings.Contains(got2, "_journal_mode=DELETE") {
 		t.Fatalf("caller override stripped: %q", got2)
 	}
-	if !strings.Contains(got2, "_foreign_keys=on") {
-		t.Fatalf("absent-key default missing: %q", got2)
+}
+
+func TestBuildDSNForcesForeignKeysOn(t *testing.T) {
+	// Item 2 from iter-2 feedback: the package documents that
+	// foreign-key enforcement is always on, so `_foreign_keys=off`
+	// in a caller-supplied DSN must be stripped, not honoured.
+	cases := []struct {
+		name        string
+		in          string
+		mustContain []string
+		mustNotHave []string
+	}{
+		{
+			name: "bare-path-no-query",
+			in:   "graph.db",
+			mustContain: []string{
+				"_foreign_keys=on", "_journal_mode=WAL", "_busy_timeout=5000",
+			},
+		},
+		{
+			name: "caller-cache-shared",
+			in:   "graph.db?cache=shared",
+			mustContain: []string{
+				"cache=shared",
+				"_foreign_keys=on", "_journal_mode=WAL", "_busy_timeout=5000",
+			},
+		},
+		{
+			name: "caller-tries-to-disable-fk",
+			in:   "graph.db?_foreign_keys=off",
+			mustContain: []string{"_foreign_keys=on"},
+			mustNotHave: []string{"_foreign_keys=off"},
+		},
+		{
+			name: "caller-tries-to-disable-fk-with-other-keys",
+			in:   "graph.db?cache=shared&_foreign_keys=off&_journal_mode=DELETE",
+			mustContain: []string{
+				"cache=shared",
+				"_journal_mode=DELETE",
+				"_foreign_keys=on",
+			},
+			mustNotHave: []string{"_foreign_keys=off"},
+		},
+		{
+			name: "caller-fk-on-passes-through",
+			in:   "graph.db?_foreign_keys=on",
+			mustContain: []string{"_foreign_keys=on"},
+			mustNotHave: []string{"_foreign_keys=on&_foreign_keys=on"}, // no duplication
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sqlite.BuildDSNForTest(tc.in)
+			for _, s := range tc.mustContain {
+				if !strings.Contains(got, s) {
+					t.Fatalf("DSN %q missing %q (got %q)", tc.in, s, got)
+				}
+			}
+			for _, s := range tc.mustNotHave {
+				if strings.Contains(got, s) {
+					t.Fatalf("DSN %q must not contain %q (got %q)", tc.in, s, got)
+				}
+			}
+		})
+	}
+}
+
+func TestForeignKeysEnforcedRuntime(t *testing.T) {
+	// End-to-end: open a Sink with a DSN that ATTEMPTS to
+	// disable foreign keys, then query `PRAGMA foreign_keys`
+	// through the live handle. The pragma MUST report 1 (on)
+	// regardless of the caller's input.
+	ctx := context.Background()
+	path := "file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "fk.db")) + "?_foreign_keys=off"
+	sink, err := sqlite.Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+
+	var fk int
+	if err := sqlite.DBForTest(sink).
+		QueryRowContext(ctx, `PRAGMA foreign_keys`).
+		Scan(&fk); err != nil {
+		t.Fatalf("PRAGMA foreign_keys: %v", err)
+	}
+	if fk != 1 {
+		t.Fatalf("PRAGMA foreign_keys = %d, want 1 (Open must force FK on regardless of DSN)", fk)
+	}
+
+	// And an actual FK-violating INSERT must be rejected.
+	// repo_commit references repo(repo_id) ON DELETE RESTRICT;
+	// inserting a commit row with a non-existent repo_id must
+	// fail with a constraint error if FK enforcement is live.
+	_, err = sqlite.DBForTest(sink).ExecContext(ctx,
+		`INSERT INTO repo_commit (repo_id, sha, committed_at) VALUES (?, ?, ?)`,
+		"00000000-0000-0000-0000-000000000000", "abc", time.Now().UnixMilli(),
+	)
+	if err == nil {
+		t.Fatalf("INSERT with bogus repo_id succeeded; FK enforcement is NOT active")
 	}
 }
 

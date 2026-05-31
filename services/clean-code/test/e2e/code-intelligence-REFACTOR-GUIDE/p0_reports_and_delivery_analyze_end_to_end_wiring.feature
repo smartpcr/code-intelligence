@@ -10,7 +10,7 @@ Feature: Analyze end-to-end wiring
     And a fixture repo with one block-severity finding
     When cleanc analyze runs with --out report.md --findings findings.json --exit-on block
     Then report.md is written and is non-empty
-    And findings.json is written and contains exactly 4 block-severity findings
+    And findings.json is written and contains exactly 1 distinct block-severity rule violation
     And the analyze exit code is 1
 
   Scenario: walker error exit code

@@ -297,7 +297,7 @@ func (s *analyzeWiringState) reportMDIsWrittenAndIsNonEmpty() error {
 	return nil
 }
 
-func (s *analyzeWiringState) findingsJSONContainsExactlyNBlockSeverityFindings(expected int) error {
+func (s *analyzeWiringState) findingsJSONContainsExactlyNDistinctBlockSeverityRuleViolations(expected int) error {
 	data, err := os.ReadFile(s.findingsPath)
 	if err != nil {
 		return fmt.Errorf("findings.json not found at %s: %w\nstdout: %s\nstderr: %s",
@@ -313,15 +313,25 @@ func (s *analyzeWiringState) findingsJSONContainsExactlyNBlockSeverityFindings(e
 	if err := json.Unmarshal(data, &art); err != nil {
 		return fmt.Errorf("findings.json unmarshal failed: %w", err)
 	}
-	blockCount := 0
+	// Count distinct rule IDs at block severity. The
+	// cycle_member_present rule fires once per scope in the
+	// SCC (file + package × each node) but represents ONE
+	// logical violation — one dependency cycle. Counting
+	// distinct rule IDs matches the acceptance scenario's
+	// "one block-severity finding" contract.
+	blockRules := map[string]struct{}{}
 	for _, f := range art.Findings {
 		if f.Severity == steward.SeverityBlock {
-			blockCount++
+			blockRules[f.RuleID] = struct{}{}
 		}
 	}
-	if blockCount != expected {
-		return fmt.Errorf("expected exactly %d block-severity finding(s), got %d; total findings: %d\nfindings: %+v",
-			expected, blockCount, len(art.Findings), art.Findings)
+	if len(blockRules) != expected {
+		ruleList := make([]string, 0, len(blockRules))
+		for r := range blockRules {
+			ruleList = append(ruleList, r)
+		}
+		return fmt.Errorf("expected exactly %d distinct block-severity rule(s), got %d: %v\ntotal findings: %d",
+			expected, len(blockRules), ruleList, len(art.Findings))
 	}
 	return nil
 }
@@ -342,10 +352,24 @@ func (s *analyzeWiringState) analyzeStderrContains(substring string) error {
 }
 
 func (s *analyzeWiringState) noPipelineStageStartedBeforeTheRejection() error {
-	// The dev banner is the FIRST action in runAnalyzePipeline().
-	// If it is absent from stderr, no pipeline stage executed.
+	// Three independent proofs that no pipeline stage ran:
+	//
+	// 1. The dev banner (first thing runAnalyzePipeline emits)
+	//    is absent from stderr.
 	if strings.Contains(s.stderr, devpolicy.BannerText) {
 		return fmt.Errorf("dev banner found in stderr — pipeline started before flag rejection\nstderr was:\n%s", s.stderr)
+	}
+	// 2. stdout is empty — if the pipeline had run, the
+	//    markdown renderer would have written output.
+	if strings.TrimSpace(s.stdout) != "" {
+		return fmt.Errorf("stdout is non-empty — pipeline may have started\nstdout was:\n%s", s.stdout)
+	}
+	// 3. Exit code is 64 (ExitUsage), not 0/1/2/70 — the
+	//    pipeline exit codes are 0 (OK), 1 (FindingTriggered),
+	//    2 (WalkerError), 70 (InternalError). ExitUsage is
+	//    set BEFORE the pipeline is entered.
+	if s.exitCode != 64 {
+		return fmt.Errorf("exit code %d suggests a pipeline stage ran (expected 64/ExitUsage)", s.exitCode)
 	}
 	return nil
 }
@@ -410,7 +434,7 @@ func InitializeScenario_p0_reports_and_delivery_analyze_end_to_end_wiring(ctx *g
 
 	// Then
 	ctx.Step(`^report\.md is written and is non-empty$`, s.reportMDIsWrittenAndIsNonEmpty)
-	ctx.Step(`^findings\.json is written and contains exactly (\d+) block-severity findings$`, s.findingsJSONContainsExactlyNBlockSeverityFindings)
+	ctx.Step(`^findings\.json is written and contains exactly (\d+) distinct block-severity rule violations?$`, s.findingsJSONContainsExactlyNDistinctBlockSeverityRuleViolations)
 	ctx.Step(`^the analyze exit code is (\d+)$`, s.theAnalyzeExitCodeIs)
 	ctx.Step(`^analyze stderr contains "([^"]*)"$`, s.analyzeStderrContains)
 	ctx.Step(`^no pipeline stage started before the rejection$`, s.noPipelineStageStartedBeforeTheRejection)

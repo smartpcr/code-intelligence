@@ -7,7 +7,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -68,7 +67,7 @@ func buildNoCGOBinary() (string, error) {
 // Minimal smart-HTTP git server (stateless-rpc via git upload-pack)
 // ---------------------------------------------------------------------------
 
-func newSmartHTTPGitServer(bareRepoPath string) *httptest.Server {
+func newSmartHTTPGitServer(t testing.TB, bareRepoPath string) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/info/refs"):
@@ -84,20 +83,28 @@ func newSmartHTTPGitServer(bareRepoPath string) *httptest.Server {
 			fmt.Fprintf(w, "%04x%s", len(hdr)+4, hdr)
 			fmt.Fprint(w, "0000")
 
+			var stderr bytes.Buffer
 			cmd := exec.Command("git", "upload-pack", "--stateless-rpc", "--advertise-refs", bareRepoPath)
 			cmd.Stdout = w
-			cmd.Stderr = io.Discard
-			_ = cmd.Run()
+			cmd.Stderr = &stderr
+			if err := cmd.Run(); err != nil {
+				t.Logf("git upload-pack --advertise-refs failed: %v\nstderr: %s", err, stderr.String())
+			}
 
 		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/git-upload-pack"):
 			w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
 			w.Header().Set("Cache-Control", "no-cache")
 
+			var stderr bytes.Buffer
 			cmd := exec.Command("git", "upload-pack", "--stateless-rpc", bareRepoPath)
 			cmd.Stdin = r.Body
 			cmd.Stdout = w
-			cmd.Stderr = io.Discard
-			_ = cmd.Run()
+			cmd.Stderr = &stderr
+			if err := cmd.Run(); err != nil {
+				t.Logf("git upload-pack (POST) failed: %v\nstderr: %s", err, stderr.String())
+				http.Error(w, fmt.Sprintf("git upload-pack failed: %v", err), http.StatusInternalServerError)
+				return
+			}
 
 		default:
 			http.NotFound(w, r)
@@ -110,6 +117,7 @@ func newSmartHTTPGitServer(bareRepoPath string) *httptest.Server {
 // ---------------------------------------------------------------------------
 
 type scanSubcommandState struct {
+	t        testing.TB
 	tmpDir   string
 	fixture  string
 	binary   string
@@ -224,7 +232,7 @@ func (s *scanSubcommandState) aGitRepoServedOverHTTP() error {
 	_ = exec.Command("git", "-C", bareDir, "config",
 		"uploadpack.allowReachableSHA1InWant", "true").Run()
 
-	s.gitSrv = newSmartHTTPGitServer(bareDir)
+	s.gitSrv = newSmartHTTPGitServer(s.t, bareDir)
 	s.gitURL = s.gitSrv.URL
 	return nil
 }
@@ -478,8 +486,8 @@ func extractKindCount(line, key string) (int, error) {
 // Initializer & entrypoint
 // ---------------------------------------------------------------------------
 
-func InitializeScenario_codeintel_cli_binary_scan_subcommand(ctx *godog.ScenarioContext) {
-	s := &scanSubcommandState{}
+func initScanSubcommandScenario(t testing.TB, ctx *godog.ScenarioContext) {
+	s := &scanSubcommandState{t: t}
 	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
 		s.cleanup()
 		return ctx, nil
@@ -512,7 +520,9 @@ func InitializeScenario_codeintel_cli_binary_scan_subcommand(ctx *godog.Scenario
 
 func TestE2E_codeintel_cli_binary_scan_subcommand(t *testing.T) {
 	suite := godog.TestSuite{
-		ScenarioInitializer: InitializeScenario_codeintel_cli_binary_scan_subcommand,
+		ScenarioInitializer: func(ctx *godog.ScenarioContext) {
+			initScanSubcommandScenario(t, ctx)
+		},
 		Options: &godog.Options{
 			Format:   "pretty",
 			Paths:    []string{"codeintel_cli_binary_scan_subcommand.feature"},

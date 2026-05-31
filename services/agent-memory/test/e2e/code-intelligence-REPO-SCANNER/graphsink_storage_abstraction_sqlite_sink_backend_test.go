@@ -107,6 +107,43 @@ func (st *sqliteSinkState) theSchemaIsApplied() error {
 	if st.sink == nil {
 		return fmt.Errorf("sink is nil — Open step did not run")
 	}
+
+	// Verify the schema was actually applied by checking that the node table
+	// has at least the expected "node_id" column via PRAGMA table_info.
+	db, err := sql.Open("sqlite3", st.dbPath+"?mode=ro")
+	if err != nil {
+		return fmt.Errorf("open verification db: %w", err)
+	}
+	defer db.Close()
+
+	rows, err := db.QueryContext(context.Background(), `PRAGMA table_info(node)`)
+	if err != nil {
+		return fmt.Errorf("PRAGMA table_info(node): %w", err)
+	}
+	defer rows.Close()
+
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt *string
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return fmt.Errorf("scan table_info: %w", err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("rows iteration: %w", err)
+	}
+
+	if len(columns) == 0 {
+		return fmt.Errorf("node table has no columns — schema was not applied")
+	}
+	if !columns["node_id"] {
+		return fmt.Errorf("node table missing expected column 'node_id'; got columns: %v", columns)
+	}
+
 	return nil
 }
 

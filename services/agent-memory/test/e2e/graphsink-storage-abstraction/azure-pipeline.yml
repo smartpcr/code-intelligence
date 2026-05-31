@@ -95,3 +95,13 @@ steps:
         ./test/e2e/code-intelligence-REPO-SCANNER/...
     displayName: "Run E2E scenarios — memory-reader-adapter"
     condition: succeededOrFailed()
+
+  - script: |
+      cd services/agent-memory
+      go test -tags e2e -v -count=1 -timeout 180s \
+        -run TestE2E_graphsink_storage_abstraction_postgres_sink_adapter \
+        ./test/e2e/code-intelligence-REPO-SCANNER/...
+    displayName: "Run E2E scenarios — postgres-sink-adapter"
+    env:
+      AGENT_MEMORY_PG_URL: $(AGENT_MEMORY_PG_URL)
+    condition: succeededOrFailed()

@@ -23,10 +23,10 @@ Feature: Postgres sink adapter — E2E
 
   Scenario: listrepos-forwards-to-graphreader
     Given a real "*graphreader.Reader" behind postgresadapter.NewReader with seeded repos
-    When the adapter's ListRepos and the underlying reader's ListRepos both run with the same opts
-    Then the two result slices are identical proving exactly-one unmodified delegation
+    When the postgres adapter's ListRepos runs with query recording
+    Then exactly one delegated query is recorded and the result matches the seeded repos
 
   Scenario: graphreader-listrepos-matches-mgmtapi
     Given the same fixture rows seeded for both graphreader.Reader.ListRepos and mgmtapi.handleListRepos
     When graphreader.Reader.ListRepos and mgmtapi.handleListRepos both run
-    Then the two return identical ordered repo_id slices
+    Then the two return identical ordered RepoSummary-equivalent slices

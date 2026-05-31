@@ -72,6 +72,7 @@ type Renderer interface {
 // downstream stages; [Markdown] tolerates their zero values
 // today and will gain per-section renderers in subsequent
 // reports-and-delivery stages without rewriting the container.
+
 // SchemaVersionCurrent is the canonical schema version stamp
 // the JSON renderer writes into every emitted document. The
 // acceptance scenario pins this as `"v1.2026.05"`. Bumping this

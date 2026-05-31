@@ -61,15 +61,29 @@ const defaultSqliteDirEnv = "CODEINTEL_DEFAULT_DB_DIR"
 // real sqlite / memory / postgres backends.
 type sinkOpener func(ctx context.Context, store, dbOrOut string) (graphsink.Sink, func() error, error)
 
+// embeddingPublisherFactory builds the AST-level embedding
+// publisher when `--with-embeddings` is set. It is ONLY called
+// from `runScan` when `root.withEmbeddings` is true; otherwise
+// the seam is never consulted and no embedder env var
+// (`AGENT_MEMORY_QDRANT_URL`, `AGENT_MEMORY_ALLOW_STUB_EMBEDDER`,
+// `AGENT_MEMORY_QDRANT_API_KEY`) is read. This honours
+// tech-spec C8: "the CLI must run without Qdrant".
+//
+// Returns the AST-side publisher (already wrapped via
+// `embedding.AsASTPublisher`), an optional closer the runScan
+// loop will defer, and an error.
+type embeddingPublisherFactory func(ctx context.Context, root *rootFlags) (ast.NodeEmbeddingPublisher, func() error, error)
+
 // scanRunner bundles the seams tests override. Production wires
 // nil into every field; the `nil`-default fallback inside `runScan`
 // installs the real wiring.
 type scanRunner struct {
-	openSink     sinkOpener
-	newGitMat    func() repoindexer.Materializer
-	newLocalMat  func() repoindexer.Materializer
-	dispatchOpts []ast.DispatcherOption
-	stdout       io.Writer
+	openSink              sinkOpener
+	newGitMat             func() repoindexer.Materializer
+	newLocalMat           func() repoindexer.Materializer
+	newEmbeddingPublisher embeddingPublisherFactory
+	dispatchOpts          []ast.DispatcherOption
+	stdout                io.Writer
 }
 
 func newScanCmdImpl(root *rootFlags) *cobra.Command {
@@ -137,11 +151,6 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 	}
 	if input = strings.TrimSpace(input); input == "" {
 		return errors.New("scan: empty <path|git-url> argument")
-	}
-	if root.withEmbeddings {
-		// Stage 5.5 wires this; until then opt-in is rejected so
-		// the operator does not silently get a no-op publisher.
-		return errors.New("scan: --with-embeddings is not implemented yet (Stage 5.5)")
 	}
 
 	stdout := runner.stdout
@@ -276,6 +285,32 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 		dopts = append(dopts, ast.WithParsers(scanParsers...))
 	}
 	dopts = append(dopts, runner.dispatchOpts...)
+
+	// Stage 5.5 -- opt-in embedding publisher. The factory seam
+	// is invoked ONLY when --with-embeddings is set so the CLI's
+	// default path never reads AGENT_MEMORY_QDRANT_URL or the
+	// stub-embedder toggle (tech-spec C8).
+	if root.withEmbeddings {
+		factory := runner.newEmbeddingPublisher
+		if factory == nil {
+			factory = defaultEmbeddingPublisherFactory
+		}
+		pub, closer, perr := factory(ctx, root)
+		if perr != nil {
+			return fmt.Errorf("scan: --with-embeddings: %w", perr)
+		}
+		if pub == nil {
+			return errors.New("scan: --with-embeddings: factory returned nil publisher")
+		}
+		if closer != nil {
+			defer func() {
+				if cerr := closer(); cerr != nil {
+					slog.Warn("scan.embedding_publisher_close_failed", "error", cerr.Error())
+				}
+			}()
+		}
+		dopts = append(dopts, ast.WithEmbeddingPublisher(pub))
+	}
 
 	dispatcher := ast.NewDispatcher(counter, dopts...)
 

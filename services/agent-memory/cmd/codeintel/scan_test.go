@@ -118,11 +118,18 @@ func TestPostgresStoreSurfacesPingFailure(t *testing.T) {
 	}
 }
 
-func TestWithEmbeddingsRejected(t *testing.T) {
+func TestWithEmbeddingsRequiresPostgresInDefaultFactory(t *testing.T) {
+	// Stage 5.5: --with-embeddings is now WIRED. The default
+	// factory still requires --store=postgres because the
+	// embedding Publisher needs a real *sql.DB for the durable
+	// event log; assert that error wording surfaces clearly.
 	dir := writeFixtureRepo(t)
 	_, _, err := execute(t, "--with-embeddings", "scan", dir)
-	if err == nil || !strings.Contains(err.Error(), "with-embeddings") {
-		t.Fatalf("expected --with-embeddings rejected error, got %v", err)
+	if err == nil {
+		t.Fatalf("expected an error from --with-embeddings on the default sqlite store, got nil")
+	}
+	if !strings.Contains(err.Error(), "with-embeddings") || !strings.Contains(err.Error(), "postgres") {
+		t.Fatalf("expected error to mention --with-embeddings + postgres requirement, got %v", err)
 	}
 }
 

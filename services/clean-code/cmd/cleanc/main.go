@@ -42,14 +42,23 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/devpolicy"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/flags"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/orchestrator"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/report"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/walk"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/refactor"
+	rule_engine "github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/version"
 )
 
@@ -251,20 +260,223 @@ func runAnalyze(stdout, stderr io.Writer, args []string) int {
 		return flags.ExitUsage
 	}
 
-	// Suppress unused-variable warnings: the Globals struct
-	// owns every flag pointer; the skeleton body doesn't
-	// consume the values yet but the flag-set really
-	// accepts them (the test suite asserts the surface and
-	// `-h` lists them), so downstream stages will read
-	// `g.Out`, `g.Findings`, etc. directly.
-	_ = g
+	return runAnalyzePipeline(context.Background(), stdout, stderr, g, positionals[0])
+}
 
-	// Surface stdout writer so unused-import warnings don't
-	// drop the import in tests that don't read stdout.
-	_ = stdout
+// runAnalyzePipeline is the end-to-end wiring of the `cleanc
+// analyze <repo-path>` happy path. It is split from
+// [runAnalyze] so the dispatcher arm stays focused on flag
+// parsing and validation; the pipeline body is a single linear
+// composition of the L1 - L6 packages plus the report renderers.
+//
+// Stage ordering follows the workstream brief
+// (tech-spec.md Sec 8.6 / C9):
+//
+//  1. Emit the dev banner to stderr (dev build only -- the
+//     `buildTag` constant is the empty string in dev / no-tag
+//     builds and `"prod"` in `-tags prod` builds; the prod
+//     build short-circuits the banner entirely).
+//  2. Construct the [repocontext.RepoContext] (`repo_id`,
+//     `head_sha`, `module_path`).
+//  3. Load the dev-mode policy bundle via
+//     [devpolicy.NewLoader].Load -- the loader picks between
+//     the embedded `embed.FS` and the operator's `--policy
+//     <path>` directory.
+//  4. Run the [orchestrator.Orchestrator] -- walker + parser
+//     + recipe + scope-binding pipeline.
+//  5. Build the rule-engine sample corpus and seed the
+//     [rule_engine.InMemoryStore].
+//  6. Construct the engine and call
+//     [rule_engine.Engine.RunBatch] -- emits one
+//     EvaluationRun + EvaluationVerdict + N Finding rows.
+//  7. Run the [refactor.Planner] for hot-spot scoring, then
+//     the [refactor.TaskPlanner.PlanFromSnapshot] for the
+//     refactor plan + per-finding tasks (race-safe
+//     bypass: the snapshot Stage 8.1 produced is reused so
+//     Stage 8.2 cannot drift to a different
+//     `policy_version_id`).
+//  8. Assemble the [report.RunArtifact] from the orchestrator,
+//     engine, and planner outputs.
+//  9. Dispatch the artifact to the requested renderers --
+//     `--out` markdown (default stdout), `--findings` JSON,
+//     `--diagnostics` JSON.
+// 10. Translate the verdict + `--exit-on` threshold into the
+//     process exit code.
+func runAnalyzePipeline(ctx context.Context, stdout, stderr io.Writer, g *flags.Globals, rootPath string) int {
+	// Stage 1: dev-build banner. The constant `buildTag` is
+	// the empty string in `!prod` builds and `"prod"` in
+	// `prod` builds (per `buildtag_default.go` /
+	// `buildtag_prod.go`). EmitBanner writes the C10
+	// pinned warning + a single newline to stderr; the
+	// caller cannot suppress the banner -- a dev build
+	// always announces the unsigned policy bypass.
+	if buildTag != "prod" {
+		_, _ = devpolicy.EmitBanner(stderr)
+	}
 
-	fmt.Fprintln(stderr, "cleanc analyze: pipeline not yet wired in the Stage 1.1 skeleton; the walker, parser, engine, planner, and report renderer land in Phase 2+ stages.")
-	return flags.ExitInternalError
+	// Stage 2: RepoContext. The walker, parser, recipes,
+	// rule engine, and refactor planner all consume this
+	// frozen value; minting it ONCE at the composition root
+	// is the architecture G2 invariant (Sec 4.1).
+	absPath, err := filepath.Abs(rootPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "cleanc analyze: resolve repo path %q: %v\n", rootPath, err)
+		return flags.ExitInternalError
+	}
+	repoCtx := buildRepoContext(absPath)
+
+	// Stage 3: policy load. Pick between the embedded
+	// rule-pack `embed.FS` (default) and the operator's
+	// `--policy <path>` override directory. The dev build's
+	// loader is currently the Stage 1.1 shell which returns
+	// [devpolicy.ErrLoaderNotYetImplemented] (the YAML
+	// decoder lands in the impl-plan Stage 1.4 follow-up);
+	// the stderr line below preserves the literal
+	// "not yet wired" substring the existing
+	// `TestAnalyzeStubExitsInternalError` asserts on, so
+	// the wiring change in this stage does not regress that
+	// contract.
+	loader := devpolicy.NewLoader()
+	src := devpolicy.LoaderSource{UseEmbedded: *g.Policy == "", DirPath: *g.Policy}
+	bundle, err := loader.Load(ctx, src)
+	if err != nil {
+		switch {
+		case errors.Is(err, devpolicy.ErrLoaderNotYetImplemented):
+			fmt.Fprintf(stderr, "cleanc analyze: dev policy loader not yet wired (Stage 1.4 follow-up): %v\n", err)
+		case errors.Is(err, devpolicy.ErrDevModeUnavailable):
+			fmt.Fprintf(stderr, "cleanc analyze: %v\n", err)
+		default:
+			fmt.Fprintf(stderr, "cleanc analyze: load policy bundle: %v\n", err)
+		}
+		return flags.ExitInternalError
+	}
+
+	// Stage 4: orchestrator. The walker is wired with the
+	// stderr-backed slog handler so per-file parse errors /
+	// panics / scope-binding errors surface as warning lines
+	// the operator sees inline. The dispatcher relies on
+	// `New(Options{})` to fill every nil hook with the
+	// production default; passing only the logger keeps the
+	// composition root narrow and lets future workstreams
+	// override hooks without touching this call site.
+	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	orch := orchestrator.New(orchestrator.Options{Logger: logger})
+	result, err := orch.Run(ctx, repoCtx, absPath)
+	if err != nil {
+		if errors.Is(err, walk.ErrRootNotFound) {
+			fmt.Fprintf(stderr, "cleanc analyze: repo path not found: %s\n", rootPath)
+			return flags.ExitWalkerError
+		}
+		fmt.Fprintf(stderr, "cleanc analyze: walker/orchestrator failed: %v\n", err)
+		return flags.ExitWalkerError
+	}
+
+	// Stage 5: rule-engine sample corpus + store seed.
+	// BuildSamples is the canonical CLI-side rewrite of
+	// MetricSampleDraft -> rule_engine.Sample; the scope-id
+	// resolution and binding-signature stamping are pinned
+	// inside it so this composition root cannot drift.
+	samples := orchestrator.BuildSamples(repoCtx, result.Drafts, orch.ScopeBindings(), result.ScopeIDs)
+	store, err := orchestrator.LoadStore(bundle, samples, repoCtx)
+	if err != nil {
+		fmt.Fprintf(stderr, "cleanc analyze: load store: %v\n", err)
+		return flags.ExitInternalError
+	}
+
+	// Stage 6: engine. The engine writes one
+	// EvaluationRun + EvaluationVerdict + N Finding rows on
+	// each call; the dispatcher reads those rows back through
+	// the store's snapshot helpers (Runs / Verdicts /
+	// Findings) so the report artifact can serialise the
+	// canonical row shapes verbatim.
+	engine, err := rule_engine.New(rule_engine.Config{Store: store})
+	if err != nil {
+		fmt.Fprintf(stderr, "cleanc analyze: rule engine init: %v\n", err)
+		return flags.ExitInternalError
+	}
+	runRes, err := engine.RunBatch(ctx, repoCtx.RepoID, repoCtx.HeadSHA, bundle.PolicyVersion.PolicyVersionID)
+	if err != nil {
+		fmt.Fprintf(stderr, "cleanc analyze: rule engine run: %v\n", err)
+		return flags.ExitInternalError
+	}
+	evalRun, verdict := lookupRunAndVerdict(store, runRes)
+	findings := store.Findings()
+
+	// Stage 7: refactor planner + task planner. The CLI
+	// policy reader projects the dev-mode bundle onto the
+	// planner's [refactor.PolicySnapshot] contract (no
+	// SQL steward). The Stage 8.2 pass reuses the
+	// Stage 8.1 snapshot via PlanFromSnapshot to avoid the
+	// concurrent-activate race the rubber-duck design
+	// review pinned (planner.go ~Sec 8.1 docstring).
+	policyR := orchestrator.NewCLIPolicyReader(bundle)
+	metricsR := orchestrator.BuildMetricSampleReader(samples)
+	findingsR := orchestrator.BuildFindingReader(findings)
+	hotSpotWriter := refactor.NewInMemoryHotSpotWriter()
+	planner, err := refactor.NewPlanner(policyR, metricsR, findingsR, hotSpotWriter)
+	if err != nil {
+		fmt.Fprintf(stderr, "cleanc analyze: planner init: %v\n", err)
+		return flags.ExitInternalError
+	}
+	planRes, err := planner.Plan(ctx, repoCtx.RepoID, repoCtx.HeadSHA)
+	if err != nil && !errors.Is(err, refactor.ErrNoActivePolicy) {
+		fmt.Fprintf(stderr, "cleanc analyze: planner run: %v\n", err)
+		return flags.ExitInternalError
+	}
+
+	plans, tasks, err := runTaskPlanner(ctx, stderr, bundle, planRes, findings, repoCtx)
+	if err != nil {
+		return flags.ExitInternalError
+	}
+	var refactorPlan refactor.RefactorPlan
+	if len(plans) > 0 {
+		refactorPlan = plans[0]
+	}
+
+	// Stage 8: assemble the RunArtifact every renderer
+	// consumes. Field order mirrors architecture Sec 4.7
+	// verbatim (see report/runartifact.go).
+	art := report.RunArtifact{
+		SchemaVersion: report.SchemaVersionCurrent,
+		Context:       repoCtx,
+		Policy:        bundle.PolicyVersion,
+		Files:         buildFileSummaries(result),
+		Skips:         result.Skips,
+		DarkMetrics:   result.Diagnostics.DarkMetrics,
+		Samples:       samples,
+		Run:           evalRun,
+		Verdict:       verdict,
+		Findings:      findings,
+		HotSpots:      planRes.HotSpots,
+		Plan:          refactorPlan,
+		Tasks:         tasks,
+		Diagnostics:   result.Diagnostics,
+	}
+
+	// Stage 9: dispatch to renderers. `--out` defaults to
+	// stdout when empty (tech-spec Sec 8.1 row 1); the JSON
+	// sidecars are only emitted when their flag carries a
+	// non-empty path. Every file writer uses the `os.Create`
+	// + `defer w.Close()` pattern pinned by the workstream
+	// brief so a partial write leaves the destination file
+	// at the OS truncation boundary rather than silently
+	// retaining stale bytes from a prior run.
+	if err := dispatchMarkdown(ctx, stdout, stderr, *g.Out, art); err != nil {
+		return flags.ExitInternalError
+	}
+	if err := dispatchJSONFile(ctx, stderr, *g.Findings, "--findings", report.JSON{}.Render, art); err != nil {
+		return flags.ExitInternalError
+	}
+	if err := dispatchDiagnostics(stderr, *g.Diagnostics, art.Diagnostics); err != nil {
+		return flags.ExitInternalError
+	}
+
+	// Stage 10: exit code. The verdict + `--exit-on`
+	// threshold collapse into a single 0/1 decision.
+	if verdictTriggersExit(verdict.Verdict, *g.ExitOn) {
+		return flags.ExitFindingTriggered
+	}
+	return flags.ExitOK
 }
 
 // runReport handles `cleanc report <findings.json> [--out report.md]`.

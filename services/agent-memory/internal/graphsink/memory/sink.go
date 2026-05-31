@@ -37,12 +37,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphreader"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphsink"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
@@ -99,6 +97,19 @@ type Sink struct {
 	edgeIDByFP  map[fingerprint.Sum]string
 	edgeIdxByID map[string]int // EdgeID -> index in `edges`
 
+	// sigIndex is the `LookupBySignature` fast-path the
+	// workstream brief names literally: `map[sigKey]nodeID`.
+	// It is populated on every successful InsertNode (and on
+	// LoadExport's rehydration) so the reader-side lookup
+	// resolves a (kind, canonical_signature) seed to its
+	// NodeID in O(1) instead of scanning the `nodes` slice.
+	// The RepoID is not part of the key because the memory
+	// backend is single-repo by construction (architecture
+	// S3.2.4): every Node in `nodes` shares `s.repo.record.ID`,
+	// and LookupBySignature already rejects a mismatching
+	// repoID before consulting the index.
+	sigIndex map[sigKey]string
+
 	// nextNodeID / nextEdgeID are the monotonic counters
 	// behind the synthetic ids the memory backend mints.
 	// Postgres uses `gen_random_uuid()`; SQLite uses an
@@ -135,6 +146,7 @@ func New(opts Options) *Sink {
 		nodeFPByID:  make(map[string]fingerprint.Sum),
 		edgeIDByFP:  make(map[fingerprint.Sum]string),
 		edgeIdxByID: make(map[string]int),
+		sigIndex:    make(map[sigKey]string),
 	}
 }
 
@@ -329,6 +341,7 @@ func (s *Sink) InsertNode(ctx context.Context, in graphwriter.NodeInput) (graphw
 	s.nodeIDByFP[fp] = nodeID
 	s.nodeIdxByID[nodeID] = idx
 	s.nodeFPByID[nodeID] = fp
+	s.sigIndex[sigKey{Kind: in.Kind, Sig: in.CanonicalSignature}] = nodeID
 	return rec, nil
 }
 
@@ -459,204 +472,12 @@ func (s *Sink) Close() error {
 }
 
 // ----- Reader: read side -----------------------------------------
-
-// ListRepos returns the single repo this sink wraps (or an
-// empty slice when EnsureRepo has not been called).
-func (s *Sink) ListRepos(ctx context.Context, opts graphreader.ReaderOptions) ([]graphreader.RepoSummary, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil, ErrClosed
-	}
-	if s.repo == nil {
-		return nil, nil
-	}
-	sha := s.repo.input.CurrentHeadSHA
-	// Prefer the most recent EnsureCommit-supplied SHA when the
-	// repo row's `current_head_sha` is empty (the CLI registers
-	// the repo before scanning a particular commit).
-	if sha == "" {
-		for i := len(s.commits) - 1; i >= 0; i-- {
-			if s.commits[i].record.RepoID == s.repo.record.RepoID {
-				sha = s.commits[i].record.SHA
-				break
-			}
-		}
-	}
-	return []graphreader.RepoSummary{{
-		RepoID:      s.repo.record.RepoID,
-		URL:         s.repo.input.URL,
-		SHA:         sha,
-		GeneratedAt: s.repo.generatedAt,
-	}}, nil
-}
-
-// ListNodes enumerates Nodes matching the supplied filters.
-// Stable order: `kind, canonical_signature, node_id` -- matches
-// the Postgres reader's ORDER BY.
-func (s *Sink) ListNodes(
-	ctx context.Context,
-	repoID fingerprint.RepoID,
-	kinds []string,
-	f graphreader.ListNodesFilter,
-	opts graphreader.ReaderOptions,
-) ([]graphreader.Node, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if repoID.IsZero() {
-		return nil, errors.New("graphsink/memory: ListNodes: zero repo_id")
-	}
-	if err := validateNodeKinds(kinds); err != nil {
-		return nil, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil, ErrClosed
-	}
-	if s.repo == nil || s.repo.record.ID != repoID {
-		return nil, nil
-	}
-	kindSet := stringSet(kinds)
-	var out []graphreader.Node
-	limit := normaliseLimit(f.Limit)
-	for _, n := range s.nodes {
-		if len(kindSet) > 0 && !kindSet[n.input.Kind] {
-			continue
-		}
-		if f.ParentNodeID != "" && n.input.ParentNodeID != f.ParentNodeID {
-			continue
-		}
-		if f.FromSHA != "" && n.input.FromSHA != f.FromSHA {
-			continue
-		}
-		if f.CanonicalSignature != "" && n.input.CanonicalSignature != f.CanonicalSignature {
-			continue
-		}
-		out = append(out, nodeToReader(n, repoID))
-	}
-	sortNodes(out)
-	if len(out) > limit {
-		out = out[:limit]
-	}
-	return out, nil
-}
-
-// ListEdgesFrom returns every outbound Edge from srcNodeID.
-func (s *Sink) ListEdgesFrom(
-	ctx context.Context, srcNodeID string, kinds []string, opts graphreader.ReaderOptions,
-) ([]graphreader.Edge, error) {
-	if srcNodeID == "" {
-		return nil, errors.New("graphsink/memory: ListEdgesFrom: empty src_node_id")
-	}
-	return s.listEdges(ctx, srcNodeID, "", kinds, opts)
-}
-
-// ListEdgesTo returns every inbound Edge to dstNodeID.
-func (s *Sink) ListEdgesTo(
-	ctx context.Context, dstNodeID string, kinds []string, opts graphreader.ReaderOptions,
-) ([]graphreader.Edge, error) {
-	if dstNodeID == "" {
-		return nil, errors.New("graphsink/memory: ListEdgesTo: empty dst_node_id")
-	}
-	return s.listEdges(ctx, "", dstNodeID, kinds, opts)
-}
-
-func (s *Sink) listEdges(
-	ctx context.Context, src, dst string, kinds []string, opts graphreader.ReaderOptions,
-) ([]graphreader.Edge, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if err := validateEdgeKinds(kinds); err != nil {
-		return nil, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil, ErrClosed
-	}
-	if s.repo == nil {
-		return nil, nil
-	}
-	kindSet := stringSet(kinds)
-	limit := normaliseLimit(opts.Limit)
-	var out []graphreader.Edge
-	for _, e := range s.edges {
-		if src != "" && e.input.SrcNodeID != src {
-			continue
-		}
-		if dst != "" && e.input.DstNodeID != dst {
-			continue
-		}
-		if len(kindSet) > 0 && !kindSet[e.input.Kind] {
-			continue
-		}
-		out = append(out, edgeToReader(e, s.repo.record.ID))
-	}
-	sortEdges(out)
-	if len(out) > limit {
-		out = out[:limit]
-	}
-	return out, nil
-}
-
-// GetNode fetches a single Node by id.
-func (s *Sink) GetNode(ctx context.Context, nodeID string, opts graphreader.ReaderOptions) (graphreader.Node, error) {
-	if err := ctx.Err(); err != nil {
-		return graphreader.Node{}, err
-	}
-	if nodeID == "" {
-		return graphreader.Node{}, errors.New("graphsink/memory: GetNode: empty node_id")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return graphreader.Node{}, ErrClosed
-	}
-	fp, ok := s.nodeFPByID[nodeID]
-	if !ok {
-		return graphreader.Node{}, graphreader.ErrNotFound
-	}
-	idx, ok := s.nodeIdxByID[nodeID]
-	if !ok || s.repo == nil {
-		return graphreader.Node{}, graphreader.ErrNotFound
-	}
-	_ = fp
-	return nodeToReader(s.nodes[idx], s.repo.record.ID), nil
-}
-
-// LookupBySignature resolves (repoID, kind, canonicalSignature)
-// to its Node.
-func (s *Sink) LookupBySignature(
-	ctx context.Context,
-	repoID fingerprint.RepoID,
-	kind string,
-	canonicalSignature string,
-	opts graphreader.ReaderOptions,
-) (graphreader.Node, error) {
-	if err := ctx.Err(); err != nil {
-		return graphreader.Node{}, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return graphreader.Node{}, ErrClosed
-	}
-	if s.repo == nil || s.repo.record.ID != repoID {
-		return graphreader.Node{}, graphreader.ErrNotFound
-	}
-	for _, n := range s.nodes {
-		if n.input.Kind == kind && n.input.CanonicalSignature == canonicalSignature {
-			return nodeToReader(n, repoID), nil
-		}
-	}
-	return graphreader.Node{}, graphreader.ErrNotFound
-}
+//
+// The Reader-half methods (ListRepos / ListNodes / ListEdgesFrom /
+// ListEdgesTo / GetNode / LookupBySignature) and their reader-only
+// helpers live in `reader.go`. They share the `*Sink` receiver
+// because the memory backend's reader is a thin linear scan over
+// the same in-process slices the writer half populates.
 
 // ----- JSON export --------------------------------------------------
 
@@ -951,6 +772,7 @@ func loadExportToSink(path string) (*Sink, error) {
 		s.nodeIDByFP[fp] = n.NodeID
 		s.nodeIdxByID[n.NodeID] = idx
 		s.nodeFPByID[n.NodeID] = fp
+		s.sigIndex[sigKey{Kind: n.Kind, Sig: n.CanonicalSignature}] = n.NodeID
 		if seq := parseSyntheticID(n.NodeID, "n-"); seq > maxNodeID {
 			maxNodeID = seq
 		}
@@ -1083,17 +905,6 @@ func loadExportToSink(path string) (*Sink, error) {
 
 // ----- helpers ----------------------------------------------------
 
-func stringSet(in []string) map[string]bool {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make(map[string]bool, len(in))
-	for _, s := range in {
-		out[s] = true
-	}
-	return out
-}
-
 func cloneRaw(in json.RawMessage) json.RawMessage {
 	if len(in) == 0 {
 		return json.RawMessage("{}")
@@ -1133,115 +944,4 @@ func parseSyntheticID(id, prefix string) int {
 		return 0
 	}
 	return n
-}
-
-func nodeToReader(n nodeEntry, repoID fingerprint.RepoID) graphreader.Node {
-	return graphreader.Node{
-		NodeID:             n.record.NodeID,
-		RepoID:             repoID.String(),
-		Fingerprint:        n.record.Fingerprint,
-		Kind:               n.input.Kind,
-		CanonicalSignature: n.input.CanonicalSignature,
-		ParentNodeID:       n.input.ParentNodeID,
-		FromSHA:            n.input.FromSHA,
-		AttrsJSON:          cloneRaw(n.input.AttrsJSON),
-	}
-}
-
-func edgeToReader(e edgeEntry, repoID fingerprint.RepoID) graphreader.Edge {
-	return graphreader.Edge{
-		EdgeID:      e.record.EdgeID,
-		RepoID:      repoID.String(),
-		Fingerprint: e.record.Fingerprint,
-		Kind:        e.input.Kind,
-		SrcNodeID:   e.input.SrcNodeID,
-		DstNodeID:   e.input.DstNodeID,
-		FromSHA:     e.input.FromSHA,
-		AttrsJSON:   cloneRaw(e.input.AttrsJSON),
-	}
-}
-
-func sortNodes(in []graphreader.Node) {
-	sort.SliceStable(in, func(i, j int) bool {
-		if in[i].Kind != in[j].Kind {
-			return in[i].Kind < in[j].Kind
-		}
-		if in[i].CanonicalSignature != in[j].CanonicalSignature {
-			return in[i].CanonicalSignature < in[j].CanonicalSignature
-		}
-		return in[i].NodeID < in[j].NodeID
-	})
-}
-
-func sortEdges(in []graphreader.Edge) {
-	sort.SliceStable(in, func(i, j int) bool {
-		if in[i].Kind != in[j].Kind {
-			return in[i].Kind < in[j].Kind
-		}
-		return in[i].EdgeID < in[j].EdgeID
-	})
-}
-
-func normaliseLimit(requested int) int {
-	if requested <= 0 || requested > graphreader.MaxListLimit {
-		return graphreader.MaxListLimit
-	}
-	return requested
-}
-
-// nodeKindsAllowed mirrors graphreader's closed node_kind set
-// (architecture.md §5.2.1 / migration 0001). Memory backend
-// keeps its own copy because graphreader's set is unexported;
-// when a future migration appends a kind, update BOTH lists.
-var nodeKindsAllowed = map[string]struct{}{
-	"repo":    {},
-	"package": {},
-	"file":    {},
-	"class":   {},
-	"method":  {},
-	"block":   {},
-}
-
-// edgeKindsAllowed mirrors graphreader's closed edge_kind set
-// (migration 0001 + 0022 overrides).
-var edgeKindsAllowed = map[string]struct{}{
-	"contains":       {},
-	"imports":        {},
-	"static_calls":   {},
-	"observed_calls": {},
-	"extends":        {},
-	"implements":     {},
-	"reads":          {},
-	"writes":         {},
-	"renamed_to":     {},
-	"overrides":      {},
-}
-
-// validateNodeKinds returns an error when any element of kinds
-// is not a member of the node_kind ENUM. An empty slice passes
-// -- callers use that to mean "all kinds". Same contract as
-// `graphreader.validateNodeKinds` so the memory backend rejects
-// the same set of invalid inputs the Postgres backend would
-// (otherwise a `--store=memory` scan could swallow a typo that
-// `--store=postgres` would reject).
-func validateNodeKinds(kinds []string) error {
-	for _, k := range kinds {
-		if _, ok := nodeKindsAllowed[k]; !ok {
-			return fmt.Errorf("graphsink/memory: invalid node kind %q "+
-				"(allowed: repo/package/file/class/method/block)", k)
-		}
-	}
-	return nil
-}
-
-// validateEdgeKinds is the edge analogue of validateNodeKinds.
-func validateEdgeKinds(kinds []string) error {
-	for _, k := range kinds {
-		if _, ok := edgeKindsAllowed[k]; !ok {
-			return fmt.Errorf("graphsink/memory: invalid edge kind %q "+
-				"(allowed: contains/imports/static_calls/observed_calls/"+
-				"extends/implements/reads/writes/renamed_to/overrides)", k)
-		}
-	}
-	return nil
 }

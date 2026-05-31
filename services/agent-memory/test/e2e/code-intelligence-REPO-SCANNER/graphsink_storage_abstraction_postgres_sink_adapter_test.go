@@ -34,15 +34,12 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/cucumber/godog"
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lib/pq"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphreader"
@@ -71,46 +68,52 @@ func (psaStubResolver) Resolve(_ context.Context, _, _ string) (string, error) {
 }
 
 // ──────────────────────────────────────────────────────────────
-// pgx QueryTracer for call-recording (scenario 5)
+// Fake readerBackend for call-recording (scenario 5)
 // ──────────────────────────────────────────────────────────────
 
-type psaRecordedQuery struct {
-	SQL  string
-	Args []any
+type psaFakeReaderCall struct {
+	Method string
+	Args   []any
 }
 
-type psaQueryRecorder struct {
-	mu      sync.Mutex
-	queries []psaRecordedQuery
+// psaFakeReader implements postgresadapter.ReaderBackendForTest
+// (the E2E-visible alias for the unexported readerBackend interface).
+// It records every call and returns canned responses, letting the
+// E2E test assert exactly-one-forwarded-call with matching args
+// and an unmodified return slice.
+type psaFakeReader struct {
+	calls []psaFakeReaderCall
+	repos []graphreader.RepoSummary
 }
 
-func (r *psaQueryRecorder) TraceQueryStart(_ context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.queries = append(r.queries, psaRecordedQuery{SQL: data.SQL, Args: data.Args})
-	return context.Background()
+func (f *psaFakeReader) ListRepos(_ context.Context, opts graphreader.ReaderOptions) ([]graphreader.RepoSummary, error) {
+	f.calls = append(f.calls, psaFakeReaderCall{Method: "ListRepos", Args: []any{opts}})
+	return f.repos, nil
 }
 
-func (r *psaQueryRecorder) TraceQueryEnd(_ context.Context, _ *pgx.Conn, _ pgx.TraceQueryEndData) {}
-
-func (r *psaQueryRecorder) reset() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.queries = nil
+func (f *psaFakeReader) ListNodes(_ context.Context, repoID fingerprint.RepoID, kinds []string, filter graphreader.ListNodesFilter, opts graphreader.ReaderOptions) ([]graphreader.Node, error) {
+	f.calls = append(f.calls, psaFakeReaderCall{Method: "ListNodes", Args: []any{repoID, kinds, filter, opts}})
+	return nil, nil
 }
 
-func (r *psaQueryRecorder) count() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.queries)
+func (f *psaFakeReader) ListEdgesFrom(_ context.Context, src string, kinds []string, opts graphreader.ReaderOptions) ([]graphreader.Edge, error) {
+	f.calls = append(f.calls, psaFakeReaderCall{Method: "ListEdgesFrom", Args: []any{src, kinds, opts}})
+	return nil, nil
 }
 
-func (r *psaQueryRecorder) snapshot() []psaRecordedQuery {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]psaRecordedQuery, len(r.queries))
-	copy(out, r.queries)
-	return out
+func (f *psaFakeReader) ListEdgesTo(_ context.Context, dst string, kinds []string, opts graphreader.ReaderOptions) ([]graphreader.Edge, error) {
+	f.calls = append(f.calls, psaFakeReaderCall{Method: "ListEdgesTo", Args: []any{dst, kinds, opts}})
+	return nil, nil
+}
+
+func (f *psaFakeReader) GetNode(_ context.Context, id string, opts graphreader.ReaderOptions) (graphreader.Node, error) {
+	f.calls = append(f.calls, psaFakeReaderCall{Method: "GetNode", Args: []any{id, opts}})
+	return graphreader.Node{}, graphreader.ErrNotFound
+}
+
+func (f *psaFakeReader) LookupBySignature(_ context.Context, repoID fingerprint.RepoID, kind, sig string, opts graphreader.ReaderOptions) (graphreader.Node, error) {
+	f.calls = append(f.calls, psaFakeReaderCall{Method: "LookupBySignature", Args: []any{repoID, kind, sig, opts}})
+	return graphreader.Node{}, graphreader.ErrNotFound
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -141,32 +144,6 @@ func (pg *psaPGInstance) newPSAReader(ctx context.Context) (*graphreader.Reader,
 	pool, err := graphreader.NewPool(ctx, pg.dsn, opts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("graphreader.NewPool: %w", err)
-	}
-	reader := graphreader.New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	return reader, func() { pool.Close() }, nil
-}
-
-// newPSAReaderWithTracer creates a *graphreader.Reader backed by a
-// pgxpool with a custom pgx.QueryTracer attached. This bypasses
-// graphreader.NewPool (which doesn't expose the tracer) to enable
-// call-recording proofs for the listrepos-forwards scenario.
-func (pg *psaPGInstance) newPSAReaderWithTracer(ctx context.Context, tracer pgx.QueryTracer) (*graphreader.Reader, func(), error) {
-	cfg, err := pgxpool.ParseConfig(pg.dsn)
-	if err != nil {
-		return nil, nil, fmt.Errorf("pgxpool.ParseConfig: %w", err)
-	}
-	cfg.MaxConns = 2
-	cfg.MinConns = 1
-	cfg.ConnConfig.Tracer = tracer
-	if pg.schema != "" {
-		cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-			_, err := conn.Exec(ctx, "SET search_path TO "+psaQuoteIdent(pg.schema)+", public")
-			return err
-		}
-	}
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		return nil, nil, fmt.Errorf("pgxpool.NewWithConfig: %w", err)
 	}
 	reader := graphreader.New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return reader, func() { pool.Close() }, nil
@@ -374,9 +351,9 @@ type postgresAdapterState struct {
 
 	goListDepsOutput string
 
-	// listrepos-forwards call-recording state
-	queryRecorder *psaQueryRecorder
-	seedURLs      []string
+	// listrepos-forwards fake-reader state
+	fakeReader    *psaFakeReader
+	listReposOpts graphreader.ReaderOptions
 	adapterResult []graphreader.RepoSummary
 	adapterErr    error
 
@@ -460,48 +437,15 @@ func (st *postgresAdapterState) theGraphsinkPostgresPackageSource() error {
 	return nil // no-op; the When step runs go list
 }
 
-func (st *postgresAdapterState) aRealGraphreaderReaderWithSeededRepos() error {
-	pg, err := openPSAPG()
-	if err != nil {
-		return fmt.Errorf("provision Postgres: %w", err)
+func (st *postgresAdapterState) aFakeGraphreaderReaderThatRecordsCalls() error {
+	fake := &psaFakeReader{
+		repos: []graphreader.RepoSummary{
+			{RepoID: "11111111-1111-1111-1111-111111111111", URL: "https://example.test/fake-a", SHA: "sha-fa"},
+			{RepoID: "22222222-2222-2222-2222-222222222222", URL: "https://example.test/fake-b", SHA: "sha-fb"},
+		},
 	}
-	st.pgInst = pg
-
-	ctx, cancel := context.WithTimeout(context.Background(), psaTimeout)
-	defer cancel()
-
-	urls := []string{
-		"https://example.test/list-a",
-		"https://example.test/list-b",
-		"https://example.test/list-c",
-	}
-	shas := []string{"sha-a", "sha-b", "sha-c"}
-	intervals := []string{
-		"now() - INTERVAL '3 seconds'",
-		"now() - INTERVAL '2 seconds'",
-		"now() - INTERVAL '1 second'",
-	}
-	for i, u := range urls {
-		stmt := `INSERT INTO repo (url, default_branch, current_head_sha, created_at)
-		         VALUES ($1, 'main', $2, ` + intervals[i] + `)`
-		if _, err := pg.db.ExecContext(ctx, stmt, u, shas[i]); err != nil {
-			return fmt.Errorf("seed repo %s: %w", u, err)
-		}
-	}
-	// Store seed URLs in expected ORDER BY r.created_at DESC order
-	// (list-c is newest → first)
-	st.seedURLs = []string{urls[2], urls[1], urls[0]}
-
-	// Create reader with a QueryTracer that records SQL calls
-	recorder := &psaQueryRecorder{}
-	st.queryRecorder = recorder
-	reader, poolClose, err := pg.newPSAReaderWithTracer(ctx, recorder)
-	if err != nil {
-		return fmt.Errorf("create reader pool with tracer: %w", err)
-	}
-	st.poolCleanups = append(st.poolCleanups, poolClose)
-	st.underlyingReader = reader
-	st.adapterReader = postgresadapter.NewReader(reader)
+	st.fakeReader = fake
+	st.adapterReader = postgresadapter.NewReaderForTest(fake)
 	return nil
 }
 
@@ -684,12 +628,10 @@ func (st *postgresAdapterState) goListDepsRunsAgainstThePackage() error {
 	return nil
 }
 
-func (st *postgresAdapterState) adapterListReposRunsWithRecording() error {
-	// Reset the query recorder to capture only adapter.ListRepos queries
-	st.queryRecorder.reset()
-	ctx := context.Background()
+func (st *postgresAdapterState) adapterListReposRuns() error {
 	opts := graphreader.ReaderOptions{Limit: 100}
-	st.adapterResult, st.adapterErr = st.adapterReader.ListRepos(ctx, opts)
+	st.listReposOpts = opts
+	st.adapterResult, st.adapterErr = st.adapterReader.ListRepos(context.Background(), opts)
 	return nil
 }
 
@@ -814,82 +756,65 @@ func (st *postgresAdapterState) databaseSQLNotInDeps() error {
 	if strings.TrimSpace(st.goListDepsOutput) == "" {
 		return errors.New("go list -deps produced no output")
 	}
-	// The acceptance scenario requires that `database/sql` does NOT
-	// appear in the `go list -deps` output. database/sql IS present
-	// transitively (graphsink → graphwriter → lib/pq → database/sql)
-	// because the Sink interface re-exports graphwriter types. This
-	// is a structural property of the graphsink package design, not
-	// a violation by this adapter. See the existing unit test at
-	// internal/graphsink/postgres/no_database_sql_import_test.go
-	// (TestPostgresAdapter_literalDepsContainsDatabaseSQL) which
-	// proves and documents this structural reality.
-	//
-	// The C5/S4.5 thin-forwarder invariant ("all SQL must live in
-	// graphwriter or graphreader, not in the adapter") is enforced
-	// by checking that `database/sql` is NOT a DIRECT import of
-	// the adapter package, which is the strongest invariant the
-	// thin-forwarder design can guarantee.
-	modRoot := psaModuleRoot()
-	cmd := exec.Command("go", "list", "-f",
-		`{{join .Imports "\n"}}`,
-		"./internal/graphsink/postgres/...")
-	cmd.Dir = modRoot
-	out, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("go list direct imports: %w", err)
-	}
-	for _, line := range strings.Split(string(out), "\n") {
+
+	// Check the go list -deps output for database/sql — this is the
+	// assertion the acceptance scenario requires.
+	for _, line := range strings.Split(st.goListDepsOutput, "\n") {
 		if strings.TrimSpace(line) == "database/sql" {
 			return fmt.Errorf(
-				"database/sql is a DIRECT import of internal/graphsink/postgres "+
-					"(C5 / S4.5 thin-forwarder invariant violated: all SQL must "+
-					"live in graphwriter or graphreader)",
-			)
+				"database/sql appears in `go list -deps` output for " +
+					"internal/graphsink/postgres/ — C5/S4.5 thin-forwarder " +
+					"invariant requires it absent. Root cause: " +
+					"graphsink/sink.go imports graphwriter for type re-exports " +
+					"(graphwriter -> lib/pq -> database/sql). Resolving " +
+					"requires lifting RepoInput/NodeInput/EdgeInput types " +
+					"out of graphwriter into a SQL-free package.")
 		}
 	}
 	return nil
 }
 
-func (st *postgresAdapterState) exactlyOneDelegatedCallAndResultMatchesSeeds() error {
+func (st *postgresAdapterState) exactlyOneDelegatedCallAndReturnUnmodified() error {
 	if st.adapterErr != nil {
-		return fmt.Errorf("adapter.ListRepos error: %v", st.adapterErr)
+		return fmt.Errorf("adapter.ListRepos: %v", st.adapterErr)
 	}
 
-	// Assert exactly one SQL query was recorded by the pgx tracer
-	qcount := st.queryRecorder.count()
-	if qcount != 1 {
-		queries := st.queryRecorder.snapshot()
-		sqlList := make([]string, len(queries))
-		for i, q := range queries {
-			sqlList[i] = q.SQL
+	// Assert exactly one ListRepos call was recorded by the fake
+	if len(st.fakeReader.calls) != 1 {
+		methods := make([]string, len(st.fakeReader.calls))
+		for i, c := range st.fakeReader.calls {
+			methods[i] = c.Method
 		}
 		return fmt.Errorf(
-			"expected exactly 1 delegated query, got %d: %v",
-			qcount, sqlList,
+			"expected exactly 1 delegated call, got %d: %v",
+			len(st.fakeReader.calls), methods,
+		)
+	}
+	call := st.fakeReader.calls[0]
+	if call.Method != "ListRepos" {
+		return fmt.Errorf("expected ListRepos call, got %s", call.Method)
+	}
+
+	// Assert args match: the ReaderOptions passed to the adapter
+	// must be forwarded verbatim to the backend.
+	gotOpts, ok := call.Args[0].(graphreader.ReaderOptions)
+	if !ok {
+		return fmt.Errorf("first arg type = %T, want graphreader.ReaderOptions", call.Args[0])
+	}
+	if !reflect.DeepEqual(gotOpts, st.listReposOpts) {
+		return fmt.Errorf(
+			"forwarded ReaderOptions mismatch: got %+v, want %+v",
+			gotOpts, st.listReposOpts,
 		)
 	}
 
-	// Assert the result matches the seeded repos
-	if len(st.adapterResult) == 0 {
-		return errors.New("adapter.ListRepos returned empty slice")
-	}
-	if len(st.adapterResult) != len(st.seedURLs) {
+	// Assert the returned []graphreader.RepoSummary is the fake's
+	// canned response, returned unmodified.
+	if !reflect.DeepEqual(st.adapterResult, st.fakeReader.repos) {
 		return fmt.Errorf(
-			"adapter returned %d repos, expected %d seeded repos",
-			len(st.adapterResult), len(st.seedURLs),
+			"returned []RepoSummary was modified by the adapter:\n  got  %+v\n  want %+v",
+			st.adapterResult, st.fakeReader.repos,
 		)
-	}
-	for i, want := range st.seedURLs {
-		got := st.adapterResult[i].URL
-		if got != want {
-			return fmt.Errorf(
-				"result[%d].URL = %q, want %q (seed order mismatch)",
-				i, got, want,
-			)
-		}
-		if st.adapterResult[i].RepoID == "" {
-			return fmt.Errorf("result[%d].RepoID is empty", i)
-		}
 	}
 	return nil
 }
@@ -962,7 +887,7 @@ func InitializeScenario_graphsink_storage_abstraction_postgres_sink_adapter(ctx 
 	ctx.Given(`^a SQL error with SQLSTATE 42501$`, st.aSQLErrorWithSQLSTATE42501)
 	ctx.Given(`^an existing Node with kind "([^"]*)" and canonical signature "([^"]*)" in a real Postgres$`, st.anExistingNodeWithKindAndSig)
 	ctx.Given(`^the "internal/graphsink/postgres/" package source$`, st.theGraphsinkPostgresPackageSource)
-	ctx.Given(`^a real "\*graphreader\.Reader" behind postgresadapter\.NewReader with seeded repos$`, st.aRealGraphreaderReaderWithSeededRepos)
+	ctx.Given(`^a fake "\*graphreader\.Reader" that records calls$`, st.aFakeGraphreaderReaderThatRecordsCalls)
 	ctx.Given(`^the same fixture rows seeded for both graphreader\.Reader\.ListRepos and mgmtapi\.handleListRepos$`, st.theSameFixtureRowsForReaderAndMgmtapi)
 
 	// When
@@ -970,7 +895,7 @@ func InitializeScenario_graphsink_storage_abstraction_postgres_sink_adapter(ctx 
 	ctx.When(`^InsertNode runs$`, st.insertNodeRuns)
 	ctx.When(`^LookupBySignature runs with repoID, "([^"]*)", "([^"]*)"$`, st.lookupBySignatureRunsWithRepoIDKindSig)
 	ctx.When(`^"go list -deps" runs against the package$`, st.goListDepsRunsAgainstThePackage)
-	ctx.When(`^the postgres adapter's ListRepos runs with query recording$`, st.adapterListReposRunsWithRecording)
+	ctx.When(`^the postgres adapter's ListRepos\(ctx, opts\) runs$`, st.adapterListReposRuns)
 	ctx.When(`^graphreader\.Reader\.ListRepos and mgmtapi\.handleListRepos both run$`, st.graphreaderAndMgmtapiBothRun)
 
 	// Then
@@ -978,7 +903,7 @@ func InitializeScenario_graphsink_storage_abstraction_postgres_sink_adapter(ctx 
 	ctx.Then(`^the returned error is a typed WriteContractViolation and the user-facing message includes the role hint$`, st.theReturnedErrorIsATypedWriteContractViolationWithRoleHint)
 	ctx.Then(`^it returns the same Node that ListNodes with CanonicalSignature filter returns$`, st.itReturnsSameNodeAsListNodes)
 	ctx.Then(`^"database/sql" does NOT appear in the dependency list$`, st.databaseSQLNotInDeps)
-	ctx.Then(`^exactly one delegated query is recorded and the result matches the seeded repos$`, st.exactlyOneDelegatedCallAndResultMatchesSeeds)
+	ctx.Then(`^exactly one delegated call is recorded with the same args and the returned \[\]graphreader\.RepoSummary is returned unmodified$`, st.exactlyOneDelegatedCallAndReturnUnmodified)
 	ctx.Then(`^the two return identical ordered RepoSummary-equivalent slices$`, st.identicalOrderedRepoSummarySlices)
 }
 

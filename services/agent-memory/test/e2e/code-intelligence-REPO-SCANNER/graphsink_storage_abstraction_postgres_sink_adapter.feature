@@ -22,9 +22,9 @@ Feature: Postgres sink adapter — E2E
     Then "database/sql" does NOT appear in the dependency list
 
   Scenario: listrepos-forwards-to-graphreader
-    Given a real "*graphreader.Reader" behind postgresadapter.NewReader with seeded repos
-    When the postgres adapter's ListRepos runs with query recording
-    Then exactly one delegated query is recorded and the result matches the seeded repos
+    Given a fake "*graphreader.Reader" that records calls
+    When the postgres adapter's ListRepos(ctx, opts) runs
+    Then exactly one delegated call is recorded with the same args and the returned []graphreader.RepoSummary is returned unmodified
 
   Scenario: graphreader-listrepos-matches-mgmtapi
     Given the same fixture rows seeded for both graphreader.Reader.ListRepos and mgmtapi.handleListRepos

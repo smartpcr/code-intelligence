@@ -441,12 +441,18 @@ func (s *Sink) Close() error {
 	}
 	s.mu.Unlock()
 	if err != nil {
+		s.mu.Lock()
+		s.closed = false
+		s.mu.Unlock()
 		return err
 	}
 	if path == "" {
 		return nil
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
+		s.mu.Lock()
+		s.closed = false
+		s.mu.Unlock()
 		return fmt.Errorf("graphsink/memory: write export: %w", err)
 	}
 	return nil

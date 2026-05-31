@@ -56,14 +56,58 @@ func vettoolBinaryName() string {
 	return "buildtaglint"
 }
 
-// runVetToolInDir builds the buildtaglint vettool and runs
-// `go vet -vettool=<binary>` over the CLI source trees.
-func (s *customLintRulesState) runVetToolInDir() error {
+// runCommandCaptureCLR executes a command in dir and captures
+// stdout, stderr, and exit code into the state.
+func (s *customLintRulesState) runCommandCaptureCLR(dir, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	err := cmd.Run()
+	s.stdout = stdoutBuf.String()
+	s.stderr = stderrBuf.String()
+
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			s.exitCode = exitErr.ExitCode()
+		} else {
+			return fmt.Errorf("command %q execution failed: %w", name, err)
+		}
+	} else {
+		s.exitCode = 0
+	}
+	return nil
+}
+
+// runMakeLintCLI runs `make lint-cli` on platforms where make is
+// available, or replicates the full Makefile target (vettool +
+// golangci-lint forbidigo) on Windows when make is absent.
+func (s *customLintRulesState) runMakeLintCLI() error {
+	// Try `make lint-cli` first — it runs the full target
+	// including both the vettool AND golangci-lint forbidigo.
+	if _, err := exec.LookPath("make"); err == nil {
+		return s.runCommandCaptureCLR(s.moduleRoot, "make", "lint-cli")
+	}
+
+	// Fallback: replicate the Makefile's lint-cli target
+	// manually so the test still covers both halves.
+	return s.runLintCLIFallback()
+}
+
+// runLintCLIFallback replicates the `make lint-cli` target:
+//  1. Build the buildtaglint vettool.
+//  2. Run `go vet -vettool=<binary>` over the CLI trees.
+//  3. Run `golangci-lint run --enable-only forbidigo` over the CLI trees.
+//
+// Mirrors make's stop-on-first-failure: if go vet exits non-zero
+// the golangci-lint step is skipped (the Makefile would stop too).
+func (s *customLintRulesState) runLintCLIFallback() error {
 	binDir := filepath.Join(s.moduleRoot, "bin")
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		return fmt.Errorf("failed to create bin dir: %w", err)
 	}
-
 	vettoolPath := filepath.Join(binDir, vettoolBinaryName())
 
 	// Step 1: build the vettool.
@@ -73,29 +117,31 @@ func (s *customLintRulesState) runVetToolInDir() error {
 		return fmt.Errorf("failed to build buildtaglint: %s\n%s", err, string(out))
 	}
 
-	// Step 2: run go vet with the vettool.
-	vetCmd := exec.Command("go", "vet",
-		fmt.Sprintf("-vettool=%s", vettoolPath),
-		"./cmd/cleanc/...", "./internal/cli/...")
-	vetCmd.Dir = s.moduleRoot
-
-	var stdoutBuf, stderrBuf bytes.Buffer
-	vetCmd.Stdout = &stdoutBuf
-	vetCmd.Stderr = &stderrBuf
-
-	err := vetCmd.Run()
-	s.stdout = stdoutBuf.String()
-	s.stderr = stderrBuf.String()
-
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			s.exitCode = exitErr.ExitCode()
-		} else {
-			return fmt.Errorf("go vet execution failed: %w", err)
-		}
-	} else {
-		s.exitCode = 0
+	// Step 2: go vet with the vettool.
+	if err := s.runCommandCaptureCLR(s.moduleRoot, "go", "vet",
+		"-vettool="+vettoolPath,
+		"./cmd/cleanc/...", "./internal/cli/..."); err != nil {
+		return err
 	}
+	if s.exitCode != 0 {
+		return nil // mimic make's stop-on-first-failure
+	}
+	step1Stdout, step1Stderr := s.stdout, s.stderr
+
+	// Step 3: golangci-lint forbidigo.
+	lintBin := "golangci-lint"
+	if _, lookErr := exec.LookPath(lintBin); lookErr != nil {
+		return fmt.Errorf("golangci-lint not found on PATH; " +
+			"make lint-cli requires it for the forbidigo half")
+	}
+	if err := s.runCommandCaptureCLR(s.moduleRoot, lintBin,
+		"run", "--enable-only", "forbidigo",
+		"./cmd/cleanc/...", "./internal/cli/..."); err != nil {
+		return err
+	}
+	// Accumulate output from both steps.
+	s.stdout = step1Stdout + s.stdout
+	s.stderr = step1Stderr + s.stderr
 	return nil
 }
 
@@ -160,7 +206,7 @@ func (s *customLintRulesState) theActualCLISourceTree() error {
 // --- When steps ---
 
 func (s *customLintRulesState) makeLintCLIRuns() error {
-	return s.runVetToolInDir()
+	return s.runMakeLintCLI()
 }
 
 // --- Then steps ---
@@ -182,14 +228,13 @@ func (s *customLintRulesState) itExits0CLR() error {
 }
 
 func (s *customLintRulesState) stderrNamesTheFileAndTheRule(ruleName string) error {
-	combined := s.stdout + s.stderr
-	if !strings.Contains(combined, s.fixtureName) {
-		return fmt.Errorf("output does not mention fixture file %q\nstdout:\n%s\nstderr:\n%s",
-			s.fixtureName, s.stdout, s.stderr)
+	if !strings.Contains(s.stderr, s.fixtureName) {
+		return fmt.Errorf("stderr does not mention fixture file %q\nstderr:\n%s",
+			s.fixtureName, s.stderr)
 	}
-	if !strings.Contains(combined, ruleName) {
-		return fmt.Errorf("output does not mention rule %q\nstdout:\n%s\nstderr:\n%s",
-			ruleName, s.stdout, s.stderr)
+	if !strings.Contains(s.stderr, ruleName) {
+		return fmt.Errorf("stderr does not mention rule %q\nstderr:\n%s",
+			ruleName, s.stderr)
 	}
 	return nil
 }

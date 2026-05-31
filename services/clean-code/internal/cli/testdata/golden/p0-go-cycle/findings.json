@@ -8,7 +8,7 @@
     "IsGitRepo": false
   },
   "Policy": {
-    "policy_version_id": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+    "policy_version_id": "2b8b672e-2c5c-5891-ad9a-394921e95273",
     "name": "cleanc.devpolicy",
     "rule_refs": [
       {
@@ -65,6 +65,10 @@
       },
       {
         "rule_id": "solid.srp.interface_width_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.srp.loc_high",
         "version": 1
       }
     ],
@@ -686,7 +690,7 @@
     "EvaluationRunID": "5c8260b1-3417-5316-bee9-dcdda33b17bb",
     "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
     "SHA": "working-copy",
-    "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+    "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
     "Caller": "batch_refresh",
     "ScopeID": null,
     "CreatedAt": "2026-05-01T12:00:00Z"
@@ -708,7 +712,7 @@
       "ScopeID": "680c7ecd-d9d1-5030-8811-f9a1facb798b",
       "RuleID": "decoupling.cycle_member_present",
       "RuleVersion": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "MetricSampleIDs": [
         "00f2b54d-b126-53a2-b3d5-b4181e91e478"
       ],
@@ -725,7 +729,7 @@
       "ScopeID": "42ffb9fb-4f66-55d2-a1b4-162d572cd73f",
       "RuleID": "decoupling.cycle_member_present",
       "RuleVersion": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "MetricSampleIDs": [
         "6ad499a0-c07f-58c9-8272-5658db67a268"
       ],
@@ -742,7 +746,7 @@
       "ScopeID": "b7715ba9-e6fb-5e12-9953-e86998f09b12",
       "RuleID": "solid.srp.interface_width_high",
       "RuleVersion": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "MetricSampleIDs": [
         "9e507b83-e930-524f-8ae1-a25cef690aa4"
       ],
@@ -759,7 +763,7 @@
       "ScopeID": "1af4afdf-ec67-5beb-81ab-8defe560a95a",
       "RuleID": "decoupling.cycle_member_present",
       "RuleVersion": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "MetricSampleIDs": [
         "eb293ef8-d8f2-5adb-baad-472f55578ba4"
       ],
@@ -776,7 +780,7 @@
       "ScopeID": "a0689269-db85-550f-afb3-f55fe4756122",
       "RuleID": "decoupling.cycle_member_present",
       "RuleVersion": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "MetricSampleIDs": [
         "625a0f75-572b-57a0-95d5-b4e35e058a4a"
       ],
@@ -793,7 +797,7 @@
       "ScopeID": "a0689269-db85-550f-afb3-f55fe4756122",
       "RuleID": "decoupling.duplication_ratio_high",
       "RuleVersion": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "MetricSampleIDs": [
         "6a6588d7-6c20-5627-beea-e1465645353b"
       ],
@@ -810,7 +814,7 @@
       "SHA": "working-copy",
       "ScopeID": "a0689269-db85-550f-afb3-f55fe4756122",
       "Score": 2,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -819,7 +823,7 @@
       "SHA": "working-copy",
       "ScopeID": "1af4afdf-ec67-5beb-81ab-8defe560a95a",
       "Score": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -828,7 +832,7 @@
       "SHA": "working-copy",
       "ScopeID": "42ffb9fb-4f66-55d2-a1b4-162d572cd73f",
       "Score": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -837,7 +841,7 @@
       "SHA": "working-copy",
       "ScopeID": "680c7ecd-d9d1-5030-8811-f9a1facb798b",
       "Score": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -846,7 +850,7 @@
       "SHA": "working-copy",
       "ScopeID": "7c171f5f-2dc2-58ff-8070-b6c40b55b5af",
       "Score": 0.8660254037844387,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -855,7 +859,7 @@
       "SHA": "working-copy",
       "ScopeID": "84ed6678-e597-51e0-81be-647ed21e11c5",
       "Score": 0.8660254037844387,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -864,7 +868,7 @@
       "SHA": "working-copy",
       "ScopeID": "8b7ab222-6046-53a2-b159-059dfd2b0ea5",
       "Score": 0.8660254037844387,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -873,7 +877,7 @@
       "SHA": "working-copy",
       "ScopeID": "c80b2133-9881-53e9-a5fe-7432fea36a83",
       "Score": 0.8660254037844387,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -882,7 +886,7 @@
       "SHA": "working-copy",
       "ScopeID": "b7715ba9-e6fb-5e12-9953-e86998f09b12",
       "Score": -0.15470053837925146,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -891,7 +895,7 @@
       "SHA": "working-copy",
       "ScopeID": "62d979b1-3121-5d37-8450-83abad9d0b3c",
       "Score": -1.1547005383792515,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -900,7 +904,7 @@
       "SHA": "working-copy",
       "ScopeID": "7c18d1f8-ee5a-5303-aa5a-a7b0dda9649b",
       "Score": -1.1547005383792515,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     }
   ],
@@ -921,7 +925,7 @@
       "61aaf012-99a4-54b7-882e-ef337a2d00cc",
       "7bca3ef6-9bf5-5556-aaf2-ba1abcef0667"
     ],
-    "SummaryMD": "Refactor plan for repo 3f95aed7-bc92-5db1-a6eb-2274edfe46a4 at sha working-copy.\n\nCovered hot_spots: 11\nGenerated tasks: 6\nPolicy version: ac2ca2b6-2dd1-5db9-81f8-895918458335\n",
+    "SummaryMD": "Refactor plan for repo 3f95aed7-bc92-5db1-a6eb-2274edfe46a4 at sha working-copy.\n\nCovered hot_spots: 11\nGenerated tasks: 6\nPolicy version: 2b8b672e-2c5c-5891-ad9a-394921e95273\n",
     "CreatedAt": "2026-05-01T12:00:00Z"
   },
   "Tasks": [
@@ -932,7 +936,7 @@
       "Kind": "break_cycle",
       "EffortHours": 0,
       "RuleID": "decoupling.cycle_member_present",
-      "DescriptionMD": "Refactor task: kind=break_cycle for scope a0689269-db85-550f-afb3-f55fe4756122 motivated by rule decoupling.cycle_member_present.\nHot_spot id: d24ae053-783a-5bb7-929b-533ce0189f55 (score=2, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope a0689269-db85-550f-afb3-f55fe4756122 motivated by rule decoupling.cycle_member_present.\nHot_spot id: d24ae053-783a-5bb7-929b-533ce0189f55 (score=2, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -942,7 +946,7 @@
       "Kind": "consolidate_duplication",
       "EffortHours": 0,
       "RuleID": "decoupling.duplication_ratio_high",
-      "DescriptionMD": "Refactor task: kind=consolidate_duplication for scope a0689269-db85-550f-afb3-f55fe4756122 motivated by rule decoupling.duplication_ratio_high.\nHot_spot id: d24ae053-783a-5bb7-929b-533ce0189f55 (score=2, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=consolidate_duplication for scope a0689269-db85-550f-afb3-f55fe4756122 motivated by rule decoupling.duplication_ratio_high.\nHot_spot id: d24ae053-783a-5bb7-929b-533ce0189f55 (score=2, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -952,7 +956,7 @@
       "Kind": "break_cycle",
       "EffortHours": 0,
       "RuleID": "decoupling.cycle_member_present",
-      "DescriptionMD": "Refactor task: kind=break_cycle for scope 1af4afdf-ec67-5beb-81ab-8defe560a95a motivated by rule decoupling.cycle_member_present.\nHot_spot id: 30cc36dd-c0fe-59fe-a684-1ee53f5d6282 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope 1af4afdf-ec67-5beb-81ab-8defe560a95a motivated by rule decoupling.cycle_member_present.\nHot_spot id: 30cc36dd-c0fe-59fe-a684-1ee53f5d6282 (score=1, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -962,7 +966,7 @@
       "Kind": "break_cycle",
       "EffortHours": 0,
       "RuleID": "decoupling.cycle_member_present",
-      "DescriptionMD": "Refactor task: kind=break_cycle for scope 42ffb9fb-4f66-55d2-a1b4-162d572cd73f motivated by rule decoupling.cycle_member_present.\nHot_spot id: 37daf3c3-4030-572b-8d11-332b1977ebe9 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope 42ffb9fb-4f66-55d2-a1b4-162d572cd73f motivated by rule decoupling.cycle_member_present.\nHot_spot id: 37daf3c3-4030-572b-8d11-332b1977ebe9 (score=1, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -972,7 +976,7 @@
       "Kind": "break_cycle",
       "EffortHours": 0,
       "RuleID": "decoupling.cycle_member_present",
-      "DescriptionMD": "Refactor task: kind=break_cycle for scope 680c7ecd-d9d1-5030-8811-f9a1facb798b motivated by rule decoupling.cycle_member_present.\nHot_spot id: b0aa8db3-a2be-5bca-af04-894673a90d2d (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope 680c7ecd-d9d1-5030-8811-f9a1facb798b motivated by rule decoupling.cycle_member_present.\nHot_spot id: b0aa8db3-a2be-5bca-af04-894673a90d2d (score=1, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -982,7 +986,7 @@
       "Kind": "split_class",
       "EffortHours": 0,
       "RuleID": "solid.srp.interface_width_high",
-      "DescriptionMD": "Refactor task: kind=split_class for scope b7715ba9-e6fb-5e12-9953-e86998f09b12 motivated by rule solid.srp.interface_width_high.\nHot_spot id: c64225c2-22e1-5a47-9b74-ee191e0b9e99 (score=-0.15470053837925146, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=split_class for scope b7715ba9-e6fb-5e12-9953-e86998f09b12 motivated by rule solid.srp.interface_width_high.\nHot_spot id: c64225c2-22e1-5a47-9b74-ee191e0b9e99 (score=-0.15470053837925146, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     }
   ],

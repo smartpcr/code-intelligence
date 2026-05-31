@@ -8,7 +8,7 @@
     "IsGitRepo": false
   },
   "Policy": {
-    "policy_version_id": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+    "policy_version_id": "2b8b672e-2c5c-5891-ad9a-394921e95273",
     "name": "cleanc.devpolicy",
     "rule_refs": [
       {
@@ -65,6 +65,10 @@
       },
       {
         "rule_id": "solid.srp.interface_width_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.srp.loc_high",
         "version": 1
       }
     ],
@@ -692,7 +696,7 @@
     "EvaluationRunID": "86899bc6-ef41-5bbe-9785-3767eadfb169",
     "RepoID": "3c8339d3-0d6b-5ef6-9cc4-0feca496adec",
     "SHA": "working-copy",
-    "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+    "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
     "Caller": "batch_refresh",
     "ScopeID": null,
     "CreatedAt": "2026-05-01T12:00:00Z"
@@ -714,7 +718,7 @@
       "ScopeID": "ad97b3b3-8700-57c3-aa9a-e1a36a44a4e1",
       "RuleID": "decoupling.cycle_member_present",
       "RuleVersion": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "MetricSampleIDs": [
         "4dbafe9a-bf85-51eb-b093-e7661003775a"
       ],
@@ -731,7 +735,7 @@
       "ScopeID": "ee0f2d2a-b00e-5160-b6b3-e5633e0f2e4f",
       "RuleID": "solid.srp.interface_width_high",
       "RuleVersion": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "MetricSampleIDs": [
         "23136039-e0c9-5176-8e7b-210164342127"
       ],
@@ -748,7 +752,7 @@
       "ScopeID": "4da7085b-de3f-56e0-a47a-68f7b82ba985",
       "RuleID": "decoupling.cycle_member_present",
       "RuleVersion": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "MetricSampleIDs": [
         "34887be6-a83c-509d-9444-f41df54ed898"
       ],
@@ -765,7 +769,7 @@
       "ScopeID": "4da7085b-de3f-56e0-a47a-68f7b82ba985",
       "RuleID": "decoupling.duplication_ratio_high",
       "RuleVersion": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "MetricSampleIDs": [
         "258fa581-d878-5271-b7b6-e137e22569b5"
       ],
@@ -782,7 +786,7 @@
       "ScopeID": "8ba1719d-ff24-5a77-995f-76677c5126d1",
       "RuleID": "decoupling.cycle_member_present",
       "RuleVersion": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "MetricSampleIDs": [
         "0426a89f-611b-50f4-b6f2-095190309da2"
       ],
@@ -799,7 +803,7 @@
       "ScopeID": "8feb7f54-39d9-57d9-8dd4-72ce40ff321e",
       "RuleID": "decoupling.cycle_member_present",
       "RuleVersion": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "MetricSampleIDs": [
         "0fe5877c-13cb-5b16-8460-9925f79a158d"
       ],
@@ -816,7 +820,7 @@
       "ScopeID": "fbd05f08-7304-5130-a9a8-51d408f8dc45",
       "RuleID": "solid.isp.interface_width_high",
       "RuleVersion": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "MetricSampleIDs": [
         "5cd34d63-3287-59e4-9cab-5e80826a22cc"
       ],
@@ -833,7 +837,7 @@
       "SHA": "working-copy",
       "ScopeID": "ee0f2d2a-b00e-5160-b6b3-e5633e0f2e4f",
       "Score": 2.3489815189531904,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -842,7 +846,7 @@
       "SHA": "working-copy",
       "ScopeID": "4da7085b-de3f-56e0-a47a-68f7b82ba985",
       "Score": 2,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -851,7 +855,7 @@
       "SHA": "working-copy",
       "ScopeID": "8ba1719d-ff24-5a77-995f-76677c5126d1",
       "Score": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -860,7 +864,7 @@
       "SHA": "working-copy",
       "ScopeID": "8feb7f54-39d9-57d9-8dd4-72ce40ff321e",
       "Score": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -869,7 +873,7 @@
       "SHA": "working-copy",
       "ScopeID": "ad97b3b3-8700-57c3-aa9a-e1a36a44a4e1",
       "Score": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -878,7 +882,7 @@
       "SHA": "working-copy",
       "ScopeID": "fbd05f08-7304-5130-a9a8-51d408f8dc45",
       "Score": 1,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -887,7 +891,7 @@
       "SHA": "working-copy",
       "ScopeID": "02c76db2-3ff2-5cc4-b5d0-645cbcdba814",
       "Score": 0,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -896,7 +900,7 @@
       "SHA": "working-copy",
       "ScopeID": "1ebd2d87-b942-5a9f-8c6e-21edacdf6ed7",
       "Score": 0,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -905,7 +909,7 @@
       "SHA": "working-copy",
       "ScopeID": "7f86fbb0-f4ee-56e3-a918-4664cfa76a9e",
       "Score": 0,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -914,7 +918,7 @@
       "SHA": "working-copy",
       "ScopeID": "3018ad71-af88-5f5f-a765-8893d3502108",
       "Score": -1.3489815189531904,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -923,7 +927,7 @@
       "SHA": "working-copy",
       "ScopeID": "d190ef55-c74d-524c-a6aa-e051b7558ec6",
       "Score": -1.3489815189531904,
-      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
       "CreatedAt": "2026-05-01T12:00:00Z"
     }
   ],
@@ -944,7 +948,7 @@
       "02c959b4-acf9-53b5-99fb-b0de4178ea9d",
       "b92a4dbd-a8b7-5500-b009-559cfbefef01"
     ],
-    "SummaryMD": "Refactor plan for repo 3c8339d3-0d6b-5ef6-9cc4-0feca496adec at sha working-copy.\n\nCovered hot_spots: 11\nGenerated tasks: 7\nPolicy version: ac2ca2b6-2dd1-5db9-81f8-895918458335\n",
+    "SummaryMD": "Refactor plan for repo 3c8339d3-0d6b-5ef6-9cc4-0feca496adec at sha working-copy.\n\nCovered hot_spots: 11\nGenerated tasks: 7\nPolicy version: 2b8b672e-2c5c-5891-ad9a-394921e95273\n",
     "CreatedAt": "2026-05-01T12:00:00Z"
   },
   "Tasks": [
@@ -955,7 +959,7 @@
       "Kind": "split_class",
       "EffortHours": 0,
       "RuleID": "solid.srp.interface_width_high",
-      "DescriptionMD": "Refactor task: kind=split_class for scope ee0f2d2a-b00e-5160-b6b3-e5633e0f2e4f motivated by rule solid.srp.interface_width_high.\nHot_spot id: 8a30998a-6d40-59c4-b294-b7b2326fcbbf (score=2.3489815189531904, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=split_class for scope ee0f2d2a-b00e-5160-b6b3-e5633e0f2e4f motivated by rule solid.srp.interface_width_high.\nHot_spot id: 8a30998a-6d40-59c4-b294-b7b2326fcbbf (score=2.3489815189531904, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -965,7 +969,7 @@
       "Kind": "break_cycle",
       "EffortHours": 0,
       "RuleID": "decoupling.cycle_member_present",
-      "DescriptionMD": "Refactor task: kind=break_cycle for scope 4da7085b-de3f-56e0-a47a-68f7b82ba985 motivated by rule decoupling.cycle_member_present.\nHot_spot id: 5f8aec5e-8459-5355-91c4-d801e62589ce (score=2, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope 4da7085b-de3f-56e0-a47a-68f7b82ba985 motivated by rule decoupling.cycle_member_present.\nHot_spot id: 5f8aec5e-8459-5355-91c4-d801e62589ce (score=2, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -975,7 +979,7 @@
       "Kind": "consolidate_duplication",
       "EffortHours": 0,
       "RuleID": "decoupling.duplication_ratio_high",
-      "DescriptionMD": "Refactor task: kind=consolidate_duplication for scope 4da7085b-de3f-56e0-a47a-68f7b82ba985 motivated by rule decoupling.duplication_ratio_high.\nHot_spot id: 5f8aec5e-8459-5355-91c4-d801e62589ce (score=2, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=consolidate_duplication for scope 4da7085b-de3f-56e0-a47a-68f7b82ba985 motivated by rule decoupling.duplication_ratio_high.\nHot_spot id: 5f8aec5e-8459-5355-91c4-d801e62589ce (score=2, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -985,7 +989,7 @@
       "Kind": "break_cycle",
       "EffortHours": 0,
       "RuleID": "decoupling.cycle_member_present",
-      "DescriptionMD": "Refactor task: kind=break_cycle for scope 8ba1719d-ff24-5a77-995f-76677c5126d1 motivated by rule decoupling.cycle_member_present.\nHot_spot id: 18b950da-d80e-5c8a-9d1f-10efa5dab0d6 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope 8ba1719d-ff24-5a77-995f-76677c5126d1 motivated by rule decoupling.cycle_member_present.\nHot_spot id: 18b950da-d80e-5c8a-9d1f-10efa5dab0d6 (score=1, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -995,7 +999,7 @@
       "Kind": "break_cycle",
       "EffortHours": 0,
       "RuleID": "decoupling.cycle_member_present",
-      "DescriptionMD": "Refactor task: kind=break_cycle for scope 8feb7f54-39d9-57d9-8dd4-72ce40ff321e motivated by rule decoupling.cycle_member_present.\nHot_spot id: 2d4ef6fa-ee6f-52ca-811d-7b5f5f8d8c94 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope 8feb7f54-39d9-57d9-8dd4-72ce40ff321e motivated by rule decoupling.cycle_member_present.\nHot_spot id: 2d4ef6fa-ee6f-52ca-811d-7b5f5f8d8c94 (score=1, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -1005,7 +1009,7 @@
       "Kind": "break_cycle",
       "EffortHours": 0,
       "RuleID": "decoupling.cycle_member_present",
-      "DescriptionMD": "Refactor task: kind=break_cycle for scope ad97b3b3-8700-57c3-aa9a-e1a36a44a4e1 motivated by rule decoupling.cycle_member_present.\nHot_spot id: fee4ce49-0eb6-5502-ae02-ec8ec45f02b5 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope ad97b3b3-8700-57c3-aa9a-e1a36a44a4e1 motivated by rule decoupling.cycle_member_present.\nHot_spot id: fee4ce49-0eb6-5502-ae02-ec8ec45f02b5 (score=1, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     },
     {
@@ -1015,7 +1019,7 @@
       "Kind": "split_class",
       "EffortHours": 0,
       "RuleID": "solid.isp.interface_width_high",
-      "DescriptionMD": "Refactor task: kind=split_class for scope fbd05f08-7304-5130-a9a8-51d408f8dc45 motivated by rule solid.isp.interface_width_high.\nHot_spot id: db4de943-f7f3-5e31-9d15-3d718a802310 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "DescriptionMD": "Refactor task: kind=split_class for scope fbd05f08-7304-5130-a9a8-51d408f8dc45 motivated by rule solid.isp.interface_width_high.\nHot_spot id: db4de943-f7f3-5e31-9d15-3d718a802310 (score=1, policy_version=2b8b672e-2c5c-5891-ad9a-394921e95273).\n",
       "CreatedAt": "2026-05-01T12:00:00Z"
     }
   ],

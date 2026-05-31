@@ -202,7 +202,6 @@ func TestVersionContainsBuildTagSegment(t *testing.T) {
 // the dispatcher, and asserts the markdown contains the
 // expected header tokens (RootPath, Verdict).
 func TestReportRendersFromFindingsArtifact(t *testing.T) {
-	t.Skip("pending Stage 4.1: cleanc report re-render lands in phase-p1-structured-prompt-emitter (runReport currently returns the 'follow-up stage' sentinel)")
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -234,7 +233,6 @@ func TestReportRendersFromFindingsArtifact(t *testing.T) {
 // stdout-default behaviour: omitting `--out` writes the
 // markdown to the process's stdout instead of a file.
 func TestReportRendersToStdoutWhenOutEmpty(t *testing.T) {
-	t.Skip("pending Stage 4.1: cleanc report re-render lands in phase-p1-structured-prompt-emitter (runReport currently returns the 'follow-up stage' sentinel)")
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -260,7 +258,6 @@ func TestReportRendersToStdoutWhenOutEmpty(t *testing.T) {
 // operator can correlate artifact-vs-binary skew without
 // re-reading either file.
 func TestReportRejectsSchemaVersionMismatch(t *testing.T) {
-	t.Skip("pending Stage 4.1: cleanc report schema-mismatch handling lands in phase-p1-structured-prompt-emitter")
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -297,7 +294,6 @@ func TestReportRejectsSchemaVersionMismatch(t *testing.T) {
 // open destination only on success), the existing file's
 // bytes survive the refusal byte-for-byte.
 func TestReportSchemaMismatchPreservesExistingOutFile(t *testing.T) {
-	t.Skip("pending Stage 4.1: cleanc report schema-mismatch handling lands in phase-p1-structured-prompt-emitter")
 	t.Parallel()
 
 	dir := t.TempDir()

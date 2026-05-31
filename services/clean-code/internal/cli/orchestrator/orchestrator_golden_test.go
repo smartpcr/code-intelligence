@@ -300,10 +300,10 @@ func assertScenarioSignals(t *testing.T, scenario string, art report.RunArtifact
 			hasSplitClassTask = true
 		}
 	}
-	hasLocFinding := false
+	hasLocRuleFinding := false
 	for _, f := range art.Findings {
-		if strings.Contains(f.RuleID, "loc") || strings.Contains(f.RuleID, "srp") {
-			hasLocFinding = true
+		if f.RuleID == "solid.srp.loc_high" {
+			hasLocRuleFinding = true
 			break
 		}
 	}
@@ -318,37 +318,27 @@ func assertScenarioSignals(t *testing.T, scenario string, art report.RunArtifact
 		if !hasLargeLocSample {
 			t.Fatalf("%s: expected at least one loc sample with value > 2000 (the fixture's >2000-line file); samples=%d", scenario, len(art.Samples))
 		}
+		if !hasLocRuleFinding {
+			t.Fatalf("%s: expected the high-LOC sample to drive a solid.srp.loc_high finding (NOT just an interface_width SRP finding); rules=%v", scenario, findingRuleIDs(art))
+		}
 		if !hasSplitClassTask {
-			t.Fatalf("%s: expected at least one split_class task driven by an SRP-family finding; rules=%v tasks=%v", scenario, findingRuleIDs(art), taskKinds(art))
+			t.Fatalf("%s: expected at least one split_class task driven by solid.srp.loc_high; rules=%v tasks=%v", scenario, findingRuleIDs(art), taskKinds(art))
 		}
-		if !hasLocFinding {
-			t.Fatalf("%s: expected at least one SRP-family finding (rule_id containing 'srp' or 'loc'); rules=%v", scenario, findingRuleIDs(art))
-		}
-		return
-	}
-	if scenario == "p0-java-cycle" {
-		// The Java fixture is valid compilable Java that uses
-		// FQN class imports (e.g. `import example.beta.BetaLeaf;`).
-		// The `cycle_member` import resolver matches by package
-		// qualifiedName or directory, neither of which equals the
-		// FQN class import target. The cycle is therefore not
-		// detected today; this is a known gap in the
-		// recipe (not the fixture), tracked as an open question
-		// (`java-fqn-import-cycle-resolution`).  For now require
-		// at minimum an interface_width OR duplication finding so
-		// the fixture is still exercising the lit-up metrics.
-		hasInterfaceOrDup := false
-		for _, f := range art.Findings {
-			if strings.Contains(f.RuleID, "interface_width") || strings.Contains(f.RuleID, "duplication") {
-				hasInterfaceOrDup = true
+		// Defensive: confirm the split_class task is wired
+		// back to the loc_high rule, not some other srp.*
+		// rule. This prevents a regression where loc_high
+		// fires but the task is generated from a sibling
+		// rule (then the loc signal isn't actually the
+		// motivator).
+		locDrovenSplit := false
+		for _, task := range art.Tasks {
+			if task.Kind == refactor.TaskKindSplitClass && task.RuleID == "solid.srp.loc_high" {
+				locDrovenSplit = true
 				break
 			}
 		}
-		if !hasInterfaceOrDup {
-			t.Fatalf("%s: expected at least one interface_width or duplication finding; rules=%v", scenario, findingRuleIDs(art))
-		}
-		if !hasCycleFinding {
-			t.Logf("%s: NOTE -- no cycle_member finding produced; FQN Java imports (e.g. 'import example.beta.BetaLeaf;') are not yet resolved by cycle_member recipe. See open question `java-fqn-import-cycle-resolution`.", scenario)
+		if !locDrovenSplit {
+			t.Fatalf("%s: expected at least one split_class task whose RuleID == solid.srp.loc_high; tasks=%v", scenario, taskRules(art))
 		}
 		return
 	}
@@ -358,6 +348,14 @@ func assertScenarioSignals(t *testing.T, scenario string, art report.RunArtifact
 	if !hasBreakCycleTask {
 		t.Fatalf("%s: expected at least one break_cycle task; rules=%v tasks=%v hotspots=%d", scenario, findingRuleIDs(art), taskKinds(art), len(art.HotSpots))
 	}
+}
+
+func taskRules(art report.RunArtifact) []string {
+	out := make([]string, 0, len(art.Tasks))
+	for _, task := range art.Tasks {
+		out = append(out, string(task.Kind)+"->"+task.RuleID)
+	}
+	return out
 }
 
 func findingRuleIDs(art report.RunArtifact) []string {

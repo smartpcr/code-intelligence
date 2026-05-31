@@ -55,3 +55,17 @@ rules:
       public methods, suggesting it handles too many concerns.
       Suggested refactor: split the class into focused,
       single-responsibility components (SRP).
+  - rule_id: solid.srp.loc_high
+    version: 1
+    predicate_dsl: "metric_kind == 'loc' AND scope_kind == 'file' AND value >= 1500"
+    severity_default: warn
+    description_md: |-
+      File `loc` >= 1500 -- a single source file this large is
+      almost always a Single-Responsibility violation: the
+      module accretes unrelated concerns until it becomes a
+      maintenance hot_spot. Suggested refactor: split the
+      file along its responsibility boundaries (SRP), grouping
+      methods and types that share a cohesion cluster into
+      smaller, focused modules. The threshold (1500 LOC)
+      matches the dev-mode bundle pinned in the
+      `pipeline_rule_engine_wiring` e2e feature.

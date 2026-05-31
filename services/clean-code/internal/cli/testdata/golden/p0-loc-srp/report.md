@@ -2,7 +2,7 @@
 
 - **Repo path:** /fixtures/loc-srp
 - **Head SHA:** working-copy
-- **Policy:** policy_id=ac2ca2b6-2dd1-5db9-81f8-895918458335 version=dev
+- **Policy:** policy_id=2b8b672e-2c5c-5891-ad9a-394921e95273 version=dev
 - **Active parser fleet:** go, java, python, typescript
 - **Dark metrics:** 5
 
@@ -20,4 +20,5 @@ Verdict: warn
 ## Findings
 
 - solid.srp.interface_width_high [warn]
+- solid.srp.loc_high [warn]
 

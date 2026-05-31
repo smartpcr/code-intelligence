@@ -763,6 +763,36 @@ func resolveImportToInProjectIdent(target string, qnToIdents map[string][]string
 	if idents, ok := qnToIdents[target]; ok && len(idents) == 1 {
 		return idents[0], true
 	}
+	// Tier 2.5: Java-style FQN class import canonicalisation.
+	// Java's per-class import syntax is `import a.b.C;` where
+	// `a.b` is the PACKAGE and `C` is the type. The package
+	// qns produced by the Java parser key on `a.b` (no
+	// trailing `.C`), so the tier-2 lookup misses every FQN
+	// class import. This tier iteratively strips trailing
+	// `.<segment>` from a dot-separated target and retries
+	// the qn lookup; the FIRST hit wins. A wildcard import
+	// `import a.b.*;` is normalised by stripping the literal
+	// `.*` suffix before the loop. Same fail-closed semantics
+	// as tier 2: ambiguous (>1 ident) lookups are dropped.
+	//
+	// Guarded to `.`-separated targets only so Go and TS
+	// `/`-separated module paths fall through untouched.
+	if !strings.Contains(target, "/") && strings.Contains(target, ".") {
+		trimmed := strings.TrimSuffix(target, ".*")
+		for {
+			idx := strings.LastIndex(trimmed, ".")
+			if idx <= 0 {
+				break
+			}
+			trimmed = trimmed[:idx]
+			if idents, ok := qnToIdents[trimmed]; ok && len(idents) == 1 {
+				return idents[0], true
+			}
+			if ident, ok := dirToIdent[trimmed]; ok {
+				return ident, true
+			}
+		}
+	}
 	// Tier 3: module-path canonicalisation. Walk module
 	// paths longest-first; first BOUNDARY match wins. A
 	// boundary match is `target == m` OR

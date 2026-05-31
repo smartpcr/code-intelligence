@@ -621,14 +621,43 @@ func runReport(stdout, stderr io.Writer, args []string) int {
 	// refusal (exit 64) leaves the destination file
 	// untouched.
 	findingsPath := positionals[0]
-	_, err = os.ReadFile(findingsPath)
+	prev, err := os.ReadFile(findingsPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "cleanc report: read %s: %v\n", findingsPath, err)
 		return flags.ExitInternalError
 	}
 
-	fmt.Fprintln(stderr, "cleanc report: re-render is a follow-up stage; the report renderer lands in Stage 4.1.")
-	return flags.ExitInternalError
+	// Iter-3 (Stage 3.5/3.4 closure): render into an in-memory
+	// buffer FIRST and only open / write to `--out` after a
+	// successful render. A schemaVersion-mismatch refusal
+	// must leave any pre-existing destination file untouched.
+	var rendered strings.Builder
+	if rerr := (report.JSON{}).RenderFromBytes(prev, &rendered); rerr != nil {
+		var mismatch *report.SchemaVersionMismatchError
+		if errors.As(rerr, &mismatch) {
+			fmt.Fprintln(stderr, "cleanc report: "+mismatch.Error())
+			return flags.ExitUsage
+		}
+		fmt.Fprintf(stderr, "cleanc report: %v\n", rerr)
+		return flags.ExitInternalError
+	}
+
+	outPath := ""
+	if g.Out != nil {
+		outPath = *g.Out
+	}
+	if outPath == "" {
+		if _, werr := io.WriteString(stdout, rendered.String()); werr != nil {
+			fmt.Fprintf(stderr, "cleanc report: write stdout: %v\n", werr)
+			return flags.ExitInternalError
+		}
+		return flags.ExitOK
+	}
+	if werr := os.WriteFile(outPath, []byte(rendered.String()), 0o644); werr != nil {
+		fmt.Fprintf(stderr, "cleanc report: write %s: %v\n", outPath, werr)
+		return flags.ExitInternalError
+	}
+	return flags.ExitOK
 }
 
 // parseInterleavedFlags runs the supplied flag-set against

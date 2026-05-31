@@ -425,7 +425,7 @@ func runAnalyzePipeline(ctx context.Context, stdout, stderr io.Writer, g *flags.
 	result, err := orch.Run(ctx, repoCtx, absPath)
 	if err != nil {
 		if errors.Is(err, walk.ErrRootNotFound) {
-			fmt.Fprintf(stderr, "cleanc analyze: ErrRootNotFound: %s\n", rootPath)
+			fmt.Fprintf(stderr, "cleanc analyze: repo path not found: %s\n", rootPath)
 			return flags.ExitWalkerError
 		}
 		fmt.Fprintf(stderr, "cleanc analyze: walker/orchestrator failed: %v\n", err)

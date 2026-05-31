@@ -289,6 +289,9 @@ func (s *Sink) ListNodes(
 	}
 	b.WriteString(" ORDER BY kind ASC, canonical_signature ASC, node_id ASC LIMIT ?")
 	effective := normaliseLimit(f.Limit)
+	// Only log when the caller explicitly exceeded the cap. The <= 0
+	// path is the normal "no limit specified" default and is intentionally
+	// silent to avoid noise — callers routinely omit Limit.
 	if f.Limit > graphreader.MaxListLimit {
 		slog.InfoContext(ctx, "graphsink.reader.limit_clamped",
 			slog.Int("requested", f.Limit),

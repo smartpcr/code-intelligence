@@ -38,9 +38,13 @@ tests/e2e/cleanc/
         expected-languages.txt -- the assertion target: the four canonical
                                    language tags that MUST show up in
                                    `RunArtifact.Files[].language`
-      run.sh                   -- runs `cleanc analyze . --findings findings.json`,
-                                   extracts the unique `Files[].language` set
-                                   via jq, and asserts it equals the golden
+      run.sh                   -- runs `cleanc analyze . --out report.md --findings findings.json`
+                                   (the markdown report is sunk to a file so
+                                   it does not pollute stdout; `--diagnostics`
+                                   is intentionally omitted, as the scenario
+                                   only asserts the language set), extracts
+                                   the unique `Files[].language` set via jq,
+                                   and asserts it equals the golden
 ```
 
 ## Running locally

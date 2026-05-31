@@ -153,33 +153,43 @@ test-race:
 lint: lint-cli
 	$(GOLANGCI_LINT) run $(GO_PKGS)
 
-## lint-cli: run the CLI-specific custom lint rules.
+## lint-cli: run the two CLI-specific custom lint rules
+## end-to-end against the real `cmd/cleanc/...` and
+## `internal/cli/...` source trees (tech-spec
+## REFACTOR-GUIDE Sec 8.10).
 ##
-## 1. `no-production-build-tag-bypass` (tech-spec Sec 8.10):
-##    a stdlib-only `go vet`-style analyser under
-##    `tools/buildtaglint/` that walks
-##    `internal/cli/devpolicy/` and asserts every file which
-##    constructs a `steward.PolicyVersion` with nil
-##    `Signature` carries `//go:build !prod`.
+## Step 1 -- build the custom `go vet` analyser binary.
+## The binary multiplexes two `go/analysis` analyzers
+## (`nobuildtagbypass`, `nocliproductionsqlimport`) under
+## `multichecker.Main` so a single `go vet` invocation
+## exercises BOTH rules. See `tools/buildtaglint/README.md`
+## for the rule reference.
 ##
-## 2. `no-production-sql-import` (tech-spec Sec 8.10): a
-##    `forbidigo` config rule under `.golangci.yml` scoped
-##    via `path-except` to `cmd/cleanc/...` and
-##    `internal/cli/...`. The rule fires when those trees
-##    use `database/sql` or import any `*_sql_store` adapter.
-##    The rule itself runs as part of `golangci-lint run`
-##    (the `lint` target above); this target additionally
-##    asserts the config still loads cleanly so an
-##    accidental edit to `.golangci.yml` that drops the
-##    `forbidigo` linter block is caught immediately.
+## Step 2 -- invoke `go vet -vettool=<binary>` over the
+## CLI source trees. A violation in either analyzer prints
+## `file:line:col: <rule-name>: <message>` to stderr (the
+## rule name is part of the diagnostic message so `grep`
+## for "no-production-sql-import" or
+## "no-production-build-tag-bypass" surfaces the relevant
+## hit) and produces a non-zero exit status that aborts
+## the build.
+##
+## Step 3 -- run the forbidigo half of the SQL-import
+## rule via golangci-lint. The vettool's import-list walker
+## catches blank imports that forbidigo cannot see (per
+## evaluator iter 1, item #2); golangci-lint's forbidigo
+## rule catches symbol-use violations under the same name
+## and supplies the canonical `golangci-lint`-style output
+## that CI dashboards already parse. Both layers run on
+## every PR so a regression on either path fails fast.
 lint-cli:
-	@echo "==> buildtaglint (no-production-build-tag-bypass)"
-	$(GO) run ./tools/buildtaglint ./internal/cli/devpolicy
-	@echo "==> golangci-lint config sanity check (no-production-sql-import)"
-	@$(GOLANGCI_LINT) linters 2>/dev/null | grep -q '^forbidigo:' || { \
-		echo "ERROR: forbidigo linter not enabled in .golangci.yml (tech-spec Sec 8.10)"; \
-		exit 1; \
-	}
+	@echo "==> buildtaglint: building vettool"
+	@mkdir -p $(BIN_DIR)
+	@$(GO) build -o $(BIN_DIR)/buildtaglint ./tools/buildtaglint
+	@echo "==> go vet -vettool=buildtaglint ./cmd/cleanc/... ./internal/cli/..."
+	$(GO) vet -vettool=$(BIN_DIR)/buildtaglint ./cmd/cleanc/... ./internal/cli/...
+	@echo "==> golangci-lint forbidigo (no-production-sql-import) on cmd/cleanc + internal/cli"
+	$(GOLANGCI_LINT) run --enable-only forbidigo ./cmd/cleanc/... ./internal/cli/...
 
 vet:
 	$(GO) vet $(GO_PKGS)

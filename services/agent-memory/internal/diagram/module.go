@@ -486,24 +486,6 @@ func repoLabel(url, sig string) string {
 	return tailSegment(sig)
 }
 
-// extractLanguage reads the `language` key from a Node's
-// `attrs_json` blob. Returns the empty string when the key is
-// missing, the blob is empty, or the JSON is malformed -- the
-// envelope's per-Node `language` field is best-effort metadata
-// the UI uses for coloring, not a structural invariant.
-func extractLanguage(attrs json.RawMessage) string {
-	if len(attrs) == 0 {
-		return ""
-	}
-	var probe struct {
-		Language string `json:"language"`
-	}
-	if err := json.Unmarshal(attrs, &probe); err != nil {
-		return ""
-	}
-	return probe.Language
-}
-
 // nonEmptyAttrs returns the supplied attrs verbatim when non-
 // empty, and `nil` otherwise so Node.MarshalJSON's nil-guard
 // can substitute the `{}` placeholder.

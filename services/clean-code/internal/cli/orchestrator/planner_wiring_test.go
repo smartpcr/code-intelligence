@@ -9,6 +9,7 @@ package orchestrator_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/gofrs/uuid"
 
@@ -324,5 +325,180 @@ func TestPlannerWiring_EndToEnd(t *testing.T) {
 	}
 	if len(res.Breakdowns) != 1 || res.Breakdowns[0].FindingCount != 1 {
 		t.Errorf("Breakdowns FindingCount = %+v, want one row with count 1", res.Breakdowns)
+	}
+
+	// ---- Stage 8.2 TaskPlanner wiring on the SAME snapshot. ----
+	// Architecture Sec 3.5 race-safety pin: reuse the
+	// snapshot from Stage 8.1 rather than re-reading the
+	// active policy.
+	findings = append(findings, rule_engine.Finding{
+		FindingID:       uuid.Must(uuid.NewV4()),
+		RepoID:          repoID,
+		SHA:             sha,
+		ScopeID:         scope1,
+		PolicyVersionID: pvID,
+		RuleID:          "solid.srp.high_lcom4",
+		Delta:           rule_engine.DeltaNew,
+	})
+
+	tp, planWriter, err := orchestrator.NewTaskPlannerWiring(bundle, res.HotSpots, findings)
+	if err != nil {
+		t.Fatalf("NewTaskPlannerWiring: %v", err)
+	}
+	taskRes, err := tp.PlanFromSnapshot(context.Background(), repoID, sha, res.Snapshot)
+	if err != nil {
+		t.Fatalf("TaskPlanner.PlanFromSnapshot: %v", err)
+	}
+	if taskRes.Plan.PlanID == uuid.Nil {
+		t.Fatalf("PlanFromSnapshot: PlanID is uuid.Nil, want a freshly-minted plan id")
+	}
+	if taskRes.PolicyVersionID != pvID {
+		t.Errorf("PlanAndTasksResult.PolicyVersionID = %v, want %v", taskRes.PolicyVersionID, pvID)
+	}
+	if len(taskRes.Tasks) == 0 {
+		t.Fatalf("PlanFromSnapshot: Tasks empty, want >=1 task for scope %v", scope1)
+	}
+	if got := taskRes.Tasks[0].ScopeID; got != scope1 {
+		t.Errorf("Tasks[0].ScopeID = %v, want %v", got, scope1)
+	}
+	if plans := planWriter.Plans(); len(plans) != 1 {
+		t.Errorf("planWriter.Plans len = %d, want 1", len(plans))
+	}
+	if writtenTasks := planWriter.Tasks(); len(writtenTasks) != len(taskRes.Tasks) {
+		t.Errorf("planWriter.Tasks len = %d, want %d (matching PlanAndTasksResult)", len(writtenTasks), len(taskRes.Tasks))
+	}
+}
+
+func TestBuildFindingDetailReader_FiltersToQualifyingDeltasAndCarriesRuleID(t *testing.T) {
+	t.Parallel()
+
+	repoID := uuid.Must(uuid.FromString("11111111-1111-4111-8111-111111111111"))
+	sha := "deadbeef"
+	pvID := uuid.Must(uuid.FromString("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"))
+	scopeA := uuid.Must(uuid.FromString("22222222-2222-4222-8222-222222222222"))
+	scopeB := uuid.Must(uuid.FromString("33333333-3333-4333-8333-333333333333"))
+
+	mk := func(scopeID uuid.UUID, ruleID string, delta rule_engine.Delta) rule_engine.Finding {
+		return rule_engine.Finding{
+			FindingID:       uuid.Must(uuid.NewV4()),
+			RepoID:          repoID,
+			SHA:             sha,
+			ScopeID:         scopeID,
+			PolicyVersionID: pvID,
+			RuleID:          ruleID,
+			Delta:           delta,
+		}
+	}
+	findings := []rule_engine.Finding{
+		mk(scopeA, "solid.srp.high_lcom4", rule_engine.DeltaNew),
+		mk(scopeA, "solid.srp.high_lcom4", rule_engine.DeltaNew),     // dedup target
+		mk(scopeB, "decoupling.cycle_member", rule_engine.DeltaNewlyFailing),
+		mk(scopeA, "decoupling.fan_out_high", rule_engine.DeltaUnchanged), // DROPPED
+		mk(scopeB, "solid.dip.high_cbo", rule_engine.DeltaResolved),       // DROPPED
+	}
+
+	reader := orchestrator.BuildFindingDetailReader(findings)
+	if reader == nil {
+		t.Fatalf("BuildFindingDetailReader returned nil")
+	}
+	got, err := reader.FindingDetails(context.Background(), repoID, sha, pvID, []uuid.UUID{scopeA, scopeB})
+	if err != nil {
+		t.Fatalf("FindingDetails: %v", err)
+	}
+	// Expect dedup'd set: (scopeA, srp.high_lcom4) + (scopeB, cycle_member).
+	if len(got) != 2 {
+		t.Fatalf("FindingDetails len = %d, want 2 (dedup + delta filter); got=%+v", len(got), got)
+	}
+	seen := map[string]bool{}
+	for _, d := range got {
+		seen[d.ScopeID.String()+"|"+d.RuleID] = true
+	}
+	if !seen[scopeA.String()+"|solid.srp.high_lcom4"] {
+		t.Errorf("missing (scopeA, solid.srp.high_lcom4)")
+	}
+	if !seen[scopeB.String()+"|decoupling.cycle_member"] {
+		t.Errorf("missing (scopeB, decoupling.cycle_member)")
+	}
+}
+
+func TestBuildHotSpotReader_RoundTripsBatch(t *testing.T) {
+	t.Parallel()
+
+	repoID := uuid.Must(uuid.FromString("11111111-1111-4111-8111-111111111111"))
+	sha := "deadbeef"
+	pvID := uuid.Must(uuid.FromString("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"))
+	scope1 := uuid.Must(uuid.FromString("22222222-2222-4222-8222-222222222222"))
+	scope2 := uuid.Must(uuid.FromString("33333333-3333-4333-8333-333333333333"))
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	rows := []refactor.HotSpot{
+		{
+			HotspotID:       uuid.Must(uuid.NewV4()),
+			RepoID:          repoID,
+			SHA:             sha,
+			ScopeID:         scope1,
+			Score:           10.0,
+			PolicyVersionID: pvID,
+			CreatedAt:       now,
+		},
+		{
+			HotspotID:       uuid.Must(uuid.NewV4()),
+			RepoID:          repoID,
+			SHA:             sha,
+			ScopeID:         scope2,
+			Score:           3.0,
+			PolicyVersionID: pvID,
+			CreatedAt:       now,
+		},
+	}
+	reader := orchestrator.BuildHotSpotReader(rows)
+	if reader == nil {
+		t.Fatalf("BuildHotSpotReader returned nil")
+	}
+	got, err := reader.LatestHotSpotsByScore(context.Background(), repoID, sha, pvID, 0)
+	if err != nil {
+		t.Fatalf("LatestHotSpotsByScore: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("LatestHotSpotsByScore len = %d, want 2", len(got))
+	}
+	if got[0].ScopeID != scope1 {
+		t.Errorf("score-DESC: got[0].ScopeID = %v, want %v (higher score first)", got[0].ScopeID, scope1)
+	}
+}
+
+func TestBuildHotSpotReader_NilAndEmptyReturnNonNilReader(t *testing.T) {
+	t.Parallel()
+	if r := orchestrator.BuildHotSpotReader(nil); r == nil {
+		t.Errorf("BuildHotSpotReader(nil) = nil, want non-nil")
+	}
+	if r := orchestrator.BuildHotSpotReader([]refactor.HotSpot{}); r == nil {
+		t.Errorf("BuildHotSpotReader([]) = nil, want non-nil")
+	}
+}
+
+func TestBuildFindingDetailReader_NilAndEmptyReturnNonNilReader(t *testing.T) {
+	t.Parallel()
+	if r := orchestrator.BuildFindingDetailReader(nil); r == nil {
+		t.Errorf("BuildFindingDetailReader(nil) = nil, want non-nil")
+	}
+	if r := orchestrator.BuildFindingDetailReader([]rule_engine.Finding{}); r == nil {
+		t.Errorf("BuildFindingDetailReader([]) = nil, want non-nil")
+	}
+}
+
+func TestNewTaskPlannerWiring_RejectsNilOption(t *testing.T) {
+	t.Parallel()
+	bundle := devpolicy.Bundle{
+		PolicyVersion: steward.PolicyVersion{
+			PolicyVersionID: uuid.Must(uuid.FromString("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")),
+		},
+	}
+	// Pass an option that the underlying NewTaskPlanner
+	// rejects (nil clock callback). The wiring helper must
+	// surface the error rather than panic.
+	_, _, err := orchestrator.NewTaskPlannerWiring(bundle, nil, nil, refactor.WithTaskClock(nil))
+	if err == nil {
+		t.Fatalf("NewTaskPlannerWiring(WithTaskClock(nil)) err = nil, want non-nil")
 	}
 }

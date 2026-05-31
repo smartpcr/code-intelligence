@@ -166,3 +166,123 @@ func BuildFindingReader(findings []rule_engine.Finding) *refactor.InMemoryFindin
 	}
 	return r
 }
+
+// BuildFindingDetailReader returns a freshly-populated
+// [refactor.InMemoryFindingDetailReader] seeded with every
+// [rule_engine.Finding] whose `Delta` is in
+// [refactor.HotSpotQualifyingDeltas]. Unlike the Stage 8.1
+// count-only [refactor.InMemoryFindingReader], the Stage 8.2
+// detail reader carries the `RuleID` per row so the
+// [refactor.TaskPlanner] can map a finding's rule_id onto a
+// canonical [refactor.TaskKind] via
+// [refactor.DefaultTaskKindForRule].
+//
+// The pre-filter on Delta mirrors the architecture Sec 3.5 /
+// Sec 5.4.1 `delta IN ('new', 'newly_failing')` invariant and
+// matches the SQL [refactor.SQLFindingDetailReader] which
+// pushes the same predicate into a `WHERE delta IN (...)`
+// clause. The reader's own [refactor.InMemoryFindingDetailReader.FindingDetails]
+// method ALSO filters by qualifying delta + policy_version_id
+// + scope membership; pre-filtering here keeps the in-memory
+// row count proportional to the foundation corpus rather than
+// the whole engine finding set.
+//
+// Returns a non-nil reader even for nil/empty findings so the
+// caller can pass it directly into [refactor.NewTaskPlanner].
+func BuildFindingDetailReader(findings []rule_engine.Finding) *refactor.InMemoryFindingDetailReader {
+	r := refactor.NewInMemoryFindingDetailReader()
+	if len(findings) == 0 {
+		return r
+	}
+	for _, f := range findings {
+		if !refactor.IsHotSpotQualifyingDelta(f.Delta) {
+			continue
+		}
+		r.Insert(refactor.InMemoryFindingWithRule{
+			InMemoryFinding: refactor.InMemoryFinding{
+				RepoID:          f.RepoID,
+				SHA:             f.SHA,
+				ScopeID:         f.ScopeID,
+				PolicyVersionID: f.PolicyVersionID,
+				Delta:           f.Delta,
+			},
+			RuleID: f.RuleID,
+		})
+	}
+	return r
+}
+
+// BuildHotSpotReader returns a freshly-populated
+// [refactor.InMemoryHotSpotReader] seeded with the hot_spot
+// rows the Stage 8.1 [refactor.Planner.Plan] just persisted
+// (i.e. `planResult.HotSpots`).
+//
+// The Stage 8.2 [refactor.TaskPlanner.PlanFromSnapshot]
+// canonical wiring reads the SAME batch the Stage 8.1 planner
+// produced -- the reader's [refactor.InMemoryHotSpotReader.LatestHotSpotsByScore]
+// implementation filters by `(repo_id, sha,
+// policy_version_id)` and returns the latest `CreatedAt`
+// cohort, so feeding the just-emitted batch through this
+// helper exactly mirrors the SQL [refactor.SQLHotSpotReader]
+// path the production composition root uses.
+//
+// Returns a non-nil reader even for nil/empty input so the
+// caller can pass it directly into [refactor.NewTaskPlanner]
+// without an additional nil guard.
+func BuildHotSpotReader(rows []refactor.HotSpot) *refactor.InMemoryHotSpotReader {
+	r := refactor.NewInMemoryHotSpotReader()
+	if len(rows) == 0 {
+		return r
+	}
+	r.InsertBatch(rows)
+	return r
+}
+
+// NewTaskPlannerWiring is the CLI composition root convenience
+// that wires a [refactor.TaskPlanner] from the planner-level
+// outputs the orchestrator already has on hand:
+//
+//   - `bundle` -- the dev-mode [devpolicy.Bundle] providing the
+//     active PolicyVersion + RefactorWeights (same source as
+//     [NewCLIPolicyReader] for Stage 8.1).
+//   - `planHotSpots` -- the [refactor.PlanResult.HotSpots] slice
+//     from the Stage 8.1 [refactor.Planner.Plan] call (in
+//     score-DESC, scope_id-ASC order).
+//   - `findings` -- the engine's `[]rule_engine.Finding` snapshot
+//     (e.g. `rule_engine.InMemoryStore.Findings()`); filtered
+//     to qualifying deltas at wiring time.
+//
+// Returns the TaskPlanner plus the [refactor.InMemoryRefactorPlanTaskWriter]
+// so the composition root can inspect emitted plans/tasks for
+// serialisation into the CLI's report.md / findings.json
+// surfaces.
+//
+// Composition root usage (Stage 8.1 -> Stage 8.2):
+//
+//	planRes, _ := planner.Plan(ctx, repoID, sha)
+//	tp, writer, _ := orchestrator.NewTaskPlannerWiring(bundle,
+//	    planRes.HotSpots, store.Findings())
+//	taskRes, _ := tp.PlanFromSnapshot(ctx, repoID, sha, planRes.Snapshot)
+//	plans := writer.Plans()  // for report.md
+//	tasks := writer.Tasks()  // for findings.json / prompts.jsonl
+//
+// `PlanFromSnapshot` is the race-safe entrypoint (rubber-duck
+// iter-2 finding #1 on architecture Sec 3.5) -- the Stage 8.1
+// snapshot is REUSED so the two planner passes pin the same
+// `policy_version_id`.
+func NewTaskPlannerWiring(
+	bundle devpolicy.Bundle,
+	planHotSpots []refactor.HotSpot,
+	findings []rule_engine.Finding,
+	opts ...refactor.TaskOption,
+) (*refactor.TaskPlanner, *refactor.InMemoryRefactorPlanTaskWriter, error) {
+	policyR := NewCLIPolicyReader(bundle)
+	hotSpotR := BuildHotSpotReader(planHotSpots)
+	detailR := BuildFindingDetailReader(findings)
+	writer := refactor.NewInMemoryRefactorPlanTaskWriter()
+	tp, err := refactor.NewTaskPlanner(policyR, hotSpotR, detailR, writer, opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tp, writer, nil
+}

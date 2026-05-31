@@ -142,13 +142,17 @@ func (st *sinkSkeletonState) theUnchangedGraphwriterWriter() error {
 // When steps
 // ---------------------------------------------------------------------------
 
-// goVetGraphsinkRuns executes `go vet ./internal/graphsink/...`
-// against the module root. This is the real executable proof: if
-// the graphsink package (including its _test files) has any type
-// error or vet diagnostic, the step fails.
+// goVetGraphsinkRuns executes `go vet` against both the graphsink
+// package AND this e2e test package (with the e2e build tag). The
+// e2e package contains the var _ compile-time assertions that prove
+// the stubs satisfy graphsink.Sink and graphsink.Reader; vetting it
+// ensures those assertions compile and pass vet analysis. Vetting
+// graphsink as well catches vet diagnostics in the production code.
 func (st *sinkSkeletonState) goVetGraphsinkRuns() error {
 	modRoot := sinkSkeletonModuleRoot()
-	cmd := exec.Command("go", "vet", "./internal/graphsink/...")
+	cmd := exec.Command("go", "vet", "-tags", "e2e",
+		"./internal/graphsink/...",
+		"./test/e2e/code-intelligence-REPO-SCANNER/...")
 	cmd.Dir = modRoot
 	out, err := cmd.CombinedOutput()
 	st.goVetOutput = strings.TrimSpace(string(out))
@@ -190,7 +194,7 @@ func (st *sinkSkeletonState) aTestAssignsToRepoCommitNodeEdgeWriter() error {
 func (st *sinkSkeletonState) theImplSatisfiesSink() error {
 	if st.goVetExitCode != 0 {
 		return fmt.Errorf(
-			"go vet ./internal/graphsink/... failed (exit %d): %s",
+			"go vet (graphsink + e2e stubs) failed (exit %d): %s",
 			st.goVetExitCode, st.goVetOutput,
 		)
 	}
@@ -200,7 +204,7 @@ func (st *sinkSkeletonState) theImplSatisfiesSink() error {
 func (st *sinkSkeletonState) theStubSatisfiesReader() error {
 	if st.goVetExitCode != 0 {
 		return fmt.Errorf(
-			"go vet ./internal/graphsink/... failed (exit %d): %s",
+			"go vet (graphsink + e2e stubs) failed (exit %d): %s",
 			st.goVetExitCode, st.goVetOutput,
 		)
 	}

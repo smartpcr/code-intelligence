@@ -12,6 +12,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -28,8 +30,7 @@ import (
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
 )
 
-// must wraps uuid.NewV4 for terser fixture construction.
-func must(t *testing.T) uuid.UUID {
+func mustUUID(t *testing.T) uuid.UUID {
 	t.Helper()
 	id, err := uuid.NewV4()
 	if err != nil {
@@ -38,37 +39,54 @@ func must(t *testing.T) uuid.UUID {
 	return id
 }
 
-// fixtureArtifact assembles a minimal report.RunArtifact +
-// scopebinding.Table consistent enough for the emitter to
-// resolve every task. The (Sample, Finding, Task) triple
-// shares the same ScopeID/RuleID/SampleID web so the join
-// path through findingByKey + sampleByID exercises end-to-end.
-func fixtureArtifact(t *testing.T) (report.RunArtifact, *scopebinding.Table) {
+// fixture assembles a minimal report.RunArtifact + scopebinding.Table
+// + matching steward fixtures. The (Sample, Finding, Task, Threshold,
+// Rule) web shares ScopeID/RuleID/SampleID consistently so the join
+// path through findingByKey + sampleByID + Thresholds + Rules
+// exercises end-to-end.
+func fixture(t *testing.T) (report.RunArtifact, *scopebinding.Table, steward.Threshold, steward.Rule) {
 	t.Helper()
 
-	repoID := must(t)
-	scopeID := must(t)
-	sampleID := must(t)
-	planID := must(t)
-	taskID := must(t)
-	policyVersionID := must(t)
+	repoID := mustUUID(t)
+	scopeID := mustUUID(t)
+	sampleID := mustUUID(t)
+	planID := mustUUID(t)
+	taskID := mustUUID(t)
+	policyVersionID := mustUUID(t)
+	thresholdID := mustUUID(t)
 
 	tbl := scopebinding.NewTable()
 	if err := tbl.Insert(scopebinding.ScopeBinding{
 		ScopeID:   scopeID,
 		ScopeKind: "class",
 		FilePath:  "pkg/foo.go",
-		StartLine: 10,
-		EndLine:   42,
+		StartLine: 1,
+		EndLine:   3,
 		Signature: "pkg.Foo",
 		Language:  "go",
 	}); err != nil {
 		t.Fatalf("insert binding: %v", err)
 	}
 
+	threshold := steward.Threshold{
+		ThresholdID: thresholdID,
+		MetricKind:  "lcom4",
+		ScopeKind:   "class",
+		Op:          string(dsl.OpGE),
+		Value:       10,
+	}
+	rule := steward.Rule{
+		RuleID:          "solid.srp.lcom4_high",
+		Version:         3,
+		PackID:          "solid",
+		PredicateDSL:    "metric_kind == 'lcom4' AND value >= 10",
+		SeverityDefault: steward.SeverityWarn,
+		DescriptionMD:   "Split the class along cohesion boundaries (SRP).",
+	}
+
 	art := report.RunArtifact{
 		Context: repocontext.RepoContext{
-			RootPath: "/repo",
+			RootPath: "", // overridden per test when snippet is exercised
 			RepoID:   repoID,
 			HeadSHA:  "deadbeef",
 		},
@@ -76,168 +94,444 @@ func fixtureArtifact(t *testing.T) (report.RunArtifact, *scopebinding.Table) {
 			PolicyVersionID: policyVersionID,
 			Name:            "cleanc-dev-policy",
 		},
-		Samples: []rule_engine.Sample{
-			{
-				Sample: dsl.Sample{
-					SampleID:   sampleID,
-					RepoID:     repoID,
-					SHA:        "deadbeef",
-					ScopeID:    scopeID,
-					ScopeKind:  "class",
-					MetricKind: "lcom4",
-					Value:      12,
-					HasValue:   true,
-				},
-				ScopeSignature: "pkg.Foo",
+		Samples: []rule_engine.Sample{{
+			Sample: dsl.Sample{
+				SampleID:   sampleID,
+				RepoID:     repoID,
+				SHA:        "deadbeef",
+				ScopeID:    scopeID,
+				ScopeKind:  "class",
+				MetricKind: "lcom4",
+				Value:      12,
+				HasValue:   true,
 			},
-		},
-		Findings: []rule_engine.Finding{
-			{
-				FindingID:       must(t),
-				EvaluationRunID: must(t),
-				RepoID:          repoID,
-				SHA:             "deadbeef",
-				ScopeID:         scopeID,
-				RuleID:          "solid.srp.lcom4_high",
-				RuleVersion:     3,
-				PolicyVersionID: policyVersionID,
-				MetricSampleIDs: []uuid.UUID{sampleID},
-				Severity:        steward.SeverityWarn,
-			},
-		},
-		Tasks: []refactor.RefactorTask{
-			{
-				TaskID:        taskID,
-				PlanID:        planID,
-				ScopeID:       scopeID,
-				Kind:          refactor.TaskKindSplitClass,
-				EffortHours:   4.5,
-				RuleID:        "solid.srp.lcom4_high",
-				DescriptionMD: "Split the class along cohesion boundaries.",
-			},
-		},
-		Diagnostics: orchestrator.Diagnostics{
-			EffortSource: "fallback",
-		},
+			ScopeSignature: "pkg.Foo",
+		}},
+		Findings: []rule_engine.Finding{{
+			FindingID:       mustUUID(t),
+			EvaluationRunID: mustUUID(t),
+			RepoID:          repoID,
+			SHA:             "deadbeef",
+			ScopeID:         scopeID,
+			RuleID:          rule.RuleID,
+			RuleVersion:     rule.Version,
+			PolicyVersionID: policyVersionID,
+			MetricSampleIDs: []uuid.UUID{sampleID},
+			Severity:        steward.SeverityWarn,
+		}},
+		Tasks: []refactor.RefactorTask{{
+			TaskID:        taskID,
+			PlanID:        planID,
+			ScopeID:       scopeID,
+			Kind:          refactor.TaskKindSplitClass,
+			EffortHours:   4.5,
+			RuleID:        rule.RuleID,
+			DescriptionMD: "fallback task prose",
+		}},
+		Diagnostics: orchestrator.Diagnostics{EffortSource: "fallback"},
 	}
 
-	return art, tbl
+	return art, tbl, threshold, rule
 }
 
-func TestJSONL_Emit_OneJSONLineWithTrailingLFPerTask(t *testing.T) {
-	t.Parallel()
-	art, tbl := fixtureArtifact(t)
-
-	var buf bytes.Buffer
-	em := &suggest.JSONL{Bindings: tbl}
-	if err := em.Emit(context.Background(), art, &buf); err != nil {
-		t.Fatalf("Emit: %v", err)
+// withTempRepo writes the fixture file at the path the binding
+// references so the default FileSnippetExtractor finds bytes
+// to read. Returns the rootPath the caller stamps onto art.Context.
+func withTempRepo(t *testing.T, body string) string {
+	t.Helper()
+	root := t.TempDir()
+	target := filepath.Join(root, "pkg", "foo.go")
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
 	}
-
-	out := buf.String()
-	if !strings.HasSuffix(out, "\n") {
-		t.Fatalf("output missing trailing LF: %q", out)
+	if err := os.WriteFile(target, []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
 	}
-	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
-	if len(lines) != 1 {
-		t.Fatalf("expected 1 record line, got %d: %q", len(lines), out)
-	}
-	if strings.Contains(lines[0], "\n") {
-		t.Fatalf("a single record line must not contain an embedded LF: %q", lines[0])
-	}
+	return root
 }
 
-func TestJSONL_Emit_PopulatesExpectedFields(t *testing.T) {
-	t.Parallel()
-	art, tbl := fixtureArtifact(t)
-
-	var buf bytes.Buffer
-	em := &suggest.JSONL{Bindings: tbl}
-	if err := em.Emit(context.Background(), art, &buf); err != nil {
-		t.Fatalf("Emit: %v", err)
+func decodeOne(t *testing.T, raw []byte) suggest.RefactorPromptRecord {
+	t.Helper()
+	if !bytes.HasSuffix(raw, []byte("\n")) {
+		t.Fatalf("output missing trailing LF: %q", raw)
 	}
-
 	var rec suggest.RefactorPromptRecord
-	if err := json.Unmarshal(bytes.TrimRight(buf.Bytes(), "\n"), &rec); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	if err := json.Unmarshal(bytes.TrimRight(raw, "\n"), &rec); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, raw)
+	}
+	return rec
+}
+
+// =====================================================================
+// Happy-path
+// =====================================================================
+
+func TestJSONL_Emit_FullyWiredHappyPath(t *testing.T) {
+	t.Parallel()
+	art, tbl, th, rule := fixture(t)
+	art.Context.RootPath = withTempRepo(t, "line1\nline2\nline3\n")
+
+	var buf bytes.Buffer
+	em := &suggest.JSONL{
+		Bindings:   tbl,
+		Rules:      suggest.NewSliceRuleResolver([]steward.Rule{rule}),
+		Thresholds: suggest.NewSliceThresholdResolver([]steward.Threshold{th}),
+	}
+	if err := em.Emit(context.Background(), art, &buf); err != nil {
+		t.Fatalf("Emit: %v", err)
 	}
 
+	rec := decodeOne(t, buf.Bytes())
 	task := art.Tasks[0]
-	if rec.TaskID != task.TaskID.String() {
-		t.Errorf("TaskID = %q, want %q", rec.TaskID, task.TaskID.String())
+
+	checks := []struct {
+		got, want any
+		field     string
+	}{
+		{rec.TaskID, task.TaskID.String(), "TaskID"},
+		{rec.PlanID, task.PlanID.String(), "PlanID"},
+		{rec.RepoID, art.Context.RepoID.String(), "RepoID"},
+		{rec.HeadSHA, "deadbeef", "HeadSHA"},
+		{rec.PolicyVersionID, art.Policy.PolicyVersionID.String(), "PolicyVersionID"},
+		{rec.TaskKind, string(refactor.TaskKindSplitClass), "TaskKind"},
+		{rec.RuleID, rule.RuleID, "RuleID"},
+		{rec.RuleVersion, rule.Version, "RuleVersion"},
+		{rec.Severity, string(steward.SeverityWarn), "Severity"},
+		{rec.Scope.Signature, "pkg.Foo", "Scope.Signature"},
+		{rec.Scope.Kind, "class", "Scope.Kind"},
+		{rec.Scope.FilePath, "pkg/foo.go", "Scope.FilePath"},
+		{rec.Scope.StartLine, 1, "Scope.StartLine"},
+		{rec.Scope.EndLine, 3, "Scope.EndLine"},
+		{rec.EffortHours, 4.5, "EffortHours"},
+		{rec.EffortSource, "fallback", "EffortSource"},
+		{rec.PromptFormatVersion, suggest.PromptFormatVersion, "PromptFormatVersion"},
+		{rec.ProseSuggestion, rule.DescriptionMD, "ProseSuggestion (from rule)"},
 	}
-	if rec.PlanID != task.PlanID.String() {
-		t.Errorf("PlanID = %q, want %q", rec.PlanID, task.PlanID.String())
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %v, want %v", c.field, c.got, c.want)
+		}
 	}
-	if rec.RepoID != art.Context.RepoID.String() {
-		t.Errorf("RepoID mismatch")
+
+	if len(rec.MetricEvidence) != 1 {
+		t.Fatalf("MetricEvidence len = %d, want 1", len(rec.MetricEvidence))
 	}
-	if rec.HeadSHA != "deadbeef" {
-		t.Errorf("HeadSHA = %q, want deadbeef", rec.HeadSHA)
+	ev := rec.MetricEvidence[0]
+	if ev.MetricKind != "lcom4" || ev.Value != 12 || ev.Threshold != 10 || ev.Op != ">=" {
+		t.Errorf("MetricEvidence mismatch: %+v", ev)
 	}
-	if rec.PolicyVersionID != art.Policy.PolicyVersionID.String() {
-		t.Errorf("PolicyVersionID mismatch")
+
+	// Default FileSnippetExtractor read from disk.
+	if rec.SourceSnippet == "" {
+		t.Errorf("SourceSnippet should be populated by default extractor")
 	}
-	if rec.TaskKind != string(refactor.TaskKindSplitClass) {
-		t.Errorf("TaskKind = %q, want split_class", rec.TaskKind)
+	if !strings.Contains(rec.SourceSnippet, "line1") || !strings.Contains(rec.SourceSnippet, "line3") {
+		t.Errorf("SourceSnippet content unexpected: %q", rec.SourceSnippet)
 	}
-	if rec.RuleID != "solid.srp.lcom4_high" {
-		t.Errorf("RuleID = %q", rec.RuleID)
-	}
-	if rec.RuleVersion != 3 {
-		t.Errorf("RuleVersion = %d, want 3", rec.RuleVersion)
-	}
-	if rec.Severity != string(steward.SeverityWarn) {
-		t.Errorf("Severity = %q, want warn", rec.Severity)
-	}
-	if rec.Scope.Signature != "pkg.Foo" || rec.Scope.Kind != "class" ||
-		rec.Scope.FilePath != "pkg/foo.go" || rec.Scope.StartLine != 10 || rec.Scope.EndLine != 42 {
-		t.Errorf("Scope mismatch: %+v", rec.Scope)
-	}
-	if rec.EffortHours != 4.5 {
-		t.Errorf("EffortHours = %v", rec.EffortHours)
-	}
-	if rec.EffortSource != "fallback" {
-		t.Errorf("EffortSource = %q", rec.EffortSource)
-	}
-	if rec.ProseSuggestion != "Split the class along cohesion boundaries." {
-		t.Errorf("ProseSuggestion = %q", rec.ProseSuggestion)
-	}
-	if rec.PromptFormatVersion != suggest.PromptFormatVersion {
-		t.Errorf("PromptFormatVersion = %q, want %q", rec.PromptFormatVersion, suggest.PromptFormatVersion)
-	}
-	if len(rec.MetricEvidence) != 1 ||
-		rec.MetricEvidence[0].MetricKind != "lcom4" ||
-		rec.MetricEvidence[0].Value != 12 {
-		t.Errorf("MetricEvidence mismatch: %+v", rec.MetricEvidence)
-	}
-	if rec.SourceSnippet != "" || rec.SourceSnippetTruncated {
-		t.Errorf("SourceSnippet should be empty when no extractor configured; got %q / %v",
-			rec.SourceSnippet, rec.SourceSnippetTruncated)
+	if rec.SourceSnippetTruncated {
+		t.Errorf("SourceSnippetTruncated should be false (fits in cap)")
 	}
 }
 
-func TestJSONL_Emit_FailsClosedOnMissingBinding(t *testing.T) {
+// =====================================================================
+// Iter-1 evaluator item 1: default snippet extractor
+// =====================================================================
+
+func TestJSONL_Emit_DefaultSnippetExtractorWiredFromRootPath(t *testing.T) {
 	t.Parallel()
-	art, _ := fixtureArtifact(t)
-	// Replace the table with an empty one -- the task's
-	// ScopeID is now unresolvable and Emit must refuse.
-	em := &suggest.JSONL{Bindings: scopebinding.NewTable()}
+	art, tbl, _, _ := fixture(t)
+	art.Context.RootPath = withTempRepo(t, "package foo\nfunc Bar() {}\nvar X = 1\n")
+
+	var buf bytes.Buffer
+	em := &suggest.JSONL{Bindings: tbl}
+	if err := em.Emit(context.Background(), art, &buf); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	rec := decodeOne(t, buf.Bytes())
+	if rec.SourceSnippet == "" {
+		t.Fatalf("default extractor did not populate SourceSnippet")
+	}
+}
+
+func TestJSONL_Emit_DisableSnippetDefaultLeavesEmpty(t *testing.T) {
+	t.Parallel()
+	art, tbl, _, _ := fixture(t)
+	art.Context.RootPath = withTempRepo(t, "anything\n")
+
+	var buf bytes.Buffer
+	em := &suggest.JSONL{Bindings: tbl, DisableSnippetDefault: true}
+	if err := em.Emit(context.Background(), art, &buf); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	rec := decodeOne(t, buf.Bytes())
+	if rec.SourceSnippet != "" {
+		t.Errorf("opt-out failed; SourceSnippet=%q", rec.SourceSnippet)
+	}
+}
+
+func TestJSONL_Emit_ExplicitSnippetExtractorOverridesDefault(t *testing.T) {
+	t.Parallel()
+	art, tbl, _, _ := fixture(t)
+	art.Context.RootPath = withTempRepo(t, "ignored\n")
+
+	em := &suggest.JSONL{
+		Bindings: tbl,
+		SnippetExtractor: func(suggest.Scope) (string, bool, error) {
+			return "<injected>", true, nil
+		},
+	}
+	var buf bytes.Buffer
+	if err := em.Emit(context.Background(), art, &buf); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	rec := decodeOne(t, buf.Bytes())
+	if rec.SourceSnippet != "<injected>" || !rec.SourceSnippetTruncated {
+		t.Errorf("explicit extractor not honored: %+v", rec)
+	}
+}
+
+func TestJSONL_Emit_SnippetExtractorErrorPropagates(t *testing.T) {
+	t.Parallel()
+	art, tbl, _, _ := fixture(t)
+	sentinel := errors.New("disk on fire")
+	em := &suggest.JSONL{
+		Bindings: tbl,
+		SnippetExtractor: func(suggest.Scope) (string, bool, error) {
+			return "", false, sentinel
+		},
+	}
+	err := em.Emit(context.Background(), art, io.Discard)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Emit returned %v; want wrap of sentinel", err)
+	}
+}
+
+// =====================================================================
+// Iter-1 evaluator item 2: prose_suggestion from Rule.DescriptionMD
+// =====================================================================
+
+func TestJSONL_Emit_ProseFromRuleDescriptionMD(t *testing.T) {
+	t.Parallel()
+	art, tbl, _, rule := fixture(t)
+	em := &suggest.JSONL{
+		Bindings:              tbl,
+		Rules:                 suggest.NewSliceRuleResolver([]steward.Rule{rule}),
+		DisableSnippetDefault: true,
+	}
+	var buf bytes.Buffer
+	if err := em.Emit(context.Background(), art, &buf); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	rec := decodeOne(t, buf.Bytes())
+	if rec.ProseSuggestion != rule.DescriptionMD {
+		t.Errorf("ProseSuggestion = %q, want rule.DescriptionMD %q",
+			rec.ProseSuggestion, rule.DescriptionMD)
+	}
+}
+
+func TestJSONL_Emit_ProseFallsBackToTaskWhenRuleUnknown(t *testing.T) {
+	t.Parallel()
+	art, tbl, _, _ := fixture(t)
+	// Configure a resolver that knows NO rules — lookup misses.
+	em := &suggest.JSONL{
+		Bindings:              tbl,
+		Rules:                 suggest.NewSliceRuleResolver(nil),
+		DisableSnippetDefault: true,
+	}
+	var buf bytes.Buffer
+	if err := em.Emit(context.Background(), art, &buf); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	rec := decodeOne(t, buf.Bytes())
+	if rec.ProseSuggestion != art.Tasks[0].DescriptionMD {
+		t.Errorf("expected fallback to task.DescriptionMD %q, got %q",
+			art.Tasks[0].DescriptionMD, rec.ProseSuggestion)
+	}
+}
+
+func TestJSONL_Emit_ProseFallsBackToTaskWhenRulesResolverNil(t *testing.T) {
+	t.Parallel()
+	art, tbl, _, _ := fixture(t)
+	em := &suggest.JSONL{Bindings: tbl, DisableSnippetDefault: true}
+	var buf bytes.Buffer
+	if err := em.Emit(context.Background(), art, &buf); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	rec := decodeOne(t, buf.Bytes())
+	if rec.ProseSuggestion != art.Tasks[0].DescriptionMD {
+		t.Errorf("expected fallback prose, got %q", rec.ProseSuggestion)
+	}
+}
+
+// =====================================================================
+// Iter-1 evaluator item 3: metric_evidence.threshold / op
+// =====================================================================
+
+func TestJSONL_Emit_MetricEvidenceCarriesThresholdAndOp(t *testing.T) {
+	t.Parallel()
+	art, tbl, th, _ := fixture(t)
+	em := &suggest.JSONL{
+		Bindings:              tbl,
+		Thresholds:            suggest.NewSliceThresholdResolver([]steward.Threshold{th}),
+		DisableSnippetDefault: true,
+	}
+	var buf bytes.Buffer
+	if err := em.Emit(context.Background(), art, &buf); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	rec := decodeOne(t, buf.Bytes())
+	if len(rec.MetricEvidence) != 1 {
+		t.Fatalf("MetricEvidence len = %d, want 1", len(rec.MetricEvidence))
+	}
+	ev := rec.MetricEvidence[0]
+	if ev.MetricKind != "lcom4" || ev.Value != 12 || ev.Threshold != 10 || ev.Op != ">=" {
+		t.Errorf("MetricEvidence mismatch: %+v", ev)
+	}
+}
+
+func TestJSONL_Emit_NoThresholdResolverEmitsEmptyEvidenceNotZeros(t *testing.T) {
+	t.Parallel()
+	art, tbl, _, _ := fixture(t)
+	em := &suggest.JSONL{Bindings: tbl, DisableSnippetDefault: true}
+
+	var buf bytes.Buffer
+	if err := em.Emit(context.Background(), art, &buf); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	rec := decodeOne(t, buf.Bytes())
+
+	// No fabricated 0/"" -- evidence stays empty, never appears
+	// as a row with threshold:0,op:"".
+	if rec.MetricEvidence == nil || len(rec.MetricEvidence) != 0 {
+		t.Errorf("expected empty MetricEvidence (no fabricated zeros); got %+v", rec.MetricEvidence)
+	}
+	// The JSON literal MUST be `[]`, not `null`, so consumers
+	// indexing .metric_evidence[0] don't NPE.
+	if !bytes.Contains(buf.Bytes(), []byte(`"metric_evidence":[]`)) {
+		t.Errorf("expected `\"metric_evidence\":[]` literal; got %s", buf.String())
+	}
+	// And critically, no `"threshold":0,"op":""` substring.
+	if bytes.Contains(buf.Bytes(), []byte(`"threshold":0,"op":""`)) {
+		t.Errorf("output contains silent zero threshold pair: %s", buf.String())
+	}
+}
+
+func TestJSONL_Emit_ThresholdMissForOneSampleSkipsThatRowOnly(t *testing.T) {
+	t.Parallel()
+	art, tbl, th, _ := fixture(t)
+	// Configure a resolver that returns ok ONLY for some other
+	// (metric, scope) pair so the single sample misses.
+	em := &suggest.JSONL{
+		Bindings: tbl,
+		Thresholds: suggest.ThresholdResolverFunc(func(mk, sk string) (string, float64, bool) {
+			if mk == "loc" {
+				return ">", th.Value, true
+			}
+			return "", 0, false
+		}),
+		DisableSnippetDefault: true,
+	}
+	var buf bytes.Buffer
+	if err := em.Emit(context.Background(), art, &buf); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	rec := decodeOne(t, buf.Bytes())
+	if len(rec.MetricEvidence) != 0 {
+		t.Fatalf("expected miss to skip the evidence row, got %+v", rec.MetricEvidence)
+	}
+}
+
+func TestThresholdOpSymbol(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in   dsl.ThresholdOp
+		want string
+	}{
+		{dsl.OpGT, ">"},
+		{dsl.OpGE, ">="},
+		{dsl.OpLT, "<"},
+		{dsl.OpLE, "<="},
+		{dsl.OpEQ, "=="},
+		{dsl.ThresholdOp(">="), ">="}, // idempotent
+		{dsl.ThresholdOp("bogus"), ""},
+	}
+	for _, c := range cases {
+		if got := suggest.ThresholdOpSymbol(c.in); got != c.want {
+			t.Errorf("ThresholdOpSymbol(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// =====================================================================
+// Iter-1 evaluator item 4: task-kind gate
+// =====================================================================
+
+func TestJSONL_Emit_FailsClosedOnRejectedTaskKindAlias(t *testing.T) {
+	t.Parallel()
+	art, tbl, _, _ := fixture(t)
+	art.Tasks[0].Kind = refactor.TaskKind("extract_function") // rejected alias
+	em := &suggest.JSONL{Bindings: tbl, DisableSnippetDefault: true}
 
 	var buf bytes.Buffer
 	err := em.Emit(context.Background(), art, &buf)
-	if err == nil {
-		t.Fatalf("Emit returned nil error; expected MissingScopeBindingError")
+	var iae *suggest.InvalidTaskKindError
+	if !errors.As(err, &iae) {
+		t.Fatalf("Emit returned %v; want *InvalidTaskKindError", err)
 	}
+	if !errors.Is(err, refactor.ErrRejectedTaskKindAlias) {
+		t.Errorf("expected wrap of refactor.ErrRejectedTaskKindAlias; got %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("expected zero bytes on fail-closed; got %d", buf.Len())
+	}
+}
+
+func TestJSONL_Emit_FailsClosedOnUnknownTaskKind(t *testing.T) {
+	t.Parallel()
+	art, tbl, _, _ := fixture(t)
+	art.Tasks[0].Kind = refactor.TaskKind("frobnicate")
+	em := &suggest.JSONL{Bindings: tbl, DisableSnippetDefault: true}
+
+	err := em.Emit(context.Background(), art, io.Discard)
+	if !errors.Is(err, refactor.ErrUnknownTaskKind) {
+		t.Fatalf("Emit returned %v; want wrap of ErrUnknownTaskKind", err)
+	}
+}
+
+// =====================================================================
+// Iter-1 evaluator item 5: nil writer guard
+// =====================================================================
+
+func TestJSONL_Emit_NilWriterReturnsErrNilWriter(t *testing.T) {
+	t.Parallel()
+	art, tbl, _, _ := fixture(t)
+	em := &suggest.JSONL{Bindings: tbl, DisableSnippetDefault: true}
+	err := em.Emit(context.Background(), art, nil)
+	if !errors.Is(err, suggest.ErrNilWriter) {
+		t.Fatalf("Emit(nil writer) = %v, want ErrNilWriter", err)
+	}
+}
+
+// =====================================================================
+// Existing fail-closed contract regressions
+// =====================================================================
+
+func TestJSONL_Emit_FailsClosedOnMissingBinding(t *testing.T) {
+	t.Parallel()
+	art, _, _, _ := fixture(t)
+	em := &suggest.JSONL{Bindings: scopebinding.NewTable(), DisableSnippetDefault: true}
+
+	var buf bytes.Buffer
+	err := em.Emit(context.Background(), art, &buf)
 	var mbe *suggest.MissingScopeBindingError
 	if !errors.As(err, &mbe) {
-		t.Fatalf("Emit returned %v (%T); want *MissingScopeBindingError", err, err)
+		t.Fatalf("Emit returned %v; want *MissingScopeBindingError", err)
 	}
 	if mbe.TaskID != art.Tasks[0].TaskID || mbe.ScopeID != art.Tasks[0].ScopeID {
 		t.Errorf("MissingScopeBindingError mismatched IDs: %+v", mbe)
 	}
 	if buf.Len() != 0 {
-		t.Errorf("expected zero bytes written on fail-closed; got %d", buf.Len())
+		t.Errorf("expected zero bytes on fail-closed; got %d", buf.Len())
 	}
 }
 
@@ -252,21 +546,20 @@ func TestJSONL_Emit_NilBindingsReturnsErrNilBindingTable(t *testing.T) {
 
 func TestJSONL_Emit_EmptyTasksProducesEmptyOutput(t *testing.T) {
 	t.Parallel()
-	tbl := scopebinding.NewTable()
-	em := &suggest.JSONL{Bindings: tbl}
+	em := &suggest.JSONL{Bindings: scopebinding.NewTable(), DisableSnippetDefault: true}
 	var buf bytes.Buffer
 	if err := em.Emit(context.Background(), report.RunArtifact{}, &buf); err != nil {
 		t.Fatalf("Emit: %v", err)
 	}
 	if buf.Len() != 0 {
-		t.Fatalf("expected empty output for zero tasks; got %q", buf.String())
+		t.Fatalf("expected empty output; got %q", buf.String())
 	}
 }
 
 func TestJSONL_Emit_HonoursContextCancellation(t *testing.T) {
 	t.Parallel()
-	art, tbl := fixtureArtifact(t)
-	em := &suggest.JSONL{Bindings: tbl}
+	art, tbl, _, _ := fixture(t)
+	em := &suggest.JSONL{Bindings: tbl, DisableSnippetDefault: true}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	err := em.Emit(ctx, art, io.Discard)
@@ -277,8 +570,13 @@ func TestJSONL_Emit_HonoursContextCancellation(t *testing.T) {
 
 func TestJSONL_Emit_DeterministicOutputOnRepeatedInvocations(t *testing.T) {
 	t.Parallel()
-	art, tbl := fixtureArtifact(t)
-	em := &suggest.JSONL{Bindings: tbl}
+	art, tbl, th, rule := fixture(t)
+	art.Context.RootPath = withTempRepo(t, "a\nb\nc\n")
+	em := &suggest.JSONL{
+		Bindings:   tbl,
+		Rules:      suggest.NewSliceRuleResolver([]steward.Rule{rule}),
+		Thresholds: suggest.NewSliceThresholdResolver([]steward.Threshold{th}),
+	}
 
 	var first, second bytes.Buffer
 	if err := em.Emit(context.Background(), art, &first); err != nil {
@@ -292,77 +590,15 @@ func TestJSONL_Emit_DeterministicOutputOnRepeatedInvocations(t *testing.T) {
 	}
 }
 
-func TestJSONL_Emit_SnippetExtractorWired(t *testing.T) {
+// =====================================================================
+// Constructor
+// =====================================================================
+
+func TestNewJSONL_ReturnsEmitterWithBindingsSet(t *testing.T) {
 	t.Parallel()
-	art, tbl := fixtureArtifact(t)
-
-	want := "package foo\n"
-	em := &suggest.JSONL{
-		Bindings: tbl,
-		SnippetExtractor: func(scope suggest.Scope) (string, bool, error) {
-			if scope.FilePath != "pkg/foo.go" {
-				t.Errorf("extractor got scope %+v", scope)
-			}
-			return want, true, nil
-		},
-	}
-
-	var buf bytes.Buffer
-	if err := em.Emit(context.Background(), art, &buf); err != nil {
-		t.Fatalf("Emit: %v", err)
-	}
-	var rec suggest.RefactorPromptRecord
-	if err := json.Unmarshal(bytes.TrimRight(buf.Bytes(), "\n"), &rec); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if rec.SourceSnippet != want || !rec.SourceSnippetTruncated {
-		t.Fatalf("snippet not wired: %+v", rec)
-	}
-}
-
-func TestJSONL_Emit_SnippetExtractorErrorPropagates(t *testing.T) {
-	t.Parallel()
-	art, tbl := fixtureArtifact(t)
-	sentinel := errors.New("disk on fire")
-	em := &suggest.JSONL{
-		Bindings: tbl,
-		SnippetExtractor: func(suggest.Scope) (string, bool, error) {
-			return "", false, sentinel
-		},
-	}
-
-	err := em.Emit(context.Background(), art, io.Discard)
-	if !errors.Is(err, sentinel) {
-		t.Fatalf("Emit returned %v; want wrap of sentinel", err)
-	}
-}
-
-func TestJSONL_Emit_MissingFindingLeavesEvidenceEmptyButRecordEmitted(t *testing.T) {
-	t.Parallel()
-	art, tbl := fixtureArtifact(t)
-	// Strip findings so the (ScopeID, RuleID) join misses.
-	art.Findings = nil
-
-	var buf bytes.Buffer
-	em := &suggest.JSONL{Bindings: tbl}
-	if err := em.Emit(context.Background(), art, &buf); err != nil {
-		t.Fatalf("Emit: %v", err)
-	}
-	var rec suggest.RefactorPromptRecord
-	if err := json.Unmarshal(bytes.TrimRight(buf.Bytes(), "\n"), &rec); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if rec.RuleVersion != 0 || rec.Severity != "" {
-		t.Errorf("expected zero rule_version + empty severity when finding missing; got %d / %q",
-			rec.RuleVersion, rec.Severity)
-	}
-	if rec.MetricEvidence == nil || len(rec.MetricEvidence) != 0 {
-		t.Errorf("MetricEvidence must serialise as `[]`, not null; got %+v", rec.MetricEvidence)
-	}
-	// And the JSON itself must contain `"metric_evidence":[]`, not `null`,
-	// so downstream prompt templates that index .metric_evidence[0]
-	// don't NPE.
-	if !bytes.Contains(buf.Bytes(), []byte(`"metric_evidence":[]`)) {
-		t.Errorf("expected literal `\"metric_evidence\":[]` in output; got %s", buf.String())
+	tbl := scopebinding.NewTable()
+	em := suggest.NewJSONL(tbl)
+	if em == nil || em.Bindings != tbl {
+		t.Fatalf("NewJSONL did not wire Bindings: %+v", em)
 	}
 }

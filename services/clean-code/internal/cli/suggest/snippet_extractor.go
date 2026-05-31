@@ -12,19 +12,17 @@ import (
 
 // FileSnippetExtractor returns a [SnippetExtractor] that
 // resolves the snippet by reading bytes from disk via
-// [ExtractSnippet]. `repoRoot` is the absolute filesystem path
-// of the repo under analysis; `scope.FilePath` is treated as
-// repo-relative and is joined with `repoRoot` to form the
-// absolute path passed to [ExtractSnippet]. `maxLines` is the
-// snippet cap (callers SHOULD pass [DefaultSnippetMaxLines]
-// unless the operator overrode via the reserved
-// `--snippet-cap-lines` flag).
+// [ExtractSnippet]. `repoRoot` is the absolute filesystem
+// path of the repo under analysis; `scope.FilePath` is
+// treated as repo-relative and is joined with `repoRoot` to
+// form the absolute path passed to [ExtractSnippet].
+// `maxLines` is the snippet cap (callers SHOULD pass
+// [DefaultSnippetMaxLines] unless the operator overrode via
+// the reserved `--snippet-cap-lines` flag).
 //
 // When `scope.FilePath` is already absolute, the join leaves
 // it unchanged (per `filepath.Join` semantics on most
-// platforms; on Windows an absolute Unix-style path is
-// treated as rooted at the current drive -- callers that
-// support cross-platform absolute paths SHOULD pre-resolve).
+// platforms).
 //
 // The returned extractor is safe for concurrent use because
 // [ExtractSnippet] opens and reads the file on each call

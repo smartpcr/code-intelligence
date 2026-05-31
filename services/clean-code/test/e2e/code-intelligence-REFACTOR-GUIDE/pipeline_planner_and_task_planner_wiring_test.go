@@ -10,6 +10,7 @@ package e2e
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/devpolicy"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/effort"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/flags"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/orchestrator"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/repocontext"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/policy/steward"
@@ -45,10 +47,18 @@ type plannerWiringState struct {
 	planResult refactor.PlanResult
 	taskResult refactor.PlanAndTasksResult
 
-	// orchDiagnostics stores the diagnostics from an actual
-	// orchestrator.Run() invocation so the effort-fallback
-	// assertion checks the real RunArtifact field.
+	// orchDiagnostics stores the diagnostics from the SAME
+	// orchestrator.Run() invocation whose output feeds the
+	// engine, planner, and task planner — so the effort-
+	// fallback assertion checks the actual RunArtifact field
+	// from a unified pipeline execution.
 	orchDiagnostics orchestrator.Diagnostics
+
+	// topNOverride stores the --top-n flag value to be applied
+	// via the production flags.Register + flag.FlagSet.Parse
+	// path in the When step. Zero means "not set" (use bundle
+	// default).
+	topNOverride int
 
 	fixtureDir string
 }
@@ -293,33 +303,41 @@ func (s *plannerWiringState) aFixtureRunProducingOneTaskPerKind() error {
 }
 
 func (s *plannerWiringState) aFixtureWhereNoONNXModelIsConfigured() error {
-	// Create a real fixture dir so we can run the orchestrator and
-	// capture its Diagnostics.EffortSource (the acceptance scenario
-	// requires checking the actual RunArtifact field, not a
-	// standalone constant).
+	// Create a fixture dir so the orchestrator can parse real
+	// files — the When step runs the FULL pipeline (orchestrator
+	// → engine → planner → task planner) from a single invocation.
 	if err := s.createFixtureDir(200, "big.go"); err != nil {
 		return err
 	}
 
+	// Include a rule that fires on the orchestrator's loc samples
+	// so the engine produces findings → the planner produces hot
+	// spots → the task planner produces tasks with EffortHours.
+	rule := steward.Rule{
+		RuleID:          "solid.srp.loc_high",
+		Version:         1,
+		PackID:          "solid.srp",
+		PredicateDSL:    "metric_kind == 'loc' AND value >= 50",
+		SeverityDefault: steward.SeverityBlock,
+		CreatedAt:       time.Date(2026, 5, 30, 0, 0, 0, 0, time.UTC),
+	}
 	s.makeBundle(steward.RefactorWeights{
 		Alpha: 1, Beta: 1, Gamma: 1, Delta: 1,
 		WindowDays:         7,
 		EffortModelVersion: "fallback-linear",
-	}, nil)
-
-	sid := scopeUUID("EffortScope")
-	s.addMetricSample(sid, refactor.MetricKindCyclo, 25)
-	s.addMetricSample(sid, refactor.MetricKindCognitiveComplexity, 12)
-	s.addMetricSample(sid, refactor.MetricKindModificationCountInWindow, 5)
-	s.addFinding(sid, "solid.srp.lcom4_high")
+	}, []steward.Rule{rule})
+	// No hand-crafted samples — the When step builds them from
+	// the orchestrator's output and supplements with hot-spot-
+	// scoring metrics for the discovered scope IDs.
 	return nil
 }
 
 func (s *plannerWiringState) aFixtureWith50HotSpotsAndTopN5() error {
-	// The --top-n 5 flag in the analyze command maps to
-	// RefactorWeights.TopN=5 at the composition root level. The
-	// rule "solid.srp.loc_high" fires on each scope's loc sample
-	// to produce findings through the engine stage.
+	// The bundle starts with TopN=0 (no truncation — the default).
+	// The --top-n 5 flag override is applied in the When step via
+	// flags.Register + flag.FlagSet.Parse, exercising the actual
+	// CLI flag parsing path. If the override is broken, TopN stays
+	// at 0 and all 50 tasks flow through → assertion fails.
 	rule := steward.Rule{
 		RuleID:          "solid.srp.loc_high",
 		Version:         1,
@@ -331,9 +349,11 @@ func (s *plannerWiringState) aFixtureWith50HotSpotsAndTopN5() error {
 	s.makeBundle(steward.RefactorWeights{
 		Alpha: 1, Beta: 1, Gamma: 1, Delta: 1,
 		WindowDays:         7,
-		TopN:               5,
+		TopN:               0, // no truncation — default
 		EffortModelVersion: "fallback-linear",
 	}, []steward.Rule{rule})
+
+	s.topNOverride = 5 // applied via --top-n flag in When step
 
 	for i := 0; i < 50; i++ {
 		name := fmt.Sprintf("Scope%03d", i)
@@ -359,33 +379,62 @@ func (s *plannerWiringState) theTaskPlannerStageRuns() error {
 }
 
 func (s *plannerWiringState) theTaskPlannerRuns() error {
-	// Run the orchestrator on the fixture dir to capture
-	// Diagnostics.EffortSource from the actual pipeline. The
-	// default EffortEstimator is effort.NewFallbackModel() which
-	// stamps EffortSource = "fallback" when no ONNX model is
-	// configured.
+	ctx := context.Background()
+
+	// Step 1: Run the orchestrator to get Diagnostics + Drafts
+	// from the SAME pipeline that will feed the engine, planner,
+	// and task planner. When no ONNX model is configured, the
+	// default effort estimator is effort.NewFallbackModel(),
+	// which stamps EffortSource = "fallback".
 	orch := orchestrator.New(orchestrator.Options{Workers: 1})
-	orchResult, err := orch.Run(context.Background(), s.repoCtx, s.fixtureDir)
+	orchResult, err := orch.Run(ctx, s.repoCtx, s.fixtureDir)
 	if err != nil {
 		return fmt.Errorf("orchestrator.Run: %w", err)
 	}
 	s.orchDiagnostics = orchResult.Diagnostics
 
-	// Run planner + task planner with HeuristicEffortModel so
-	// tasks get EffortHours > 0.
-	if err := s.runPlanner(); err != nil {
-		return err
+	// Step 2: Build engine samples from the orchestrator's
+	// drafts — the same wiring the CLI composition root uses.
+	orchSamples := orchestrator.BuildSamples(
+		s.repoCtx, orchResult.Drafts,
+		orch.ScopeBindings(), orchResult.ScopeIDs,
+	)
+
+	// Step 3: Supplement each discovered scope with hot-spot-
+	// scoring metrics that the current parser fleet cannot
+	// produce (cyclo, cognitive_complexity,
+	// modification_count_in_window are "dark" per Sec 8.7).
+	for _, scopeID := range orchResult.ScopeIDs {
+		s.addMetricSample(scopeID, refactor.MetricKindCyclo, 25)
+		s.addMetricSample(scopeID, refactor.MetricKindCognitiveComplexity, 12)
+		s.addMetricSample(scopeID, refactor.MetricKindModificationCountInWindow, 5)
 	}
-	return s.runTaskPlanner(refactor.HeuristicEffortModel{})
+
+	// Merge orchestrator-produced and supplemental samples into
+	// a single set — diagnostics and tasks are now outputs of
+	// the same unified pipeline execution.
+	s.samples = append(orchSamples, s.samples...)
+
+	// Steps 4-6: Engine → Planner → Task Planner.
+	return s.runAnalyzeCompositionRoot(refactor.HeuristicEffortModel{})
 }
 
 func (s *plannerWiringState) theAnalyzeCommandRuns() error {
-	// Exercise the full analyze-command composition root:
-	// engine → planner → task planner, using the orchestrator's
-	// production wiring helpers (LoadStore, BuildMetricSampleReader,
-	// BuildFindingReader, NewTaskPlannerWiring). The --top-n value
-	// is already set in RefactorWeights.TopN, which is how the CLI
-	// flag propagates through the composition root.
+	// Exercise the --top-n flag parsing and override path:
+	// parse the flag through the production flags.Register
+	// mechanism, then apply the parsed value to the bundle's
+	// RefactorWeights — the same override the CLI composition
+	// root performs before wiring the planner. If --top-n is
+	// mis-registered (wrong name, type, or default), the parse
+	// call fails and this scenario fails.
+	fs := flag.NewFlagSet("analyze", flag.ContinueOnError)
+	g := flags.Register(fs)
+	args := []string{fmt.Sprintf("--top-n=%d", s.topNOverride)}
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("flag parse: %w", err)
+	}
+	s.bundle.PolicyVersion.RefactorWeights.TopN = *g.TopN
+
 	return s.runAnalyzeCompositionRoot(refactor.HeuristicEffortModel{})
 }
 

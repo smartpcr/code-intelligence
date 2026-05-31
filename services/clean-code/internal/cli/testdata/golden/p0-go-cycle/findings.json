@@ -1,0 +1,1040 @@
+{
+  "schemaVersion": "v1.2026.05",
+  "Context": {
+    "RootPath": "/fixtures/go",
+    "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+    "HeadSHA": "working-copy",
+    "ModulePath": "example.com/cleanc-fixture-go",
+    "IsGitRepo": false
+  },
+  "Policy": {
+    "policy_version_id": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+    "name": "cleanc.devpolicy",
+    "rule_refs": [
+      {
+        "rule_id": "decoupling.fan_in_high",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.fan_out_high",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.cbo_high",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.cycle_member_present",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.duplication_ratio_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.dip.fan_out_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.dip.coupling_between_objects_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.isp.interface_width_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.lsp.depth_of_inheritance_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.lsp.override_violation",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.ocp.fan_in_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.ocp.modification_count_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.srp.lcom4_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.srp.interface_width_high",
+        "version": 1
+      }
+    ],
+    "threshold_refs": [
+      {
+        "threshold_id": "1e105766-3e02-5b49-b5be-49a787fd8e04"
+      },
+      {
+        "threshold_id": "d3a40d02-4b95-54c6-98fa-22793b425346"
+      },
+      {
+        "threshold_id": "fd6a0f05-ecbf-56cb-9e97-e6a83cc6a13e"
+      },
+      {
+        "threshold_id": "04d9f035-5183-5cb7-86bb-b582f85d3241"
+      }
+    ],
+    "refactor_weights": {
+      "alpha": 1,
+      "beta": 1,
+      "gamma": 1,
+      "delta": 1,
+      "effort_model_version": "dev",
+      "window_days": 90,
+      "top_n": 20
+    },
+    "signature": null,
+    "created_at": "2026-05-01T12:00:00Z"
+  },
+  "Files": [
+    {
+      "path": "go.mod",
+      "language": "",
+      "size_bytes": 0,
+      "parse_status": "skipped"
+    },
+    {
+      "path": "pkg/a/a.go",
+      "language": "go",
+      "size_bytes": 1886,
+      "parse_status": "parsed"
+    },
+    {
+      "path": "pkg/b/b.go",
+      "language": "go",
+      "size_bytes": 433,
+      "parse_status": "parsed"
+    }
+  ],
+  "Skips": [
+    {
+      "Path": "go.mod",
+      "Reason": "unsupported_language"
+    }
+  ],
+  "DarkMetrics": [
+    {
+      "metric_kind": "cognitive_complexity",
+      "language": "go",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 25,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "cyclo",
+      "language": "go",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 23,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_in",
+      "language": "go",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 32,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_out",
+      "language": "go",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 32,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "lcom4",
+      "language": "go",
+      "missing_attrs": [
+        "call_edges",
+        "field_accesses"
+      ],
+      "affected_scope_count": 7,
+      "closure_phase": "P2"
+    }
+  ],
+  "Samples": [
+    {
+      "SampleID": "7a68f853-9e6b-5546-9ac5-3c85424e34ac",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "b7715ba9-e6fb-5e12-9953-e86998f09b12",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/a/a.go#a.a.go.WideClass"
+    },
+    {
+      "SampleID": "46764b12-0c2e-55b3-8843-6a058801733a",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "62d979b1-3121-5d37-8450-83abad9d0b3c",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/a/a.go#a.a.go.Base"
+    },
+    {
+      "SampleID": "80a9c506-a45b-5ce2-8a28-89a3a7c1f939",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "8b7ab222-6046-53a2-b159-059dfd2b0ea5",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/a/a.go#a.a.go.Mid"
+    },
+    {
+      "SampleID": "02338306-ed61-5a0d-a66e-8352274565e5",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "7c171f5f-2dc2-58ff-8070-b6c40b55b5af",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/a/a.go#a.a.go.Leaf"
+    },
+    {
+      "SampleID": "f39f96ee-2cf9-5560-a928-b59237e7442f",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "7c18d1f8-ee5a-5303-aa5a-a7b0dda9649b",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/b/b.go#b.b.go.BBase"
+    },
+    {
+      "SampleID": "0e560d0e-8e95-50e0-a4e0-efa4496fec32",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "c80b2133-9881-53e9-a5fe-7432fea36a83",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/b/b.go#b.b.go.BMid"
+    },
+    {
+      "SampleID": "460387b3-9789-5238-b5f5-a336418eeaef",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "84ed6678-e597-51e0-81be-647ed21e11c5",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/b/b.go#b.b.go.BLeaf"
+    },
+    {
+      "SampleID": "625a0f75-572b-57a0-95d5-b4e35e058a4a",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "a0689269-db85-550f-afb3-f55fe4756122",
+      "ScopeKind": "file",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::file::pkg/a/a.go"
+    },
+    {
+      "SampleID": "eb293ef8-d8f2-5adb-baad-472f55578ba4",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "1af4afdf-ec67-5beb-81ab-8defe560a95a",
+      "ScopeKind": "package",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::pkg::pkg/a"
+    },
+    {
+      "SampleID": "6ad499a0-c07f-58c9-8272-5658db67a268",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "42ffb9fb-4f66-55d2-a1b4-162d572cd73f",
+      "ScopeKind": "file",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::file::pkg/b/b.go"
+    },
+    {
+      "SampleID": "00f2b54d-b126-53a2-b3d5-b4181e91e478",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "680c7ecd-d9d1-5030-8811-f9a1facb798b",
+      "ScopeKind": "package",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::pkg::pkg/b"
+    },
+    {
+      "SampleID": "b7ee75bd-36e2-50b9-9faf-40e168346d2f",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "b7715ba9-e6fb-5e12-9953-e86998f09b12",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/a/a.go#a.a.go.WideClass"
+    },
+    {
+      "SampleID": "67b43f0e-11ac-5fbf-9006-f2de1fe4fa3c",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "62d979b1-3121-5d37-8450-83abad9d0b3c",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/a/a.go#a.a.go.Base"
+    },
+    {
+      "SampleID": "45433831-e1b6-5caf-ba9c-ea5c95b6bec0",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "8b7ab222-6046-53a2-b159-059dfd2b0ea5",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/a/a.go#a.a.go.Mid"
+    },
+    {
+      "SampleID": "a019b406-389d-5f33-8eca-b893fe5c93e4",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "7c171f5f-2dc2-58ff-8070-b6c40b55b5af",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/a/a.go#a.a.go.Leaf"
+    },
+    {
+      "SampleID": "99ee78d0-a6ae-55d8-a918-eb851fdc5595",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "7c18d1f8-ee5a-5303-aa5a-a7b0dda9649b",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/b/b.go#b.b.go.BBase"
+    },
+    {
+      "SampleID": "0e4a5242-00d9-5e21-9579-d86c8258d705",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "c80b2133-9881-53e9-a5fe-7432fea36a83",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/b/b.go#b.b.go.BMid"
+    },
+    {
+      "SampleID": "9b84e8a0-7453-53a9-ab3c-deafdd669fd0",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "84ed6678-e597-51e0-81be-647ed21e11c5",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/b/b.go#b.b.go.BLeaf"
+    },
+    {
+      "SampleID": "6a6588d7-6c20-5627-beea-e1465645353b",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "a0689269-db85-550f-afb3-f55fe4756122",
+      "ScopeKind": "file",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0.3293718166383701,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::file::pkg/a/a.go"
+    },
+    {
+      "SampleID": "e6e30113-da21-524a-9cfe-afc34132ef89",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "1af4afdf-ec67-5beb-81ab-8defe560a95a",
+      "ScopeKind": "package",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0.3293718166383701,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::pkg::pkg/a"
+    },
+    {
+      "SampleID": "2011522c-1dd4-5c90-9aca-fd6becf7c0f2",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "42ffb9fb-4f66-55d2-a1b4-162d572cd73f",
+      "ScopeKind": "file",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::file::pkg/b/b.go"
+    },
+    {
+      "SampleID": "3fccd074-c085-5935-9038-a1c05fc8092b",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "680c7ecd-d9d1-5030-8811-f9a1facb798b",
+      "ScopeKind": "package",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::pkg::pkg/b"
+    },
+    {
+      "SampleID": "9e507b83-e930-524f-8ae1-a25cef690aa4",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "b7715ba9-e6fb-5e12-9953-e86998f09b12",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 16,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/a/a.go#a.a.go.WideClass"
+    },
+    {
+      "SampleID": "4e6e2ec0-f931-529e-82a1-0e3f32670d1e",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "62d979b1-3121-5d37-8450-83abad9d0b3c",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/a/a.go#a.a.go.Base"
+    },
+    {
+      "SampleID": "919dbad7-9815-5a21-9191-aacfe8e6d29c",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "8b7ab222-6046-53a2-b159-059dfd2b0ea5",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/a/a.go#a.a.go.Mid"
+    },
+    {
+      "SampleID": "f970e563-a078-518f-aa66-564c167b00bd",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "7c171f5f-2dc2-58ff-8070-b6c40b55b5af",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/a/a.go#a.a.go.Leaf"
+    },
+    {
+      "SampleID": "f9f3f0fc-af70-5b37-ae8f-28b2d4dee49a",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "05894b95-57a2-550c-8e27-400f5915347a",
+      "ScopeKind": "interface",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/a/a.go#a.a.go.WideInterface"
+    },
+    {
+      "SampleID": "9a8655dd-a299-5986-952c-f3b05796adc4",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "7c18d1f8-ee5a-5303-aa5a-a7b0dda9649b",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/b/b.go#b.b.go.BBase"
+    },
+    {
+      "SampleID": "38d499da-40d8-5474-bab0-404923fd77ff",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "c80b2133-9881-53e9-a5fe-7432fea36a83",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/b/b.go#b.b.go.BMid"
+    },
+    {
+      "SampleID": "24927c7d-3200-5b8b-9e4e-2576cedbeccb",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "84ed6678-e597-51e0-81be-647ed21e11c5",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::class::pkg/b/b.go#b.b.go.BLeaf"
+    },
+    {
+      "SampleID": "aec99b2d-7b34-5d66-bb07-a166d8813763",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "a0689269-db85-550f-afb3-f55fe4756122",
+      "ScopeKind": "file",
+      "MetricKind": "loc",
+      "MetricVersion": 1,
+      "Value": 97,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::file::pkg/a/a.go"
+    },
+    {
+      "SampleID": "9e5e84a2-2974-5188-ae12-db0fbb21696b",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "42ffb9fb-4f66-55d2-a1b4-162d572cd73f",
+      "ScopeKind": "file",
+      "MetricKind": "loc",
+      "MetricVersion": 1,
+      "Value": 26,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3f95aed7-bc92-5db1-a6eb-2274edfe46a4::file::pkg/b/b.go"
+    }
+  ],
+  "Run": {
+    "EvaluationRunID": "5c8260b1-3417-5316-bee9-dcdda33b17bb",
+    "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+    "SHA": "working-copy",
+    "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+    "Caller": "batch_refresh",
+    "ScopeID": null,
+    "CreatedAt": "2026-05-01T12:00:00Z"
+  },
+  "Verdict": {
+    "VerdictID": "67bb95f8-2776-57d9-a6d0-8dbb0e817796",
+    "EvaluationRunID": "5c8260b1-3417-5316-bee9-dcdda33b17bb",
+    "Verdict": "block",
+    "Degraded": false,
+    "DegradedReason": "",
+    "CreatedAt": "2026-05-01T12:00:00Z"
+  },
+  "Findings": [
+    {
+      "FindingID": "3eb0493c-5dd6-5439-a012-d5e0535ab742",
+      "EvaluationRunID": "5c8260b1-3417-5316-bee9-dcdda33b17bb",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "680c7ecd-d9d1-5030-8811-f9a1facb798b",
+      "RuleID": "decoupling.cycle_member_present",
+      "RuleVersion": 1,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "MetricSampleIDs": [
+        "00f2b54d-b126-53a2-b3d5-b4181e91e478"
+      ],
+      "Severity": "block",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "FindingID": "50a56a53-8e3b-56c6-b275-e780bdbced1c",
+      "EvaluationRunID": "5c8260b1-3417-5316-bee9-dcdda33b17bb",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "42ffb9fb-4f66-55d2-a1b4-162d572cd73f",
+      "RuleID": "decoupling.cycle_member_present",
+      "RuleVersion": 1,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "MetricSampleIDs": [
+        "6ad499a0-c07f-58c9-8272-5658db67a268"
+      ],
+      "Severity": "block",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "FindingID": "93fa7375-f886-5c1e-835d-64948a9c4fc1",
+      "EvaluationRunID": "5c8260b1-3417-5316-bee9-dcdda33b17bb",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "b7715ba9-e6fb-5e12-9953-e86998f09b12",
+      "RuleID": "solid.srp.interface_width_high",
+      "RuleVersion": 1,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "MetricSampleIDs": [
+        "9e507b83-e930-524f-8ae1-a25cef690aa4"
+      ],
+      "Severity": "warn",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "FindingID": "ba62486d-42a2-5f5a-a9cb-fccb2cf88c77",
+      "EvaluationRunID": "5c8260b1-3417-5316-bee9-dcdda33b17bb",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "1af4afdf-ec67-5beb-81ab-8defe560a95a",
+      "RuleID": "decoupling.cycle_member_present",
+      "RuleVersion": 1,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "MetricSampleIDs": [
+        "eb293ef8-d8f2-5adb-baad-472f55578ba4"
+      ],
+      "Severity": "block",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "FindingID": "e2e2c931-a16a-5f28-baae-e22b25b67476",
+      "EvaluationRunID": "5c8260b1-3417-5316-bee9-dcdda33b17bb",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "a0689269-db85-550f-afb3-f55fe4756122",
+      "RuleID": "decoupling.cycle_member_present",
+      "RuleVersion": 1,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "MetricSampleIDs": [
+        "625a0f75-572b-57a0-95d5-b4e35e058a4a"
+      ],
+      "Severity": "block",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "FindingID": "f60c0116-8726-5c3b-87ab-29f63113b2b9",
+      "EvaluationRunID": "5c8260b1-3417-5316-bee9-dcdda33b17bb",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "a0689269-db85-550f-afb3-f55fe4756122",
+      "RuleID": "decoupling.duplication_ratio_high",
+      "RuleVersion": 1,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "MetricSampleIDs": [
+        "6a6588d7-6c20-5627-beea-e1465645353b"
+      ],
+      "Severity": "warn",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    }
+  ],
+  "HotSpots": [
+    {
+      "HotspotID": "d24ae053-783a-5bb7-929b-533ce0189f55",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "a0689269-db85-550f-afb3-f55fe4756122",
+      "Score": 2,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "30cc36dd-c0fe-59fe-a684-1ee53f5d6282",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "1af4afdf-ec67-5beb-81ab-8defe560a95a",
+      "Score": 1,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "37daf3c3-4030-572b-8d11-332b1977ebe9",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "42ffb9fb-4f66-55d2-a1b4-162d572cd73f",
+      "Score": 1,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "b0aa8db3-a2be-5bca-af04-894673a90d2d",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "680c7ecd-d9d1-5030-8811-f9a1facb798b",
+      "Score": 1,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "0c9ce781-dab5-52f3-853c-721f63754b84",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "7c171f5f-2dc2-58ff-8070-b6c40b55b5af",
+      "Score": 0.8660254037844387,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "ac58c42e-dfd9-5387-a6e3-bdc609259605",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "84ed6678-e597-51e0-81be-647ed21e11c5",
+      "Score": 0.8660254037844387,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "84d67858-015f-51c3-ad57-89cfaf9c432b",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "8b7ab222-6046-53a2-b159-059dfd2b0ea5",
+      "Score": 0.8660254037844387,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "5360b62f-1754-5c1a-a2e5-46a6c48413f6",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "c80b2133-9881-53e9-a5fe-7432fea36a83",
+      "Score": 0.8660254037844387,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "c64225c2-22e1-5a47-9b74-ee191e0b9e99",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "b7715ba9-e6fb-5e12-9953-e86998f09b12",
+      "Score": -0.15470053837925146,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "61aaf012-99a4-54b7-882e-ef337a2d00cc",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "62d979b1-3121-5d37-8450-83abad9d0b3c",
+      "Score": -1.1547005383792515,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "HotspotID": "7bca3ef6-9bf5-5556-aaf2-ba1abcef0667",
+      "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+      "SHA": "working-copy",
+      "ScopeID": "7c18d1f8-ee5a-5303-aa5a-a7b0dda9649b",
+      "Score": -1.1547005383792515,
+      "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    }
+  ],
+  "Plan": {
+    "PlanID": "547a523d-6d93-59fb-8d01-98c4b1222b3c",
+    "RepoID": "3f95aed7-bc92-5db1-a6eb-2274edfe46a4",
+    "SHA": "working-copy",
+    "HotspotIDs": [
+      "d24ae053-783a-5bb7-929b-533ce0189f55",
+      "30cc36dd-c0fe-59fe-a684-1ee53f5d6282",
+      "37daf3c3-4030-572b-8d11-332b1977ebe9",
+      "b0aa8db3-a2be-5bca-af04-894673a90d2d",
+      "0c9ce781-dab5-52f3-853c-721f63754b84",
+      "ac58c42e-dfd9-5387-a6e3-bdc609259605",
+      "84d67858-015f-51c3-ad57-89cfaf9c432b",
+      "5360b62f-1754-5c1a-a2e5-46a6c48413f6",
+      "c64225c2-22e1-5a47-9b74-ee191e0b9e99",
+      "61aaf012-99a4-54b7-882e-ef337a2d00cc",
+      "7bca3ef6-9bf5-5556-aaf2-ba1abcef0667"
+    ],
+    "SummaryMD": "Refactor plan for repo 3f95aed7-bc92-5db1-a6eb-2274edfe46a4 at sha working-copy.\n\nCovered hot_spots: 11\nGenerated tasks: 6\nPolicy version: ac2ca2b6-2dd1-5db9-81f8-895918458335\n",
+    "CreatedAt": "2026-05-01T12:00:00Z"
+  },
+  "Tasks": [
+    {
+      "TaskID": "a2bec3fa-012d-5ef3-9341-b6f670f7d82a",
+      "PlanID": "547a523d-6d93-59fb-8d01-98c4b1222b3c",
+      "ScopeID": "a0689269-db85-550f-afb3-f55fe4756122",
+      "Kind": "break_cycle",
+      "EffortHours": 0,
+      "RuleID": "decoupling.cycle_member_present",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope a0689269-db85-550f-afb3-f55fe4756122 motivated by rule decoupling.cycle_member_present.\nHot_spot id: d24ae053-783a-5bb7-929b-533ce0189f55 (score=2, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "TaskID": "f64eaca2-9be1-5847-af6f-9c02f00b9324",
+      "PlanID": "547a523d-6d93-59fb-8d01-98c4b1222b3c",
+      "ScopeID": "a0689269-db85-550f-afb3-f55fe4756122",
+      "Kind": "consolidate_duplication",
+      "EffortHours": 0,
+      "RuleID": "decoupling.duplication_ratio_high",
+      "DescriptionMD": "Refactor task: kind=consolidate_duplication for scope a0689269-db85-550f-afb3-f55fe4756122 motivated by rule decoupling.duplication_ratio_high.\nHot_spot id: d24ae053-783a-5bb7-929b-533ce0189f55 (score=2, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "TaskID": "1b2a94be-04c0-5cf9-8b3f-c259de613405",
+      "PlanID": "547a523d-6d93-59fb-8d01-98c4b1222b3c",
+      "ScopeID": "1af4afdf-ec67-5beb-81ab-8defe560a95a",
+      "Kind": "break_cycle",
+      "EffortHours": 0,
+      "RuleID": "decoupling.cycle_member_present",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope 1af4afdf-ec67-5beb-81ab-8defe560a95a motivated by rule decoupling.cycle_member_present.\nHot_spot id: 30cc36dd-c0fe-59fe-a684-1ee53f5d6282 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "TaskID": "cfc7d15c-0064-573d-a86f-e4cddf628581",
+      "PlanID": "547a523d-6d93-59fb-8d01-98c4b1222b3c",
+      "ScopeID": "42ffb9fb-4f66-55d2-a1b4-162d572cd73f",
+      "Kind": "break_cycle",
+      "EffortHours": 0,
+      "RuleID": "decoupling.cycle_member_present",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope 42ffb9fb-4f66-55d2-a1b4-162d572cd73f motivated by rule decoupling.cycle_member_present.\nHot_spot id: 37daf3c3-4030-572b-8d11-332b1977ebe9 (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "TaskID": "ce3d8bea-525e-5c52-9f92-4240009412bc",
+      "PlanID": "547a523d-6d93-59fb-8d01-98c4b1222b3c",
+      "ScopeID": "680c7ecd-d9d1-5030-8811-f9a1facb798b",
+      "Kind": "break_cycle",
+      "EffortHours": 0,
+      "RuleID": "decoupling.cycle_member_present",
+      "DescriptionMD": "Refactor task: kind=break_cycle for scope 680c7ecd-d9d1-5030-8811-f9a1facb798b motivated by rule decoupling.cycle_member_present.\nHot_spot id: b0aa8db3-a2be-5bca-af04-894673a90d2d (score=1, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    },
+    {
+      "TaskID": "9f74c489-f55b-53c2-971c-31838578a85b",
+      "PlanID": "547a523d-6d93-59fb-8d01-98c4b1222b3c",
+      "ScopeID": "b7715ba9-e6fb-5e12-9953-e86998f09b12",
+      "Kind": "split_class",
+      "EffortHours": 0,
+      "RuleID": "solid.srp.interface_width_high",
+      "DescriptionMD": "Refactor task: kind=split_class for scope b7715ba9-e6fb-5e12-9953-e86998f09b12 motivated by rule solid.srp.interface_width_high.\nHot_spot id: c64225c2-22e1-5a47-9b74-ee191e0b9e99 (score=-0.15470053837925146, policy_version=ac2ca2b6-2dd1-5db9-81f8-895918458335).\n",
+      "CreatedAt": "2026-05-01T12:00:00Z"
+    }
+  ],
+  "Diagnostics": {
+    "dark_metrics": [
+      {
+        "metric_kind": "cognitive_complexity",
+        "language": "go",
+        "missing_attrs": [
+          "decision_blocks"
+        ],
+        "affected_scope_count": 25,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "cyclo",
+        "language": "go",
+        "missing_attrs": [
+          "decision_blocks"
+        ],
+        "affected_scope_count": 23,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "fan_in",
+        "language": "go",
+        "missing_attrs": [
+          "call_edges"
+        ],
+        "affected_scope_count": 32,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "fan_out",
+        "language": "go",
+        "missing_attrs": [
+          "call_edges"
+        ],
+        "affected_scope_count": 32,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "lcom4",
+        "language": "go",
+        "missing_attrs": [
+          "call_edges",
+          "field_accesses"
+        ],
+        "affected_scope_count": 7,
+        "closure_phase": "P2"
+      }
+    ],
+    "effort_source": "fallback"
+  }
+}

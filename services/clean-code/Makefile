@@ -57,7 +57,7 @@ PROTO_FILES         ?= ast/v1/ast.proto
 PG_URL ?= postgres://clean_code_admin:e2e_test_password@localhost:5432/clean_code?sslmode=disable
 COMPOSE_FILE ?= ../../tests/e2e/phase-09-audit-wal/docker-compose.yml
 
-.PHONY: build build-prod test test-cgo test-nocgo test-race lint vet tidy clean proto proto-tools docker-build compose-up compose-down
+.PHONY: build build-prod test test-cgo test-nocgo test-race lint vet tidy clean proto proto-tools docker-build compose-up compose-down update-cli-golden
 .PHONY: migrate-up migrate-down seed-phase-09 test-phase-09
 .PHONY: test-e2e
 
@@ -87,6 +87,9 @@ build-prod:
 ## `test-nocgo` / `test-cgo` for explicit CGO mode pinning.
 test:
 	$(GO) test $(TEST_FLAGS) $(GO_PKGS)
+
+update-cli-golden:
+	UPDATE=1 $(GO) test $(TEST_FLAGS) -run TestAnalyzeGolden ./internal/cli/orchestrator/...
 
 ## test-nocgo: exercise the `//go:build !cgo` lexer-fallback
 ## adapters for Python / TypeScript / Java (and stdlib parser

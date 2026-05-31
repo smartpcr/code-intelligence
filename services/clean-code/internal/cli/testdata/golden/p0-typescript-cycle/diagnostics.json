@@ -1,0 +1,51 @@
+{
+  "dark_metrics": [
+    {
+      "metric_kind": "cognitive_complexity",
+      "language": "typescript",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 52,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "cyclo",
+      "language": "typescript",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 50,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_in",
+      "language": "typescript",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 58,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_out",
+      "language": "typescript",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 58,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "lcom4",
+      "language": "typescript",
+      "missing_attrs": [
+        "call_edges",
+        "field_accesses"
+      ],
+      "affected_scope_count": 6,
+      "closure_phase": "P2"
+    }
+  ],
+  "effort_source": "fallback"
+}

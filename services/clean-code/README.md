@@ -145,6 +145,34 @@ workflow file itself it runs:
 4. `make test-race` (Linux runner, CGO available)
 5. `docker build` of the clean-code service container image
 
+### End-to-end cleanc golden tests
+
+`tests/e2e/cleanc/` ships a shell-driven, compose-less harness that
+exercises the `cleanc` binary against checked-in sample repos and
+diffs the produced `report.md` / `findings.json` / `diag.json`
+against checked-in golden files. The harness is compose-less because
+`cleanc` is a single static binary with no PostgreSQL / HTTP /
+docker-stack dependencies, so each scenario is a plain `bash run.sh`
+with no `docker compose up` in front of it.
+
+Run all scenarios locally:
+
+```bash
+bash ./tests/e2e/cleanc/run_all.sh
+```
+
+The two P0 scenarios shipped today are:
+
+- `tests/e2e/cleanc/scenarios/p0-go-cycle/` — Go fixture with a
+  package-level import cycle; asserts byte-match against a
+  path-normalised, UUID-/timestamp-masked golden report.
+- `tests/e2e/cleanc/scenarios/p0-mixed-langs/` — one source file
+  per supported language (Go / Python / TypeScript / Java);
+  asserts all four languages appear in `RunArtifact.Files`.
+
+See [`tests/e2e/cleanc/README.md`](../../tests/e2e/cleanc/README.md)
+for the normalisation strategy and how to add new scenarios.
+
 ## Stage 1.1 -- `cleanc` CLI binary
 
 `bin/cleanc` is the Stage 1.1 deliverable -- a single-binary, no-server

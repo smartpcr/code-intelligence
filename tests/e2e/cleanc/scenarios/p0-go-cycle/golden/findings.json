@@ -1,0 +1,1055 @@
+{
+  "schemaVersion": "v1.2026.05",
+  "Context": {
+    "RootPath": "/fixtures/go",
+    "RepoID": "<uuid>",
+    "HeadSHA": "working-copy",
+    "ModulePath": "example.com/cleanc-fixture-go",
+    "IsGitRepo": false
+  },
+  "Policy": {
+    "policy_version_id": "<uuid>",
+    "name": "cleanc.devpolicy",
+    "rule_refs": [
+      {
+        "rule_id": "decoupling.cbo_high",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.cycle_member_present",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.duplication_ratio_high",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.fan_in_high",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.fan_out_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.dip.coupling_between_objects_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.dip.fan_out_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.isp.interface_width_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.lsp.depth_of_inheritance_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.lsp.override_violation",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.ocp.fan_in_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.ocp.modification_count_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.srp.interface_width_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.srp.lcom4_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.srp.loc_high",
+        "version": 1
+      }
+    ],
+    "threshold_refs": [
+      {
+        "threshold_id": "<uuid>"
+      },
+      {
+        "threshold_id": "<uuid>"
+      },
+      {
+        "threshold_id": "<uuid>"
+      },
+      {
+        "threshold_id": "<uuid>"
+      }
+    ],
+    "refactor_weights": {
+      "alpha": 1,
+      "beta": 1,
+      "gamma": 1,
+      "delta": 1,
+      "effort_model_version": "dev",
+      "window_days": 90,
+      "top_n": 20
+    },
+    "signature": null,
+    "created_at": "<timestamp>"
+  },
+  "Files": [
+    {
+      "path": ".x",
+      "language": "",
+      "size_bytes": 0,
+      "parse_status": "skipped"
+    },
+    {
+      "path": "go.mod",
+      "language": "",
+      "size_bytes": 0,
+      "parse_status": "skipped"
+    },
+    {
+      "path": "pkg/a/a.go",
+      "language": "go",
+      "size_bytes": 1886,
+      "parse_status": "parsed"
+    },
+    {
+      "path": "pkg/b/b.go",
+      "language": "go",
+      "size_bytes": 433,
+      "parse_status": "parsed"
+    }
+  ],
+  "Skips": [
+    {
+      "Path": ".x",
+      "Reason": "unsupported_language"
+    },
+    {
+      "Path": "go.mod",
+      "Reason": "unsupported_language"
+    }
+  ],
+  "DarkMetrics": [
+    {
+      "metric_kind": "cognitive_complexity",
+      "language": "go",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 25,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "cyclo",
+      "language": "go",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 23,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_in",
+      "language": "go",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 32,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_out",
+      "language": "go",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 32,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "lcom4",
+      "language": "go",
+      "missing_attrs": [
+        "call_edges",
+        "field_accesses"
+      ],
+      "affected_scope_count": 7,
+      "closure_phase": "P2"
+    }
+  ],
+  "Samples": [
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/a/a.go#a.a.go.Base"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/a/a.go#a.a.go.WideClass"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/b/b.go#b.b.go.BBase"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/a/a.go#a.a.go.Leaf"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/a/a.go#a.a.go.Mid"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/b/b.go#b.b.go.BLeaf"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "coupling_between_objects",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/b/b.go#b.b.go.BMid"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/a/a.go#a.a.go.Base"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/a/a.go#a.a.go.WideClass"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/b/b.go#b.b.go.BBase"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/a/a.go#a.a.go.Leaf"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/a/a.go#a.a.go.Mid"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/b/b.go#b.b.go.BLeaf"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "depth_of_inheritance",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/b/b.go#b.b.go.BMid"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/a/a.go#a.a.go.Base"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/a/a.go#a.a.go.Leaf"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/a/a.go#a.a.go.Mid"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/b/b.go#b.b.go.BBase"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/b/b.go#b.b.go.BLeaf"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/b/b.go#b.b.go.BMid"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "class",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 16,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/a/a.go#a.a.go.WideClass"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "file",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::file::pkg/a/a.go"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "file",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::file::pkg/b/b.go"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "file",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::file::pkg/b/b.go"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "file",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0.3293718166383701,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::file::pkg/a/a.go"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "file",
+      "MetricKind": "loc",
+      "MetricVersion": 1,
+      "Value": 26,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::file::pkg/b/b.go"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "file",
+      "MetricKind": "loc",
+      "MetricVersion": 1,
+      "Value": 97,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::file::pkg/a/a.go"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "interface",
+      "MetricKind": "interface_width",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "solid",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::class::pkg/a/a.go#a.a.go.WideInterface"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "package",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::pkg::pkg/a"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "package",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 1,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::pkg::pkg/b"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "package",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::pkg::pkg/b"
+    },
+    {
+      "SampleID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "ScopeKind": "package",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0.3293718166383701,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:<uuid>::pkg::pkg/a"
+    }
+  ],
+  "Run": {
+    "EvaluationRunID": "<uuid>",
+    "RepoID": "<uuid>",
+    "SHA": "working-copy",
+    "PolicyVersionID": "<uuid>",
+    "Caller": "batch_refresh",
+    "ScopeID": null,
+    "CreatedAt": "<timestamp>"
+  },
+  "Verdict": {
+    "VerdictID": "<uuid>",
+    "EvaluationRunID": "<uuid>",
+    "Verdict": "block",
+    "Degraded": false,
+    "DegradedReason": "",
+    "CreatedAt": "<timestamp>"
+  },
+  "Findings": [
+    {
+      "FindingID": "<uuid>",
+      "EvaluationRunID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "RuleID": "decoupling.cycle_member_present",
+      "RuleVersion": 1,
+      "PolicyVersionID": "<uuid>",
+      "MetricSampleIDs": [
+        "<uuid>"
+      ],
+      "Severity": "block",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "FindingID": "<uuid>",
+      "EvaluationRunID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "RuleID": "decoupling.cycle_member_present",
+      "RuleVersion": 1,
+      "PolicyVersionID": "<uuid>",
+      "MetricSampleIDs": [
+        "<uuid>"
+      ],
+      "Severity": "block",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "FindingID": "<uuid>",
+      "EvaluationRunID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "RuleID": "decoupling.cycle_member_present",
+      "RuleVersion": 1,
+      "PolicyVersionID": "<uuid>",
+      "MetricSampleIDs": [
+        "<uuid>"
+      ],
+      "Severity": "block",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "FindingID": "<uuid>",
+      "EvaluationRunID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "RuleID": "decoupling.cycle_member_present",
+      "RuleVersion": 1,
+      "PolicyVersionID": "<uuid>",
+      "MetricSampleIDs": [
+        "<uuid>"
+      ],
+      "Severity": "block",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "FindingID": "<uuid>",
+      "EvaluationRunID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "RuleID": "decoupling.duplication_ratio_high",
+      "RuleVersion": 1,
+      "PolicyVersionID": "<uuid>",
+      "MetricSampleIDs": [
+        "<uuid>"
+      ],
+      "Severity": "warn",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "FindingID": "<uuid>",
+      "EvaluationRunID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "RuleID": "solid.srp.interface_width_high",
+      "RuleVersion": 1,
+      "PolicyVersionID": "<uuid>",
+      "MetricSampleIDs": [
+        "<uuid>"
+      ],
+      "Severity": "warn",
+      "Delta": "new",
+      "ExplanationMD": "",
+      "CreatedAt": "<timestamp>"
+    }
+  ],
+  "HotSpots": [
+    {
+      "HotspotID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "Score": -0.15470053837925146,
+      "PolicyVersionID": "<uuid>",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "HotspotID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "Score": -1.1547005383792515,
+      "PolicyVersionID": "<uuid>",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "HotspotID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "Score": -1.1547005383792515,
+      "PolicyVersionID": "<uuid>",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "HotspotID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "Score": 0.8660254037844387,
+      "PolicyVersionID": "<uuid>",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "HotspotID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "Score": 0.8660254037844387,
+      "PolicyVersionID": "<uuid>",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "HotspotID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "Score": 0.8660254037844387,
+      "PolicyVersionID": "<uuid>",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "HotspotID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "Score": 0.8660254037844387,
+      "PolicyVersionID": "<uuid>",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "HotspotID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "Score": 1,
+      "PolicyVersionID": "<uuid>",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "HotspotID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "Score": 1,
+      "PolicyVersionID": "<uuid>",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "HotspotID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "Score": 1,
+      "PolicyVersionID": "<uuid>",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "HotspotID": "<uuid>",
+      "RepoID": "<uuid>",
+      "SHA": "working-copy",
+      "ScopeID": "<uuid>",
+      "Score": 2,
+      "PolicyVersionID": "<uuid>",
+      "CreatedAt": "<timestamp>"
+    }
+  ],
+  "Plan": {
+    "PlanID": "<uuid>",
+    "RepoID": "<uuid>",
+    "SHA": "working-copy",
+    "HotspotIDs": [
+      "<uuid>",
+      "<uuid>",
+      "<uuid>",
+      "<uuid>",
+      "<uuid>",
+      "<uuid>",
+      "<uuid>",
+      "<uuid>",
+      "<uuid>",
+      "<uuid>",
+      "<uuid>"
+    ],
+    "SummaryMD": "Refactor plan for repo <uuid> at sha working-copy.\n\nCovered hot_spots: 11\nGenerated tasks: 6\nPolicy version: <uuid>\n",
+    "CreatedAt": "<timestamp>"
+  },
+  "Tasks": [
+    {
+      "TaskID": "<uuid>",
+      "PlanID": "<uuid>",
+      "ScopeID": "<uuid>",
+      "Kind": "consolidate_duplication",
+      "EffortHours": 0,
+      "RuleID": "decoupling.duplication_ratio_high",
+      "DescriptionMD": "Refactor task: kind=consolidate_duplication for scope <uuid> motivated by rule decoupling.duplication_ratio_high.\nHot_spot id: <uuid> (score=2, policy_version=<uuid>).\n",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "TaskID": "<uuid>",
+      "PlanID": "<uuid>",
+      "ScopeID": "<uuid>",
+      "Kind": "extract_method",
+      "EffortHours": 0,
+      "RuleID": "decoupling.cycle_member_present",
+      "DescriptionMD": "Refactor task: kind=extract_method for scope <uuid> motivated by rule decoupling.cycle_member_present.\nHot_spot id: <uuid> (score=1, policy_version=<uuid>).\n",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "TaskID": "<uuid>",
+      "PlanID": "<uuid>",
+      "ScopeID": "<uuid>",
+      "Kind": "extract_method",
+      "EffortHours": 0,
+      "RuleID": "decoupling.cycle_member_present",
+      "DescriptionMD": "Refactor task: kind=extract_method for scope <uuid> motivated by rule decoupling.cycle_member_present.\nHot_spot id: <uuid> (score=1, policy_version=<uuid>).\n",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "TaskID": "<uuid>",
+      "PlanID": "<uuid>",
+      "ScopeID": "<uuid>",
+      "Kind": "extract_method",
+      "EffortHours": 0,
+      "RuleID": "decoupling.cycle_member_present",
+      "DescriptionMD": "Refactor task: kind=extract_method for scope <uuid> motivated by rule decoupling.cycle_member_present.\nHot_spot id: <uuid> (score=1, policy_version=<uuid>).\n",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "TaskID": "<uuid>",
+      "PlanID": "<uuid>",
+      "ScopeID": "<uuid>",
+      "Kind": "extract_method",
+      "EffortHours": 0,
+      "RuleID": "decoupling.cycle_member_present",
+      "DescriptionMD": "Refactor task: kind=extract_method for scope <uuid> motivated by rule decoupling.cycle_member_present.\nHot_spot id: <uuid> (score=2, policy_version=<uuid>).\n",
+      "CreatedAt": "<timestamp>"
+    },
+    {
+      "TaskID": "<uuid>",
+      "PlanID": "<uuid>",
+      "ScopeID": "<uuid>",
+      "Kind": "split_class",
+      "EffortHours": 0,
+      "RuleID": "solid.srp.interface_width_high",
+      "DescriptionMD": "Refactor task: kind=split_class for scope <uuid> motivated by rule solid.srp.interface_width_high.\nHot_spot id: <uuid> (score=-0.15470053837925146, policy_version=<uuid>).\n",
+      "CreatedAt": "<timestamp>"
+    }
+  ],
+  "Diagnostics": {
+    "dark_metrics": [
+      {
+        "metric_kind": "cognitive_complexity",
+        "language": "go",
+        "missing_attrs": [
+          "decision_blocks"
+        ],
+        "affected_scope_count": 25,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "cyclo",
+        "language": "go",
+        "missing_attrs": [
+          "decision_blocks"
+        ],
+        "affected_scope_count": 23,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "fan_in",
+        "language": "go",
+        "missing_attrs": [
+          "call_edges"
+        ],
+        "affected_scope_count": 32,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "fan_out",
+        "language": "go",
+        "missing_attrs": [
+          "call_edges"
+        ],
+        "affected_scope_count": 32,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "lcom4",
+        "language": "go",
+        "missing_attrs": [
+          "call_edges",
+          "field_accesses"
+        ],
+        "affected_scope_count": 7,
+        "closure_phase": "P2"
+      }
+    ],
+    "effort_source": "fallback",
+    "prompt_count": 0
+  }
+}

@@ -1,12 +1,13 @@
 # `cleanc` — operator usage guide
 
-> **Stage:** Phase 1 / Stage 1.1 (CLI binary skeleton).
 > **Scope:** the sub-command dispatcher, global-flag surface,
-> exit-code contract, and reserved-surface rejections shipped
-> in this stage.  The walker, parser-fan-out, rule engine,
-> planner, and report renderer land in Stages 2.1 – 3.x and are
-> intentionally stubbed here (any verb that would touch them
-> exits `70 EX_SOFTWARE` with a "not yet wired" stderr line).
+> exit-code contract, reserved-surface rejections, and the
+> full `analyze` pipeline (walker, parser fan-out, rule
+> engine, refactor planner, report renderer + JSON sidecars,
+> JSONL prompt emitter). The `report` re-render verb is
+> wired and shares its flag set with `analyze`; the `apply`
+> verb is reserved and rejected at the dispatcher pending
+> operator pin `cli-l7-authority`.
 >
 > **Authority order** (per repository `README.md`): when this
 > document and the source disagree, the **specs win** —
@@ -24,10 +25,10 @@ cleanc <subcommand> [flags]
 
 Canonical sub-commands (the dispatcher's closed set):
 
-| Verb      | Status (Stage 1.1) | Purpose                                                              |
+| Verb      | Status             | Purpose                                                              |
 | --------- | ------------------ | -------------------------------------------------------------------- |
-| `analyze` | stub (exit 70)     | Walk a repo, evaluate the rule engine, write a markdown report.      |
-| `report`  | stub (exit 70)     | Re-render markdown from a previously written `findings.json`.        |
+| `analyze` | implemented        | Walk a repo, evaluate the rule engine, write a markdown report + JSON sidecars (+ optional `--emit-prompts` JSONL). |
+| `report`  | implemented        | Re-render markdown from a previously written `findings.json`.        |
 | `version` | implemented        | Print binary version + build tag + parser set + rule-pack set.       |
 | `apply`   | reserved (exit 64) | Apply a refactor task; pending operator pin `cli-l7-authority`.      |
 | `help`    | implemented        | Print global usage (no arg) or per-verb usage (`cleanc help <verb>`).|
@@ -81,7 +82,7 @@ of any dispatcher-side overrides.
 | `1`  | (find)        | Clean run; maximum finding severity met or exceeded `--exit-on` (one of `info`/`warn`/`block`).   |
 | `2`  | (walker)      | Walker failure — missing root path, permission denied on a traversed directory, etc.              |
 | `64` | `EX_USAGE`    | Operator-facing usage error: unknown sub-command, malformed flag, missing/surplus positional, reserved verb (`apply`), or reserved flag (`--telemetry-otlp` / `--with-churn` / `--snippet-cap-lines`). |
-| `70` | `EX_SOFTWARE` | Internal engine error (parser panic, planner crash). The Stage 1.1 skeleton also emits `70` for unwired sub-command bodies so a successful exit is never claimed for unimplemented behaviour. |
+| `70` | `EX_SOFTWARE` | Internal engine error (parser panic, planner crash, renderer I/O failure). |
 
 ## 4. Reserved surface (tech-spec Sec 8.1 + e2e Stage 4.4)
 
@@ -141,7 +142,10 @@ cleanc version
 cleanc help analyze
 cleanc analyze -h
 
-# Stage 1.1 stub — exits 70 with "pipeline not yet wired".
+# Stage 5.x — full analyze pipeline (walker, rule engine,
+# planner, report + JSON sidecars). Exits 0 on a clean run,
+# 1 when a finding crosses --exit-on, or a >=64 BSD code
+# on usage / internal failures (see §3).
 cleanc analyze .
 cleanc analyze . --out report.md --findings findings.json --exit-on warn
 
@@ -157,6 +161,56 @@ cleanc apply 00000000-0000-0000-0000-000000000000
 cleanc not-a-verb
 ```
 
+## 6.1 End-to-end golden tests
+
+The shell-driven harness at `tests/e2e/cleanc/` exercises the
+binary end-to-end against checked-in sample repos and diffs the
+produced artifacts against checked-in golden files. The harness
+is **compose-less** because `cleanc` is a single static binary
+with no PostgreSQL / HTTP / docker-stack dependencies, so each
+scenario is a plain `bash run.sh` with no `docker compose up`
+in front of it.
+
+```bash
+# Run every scenario sequentially.  Invoke via `bash` so the
+# executable bit on run.sh / run_all.sh does not need to
+# survive a git checkout where core.fileMode drops it.
+bash ./tests/e2e/cleanc/run_all.sh
+
+# Or run one scenario in isolation.
+bash ./tests/e2e/cleanc/scenarios/p0-go-cycle/run.sh
+```
+
+Per-scenario layout:
+
+```text
+tests/e2e/cleanc/scenarios/<name>/
+  repo/        # tarball-able sample repo (the cleanc input)
+  golden/      # checked-in expected artifacts
+  run.sh       # builds cleanc, runs analyze, normalises outputs,
+               # diffs against golden/
+```
+
+The two P0 scenarios shipped today are:
+
+| Scenario          | Sample repo                             | Assertion                                                  |
+| ----------------- | --------------------------------------- | ---------------------------------------------------------- |
+| `p0-go-cycle`     | Go module with a `pkg/a ↔ pkg/b` cycle  | byte-match against golden `report.md`, `findings.json`, `diag.json` |
+| `p0-mixed-langs`  | one source file each of Go/Py/TS/Java   | `RunArtifact.Files[].language` contains all four languages  |
+
+`findings.json` byte-match goes through `lib/normalize.jq`, which
+masks the random `EvaluationRunID` / `VerdictID` / `FindingID` /
+`HotSpotID` / `RefactorPlanID` / `RefactorTaskID` UUIDs to
+`"<uuid>"`, every ISO-8601 timestamp to `"<timestamp>"`, and
+canonicalises array order via `sort_by(tojson)`. `report.md`
+byte-match goes through `lib/normalize-md.sh`, which sorts any
+contiguous block of `- ` bullet lines so the engine's
+non-deterministic insertion order doesn't bleed into the diff.
+
+`diag.json` carries no UUIDs and no timestamps -- only
+dark-metric counts and the effort-source tag -- so it is
+byte-matched as-is.
+
 ## 7. Cross-references
 
 - `docs/stories/code-intelligence-REFACTOR-GUIDE/tech-spec.md`
@@ -171,14 +225,23 @@ cleanc not-a-verb
   - **Phase 1** — version output, sub-command surface, `analyze` missing-path.
   - **Phase 4 / Stage 4.4** — reserved surface (`apply` + `--telemetry-otlp` + `--with-churn` + `--snippet-cap-lines`).
 - `docs/stories/code-intelligence-REFACTOR-GUIDE/implementation-plan.md`
-  - **Stage 1.1** — this skeleton.
-  - **Stages 1.2 / 1.4 / 2.x / 3.x / 4.x** — downstream wiring that replaces each Stage 1.1 stub.
+  - **Stages 1.1 / 1.2 / 1.4 / 2.x / 3.x / 4.x / 5.x** — the
+    incremental rollout from the original CLI binary skeleton to
+    today's fully wired walker + parser + rule engine + planner
+    + report + JSON sidecars + JSONL emitter surface.  All
+    stages cited above have shipped; the implementation-plan
+    history is preserved verbatim there for audit traceability.
 
-## 8. Stage 1.1 scope boundary
+## 8. Implementation history
 
-Stage 1.1 ships the CLI binary skeleton **plus** the
-foundational internal CLI support packages required to make
-the skeleton self-contained:
+The CLI shipped incrementally across the REFACTOR-GUIDE
+implementation-plan stages.  The original Stage 1.1 binary
+skeleton (sub-command dispatcher, global-flag surface, exit
+codes, reserved-surface rejections) has been **fully
+superseded** by the wired analyze / report pipeline described
+in §1–§6 above.  The Stage 1.1 support packages are still
+present in the source tree because the downstream stages
+extended them rather than replacing them wholesale:
 
 - `cmd/cleanc/` — entry, sub-command dispatcher, build-tag-paired defaults.
 - `internal/cli/flags/` — exit codes, verb names, flag defaults.
@@ -196,13 +259,14 @@ the skeleton self-contained:
 - `internal/cli/effort/` — `FallbackModel.Estimate` deterministic
   effort score used when the ONNX model is unavailable.
 
-The next-layer integrations land in downstream workstreams:
-**Stage 1.2** wires `repocontext` / `scopebinding` into the
-walker / orchestrator (implementation-plan lines 46-54);
-**Stage 1.4** swaps the dev-build `Loader.Load` stub for the
-real YAML decoder + unsigned `steward.PolicyVersion`
-synthesiser (implementation-plan lines 90-100); **Stage 1.5+**
-supersedes the `effort` fallback with the ONNX model.
+The next-layer integrations have all landed in downstream
+workstreams: **Stage 1.2** wired `repocontext` / `scopebinding`
+into the walker / orchestrator; **Stage 1.4** swapped the
+dev-build `Loader.Load` stub for the real YAML decoder +
+unsigned `steward.PolicyVersion` synthesiser; **Stage 1.5+**
+left the deterministic `effort` fallback in place because the
+ONNX model is still optional.  See the implementation-plan
+history for the per-stage diff trail.
 
 The operator's literal 2026-05-30 scope phrasing is preserved
 verbatim in the `Stage11ScopeNote` constant in

@@ -109,15 +109,21 @@ func (s *parseAndRecipeFanoutState) runOrchestrator(opts orchestrator.Options) e
 }
 
 // ---------------------------------------------------------------------------
-// panicking parser test double
+// panicking parser test double — selective: only panics for a specific file
 // ---------------------------------------------------------------------------
 
-type panickingGoParser struct{}
+type selectivePanickingParser struct {
+	panicPath    string // repo-relative path that triggers the panic
+	realRegistry *parser.Registry
+}
 
-func (panickingGoParser) Language() string { return "go" }
+func (p *selectivePanickingParser) Language() string { return "go" }
 
-func (panickingGoParser) Parse(_ context.Context, path string, _ []byte) (*parser.AstFile, error) {
-	panic("e2e: synthetic parser panic for path=" + path)
+func (p *selectivePanickingParser) Parse(ctx context.Context, path string, content []byte) (*parser.AstFile, error) {
+	if path == p.panicPath {
+		panic("e2e: synthetic parser panic for path=" + path)
+	}
+	return p.realRegistry.Parse(ctx, path, content)
 }
 
 // ---------------------------------------------------------------------------
@@ -140,14 +146,22 @@ func (s *parseAndRecipeFanoutState) aFixtureRepoWithOneFileEachOfFourLanguages()
 	return nil
 }
 
-func (s *parseAndRecipeFanoutState) aFixtureGoFileOfKnownLineCount() error {
+func (s *parseAndRecipeFanoutState) aFixtureGoFileWithExactly6Lines() error {
+	// 6 physical lines: the trailing newline creates line 6 (the parser's
+	// file scope Range is 1-6, so loc = 6).
+	// Line 1: package foo
+	// Line 2: (blank)
+	// Line 3: func Bar() {
+	// Line 4:     return
+	// Line 5: }
+	// Line 6: (trailing newline creates this empty line)
 	content := "package foo\n\nfunc Bar() {\n\treturn\n}\n"
 	relPath, err := s.writeFixtureFile("pkg/bar.go", content)
 	if err != nil {
 		return err
 	}
 	s.goRelPath = relPath
-	s.knownLineCount = float64(strings.Count(content, "\n"))
+	s.knownLineCount = 6
 	return nil
 }
 
@@ -173,15 +187,13 @@ func (s *parseAndRecipeFanoutState) aFixtureGoFileWithBranches() error {
 	return nil
 }
 
-func (s *parseAndRecipeFanoutState) aFixtureGoFileWithFunctionFoo() error {
-	content := strings.Join([]string{
-		"package mypkg",
-		"",
-		"func Foo() {",
-		"\treturn",
-		"}",
-		"",
-	}, "\n")
+func (s *parseAndRecipeFanoutState) aFixtureGoFileWithFunctionFooSpanningLines3To5() error {
+	// Line 1: package mypkg
+	// Line 2: (blank)
+	// Line 3: func Foo() {
+	// Line 4:     return
+	// Line 5: }
+	content := "package mypkg\n\nfunc Foo() {\n\treturn\n}\n"
 	relPath, err := s.writeFixtureFile("mypkg/foo.go", content)
 	if err != nil {
 		return err
@@ -190,13 +202,13 @@ func (s *parseAndRecipeFanoutState) aFixtureGoFileWithFunctionFoo() error {
 	return nil
 }
 
-func (s *parseAndRecipeFanoutState) aFixtureFileThatTriggersAPanicInTheParserStub() error {
-	panicRel, err := s.writeFixtureFile("pkg/boom.go", "package boom\n")
+func (s *parseAndRecipeFanoutState) aFixtureWhereOnlyBoomGoTriggersAPanicAndCleanGoParsesNormally() error {
+	panicRel, err := s.writeFixtureFile("pkg/boom.go", "package boom\n\nfunc Boom() {}\n")
 	if err != nil {
 		return err
 	}
 	s.panicRelPath = panicRel
-	cleanRel, err := s.writeFixtureFile("pkg/clean.go", "package boom\n")
+	cleanRel, err := s.writeFixtureFile("pkg/clean.go", "package boom\n\nfunc Clean() {}\n")
 	if err != nil {
 		return err
 	}
@@ -224,10 +236,15 @@ func (s *parseAndRecipeFanoutState) parseAndRecipeFanOutCompletes() error {
 	return s.runOrchestrator(orchestrator.Options{})
 }
 
-func (s *parseAndRecipeFanoutState) theOrchestratorRunsWithThePanickingParser() error {
+func (s *parseAndRecipeFanoutState) theOrchestratorRunsWithTheSelectivePanickingParser() error {
+	realReg := parser.DefaultRegistry()
+	selectiveParser := &selectivePanickingParser{
+		panicPath:    s.panicRelPath,
+		realRegistry: realReg,
+	}
 	reg := parser.NewRegistry()
-	if err := reg.Register("go", func() parser.Parser { return panickingGoParser{} }); err != nil {
-		return fmt.Errorf("register panicking parser: %w", err)
+	if err := reg.Register("go", func() parser.Parser { return selectiveParser }); err != nil {
+		return fmt.Errorf("register selective panicking parser: %w", err)
 	}
 	return s.runOrchestrator(orchestrator.Options{
 		Workers: 1,
@@ -265,7 +282,7 @@ func (s *parseAndRecipeFanoutState) zeroWalkSkipRowsWithReasonUnsupportedLanguag
 	return nil
 }
 
-func (s *parseAndRecipeFanoutState) aMetricSampleDraftWithLocAndExpectedValue() error {
+func (s *parseAndRecipeFanoutState) aMetricSampleDraftWithLocAndValueExactly6() error {
 	if s.resultErr != nil {
 		return fmt.Errorf("orchestrator returned error: %w", s.resultErr)
 	}
@@ -283,11 +300,24 @@ func (s *parseAndRecipeFanoutState) aMetricSampleDraftWithLocAndExpectedValue() 
 		return fmt.Errorf("no loc draft emitted for %q; saw metric_kinds=%v", s.goRelPath, allKinds)
 	}
 	for _, d := range locDrafts {
-		if d.Value <= 0 {
-			return fmt.Errorf("loc draft for %q: Value = %v, want > 0", s.goRelPath, d.Value)
+		if d.Value != float64(s.knownLineCount) {
+			return fmt.Errorf("loc draft for %q: Value = %v, want exactly %v", s.goRelPath, d.Value, s.knownLineCount)
 		}
-		if d.Value > s.knownLineCount+1 {
-			return fmt.Errorf("loc draft for %q: Value = %v, want <= %v", s.goRelPath, d.Value, s.knownLineCount+1)
+	}
+	return nil
+}
+
+func (s *parseAndRecipeFanoutState) recipeAppliesToReturnsFalseForCycloOnEveryParsedAstFile() error {
+	if s.resultErr != nil {
+		return fmt.Errorf("orchestrator returned error: %w", s.resultErr)
+	}
+	if len(s.result.Files) == 0 {
+		return fmt.Errorf("no AstFiles parsed — cannot verify AppliesTo gate")
+	}
+	cycloRecipe := recipes.NewCycloRecipe()
+	for _, ast := range s.result.Files {
+		if cycloRecipe.AppliesTo(ast) {
+			return fmt.Errorf("CycloRecipe.AppliesTo returned true for %q — Stage 2.1 parsers MUST NOT stamp decision_blocks", ast.GetPath())
 		}
 	}
 	return nil
@@ -305,7 +335,7 @@ func (s *parseAndRecipeFanoutState) zeroMetricSampleDraftRowsForCyclo() error {
 	return nil
 }
 
-func (s *parseAndRecipeFanoutState) scopeBindingTableContainsFooMethodBinding() error {
+func (s *parseAndRecipeFanoutState) scopeBindingTableContainsFooMethodBindingWithExactLines() error {
 	if s.resultErr != nil {
 		return fmt.Errorf("orchestrator returned error: %w", s.resultErr)
 	}
@@ -331,32 +361,41 @@ func (s *parseAndRecipeFanoutState) scopeBindingTableContainsFooMethodBinding() 
 	}
 
 	for _, b := range methodBindings {
-		if !strings.Contains(b.Signature, "Foo") {
+		// Signature must end with "Foo()" per BuildMethod format:
+		// <repoURL>::method::<relPath>#<qualifiedName>(<params>)
+		// The qualifiedName includes the package prefix (e.g. "mypkg.foo.go.Foo"),
+		// so the full signature ends with ".Foo()" or "#Foo()".
+		if !strings.HasSuffix(b.Signature, "Foo()") {
 			continue
 		}
-		if b.StartLine < 1 {
-			return fmt.Errorf("method binding StartLine = %d, want >= 1", b.StartLine)
+		// Verify the full signature structure
+		if !strings.Contains(b.Signature, "::method::"+s.goRelPath+"#") {
+			return fmt.Errorf("method binding signature %q missing ::method::%s# segment", b.Signature, s.goRelPath)
 		}
-		if b.EndLine < b.StartLine {
-			return fmt.Errorf("method binding EndLine = %d < StartLine = %d", b.EndLine, b.StartLine)
+		if !strings.HasPrefix(b.Signature, orchestrator.SyntheticRepoURLPrefix) {
+			return fmt.Errorf("method binding signature %q missing %q prefix", b.Signature, orchestrator.SyntheticRepoURLPrefix)
 		}
 		if b.FilePath != s.goRelPath {
 			return fmt.Errorf("method binding FilePath = %q, want %q", b.FilePath, s.goRelPath)
 		}
-		if !strings.HasPrefix(b.Signature, orchestrator.SyntheticRepoURLPrefix) {
-			return fmt.Errorf("method binding signature %q missing %q prefix", b.Signature, orchestrator.SyntheticRepoURLPrefix)
+		// StartLine and EndLine must enclose the function body (lines 3-5)
+		if b.StartLine != 3 {
+			return fmt.Errorf("method binding StartLine = %d, want 3 (func Foo() is on line 3)", b.StartLine)
+		}
+		if b.EndLine != 5 {
+			return fmt.Errorf("method binding EndLine = %d, want 5 (closing brace is on line 5)", b.EndLine)
 		}
 		return nil // found the Foo binding, all checks pass
 	}
 
 	sigs := make([]string, 0, len(methodBindings))
 	for _, b := range methodBindings {
-		sigs = append(sigs, b.Signature)
+		sigs = append(sigs, fmt.Sprintf("%s [%d-%d]", b.Signature, b.StartLine, b.EndLine))
 	}
-	return fmt.Errorf("no method binding mentioning Foo in %q; saw signatures=%v", s.goRelPath, sigs)
+	return fmt.Errorf("no method binding with signature ending in Foo() in %q; saw: %v", s.goRelPath, sigs)
 }
 
-func (s *parseAndRecipeFanoutState) aWalkSkipWithParserPanicForPanickingFile() error {
+func (s *parseAndRecipeFanoutState) aWalkSkipWithParserPanicForBoomGo() error {
 	if s.resultErr != nil {
 		return fmt.Errorf("orchestrator returned error: %w", s.resultErr)
 	}
@@ -370,6 +409,22 @@ func (s *parseAndRecipeFanoutState) aWalkSkipWithParserPanicForPanickingFile() e
 		found = append(found, fmt.Sprintf("{Path:%q Reason:%q}", sk.Path, sk.Reason))
 	}
 	return fmt.Errorf("no WalkSkip{Path:%q, Reason:%q} found; skips: %s", s.panicRelPath, orchestrator.SkipReasonParserPanic, strings.Join(found, ", "))
+}
+
+func (s *parseAndRecipeFanoutState) cleanGoAppearsInTheParsedAstFileResults() error {
+	if s.resultErr != nil {
+		return fmt.Errorf("orchestrator returned error: %w", s.resultErr)
+	}
+	for _, f := range s.result.Files {
+		if f.GetPath() == s.cleanRelPath {
+			return nil
+		}
+	}
+	paths := make([]string, len(s.result.Files))
+	for i, f := range s.result.Files {
+		paths[i] = f.GetPath()
+	}
+	return fmt.Errorf("clean.go (%q) not found in parsed AstFile results (got %v) — the worker did NOT survive the boom.go panic", s.cleanRelPath, paths)
 }
 
 func (s *parseAndRecipeFanoutState) theOrchestratorExitsCleanly() error {
@@ -396,25 +451,27 @@ func InitializeScenario_pipeline_parse_and_recipe_fanout(ctx *godog.ScenarioCont
 
 	// Given
 	ctx.Step(`^a fixture repo with one file each of Go, Python, TypeScript, and Java$`, s.aFixtureRepoWithOneFileEachOfFourLanguages)
-	ctx.Step(`^a fixture Go file of known line count$`, s.aFixtureGoFileOfKnownLineCount)
+	ctx.Step(`^a fixture Go file with exactly 6 lines$`, s.aFixtureGoFileWithExactly6Lines)
 	ctx.Step(`^a fixture Go file with branches$`, s.aFixtureGoFileWithBranches)
-	ctx.Step(`^a fixture Go file with a function "Foo"$`, s.aFixtureGoFileWithFunctionFoo)
-	ctx.Step(`^a fixture file that triggers a panic in the parser stub$`, s.aFixtureFileThatTriggersAPanicInTheParserStub)
+	ctx.Step(`^a fixture Go file with a function "Foo" spanning lines 3 to 5$`, s.aFixtureGoFileWithFunctionFooSpanningLines3To5)
+	ctx.Step(`^a fixture where only "boom\.go" triggers a panic in the parser stub and "clean\.go" parses normally$`, s.aFixtureWhereOnlyBoomGoTriggersAPanicAndCleanGoParsesNormally)
 
 	// When
 	ctx.Step(`^the orchestrator runs the parse stage$`, s.theOrchestratorRunsTheParseStage)
 	ctx.Step(`^recipes run$`, s.recipesRun)
 	ctx.Step(`^recipes run against the branchy file$`, s.recipesRunAgainstTheBranchyFile)
 	ctx.Step(`^parse and recipe fan-out completes$`, s.parseAndRecipeFanOutCompletes)
-	ctx.Step(`^the orchestrator runs with the panicking parser$`, s.theOrchestratorRunsWithThePanickingParser)
+	ctx.Step(`^the orchestrator runs with the selective panicking parser$`, s.theOrchestratorRunsWithTheSelectivePanickingParser)
 
 	// Then
 	ctx.Step(`^four AstFile rows are collected$`, s.fourAstFileRowsAreCollected)
 	ctx.Step(`^zero WalkSkip rows with reason "unsupported_language" are emitted$`, s.zeroWalkSkipRowsWithReasonUnsupportedLanguage)
-	ctx.Step(`^a MetricSampleDraft with MetricKind "loc" and the expected value is collected$`, s.aMetricSampleDraftWithLocAndExpectedValue)
+	ctx.Step(`^a MetricSampleDraft with MetricKind "loc" and Value exactly 6 is collected$`, s.aMetricSampleDraftWithLocAndValueExactly6)
+	ctx.Step(`^Recipe\.AppliesTo returns false for the cyclo recipe on every parsed AstFile$`, s.recipeAppliesToReturnsFalseForCycloOnEveryParsedAstFile)
 	ctx.Step(`^zero MetricSampleDraft rows for metric_kind "cyclo" are emitted$`, s.zeroMetricSampleDraftRowsForCyclo)
-	ctx.Step(`^the scope binding table contains a method binding whose Signature ends with "Foo" and whose StartLine and EndLine enclose the function body$`, s.scopeBindingTableContainsFooMethodBinding)
-	ctx.Step(`^a WalkSkip with reason "parser_panic" is emitted for the panicking file$`, s.aWalkSkipWithParserPanicForPanickingFile)
+	ctx.Step(`^the scope binding table contains a method binding whose Signature ends with "Foo\(\)" and whose StartLine is 3 and EndLine is 5$`, s.scopeBindingTableContainsFooMethodBindingWithExactLines)
+	ctx.Step(`^a WalkSkip with reason "parser_panic" is emitted for "boom\.go"$`, s.aWalkSkipWithParserPanicForBoomGo)
+	ctx.Step(`^"clean\.go" appears in the parsed AstFile results$`, s.cleanGoAppearsInTheParsedAstFileResults)
 	ctx.Step(`^the orchestrator exits cleanly$`, s.theOrchestratorExitsCleanly)
 }
 

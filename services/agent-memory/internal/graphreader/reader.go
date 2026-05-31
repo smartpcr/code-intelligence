@@ -526,3 +526,132 @@ func scanEdgeRows(rows pgx.Rows, includeRetired bool) ([]Edge, error) {
 	}
 	return out, nil
 }
+
+// ListRepos returns the per-repo overview rows the multi-repo
+// surfaces (the React UI's repo picker and the `GET /v1/repos`
+// JSON envelope served by `codeintel serve` / `mgmt-api`) need.
+//
+// This is the single owner of the `SELECT … FROM repo …` query
+// the Postgres backend uses to materialise `[]RepoSummary`:
+// `internal/graphsink/postgres.Reader.ListRepos` forwards
+// straight through to this method so the adapter package
+// remains free of direct SQL (tech-spec C5 / S4.5 -- backends
+// MUST go through the typed reader API and never bypass to the
+// underlying pool).
+//
+// The projection is the subset of columns `RepoSummary` carries
+// (the `RepoCard`-style ingest-job join used by
+// `mgmt.read.repos` is intentionally NOT lifted here -- that
+// view-specific aggregate stays inside `internal/mgmtapi` where
+// the `RepoCard` shape lives). Field mapping for the Postgres
+// row:
+//
+//   - `repo.repo_id::text` populates BOTH `RepoSummary.RepoID`
+//     (because for Postgres-scanned repos the surrogate UUID
+//     IS the backend-parity ID -- writes go through
+//     `graphwriter.Writer.EnsureRepoWithID` which honours the
+//     `fingerprint.RepoIDFromURL` precomputation) AND
+//     `RepoSummary.RepoUUID`.
+//   - `repo.url` -> `RepoSummary.URL`.
+//   - `repo.current_head_sha` -> `RepoSummary.SHA` (the column
+//     is `NOT NULL` per migration `0002` so an empty string is
+//     possible but never NULL).
+//   - `repo.created_at` -> `RepoSummary.GeneratedAt`.
+//
+// Order is `created_at DESC, repo_id DESC` so successive calls
+// return a stable newest-first feed (matches the existing
+// `mgmtapi.handleListRepos` ordering byte-for-byte). The
+// `opts.Limit` field is clamped via `normaliseLimit` so a
+// caller passing the zero-value `ReaderOptions` receives at
+// most `MaxListLimit` rows. `opts.IncludeRetired` is currently
+// a no-op for this method -- `repo` rows have no retirement
+// concept in migration `0002`, and the field is accepted only
+// to keep the call shape consistent with the rest of the
+// `Reader` surface.
+func (r *Reader) ListRepos(ctx context.Context, opts ReaderOptions) ([]RepoSummary, error) {
+	limit := normaliseLimit(opts.Limit)
+
+	const q = `
+		SELECT r.repo_id::text, r.url, r.current_head_sha, r.created_at
+		FROM repo r
+		ORDER BY r.created_at DESC, r.repo_id DESC
+		LIMIT $1
+	`
+	rows, err := r.pool.Query(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("graphreader: ListRepos query: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]RepoSummary, 0, 16)
+	for rows.Next() {
+		var rec RepoSummary
+		if err := rows.Scan(&rec.RepoID, &rec.URL, &rec.SHA, &rec.GeneratedAt); err != nil {
+			return nil, fmt.Errorf("graphreader: ListRepos scan: %w", err)
+		}
+		// On Postgres the surrogate UUID IS the backend-parity
+		// id; mirror it into RepoUUID so callers that index by
+		// the surrogate (e.g. existing mgmt-api `?repo_id=`
+		// query filters) keep working without a second query.
+		rec.RepoUUID = rec.RepoID
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("graphreader: ListRepos rows: %w", err)
+	}
+	return out, nil
+}
+
+// LookupBySignature resolves a (repoID, kind, canonicalSignature)
+// triple to its current `Node`. The human-readable counterpart
+// to `GetNode`: callers use this to translate a CLI `--seed`
+// argument or an HTTP `?seed=` query parameter into the
+// concrete `nodeID` the call-chain BFS expects.
+//
+// Returns `ErrNotFound` when no matching Node exists, OR when
+// the matching Node is retired and `opts.IncludeRetired` is
+// false (same collapse policy as `GetNode`). When more than one
+// Node would match -- e.g. an `attrs_json`-only divergence
+// across SHAs that the canonical-signature index does not
+// distinguish -- the lookup deterministically returns the first
+// row under the standard `(kind, canonical_signature, node_id)`
+// order so successive calls are stable.
+//
+// Implementation is a thin specialisation of `ListNodes` with
+// the per-field filter pinned to a single kind + canonical
+// signature, capped at one row, so any future change to
+// retirement semantics or kind-filter encoding stays in one
+// place. The pin to a single kind matches how the seed lookup
+// is used in practice (CLI / HTTP callers always supply a
+// `method`-kinded signature).
+func (r *Reader) LookupBySignature(
+	ctx context.Context,
+	repoID fingerprint.RepoID,
+	kind string,
+	canonicalSignature string,
+	opts ReaderOptions,
+) (Node, error) {
+	if repoID.IsZero() {
+		return Node{}, errors.New("graphreader: LookupBySignature: zero repo_id")
+	}
+	if kind == "" {
+		return Node{}, errors.New("graphreader: LookupBySignature: empty kind")
+	}
+	if canonicalSignature == "" {
+		return Node{}, errors.New("graphreader: LookupBySignature: empty canonical_signature")
+	}
+
+	nodes, err := r.ListNodes(ctx, repoID, []string{kind}, ListNodesFilter{
+		CanonicalSignature: canonicalSignature,
+		Limit:              1,
+	}, opts)
+	if err != nil {
+		return Node{}, err
+	}
+	if len(nodes) == 0 {
+		return Node{}, ErrNotFound
+	}
+	return nodes[0], nil
+}
+
+

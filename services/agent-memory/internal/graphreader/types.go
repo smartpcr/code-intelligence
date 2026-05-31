@@ -50,15 +50,32 @@ import "time"
 //     lives in `RepoID` and there is no separate surrogate-key
 //     namespace. Treat as best-effort metadata, not a primary
 //     key.
+//
+// JSON wire shape (locked -- changing any tag is a breaking
+// change to the Stage 7.2 envelope and the React UI's
+// TypeScript types):
+//
+//   {
+//     "repo_id":      "<backend-parity natural key>",
+//     "url":          "<canonical URL>",
+//     "sha":          "<commit SHA, omitted when empty>",
+//     "generated_at": "<RFC3339 timestamp>",
+//     "repo_uuid":    "<Postgres surrogate-key, omitted when empty>"
+//   }
+//
+// The `omitempty` on `sha` and `repo_uuid` keeps the SQLite /
+// in-memory backends' envelopes free of always-blank fields
+// while still matching the Postgres envelope when those values
+// are populated.
 type RepoSummary struct {
 	// RepoID is the backend-parity natural key (see field doc).
-	RepoID string
+	RepoID string `json:"repo_id"`
 	// URL is the repo's canonical URL.
-	URL string
+	URL string `json:"url"`
 	// SHA is the commit SHA this row describes.
-	SHA string
+	SHA string `json:"sha,omitempty"`
 	// GeneratedAt is the row's materialisation wall-clock time.
-	GeneratedAt time.Time
+	GeneratedAt time.Time `json:"generated_at"`
 	// RepoUUID is the Postgres surrogate-key (best-effort).
-	RepoUUID string
+	RepoUUID string `json:"repo_uuid,omitempty"`
 }

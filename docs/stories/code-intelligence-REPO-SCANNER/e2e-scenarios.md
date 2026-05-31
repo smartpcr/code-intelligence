@@ -262,16 +262,20 @@ storyId: "code-intelligence:REPO-SCANNER"
     `ensurefile-before-ensurerepo-errors`).
 
 - **Scenario:** worker-refactor-preserves-on-disk-graph
-  - **Given** the existing fixture repo exercised by
-    `worker_integration_test.go` and a Postgres test instance
-    populated by the pre-refactor worker.
-  - **When** the post-refactor `worker.runFull` runs against the
-    same fixture into a clean schema (implementation-plan Stage
-    2.4).
-  - **Then** the resulting `(canonical_signature, kind,
+  - **Given** an in-memory fixture repo and a recording
+    `RepoCommitNodeEdgeWriter` (the Stage 2.3 interface) that
+    captures every node/edge the writer is asked to insert, plus
+    a committed golden fixture of the tuples captured from the
+    PRE-refactor implementation.
+  - **When** the post-refactor `worker.runFull` runs through
+    `AncestryWriter` against that fixture (implementation-plan
+    Stage 2.4).
+  - **Then** the captured `(canonical_signature, kind,
     parent_node_id, fingerprint_hex)` tuples for every `node`
-    row match the pre-refactor run byte-for-byte
-    (`worker-graph-byte-identical`).
+    row are byte-identical to the golden fixture
+    (`worker-graph-byte-identical`). Proven IN-PROCESS with NO
+    Postgres; the live Postgres `worker_integration_test.go`
+    stays a CI regression guard, not a gate requirement.
 
 - **Edge:** ancestrywriter-rejects-cross-repo-walkfile
   - **Given** an `AncestryWriter` bound to repo URL

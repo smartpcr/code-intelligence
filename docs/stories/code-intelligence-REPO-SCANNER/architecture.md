@@ -1279,6 +1279,35 @@ allowed to assume a different default.
 
 ---
 
+## Test & Environment Contract
+
+Each acceptance area declares HOW it is proven in Forge's gate (the gate host has
+NO docker and NO pre-provisioned services) and its dependency. Proof kinds:
+`in-process` (zero external I/O), `golden` (committed snapshot for
+preservation/equality), `service:<name>` (live backing service — CI/provided DSN
+only, NEVER `inline`), `lab` (physical lab).
+
+| Acceptance area | Proof | Dependency / how the gate provides it |
+| --- | --- | --- |
+| Phase 1 — parser coverage (CGO build, per-language parse smoke) | `in-process` | none (CGO toolchain on the build host; `pwsh` optional, degradation documented) |
+| Phase 2 — identity/ancestry refactor, graph byte-identity | `golden` | none — capture `worker.runFull`'s node/edge tuples via the Stage 2.3 `RepoCommitNodeEdgeWriter` and assert against a committed golden fixture. The Postgres `worker_integration_test.go` is a CI regression guard (`service:postgres`, provided DSN), NOT a gate requirement. |
+| Phase 3 — graphsink interface / Postgres forwarder / sqlite + memory backends | `in-process` | none — sqlmock for the Postgres forwarder; temp-file SQLite; in-memory backend |
+| Phase 3 — Postgres-backed parity / legacy-row exception | `service:postgres` | provided DSN on CI (partman-equipped Postgres); not run in the gate |
+| Phase 4 — local materializer / SHA synthesis | `in-process` | none (temp dir) |
+| Phase 5 — codeintel CLI (scan to sqlite / memory) | `in-process` | none (temp-file / in-memory store); `scan-url` uses a real git fetch (`service:network`, opt-in / CI) |
+| Phase 6 — diagram projector | `golden` | none — golden JSON envelopes over a fixed fixture graph |
+| Phase 7 — serve endpoint (sqlite handlers) / (Postgres repos handler) | `in-process` / `service:postgres` | sqlite handlers in-process; Postgres-backed handlers via provided DSN on CI |
+| Phase 8 — React + neo4j-nvl UI | `in-process` | none (vitest/jsdom; API mocked) |
+| Phase 9 — docs / e2e acceptance walk | `in-process` | none |
+
+Rule: a `service:<name>` criterion is proven on CI against a provided DSN and is
+NEVER declared `inline`; gate-required proofs use `in-process` or `golden`.
+Embedded/ephemeral services are acceptable only when the schema needs no
+non-bundled extension an embedded build lacks (otherwise a provided DSN or a
+golden snapshot).
+
+---
+
 ## Iteration history
 
 - 2026-05-30: initial draft -- component map, data model, interface

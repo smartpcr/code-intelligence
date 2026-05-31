@@ -17,12 +17,14 @@
 //     `internal/cli/flags`).
 //   - Process exit codes pinned in `tech-spec.md` Sec 8.6
 //     (`0`/`1`/`2`/`64`/`70`).
-//   - The `version` body, which emits a line matching the
-//     e2e-scenarios.md regex
+//   - The `version` body, which emits a SINGLE line
+//     matching the e2e-scenarios.md regex
 //     `^cleanc \d+\.\d+\.\d+ \(build-tag=(|prod)\) \(parsers=[^)]+\) \(rule-packs=[^)]+\)$`
-//     followed by implementation-plan substring lines
-//     (`version=`, `parsers=[go,python,typescript,java]`,
-//     ...).
+//     terminated by exactly one `\n` (Stage 3.4 finalised
+//     format; the earlier follow-on `version=` / `commit=` /
+//     `build_time=` / bracketed `parsers=[...]` diagnostic
+//     lines were dropped to keep CI consumers from pinning
+//     non-contract substrings).
 //
 // Subsequent stages replace the `analyze` / `report` /
 // `apply` bodies with their real implementations:
@@ -189,23 +191,31 @@ func writeGlobalUsage(w io.Writer) {
 	fmt.Fprintln(w, "run `cleanc help <subcommand>` for per-sub-command flag documentation.")
 }
 
-// runVersion prints the binary version, the parser set, and
-// the rule-pack set. Output format is pinned by:
+// runVersion prints the binary version, the parser set,
+// and the rule-pack set on a SINGLE line, terminated by
+// exactly one `\n`. Stage 3.4 (implementation-plan.md
+// line 328) finalises the output to the format:
 //
+//	cleanc <semver> (build-tag=<tag>) (parsers=<csv>) (rule-packs=<csv>)
+//
+// pinned by:
+//
+//   - the workstream brief (Stage 3.4) -- the single-line
+//     format is the contract;
 //   - e2e-scenarios.md line 146 (regex):
-//     `^cleanc \d+\.\d+\.\d+ \(build-tag=(|prod)\) \(parsers=[^)]+\) \(rule-packs=[^)]+\)$`
-//   - e2e-scenarios.md line 147 (set check):
-//     stdout contains `parsers=` whose CSV value is exactly the
-//     set `{go, python, typescript, java}`.
-//   - implementation-plan.md Stage 1.1 line 41 (substrings):
-//     stdout includes `version=` and
-//     `parsers=[go,python,typescript,java]`.
+//     `^cleanc \d+\.\d+\.\d+ \(build-tag=(|prod)\) \(parsers=[^)]+\) \(rule-packs=[^)]+\)$`;
+//   - e2e-scenarios.md line 147 (CSV set check): the
+//     `parsers=` CSV value is exactly the set
+//     `{go, python, typescript, java}`.
 //
-// To satisfy all three, the first line is the strict-regex
-// header (CSV value, no brackets), and the subsequent lines
-// carry the impl-plan substrings (`version=`, bracketed
-// `parsers=[...]`, etc.) plus operator-debug stamps (commit,
-// build_time).
+// The earlier Stage 1.1 skeleton body also emitted
+// follow-on diagnostic lines (`version=`, `commit=`,
+// `build_time=`, bracketed `parsers=[...]` /
+// `rule-packs=[...]`); those were dropped at Stage 3.4
+// because they would let a CI consumer accidentally pin a
+// non-contract substring. The full-stdout pin lives in
+// `TestVersionFormatExact` and the single-line guard in
+// `TestVersionFormatIsExactlyOneLine`.
 func runVersion(stdout, stderr io.Writer, args []string) int {
 	fs := flag.NewFlagSet("cleanc version", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -227,11 +237,6 @@ func runVersion(stdout, stderr io.Writer, args []string) int {
 
 	fmt.Fprintf(stdout, "cleanc %s (build-tag=%s) (parsers=%s) (rule-packs=%s)\n",
 		semver, buildTag, parserCSV, rulePackCSV)
-	fmt.Fprintf(stdout, "version=%s\n", version.Version)
-	fmt.Fprintf(stdout, "commit=%s\n", version.Commit)
-	fmt.Fprintf(stdout, "build_time=%s\n", version.BuildTime)
-	fmt.Fprintf(stdout, "parsers=[%s]\n", parserCSV)
-	fmt.Fprintf(stdout, "rule-packs=[%s]\n", rulePackCSV)
 	return flags.ExitOK
 }
 
@@ -597,8 +602,30 @@ func runReport(stdout, stderr io.Writer, args []string) int {
 		return flags.ExitUsage
 	}
 
-	_ = g
-	_ = stdout
+	// Stage 3.4: re-render markdown from the supplied
+	// findings.json artifact without re-running the
+	// pipeline. The helper [report.JSON.RenderFromBytes]
+	// is the single re-render seam (implementation-plan.md
+	// Stage 3.2 line 285); a schemaVersion mismatch
+	// short-circuits to ExitUsage (64) with both versions
+	// named so a stale CLI invoked against a newer artifact
+	// fails loudly rather than producing a partial render.
+	//
+	// Iter-2 evaluator item 2: render into an in-memory
+	// buffer FIRST and only open / write to `--out` after a
+	// successful render. The iter-1 ordering created or
+	// truncated the destination file before validating
+	// `schemaVersion`, so a refused artifact would still
+	// destroy an existing report file before the dispatcher
+	// returned. With a staged buffer, a schema-mismatch
+	// refusal (exit 64) leaves the destination file
+	// untouched.
+	findingsPath := positionals[0]
+	data, err := os.ReadFile(findingsPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "cleanc report: read %s: %v\n", findingsPath, err)
+		return flags.ExitInternalError
+	}
 
 	fmt.Fprintln(stderr, "cleanc report: re-render is a follow-up stage; the report renderer lands in Stage 4.1.")
 	return flags.ExitInternalError

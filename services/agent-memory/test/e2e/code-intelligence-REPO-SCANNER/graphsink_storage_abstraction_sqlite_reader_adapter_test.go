@@ -335,8 +335,9 @@ func (s *sqliteMaxListLimitState) given15000MethodNodes(ctx context.Context) err
 func (s *sqliteMaxListLimitState) whenListNodesWithLimit20000(ctx context.Context) error {
 	s.requested = 20000
 
-	// Install a structured JSON logger so we can capture and assert
-	// the clamp event the Then step requires.
+	// Install a structured JSON logger so we can capture the clamp
+	// log emitted by the SQLite reader's ListNodes when the
+	// requested limit exceeds MaxListLimit.
 	handler := slog.NewJSONHandler(&s.logBuf, &slog.HandlerOptions{Level: slog.LevelInfo})
 	slog.SetDefault(slog.New(handler))
 
@@ -348,18 +349,6 @@ func (s *sqliteMaxListLimitState) whenListNodesWithLimit20000(ctx context.Contex
 		return fmt.Errorf("ListNodes: %w", err)
 	}
 
-	// Emit a structured log recording the detected clamp: the
-	// requested limit exceeded MaxListLimit, so the reader clamped
-	// the result set. This is the observable proof the acceptance
-	// scenario requires.
-	if s.requested > graphreader.MaxListLimit && len(s.nodes) == graphreader.MaxListLimit {
-		slog.Info("graphsink.reader.limit_clamped",
-			slog.Int("requested", s.requested),
-			slog.Int("effective", graphreader.MaxListLimit),
-			slog.Bool("clamped", true),
-		)
-	}
-
 	return nil
 }
 
@@ -369,7 +358,8 @@ func (s *sqliteMaxListLimitState) thenExactly10000Returned(ctx context.Context) 
 		return fmt.Errorf("expected %d nodes (MaxListLimit), got %d", want, len(s.nodes))
 	}
 
-	// Assert the structured log captured the clamp event with the
+	// Assert the structured log emitted by the SQLite reader (SUT)
+	// in reader.go ListNodes contains the clamp record with the
 	// correct fields: requested > MaxListLimit, effective ==
 	// MaxListLimit, clamped == true.
 	logData := s.logBuf.Bytes()

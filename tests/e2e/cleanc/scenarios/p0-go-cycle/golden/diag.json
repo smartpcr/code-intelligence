@@ -1,0 +1,52 @@
+{
+  "dark_metrics": [
+    {
+      "metric_kind": "cognitive_complexity",
+      "language": "go",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 25,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "cyclo",
+      "language": "go",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 23,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_in",
+      "language": "go",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 32,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_out",
+      "language": "go",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 32,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "lcom4",
+      "language": "go",
+      "missing_attrs": [
+        "call_edges",
+        "field_accesses"
+      ],
+      "affected_scope_count": 7,
+      "closure_phase": "P2"
+    }
+  ],
+  "effort_source": "fallback",
+  "prompt_count": 0
+}

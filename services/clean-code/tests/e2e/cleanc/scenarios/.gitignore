@@ -1,0 +1,11 @@
+# Generated artifacts from e2e scenario runs.
+# Golden files are under golden/ subdirs and ARE tracked.
+# Ignore only at scenario root level, not in golden/ subdirs.
+/*/findings.json
+/*/report.md
+/*/prompts.jsonl
+/*/diagnostics.json
+/exit-codes/*/findings.json
+/exit-codes/*/report.md
+/exit-codes/*/prompts.jsonl
+/exit-codes/*/diagnostics.json

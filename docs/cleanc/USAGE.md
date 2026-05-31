@@ -225,14 +225,23 @@ byte-matched as-is.
   - **Phase 1** — version output, sub-command surface, `analyze` missing-path.
   - **Phase 4 / Stage 4.4** — reserved surface (`apply` + `--telemetry-otlp` + `--with-churn` + `--snippet-cap-lines`).
 - `docs/stories/code-intelligence-REFACTOR-GUIDE/implementation-plan.md`
-  - **Stage 1.1** — this skeleton.
-  - **Stages 1.2 / 1.4 / 2.x / 3.x / 4.x** — downstream wiring that replaces each Stage 1.1 stub.
+  - **Stages 1.1 / 1.2 / 1.4 / 2.x / 3.x / 4.x / 5.x** — the
+    incremental rollout from the original CLI binary skeleton to
+    today's fully wired walker + parser + rule engine + planner
+    + report + JSON sidecars + JSONL emitter surface.  All
+    stages cited above have shipped; the implementation-plan
+    history is preserved verbatim there for audit traceability.
 
-## 8. Stage 1.1 scope boundary
+## 8. Implementation history
 
-Stage 1.1 ships the CLI binary skeleton **plus** the
-foundational internal CLI support packages required to make
-the skeleton self-contained:
+The CLI shipped incrementally across the REFACTOR-GUIDE
+implementation-plan stages.  The original Stage 1.1 binary
+skeleton (sub-command dispatcher, global-flag surface, exit
+codes, reserved-surface rejections) has been **fully
+superseded** by the wired analyze / report pipeline described
+in §1–§6 above.  The Stage 1.1 support packages are still
+present in the source tree because the downstream stages
+extended them rather than replacing them wholesale:
 
 - `cmd/cleanc/` — entry, sub-command dispatcher, build-tag-paired defaults.
 - `internal/cli/flags/` — exit codes, verb names, flag defaults.
@@ -250,13 +259,14 @@ the skeleton self-contained:
 - `internal/cli/effort/` — `FallbackModel.Estimate` deterministic
   effort score used when the ONNX model is unavailable.
 
-The next-layer integrations land in downstream workstreams:
-**Stage 1.2** wires `repocontext` / `scopebinding` into the
-walker / orchestrator (implementation-plan lines 46-54);
-**Stage 1.4** swaps the dev-build `Loader.Load` stub for the
-real YAML decoder + unsigned `steward.PolicyVersion`
-synthesiser (implementation-plan lines 90-100); **Stage 1.5+**
-supersedes the `effort` fallback with the ONNX model.
+The next-layer integrations have all landed in downstream
+workstreams: **Stage 1.2** wired `repocontext` / `scopebinding`
+into the walker / orchestrator; **Stage 1.4** swapped the
+dev-build `Loader.Load` stub for the real YAML decoder +
+unsigned `steward.PolicyVersion` synthesiser; **Stage 1.5+**
+left the deterministic `effort` fallback in place because the
+ONNX model is still optional.  See the implementation-plan
+history for the per-stage diff trail.
 
 The operator's literal 2026-05-30 scope phrasing is preserved
 verbatim in the `Stage11ScopeNote` constant in

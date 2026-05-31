@@ -78,17 +78,25 @@ done
 #          a golden whose Context.RootPath is `/fixtures/go`.
 # ---------------------------------------------------------------
 # `$ABS_REPO` is interpolated into a `sed s|...|...|` expression,
-# so we must escape any of `|`, `&`, `\` that may appear in the
-# pathname (e.g. a workspace under a directory whose name
-# contains `&`).  sed treats `&` on the replacement side as the
-# matched text and `\` as an escape, so unescaped paths can
-# corrupt the substitution and silently bend the diff.
-sed_escape () {
-    # Escape `\`, `|`, and `&` for both pattern and replacement.
-    printf '%s' "$1" | sed -e 's/[\\|&]/\\&/g'
+# so we must escape every character that `sed` interprets
+# specially on EITHER side of the substitution.  The pattern
+# side is a Basic Regular Expression, so the regex
+# metacharacters `.`, `[`, `]`, `*`, `^`, `$`, plus the
+# alternative delimiter `|`, plus the BRE escape `\` all need
+# backslash-prefixing; the replacement side additionally
+# interprets `&` as the matched text, so it also gets escaped.
+# We use a single pass that covers the union of both sets so
+# a path containing e.g. a literal `[` or `.` never bleeds
+# into the regex engine.
+#
+# sed_escape_bre: escape a string so it is safe on BOTH the
+#                  pattern AND replacement side of a BRE
+#                  `s|PATTERN|REPLACEMENT|` substitution.
+sed_escape_bre () {
+    printf '%s' "$1" | sed -e 's/[][\\|&.*^$]/\\&/g'
 }
-ABS_REPO_ESC="$(sed_escape "$ABS_REPO")"
-SYN_PATH_ESC="$(sed_escape "$SYNTHETIC_PATH")"
+ABS_REPO_ESC="$(sed_escape_bre "$ABS_REPO")"
+SYN_PATH_ESC="$(sed_escape_bre "$SYNTHETIC_PATH")"
 # sed -i syntax differs between BSD (macOS) and GNU. Use a temp
 # file so the script is portable across both.
 sed_in_place () {

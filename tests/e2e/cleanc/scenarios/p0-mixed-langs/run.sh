@@ -37,9 +37,13 @@ if [[ -z "${CLEANC:-}" ]]; then
 fi
 
 # ---------------------------------------------------------------
-# Step 2: run analyze. We do NOT request --out / --diagnostics
-#          because the assertion only needs findings.json's
-#          Files[].language column.
+# Step 2: run analyze.  The assertion only needs findings.json's
+#          Files[].language column, but we still request --out so
+#          the markdown report goes to a sink file instead of
+#          stdout (which we capture for diagnostics on failure).
+#          --diagnostics is intentionally NOT requested -- the
+#          scenario covers walker / parser language coverage, not
+#          the diagnostics sidecar surface.
 # ---------------------------------------------------------------
 echo "[p0-mixed-langs] running cleanc analyze . (in $SAMPLE_REPO)"
 set +e

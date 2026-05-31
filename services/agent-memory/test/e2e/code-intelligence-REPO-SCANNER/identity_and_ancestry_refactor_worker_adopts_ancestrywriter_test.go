@@ -704,9 +704,6 @@ func grepForIdentifier(dir, ident string) ([]string, error) {
 		if !strings.HasSuffix(path, ".go") {
 			return nil
 		}
-		if strings.Contains(path, "test"+string(os.PathSeparator)+"e2e") {
-			return nil
-		}
 		f, fErr := os.Open(path)
 		if fErr != nil {
 			return fErr

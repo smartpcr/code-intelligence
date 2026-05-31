@@ -1,0 +1,88 @@
+{
+  "nodes": [
+    {
+      "kind": "class",
+      "canonical_signature": "https://example.test/graphsink/parity::class::polyglot/greeter.py#Greeter",
+      "fingerprint_hex": "8e1de6d8538543221d63aa2bfd1f1e5160b3123c7bacd23201c5d9262802ba79"
+    },
+    {
+      "kind": "file",
+      "canonical_signature": "https://example.test/graphsink/parity::file::polyglot/greeter.py",
+      "fingerprint_hex": "dace57999f574dd2d281192a08f4e00e0c03b5aabfad11299109fd46a5dce292"
+    },
+    {
+      "kind": "method",
+      "canonical_signature": "https://example.test/graphsink/parity::method::polyglot/greeter.py#Greeter.greet(self, name)",
+      "fingerprint_hex": "b7137a4fd16ae7f33a013d0356b399485f2fafbe7063b06f214226eec2413d56"
+    },
+    {
+      "kind": "method",
+      "canonical_signature": "https://example.test/graphsink/parity::method::polyglot/greeter.py#main()",
+      "fingerprint_hex": "5f617f5270c13ece6d21d1bf69b83fc2c5763be26f9d38284f60299938bb10f1"
+    },
+    {
+      "kind": "package",
+      "canonical_signature": "https://example.test/graphsink/parity::package::os",
+      "fingerprint_hex": "6a54b184636e73e739d42a90667c84b925711148205e7554e6f2db5d0f496eb7"
+    },
+    {
+      "kind": "package",
+      "canonical_signature": "https://example.test/graphsink/parity::package::typing",
+      "fingerprint_hex": "0b30e1df395a160403b145adea43f58bd3ad6a58ec528b0bcb0d914ffbfb3d1f"
+    },
+    {
+      "kind": "package",
+      "canonical_signature": "https://example.test/graphsink/parity::pkg::polyglot",
+      "fingerprint_hex": "788706924c13b7eb2f3defe78064ffd5e250e9b36db0ad23eed6dff41d0c463c"
+    },
+    {
+      "kind": "repo",
+      "canonical_signature": "https://example.test/graphsink/parity",
+      "fingerprint_hex": "855d6f49c0b1b88265c105410daa01a0be5ae06887a881b26fba65988ce06d59"
+    }
+  ],
+  "edges": [
+    {
+      "kind": "contains",
+      "src_fingerprint_hex": "788706924c13b7eb2f3defe78064ffd5e250e9b36db0ad23eed6dff41d0c463c",
+      "dst_fingerprint_hex": "dace57999f574dd2d281192a08f4e00e0c03b5aabfad11299109fd46a5dce292",
+      "fingerprint_hex": "2a76e7ab87fc68bbfd2ac81a77907daa2a6ea43cfe26a7a68eb72b8bcccce633"
+    },
+    {
+      "kind": "contains",
+      "src_fingerprint_hex": "855d6f49c0b1b88265c105410daa01a0be5ae06887a881b26fba65988ce06d59",
+      "dst_fingerprint_hex": "788706924c13b7eb2f3defe78064ffd5e250e9b36db0ad23eed6dff41d0c463c",
+      "fingerprint_hex": "74dacc7d58142ba9f19bca96347b1c710ab8c254f8596c6a547b299e1b538662"
+    },
+    {
+      "kind": "contains",
+      "src_fingerprint_hex": "8e1de6d8538543221d63aa2bfd1f1e5160b3123c7bacd23201c5d9262802ba79",
+      "dst_fingerprint_hex": "b7137a4fd16ae7f33a013d0356b399485f2fafbe7063b06f214226eec2413d56",
+      "fingerprint_hex": "43c49700d16704384cf5c9dedc84a76a1869f8c8ae6d25766af995f34fdfd6fd"
+    },
+    {
+      "kind": "contains",
+      "src_fingerprint_hex": "dace57999f574dd2d281192a08f4e00e0c03b5aabfad11299109fd46a5dce292",
+      "dst_fingerprint_hex": "5f617f5270c13ece6d21d1bf69b83fc2c5763be26f9d38284f60299938bb10f1",
+      "fingerprint_hex": "52607fc04ea27eb13271bea912dfdb6e1366f053e9610cf2280964281f5b040e"
+    },
+    {
+      "kind": "contains",
+      "src_fingerprint_hex": "dace57999f574dd2d281192a08f4e00e0c03b5aabfad11299109fd46a5dce292",
+      "dst_fingerprint_hex": "8e1de6d8538543221d63aa2bfd1f1e5160b3123c7bacd23201c5d9262802ba79",
+      "fingerprint_hex": "b55a9be52ed736e2637f3a02e8941615c0e9c6f604ba0be6ad545caa538d43f1"
+    },
+    {
+      "kind": "imports",
+      "src_fingerprint_hex": "dace57999f574dd2d281192a08f4e00e0c03b5aabfad11299109fd46a5dce292",
+      "dst_fingerprint_hex": "0b30e1df395a160403b145adea43f58bd3ad6a58ec528b0bcb0d914ffbfb3d1f",
+      "fingerprint_hex": "48f9f93ad3c02187a4a5620536c66c6a16d2b162b83fc71cb8bdc781bfc2a2d9"
+    },
+    {
+      "kind": "imports",
+      "src_fingerprint_hex": "dace57999f574dd2d281192a08f4e00e0c03b5aabfad11299109fd46a5dce292",
+      "dst_fingerprint_hex": "6a54b184636e73e739d42a90667c84b925711148205e7554e6f2db5d0f496eb7",
+      "fingerprint_hex": "37692a9ac4ca600c0f618ba37a9d53bbbc27809d3da137dc883568a41d79cb7d"
+    }
+  ]
+}

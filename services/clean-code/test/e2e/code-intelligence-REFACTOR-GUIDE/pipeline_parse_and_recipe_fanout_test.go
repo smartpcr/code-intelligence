@@ -507,6 +507,3 @@ func TestE2E_pipeline_parse_and_recipe_fanout(t *testing.T) {
 		t.Fatal("non-zero status returned, failed to run feature tests")
 	}
 }
-
-// Ensure uuid import is used (the type appears in orchestrator.Result.ScopeIDs key comparisons).
-var _ = uuid.Nil

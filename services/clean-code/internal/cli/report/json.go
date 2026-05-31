@@ -110,6 +110,12 @@ func (JSON) Render(ctx context.Context, art RunArtifact, w io.Writer) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("report: json render cancelled before write: %w", err)
 	}
+	// Auto-stamp schema version so every emitted document
+	// carries the version tag regardless of composition-root
+	// wiring. art is by-value; caller's copy is unaffected.
+	if art.SchemaVersion == "" {
+		art.SchemaVersion = SchemaVersionCurrent
+	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	enc.SetEscapeHTML(false)

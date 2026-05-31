@@ -21,7 +21,6 @@ Feature: Build Tag Matrix
     And the test output contains "PASS"
 
   Scenario: prod tests pass
-    Given the services/clean-code source tree
-    When CI runs go test -tags prod for the prod-gated packages
-    Then the exit code is 0
-    And the test output contains "PASS"
+    Given the source tree
+    When CI runs make test-prod
+    Then it exits 0

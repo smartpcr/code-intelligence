@@ -113,17 +113,18 @@ func (s *buildTagMatrixState) ciRunsGoTestProdDevBypass() error {
 	return s.runCommandInDir(s.moduleRoot, "go", "test", "-tags", "prod", "-v", "-count=1", "-run", "TestProdBuildExcludesDevBypass", "./internal/cli/devpolicy/...")
 }
 
-func (s *buildTagMatrixState) ciRunsGoTestProdGatedPackages() error {
-	// Run only the prod-gated test functions across all packages that carry
-	// //go:build prod test files. Non-prod-gated tests in cmd/cleanc (e.g.
-	// TestAnalyzeHappyPath*) assume dev-mode defaults and fail expectedly
-	// under -tags prod; they are NOT part of the prod test surface.
-	return s.runCommandInDir(s.moduleRoot, "go", "test", "-tags", "prod", "-v", "-count=1",
-		"-run", "TestProdBuildExcludesDevBypass|TestLoadUnsignedBundle_Prod|TestBuildTagIsProd|TestFlagsDefaultDevMode|TestProdNewLoader",
-		"./cmd/cleanc/...",
-		"./internal/cli/devpolicy/...",
-		"./internal/cli/flags/...",
-	)
+func (s *buildTagMatrixState) ciRunsMakeTestProd() error {
+	// On Windows where make may not be available, fall back to the
+	// equivalent go test invocation that the Makefile target wraps.
+	if runtime.GOOS == "windows" {
+		return s.runCommandInDir(s.moduleRoot, "go", "test", "-tags", "prod", "-count=1",
+			"-run", "TestProdBuildExcludesDevBypass|TestLoadUnsignedBundle_Prod|TestBuildTagIsProd|TestFlagsDefaultDevMode|TestProdNewLoader",
+			"./cmd/cleanc/...",
+			"./internal/cli/devpolicy/...",
+			"./internal/cli/flags/...",
+		)
+	}
+	return s.runCommandInDir(s.moduleRoot, "make", "test-prod")
 }
 
 // --- Then steps ---
@@ -184,7 +185,7 @@ func InitializeScenario_hardening_and_release_build_tag_matrix(ctx *godog.Scenar
 	// When
 	ctx.Step(`^CI runs make build-prod$`, s.ciRunsMakeBuildProd)
 	ctx.Step(`^CI runs go test -tags prod -run TestProdBuildExcludesDevBypass \./internal/cli/devpolicy/\.\.\.$`, s.ciRunsGoTestProdDevBypass)
-	ctx.Step(`^CI runs go test -tags prod for the prod-gated packages$`, s.ciRunsGoTestProdGatedPackages)
+	ctx.Step(`^CI runs make test-prod$`, s.ciRunsMakeTestProd)
 
 	// Then
 	ctx.Step(`^it exits 0$`, s.itExits0)

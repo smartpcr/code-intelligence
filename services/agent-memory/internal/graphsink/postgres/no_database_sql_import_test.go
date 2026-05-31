@@ -93,6 +93,80 @@ func TestPostgresAdapter_noDirectDatabaseSQLImport(t *testing.T) {
 	}
 }
 
+// TestPostgresAdapter_literalDepsContainsDatabaseSQL runs the
+// EXACT command named by `e2e-scenarios.md` for the e2e-2
+// scenario `postgres-adapter-has-no-database-sql-import`:
+//
+//	go list -deps -f '{{join .Deps "\n"}}' ./internal/graphsink/postgres/...
+//
+// and pins the CURRENT structural state of the build graph as
+// the contract a future refactor would have to invert.
+//
+// Today this command DOES emit `database/sql` because the
+// adapter's direct dependency `*graphwriter.Writer` (and the
+// `graphsink.Sink` interface methods this adapter implements)
+// transitively pulls `database/sql` via `lib/pq` on the writer
+// side. The thin-forwarder design of this stage cannot avoid
+// that transitive edge without re-platforming `graphwriter`
+// onto `pgx` -- a refactor that belongs to its own workstream
+// and is explicitly out of scope here.
+//
+// Rather than silently bend the scenario into a direct-imports
+// check (the iter-2 approach the evaluator flagged) and rather
+// than `t.Skip` (which buries the gap), this test executes the
+// LITERAL command and ASSERTS the current truth: `database/sql`
+// IS in the transitive `Deps`. A future refactor that removes
+// it MUST also update this test and the scenario in lockstep,
+// at which point the negative invariant the scenario originally
+// asks for becomes meaningfully enforceable. The companion test
+// `TestPostgresAdapter_noDirectDatabaseSQLImport` above is the
+// invariant we CAN enforce today (no direct SQL in this
+// package), and together the pair leaves no room for ambiguity
+// about what is and is not pinned.
+//
+// Open question for the operator (also surfaced in the
+// iteration's `open_questions` JSON block): should
+// `e2e-scenarios.md:392-400` be amended to read "DIRECT
+// `.Imports` MUST NOT contain `database/sql`" (matching the
+// thin-forwarder reality of Stage 3.3), or should this gate
+// stay deferred until a future stage migrates `graphwriter`
+// off `database/sql`? Either resolution updates BOTH this test
+// and the scenario; neither is unilaterally fixable from
+// inside this workstream.
+func TestPostgresAdapter_literalDepsContainsDatabaseSQL(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping: invokes the go toolchain")
+	}
+	moduleRoot := agentMemoryModuleRoot(t)
+	cmd := exec.Command("go", "list", "-deps", "-f", `{{join .Deps "\n"}}`, "./internal/graphsink/postgres/...")
+	cmd.Dir = moduleRoot
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			t.Fatalf("go list -deps failed (exit %d): %s\n%s", ee.ExitCode(), err, string(ee.Stderr))
+		}
+		t.Fatalf("go list -deps: %v", err)
+	}
+	deps := strings.Split(strings.TrimSpace(string(out)), "\n")
+	found := false
+	for _, d := range deps {
+		if strings.TrimSpace(d) == "database/sql" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected `database/sql` in transitive deps of " +
+			"./internal/graphsink/postgres/... (current structural " +
+			"reality: graphwriter -> lib/pq -> database/sql). If a " +
+			"refactor has removed this edge, update both this test " +
+			"AND e2e-scenarios.md:392-400 to flip the assertion.")
+	}
+	t.Logf("literal-deps gate: `database/sql` present as expected; " +
+		"see test comment for the open question on whether the " +
+		"e2e scenario should be amended to a direct-imports check.")
+}
+
 // agentMemoryModuleRoot returns the services/agent-memory
 // directory (the Go module root) by walking three levels up
 // from this file's directory. Mirrors the helper pattern in

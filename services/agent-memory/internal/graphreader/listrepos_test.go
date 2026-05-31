@@ -49,13 +49,18 @@ func TestReader_ListRepos_returnsAllRowsNewestFirst(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testDBTimeout)
 	defer cancel()
 
-	// Seed three repos. Because the `created_at` column defaults
-	// to `now()` (migration 0002) and we INSERT them serially,
-	// the third insert has the latest timestamp and must appear
-	// first in the ListRepos result.
-	repoA := seedRepoWithSHA(t, ctx, fx, "sha-a")
-	repoB := seedRepoWithSHA(t, ctx, fx, "sha-b")
-	repoC := seedRepoWithSHA(t, ctx, fx, "sha-c")
+	// Seed three repos with EXPLICIT, strictly-decreasing
+	// `created_at` timestamps so the ordering assertion below
+	// cannot flake under fast clocks. Relying on the column's
+	// `now()` default plus serial INSERTs is fragile: when two
+	// rows land in the same microsecond, the SELECT's secondary
+	// `repo_id DESC` tiebreak takes over and the assumed
+	// {repoC, repoB, repoA} order silently inverts. Passing
+	// `now() - INTERVAL` constants guarantees distinct
+	// timestamps regardless of clock resolution.
+	repoA := seedRepoWithSHAAt(t, ctx, fx, "sha-a", "now() - INTERVAL '3 seconds'")
+	repoB := seedRepoWithSHAAt(t, ctx, fx, "sha-b", "now() - INTERVAL '2 seconds'")
+	repoC := seedRepoWithSHAAt(t, ctx, fx, "sha-c", "now() - INTERVAL '1 second'")
 
 	reader := graphreader.New(fx.pool, nil)
 	got, err := reader.ListRepos(ctx, graphreader.ReaderOptions{})
@@ -140,11 +145,29 @@ func TestReader_ListRepos_capsAtMaxListLimit(t *testing.T) {
 }
 
 // seedRepoWithSHA inserts one `repo` row with the supplied
-// `current_head_sha` and returns its `repo_id::text`. Mirrors
-// the existing `seedRepo` helper in `reader_integration_test.go`
-// but exposes the SHA so the test can assert it round-trips
-// through `RepoSummary.SHA`.
+// `current_head_sha` (and the column's default `created_at`)
+// and returns its `repo_id::text`. Kept for the limit/clamp
+// test, which does not care about ordering.
 func seedRepoWithSHA(t *testing.T, ctx context.Context, fx *readerFixture, sha string) string {
+	t.Helper()
+	return seedRepoWithSHAAt(t, ctx, fx, sha, "now()")
+}
+
+// seedRepoWithSHAAt is the explicit-timestamp variant used by
+// the ordering test. `createdAtSQL` is an unparameterised SQL
+// expression spliced verbatim into the INSERT -- callers MUST
+// pass a literal (e.g. `now() - INTERVAL '2 seconds'`), never
+// untrusted input. The split avoids a $3 placeholder so the
+// column accepts a true SQL expression rather than a Go-side
+// `time.Time` value (which would still incur the rounding the
+// flake hides behind).
+func seedRepoWithSHAAt(
+	t *testing.T,
+	ctx context.Context,
+	fx *readerFixture,
+	sha string,
+	createdAtSQL string,
+) string {
 	t.Helper()
 	var buf [4]byte
 	if _, err := rand.Read(buf[:]); err != nil {
@@ -152,13 +175,14 @@ func seedRepoWithSHA(t *testing.T, ctx context.Context, fx *readerFixture, sha s
 	}
 	repoURL := "https://example.test/listrepos/" + hex.EncodeToString(buf[:])
 	var repoID string
-	err := fx.owner.QueryRowContext(ctx, `
-		INSERT INTO repo (url, default_branch, current_head_sha)
-		VALUES ($1, 'main', $2)
+	stmt := `
+		INSERT INTO repo (url, default_branch, current_head_sha, created_at)
+		VALUES ($1, 'main', $2, ` + createdAtSQL + `)
 		RETURNING repo_id::text
-	`, repoURL, sha).Scan(&repoID)
+	`
+	err := fx.owner.QueryRowContext(ctx, stmt, repoURL, sha).Scan(&repoID)
 	if err != nil {
-		t.Fatalf("seedRepoWithSHA: %v", err)
+		t.Fatalf("seedRepoWithSHAAt: %v", err)
 	}
 	return repoID
 }

@@ -1,4 +1,4 @@
-package postgres_test
+package postgres
 
 // Pure forwarding tests for the Postgres reader adapter. A
 // `fakeBackend` records every call to its `graphsink.Reader`
@@ -27,7 +27,6 @@ import (
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphreader"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphsink"
-	postgresadapter "github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphsink/postgres"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
 )
 
@@ -113,7 +112,7 @@ func TestNewReader_panicsOnNilBackend(t *testing.T) {
 			t.Fatal("NewReader(nil) did not panic")
 		}
 	}()
-	_ = postgresadapter.NewReader(nil)
+	_ = NewReader(nil)
 }
 
 // --------------------------------------------------------------
@@ -129,7 +128,7 @@ func TestReader_ListRepos_forwardsAndReturnsUnchanged(t *testing.T) {
 		{RepoID: "22222222-2222-2222-2222-222222222222", URL: "file:///r/b", SHA: "def", GeneratedAt: now.Add(-time.Hour)},
 	}
 	be := &fakeBackend{repos: want}
-	r := postgresadapter.NewReader(be)
+	r := newReaderWithBackend(be)
 	opts := graphreader.ReaderOptions{Limit: 7}
 
 	got, err := r.ListRepos(context.Background(), opts)
@@ -150,7 +149,7 @@ func TestReader_ListRepos_forwardsAndReturnsUnchanged(t *testing.T) {
 func TestReader_ListRepos_propagatesError(t *testing.T) {
 	t.Parallel()
 	sentinel := errors.New("backend boom")
-	r := postgresadapter.NewReader(&fakeBackend{listErr: sentinel})
+	r := newReaderWithBackend(&fakeBackend{listErr: sentinel})
 	if _, err := r.ListRepos(context.Background(), graphreader.ReaderOptions{}); !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v; want errors.Is sentinel", err)
 	}
@@ -171,7 +170,7 @@ func TestReader_ListNodes_forwardsAllArgs(t *testing.T) {
 	want := []graphreader.Node{{NodeID: "n1", RepoID: repoID.String(), Kind: "method", AttrsJSON: json.RawMessage(`{}`)}}
 
 	be := &fakeBackend{nodes: want}
-	r := postgresadapter.NewReader(be)
+	r := newReaderWithBackend(be)
 
 	got, err := r.ListNodes(context.Background(), repoID, kinds, filter, opts)
 	if err != nil {
@@ -196,7 +195,7 @@ func TestReader_ListNodes_forwardsAllArgs(t *testing.T) {
 func TestReader_ListEdgesFrom_forwardsAllArgs(t *testing.T) {
 	t.Parallel()
 	be := &fakeBackend{edges: []graphreader.Edge{{EdgeID: "e1"}}}
-	r := postgresadapter.NewReader(be)
+	r := newReaderWithBackend(be)
 	src, kinds, opts := "node-src", []string{"static_calls"}, graphreader.ReaderOptions{Limit: 9}
 
 	if _, err := r.ListEdgesFrom(context.Background(), src, kinds, opts); err != nil {
@@ -215,7 +214,7 @@ func TestReader_ListEdgesFrom_forwardsAllArgs(t *testing.T) {
 func TestReader_ListEdgesTo_forwardsAllArgs(t *testing.T) {
 	t.Parallel()
 	be := &fakeBackend{edges: []graphreader.Edge{{EdgeID: "e2"}}}
-	r := postgresadapter.NewReader(be)
+	r := newReaderWithBackend(be)
 	dst, kinds, opts := "node-dst", []string{"observed_calls"}, graphreader.ReaderOptions{}
 
 	if _, err := r.ListEdgesTo(context.Background(), dst, kinds, opts); err != nil {
@@ -233,7 +232,7 @@ func TestReader_ListEdgesTo_forwardsAllArgs(t *testing.T) {
 func TestReader_GetNode_forwardsAndPropagatesNotFound(t *testing.T) {
 	t.Parallel()
 	be := &fakeBackend{getErr: graphreader.ErrNotFound}
-	r := postgresadapter.NewReader(be)
+	r := newReaderWithBackend(be)
 	_, err := r.GetNode(context.Background(), "nope", graphreader.ReaderOptions{})
 	if !errors.Is(err, graphreader.ErrNotFound) {
 		t.Fatalf("err = %v; want ErrNotFound", err)
@@ -248,7 +247,7 @@ func TestReader_LookupBySignature_forwardsAllArgs(t *testing.T) {
 	repoID := fingerprint.MustParseRepoID("44444444-4444-4444-4444-444444444444")
 	want := graphreader.Node{NodeID: "n7", Kind: "method", CanonicalSignature: "sig://foo"}
 	be := &fakeBackend{lookupOK: want}
-	r := postgresadapter.NewReader(be)
+	r := newReaderWithBackend(be)
 
 	got, err := r.LookupBySignature(context.Background(), repoID, "method", "sig://foo", graphreader.ReaderOptions{})
 	if err != nil {

@@ -10,20 +10,21 @@ Feature: Analyze end-to-end wiring
     And a fixture repo with one block-severity finding
     When cleanc analyze runs with --out report.md --findings findings.json --exit-on block
     Then report.md is written and is non-empty
-    And findings.json is written and contains at least one block-severity finding
+    And findings.json is written and contains exactly 4 block-severity findings
     And the analyze exit code is 1
 
   Scenario: walker error exit code
     Given a built cleanc binary for analyze wiring
     When cleanc analyze runs against a non-existent root path
     Then the analyze exit code is 2
-    And analyze stderr contains "repo path not found"
+    And analyze stderr contains "ErrRootNotFound"
 
   Scenario: invalid exit-on
     Given a built cleanc binary for analyze wiring
     When cleanc analyze runs with --exit-on critical
     Then the analyze exit code is 64
     And analyze stderr contains "--exit-on must be one of info, warn, block"
+    And no pipeline stage started before the rejection
 
   Scenario: dev banner emitted
     Given a built cleanc binary for analyze wiring

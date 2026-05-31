@@ -297,7 +297,7 @@ func (s *analyzeWiringState) reportMDIsWrittenAndIsNonEmpty() error {
 	return nil
 }
 
-func (s *analyzeWiringState) findingsJSONContainsExactlyOneBlockSeverityFinding() error {
+func (s *analyzeWiringState) findingsJSONContainsExactlyNBlockSeverityFindings(expected int) error {
 	data, err := os.ReadFile(s.findingsPath)
 	if err != nil {
 		return fmt.Errorf("findings.json not found at %s: %w\nstdout: %s\nstderr: %s",
@@ -319,9 +319,9 @@ func (s *analyzeWiringState) findingsJSONContainsExactlyOneBlockSeverityFinding(
 			blockCount++
 		}
 	}
-	if blockCount < 1 {
-		return fmt.Errorf("expected at least one block-severity finding, got %d; total findings: %d\nfindings: %+v",
-			blockCount, len(art.Findings), art.Findings)
+	if blockCount != expected {
+		return fmt.Errorf("expected exactly %d block-severity finding(s), got %d; total findings: %d\nfindings: %+v",
+			expected, blockCount, len(art.Findings), art.Findings)
 	}
 	return nil
 }
@@ -337,6 +337,15 @@ func (s *analyzeWiringState) theAnalyzeExitCodeIs(expected int) error {
 func (s *analyzeWiringState) analyzeStderrContains(substring string) error {
 	if !strings.Contains(s.stderr, substring) {
 		return fmt.Errorf("stderr does not contain %q\nstderr was:\n%s", substring, s.stderr)
+	}
+	return nil
+}
+
+func (s *analyzeWiringState) noPipelineStageStartedBeforeTheRejection() error {
+	// The dev banner is the FIRST action in runAnalyzePipeline().
+	// If it is absent from stderr, no pipeline stage executed.
+	if strings.Contains(s.stderr, devpolicy.BannerText) {
+		return fmt.Errorf("dev banner found in stderr — pipeline started before flag rejection\nstderr was:\n%s", s.stderr)
 	}
 	return nil
 }
@@ -401,9 +410,10 @@ func InitializeScenario_p0_reports_and_delivery_analyze_end_to_end_wiring(ctx *g
 
 	// Then
 	ctx.Step(`^report\.md is written and is non-empty$`, s.reportMDIsWrittenAndIsNonEmpty)
-	ctx.Step(`^findings\.json is written and contains at least one block-severity finding$`, s.findingsJSONContainsExactlyOneBlockSeverityFinding)
+	ctx.Step(`^findings\.json is written and contains exactly (\d+) block-severity findings$`, s.findingsJSONContainsExactlyNBlockSeverityFindings)
 	ctx.Step(`^the analyze exit code is (\d+)$`, s.theAnalyzeExitCodeIs)
 	ctx.Step(`^analyze stderr contains "([^"]*)"$`, s.analyzeStderrContains)
+	ctx.Step(`^no pipeline stage started before the rejection$`, s.noPipelineStageStartedBeforeTheRejection)
 	ctx.Step(`^analyze stderr begins with the exact C10 banner string$`, s.analyzeStderrBeginsWithTheExactC10BannerString)
 	ctx.Step(`^markdown is written to stdout$`, s.markdownIsWrittenToStdout)
 	ctx.Step(`^the analyze exit code is 0 or 1$`, s.theAnalyzeExitCodeIsZeroOrOne)

@@ -487,12 +487,10 @@ func TestLoadExport_RejectsNodeRepoIDMismatch(t *testing.T) {
 	}
 	original := mustRepoID(t).String()
 	other := "00000000-0000-0000-0000-000000000001"
-	bad := strings.Replace(string(data), `"repo_id": "`+original+`"`,
-		`"repo_id": "`+other+`"`, 1) // first match = first node entry
-	// First match could be the top-level repo.id (it's also
-	// written first); skip past the `"repo": {` block by
-	// finding the second occurrence.
-	bad = string(data)
+	// First occurrence of repo_id in the file is the top-level
+	// repo.id; we want to mutate the first per-node repo_id,
+	// which appears after the `"nodes"` block opens.
+	bad := string(data)
 	idx := strings.Index(bad, `"nodes"`)
 	if idx < 0 {
 		t.Fatalf("nodes block not found in export")
@@ -696,4 +694,77 @@ func safeIdx(s []string, i int) any {
 		return "<missing>"
 	}
 	return s[i]
+}
+
+// LoadExport rejects an export where any node row omits repo_id
+// entirely. The export schema is strict: every row must carry
+// repo_id == repo.id (no implicit defaulting).
+func TestLoadExport_RejectsNodeMissingRepoID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "graph.json")
+	writeRoundtripExport(t, path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	original := mustRepoID(t).String()
+	bad := string(data)
+	idx := strings.Index(bad, `"nodes"`)
+	if idx < 0 {
+		t.Fatalf("nodes block not found in export")
+	}
+	// Remove the first per-node repo_id field entirely so the
+	// rehydrator sees an empty/missing RepoID on that row.
+	rest := bad[idx:]
+	target := `"repo_id": "` + original + `",`
+	if !strings.Contains(rest, target) {
+		t.Fatalf("could not find per-node repo_id field to drop in: %s", rest)
+	}
+	rest = strings.Replace(rest, target, "", 1)
+	bad = bad[:idx] + rest
+	if err := os.WriteFile(path, []byte(bad), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, _, err = LoadExport(path)
+	if err == nil {
+		t.Fatalf("LoadExport should reject node row missing repo_id")
+	}
+	if !strings.Contains(err.Error(), "missing repo_id") {
+		t.Errorf("error %q should mention missing repo_id", err)
+	}
+}
+
+// LoadExport rejects an export where any edge row omits repo_id
+// entirely. Same strict-schema rule as nodes.
+func TestLoadExport_RejectsEdgeMissingRepoID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "graph.json")
+	writeRoundtripExport(t, path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	original := mustRepoID(t).String()
+	bad := string(data)
+	idx := strings.Index(bad, `"edges"`)
+	if idx < 0 {
+		t.Fatalf("edges block not found in export")
+	}
+	rest := bad[idx:]
+	target := `"repo_id": "` + original + `",`
+	if !strings.Contains(rest, target) {
+		t.Fatalf("could not find per-edge repo_id field to drop in: %s", rest)
+	}
+	rest = strings.Replace(rest, target, "", 1)
+	bad = bad[:idx] + rest
+	if err := os.WriteFile(path, []byte(bad), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, _, err = LoadExport(path)
+	if err == nil {
+		t.Fatalf("LoadExport should reject edge row missing repo_id")
+	}
+	if !strings.Contains(err.Error(), "missing repo_id") {
+		t.Errorf("error %q should mention missing repo_id", err)
+	}
 }

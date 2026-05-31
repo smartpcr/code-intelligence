@@ -884,7 +884,13 @@ func loadExportToSink(path string) (*Sink, error) {
 
 	maxNodeID := 0
 	for i, n := range exp.Nodes {
-		if n.RepoID != "" && n.RepoID != exp.Repo.ID {
+		if n.RepoID == "" {
+			return nil, fmt.Errorf(
+				"graphsink/memory: node[%d] %s: missing repo_id (export schema is strict; every node row must carry repo_id == repo.id %q)",
+				i, n.NodeID, exp.Repo.ID,
+			)
+		}
+		if n.RepoID != exp.Repo.ID {
 			return nil, fmt.Errorf(
 				"graphsink/memory: node[%d] %s: repo_id %q does not match export repo.id %q",
 				i, n.NodeID, n.RepoID, exp.Repo.ID,
@@ -961,7 +967,13 @@ func loadExportToSink(path string) (*Sink, error) {
 
 	maxEdgeID := 0
 	for i, e := range exp.Edges {
-		if e.RepoID != "" && e.RepoID != exp.Repo.ID {
+		if e.RepoID == "" {
+			return nil, fmt.Errorf(
+				"graphsink/memory: edge[%d] %s: missing repo_id (export schema is strict; every edge row must carry repo_id == repo.id %q)",
+				i, e.EdgeID, exp.Repo.ID,
+			)
+		}
+		if e.RepoID != exp.Repo.ID {
 			return nil, fmt.Errorf(
 				"graphsink/memory: edge[%d] %s: repo_id %q does not match export repo.id %q",
 				i, e.EdgeID, e.RepoID, exp.Repo.ID,

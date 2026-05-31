@@ -11,36 +11,32 @@
 // of the two is consumed per build. Anything BOTH files need
 // to agree on lives in `bypass.go` (no build tag).
 //
-// # Stage 1.1 scope
+// # Scope
 //
-// This file ships the SHELL of the dev-build loader -- a
-// concrete implementation of the [Loader] interface whose
-// `Load` method validates the [LoaderSource] and then returns
-// [ErrLoaderNotYetImplemented]. That is enough to:
+// This file ships the dev-build loader: a concrete
+// implementation of the [Loader] interface whose `Load` method
+// validates the [LoaderSource], walks the chosen YAML source
+// (embedded `embed.FS` or `--policy <dir>` override), decodes
+// each `*.yaml` file with `gopkg.in/yaml.v3` strict mode, and
+// returns a fully-populated [Bundle] whose
+// `PolicyVersion.PolicyVersionID` is a deterministic UUID-v5
+// over the sorted rule-id set (tech-spec C11). Threshold rows
+// are seeded from `decoupling.ListCanonicalThresholds()` when
+// the decoupling pack is present.
 //
-//   - Make `Loader` reachable in the dev build (the
-//     `cmd/cleanc` dispatcher can call `devpolicy.NewLoader()`
-//     without a per-build-tag branch).
-//   - Pin the source-resolution behaviour (an operator who
-//     forgets `--policy <path>` still gets
-//     [ErrMissingPolicyDir] at THIS layer, not later inside
-//     an empty walk).
-//
-// `implementation-plan.md` Stage 1.4 items 97-102 swap the
-// stub body for the real YAML decoder + unsigned
-// `PolicyVersion` synthesiser. Nothing in this file's API
-// surface needs to change in that follow-up; only the
-// `Load` body.
+// The [Loader] surface is identical across both build tags so
+// the `cmd/cleanc` dispatcher can call `devpolicy.NewLoader()`
+// without a per-build-tag branch. An operator who forgets
+// `--policy <path>` still gets [ErrMissingPolicyDir] at THIS
+// layer, not later inside an empty walk.
 //
 // # Why the package-doc note in `embed.go` still applies
 //
-// `embed.go` already documents that `unsigned_dev.go` will
-// READ from `embeddedRulePacks` to produce an unsigned
+// `embed.go` already documents that `unsigned_dev.go` READS
+// from `embeddedRulePacks` to produce an unsigned
 // `steward.PolicyVersion` (architecture Sec 3.8 STRUCTURAL
-// bypass). This file honours that documentation today by
-// SHIPPING THE FILE under the same `//go:build !prod` tag;
-// the missing piece is only the YAML decoder body, which
-// is Stage 1.4 work as noted.
+// bypass). This file honours that documentation by SHIPPING
+// the real decoder under the `//go:build !prod` tag.
 
 package devpolicy
 

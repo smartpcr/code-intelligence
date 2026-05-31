@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"flag"
 	"io"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -238,7 +239,11 @@ func TestAnalyzeAcceptsAllValidExitOnLevels(t *testing.T) {
 		t.Run(lvl, func(t *testing.T) {
 			t.Parallel()
 			dir := t.TempDir()
-			_, stderr, code := captureRun("analyze", dir, "--exit-on", lvl)
+			outDir := t.TempDir()
+			_, stderr, code := captureRun("analyze", dir, "--exit-on", lvl,
+				"--out", filepath.Join(outDir, "report.md"),
+				"--findings", filepath.Join(outDir, "findings.json"),
+				"--diagnostics", filepath.Join(outDir, "diagnostics.json"))
 			if code == flags.ExitUsage {
 				t.Errorf("exit code = %d (ExitUsage) for valid level %q; stderr=%s", code, lvl, stderr)
 			}
@@ -260,7 +265,11 @@ func TestAnalyzeHappyPathExitsCleanOnEmptyRepo(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	_, stderr, code := captureRun("analyze", dir)
+	outDir := t.TempDir()
+	_, stderr, code := captureRun("analyze", dir,
+		"--out", filepath.Join(outDir, "report.md"),
+		"--findings", filepath.Join(outDir, "findings.json"),
+		"--diagnostics", filepath.Join(outDir, "diagnostics.json"))
 	if code != flags.ExitOK {
 		t.Errorf("exit code = %d, want %d (clean run, no findings); stderr=%s", code, flags.ExitOK, stderr)
 	}

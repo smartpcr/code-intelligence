@@ -15,41 +15,37 @@ import (
 // canonical `steward.*` row shapes the rule engine's
 // `InMemoryStore` consumes (architecture Sec 3.8, Sec 5.8).
 //
-// This file declares the contract ONLY; no concrete
-// implementation ships in this iteration. A follow-up
-// workstream (implementation-plan Stage 1.4 items 97-102) will
-// add two build-tag-gated synthesiser files in this same
-// `devpolicy` package:
+// Two build-tag-gated implementations live alongside this
+// contract in the same `devpolicy` package:
 //
-//   - `unsigned_dev.go` (`//go:build !prod`) -- will construct
-//     an unsigned `steward.PolicyVersion` per architecture
-//     Sec 3.8's "STRUCTURAL signature bypass".
-//   - `unsigned_prod.go` (`//go:build prod`) -- will return an
-//     `ErrDevModeUnavailable` sentinel (introduced by the same
-//     follow-up) without producing any `PolicyVersion`, so the
-//     bypass cannot be smuggled into a production binary at
-//     compile time.
+//   - `unsigned_dev.go` (`//go:build !prod`) constructs an
+//     unsigned [steward.PolicyVersion] per architecture Sec 3.8's
+//     "STRUCTURAL signature bypass" by walking the YAML source
+//     (embedded `embed.FS` or `--policy <dir>` override) and
+//     decoding each file with `gopkg.in/yaml.v3` strict mode.
+//   - `unsigned_prod.go` (`//go:build prod`) returns the
+//     [ErrDevModeUnavailable] sentinel without reading any bytes
+//     so the bypass cannot be smuggled into a production binary
+//     at compile time.
 //
-// Declaring the interface up front lets the future CLI
-// orchestrator and its tests program against the canonical
-// shape regardless of which file is in the active build.
+// Declaring the interface here lets the CLI orchestrator and its
+// tests program against the canonical shape regardless of which
+// file is in the active build.
 type Loader interface {
 	// Load reads YAML rule pack files from the source described
 	// by src and returns a fully-populated [Bundle]. The
-	// concrete implementation is added by a follow-up workstream
-	// (implementation-plan Stage 1.4 items 97-102); the
-	// contract declared here will be honoured as follows:
+	// contract is:
 	//
-	//   - YAML decode / validation errors will surface unchanged
+	//   - YAML decode / validation errors surface unchanged
 	//     from the underlying decoder so the operator sees the
 	//     offending filename and line.
 	//   - When the active build does not permit the unsigned
-	//     bypass (a `-tags prod` build), Load will return an
-	//     `ErrDevModeUnavailable` sentinel (to be introduced by
-	//     the same follow-up) without reading any bytes.
+	//     bypass (a `-tags prod` build), Load returns the
+	//     [ErrDevModeUnavailable] sentinel without reading any
+	//     bytes.
 	//
-	// The returned `Bundle.PolicyVersion.Signature` will always
-	// be nil in the dev build (architecture Sec 3.8 / tech-spec
+	// The returned `Bundle.PolicyVersion.Signature` is always
+	// nil in the dev build (architecture Sec 3.8 / tech-spec
 	// C6); the rule engine's InMemoryStore accepts the unsigned
 	// row without invoking the Steward verifier.
 	Load(ctx context.Context, src LoaderSource) (Bundle, error)

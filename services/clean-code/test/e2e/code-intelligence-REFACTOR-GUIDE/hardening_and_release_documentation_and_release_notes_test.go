@@ -83,6 +83,13 @@ func (s *docReleaseNotesState) grepFixedStringRunsAgainstIt(pattern string) erro
 
 // --- Then steps ---
 
+func (s *docReleaseNotesState) itReturnsExactlyOneMatch() error {
+	if len(s.matches) != 1 {
+		return fmt.Errorf("expected exactly 1 match in %s, got %d", s.filePath, len(s.matches))
+	}
+	return nil
+}
+
 func (s *docReleaseNotesState) itReturnsAtLeastOneMatch() error {
 	if len(s.matches) == 0 {
 		return fmt.Errorf("expected at least one match in %s, got none", s.filePath)
@@ -112,11 +119,10 @@ func (s *docReleaseNotesState) itReturnsAtLeastOneMatchUnderHeading(heading stri
 		trimmed := strings.TrimSpace(line)
 
 		if strings.HasPrefix(trimmed, "## ") {
-			if strings.Contains(trimmed, "Unreleased") {
+			if trimmed == heading {
 				inSection = true
 				continue
 			} else if inSection {
-				// Reached next ## heading; stop scanning this section.
 				break
 			}
 		}
@@ -136,7 +142,7 @@ func (s *docReleaseNotesState) itReturnsAtLeastOneMatchUnderHeading(heading stri
 	}
 
 	if !inSection {
-		return fmt.Errorf("heading containing 'Unreleased' not found in %s", s.filePath)
+		return fmt.Errorf("heading %q not found in %s", heading, s.filePath)
 	}
 	if !foundUnderHeading {
 		return fmt.Errorf("matched lines exist in %s but none appear under the %s section", s.filePath, heading)
@@ -161,6 +167,7 @@ func InitializeScenario_hardening_and_release_documentation_and_release_notes(ct
 	ctx.Step(`^grep -F "([^"]*)" runs against it$`, s.grepFixedStringRunsAgainstIt)
 
 	// Then
+	ctx.Step(`^it returns exactly one match$`, s.itReturnsExactlyOneMatch)
 	ctx.Step(`^it returns at least one match$`, s.itReturnsAtLeastOneMatch)
 	ctx.Step(`^it returns at least one match under an "([^"]*)" heading$`, s.itReturnsAtLeastOneMatchUnderHeading)
 }

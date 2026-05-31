@@ -8,7 +8,7 @@ Feature: Documentation and Release Notes
   Scenario: README has cleanc section
     Given the updated "services/clean-code/README.md"
     When grep -F "## cleanc CLI" runs against it
-    Then it returns at least one match
+    Then it returns exactly one match
 
   Scenario: usage doc references flags
     Given the file "docs/cleanc/USAGE.md"
@@ -23,4 +23,4 @@ Feature: Documentation and Release Notes
   Scenario: changelog updated
     Given the file "CHANGELOG.md"
     When grep -F "cleanc" runs against it
-    Then it returns at least one match under an "## Unreleased" heading
+    Then it returns at least one match under an "## [Unreleased]" heading

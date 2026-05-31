@@ -8,7 +8,7 @@ shipped under an evolving story spec, version numbering
 mirrors the `REFACTOR-GUIDE` phase / stage pins rather than
 SemVer.
 
-## Unreleased
+## [Unreleased]
 
 ### Added
 

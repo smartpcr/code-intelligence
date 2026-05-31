@@ -330,17 +330,29 @@ func dispatchDiagnostics(stderr io.Writer, path string, diag orchestrator.Diagno
 // "any finding meets the info threshold" semantics
 // tech-spec Sec 8.6 C9 pins.
 //
+// Rank scale (info=1, warn=2, block=3) — DISTINCT for every
+// severity so an info finding does NOT satisfy
+// `--exit-on=warn` (iter-2 evaluator item 3). The verdict
+// scale uses the same numeric values for warn/block; the
+// engine never emits a "VerdictInfo" (info findings collapse
+// to Pass), so a verdict-only check at `--exit-on=info` is
+// always false -- the per-finding loop carries the info
+// signal.
+//
 // Mapping:
 //
-//   - `--exit-on=info`  -> trigger on any finding (info,
-//     warn, or block).
-//   - `--exit-on=warn`  -> trigger on any warn-or-higher
-//     finding OR verdict in {warn, block}.
-//   - `--exit-on=block` -> trigger on any block finding OR
-//     verdict block.
+//   - `--exit-on=info`  -> trigger on any info, warn, or
+//     block finding (verdict never reaches the info rank).
+//   - `--exit-on=warn`  -> trigger on warn-or-block finding
+//     OR warn/block verdict; info findings do NOT trigger.
+//   - `--exit-on=block` -> trigger on block finding OR
+//     block verdict.
 func findingsTriggerExit(verdict rule_engine.Verdict, findings []rule_engine.Finding, threshold string) bool {
 	tRank := thresholdRank(threshold)
-	if verdictRank(verdict) >= tRank && verdictRank(verdict) > 0 {
+	if tRank == 0 {
+		return false
+	}
+	if vRank := verdictRank(verdict); vRank >= tRank {
 		return true
 	}
 	for _, f := range findings {
@@ -352,15 +364,22 @@ func findingsTriggerExit(verdict rule_engine.Verdict, findings []rule_engine.Fin
 }
 
 // findingSeverityRank assigns the canonical numeric rank for
-// a per-finding [steward.Severity] value. Mirrors
-// [verdictRank] for the closed `{info, warn, block}` set
-// the engine stamps onto every finding.
+// a per-finding [steward.Severity] value. Each of info /
+// warn / block carries a distinct rank so the
+// `--exit-on <sev>` threshold-comparison check in
+// [findingsTriggerExit] does NOT conflate info with warn
+// (iter-2 evaluator item 3).
+//
+// Scale: info=1, warn=2, block=3. Any non-canonical value
+// is treated as the lowest non-trigger rank (0) so a future
+// enum widening is fail-safe rather than silently lighting
+// up an `--exit-on=block` gate.
 func findingSeverityRank(s steward.Severity) int {
 	switch s {
 	case steward.SeverityBlock:
-		return 2
+		return 3
 	case steward.SeverityWarn:
-		return 1
+		return 2
 	case steward.SeverityInfo:
 		return 1
 	default:
@@ -373,44 +392,32 @@ func findingSeverityRank(s steward.Severity) int {
 // threshold into a single boolean: true when the verdict
 // rank meets or exceeds the threshold rank, false otherwise.
 //
-// Mapping (tech-spec Sec 8.6 C9, and the closed
-// `--exit-on` set `{info, warn, block}` from
-// `flags.ExitOnLevels`):
-//
-//   - `--exit-on=info`  -> trigger on any verdict above
-//     `pass` (i.e. `warn` or `block`). The `info`
-//     threshold means "any finding at all"; `pass` is the
-//     zero-finding verdict, so `pass` never triggers.
-//   - `--exit-on=warn`  -> trigger on `warn` or `block`.
-//   - `--exit-on=block` -> trigger on `block` only
-//     (the default; tech-spec Sec 8.1 row 7).
-//
-// An unrecognised threshold (the flag-set validator already
-// rejects these) falls back to the default `block` semantics
-// so a future enum widening is fail-safe.
-//
 // Deprecated: use [findingsTriggerExit] -- this helper does
 // not consult per-finding severities so it misses
 // `--exit-on=info` cases when the engine collapses info-only
 // findings to `VerdictPass`. Kept for unit-test coverage of
 // the verdict-only path.
 func verdictTriggersExit(verdict rule_engine.Verdict, threshold string) bool {
-	vRank := verdictRank(verdict)
 	tRank := thresholdRank(threshold)
-	return vRank >= tRank && vRank > 0
+	if tRank == 0 {
+		return false
+	}
+	return verdictRank(verdict) >= tRank
 }
 
-// verdictRank assigns the canonical numeric rank used by
-// [verdictTriggersExit]. `pass = 0`, `warn = 1`, `block = 2`;
-// any non-canonical value (the engine should never stamp one)
-// is treated as the lowest rank so a future regression
-// surfaces as a missed exit rather than a spurious one.
+// verdictRank assigns the canonical numeric rank for a
+// [rule_engine.Verdict]. The engine never emits an
+// info-level verdict (info findings collapse to
+// [rule_engine.VerdictPass]); pass therefore ranks 0, warn
+// ranks 2, block ranks 3 -- mirroring
+// [findingSeverityRank] so a single threshold comparison
+// is meaningful across both axes.
 func verdictRank(v rule_engine.Verdict) int {
 	switch v {
 	case rule_engine.VerdictBlock:
-		return 2
+		return 3
 	case rule_engine.VerdictWarn:
-		return 1
+		return 2
 	case rule_engine.VerdictPass:
 		return 0
 	default:
@@ -419,18 +426,24 @@ func verdictRank(v rule_engine.Verdict) int {
 }
 
 // thresholdRank assigns the canonical numeric rank for the
-// `--exit-on` threshold. `info` is the LOWEST trigger rank
-// (any verdict above pass triggers); `warn` and `block`
-// match the canonical [rule_engine.Verdict] ranks.
+// `--exit-on` threshold. Distinct values for info / warn /
+// block mirror [findingSeverityRank] so an info finding
+// does NOT satisfy a `--exit-on=warn` threshold
+// (iter-2 evaluator item 3).
+//
+// Scale: info=1, warn=2, block=3. An unrecognised
+// threshold (the flag-set validator already rejects these)
+// returns 0 so [findingsTriggerExit] short-circuits to
+// `false` -- a future enum widening is fail-safe.
 func thresholdRank(threshold string) int {
 	switch threshold {
 	case "info":
 		return 1
 	case "warn":
-		return 1
+		return 2
 	case "block":
-		return 2
+		return 3
 	default:
-		return 2
+		return 0
 	}
 }

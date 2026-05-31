@@ -1,8 +1,8 @@
 {
   "schemaVersion": "v1.2026.05",
   "Context": {
-    "RootPath": "C:/Users/xiaodoli/AppData/Local/Temp/TestAnalyzeAcceptsAllValidExitOnLevelsblock2962566540/001",
-    "RepoID": "9791a87a-5bff-56cf-8477-2f00b8248a94",
+    "RootPath": "C:/Users/xiaodoli/AppData/Local/Temp/TestAnalyzeAcceptsAllValidExitOnLevelswarn516208006/001",
+    "RepoID": "7426f5c8-9483-5b18-a8e8-0b2bf650651c",
     "HeadSHA": "working-copy",
     "ModulePath": "",
     "IsGitRepo": false
@@ -92,28 +92,28 @@
       "top_n": 20
     },
     "signature": null,
-    "created_at": "2026-05-31T04:45:09.9592379Z"
+    "created_at": "2026-05-31T04:54:36.502791Z"
   },
   "Files": [],
   "Skips": [],
   "DarkMetrics": [],
   "Samples": [],
   "Run": {
-    "EvaluationRunID": "6c655b44-1f9b-41ac-ad20-3573bb33fbae",
-    "RepoID": "9791a87a-5bff-56cf-8477-2f00b8248a94",
+    "EvaluationRunID": "2c7a48c5-7743-48f8-8db7-a253416d663f",
+    "RepoID": "7426f5c8-9483-5b18-a8e8-0b2bf650651c",
     "SHA": "working-copy",
     "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
     "Caller": "batch_refresh",
     "ScopeID": null,
-    "CreatedAt": "2026-05-31T04:45:09.9597632Z"
+    "CreatedAt": "2026-05-31T04:54:36.5033196Z"
   },
   "Verdict": {
-    "VerdictID": "02aa6dde-284a-4c2a-ba79-64cb72bfcd6f",
-    "EvaluationRunID": "6c655b44-1f9b-41ac-ad20-3573bb33fbae",
+    "VerdictID": "8f4e5b60-a1fc-4420-a0b6-f11cf00fcdf3",
+    "EvaluationRunID": "2c7a48c5-7743-48f8-8db7-a253416d663f",
     "Verdict": "pass",
     "Degraded": false,
     "DegradedReason": "",
-    "CreatedAt": "2026-05-31T04:45:09.9597632Z"
+    "CreatedAt": "2026-05-31T04:54:36.5033196Z"
   },
   "Findings": [],
   "HotSpots": null,
@@ -130,4 +130,6 @@
     "dark_metrics": [],
     "effort_source": "fallback"
   }
+}
+
 }

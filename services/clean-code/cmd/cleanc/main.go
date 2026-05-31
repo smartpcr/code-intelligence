@@ -112,7 +112,21 @@ func main() {
 // the binary so each sub-command body can stay panic-free
 // without per-verb recover scaffolding; any panic raised
 // below this line surfaces here.
-func runWithRecover(args []string, stdout, stderr io.Writer) (code int) {
+func runWithRecover(args []string, stdout, stderr io.Writer) int {
+	return recoverDispatch(func() int {
+		return run(args, stdout, stderr)
+	}, stderr)
+}
+
+// recoverDispatch wraps an arbitrary `func() int`
+// dispatcher in a `recover()` frame so any panic raised
+// below surfaces as the canonical [flags.ExitInternalError]
+// exit code with the panic value + Go stack trace written
+// to `stderr`. Extracted as a closure-taking helper so the
+// recovery contract can be unit-tested directly with a
+// panicking closure rather than having to make a real
+// sub-command panic (iter-2 evaluator item 4).
+func recoverDispatch(fn func() int, stderr io.Writer) (code int) {
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Fprintf(stderr, "cleanc: panic: %v\n", r)
@@ -123,7 +137,7 @@ func runWithRecover(args []string, stdout, stderr io.Writer) (code int) {
 			code = flags.ExitInternalError
 		}
 	}()
-	return run(args, stdout, stderr)
+	return fn()
 }
 
 // run is the testable dispatcher. Each sub-command body is a
@@ -222,19 +236,15 @@ func runVersion(stdout, stderr io.Writer, args []string) int {
 }
 
 // runAnalyze handles `cleanc analyze <repo-path> [flags]`.
-// Stage 1.1 wires the flag-set per tech-spec Sec 8.1 but does
-// NOT yet execute the pipeline -- the walker / parser / engine
-// / planner / report renderer land in Phase 2+ stages. To keep
-// the skeleton from claiming success for unimplemented work,
-// the body returns `ExitInternalError` (70, EX_SOFTWARE) with
-// an explicit "not yet wired" stderr line once flag validation
-// succeeds.
+// The body validates the global flag surface (tech-spec
+// Sec 8.1), rejects reserved / unknown flag values, then
+// dispatches to [runAnalyzePipeline] which performs the
+// Stage 3.3 end-to-end composition.
 //
 // The reserved-flag and invalid-value rejections (`--telemetry-otlp`,
-// `--with-churn`, `--exit-on banana`) ARE wired in Stage 1.1
-// because the workstream brief lists them as global-flag
-// requirements; the same checks satisfy the corresponding
-// Stage 3.3 / Stage 4.4 e2e assertions verbatim.
+// `--with-churn`, `--exit-on banana`) live here so they fire
+// before the pipeline starts; they share the same checks
+// the corresponding Stage 3.3 / Stage 4.4 e2e assertions pin.
 func runAnalyze(stdout, stderr io.Writer, args []string) int {
 	// Reserved-flag pre-scan: `--snippet-cap-lines` is NOT
 	// registered on the analyze flag-set (it is reserved for
@@ -299,14 +309,15 @@ func runAnalyze(stdout, stderr io.Writer, args []string) int {
 	// --dev-mode=false guard (resolves iter-1 evaluator
 	// item 4). The CLI's policy-loader surface is the
 	// dev-mode unsigned bypass (architecture Sec 3.8). A
-	// signed-policy loader is not yet wired, so an operator
-	// who explicitly opted OUT of dev mode cannot proceed --
-	// refuse the run with `ExitUsage` (BSD EX_USAGE 64) so
-	// the operator sees a usage diagnostic rather than a
+	// signed-policy loader is a separate workstream that
+	// has not landed yet, so an operator who explicitly
+	// opted OUT of dev mode cannot proceed -- refuse the
+	// run with `ExitUsage` (BSD EX_USAGE 64) so the
+	// operator sees a usage diagnostic rather than a
 	// confusing "loader returned ErrDevModeUnavailable"
 	// internal error.
 	if g.DevMode != nil && !*g.DevMode {
-		fmt.Fprintln(stderr, "cleanc analyze: --dev-mode=false but the signed-policy loader is not yet wired; pass --dev-mode (or omit the flag) to proceed with the unsigned dev policy bundle.")
+		fmt.Fprintln(stderr, "cleanc analyze: --dev-mode=false requires a signed-policy loader, which is not available in this build; pass --dev-mode (or omit the flag) to proceed with the unsigned dev policy bundle.")
 		return flags.ExitUsage
 	}
 
@@ -377,22 +388,17 @@ func runAnalyzePipeline(ctx context.Context, stdout, stderr io.Writer, g *flags.
 
 	// Stage 3: policy load. Pick between the embedded
 	// rule-pack `embed.FS` (default) and the operator's
-	// `--policy <path>` override directory. The dev build's
-	// loader is currently the Stage 1.1 shell which returns
-	// [devpolicy.ErrLoaderNotYetImplemented] (the YAML
-	// decoder lands in the impl-plan Stage 1.4 follow-up);
-	// the stderr line below preserves the literal
-	// "not yet wired" substring the existing
-	// `TestAnalyzeStubExitsInternalError` asserts on, so
-	// the wiring change in this stage does not regress that
-	// contract.
+	// `--policy <path>` override directory. The dev-build
+	// loader synthesises an unsigned [steward.PolicyVersion]
+	// per architecture Sec 3.8 STRUCTURAL bypass; the prod
+	// loader (under `-tags prod`) returns
+	// [devpolicy.ErrDevModeUnavailable] so the bypass cannot
+	// be smuggled into a release binary.
 	loader := devpolicy.NewLoader()
 	src := devpolicy.LoaderSource{UseEmbedded: *g.Policy == "", DirPath: *g.Policy}
 	bundle, err := loader.Load(ctx, src)
 	if err != nil {
 		switch {
-		case errors.Is(err, devpolicy.ErrLoaderNotYetImplemented):
-			fmt.Fprintf(stderr, "cleanc analyze: dev policy loader not yet wired (Stage 1.4 follow-up): %v\n", err)
 		case errors.Is(err, devpolicy.ErrDevModeUnavailable):
 			fmt.Fprintf(stderr, "cleanc analyze: %v\n", err)
 		default:
@@ -594,7 +600,7 @@ func runReport(stdout, stderr io.Writer, args []string) int {
 	_ = g
 	_ = stdout
 
-	fmt.Fprintln(stderr, "cleanc report: re-render not yet wired in the Stage 1.1 skeleton; the report renderer lands in Stage 4.1.")
+	fmt.Fprintln(stderr, "cleanc report: re-render is a follow-up stage; the report renderer lands in Stage 4.1.")
 	return flags.ExitInternalError
 }
 

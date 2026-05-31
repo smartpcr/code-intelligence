@@ -255,7 +255,7 @@ func TestAnalyzeAcceptsAllValidExitOnLevels(t *testing.T) {
 // `--exit-on` trigger). Resolves iter-1 evaluator item 1
 // + item 2: the pipeline is no longer blocked on the
 // devpolicy loader stub, and the test no longer pins the
-// stub-era `not yet wired` substring.
+// stub-era "loader not implemented" substring.
 func TestAnalyzeHappyPathExitsCleanOnEmptyRepo(t *testing.T) {
 	t.Parallel()
 
@@ -264,8 +264,10 @@ func TestAnalyzeHappyPathExitsCleanOnEmptyRepo(t *testing.T) {
 	if code != flags.ExitOK {
 		t.Errorf("exit code = %d, want %d (clean run, no findings); stderr=%s", code, flags.ExitOK, stderr)
 	}
-	if strings.Contains(stderr, "not yet wired") {
-		t.Errorf("stderr still mentions the stub-era 'not yet wired' substring; the loader should be functional now.\nstderr=%s", stderr)
+	for _, stale := range []string{"loader not yet wired", "Stage 1.4 follow-up", "ErrLoaderNotYetImplemented"} {
+		if strings.Contains(stderr, stale) {
+			t.Errorf("stderr still mentions stub-era phrase %q; the loader should be functional now.\nstderr=%s", stale, stderr)
+		}
 	}
 }
 
@@ -282,6 +284,11 @@ func TestAnalyzeRejectsDevModeDisabled(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "signed-policy loader") {
 		t.Errorf("stderr missing 'signed-policy loader' diagnostic\nstderr=%s", stderr)
+	}
+	for _, stale := range []string{"loader not yet wired", "Stage 1.4 follow-up"} {
+		if strings.Contains(stderr, stale) {
+			t.Errorf("stderr leaks stub-era phrase %q in --dev-mode=false diagnostic\nstderr=%s", stale, stderr)
+		}
 	}
 }
 

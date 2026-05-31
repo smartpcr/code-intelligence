@@ -1,0 +1,326 @@
+{
+  "schemaVersion": "v1.2026.05",
+  "Context": {
+    "RootPath": "C:/Users/xiaodoli/AppData/Local/Temp/cleanc-e2e-minimal-4195706913",
+    "RepoID": "3a847a41-3059-5be5-b6b7-f558dc4c9090",
+    "HeadSHA": "working-copy",
+    "ModulePath": "example.com/minimal-fixture",
+    "IsGitRepo": false
+  },
+  "Policy": {
+    "policy_version_id": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+    "name": "cleanc.devpolicy",
+    "rule_refs": [
+      {
+        "rule_id": "decoupling.fan_in_high",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.fan_out_high",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.cbo_high",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.cycle_member_present",
+        "version": 1
+      },
+      {
+        "rule_id": "decoupling.duplication_ratio_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.dip.fan_out_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.dip.coupling_between_objects_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.isp.interface_width_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.lsp.depth_of_inheritance_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.lsp.override_violation",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.ocp.fan_in_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.ocp.modification_count_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.srp.lcom4_high",
+        "version": 1
+      },
+      {
+        "rule_id": "solid.srp.interface_width_high",
+        "version": 1
+      }
+    ],
+    "threshold_refs": [
+      {
+        "threshold_id": "1e105766-3e02-5b49-b5be-49a787fd8e04"
+      },
+      {
+        "threshold_id": "d3a40d02-4b95-54c6-98fa-22793b425346"
+      },
+      {
+        "threshold_id": "fd6a0f05-ecbf-56cb-9e97-e6a83cc6a13e"
+      },
+      {
+        "threshold_id": "04d9f035-5183-5cb7-86bb-b582f85d3241"
+      }
+    ],
+    "refactor_weights": {
+      "alpha": 1,
+      "beta": 1,
+      "gamma": 1,
+      "delta": 1,
+      "effort_model_version": "dev",
+      "window_days": 90,
+      "top_n": 20
+    },
+    "signature": null,
+    "created_at": "2026-05-31T06:17:23.7955517Z"
+  },
+  "Files": [
+    {
+      "path": "go.mod",
+      "language": "",
+      "size_bytes": 0,
+      "parse_status": "skipped"
+    },
+    {
+      "path": "main.go",
+      "language": "go",
+      "size_bytes": 29,
+      "parse_status": "parsed"
+    }
+  ],
+  "Skips": [
+    {
+      "Path": "go.mod",
+      "Reason": "unsupported_language"
+    }
+  ],
+  "DarkMetrics": [
+    {
+      "metric_kind": "cognitive_complexity",
+      "language": "go",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 2,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "cyclo",
+      "language": "go",
+      "missing_attrs": [
+        "decision_blocks"
+      ],
+      "affected_scope_count": 1,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_in",
+      "language": "go",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 2,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "fan_out",
+      "language": "go",
+      "missing_attrs": [
+        "call_edges"
+      ],
+      "affected_scope_count": 2,
+      "closure_phase": "P2"
+    },
+    {
+      "metric_kind": "lcom4",
+      "language": "go",
+      "missing_attrs": [
+        "call_edges",
+        "field_accesses"
+      ],
+      "affected_scope_count": 0,
+      "closure_phase": "P2"
+    }
+  ],
+  "Samples": [
+    {
+      "SampleID": "0b13e808-52dd-5eaa-94f0-664ab2a3fb68",
+      "RepoID": "3a847a41-3059-5be5-b6b7-f558dc4c9090",
+      "SHA": "working-copy",
+      "ScopeID": "57c19f44-2310-5f63-8dc1-45b32443d436",
+      "ScopeKind": "file",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3a847a41-3059-5be5-b6b7-f558dc4c9090::file::main.go"
+    },
+    {
+      "SampleID": "3299aa79-8615-5598-9e78-a9b9fb6b2b87",
+      "RepoID": "3a847a41-3059-5be5-b6b7-f558dc4c9090",
+      "SHA": "working-copy",
+      "ScopeID": "fc3a0c84-f79e-5dda-a5e6-9c65407d1484",
+      "ScopeKind": "package",
+      "MetricKind": "cycle_member",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3a847a41-3059-5be5-b6b7-f558dc4c9090::pkg::."
+    },
+    {
+      "SampleID": "7de13da8-7209-5fdb-87f3-aadc0cb1581e",
+      "RepoID": "3a847a41-3059-5be5-b6b7-f558dc4c9090",
+      "SHA": "working-copy",
+      "ScopeID": "57c19f44-2310-5f63-8dc1-45b32443d436",
+      "ScopeKind": "file",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3a847a41-3059-5be5-b6b7-f558dc4c9090::file::main.go"
+    },
+    {
+      "SampleID": "782e9815-e78d-57be-be47-4a09697e2c28",
+      "RepoID": "3a847a41-3059-5be5-b6b7-f558dc4c9090",
+      "SHA": "working-copy",
+      "ScopeID": "fc3a0c84-f79e-5dda-a5e6-9c65407d1484",
+      "ScopeKind": "package",
+      "MetricKind": "duplication_ratio",
+      "MetricVersion": 1,
+      "Value": 0,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3a847a41-3059-5be5-b6b7-f558dc4c9090::pkg::."
+    },
+    {
+      "SampleID": "e7b52a46-0a98-51c0-a8f6-bbf1fc912036",
+      "RepoID": "3a847a41-3059-5be5-b6b7-f558dc4c9090",
+      "SHA": "working-copy",
+      "ScopeID": "57c19f44-2310-5f63-8dc1-45b32443d436",
+      "ScopeKind": "file",
+      "MetricKind": "loc",
+      "MetricVersion": 1,
+      "Value": 4,
+      "HasValue": true,
+      "Pack": "base",
+      "Source": "computed",
+      "Degraded": false,
+      "DegradedReason": "",
+      "ScopeSignature": "clean-code-repo:3a847a41-3059-5be5-b6b7-f558dc4c9090::file::main.go"
+    }
+  ],
+  "Run": {
+    "EvaluationRunID": "38d8056b-51ea-4911-a61e-0bbc1e04243b",
+    "RepoID": "3a847a41-3059-5be5-b6b7-f558dc4c9090",
+    "SHA": "working-copy",
+    "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+    "Caller": "batch_refresh",
+    "ScopeID": null,
+    "CreatedAt": "2026-05-31T06:17:23.7971015Z"
+  },
+  "Verdict": {
+    "VerdictID": "2ec98a0e-9b3a-4ff7-8e86-2649269ae31f",
+    "EvaluationRunID": "38d8056b-51ea-4911-a61e-0bbc1e04243b",
+    "Verdict": "pass",
+    "Degraded": false,
+    "DegradedReason": "",
+    "CreatedAt": "2026-05-31T06:17:23.7971015Z"
+  },
+  "Findings": [],
+  "HotSpots": null,
+  "Plan": {
+    "PlanID": "00000000-0000-0000-0000-000000000000",
+    "RepoID": "00000000-0000-0000-0000-000000000000",
+    "SHA": "",
+    "HotspotIDs": null,
+    "SummaryMD": "",
+    "CreatedAt": "0001-01-01T00:00:00Z"
+  },
+  "Tasks": [],
+  "Diagnostics": {
+    "dark_metrics": [
+      {
+        "metric_kind": "cognitive_complexity",
+        "language": "go",
+        "missing_attrs": [
+          "decision_blocks"
+        ],
+        "affected_scope_count": 2,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "cyclo",
+        "language": "go",
+        "missing_attrs": [
+          "decision_blocks"
+        ],
+        "affected_scope_count": 1,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "fan_in",
+        "language": "go",
+        "missing_attrs": [
+          "call_edges"
+        ],
+        "affected_scope_count": 2,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "fan_out",
+        "language": "go",
+        "missing_attrs": [
+          "call_edges"
+        ],
+        "affected_scope_count": 2,
+        "closure_phase": "P2"
+      },
+      {
+        "metric_kind": "lcom4",
+        "language": "go",
+        "missing_attrs": [
+          "call_edges",
+          "field_accesses"
+        ],
+        "affected_scope_count": 0,
+        "closure_phase": "P2"
+      }
+    ],
+    "effort_source": "fallback"
+  }
+}

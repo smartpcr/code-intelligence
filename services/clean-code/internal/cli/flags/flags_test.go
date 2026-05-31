@@ -373,6 +373,13 @@ func TestReservedWithChurnMessageForRoundTrip(t *testing.T) {
 	if !contains(got, "--with-churn is reserved for P2 and rejected in P0/P1") {
 		t.Errorf("ReservedWithChurnMessageFor(report) = %q dropped e2e substring", got)
 	}
+	// The workstream brief (Stage 4.4: "Reserved Verbs And Flags")
+	// pins the operator-facing hint that explains WHY --with-churn
+	// is dark in P0/P1. Lose this clause and operators just see
+	// "rejected" with no path forward to understand the gap.
+	if !contains(got, "modification_count_in_window will not light up until the parser-attr extension ships") {
+		t.Errorf("ReservedWithChurnMessageFor(report) = %q dropped operator-facing parser-attr hint", got)
+	}
 }
 
 // TestReservedSnippetCapLinesMessageForRoundTrip mirrors the

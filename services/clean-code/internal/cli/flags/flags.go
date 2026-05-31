@@ -236,7 +236,7 @@ func ReservedWithChurnMessageFor(verb string) string {
 	if verb == "" {
 		return ReservedWithChurnMessage
 	}
-	return fmt.Sprintf("cleanc %s: --with-churn is reserved for P2 and rejected in P0/P1", verb)
+	return fmt.Sprintf("cleanc %s: --with-churn is reserved for P2 and rejected in P0/P1; modification_count_in_window will not light up until the parser-attr extension ships", verb)
 }
 
 // ReservedSnippetCapLinesMessageFor returns the literal stderr
@@ -342,8 +342,15 @@ const ReservedTelemetryMessage = "cleanc analyze: --telemetry-otlp is reserved f
 // dispatcher writes when `--with-churn` is set on a P0/P1
 // build. The exact phrase `--with-churn is reserved for P2
 // and rejected in P0/P1` is pinned by `e2e-scenarios.md`
-// Stage 4.4 (line 1067).
-const ReservedWithChurnMessage = "cleanc analyze: --with-churn is reserved for P2 and rejected in P0/P1"
+// Stage 4.4 (line 1067); the trailing
+// `; modification_count_in_window will not light up until the
+// parser-attr extension ships` clause is the operator-facing
+// hint mandated by the workstream brief (Stage 4.4: "Reserved
+// Verbs And Flags") so an operator who reaches for `--with-churn`
+// understands WHY it's dark in P0/P1 rather than just THAT it
+// is. Both substrings together survive a future tightening of
+// the e2e assertion to byte-exact match.
+const ReservedWithChurnMessage = "cleanc analyze: --with-churn is reserved for P2 and rejected in P0/P1; modification_count_in_window will not light up until the parser-attr extension ships"
 
 // ExitOnUsageMessage is the literal stderr line the dispatcher
 // writes when `--exit-on <sev>` carries a value outside the

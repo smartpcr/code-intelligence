@@ -31,7 +31,6 @@ func TestRootHelpListsSubcommands(t *testing.T) {
 
 func TestSubcommandsReturnErrNotImplemented(t *testing.T) {
 	cases := [][]string{
-		{"scan"},
 		{"scan-many"},
 		{"diagram", "module"},
 		{"diagram", "calls"},
@@ -48,6 +47,16 @@ func TestSubcommandsReturnErrNotImplemented(t *testing.T) {
 				t.Fatalf("expected error string exactly %q, got %q", "not implemented", err)
 			}
 		})
+	}
+}
+
+func TestScanRequiresArgument(t *testing.T) {
+	_, _, err := execute(t, "scan")
+	if err == nil {
+		t.Fatalf("expected error when scan invoked without an argument, got nil")
+	}
+	if !strings.Contains(err.Error(), "requires exactly 1 argument") {
+		t.Fatalf("expected an arg-count error from scan, got %v", err)
 	}
 }
 
@@ -89,12 +98,14 @@ func TestTextLogHandlerDefault(t *testing.T) {
 // `log-flag-respected`: when --log=json is set, the log line a
 // scaffolded subcommand emits must be parseable by
 // encoding/json. We capture stderr (where slog writes) and feed
-// it to json.Unmarshal.
+// it to json.Unmarshal. Uses `scan-many` because it still routes
+// through the `notImplemented` scaffold log line; `scan` is now
+// fully implemented and emits its own log/summary instead.
 func TestSubcommandJSONLogIsValidJSON(t *testing.T) {
 	var out, errOut bytes.Buffer
 	root := newRootCmd(&out, &errOut)
-	root.SetArgs([]string{"--log", "json", "scan"})
-	_ = root.Execute() // scan returns errNotImplemented; that's expected.
+	root.SetArgs([]string{"--log", "json", "scan-many"})
+	_ = root.Execute() // scan-many returns errNotImplemented; that's expected.
 
 	line := strings.TrimSpace(errOut.String())
 	if line == "" {
@@ -113,8 +124,8 @@ func TestSubcommandJSONLogIsValidJSON(t *testing.T) {
 	if decoded["msg"] != "codeintel subcommand invoked" {
 		t.Errorf("expected msg field present, got %v", decoded["msg"])
 	}
-	if decoded["subcommand"] != "scan" {
-		t.Errorf("expected subcommand=scan, got %v", decoded["subcommand"])
+	if decoded["subcommand"] != "scan-many" {
+		t.Errorf("expected subcommand=scan-many, got %v", decoded["subcommand"])
 	}
 }
 

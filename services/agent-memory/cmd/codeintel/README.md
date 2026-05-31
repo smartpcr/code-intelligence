@@ -13,7 +13,7 @@ full production stack (Postgres + Qdrant + OTel).
 
 | Command             | Status            | Purpose |
 | ------------------- | ----------------- | ------- |
-| `scan`              | not implemented   | Scan one repository (local path or git URL). |
+| `scan`              | working           | Scan one repository (local path or git URL). |
 | `scan-many`         | not implemented   | Iterate a manifest of `<path>` / `<url>@<sha>` lines. |
 | `diagram module`    | not implemented   | Project the top-down module/component diagram. |
 | `diagram calls`     | not implemented   | Project the left-right call-chain diagram from a seed. |

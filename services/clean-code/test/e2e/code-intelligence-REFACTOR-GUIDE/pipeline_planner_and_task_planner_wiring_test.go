@@ -517,6 +517,15 @@ func (s *plannerWiringState) everyTaskHasEffortAndFallbackSource() error {
 }
 
 func (s *plannerWiringState) tasksLengthIsAtMost5() error {
+	// Guard: the planner must have produced more than 5 hot-spots
+	// so that the TopN truncation is actually exercised. Without
+	// this check the assertion is vacuously satisfiable when the
+	// pipeline silently drops scopes.
+	if len(s.planResult.HotSpots) <= 5 {
+		return fmt.Errorf("HotSpots length = %d, want > 5 to prove TopN truncation was exercised",
+			len(s.planResult.HotSpots))
+	}
+
 	tasks := s.taskResult.Tasks
 	if len(tasks) > 5 {
 		return fmt.Errorf("Tasks length = %d, want at most 5", len(tasks))

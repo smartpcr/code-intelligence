@@ -1,14 +1,14 @@
 {
   "schemaVersion": "v1.2026.05",
   "Context": {
-    "RootPath": "C:/Users/xiaodoli/AppData/Local/Temp/cleanc-e2e-minimal-4195706913",
-    "RepoID": "3a847a41-3059-5be5-b6b7-f558dc4c9090",
+    "RootPath": "C:/Users/xiaodoli/AppData/Local/Temp/cleanc-e2e-zero-tasks-2931372199",
+    "RepoID": "03245f11-c3cc-534b-bd88-f63acd0cc109",
     "HeadSHA": "working-copy",
-    "ModulePath": "example.com/minimal-fixture",
+    "ModulePath": "example.com/zero-tasks",
     "IsGitRepo": false
   },
   "Policy": {
-    "policy_version_id": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+    "policy_version_id": "2b8b672e-2c5c-5891-ad9a-394921e95273",
     "name": "cleanc.devpolicy",
     "rule_refs": [
       {
@@ -66,6 +66,10 @@
       {
         "rule_id": "solid.srp.interface_width_high",
         "version": 1
+      },
+      {
+        "rule_id": "solid.srp.loc_high",
+        "version": 1
       }
     ],
     "threshold_refs": [
@@ -92,7 +96,7 @@
       "top_n": 20
     },
     "signature": null,
-    "created_at": "2026-05-31T06:17:23.7955517Z"
+    "created_at": "2026-05-31T09:43:14.0958622Z"
   },
   "Files": [
     {
@@ -164,10 +168,10 @@
   ],
   "Samples": [
     {
-      "SampleID": "0b13e808-52dd-5eaa-94f0-664ab2a3fb68",
-      "RepoID": "3a847a41-3059-5be5-b6b7-f558dc4c9090",
+      "SampleID": "cdcd699e-94e6-552e-866c-9ed406586072",
+      "RepoID": "03245f11-c3cc-534b-bd88-f63acd0cc109",
       "SHA": "working-copy",
-      "ScopeID": "57c19f44-2310-5f63-8dc1-45b32443d436",
+      "ScopeID": "d44399ef-e158-50f4-98c0-225d3424792e",
       "ScopeKind": "file",
       "MetricKind": "cycle_member",
       "MetricVersion": 1,
@@ -177,13 +181,13 @@
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
-      "ScopeSignature": "clean-code-repo:3a847a41-3059-5be5-b6b7-f558dc4c9090::file::main.go"
+      "ScopeSignature": "clean-code-repo:03245f11-c3cc-534b-bd88-f63acd0cc109::file::main.go"
     },
     {
-      "SampleID": "3299aa79-8615-5598-9e78-a9b9fb6b2b87",
-      "RepoID": "3a847a41-3059-5be5-b6b7-f558dc4c9090",
+      "SampleID": "50dc9c5f-76e1-5597-a01a-e8f1cd11a3e2",
+      "RepoID": "03245f11-c3cc-534b-bd88-f63acd0cc109",
       "SHA": "working-copy",
-      "ScopeID": "fc3a0c84-f79e-5dda-a5e6-9c65407d1484",
+      "ScopeID": "92f25d6f-0072-5b85-9641-2f880d2dc5a8",
       "ScopeKind": "package",
       "MetricKind": "cycle_member",
       "MetricVersion": 1,
@@ -193,13 +197,13 @@
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
-      "ScopeSignature": "clean-code-repo:3a847a41-3059-5be5-b6b7-f558dc4c9090::pkg::."
+      "ScopeSignature": "clean-code-repo:03245f11-c3cc-534b-bd88-f63acd0cc109::pkg::."
     },
     {
-      "SampleID": "7de13da8-7209-5fdb-87f3-aadc0cb1581e",
-      "RepoID": "3a847a41-3059-5be5-b6b7-f558dc4c9090",
+      "SampleID": "d8a87d67-0b28-5a1f-982d-a90388dd60d1",
+      "RepoID": "03245f11-c3cc-534b-bd88-f63acd0cc109",
       "SHA": "working-copy",
-      "ScopeID": "57c19f44-2310-5f63-8dc1-45b32443d436",
+      "ScopeID": "d44399ef-e158-50f4-98c0-225d3424792e",
       "ScopeKind": "file",
       "MetricKind": "duplication_ratio",
       "MetricVersion": 1,
@@ -209,13 +213,13 @@
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
-      "ScopeSignature": "clean-code-repo:3a847a41-3059-5be5-b6b7-f558dc4c9090::file::main.go"
+      "ScopeSignature": "clean-code-repo:03245f11-c3cc-534b-bd88-f63acd0cc109::file::main.go"
     },
     {
-      "SampleID": "782e9815-e78d-57be-be47-4a09697e2c28",
-      "RepoID": "3a847a41-3059-5be5-b6b7-f558dc4c9090",
+      "SampleID": "f93fc096-cf61-5115-8099-67b9e225a305",
+      "RepoID": "03245f11-c3cc-534b-bd88-f63acd0cc109",
       "SHA": "working-copy",
-      "ScopeID": "fc3a0c84-f79e-5dda-a5e6-9c65407d1484",
+      "ScopeID": "92f25d6f-0072-5b85-9641-2f880d2dc5a8",
       "ScopeKind": "package",
       "MetricKind": "duplication_ratio",
       "MetricVersion": 1,
@@ -225,13 +229,13 @@
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
-      "ScopeSignature": "clean-code-repo:3a847a41-3059-5be5-b6b7-f558dc4c9090::pkg::."
+      "ScopeSignature": "clean-code-repo:03245f11-c3cc-534b-bd88-f63acd0cc109::pkg::."
     },
     {
-      "SampleID": "e7b52a46-0a98-51c0-a8f6-bbf1fc912036",
-      "RepoID": "3a847a41-3059-5be5-b6b7-f558dc4c9090",
+      "SampleID": "b2ad583d-8ec7-5f63-a0dc-413f8e9b9ebc",
+      "RepoID": "03245f11-c3cc-534b-bd88-f63acd0cc109",
       "SHA": "working-copy",
-      "ScopeID": "57c19f44-2310-5f63-8dc1-45b32443d436",
+      "ScopeID": "d44399ef-e158-50f4-98c0-225d3424792e",
       "ScopeKind": "file",
       "MetricKind": "loc",
       "MetricVersion": 1,
@@ -241,25 +245,25 @@
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
-      "ScopeSignature": "clean-code-repo:3a847a41-3059-5be5-b6b7-f558dc4c9090::file::main.go"
+      "ScopeSignature": "clean-code-repo:03245f11-c3cc-534b-bd88-f63acd0cc109::file::main.go"
     }
   ],
   "Run": {
-    "EvaluationRunID": "38d8056b-51ea-4911-a61e-0bbc1e04243b",
-    "RepoID": "3a847a41-3059-5be5-b6b7-f558dc4c9090",
+    "EvaluationRunID": "815d47eb-c3bf-4fd8-914a-60daa36cd2a5",
+    "RepoID": "03245f11-c3cc-534b-bd88-f63acd0cc109",
     "SHA": "working-copy",
-    "PolicyVersionID": "ac2ca2b6-2dd1-5db9-81f8-895918458335",
+    "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
     "Caller": "batch_refresh",
     "ScopeID": null,
-    "CreatedAt": "2026-05-31T06:17:23.7971015Z"
+    "CreatedAt": "2026-05-31T09:43:14.0968908Z"
   },
   "Verdict": {
-    "VerdictID": "2ec98a0e-9b3a-4ff7-8e86-2649269ae31f",
-    "EvaluationRunID": "38d8056b-51ea-4911-a61e-0bbc1e04243b",
+    "VerdictID": "b6e3ab3d-bcb6-464f-95a1-8a2cfc900dde",
+    "EvaluationRunID": "815d47eb-c3bf-4fd8-914a-60daa36cd2a5",
     "Verdict": "pass",
     "Degraded": false,
     "DegradedReason": "",
-    "CreatedAt": "2026-05-31T06:17:23.7971015Z"
+    "CreatedAt": "2026-05-31T09:43:14.0968908Z"
   },
   "Findings": [],
   "HotSpots": null,
@@ -321,6 +325,8 @@
         "closure_phase": "P2"
       }
     ],
-    "effort_source": "fallback"
+    "effort_source": "fallback",
+    "prompt_count": 0,
+    "prompt_dest": "C:\\Users\\xiaodoli\\AppData\\Local\\Temp\\cleanc-e2e-emit-prompts-4294012245\\prompts.jsonl"
   }
 }

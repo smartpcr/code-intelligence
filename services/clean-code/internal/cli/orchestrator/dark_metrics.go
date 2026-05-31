@@ -295,6 +295,18 @@ type Diagnostics struct {
 	// Anchor: workstream brief Stage 4.3 ("Emit Prompts
 	// Flag Wiring").
 	PromptCount int `json:"prompt_count"`
+
+	// PromptDest is the destination the `--emit-prompts`
+	// writer targeted: the literal CLI value (`-` for stdout,
+	// otherwise the file path). Empty when `--emit-prompts`
+	// was not requested. The markdown renderer surfaces this
+	// in the diagnostics block so the operator can correlate
+	// "Prompts emitted: N to <dest>" with the artifact on
+	// disk.
+	//
+	// Anchor: workstream brief Stage 4.3, acceptance scenario
+	// "diagnostics count".
+	PromptDest string `json:"prompt_dest,omitempty"`
 }
 
 // darkMetricKey is the dedup key the orchestrator uses

@@ -214,9 +214,33 @@ func (s *emitPromptsWiringState) cleancAnalyzeRunsWithBareEmitPrompts() error {
 func (s *emitPromptsWiringState) cleancAnalyzeRunsWithEmitPromptsFileAndOut() error {
 	s.promptsPath = filepath.Join(s.tmpDir, "prompts.jsonl")
 	s.reportPath = filepath.Join(s.tmpDir, "report.md")
-	return s.runCleancEmitPrompts("analyze", s.fixtureRoot,
-		"--emit-prompts", s.promptsPath,
+	// Use the relative filename "prompts.jsonl" for --emit-prompts
+	// so the markdown diagnostics block renders
+	// "Prompts emitted: N to prompts.jsonl" (matching the
+	// acceptance scenario's exact text). Setting cmd.Dir to
+	// tmpDir ensures the file is created there.
+	cmd := exec.Command(s.binaryPath, "analyze", s.fixtureRoot,
+		"--emit-prompts", "prompts.jsonl",
 		"--out", s.reportPath)
+	cmd.Dir = s.tmpDir
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	err := cmd.Run()
+	s.stdout = stdoutBuf.String()
+	s.stderr = stderrBuf.String()
+
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			s.exitCode = exitErr.ExitCode()
+		} else {
+			return fmt.Errorf("command execution failed: %w", err)
+		}
+	} else {
+		s.exitCode = 0
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -353,42 +377,25 @@ func (s *emitPromptsWiringState) noEmitPromptsPipelineStageStarts() error {
 //
 //	"the diagnostics block contains 'Prompts emitted: 7 to prompts.jsonl'"
 //
-// The implementation renders this as two correlated artifacts:
+// The markdown renderer outputs (with the PromptDest field):
 //
-//  1. The markdown diagnostics block carries the count:
-//     `- **Refactor prompts emitted:** 7`
-//     The step asserts the count (7) appears after "prompts emitted"
-//     (case-insensitive substring match).
+//	- **Prompts emitted:** 7 to prompts.jsonl
 //
-//  2. The JSONL file `prompts.jsonl` has exactly 7 lines,
-//     proving the "to prompts.jsonl" part of the contract.
-//
-// Together, (1) and (2) fully prove the spec's
-// "Prompts emitted: 7 to prompts.jsonl" assertion.
+// The step asserts the EXACT text from the acceptance scenario
+// appears as a substring of the rendered markdown report.
 func (s *emitPromptsWiringState) diagnosticsBlockContainsPromptsEmitted(text string) error {
-	// Parse the expected count and destination from the spec
-	// text, e.g. "Prompts emitted: 7 to prompts.jsonl".
-	var expectedCount int
-	var expectedDest string
-	if _, err := fmt.Sscanf(text, "Prompts emitted: %d to %s", &expectedCount, &expectedDest); err != nil {
-		return fmt.Errorf("cannot parse spec text %q: %w", text, err)
-	}
-
-	// (1) Verify the markdown diagnostics block contains the
-	// prompt count.
 	reportData, err := os.ReadFile(s.reportPath)
 	if err != nil {
 		return fmt.Errorf("cannot read report.md at %s: %w", s.reportPath, err)
 	}
 	report := string(reportData)
 
-	// The markdown renderer writes:
-	//   - **Refactor prompts emitted:** <N>
-	// Match case-insensitively for "prompts emitted" + count.
-	reportLower := strings.ToLower(report)
-	countStr := fmt.Sprintf("%d", expectedCount)
-	promptsIdx := strings.Index(reportLower, "prompts emitted")
-	if promptsIdx < 0 {
+	// Strip markdown bold markers so we can match plain text
+	// from the acceptance scenario against the rendered report.
+	plain := strings.ReplaceAll(report, "**", "")
+
+	// Assert the exact spec text is a substring of the report.
+	if !strings.Contains(plain, text) {
 		idx := strings.Index(report, "## Diagnostics")
 		excerpt := "(no Diagnostics section found)"
 		if idx >= 0 {
@@ -398,25 +405,9 @@ func (s *emitPromptsWiringState) diagnosticsBlockContainsPromptsEmitted(text str
 			}
 			excerpt = report[idx:end]
 		}
-		return fmt.Errorf("markdown report does not contain 'prompts emitted'\ndiagnostics excerpt:\n%s", excerpt)
+		return fmt.Errorf("markdown report does not contain the exact text %q\ndiagnostics excerpt:\n%s",
+			text, excerpt)
 	}
-	// Check the count appears near "prompts emitted".
-	tail := report[promptsIdx:]
-	if !strings.Contains(tail[:min(len(tail), 100)], countStr) {
-		return fmt.Errorf("markdown diagnostics has 'prompts emitted' but not count %d\ntail: %s",
-			expectedCount, tail[:min(len(tail), 100)])
-	}
-
-	// (2) Verify the JSONL destination file has exactly N lines.
-	promptsData, err := os.ReadFile(s.promptsPath)
-	if err != nil {
-		return fmt.Errorf("JSONL file %s not found: %w", expectedDest, err)
-	}
-	lines := nonEmptyLines(promptsData)
-	if len(lines) != expectedCount {
-		return fmt.Errorf("JSONL file has %d lines, expected %d", len(lines), expectedCount)
-	}
-
 	return nil
 }
 

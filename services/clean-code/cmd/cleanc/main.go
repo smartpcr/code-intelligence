@@ -571,6 +571,7 @@ func runAnalyzePipeline(ctx context.Context, stdout, stderr io.Writer, g *flags.
 	// the stamped value from the artifact on disk.
 	if g.EmitPrompts != nil && *g.EmitPrompts != "" {
 		art.Diagnostics.PromptCount = len(art.Tasks)
+		art.Diagnostics.PromptDest = *g.EmitPrompts
 	}
 
 	// Stage 9: dispatch to renderers. `--out` defaults to

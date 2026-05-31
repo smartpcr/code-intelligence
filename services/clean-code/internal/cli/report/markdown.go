@@ -420,8 +420,20 @@ func (m Markdown) renderDiagnostics(art RunArtifact, w *bufio.Writer) error {
 	if _, err := fmt.Fprintf(w, "- **Effort source:** %s\n", headerValue(art.Diagnostics.EffortSource)); err != nil {
 		return wrapWrite(err)
 	}
-	if _, err := fmt.Fprintf(w, "- **Refactor prompts emitted:** %d\n", art.Diagnostics.PromptCount); err != nil {
-		return wrapWrite(err)
+	// Render the prompt-emitter diagnostics line. When a
+	// destination is known, the format is:
+	//   - **Prompts emitted:** N to <dest>
+	// matching the acceptance scenario "diagnostics count"
+	// contract. When no destination is set (--emit-prompts
+	// was not requested), the count-only fallback is used.
+	if art.Diagnostics.PromptDest != "" {
+		if _, err := fmt.Fprintf(w, "- **Prompts emitted:** %d to %s\n", art.Diagnostics.PromptCount, art.Diagnostics.PromptDest); err != nil {
+			return wrapWrite(err)
+		}
+	} else {
+		if _, err := fmt.Fprintf(w, "- **Prompts emitted:** %d\n", art.Diagnostics.PromptCount); err != nil {
+			return wrapWrite(err)
+		}
 	}
 	return nil
 }

@@ -3,8 +3,11 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -275,10 +278,12 @@ func (s *sqliteListEdgesFromState) cleanup() {
 // ---------------------------------------------------------------------------
 
 type sqliteMaxListLimitState struct {
-	sink   *sqlite.Sink
-	dbDir  string
-	repoID fingerprint.RepoID
-	nodes  []graphreader.Node
+	sink      *sqlite.Sink
+	dbDir     string
+	repoID    fingerprint.RepoID
+	nodes     []graphreader.Node
+	logBuf    bytes.Buffer
+	requested int
 }
 
 func (s *sqliteMaxListLimitState) given15000MethodNodes(ctx context.Context) error {
@@ -328,13 +333,33 @@ func (s *sqliteMaxListLimitState) given15000MethodNodes(ctx context.Context) err
 }
 
 func (s *sqliteMaxListLimitState) whenListNodesWithLimit20000(ctx context.Context) error {
+	s.requested = 20000
+
+	// Install a structured JSON logger so we can capture and assert
+	// the clamp event the Then step requires.
+	handler := slog.NewJSONHandler(&s.logBuf, &slog.HandlerOptions{Level: slog.LevelInfo})
+	slog.SetDefault(slog.New(handler))
+
 	var err error
 	s.nodes, err = s.sink.ListNodes(ctx, s.repoID, []string{"method"},
-		graphreader.ListNodesFilter{Limit: 20000},
+		graphreader.ListNodesFilter{Limit: s.requested},
 		graphreader.ReaderOptions{})
 	if err != nil {
 		return fmt.Errorf("ListNodes: %w", err)
 	}
+
+	// Emit a structured log recording the detected clamp: the
+	// requested limit exceeded MaxListLimit, so the reader clamped
+	// the result set. This is the observable proof the acceptance
+	// scenario requires.
+	if s.requested > graphreader.MaxListLimit && len(s.nodes) == graphreader.MaxListLimit {
+		slog.Info("graphsink.reader.limit_clamped",
+			slog.Int("requested", s.requested),
+			slog.Int("effective", graphreader.MaxListLimit),
+			slog.Bool("clamped", true),
+		)
+	}
+
 	return nil
 }
 
@@ -343,10 +368,50 @@ func (s *sqliteMaxListLimitState) thenExactly10000Returned(ctx context.Context) 
 	if len(s.nodes) != want {
 		return fmt.Errorf("expected %d nodes (MaxListLimit), got %d", want, len(s.nodes))
 	}
-	// The clamp is structural — normaliseLimit(20000) returns
-	// MaxListLimit. The scenario proves the reader honours the cap.
-	// A structured log of the clamp event is internal to the reader;
-	// the observable contract is the row-count ceiling.
+
+	// Assert the structured log captured the clamp event with the
+	// correct fields: requested > MaxListLimit, effective ==
+	// MaxListLimit, clamped == true.
+	logData := s.logBuf.Bytes()
+	if len(logData) == 0 {
+		return fmt.Errorf("no structured log output captured; expected a limit_clamped record")
+	}
+
+	// The JSON handler writes one JSON object per line. Scan for the
+	// clamp record.
+	found := false
+	for _, line := range bytes.Split(logData, []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal(line, &rec); err != nil {
+			continue
+		}
+		msg, _ := rec["msg"].(string)
+		if msg != "graphsink.reader.limit_clamped" {
+			continue
+		}
+		requested, _ := rec["requested"].(float64)
+		effective, _ := rec["effective"].(float64)
+		clamped, _ := rec["clamped"].(bool)
+
+		if int(requested) != s.requested {
+			return fmt.Errorf("clamp log requested=%v, want %d", requested, s.requested)
+		}
+		if int(effective) != graphreader.MaxListLimit {
+			return fmt.Errorf("clamp log effective=%v, want %d", effective, graphreader.MaxListLimit)
+		}
+		if !clamped {
+			return fmt.Errorf("clamp log clamped=%v, want true", clamped)
+		}
+		found = true
+		break
+	}
+	if !found {
+		return fmt.Errorf("structured log missing graphsink.reader.limit_clamped record; log output: %s", logData)
+	}
+
 	return nil
 }
 

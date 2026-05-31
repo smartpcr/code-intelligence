@@ -338,6 +338,8 @@ func (s *sqliteMaxListLimitState) whenListNodesWithLimit20000(ctx context.Contex
 	// Install a structured JSON logger so we can capture the clamp
 	// log emitted by the SQLite reader's ListNodes when the
 	// requested limit exceeds MaxListLimit.
+	original := slog.Default()
+	defer slog.SetDefault(original)
 	handler := slog.NewJSONHandler(&s.logBuf, &slog.HandlerOptions{Level: slog.LevelInfo})
 	slog.SetDefault(slog.New(handler))
 

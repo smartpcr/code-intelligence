@@ -42,6 +42,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -167,13 +168,21 @@ func runVersion(stdout, stderr io.Writer, args []string) int {
 	rulePackCSV := strings.Join(skeletonRulePacks, ",")
 	semver := semverPrefix(version.Version)
 
+	// Stage 3.4 finalised format -- the ONLY line emitted by
+	// `cleanc version`. The skeleton's iter-1 body printed
+	// follow-on diagnostic lines (`version=`, `commit=`,
+	// `build_time=`, bracketed parsers / rule-packs); those
+	// are removed here because the workstream brief pins the
+	// single-line format:
+	//
+	//   cleanc <semver> (build-tag=<tag>) (parsers=<csv>) (rule-packs=<csv>)
+	//
+	// followed by exactly one trailing `\n`. Keeping any
+	// additional diagnostic lines would let a CI consumer
+	// accidentally pin a non-contract substring (the
+	// evaluator's iter-1 finding).
 	fmt.Fprintf(stdout, "cleanc %s (build-tag=%s) (parsers=%s) (rule-packs=%s)\n",
 		semver, buildTag, parserCSV, rulePackCSV)
-	fmt.Fprintf(stdout, "version=%s\n", version.Version)
-	fmt.Fprintf(stdout, "commit=%s\n", version.Commit)
-	fmt.Fprintf(stdout, "build_time=%s\n", version.BuildTime)
-	fmt.Fprintf(stdout, "parsers=[%s]\n", parserCSV)
-	fmt.Fprintf(stdout, "rule-packs=[%s]\n", rulePackCSV)
 	return flags.ExitOK
 }
 
@@ -333,6 +342,16 @@ func runReport(stdout, stderr io.Writer, args []string) int {
 	// short-circuits to ExitUsage (64) with both versions
 	// named so a stale CLI invoked against a newer artifact
 	// fails loudly rather than producing a partial render.
+	//
+	// Iter-2 evaluator item 2: render into an in-memory
+	// buffer FIRST and only open / write to `--out` after a
+	// successful render. The iter-1 ordering created or
+	// truncated the destination file before validating
+	// `schemaVersion`, so a refused artifact would still
+	// destroy an existing report file before the dispatcher
+	// returned. With a staged buffer, a schema-mismatch
+	// refusal (exit 64) leaves the destination file
+	// untouched.
 	findingsPath := positionals[0]
 	data, err := os.ReadFile(findingsPath)
 	if err != nil {
@@ -340,18 +359,8 @@ func runReport(stdout, stderr io.Writer, args []string) int {
 		return flags.ExitInternalError
 	}
 
-	var out io.Writer = stdout
-	if g.Out != nil && *g.Out != "" {
-		f, ferr := os.Create(*g.Out)
-		if ferr != nil {
-			fmt.Fprintf(stderr, "cleanc report: create %s: %v\n", *g.Out, ferr)
-			return flags.ExitInternalError
-		}
-		defer func() { _ = f.Close() }()
-		out = f
-	}
-
-	if err := (report.JSON{}).RenderFromBytes(data, out); err != nil {
+	var buf bytes.Buffer
+	if err := (report.JSON{}).RenderFromBytes(data, &buf); err != nil {
 		var smErr *report.SchemaVersionMismatchError
 		if errors.As(err, &smErr) {
 			// Both versions are named verbatim so the operator
@@ -366,7 +375,55 @@ func runReport(stdout, stderr io.Writer, args []string) int {
 		fmt.Fprintf(stderr, "cleanc report: render failed: %v\n", err)
 		return flags.ExitInternalError
 	}
+
+	// Render succeeded -- now stage the bytes to the
+	// destination. Empty `--out` writes to stdout; any
+	// non-empty value opens / truncates the named file.
+	if g.Out != nil && *g.Out != "" {
+		// Iter-2 evaluator item 3: surface Close failures.
+		// A delayed flush failure on the file handle MUST
+		// not be silently swallowed -- otherwise a "render
+		// succeeded" report can still arrive truncated /
+		// missing on disk. Both the Write and Close paths
+		// map to ExitInternalError (70).
+		if err := writeOutputFile(*g.Out, buf.Bytes()); err != nil {
+			fmt.Fprintf(stderr, "cleanc report: write %s: %v\n", *g.Out, err)
+			return flags.ExitInternalError
+		}
+		return flags.ExitOK
+	}
+
+	if _, err := stdout.Write(buf.Bytes()); err != nil {
+		fmt.Fprintf(stderr, "cleanc report: write stdout: %v\n", err)
+		return flags.ExitInternalError
+	}
 	return flags.ExitOK
+}
+
+// writeOutputFile creates (or truncates) `path`, writes
+// `data` to it, and explicitly surfaces a Close failure.
+// Iter-2 evaluator item 3: a deferred `_ = f.Close()` would
+// silently swallow a delayed flush / network-FS failure
+// after Write succeeded; the dispatcher MUST surface that
+// case with ExitInternalError so the operator does not see
+// "success" while the report on disk is truncated.
+//
+// The helper deliberately does NOT use `defer f.Close()`:
+// when Write returns an error we close eagerly to release
+// the handle but return the Write error (the more
+// actionable cause); when Write succeeds we return Close's
+// error verbatim so a flush failure is visible to the
+// caller.
+func writeOutputFile(path string, data []byte) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	if _, werr := f.Write(data); werr != nil {
+		_ = f.Close()
+		return werr
+	}
+	return f.Close()
 }
 
 // parseInterleavedFlags runs the supplied flag-set against

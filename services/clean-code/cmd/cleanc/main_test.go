@@ -42,9 +42,14 @@ func TestVersionFormatMatchesE2ERegex(t *testing.T) {
 	}
 }
 
-// TestVersionContainsImplPlanSubstrings pins the literal
-// substrings implementation-plan.md Stage 1.1 line 41
-// requires (`version=` and `parsers=[go,python,typescript,java]`).
+// TestVersionContainsImplPlanSubstrings pins the parser
+// CSV inside the finalised first-line format. Iter-2
+// supersedes the iter-1 contract (which asserted
+// `version=` and bracketed `parsers=[...]` /
+// `rule-packs=[...]` follow-on diagnostic lines): Stage
+// 3.4 pins a single-line output, so the only contract a
+// substring assertion can pin is the CSV inside the
+// `(parsers=...)` segment of that line.
 func TestVersionContainsImplPlanSubstrings(t *testing.T) {
 	t.Parallel()
 
@@ -54,13 +59,37 @@ func TestVersionContainsImplPlanSubstrings(t *testing.T) {
 	}
 
 	wantSubstrings := []string{
-		"version=",
-		"parsers=[go,python,typescript,java]",
-		"rule-packs=[decoupling,solid]",
+		"(parsers=go,python,typescript,java)",
+		"(rule-packs=decoupling,solid)",
 	}
 	for _, want := range wantSubstrings {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("stdout does not contain %q\nstdout=%s", want, stdout)
+		}
+	}
+}
+
+// TestVersionOmitsLegacyDiagnosticLines is the iter-2
+// negative twin of TestVersionFormatIsExactlyOneLine.
+// The iter-1 body printed follow-on `version=`,
+// `commit=`, `build_time=`, `parsers=[...]`,
+// `rule-packs=[...]` lines. Stage 3.4 finalises the
+// format to a single line; this test guards against a
+// future regression that re-introduces any of those
+// diagnostic prefixes.
+func TestVersionOmitsLegacyDiagnosticLines(t *testing.T) {
+	t.Parallel()
+
+	stdout, _, _ := captureRun("version")
+	for _, banned := range []string{
+		"\nversion=",
+		"\ncommit=",
+		"\nbuild_time=",
+		"\nparsers=[",
+		"\nrule-packs=[",
+	} {
+		if strings.Contains(stdout, banned) {
+			t.Errorf("stdout contains banned diagnostic prefix %q\nstdout=%s", banned, stdout)
 		}
 	}
 }
@@ -108,19 +137,17 @@ func TestVersionContainsNoAnsiEscape(t *testing.T) {
 	}
 }
 
-// TestVersionFormatExact pins the literal first-line format
-// `"cleanc <semver> (build-tag=<tag>) (parsers=<csv>) (rule-packs=<csv>)"`
-// pinned by implementation-plan.md Stage 3.4 line 328. The
-// existing regex test (TestVersionFormatMatchesE2ERegex)
-// proves the line MATCHES the e2e regex, but a regex match
-// permits any whitespace / ordering drift the regex happens
-// to tolerate. This test reconstructs the expected line
-// byte-for-byte from the same constants the dispatcher reads
-// (semverPrefix(version.Version), buildTag, skeletonParsers,
-// skeletonRulePacks) and asserts equality, so any future
-// tweak to the format string (e.g. dropping a parenthesis,
-// reordering segments) trips this guard on the next test
-// run.
+// TestVersionFormatExact pins the FULL stdout of
+// `cleanc version` to exactly the line
+// `"cleanc <semver> (build-tag=<tag>) (parsers=<csv>) (rule-packs=<csv>)\n"`
+// (implementation-plan.md Stage 3.4 line 328 -- "Finalise
+// `cleanc version` output: pin the format ... and assert
+// it in a test"). The iter-1 version of this test only
+// checked the first line; iter-2 asserts the full stdout
+// is exactly the format line + a single trailing newline,
+// so any future regression that re-introduces follow-on
+// diagnostic lines (e.g. `version=`, `commit=`) trips
+// this guard on the next test run.
 func TestVersionFormatExact(t *testing.T) {
 	t.Parallel()
 
@@ -129,10 +156,23 @@ func TestVersionFormatExact(t *testing.T) {
 		t.Fatalf("cleanc version exit code = %d, want %d; stderr=%q",
 			code, flags.ExitOK, stderr)
 	}
-	firstLine, _, _ := strings.Cut(stdout, "\n")
-	want := versionFirstLineExpected()
-	if firstLine != want {
-		t.Errorf("first line mismatch:\n got: %q\nwant: %q", firstLine, want)
+	want := versionFirstLineExpected() + "\n"
+	if stdout != want {
+		t.Errorf("stdout mismatch:\n got: %q\nwant: %q", stdout, want)
+	}
+}
+
+// TestVersionFormatIsExactlyOneLine asserts the
+// finalised output is a single line terminated by exactly
+// one `\n` (no trailing blank line, no follow-on diagnostic
+// lines). Pinned by Stage 3.4's "single-line format"
+// resolution of the iter-1 evaluator finding.
+func TestVersionFormatIsExactlyOneLine(t *testing.T) {
+	t.Parallel()
+
+	stdout, _, _ := captureRun("version")
+	if n := strings.Count(stdout, "\n"); n != 1 {
+		t.Errorf("expected exactly 1 newline in stdout; got %d\nstdout=%q", n, stdout)
 	}
 }
 
@@ -239,6 +279,52 @@ func TestReportRejectsSchemaVersionMismatch(t *testing.T) {
 		if !strings.Contains(stderr, want) {
 			t.Errorf("stderr missing version %q\nstderr=%s", want, stderr)
 		}
+	}
+}
+
+// TestReportSchemaMismatchPreservesExistingOutFile pins
+// iter-2 evaluator item 2: a schema-mismatch refusal MUST
+// leave an existing `--out` file unchanged. The iter-1
+// dispatcher opened the destination via `os.Create`
+// BEFORE validating `schemaVersion`, so a refused
+// artifact still destroyed (truncated to zero bytes) any
+// pre-existing report at that path. With the iter-2
+// staged-buffer ordering (render into bytes.Buffer first,
+// open destination only on success), the existing file's
+// bytes survive the refusal byte-for-byte.
+func TestReportSchemaMismatchPreservesExistingOutFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	findingsPath := dir + "/findings.json"
+	outPath := dir + "/replay.md"
+
+	const staleVersion = "v0.0.0"
+	stale := `{"schemaVersion":"` + staleVersion + `","Context":{"RootPath":"/x"}}` + "\n"
+	if err := os.WriteFile(findingsPath, []byte(stale), 0o644); err != nil {
+		t.Fatalf("stage stale findings.json: %v", err)
+	}
+
+	// Pre-seed the destination with a sentinel payload
+	// the refused render path MUST NOT overwrite.
+	const sentinel = "# pre-existing report -- must survive refusal\nbody bytes here\n"
+	if err := os.WriteFile(outPath, []byte(sentinel), 0o644); err != nil {
+		t.Fatalf("stage sentinel out file: %v", err)
+	}
+
+	_, stderr, code := captureRun("report", findingsPath, "--out", outPath)
+	if code != flags.ExitUsage {
+		t.Fatalf("exit code = %d, want %d (schema mismatch); stderr=%s",
+			code, flags.ExitUsage, stderr)
+	}
+
+	got, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read sentinel after refusal: %v", err)
+	}
+	if string(got) != sentinel {
+		t.Errorf("destination file was modified on refusal:\n got: %q\nwant: %q",
+			string(got), sentinel)
 	}
 }
 

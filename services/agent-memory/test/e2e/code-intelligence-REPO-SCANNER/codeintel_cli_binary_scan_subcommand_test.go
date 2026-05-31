@@ -13,7 +13,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -319,6 +321,20 @@ func (s *scanSubcommandState) summaryHasNonZeroCounts() error {
 			return fmt.Errorf("summary missing %q:\n%s", want, s.stdout)
 		}
 	}
+	// Parse nodes: line and verify each required kind has count >= 1.
+	nodesLine := extractSummaryLine(s.stdout, "nodes:")
+	if nodesLine == "" {
+		return fmt.Errorf("cannot find nodes: line in stdout:\n%s", s.stdout)
+	}
+	for _, kind := range []string{"repo", "package", "file", "class", "method"} {
+		n, err := extractKindCount(nodesLine, kind)
+		if err != nil {
+			return fmt.Errorf("nodes line missing kind %q: %v\nline: %s", kind, err, nodesLine)
+		}
+		if n < 1 {
+			return fmt.Errorf("expected nodes[%q] >= 1, got %d\nline: %s", kind, n, nodesLine)
+		}
+	}
 	return nil
 }
 
@@ -348,15 +364,37 @@ func (s *scanSubcommandState) exitCodeIs0() error {
 }
 
 func (s *scanSubcommandState) summaryHasSkippedNoParser() error {
-	if !strings.Contains(s.stdout, "no_parser") {
-		return fmt.Errorf("stdout missing no_parser skip count:\n%s", s.stdout)
+	skippedLine := extractSummaryLine(s.stdout, "skipped:")
+	if skippedLine == "" {
+		return fmt.Errorf("cannot find skipped: line in stdout:\n%s", s.stdout)
+	}
+	n, err := extractKindCount(skippedLine, "no_parser")
+	if err != nil {
+		return fmt.Errorf("skipped line missing no_parser: %v\nline: %s", err, skippedLine)
+	}
+	if n < 1 {
+		return fmt.Errorf("expected skipped.no_parser >= 1, got %d\nline: %s", n, skippedLine)
 	}
 	return nil
 }
 
 func (s *scanSubcommandState) stderrHasExtSkip(ext string) error {
+	// Verify stderr contains a skip entry mentioning the extension.
 	if !strings.Contains(s.stderr, ext) {
 		return fmt.Errorf("stderr missing extension %q:\n%s", ext, s.stderr)
+	}
+	// Verify stdout's per-extension count shows >= 1 for this extension.
+	byExtLine := extractSummaryLine(s.stdout, "skipped.no_parser_by_ext:")
+	if byExtLine == "" {
+		return fmt.Errorf("stdout missing skipped.no_parser_by_ext line:\n%s", s.stdout)
+	}
+	n, err := extractKindCount(byExtLine, ext)
+	if err != nil {
+		return fmt.Errorf("per-ext line missing %q: %v\nline: %s", ext, err, byExtLine)
+	}
+	if n < 1 {
+		return fmt.Errorf("expected per-extension count for %q >= 1, got %d\nline: %s",
+			ext, n, byExtLine)
 	}
 	return nil
 }
@@ -382,6 +420,32 @@ func (s *scanSubcommandState) stderrNamesIOError() error {
 		}
 	}
 	return fmt.Errorf("stderr does not name an IO error:\n%s", s.stderr)
+}
+
+// ---------------------------------------------------------------------------
+// Summary parsing helpers
+// ---------------------------------------------------------------------------
+
+// extractSummaryLine returns the first line whose trimmed form starts
+// with prefix (e.g. "nodes:", "skipped:").
+func extractSummaryLine(text, prefix string) string {
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), prefix) {
+			return line
+		}
+	}
+	return ""
+}
+
+// extractKindCount finds `key=N` in a formatted kind-map line like
+// `{class=1, file=2, method=3}` and returns N as an int.
+func extractKindCount(line, key string) (int, error) {
+	re := regexp.MustCompile(regexp.QuoteMeta(key) + `=(\d+)`)
+	m := re.FindStringSubmatch(line)
+	if m == nil {
+		return 0, fmt.Errorf("key %q not found in %q", key, line)
+	}
+	return strconv.Atoi(m[1])
 }
 
 // ---------------------------------------------------------------------------

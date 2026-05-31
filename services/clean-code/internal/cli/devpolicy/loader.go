@@ -59,10 +59,10 @@ type Loader interface {
 // `services/clean-code/policy/rulepacks/embedded_fs.go`. When
 // UseEmbedded is false, the Loader walks `os.DirFS(DirPath)` --
 // this is the `--policy <path>` override path; it is permitted
-// in the no-tag dev build and will be FORBIDDEN in a `-tags
-// prod` build (the prod synthesiser added by the Stage 1.4
-// follow-up will return its `ErrDevModeUnavailable` sentinel
-// before any filesystem access). See architecture Sec 7.2 and
+// in the no-tag dev build and is FORBIDDEN in a `-tags
+// prod` build (the prod synthesiser in `unsigned_prod.go`
+// returns its `ErrDevModeUnavailable` sentinel before any
+// filesystem access). See architecture Sec 7.2 and
 // tech-spec Sec 8.4 for the override-vs-embed precedence rules.
 type LoaderSource struct {
 	// UseEmbedded selects the embedded rule pack `embed.FS`.
@@ -141,10 +141,9 @@ var ErrMissingPolicyDir = errors.New("devpolicy: LoaderSource.DirPath must be no
 // `os.DirFS(s.DirPath)` -- the `--policy <path>` override.
 //
 // This is the SINGLE choice point between the embedded and
-// filesystem sources, so the future build-tag-gated synthesisers
-// (`unsigned_dev.go` / `unsigned_prod.go`, to be added by the
-// Stage 1.4 follow-up workstream) will stay decoupled from the
-// source-kind switch: they will call `src.FS()` and walk the
+// filesystem sources, so the build-tag-gated synthesisers
+// (`unsigned_dev.go` / `unsigned_prod.go`) stay decoupled from
+// the source-kind switch: they call `src.FS()` and walk the
 // returned FS uniformly.
 //
 // For the filesystem source, FS eagerly stats s.DirPath and

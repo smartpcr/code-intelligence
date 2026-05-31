@@ -427,7 +427,9 @@ func InitializeScenario_graphsink_storage_abstraction_sqlite_reader_adapter(ctx 
 	ctx.Step(`^ListNodes with kinds package and ParentNodeID equal to the repo node runs$`, parentState.whenListNodesRuns)
 	ctx.Step(`^the two packages are returned and nothing else$`, parentState.thenTwoPackagesReturned)
 	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
-		parentState.cleanup()
+		if sc.Name == "sqlite-list-nodes-by-parent" {
+			parentState.cleanup()
+		}
 		return ctx, nil
 	})
 
@@ -437,7 +439,9 @@ func InitializeScenario_graphsink_storage_abstraction_sqlite_reader_adapter(ctx 
 	ctx.Step(`^ListEdgesFrom with srcNodeID and kinds static_calls runs$`, edgesState.whenListEdgesFromRuns)
 	ctx.Step(`^exactly three Edges are returned$`, edgesState.thenExactlyThreeEdges)
 	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
-		edgesState.cleanup()
+		if sc.Name == "sqlite-list-edges-from" {
+			edgesState.cleanup()
+		}
 		return ctx, nil
 	})
 
@@ -447,7 +451,9 @@ func InitializeScenario_graphsink_storage_abstraction_sqlite_reader_adapter(ctx 
 	ctx.Step(`^ListNodes with kinds method and Limit 20000 runs$`, clampState.whenListNodesWithLimit20000)
 	ctx.Step(`^exactly 10000 are returned and a structured log records the clamp$`, clampState.thenExactly10000Returned)
 	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
-		clampState.cleanup()
+		if sc.Name == "sqlite-maxlistlimit-clamp" {
+			clampState.cleanup()
+		}
 		return ctx, nil
 	})
 }

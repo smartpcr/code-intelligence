@@ -1,14 +1,14 @@
 {
   "schemaVersion": "v1.2026.05",
   "Context": {
-    "RootPath": "C:/Users/xiaodoli/AppData/Local/Temp/cleanc-e2e-zero-tasks-1025254640",
-    "RepoID": "425d583e-f9d1-50ed-a713-dfac0b473c1f",
+    "RootPath": "<TEMP>/cleanc-e2e-zero-tasks",
+    "RepoID": "00000000-0000-0000-0000-000000000001",
     "HeadSHA": "working-copy",
     "ModulePath": "example.com/zero-tasks",
     "IsGitRepo": false
   },
   "Policy": {
-    "policy_version_id": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+    "policy_version_id": "00000000-0000-0000-0000-000000000002",
     "name": "cleanc.devpolicy",
     "rule_refs": [
       {
@@ -74,16 +74,16 @@
     ],
     "threshold_refs": [
       {
-        "threshold_id": "1e105766-3e02-5b49-b5be-49a787fd8e04"
+        "threshold_id": "00000000-0000-0000-0000-t00000000001"
       },
       {
-        "threshold_id": "d3a40d02-4b95-54c6-98fa-22793b425346"
+        "threshold_id": "00000000-0000-0000-0000-t00000000002"
       },
       {
-        "threshold_id": "fd6a0f05-ecbf-56cb-9e97-e6a83cc6a13e"
+        "threshold_id": "00000000-0000-0000-0000-t00000000003"
       },
       {
-        "threshold_id": "04d9f035-5183-5cb7-86bb-b582f85d3241"
+        "threshold_id": "00000000-0000-0000-0000-t00000000004"
       }
     ],
     "refactor_weights": {
@@ -96,7 +96,7 @@
       "top_n": 20
     },
     "signature": null,
-    "created_at": "2026-05-31T09:44:48.3949313Z"
+    "created_at": "2000-01-01T00:00:00Z"
   },
   "Files": [
     {
@@ -168,10 +168,10 @@
   ],
   "Samples": [
     {
-      "SampleID": "2eb27f70-31a6-5e6d-b7a1-c1b464b5838a",
-      "RepoID": "425d583e-f9d1-50ed-a713-dfac0b473c1f",
+      "SampleID": "00000000-0000-0000-0000-s00000000001",
+      "RepoID": "00000000-0000-0000-0000-000000000001",
       "SHA": "working-copy",
-      "ScopeID": "968cc99e-b7f7-52ae-8b6b-d8294f8daf9c",
+      "ScopeID": "00000000-0000-0000-0000-scope0000001",
       "ScopeKind": "file",
       "MetricKind": "cycle_member",
       "MetricVersion": 1,
@@ -181,13 +181,13 @@
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
-      "ScopeSignature": "clean-code-repo:425d583e-f9d1-50ed-a713-dfac0b473c1f::file::main.go"
+      "ScopeSignature": "clean-code-repo:00000000-0000-0000-0000-000000000001::file::main.go"
     },
     {
-      "SampleID": "a02ed6d5-d3cc-590f-b0cc-09ba3dd53a2a",
-      "RepoID": "425d583e-f9d1-50ed-a713-dfac0b473c1f",
+      "SampleID": "00000000-0000-0000-0000-s00000000002",
+      "RepoID": "00000000-0000-0000-0000-000000000001",
       "SHA": "working-copy",
-      "ScopeID": "56c631aa-c4ee-5186-9ad9-53518ddd8186",
+      "ScopeID": "00000000-0000-0000-0000-scope0000002",
       "ScopeKind": "package",
       "MetricKind": "cycle_member",
       "MetricVersion": 1,
@@ -197,13 +197,13 @@
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
-      "ScopeSignature": "clean-code-repo:425d583e-f9d1-50ed-a713-dfac0b473c1f::pkg::."
+      "ScopeSignature": "clean-code-repo:00000000-0000-0000-0000-000000000001::pkg::."
     },
     {
-      "SampleID": "655e1c36-f79a-5166-aec7-a37b914c32ed",
-      "RepoID": "425d583e-f9d1-50ed-a713-dfac0b473c1f",
+      "SampleID": "00000000-0000-0000-0000-s00000000003",
+      "RepoID": "00000000-0000-0000-0000-000000000001",
       "SHA": "working-copy",
-      "ScopeID": "968cc99e-b7f7-52ae-8b6b-d8294f8daf9c",
+      "ScopeID": "00000000-0000-0000-0000-scope0000001",
       "ScopeKind": "file",
       "MetricKind": "duplication_ratio",
       "MetricVersion": 1,
@@ -213,13 +213,13 @@
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
-      "ScopeSignature": "clean-code-repo:425d583e-f9d1-50ed-a713-dfac0b473c1f::file::main.go"
+      "ScopeSignature": "clean-code-repo:00000000-0000-0000-0000-000000000001::file::main.go"
     },
     {
-      "SampleID": "e7d4a8b1-01f7-52e8-9ade-795b8d1802e5",
-      "RepoID": "425d583e-f9d1-50ed-a713-dfac0b473c1f",
+      "SampleID": "00000000-0000-0000-0000-s00000000004",
+      "RepoID": "00000000-0000-0000-0000-000000000001",
       "SHA": "working-copy",
-      "ScopeID": "56c631aa-c4ee-5186-9ad9-53518ddd8186",
+      "ScopeID": "00000000-0000-0000-0000-scope0000002",
       "ScopeKind": "package",
       "MetricKind": "duplication_ratio",
       "MetricVersion": 1,
@@ -229,13 +229,13 @@
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
-      "ScopeSignature": "clean-code-repo:425d583e-f9d1-50ed-a713-dfac0b473c1f::pkg::."
+      "ScopeSignature": "clean-code-repo:00000000-0000-0000-0000-000000000001::pkg::."
     },
     {
-      "SampleID": "d7be4979-4319-58f3-aab9-428a7136c288",
-      "RepoID": "425d583e-f9d1-50ed-a713-dfac0b473c1f",
+      "SampleID": "00000000-0000-0000-0000-s00000000005",
+      "RepoID": "00000000-0000-0000-0000-000000000001",
       "SHA": "working-copy",
-      "ScopeID": "968cc99e-b7f7-52ae-8b6b-d8294f8daf9c",
+      "ScopeID": "00000000-0000-0000-0000-scope0000001",
       "ScopeKind": "file",
       "MetricKind": "loc",
       "MetricVersion": 1,
@@ -245,25 +245,25 @@
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
-      "ScopeSignature": "clean-code-repo:425d583e-f9d1-50ed-a713-dfac0b473c1f::file::main.go"
+      "ScopeSignature": "clean-code-repo:00000000-0000-0000-0000-000000000001::file::main.go"
     }
   ],
   "Run": {
-    "EvaluationRunID": "7fdad665-6388-48c8-91f3-9e4727699d02",
-    "RepoID": "425d583e-f9d1-50ed-a713-dfac0b473c1f",
+    "EvaluationRunID": "00000000-0000-0000-0000-run000000001",
+    "RepoID": "00000000-0000-0000-0000-000000000001",
     "SHA": "working-copy",
-    "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
+    "PolicyVersionID": "00000000-0000-0000-0000-000000000002",
     "Caller": "batch_refresh",
     "ScopeID": null,
-    "CreatedAt": "2026-05-31T09:44:48.3965002Z"
+    "CreatedAt": "2000-01-01T00:00:00Z"
   },
   "Verdict": {
-    "VerdictID": "4c062dd5-dd6a-4f11-a898-e4a6301ea7e9",
-    "EvaluationRunID": "7fdad665-6388-48c8-91f3-9e4727699d02",
+    "VerdictID": "00000000-0000-0000-0000-verdict00001",
+    "EvaluationRunID": "00000000-0000-0000-0000-run000000001",
     "Verdict": "pass",
     "Degraded": false,
     "DegradedReason": "",
-    "CreatedAt": "2026-05-31T09:44:48.3965002Z"
+    "CreatedAt": "2000-01-01T00:00:00Z"
   },
   "Findings": [],
   "HotSpots": null,
@@ -327,6 +327,6 @@
     ],
     "effort_source": "fallback",
     "prompt_count": 0,
-    "prompt_dest": "C:\\Users\\xiaodoli\\AppData\\Local\\Temp\\cleanc-e2e-emit-prompts-3687758659\\prompts.jsonl"
+    "prompt_dest": "<TEMP>/cleanc-e2e-emit-prompts/prompts.jsonl"
   }
 }

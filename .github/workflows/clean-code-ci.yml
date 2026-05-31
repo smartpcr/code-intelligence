@@ -244,6 +244,83 @@ jobs:
         # silent-skip risk this job exists to close.
         run: make test
 
+  build-prod:
+    # Stage 5.1 "Build Tag Matrix" gate (implementation-plan.md
+    # phase-hardening-and-release / stage-build-tag-matrix and
+    # tech-spec.md Sec 8.9). Two responsibilities:
+    #
+    #   1. Verify the prod binary compiles under `//go:build prod`
+    #      (catches a developer who accidentally references a
+    #      `!prod`-tagged symbol from a build-tag-agnostic file).
+    #   2. Run the build-tag-gated unit test
+    #      `TestProdBuildExcludesDevBypass` in
+    #      `internal/cli/devpolicy` to assert the unsigned-policy
+    #      bypass is excluded from the prod build -- i.e. that
+    #      `devpolicy.LoadUnsignedBundle` returns
+    #      `ErrDevModeUnavailable` whose `Error()` contains the
+    #      impl-plan-pinned phrase "dev-mode policy bypass not
+    #      available in prod build" (architecture Sec 7.2,
+    #      "earliest reachable layer" refusal).
+    #
+    # The guarantee lives in a build-tag-gated UNIT TEST, NOT in
+    # a hidden CLI subcommand, because `architecture.md` Sec 3.6
+    # and `tech-spec.md` Sec 4.1 pin the CLI surface to four
+    # subcommands only.
+    name: build-prod (prod-tag binary + dev-bypass exclusion test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/clean-code
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/clean-code/go.mod
+          cache: true
+
+      - name: Verify C toolchain is present
+        # The `cmd/cleanc` package transitively imports the
+        # tree-sitter-backed parser adapters (`//go:build cgo`),
+        # so `make build-prod` requires gcc / cc / clang at
+        # compile time. Mirror the probe in `lint-build-test` so
+        # a missing toolchain fails with an actionable error
+        # BEFORE `go build` emits the cryptic `cgo: C compiler
+        # "gcc" not found`.
+        run: |
+          set -euo pipefail
+          for c in gcc cc clang; do
+            if command -v "$c" >/dev/null 2>&1; then
+              echo "found C compiler: $c -> $(command -v "$c")"
+              "$c" --version | head -n 1
+              exit 0
+            fi
+          done
+          echo "::error::no C compiler (gcc / cc / clang) found in PATH; make build-prod will fail"
+          exit 1
+
+      - name: make build-prod
+        # Compiles every `cmd/*` binary with `-tags prod`
+        # (Makefile `build-prod` target). The output for the CLI
+        # lands at `bin/cleanc` -- the workstream brief uses the
+        # name `cleanc-prod` rhetorically but the Makefile keeps
+        # the binary name stable so downstream tooling
+        # (USAGE.md §2.1, the docker-build job) can locate the
+        # prod artifact at the same path it already expects.
+        run: make build-prod
+
+      - name: go test -tags prod -run TestProdBuildExcludesDevBypass
+        # The acceptance scenario pinned in
+        # `e2e-scenarios.md` "Prod build excludes bypass via
+        # unit test" and `implementation-plan.md` Stage 5.1.
+        # Asserts that the prod build's
+        # `devpolicy.LoadUnsignedBundle` returns
+        # `ErrDevModeUnavailable` (the unsigned-policy bypass is
+        # excluded at compile time, not at runtime via a flag).
+        run: go test -tags prod -run TestProdBuildExcludesDevBypass ./internal/cli/devpolicy/...
+
   docker-build:
     name: build clean-coded container
     runs-on: ubuntu-latest

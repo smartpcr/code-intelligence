@@ -61,15 +61,29 @@ const defaultSqliteDirEnv = "CODEINTEL_DEFAULT_DB_DIR"
 // real sqlite / memory / postgres backends.
 type sinkOpener func(ctx context.Context, store, dbOrOut string) (graphsink.Sink, func() error, error)
 
+// embeddingPublisherFactory builds the AST-level embedding
+// publisher when `--with-embeddings` is set. It is ONLY called
+// from `runScan` when `root.withEmbeddings` is true; otherwise
+// the seam is never consulted and no embedder env var
+// (`AGENT_MEMORY_QDRANT_URL`, `AGENT_MEMORY_ALLOW_STUB_EMBEDDER`,
+// `AGENT_MEMORY_QDRANT_API_KEY`) is read. This honours
+// tech-spec C8: "the CLI must run without Qdrant".
+//
+// Returns the AST-side publisher (already wrapped via
+// `embedding.AsASTPublisher`), an optional closer the runScan
+// loop will defer, and an error.
+type embeddingPublisherFactory func(ctx context.Context, root *rootFlags) (ast.NodeEmbeddingPublisher, func() error, error)
+
 // scanRunner bundles the seams tests override. Production wires
 // nil into every field; the `nil`-default fallback inside `runScan`
 // installs the real wiring.
 type scanRunner struct {
-	openSink     sinkOpener
-	newGitMat    func() repoindexer.Materializer
-	newLocalMat  func() repoindexer.Materializer
-	dispatchOpts []ast.DispatcherOption
-	stdout       io.Writer
+	openSink              sinkOpener
+	newGitMat             func() repoindexer.Materializer
+	newLocalMat           func() repoindexer.Materializer
+	newEmbeddingPublisher embeddingPublisherFactory
+	dispatchOpts          []ast.DispatcherOption
+	stdout                io.Writer
 }
 
 func newScanCmdImpl(root *rootFlags) *cobra.Command {
@@ -138,11 +152,6 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 	if input = strings.TrimSpace(input); input == "" {
 		return errors.New("scan: empty <path|git-url> argument")
 	}
-	if root.withEmbeddings {
-		// Stage 5.5 wires this; until then opt-in is rejected so
-		// the operator does not silently get a no-op publisher.
-		return errors.New("scan: --with-embeddings is not implemented yet (Stage 5.5)")
-	}
 
 	stdout := runner.stdout
 	if stdout == nil {
@@ -181,7 +190,40 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 		return fmt.Errorf("scan: cannot classify input %q (use file://, an absolute path, or a git URL)", input)
 	}
 
-	// 2. Open the sink BEFORE materializing so an unwritable
+	// 2. Stage 5.5 -- preflight the opt-in embedding publisher
+	// BEFORE any side-effecting work (sink open, materialize,
+	// ancestry writes). A misconfigured --with-embeddings (e.g.
+	// default --store=sqlite, missing AGENT_MEMORY_QDRANT_URL,
+	// failing Postgres ping) must fail without leaving a partial
+	// SQLite graph on disk -- per evaluator iter-1 feedback #1.
+	//
+	// When the flag is absent we skip this block entirely, so
+	// the default scan path makes ZERO embedder env reads per
+	// tech-spec C8.
+	var embedPub ast.NodeEmbeddingPublisher
+	if root.withEmbeddings {
+		factory := runner.newEmbeddingPublisher
+		if factory == nil {
+			factory = defaultEmbeddingPublisherFactory
+		}
+		pub, closer, perr := factory(ctx, root)
+		if perr != nil {
+			return fmt.Errorf("scan: --with-embeddings: %w", perr)
+		}
+		if pub == nil {
+			return errors.New("scan: --with-embeddings: factory returned nil publisher")
+		}
+		embedPub = pub
+		if closer != nil {
+			defer func() {
+				if cerr := closer(); cerr != nil {
+					slog.Warn("scan.embedding_publisher_close_failed", "error", cerr.Error())
+				}
+			}()
+		}
+	}
+
+	// 3. Open the sink BEFORE materializing so an unwritable
 	// --out fails fast without paying the git fetch / Walk cost.
 	opener := runner.openSink
 	if opener == nil {
@@ -276,6 +318,13 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 		dopts = append(dopts, ast.WithParsers(scanParsers...))
 	}
 	dopts = append(dopts, runner.dispatchOpts...)
+
+	// Stage 5.5 -- attach the embedding publisher constructed
+	// during the eager preflight above (nil when --with-embeddings
+	// is absent, in which case no publisher option is appended).
+	if embedPub != nil {
+		dopts = append(dopts, ast.WithEmbeddingPublisher(embedPub))
+	}
 
 	dispatcher := ast.NewDispatcher(counter, dopts...)
 

@@ -85,13 +85,3 @@ func TestBuildExprExcludesProd(t *testing.T) {
 		})
 	}
 }
-
-// TestBuildTag_RealDevpolicyTree is a regression guard
-// that runs the analyzer against the real
-// `internal/cli/devpolicy` package via the
-// `make lint-cli` Makefile target (driven by `go vet`).
-// The Makefile path is the source-of-truth regression
-// guard because analysistest runs in GOPATH mode and
-// cannot resolve module-mode imports against the real
-// service tree. See `tools/buildtaglint/README.md` for
-// the rationale.

@@ -4,7 +4,7 @@
 // </copyright>
 // -----------------------------------------------------------------------
 
-// Package buildtaglint hosts the two custom `go/analysis`
+// Package lint hosts the two custom `go/analysis`
 // analyzers required by `docs/stories/code-intelligence-REFACTOR-GUIDE/tech-spec.md`
 // Sec 8.10:
 //

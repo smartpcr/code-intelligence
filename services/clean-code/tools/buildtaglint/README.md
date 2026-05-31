@@ -76,7 +76,7 @@ Under the hood, `make lint-cli`:
 
 1. Builds the multichecker binary at `bin/buildtaglint`.
 2. Invokes `go vet -vettool=bin/buildtaglint ./cmd/cleanc/... ./internal/cli/...`.
-3. Invokes `golangci-lint run --disable-all --enable forbidigo`
+3. Invokes `golangci-lint run --enable-only forbidigo`
    on the same package set so the forbidigo rule
    (which catches symbol-use violations under the same
    `no-production-sql-import` name) runs end-to-end too.

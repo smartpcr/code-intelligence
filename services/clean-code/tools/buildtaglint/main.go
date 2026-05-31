@@ -14,9 +14,10 @@
 //
 // Invoked from `make lint-cli` as:
 //
-//go build -o bin/buildtaglint ./tools/buildtaglint
-//go vet -vettool=$(pwd)/bin/buildtaglint \
-//    ./cmd/cleanc/... ./internal/cli/...
+// go build -o bin/buildtaglint ./tools/buildtaglint
+//
+//	go vet -vettool=$(pwd)/bin/buildtaglint \
+//	   ./cmd/cleanc/... ./internal/cli/...
 //
 // The two analyzers are composed under `multichecker.Main`
 // so `go vet` invokes both in a single pass; a violation in
@@ -28,14 +29,14 @@
 package main
 
 import (
-"golang.org/x/tools/go/analysis/multichecker"
+	"golang.org/x/tools/go/analysis/multichecker"
 
-bt "github.com/smartpcr/code-intelligence/services/clean-code/tools/buildtaglint/lint"
+	bt "github.com/smartpcr/code-intelligence/services/clean-code/tools/buildtaglint/lint"
 )
 
 func main() {
-multichecker.Main(
-bt.BuildTagAnalyzer,
-bt.SQLImportAnalyzer,
-)
+	multichecker.Main(
+		bt.BuildTagAnalyzer,
+		bt.SQLImportAnalyzer,
+	)
 }

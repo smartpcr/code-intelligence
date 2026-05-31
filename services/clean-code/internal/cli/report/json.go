@@ -104,6 +104,9 @@ var _ Renderer = (*JSON)(nil)
 // before any bytes are written so a downstream consumer
 // either sees the full document or no document at all.
 func (JSON) Render(ctx context.Context, art RunArtifact, w io.Writer) error {
+	if w == nil {
+		return fmt.Errorf("report: json render requires a non-nil writer")
+	}
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("report: json render cancelled before write: %w", err)
 	}

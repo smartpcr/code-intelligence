@@ -262,3 +262,39 @@ func TestJSON_WriterErrorSurfaced(t *testing.T) {
 type failingWriter struct{ err error }
 
 func (f *failingWriter) Write(p []byte) (int, error) { return 0, f.err }
+
+// TestJSON_RejectsNilWriter pins the iter-1 evaluator's
+// hardening ask: the renderer MUST surface a clear error for
+// a nil writer rather than panicking inside
+// json.NewEncoder(nil).Encode. Composition-root callers pass
+// the user-supplied `--findings <path>` file handle directly
+// here; a nil-writer panic would mask the operator's typo as
+// a stack trace. Mirrors Markdown.Render's nil-writer
+// contract (markdown_test.go TestMarkdown_RejectsNilWriter).
+func TestJSON_RejectsNilWriter(t *testing.T) {
+	err := (report.JSON{}).Render(context.Background(), report.RunArtifact{}, nil)
+	if err == nil {
+		t.Fatal("Render(..., nil writer) returned nil error; want non-nil")
+	}
+	if !strings.Contains(err.Error(), "non-nil writer") {
+		t.Errorf("expected error to mention `non-nil writer`; got %v", err)
+	}
+}
+
+// TestJSON_NilWriterCheckPrecedesEncode is a defence-in-depth
+// assertion: when BOTH the writer is nil AND the context is
+// cancelled, the nil-writer guard MUST fire first so the
+// operator's most-actionable diagnostic (their CLI flag points
+// to nowhere) is the one they see -- not a cancellation wrap
+// that hides the underlying configuration error.
+func TestJSON_NilWriterCheckPrecedesEncode(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := (report.JSON{}).Render(ctx, report.RunArtifact{}, nil)
+	if err == nil {
+		t.Fatal("Render(cancelled ctx, nil writer) returned nil error; want non-nil")
+	}
+	if !strings.Contains(err.Error(), "non-nil writer") {
+		t.Errorf("expected nil-writer error to take precedence over ctx cancellation; got %v", err)
+	}
+}

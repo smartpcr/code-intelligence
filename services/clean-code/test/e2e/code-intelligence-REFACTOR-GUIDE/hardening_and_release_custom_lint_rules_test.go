@@ -11,6 +11,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -146,10 +147,14 @@ func (s *customLintRulesState) runLintCLIFallback() error {
 }
 
 // cleanup removes any fixture files created during the scenario.
-func (s *customLintRulesState) cleanup() {
+func (s *customLintRulesState) cleanup() error {
+	var errs []error
 	for _, f := range s.fixtureFiles {
-		os.Remove(f)
+		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
 	}
+	return errors.Join(errs...)
 }
 
 // --- Given steps ---
@@ -245,7 +250,9 @@ func InitializeScenario_hardening_and_release_custom_lint_rules(ctx *godog.Scena
 	s := newCustomLintRulesState()
 
 	ctx.After(func(ctx2 context.Context, sc *godog.Scenario, err error) (context.Context, error) {
-		s.cleanup()
+		if cErr := s.cleanup(); cErr != nil {
+			return ctx2, fmt.Errorf("fixture cleanup failed: %w", cErr)
+		}
 		return ctx2, nil
 	})
 

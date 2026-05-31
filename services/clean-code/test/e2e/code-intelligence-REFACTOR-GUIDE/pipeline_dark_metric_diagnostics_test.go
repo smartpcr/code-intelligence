@@ -12,14 +12,15 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/cucumber/godog"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/ast/parser"
-	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/effort"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/orchestrator"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/repocontext"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/scopebinding"
@@ -36,8 +37,9 @@ type darkMetricDiagnosticsState struct {
 	resultErr   error
 	table       *scopebinding.Table
 
-	// effort scenario
-	effortEstimatorName string
+	// moduleRoot is the absolute path to the services/clean-code
+	// module root — needed by the subprocess test.
+	moduleRoot string
 }
 
 func newDarkMetricDiagnosticsState() *darkMetricDiagnosticsState {
@@ -101,6 +103,30 @@ func (s *darkMetricDiagnosticsState) runOrchestrator(opts orchestrator.Options) 
 	return nil
 }
 
+// resolveModuleRoot walks up from the test's working directory
+// to find the services/clean-code module root (contains go.mod).
+func (s *darkMetricDiagnosticsState) resolveModuleRoot() error {
+	if s.moduleRoot != "" {
+		return nil
+	}
+	// godog CWD is the feature-file directory; walk up to find go.mod.
+	dir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("getwd: %w", err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			s.moduleRoot = dir
+			return nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return fmt.Errorf("could not find go.mod walking up from CWD")
+		}
+		dir = parent
+	}
+}
+
 // ---------------------------------------------------------------------------
 // bogusRecipe — a fake recipe whose MetricKind is NOT in
 // metricAttrRequirements so the dark-metric accumulator
@@ -109,10 +135,10 @@ func (s *darkMetricDiagnosticsState) runOrchestrator(opts orchestrator.Options) 
 
 type bogusRecipe struct{}
 
-func (r *bogusRecipe) MetricKind() string                               { return "bogus_metric" }
-func (r *bogusRecipe) Version() int                                     { return 1 }
-func (r *bogusRecipe) Pack() recipes.Pack                               { return recipes.PackBase }
-func (r *bogusRecipe) AppliesTo(_ *parser.AstFile) bool                 { return false }
+func (r *bogusRecipe) MetricKind() string                                    { return "bogus_metric" }
+func (r *bogusRecipe) Version() int                                          { return 1 }
+func (r *bogusRecipe) Pack() recipes.Pack                                    { return recipes.PackBase }
+func (r *bogusRecipe) AppliesTo(_ *parser.AstFile) bool                      { return false }
 func (r *bogusRecipe) Compute(_ *parser.AstFile) []recipes.MetricSampleDraft { return nil }
 
 // ---------------------------------------------------------------------------
@@ -129,15 +155,7 @@ func (s *darkMetricDiagnosticsState) aFixtureGoFileWithOneFunctionWhoseParserDoe
 }
 
 func (s *darkMetricDiagnosticsState) aRecipeRegisteredWithBogusMetricKindAndFakeAppliesToReturningFalse() error {
-	// Fixture file needed so the orchestrator actually parses something.
 	return s.writeFixture("pkg/stub.go", "package pkg\n\nfunc Stub() {}\n")
-}
-
-func (s *darkMetricDiagnosticsState) aFixtureWhereTheONNXEffortModelPathResolvesToAMissingFile() error {
-	// No ONNX model file exists anywhere — the fallback estimator is the
-	// only effort source available. This step is a no-op because the test
-	// environment never has an ONNX model.
-	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -150,24 +168,16 @@ func (s *darkMetricDiagnosticsState) theOrchestratorRuns() error {
 
 func (s *darkMetricDiagnosticsState) theOrchestratorRunsWithTheBogusRecipe() error {
 	reg := recipes.NewRegistry()
-	// Register the real loc recipe so we have at least one lit recipe.
 	reg.Register(recipes.NewLocRecipe())
-	// Register the bogus recipe whose MetricKind is not in metricAttrRequirements.
 	reg.Register(&bogusRecipe{})
 	return s.runOrchestrator(orchestrator.Options{Recipes: reg})
-}
-
-func (s *darkMetricDiagnosticsState) theFallbackEffortEstimatorIsResolved() error {
-	m := effort.NewFallbackModel()
-	s.effortEstimatorName = m.Name()
-	return nil
 }
 
 // ---------------------------------------------------------------------------
 // Then steps
 // ---------------------------------------------------------------------------
 
-func (s *darkMetricDiagnosticsState) darkMetricsIncludesCycloRow(metricKind, language, missingAttr, closurePhase string) error {
+func (s *darkMetricDiagnosticsState) darkMetricsIncludesCycloRowExact(metricKind, language, missingAttr string, exactCount int, closurePhase string) error {
 	if s.resultErr != nil {
 		return fmt.Errorf("orchestrator returned error: %w", s.resultErr)
 	}
@@ -176,21 +186,13 @@ func (s *darkMetricDiagnosticsState) darkMetricsIncludesCycloRow(metricKind, lan
 	}
 	for _, dm := range s.result.Diagnostics.DarkMetrics {
 		if dm.MetricKind == metricKind && dm.Language == language {
-			// Verify missing_attrs contains the expected attr.
-			found := false
-			for _, a := range dm.MissingAttrs {
-				if a == missingAttr {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return fmt.Errorf("(%q,%q).MissingAttrs = %v, want to contain %q",
+			if len(dm.MissingAttrs) != 1 || dm.MissingAttrs[0] != missingAttr {
+				return fmt.Errorf("(%q,%q).MissingAttrs = %v, want [%q]",
 					metricKind, language, dm.MissingAttrs, missingAttr)
 			}
-			if dm.AffectedScopeCount < 1 {
-				return fmt.Errorf("(%q,%q).AffectedScopeCount = %d, want >= 1",
-					metricKind, language, dm.AffectedScopeCount)
+			if dm.AffectedScopeCount != exactCount {
+				return fmt.Errorf("(%q,%q).AffectedScopeCount = %d, want exactly %d",
+					metricKind, language, dm.AffectedScopeCount, exactCount)
 			}
 			if dm.ClosurePhase != closurePhase {
 				return fmt.Errorf("(%q,%q).ClosurePhase = %q, want %q",
@@ -215,45 +217,76 @@ func (s *darkMetricDiagnosticsState) darkMetricsDoesNotIncludeMetricKind(metricK
 	}
 	for _, dm := range s.result.Diagnostics.DarkMetrics {
 		if dm.MetricKind == metricKind {
-			return fmt.Errorf("metric_kind=%q found in DarkMetrics but should NOT be flagged dark (it lights up today)",
+			return fmt.Errorf("metric_kind=%q found in DarkMetrics but should NOT be flagged dark",
 				metricKind)
 		}
 	}
 	return nil
 }
 
-func (s *darkMetricDiagnosticsState) closedSetValidationRejectsRowWithBogusAttr(bogusAttr string) error {
-	// Reproduce the closed-set validation logic from
-	// orchestrator/dark_metrics.go:validateMetricAttrRequirements.
-	// The real function is unexported, so we replicate the check
-	// to verify the fail-closed property.
-	allowedAttrs := map[string]struct{}{
-		recipes.AttrDecisionBlocks: {},
-		recipes.AttrCallEdges:      {},
-		recipes.AttrFieldAccesses:  {},
+func (s *darkMetricDiagnosticsState) bogusAttrValidationBinaryExitsCode70WithStderrMatchingTechSpec() error {
+	if err := s.resolveModuleRoot(); err != nil {
+		return err
 	}
-	if _, ok := allowedAttrs[bogusAttr]; ok {
-		return fmt.Errorf("attr %q is in the allowed set — use a truly bogus attr for this test", bogusAttr)
+
+	// Build the helper binary into a temp directory so we control
+	// the exit code directly (go run can mask it).
+	tmpDir, err := os.MkdirTemp("", "bogus-attr-bin-*")
+	if err != nil {
+		return fmt.Errorf("mktmpdir: %w", err)
 	}
-	// Construct the expected error string fragment from tech-spec Sec 8.7.
+	defer os.RemoveAll(tmpDir)
+
+	binName := "bogus_attr_exit70"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	binPath := filepath.Join(tmpDir, binName)
+
+	buildCmd := exec.Command("go", "build", "-o", binPath,
+		"./test/e2e/code-intelligence-REFACTOR-GUIDE/testdata/bogus_attr_exit70")
+	buildCmd.Dir = s.moduleRoot
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("go build helper: %v\n%s", err, out)
+	}
+
+	// Run the helper and capture stderr + exit code.
+	runCmd := exec.Command(binPath)
+	var stderrBuf strings.Builder
+	runCmd.Stderr = &stderrBuf
+	runErr := runCmd.Run()
+
+	// Assert exit code 70.
+	if runErr == nil {
+		return fmt.Errorf("helper exited with code 0; want 70")
+	}
+	exitErr, ok := runErr.(*exec.ExitError)
+	if !ok {
+		return fmt.Errorf("unexpected error type %T: %v", runErr, runErr)
+	}
+	if exitErr.ExitCode() != 70 {
+		return fmt.Errorf("exit code = %d; want 70\nstderr: %s", exitErr.ExitCode(), stderrBuf.String())
+	}
+
+	// Assert stderr contains the tech-spec Sec 8.7 error string.
+	stderr := stderrBuf.String()
 	expectedFragment := "NOT in the closed dark-metric attr set (tech-spec Sec 8.7"
-	errMsg := fmt.Sprintf(
-		"row 0 (kind=%q): Attrs[0]=%q is %s line 1008: {%q, %q, %q})",
-		"test_metric", bogusAttr, expectedFragment,
-		recipes.AttrDecisionBlocks, recipes.AttrCallEdges, recipes.AttrFieldAccesses,
-	)
-	if !strings.Contains(errMsg, expectedFragment) {
-		return fmt.Errorf("constructed validation error %q does not contain expected fragment %q", errMsg, expectedFragment)
+	if !strings.Contains(stderr, expectedFragment) {
+		return fmt.Errorf("stderr %q does not contain %q", stderr, expectedFragment)
 	}
-	// Verify the real init-time validation ran without panic (package loaded).
-	// The fact that we reached this line proves the production table passes.
-	_ = orchestrator.DarkMetricClosurePhase // access exported constant — proves package init succeeded
 	return nil
 }
 
-func (s *darkMetricDiagnosticsState) theEffortSourceNameIs(expected string) error {
-	if s.effortEstimatorName != expected {
-		return fmt.Errorf("effort source name = %q, want %q", s.effortEstimatorName, expected)
+func (s *darkMetricDiagnosticsState) diagnosticsEffortSourceIs(expected string) error {
+	if s.resultErr != nil {
+		return fmt.Errorf("orchestrator returned error: %w", s.resultErr)
+	}
+	if s.result == nil {
+		return fmt.Errorf("orchestrator returned nil result")
+	}
+	if s.result.Diagnostics.EffortSource != expected {
+		return fmt.Errorf("Diagnostics.EffortSource = %q, want %q",
+			s.result.Diagnostics.EffortSource, expected)
 	}
 	return nil
 }
@@ -279,20 +312,15 @@ func InitializeScenario_pipeline_dark_metric_diagnostics(ctx *godog.ScenarioCont
 		`^a recipe registered with MetricKind "bogus_metric" not in metricAttrRequirements and a fake AppliesTo returning false$`,
 		s.aRecipeRegisteredWithBogusMetricKindAndFakeAppliesToReturningFalse,
 	)
-	ctx.Step(
-		`^a fixture where the ONNX effort model path resolves to a missing file$`,
-		s.aFixtureWhereTheONNXEffortModelPathResolvesToAMissingFile,
-	)
 
 	// When
 	ctx.Step(`^the orchestrator runs$`, s.theOrchestratorRuns)
 	ctx.Step(`^the orchestrator runs with the bogus recipe$`, s.theOrchestratorRunsWithTheBogusRecipe)
-	ctx.Step(`^the fallback effort estimator is resolved$`, s.theFallbackEffortEstimatorIsResolved)
 
 	// Then
 	ctx.Step(
-		`^Diagnostics\.DarkMetrics includes a row with metric_kind "([^"]*)", language "([^"]*)", missing_attrs containing "([^"]*)", affected_scope_count at least 1, and closure_phase "([^"]*)"$`,
-		s.darkMetricsIncludesCycloRow,
+		`^Diagnostics\.DarkMetrics includes a row with metric_kind "([^"]*)", language "([^"]*)", missing_attrs \["([^"]*)"\], affected_scope_count (\d+), and closure_phase "([^"]*)"$`,
+		s.darkMetricsIncludesCycloRowExact,
 	)
 	ctx.Step(
 		`^Diagnostics\.DarkMetrics does not include any row with metric_kind "([^"]*)"$`,
@@ -303,12 +331,12 @@ func InitializeScenario_pipeline_dark_metric_diagnostics(ctx *godog.ScenarioCont
 		s.darkMetricsDoesNotIncludeMetricKind,
 	)
 	ctx.Step(
-		`^the closed-set validation rejects a row with attr "([^"]*)" with an error matching tech-spec Sec 8\.7$`,
-		s.closedSetValidationRejectsRowWithBogusAttr,
+		`^the bogus_attr validation binary exits code 70 with stderr matching tech-spec Sec 8\.7$`,
+		s.bogusAttrValidationBinaryExitsCode70WithStderrMatchingTechSpec,
 	)
 	ctx.Step(
-		`^the effort source name is "([^"]*)"$`,
-		s.theEffortSourceNameIs,
+		`^Diagnostics\.EffortSource is "([^"]*)"$`,
+		s.diagnosticsEffortSourceIs,
 	)
 }
 

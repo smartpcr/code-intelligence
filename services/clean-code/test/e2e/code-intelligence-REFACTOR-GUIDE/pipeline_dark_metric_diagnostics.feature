@@ -10,7 +10,7 @@ Feature: Dark metric diagnostics
   Scenario: cyclo dark on Go
     Given a fixture Go file with one function whose parser does not stamp decision_blocks
     When the orchestrator runs
-    Then Diagnostics.DarkMetrics includes a row with metric_kind "cyclo", language "go", missing_attrs containing "decision_blocks", affected_scope_count at least 1, and closure_phase "P2"
+    Then Diagnostics.DarkMetrics includes a row with metric_kind "cyclo", language "go", missing_attrs ["decision_blocks"], affected_scope_count 2, and closure_phase "P2"
 
   Scenario: loc not flagged dark
     Given a fixture Go file with one function whose parser does not stamp decision_blocks
@@ -21,9 +21,9 @@ Feature: Dark metric diagnostics
     Given a recipe registered with MetricKind "bogus_metric" not in metricAttrRequirements and a fake AppliesTo returning false
     When the orchestrator runs with the bogus recipe
     Then the dark-metric diagnostic does not include metric_kind "bogus_metric"
-    And the closed-set validation rejects a row with attr "bogus_attr" with an error matching tech-spec Sec 8.7
+    And the bogus_attr validation binary exits code 70 with stderr matching tech-spec Sec 8.7
 
   Scenario: effort source recorded
-    Given a fixture where the ONNX effort model path resolves to a missing file
-    When the fallback effort estimator is resolved
-    Then the effort source name is "fallback"
+    Given a fixture Go file with one function whose parser does not stamp decision_blocks
+    When the orchestrator runs
+    Then Diagnostics.EffortSource is "fallback"

@@ -253,9 +253,9 @@ type DarkMetric struct {
 // rather than at top-level on `Result` so the
 // `--diagnostics` JSON sidecar has a single root.
 //
-// Stage 2.5 emits only `DarkMetrics`; the struct is open
-// for additional fields without a breaking change because
-// every consumer reads named fields.
+// Stage 2.5 emits `DarkMetrics` + `EffortSource`; the
+// struct is open for additional fields without a breaking
+// change because every consumer reads named fields.
 type Diagnostics struct {
 	// DarkMetrics is the deduped, sorted slice of
 	// [DarkMetric] rows. One row per `(MetricKind,
@@ -264,6 +264,18 @@ type Diagnostics struct {
 	// determinism (tech-spec D9). Empty slice (NOT nil)
 	// when every recipe lit up for every language.
 	DarkMetrics []DarkMetric `json:"dark_metrics"`
+
+	// EffortSource is the stable, lowercase, snake_case
+	// identifier of the effort estimator the orchestrator
+	// resolved for this run. When the ONNX model is
+	// unavailable (the default offline/dev scenario), the
+	// value is [effort.FallbackEstimatorName] ("fallback").
+	// Stamped by the orchestrator at the end of Run so
+	// the `--diagnostics` JSON sidecar records which
+	// effort source produced the per-task hours values.
+	//
+	// Anchor: tech-spec Sec 9.3 ("Effort model fallback").
+	EffortSource string `json:"effort_source"`
 }
 
 // darkMetricKey is the dedup key the orchestrator uses

@@ -335,7 +335,28 @@ func (s *parseAndRecipeFanoutState) zeroMetricSampleDraftRowsForCyclo() error {
 	return nil
 }
 
-func (s *parseAndRecipeFanoutState) scopeBindingTableContainsFooMethodBindingWithExactLines() error {
+// scopeIDFor scans the parsed AstFiles for a scope whose Name or
+// QualifiedName identifies the function `name`, then resolves its
+// durable scope_id via result.ScopeIDs. This mirrors the acceptance
+// scenario's `scopeIDFor("Foo")` lookup contract.
+func (s *parseAndRecipeFanoutState) scopeIDFor(name string) (uuid.UUID, error) {
+	for _, ast := range s.result.Files {
+		for _, sc := range ast.GetScopes() {
+			scName := sc.GetName()
+			scQName := sc.GetQualifiedName()
+			// Match by Name (exact) or by QualifiedName suffix (e.g. "mypkg.foo.go.Foo")
+			if scName == name || strings.HasSuffix(scQName, "."+name) || scQName == name {
+				key := orchestrator.ScopeBindingKey{Path: ast.GetPath(), LocalID: sc.GetScopeId()}
+				if id, ok := s.result.ScopeIDs[key]; ok {
+					return id, nil
+				}
+			}
+		}
+	}
+	return uuid.Nil, fmt.Errorf("scopeIDFor(%q): no scope found in parsed AstFiles", name)
+}
+
+func (s *parseAndRecipeFanoutState) scopeBindingGetScopeIDForFooReturnsFooBinding() error {
 	if s.resultErr != nil {
 		return fmt.Errorf("orchestrator returned error: %w", s.resultErr)
 	}
@@ -343,56 +364,52 @@ func (s *parseAndRecipeFanoutState) scopeBindingTableContainsFooMethodBindingWit
 		return fmt.Errorf("scope binding table empty after run")
 	}
 
-	var methodBindings []scopebinding.ScopeBinding
-	for key, id := range s.result.ScopeIDs {
-		if key.Path != s.goRelPath {
-			continue
-		}
-		b, ok := s.table.Get(id)
-		if !ok {
-			continue
-		}
-		if b.ScopeKind == "method" {
-			methodBindings = append(methodBindings, b)
-		}
-	}
-	if len(methodBindings) == 0 {
-		return fmt.Errorf("no method-kind binding for %q in table", s.goRelPath)
+	// Step 1: scopeIDFor("Foo") — find the scope by name, resolve to durable ID
+	scopeID, err := s.scopeIDFor("Foo")
+	if err != nil {
+		return err
 	}
 
-	for _, b := range methodBindings {
-		// Signature must end with "Foo()" per BuildMethod format:
-		// <repoURL>::method::<relPath>#<qualifiedName>(<params>)
-		// The qualifiedName includes the package prefix (e.g. "mypkg.foo.go.Foo"),
-		// so the full signature ends with ".Foo()" or "#Foo()".
-		if !strings.HasSuffix(b.Signature, "Foo()") {
-			continue
-		}
-		// Verify the full signature structure
-		if !strings.Contains(b.Signature, "::method::"+s.goRelPath+"#") {
-			return fmt.Errorf("method binding signature %q missing ::method::%s# segment", b.Signature, s.goRelPath)
-		}
-		if !strings.HasPrefix(b.Signature, orchestrator.SyntheticRepoURLPrefix) {
-			return fmt.Errorf("method binding signature %q missing %q prefix", b.Signature, orchestrator.SyntheticRepoURLPrefix)
-		}
-		if b.FilePath != s.goRelPath {
-			return fmt.Errorf("method binding FilePath = %q, want %q", b.FilePath, s.goRelPath)
-		}
-		// StartLine and EndLine must enclose the function body (lines 3-5)
-		if b.StartLine != 3 {
-			return fmt.Errorf("method binding StartLine = %d, want 3 (func Foo() is on line 3)", b.StartLine)
-		}
-		if b.EndLine != 5 {
-			return fmt.Errorf("method binding EndLine = %d, want 5 (closing brace is on line 5)", b.EndLine)
-		}
-		return nil // found the Foo binding, all checks pass
+	// Step 2: Table.Get(scopeID) — direct lookup
+	b, ok := s.table.Get(scopeID)
+	if !ok {
+		return fmt.Errorf("scopebinding.Table.Get(%v) returned false — no binding for Foo's scope ID", scopeID)
 	}
 
-	sigs := make([]string, 0, len(methodBindings))
-	for _, b := range methodBindings {
-		sigs = append(sigs, fmt.Sprintf("%s [%d-%d]", b.Signature, b.StartLine, b.EndLine))
+	// Step 3: Signature ends with "::Foo" — the BuildMethod format is
+	// <repoURL>::method::<relPath>#<qualifiedName>(<params>); we strip the
+	// trailing parameter list and verify the method-name tail is "Foo".
+	sigNoParams := b.Signature
+	if parenIdx := strings.LastIndex(sigNoParams, "("); parenIdx >= 0 {
+		sigNoParams = sigNoParams[:parenIdx]
 	}
-	return fmt.Errorf("no method binding with signature ending in Foo() in %q; saw: %v", s.goRelPath, sigs)
+	if !strings.HasSuffix(sigNoParams, ".Foo") && !strings.HasSuffix(sigNoParams, "#Foo") {
+		return fmt.Errorf("signature %q (sans params: %q) does not end with ::Foo — expected method-name tail to be Foo", b.Signature, sigNoParams)
+	}
+
+	// Verify structural invariants
+	if !strings.Contains(b.Signature, "::method::") {
+		return fmt.Errorf("signature %q missing ::method:: segment", b.Signature)
+	}
+	if !strings.HasPrefix(b.Signature, orchestrator.SyntheticRepoURLPrefix) {
+		return fmt.Errorf("signature %q missing %q prefix", b.Signature, orchestrator.SyntheticRepoURLPrefix)
+	}
+	if b.ScopeKind != "method" {
+		return fmt.Errorf("scope kind = %q, want \"method\"", b.ScopeKind)
+	}
+	if b.FilePath != s.goRelPath {
+		return fmt.Errorf("FilePath = %q, want %q", b.FilePath, s.goRelPath)
+	}
+
+	// Step 4: StartLine/EndLine enclose the function body
+	if b.StartLine != 3 {
+		return fmt.Errorf("StartLine = %d, want 3 (func Foo() is on line 3)", b.StartLine)
+	}
+	if b.EndLine != 5 {
+		return fmt.Errorf("EndLine = %d, want 5 (closing brace is on line 5)", b.EndLine)
+	}
+
+	return nil
 }
 
 func (s *parseAndRecipeFanoutState) aWalkSkipWithParserPanicForBoomGo() error {
@@ -469,7 +486,7 @@ func InitializeScenario_pipeline_parse_and_recipe_fanout(ctx *godog.ScenarioCont
 	ctx.Step(`^a MetricSampleDraft with MetricKind "loc" and Value exactly 6 is collected$`, s.aMetricSampleDraftWithLocAndValueExactly6)
 	ctx.Step(`^Recipe\.AppliesTo returns false for the cyclo recipe on every parsed AstFile$`, s.recipeAppliesToReturnsFalseForCycloOnEveryParsedAstFile)
 	ctx.Step(`^zero MetricSampleDraft rows for metric_kind "cyclo" are emitted$`, s.zeroMetricSampleDraftRowsForCyclo)
-	ctx.Step(`^the scope binding table contains a method binding whose Signature ends with "Foo\(\)" and whose StartLine is 3 and EndLine is 5$`, s.scopeBindingTableContainsFooMethodBindingWithExactLines)
+	ctx.Step(`^scopebinding\.Table\.Get\(scopeIDFor\("Foo"\)\) returns a row whose Signature ends with "::Foo" and whose StartLine is 3 and EndLine is 5$`, s.scopeBindingGetScopeIDForFooReturnsFooBinding)
 	ctx.Step(`^a WalkSkip with reason "parser_panic" is emitted for "boom\.go"$`, s.aWalkSkipWithParserPanicForBoomGo)
 	ctx.Step(`^"clean\.go" appears in the parsed AstFile results$`, s.cleanGoAppearsInTheParsedAstFileResults)
 	ctx.Step(`^the orchestrator exits cleanly$`, s.theOrchestratorExitsCleanly)

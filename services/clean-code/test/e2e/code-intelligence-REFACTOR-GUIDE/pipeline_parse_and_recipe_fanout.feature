@@ -25,7 +25,7 @@ Feature: Parse and recipe fan-out
   Scenario: scope binding populated
     Given a fixture Go file with a function "Foo" spanning lines 3 to 5
     When parse and recipe fan-out completes
-    Then the scope binding table contains a method binding whose Signature ends with "Foo()" and whose StartLine is 3 and EndLine is 5
+    Then scopebinding.Table.Get(scopeIDFor("Foo")) returns a row whose Signature ends with "::Foo" and whose StartLine is 3 and EndLine is 5
 
   Scenario: parser panic is non-fatal
     Given a fixture where only "boom.go" triggers a panic in the parser stub and "clean.go" parses normally

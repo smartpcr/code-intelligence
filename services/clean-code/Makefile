@@ -57,7 +57,7 @@ PROTO_FILES         ?= ast/v1/ast.proto
 PG_URL ?= postgres://clean_code_admin:e2e_test_password@localhost:5432/clean_code?sslmode=disable
 COMPOSE_FILE ?= ../../tests/e2e/phase-09-audit-wal/docker-compose.yml
 
-.PHONY: build build-prod test test-prod test-cgo test-nocgo test-race lint vet tidy clean proto proto-tools docker-build compose-up compose-down update-cli-golden
+.PHONY: build build-prod test test-prod test-cgo test-nocgo test-race lint lint-cli vet tidy clean proto proto-tools docker-build compose-up compose-down update-cli-golden
 .PHONY: migrate-up migrate-down seed-phase-09 test-phase-09
 .PHONY: test-e2e
 
@@ -145,8 +145,41 @@ test-cgo:
 test-race:
 	$(GO) test -race $(GO_PKGS)
 
-lint:
+## lint: run golangci-lint over every Go package. Depends on
+## `lint-cli` so the two custom lint rules required by
+## tech-spec REFACTOR-GUIDE Sec 8.10 (no-production-sql-import
+## + no-production-build-tag-bypass) ALWAYS run as part of a
+## standard `make lint` developer workflow.
+lint: lint-cli
 	$(GOLANGCI_LINT) run $(GO_PKGS)
+
+## lint-cli: run the CLI-specific custom lint rules.
+##
+## 1. `no-production-build-tag-bypass` (tech-spec Sec 8.10):
+##    a stdlib-only `go vet`-style analyser under
+##    `tools/buildtaglint/` that walks
+##    `internal/cli/devpolicy/` and asserts every file which
+##    constructs a `steward.PolicyVersion` with nil
+##    `Signature` carries `//go:build !prod`.
+##
+## 2. `no-production-sql-import` (tech-spec Sec 8.10): a
+##    `forbidigo` config rule under `.golangci.yml` scoped
+##    via `path-except` to `cmd/cleanc/...` and
+##    `internal/cli/...`. The rule fires when those trees
+##    use `database/sql` or import any `*_sql_store` adapter.
+##    The rule itself runs as part of `golangci-lint run`
+##    (the `lint` target above); this target additionally
+##    asserts the config still loads cleanly so an
+##    accidental edit to `.golangci.yml` that drops the
+##    `forbidigo` linter block is caught immediately.
+lint-cli:
+	@echo "==> buildtaglint (no-production-build-tag-bypass)"
+	$(GO) run ./tools/buildtaglint ./internal/cli/devpolicy
+	@echo "==> golangci-lint config sanity check (no-production-sql-import)"
+	@$(GOLANGCI_LINT) linters 2>/dev/null | grep -q '^forbidigo:' || { \
+		echo "ERROR: forbidigo linter not enabled in .golangci.yml (tech-spec Sec 8.10)"; \
+		exit 1; \
+	}
 
 vet:
 	$(GO) vet $(GO_PKGS)

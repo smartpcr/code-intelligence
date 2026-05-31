@@ -30,4 +30,4 @@ Verdict: block
 ## Diagnostics
 
 - **Effort source:** fallback
-- **Refactor prompts emitted:** 0
+- **Prompts emitted:** 0

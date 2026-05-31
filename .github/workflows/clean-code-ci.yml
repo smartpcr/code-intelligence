@@ -70,6 +70,20 @@ jobs:
       - name: make lint
         run: make lint
 
+      - name: make lint-cli
+        # Dedicated CI step for the custom lint rules
+        # required by tech-spec REFACTOR-GUIDE Sec 8.10:
+        # `no-production-sql-import` and
+        # `no-production-build-tag-bypass`. `make lint`
+        # above already chains into `lint-cli`, but a
+        # dedicated step makes the rule failure surface
+        # explicitly in the GitHub Checks UI (impl-plan
+        # Stage 5.2 acceptance scenario "lint-cli step in
+        # CI"). The duplicate invocation is cheap (the
+        # vettool binary is cached by Go's build cache
+        # between the two calls).
+        run: make lint-cli
+
       - name: make build
         run: make build
 

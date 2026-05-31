@@ -34,6 +34,12 @@ linters:
     - goimports
     - misspell
     - revive
+    # Custom import guard for the CLI package trees
+    # (tech-spec REFACTOR-GUIDE Sec 8.10, rule
+    # `no-production-sql-import`). Scoped to
+    # `cmd/cleanc/...` and `internal/cli/...` via
+    # the path-except exclude rule below.
+    - forbidigo
 
 linters-settings:
   gofmt:
@@ -67,7 +73,56 @@ linters-settings:
       - name: unreachable-code
       - name: redefines-builtin-id
 
+  # ---------------------------------------------------------------
+  # `no-production-sql-import` (tech-spec REFACTOR-GUIDE Sec 8.10)
+  #
+  # The `cmd/cleanc/...` and `internal/cli/...` package trees are
+  # the CLI composition root for `cleanc` and MUST NOT depend on
+  # any production SQL store. Specifically, they MUST NOT import
+  # the stdlib `database/sql` package, nor any in-tree package
+  # whose import path ends in `_sql_store` / `.sql_store` (the
+  # repo's convention for the PostgreSQL-backed reader/writer
+  # adapters under `internal/policy/{keys,steward}/sql_store.go`
+  # and `internal/rule_engine/sql_store.go`). The Sec 4.6
+  # in-memory readers/writers are the only allowed reader/writer
+  # constructors at the CLI composition root.
+  #
+  # forbidigo with `analyze-types: true` matches against the
+  # fully-qualified package symbol (e.g. `database/sql.DB`,
+  # `database/sql.Open`), so a forbidden symbol triggers the
+  # rule wherever it is used, which implies the import was
+  # made. Combined with the `path-except` exclusion below,
+  # the rule only fires inside the CLI tree.
+  forbidigo:
+    analyze-types: true
+    exclude-godoc-examples: true
+    forbid:
+      - p: '^database/sql\..*$'
+        msg: >-
+          no-production-sql-import: cmd/cleanc/... and
+          internal/cli/... MUST NOT import database/sql.
+          Use the in-memory readers/writers from
+          internal/rule_engine/inmem_store.go and
+          internal/refactor/planner.go (Sec 4.6).
+      - p: '^.*[_./]sql_store\..*$'
+        msg: >-
+          no-production-sql-import: cmd/cleanc/... and
+          internal/cli/... MUST NOT import any *_sql_store
+          adapter. The CLI composition root binds to the
+          in-memory variants only (tech-spec Sec 8.10).
+
 issues:
   exclude-use-default: false
   max-issues-per-linter: 0
   max-same-issues: 0
+  exclude-rules:
+    # `no-production-sql-import` is scoped to the CLI composition
+    # root only (tech-spec REFACTOR-GUIDE Sec 8.10). Suppress the
+    # `forbidigo` linter for every file OUTSIDE `cmd/cleanc/` and
+    # `internal/cli/` so the production services (which legitimately
+    # use database/sql via the *_sql_store adapters) keep linting
+    # clean. golangci-lint resolves `path` relative to the run dir
+    # (services/clean-code), so the regex anchors on that root.
+    - linters:
+        - forbidigo
+      path-except: '(^|/)cmd/cleanc/|(^|/)internal/cli/'

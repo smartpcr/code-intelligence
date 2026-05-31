@@ -57,7 +57,7 @@ PROTO_FILES         ?= ast/v1/ast.proto
 PG_URL ?= postgres://clean_code_admin:e2e_test_password@localhost:5432/clean_code?sslmode=disable
 COMPOSE_FILE ?= ../../tests/e2e/phase-09-audit-wal/docker-compose.yml
 
-.PHONY: build build-prod test test-prod test-cgo test-nocgo test-race lint vet tidy clean proto proto-tools docker-build compose-up compose-down update-cli-golden
+.PHONY: build build-prod test test-prod test-cgo test-nocgo test-race lint lint-cli vet tidy clean proto proto-tools docker-build compose-up compose-down update-cli-golden
 .PHONY: migrate-up migrate-down seed-phase-09 test-phase-09
 .PHONY: test-e2e
 
@@ -145,8 +145,51 @@ test-cgo:
 test-race:
 	$(GO) test -race $(GO_PKGS)
 
-lint:
+## lint: run golangci-lint over every Go package. Depends on
+## `lint-cli` so the two custom lint rules required by
+## tech-spec REFACTOR-GUIDE Sec 8.10 (no-production-sql-import
+## + no-production-build-tag-bypass) ALWAYS run as part of a
+## standard `make lint` developer workflow.
+lint: lint-cli
 	$(GOLANGCI_LINT) run $(GO_PKGS)
+
+## lint-cli: run the two CLI-specific custom lint rules
+## end-to-end against the real `cmd/cleanc/...` and
+## `internal/cli/...` source trees (tech-spec
+## REFACTOR-GUIDE Sec 8.10).
+##
+## Step 1 -- build the custom `go vet` analyser binary.
+## The binary multiplexes two `go/analysis` analyzers
+## (`nobuildtagbypass`, `nocliproductionsqlimport`) under
+## `multichecker.Main` so a single `go vet` invocation
+## exercises BOTH rules. See `tools/buildtaglint/README.md`
+## for the rule reference.
+##
+## Step 2 -- invoke `go vet -vettool=<binary>` over the
+## CLI source trees. A violation in either analyzer prints
+## `file:line:col: <rule-name>: <message>` to stderr (the
+## rule name is part of the diagnostic message so `grep`
+## for "no-production-sql-import" or
+## "no-production-build-tag-bypass" surfaces the relevant
+## hit) and produces a non-zero exit status that aborts
+## the build.
+##
+## Step 3 -- run the forbidigo half of the SQL-import
+## rule via golangci-lint. The vettool's import-list walker
+## catches blank imports that forbidigo cannot see (per
+## evaluator iter 1, item #2); golangci-lint's forbidigo
+## rule catches symbol-use violations under the same name
+## and supplies the canonical `golangci-lint`-style output
+## that CI dashboards already parse. Both layers run on
+## every PR so a regression on either path fails fast.
+lint-cli:
+	@echo "==> buildtaglint: building vettool"
+	@mkdir -p $(BIN_DIR)
+	@$(GO) build -o $(BIN_DIR)/buildtaglint ./tools/buildtaglint
+	@echo "==> go vet -vettool=buildtaglint ./cmd/cleanc/... ./internal/cli/..."
+	$(GO) vet -vettool=$(BIN_DIR)/buildtaglint ./cmd/cleanc/... ./internal/cli/...
+	@echo "==> golangci-lint forbidigo (no-production-sql-import) on cmd/cleanc + internal/cli"
+	$(GOLANGCI_LINT) run --enable-only forbidigo ./cmd/cleanc/... ./internal/cli/...
 
 vet:
 	$(GO) vet $(GO_PKGS)

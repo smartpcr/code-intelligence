@@ -506,7 +506,7 @@ func runAnalyzePipeline(ctx context.Context, stdout, stderr io.Writer, g *flags.
 	// runs. We copy to avoid mutating the store's internal
 	// slice — downstream callers may rely on insertion order.
 	storeFindings := store.Findings()
-	findings := make([]finding.Finding, len(storeFindings))
+	findings := make([]rule_engine.Finding, len(storeFindings))
 	copy(findings, storeFindings)
 	sort.Slice(findings, func(i, j int) bool {
 		a, b := findings[i], findings[j]

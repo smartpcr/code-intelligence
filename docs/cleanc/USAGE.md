@@ -9,8 +9,9 @@
 > verb is reserved and rejected at the dispatcher pending
 > operator pin `cli-l7-authority`.
 >
-> **Authority order** (per repository `README.md`): when this
-> document and the source disagree, the **specs win** —
+> **Authority order** (per repository `README.md` and the story's
+> "docs win" rule): when this document and the source disagree,
+> the **specs win** —
 > `docs/stories/code-intelligence-REFACTOR-GUIDE/`.  This file
 > is operator documentation; the contract lives in
 > [`tech-spec.md`](../stories/code-intelligence-REFACTOR-GUIDE/tech-spec.md)
@@ -43,9 +44,9 @@ Every flag in this table is registered on **both** `analyze` and
 `report` so the two verbs share a byte-identical surface. The
 defaults are pinned in `services/clean-code/internal/cli/flags`
 (constants `Default*`) and asserted in
-`flags_test.go`. The single source of truth for the default
-matrix is the flags package, not this document — if the table
-below ever disagrees with `flags.go`, the source wins.
+`flags_test.go`. The defaults live in tech-spec Sec 8.1 — if the
+table below ever disagrees with `flags.go`, the **docs win** —
+open a PR that fixes the source, not one that rewrites this table.
 
 | Flag                   | Default       | Notes                                                                                          |
 | ---------------------- | ------------- | ---------------------------------------------------------------------------------------------- |

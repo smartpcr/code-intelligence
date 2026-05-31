@@ -229,8 +229,9 @@ Sub-command surface (the dispatcher's closed set):
 Every flag below is registered on **both** `analyze` and `report` so
 the two verbs share a byte-identical surface. The defaults are pinned
 in `services/clean-code/internal/cli/flags` and asserted by
-`flags_test.go` -- if the table here ever disagrees with the source,
-the source wins.
+`flags_test.go` -- the source mirrors this contract; any drift is a
+bug in the source, not in this document (per the repo / story
+"docs win" authority rule).
 
 | Flag                     | Default          | Purpose                                                                                          |
 | ------------------------ | ---------------- | ------------------------------------------------------------------------------------------------ |

@@ -1,19 +1,20 @@
 # `cleanc` JSONL refactor-prompt format (`RefactorPromptRecord`)
 
-> **Authority order** (per repository `README.md`): when this document
-> and the source disagree, the **source wins** --
-> [`services/clean-code/internal/cli/suggest/record.go`](../../services/clean-code/internal/cli/suggest/record.go).
-> This file is the consumer contract for downstream AI coders; the
-> on-wire shape is pinned by Go struct field tags, asserted by
-> `services/clean-code/internal/cli/suggest/emitter_test.go`, and
-> versioned by the `PromptFormatVersion` constant.
+> **Authority order** (per repository `README.md` and the story's
+> `architecture.md` "docs win" rule): when this document and the
+> source disagree, the **docs / specs win**. The Go struct in
+> [`services/clean-code/internal/cli/suggest/record.go`](../../services/clean-code/internal/cli/suggest/record.go)
+> mirrors the contract defined here; any drift between the two is a
+> bug in the source, not in this document. The on-wire shape is
+> asserted by `services/clean-code/internal/cli/suggest/emitter_test.go`
+> and versioned by the `PromptFormatVersion` constant.
 >
 > **Spec anchors:** REFACTOR-GUIDE
 > [`architecture.md`](../stories/code-intelligence-REFACTOR-GUIDE/architecture.md)
 > Sec 3.7.3 / Sec 4.6 (L7 Option A structured edit instructions);
 > [`tech-spec.md`](../stories/code-intelligence-REFACTOR-GUIDE/tech-spec.md)
-> Sec 4.9 (emitter contract), Sec 8.2 (snippet cap), Sec R12
-> (prompt-format versioning).
+> Sec 4.9 (emitter contract), Sec 8.2 (snippet cap), Sec R5
+> (prompt-format versioning mitigation, line 1192-1198).
 
 ## 1. Wire format
 
@@ -216,6 +217,7 @@ architecture Sec 6.3).
 - [`docs/cleanc/USAGE.md`](USAGE.md) -- operator walkthrough of the
   `--emit-prompts` workflow (§6.3).
 - [`docs/stories/code-intelligence-REFACTOR-GUIDE/tech-spec.md`](../stories/code-intelligence-REFACTOR-GUIDE/tech-spec.md)
-  -- Sec 4.9 emitter contract, Sec 8.2 snippet cap, Sec R12 versioning.
+  -- Sec 4.9 emitter contract, Sec 8.2 snippet cap, Sec R5
+  prompt-format versioning mitigation.
 - [`docs/stories/code-intelligence-REFACTOR-GUIDE/architecture.md`](../stories/code-intelligence-REFACTOR-GUIDE/architecture.md)
   -- Sec 3.7.3 / Sec 4.6 L7 Option A.

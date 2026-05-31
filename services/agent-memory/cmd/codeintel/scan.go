@@ -29,6 +29,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/spf13/cobra"
@@ -49,6 +50,10 @@ type scanFlags struct {
 	out       string
 	langHints []string
 }
+
+// defaultSqliteDirEnv lets tests redirect the auto-derived
+// default sqlite path away from the operator's cwd.
+const defaultSqliteDirEnv = "CODEINTEL_DEFAULT_DB_DIR"
 
 // sinkOpener is the indirection seam unit tests use to drop in a
 // pure-memory backend without touching the SQLite CGO build tag.
@@ -177,12 +182,27 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 	if dbOrOut == "" {
 		dbOrOut = root.db
 	}
+	// Default sqlite output: derive a path from the input so a
+	// bare `codeintel scan <path>` completes per acceptance 8.2.
+	// Operator can always override with --out or --db.
+	if root.store == "sqlite" && dbOrOut == "" {
+		dbOrOut = defaultSqlitePathFor(input, kind)
+		slog.Info("scan.default_sqlite_path",
+			"reason", "no --out or --db supplied",
+			"path", dbOrOut)
+	}
 	sink, sinkClose, err := opener(ctx, root.store, dbOrOut)
 	if err != nil {
 		return fmt.Errorf("scan: open store %q: %w", root.store, err)
 	}
+	// sinkCloseErr captures a deferred export/close failure so
+	// it can be surfaced as the scan's overall result. Without
+	// this the memory backend's JSON write error (see
+	// graphsink/memory/sink.go) would be silently logged.
+	var sinkCloseErr error
 	defer func() {
 		if cerr := sinkClose(); cerr != nil {
+			sinkCloseErr = cerr
 			slog.Warn("scan.sink_close_failed", "error", cerr.Error())
 		}
 	}()
@@ -220,10 +240,20 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 	skipTally := newSkipTally()
 	dispatchLogger := slog.New(skipTally.tee(slog.Default().Handler()))
 
+	// Augment defaultParsers() with Python + TypeScript scanners
+	// (and tree-sitter variants when CGO is on) so the CLI
+	// covers the v1 language set called out in the story §1.
+	// The build-tagged helper returns []ast.Parser; passing it
+	// via WithParsers REPLACES the default set, so we include
+	// everything defaultParsers() would have plus Py/TS.
+	scanParsers := scanDefaultParsers()
 	dopts := append([]ast.DispatcherOption{},
 		ast.WithLogger(dispatchLogger),
 		ast.WithLanguageHints(flags.langHints),
 	)
+	if len(scanParsers) > 0 {
+		dopts = append(dopts, ast.WithParsers(scanParsers...))
+	}
 	dopts = append(dopts, runner.dispatchOpts...)
 
 	dispatcher := ast.NewDispatcher(counter, dopts...)
@@ -241,6 +271,13 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 		if eErr != nil {
 			return fmt.Errorf("ancestry per-file (%s): %w", file.RelPath, eErr)
 		}
+		// Snapshot the skip count before EmitFile so we can
+		// distinguish "parsed" from "skipped" without trusting
+		// nil-error semantics: the dispatcher returns nil for
+		// no_parser and pwsh_not_available skips, so a naive
+		// "nil means parsed" branch over-counts skips as parsed
+		// (per evaluator iter-1 feedback item 3).
+		preSkip := skipTally.totalCount()
 		_, emErr := dispatcher.EmitFile(ctx, repoindexer.EmitFileEvent{
 			RepoID:        ancestry.RepoID,
 			RepoURL:       ws.URL(),
@@ -260,7 +297,9 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 			// is therefore a true failure (parser crash, IO).
 			return fmt.Errorf("ast emitter (%s): %w", file.RelPath, emErr)
 		}
-		atomic.AddInt64(&parsed, 1)
+		if skipTally.totalCount() == preSkip {
+			atomic.AddInt64(&parsed, 1)
+		}
 		return nil
 	})
 	if walkErr != nil {
@@ -280,11 +319,24 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 		Repo:    summaryRepo{URL: ws.URL(), SHA: ws.SHA(), NodeID: ancestry.RepoNodeID},
 		Walked:  int(walked),
 		Parsed:  int(parsed),
-		Nodes:   counter.snapshotNodes(),
-		Edges:   counter.snapshotEdges(),
 		Skipped: skipTally.snapshot(),
 	}
-	return writeScanSummary(stdout, root.logFormat, sum)
+	// Per evaluator iter-1 feedback item 4: report the resulting
+	// scan graph (unique nodes/edges ensured) rather than only
+	// first-insert deltas, so a re-scan of an unchanged repo
+	// still surfaces the graph shape.
+	sum.Nodes = counter.snapshotNodes()
+	sum.Edges = counter.snapshotEdges()
+	if err := writeScanSummary(stdout, root.logFormat, sum); err != nil {
+		return err
+	}
+	if sinkCloseErr != nil {
+		// Propagate a failed --out / sink.Close so an
+		// unwritable export does not look like a clean scan
+		// (per evaluator iter-1 feedback item 6).
+		return fmt.Errorf("scan: sink close: %w", sinkCloseErr)
+	}
+	return nil
 }
 
 // ----- input-kind detection --------------------------------------
@@ -369,6 +421,56 @@ func isWindowsDrivePath(s string) bool {
 
 // ----- sink opener ------------------------------------------------
 
+// defaultSqlitePathFor synthesises a sqlite output path when the
+// operator runs `codeintel scan <path>` with the default
+// `--store=sqlite` and no `--out` / `--db`. The default lives in
+// `${CODEINTEL_DEFAULT_DB_DIR}` (when set, used by tests) or the
+// process cwd; the basename is `<repo>.codeintel.db` so multiple
+// scans in the same directory don't collide.
+func defaultSqlitePathFor(input string, kind inputKind) string {
+	base := repoBaseName(input, kind)
+	if base == "" {
+		base = "repo"
+	}
+	dir := os.Getenv(defaultSqliteDirEnv)
+	if dir == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			dir = cwd
+		} else {
+			dir = "."
+		}
+	}
+	return filepath.Join(dir, base+".codeintel.db")
+}
+
+func repoBaseName(input string, kind inputKind) string {
+	s := input
+	if kind == inputKindFileURL {
+		s = strings.TrimPrefix(s, "file://")
+	}
+	s = strings.TrimRight(s, "/\\")
+	s = strings.TrimSuffix(s, ".git")
+	if i := strings.LastIndexAny(s, "/\\"); i >= 0 {
+		s = s[i+1:]
+	}
+	// Drop any scp/auth prefix that survives (`user@host:` for
+	// inputs that arrived as scp-like git URLs without slashes).
+	if i := strings.LastIndex(s, ":"); i >= 0 {
+		s = s[i+1:]
+	}
+	// Sanitise to a path-safe slug.
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
+}
+
 func defaultSinkOpener(ctx context.Context, store, dbOrOut string) (graphsink.Sink, func() error, error) {
 	switch store {
 	case "sqlite":
@@ -383,11 +485,10 @@ func defaultSinkOpener(ctx context.Context, store, dbOrOut string) (graphsink.Si
 		s := memory.New(memory.Options{ExportPath: dbOrOut})
 		return s, s.Close, nil
 	case "postgres":
-		// Postgres-backed CLI scan needs a pgxpool + the
-		// graphwriter migrations; that wiring belongs in a
-		// follow-up workstream. Fail explicitly so the operator
-		// does not get silent data loss.
-		return nil, nil, errors.New("--store=postgres is not yet supported by `codeintel scan` (use --store=sqlite or --store=memory)")
+		if dbOrOut == "" {
+			return nil, nil, errors.New("--db is required for --store=postgres (postgres:// DSN)")
+		}
+		return openPostgresSink(ctx, dbOrOut)
 	default:
 		return nil, nil, fmt.Errorf("unknown --store %q", store)
 	}
@@ -395,15 +496,20 @@ func defaultSinkOpener(ctx context.Context, store, dbOrOut string) (graphsink.Si
 
 // ----- counting sink decorator -----------------------------------
 
-// countingSink wraps a graphsink.Sink and tallies node/edge
-// insertions by kind so the summary printer doesn't need a second
-// pass over the backing store. Only INSERT calls that report
-// Inserted=true are counted -- idempotent re-hits on an existing
-// row reflect dedupe, not new graph data.
+// countingSink wraps a graphsink.Sink and tallies the unique
+// nodes/edges the scan ensured, regardless of whether each Ensure
+// returned `Inserted=true` (new row) or `Inserted=false` (existing
+// row hit). Dedupe is by NodeID/EdgeID so per-file repeats and
+// re-scans both report the resulting scan graph, not the delta
+// (per evaluator iter-1 feedback item 4).
 type countingSink struct {
 	inner graphsink.Sink
-	nodes map[string]*atomic.Int64
-	edges map[string]*atomic.Int64
+
+	mu        sync.Mutex
+	nodeIDs   map[string]map[string]struct{} // kind -> set of NodeID
+	edgeIDs   map[string]map[string]struct{} // kind -> set of EdgeID
+	nodeKinds []string
+	edgeKinds []string
 }
 
 func newCountingSink(inner graphsink.Sink) *countingSink {
@@ -413,15 +519,17 @@ func newCountingSink(inner graphsink.Sink) *countingSink {
 		"extends", "implements", "overrides", "reads", "writes", "renamed_to",
 	}
 	c := &countingSink{
-		inner: inner,
-		nodes: make(map[string]*atomic.Int64, len(nodeKinds)),
-		edges: make(map[string]*atomic.Int64, len(edgeKinds)),
+		inner:     inner,
+		nodeIDs:   make(map[string]map[string]struct{}, len(nodeKinds)),
+		edgeIDs:   make(map[string]map[string]struct{}, len(edgeKinds)),
+		nodeKinds: nodeKinds,
+		edgeKinds: edgeKinds,
 	}
 	for _, k := range nodeKinds {
-		c.nodes[k] = new(atomic.Int64)
+		c.nodeIDs[k] = make(map[string]struct{})
 	}
 	for _, k := range edgeKinds {
-		c.edges[k] = new(atomic.Int64)
+		c.edgeIDs[k] = make(map[string]struct{})
 	}
 	return c
 }
@@ -451,59 +559,59 @@ func (c *countingSink) EnsureCommit(ctx context.Context, in graphwriter.CommitIn
 }
 func (c *countingSink) InsertNode(ctx context.Context, in graphwriter.NodeInput) (graphwriter.NodeRecord, error) {
 	rec, err := c.inner.InsertNode(ctx, in)
-	if err == nil && rec.Inserted {
-		c.tickNode(in.Kind)
+	if err == nil && rec.NodeID != "" {
+		c.tickNode(in.Kind, rec.NodeID)
 	}
 	return rec, err
 }
 func (c *countingSink) InsertEdge(ctx context.Context, in graphwriter.EdgeInput) (graphwriter.EdgeRecord, error) {
 	rec, err := c.inner.InsertEdge(ctx, in)
-	if err == nil && rec.Inserted {
-		c.tickEdge(in.Kind)
+	if err == nil && rec.EdgeID != "" {
+		c.tickEdge(in.Kind, rec.EdgeID)
 	}
 	return rec, err
 }
 func (c *countingSink) Flush(ctx context.Context) error { return c.inner.Flush(ctx) }
 func (c *countingSink) Close() error                    { return c.inner.Close() }
 
-func (c *countingSink) tickNode(kind string) {
-	if ctr, ok := c.nodes[kind]; ok {
-		ctr.Add(1)
-		return
+func (c *countingSink) tickNode(kind, id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	set, ok := c.nodeIDs[kind]
+	if !ok {
+		set = make(map[string]struct{})
+		c.nodeIDs[kind] = set
 	}
-	// Unknown kind: lazily add a counter so the summary still
-	// reports it. Single-writer in the CLI path so no lock
-	// needed, but the dispatcher may invoke from a goroutine
-	// in the future -- the map is set up once at Scan start so
-	// adding new keys here is the only mutation; gate it with
-	// the per-bucket atomic.Int64 once seen.
-	ctr := new(atomic.Int64)
-	ctr.Add(1)
-	c.nodes[kind] = ctr
+	set[id] = struct{}{}
 }
 
-func (c *countingSink) tickEdge(kind string) {
-	if ctr, ok := c.edges[kind]; ok {
-		ctr.Add(1)
-		return
+func (c *countingSink) tickEdge(kind, id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	set, ok := c.edgeIDs[kind]
+	if !ok {
+		set = make(map[string]struct{})
+		c.edgeIDs[kind] = set
 	}
-	ctr := new(atomic.Int64)
-	ctr.Add(1)
-	c.edges[kind] = ctr
+	set[id] = struct{}{}
 }
 
 func (c *countingSink) snapshotNodes() map[string]int {
-	out := make(map[string]int, len(c.nodes))
-	for k, v := range c.nodes {
-		out[k] = int(v.Load())
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]int, len(c.nodeIDs))
+	for k, set := range c.nodeIDs {
+		out[k] = len(set)
 	}
 	return out
 }
 
 func (c *countingSink) snapshotEdges() map[string]int {
-	out := make(map[string]int, len(c.edges))
-	for k, v := range c.edges {
-		out[k] = int(v.Load())
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]int, len(c.edgeIDs))
+	for k, set := range c.edgeIDs {
+		out[k] = len(set)
 	}
 	return out
 }
@@ -592,6 +700,18 @@ func (t *skipTally) snapshot() skipSnapshot {
 		bx[k] = v
 	}
 	return skipSnapshot{ByReason: br, ByExt: bx}
+}
+
+// totalCount sums the per-reason skip counts. Used by the per-file
+// walk loop to detect whether the dispatcher classified the file
+// as a skip (no_parser, pwsh_not_available, ...) and avoid
+// counting it as parsed.
+func (t *skipTally) totalCount() int {
+	n := 0
+	for _, v := range t.counts {
+		n += v
+	}
+	return n
 }
 
 // ----- summary rendering -----------------------------------------

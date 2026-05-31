@@ -15,9 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -97,84 +95,6 @@ func e2eGoldenFindBash() (string, error) {
 		return "", fmt.Errorf("bash not found: %w", err)
 	}
 	return p, nil
-}
-
-// e2eGoldenNormalize replaces volatile fields (UUIDs, timestamps,
-// absolute paths) and sorts finding lines in the "## Findings"
-// section so that byte-comparison is deterministic across
-// runs and machines.
-func e2eGoldenNormalize(data []byte, moduleRoot string) []byte {
-	s := string(data)
-
-	// Normalise the module root in both slash orientations.
-	fwdRoot := strings.ReplaceAll(moduleRoot, `\`, "/")
-	if fwdRoot != moduleRoot {
-		s = strings.ReplaceAll(s, moduleRoot, "/NORMALIZED_ROOT")
-	}
-	s = strings.ReplaceAll(s, fwdRoot, "/NORMALIZED_ROOT")
-
-	// Replace UUID v4/v5 hex patterns.
-	uuidRe := regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
-	s = uuidRe.ReplaceAllString(s, "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX")
-
-	// Replace ISO-8601 / RFC-3339 timestamps (with optional fractional seconds).
-	tsRe := regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})`)
-	s = tsRe.ReplaceAllString(s, "XXXX-XX-XXTXX:XX:XXZ")
-
-	// Sort finding lines in the "## Findings" section of report.md.
-	// Findings are rendered as "- <rule> [<severity>]" lines.
-	// The engine sorts findings by random UUID, so the order varies.
-	s = e2eGoldenSortFindingSection(s)
-
-	return []byte(s)
-}
-
-// e2eGoldenSortFindingSection sorts the bullet lines inside the
-// "## Findings" section of a rendered report.md. Lines are
-// identified as "- " prefixed lines between the "## Findings"
-// header and the next "##" header (or EOF).
-func e2eGoldenSortFindingSection(s string) string {
-	const header = "## Findings"
-	idx := strings.Index(s, header)
-	if idx < 0 {
-		return s
-	}
-	// Find the start of finding lines (after the header line).
-	afterHeader := idx + len(header)
-	nlAfterHeader := strings.Index(s[afterHeader:], "\n")
-	if nlAfterHeader < 0 {
-		return s
-	}
-	findingsStart := afterHeader + nlAfterHeader + 1
-
-	// Find the end of the findings section (next "##" or EOF).
-	rest := s[findingsStart:]
-	findingsEnd := len(s)
-	nextSection := strings.Index(rest, "\n##")
-	if nextSection >= 0 {
-		findingsEnd = findingsStart + nextSection
-	}
-
-	// Extract the section and sort only the "- " lines.
-	section := s[findingsStart:findingsEnd]
-	lines := strings.Split(section, "\n")
-	var findingLines []string
-	var preamble []string
-	seenFinding := false
-	for _, l := range lines {
-		if strings.HasPrefix(l, "- ") {
-			findingLines = append(findingLines, l)
-			seenFinding = true
-		} else if !seenFinding {
-			preamble = append(preamble, l)
-		}
-	}
-	sort.Strings(findingLines)
-
-	var sorted []string
-	sorted = append(sorted, preamble...)
-	sorted = append(sorted, findingLines...)
-	return s[:findingsStart] + strings.Join(sorted, "\n") + s[findingsEnd:]
 }
 
 // e2eGoldenDiff produces a readable diff summary for golden mismatches.
@@ -323,19 +243,19 @@ func (s *e2eGoldenState) theObservedExitCodeEquals(expected int) error {
 	return nil
 }
 
-// artifactByteMatchesGolden normalises both the actual artifact
-// (produced by run.sh) and the committed golden file, then performs
-// a byte-level comparison. This satisfies the acceptance criterion
-// "report.md byte-matches golden" while accounting for the non-
-// deterministic fields the binary produces (random UUIDs, wall-clock
-// timestamps, machine-specific absolute paths).
+// artifactByteMatchesGolden reads the artifact file that run.sh
+// wrote to the scenario directory and byte-compares it against
+// the committed golden file. run.sh is responsible for producing
+// a stable, normalized report.md (volatile fields like UUIDs,
+// timestamps, and absolute paths are replaced by run.sh itself);
+// this step performs NO normalization — it is a raw byte-match.
 //
-// Set UPDATE_GOLDEN=1 to regenerate the golden file from the current
-// binary output (normalised).
+// Set UPDATE_GOLDEN=1 to overwrite the golden with the current
+// run.sh output.
 func (s *e2eGoldenState) artifactByteMatchesGolden(artifact, scenario string) error {
 	moduleRoot := s.resolveModuleRoot()
 
-	// Read the actual artifact produced by run.sh.
+	// Read the artifact produced by run.sh.
 	actualPath := filepath.Join(s.scenarioDir, artifact)
 	actual, err := os.ReadFile(actualPath)
 	if err != nil {
@@ -346,18 +266,14 @@ func (s *e2eGoldenState) artifactByteMatchesGolden(artifact, scenario string) er
 		return fmt.Errorf("%s was produced but is empty", artifact)
 	}
 
-	normActual := e2eGoldenNormalize(actual, moduleRoot)
-
-	// Update mode: regenerate golden from current binary output.
 	goldenPath := filepath.Join(moduleRoot, "tests", "e2e", "cleanc", "scenarios", scenario, "golden", artifact)
+
+	// Update mode: overwrite golden with current run.sh output.
 	if os.Getenv("UPDATE_GOLDEN") == "1" {
 		if err := os.MkdirAll(filepath.Dir(goldenPath), 0o755); err != nil {
 			return fmt.Errorf("mkdir golden: %w", err)
 		}
-		if err := os.WriteFile(goldenPath, normActual, 0o644); err != nil {
-			return fmt.Errorf("write golden: %w", err)
-		}
-		return nil
+		return os.WriteFile(goldenPath, actual, 0o644)
 	}
 
 	// Read the committed golden file.
@@ -366,14 +282,10 @@ func (s *e2eGoldenState) artifactByteMatchesGolden(artifact, scenario string) er
 		return fmt.Errorf("read golden %s: %w (run UPDATE_GOLDEN=1 to generate)", goldenPath, err)
 	}
 
-	// Normalise the golden too (the committed file already is,
-	// but this ensures consistency if the golden was hand-edited).
-	normGolden := e2eGoldenNormalize(golden, moduleRoot)
-
-	if !bytes.Equal(normActual, normGolden) {
-		return fmt.Errorf("%s normalised golden mismatch for %s:\n%s",
+	if !bytes.Equal(actual, golden) {
+		return fmt.Errorf("%s does not byte-match golden for %s:\n%s",
 			artifact, scenario,
-			e2eGoldenDiff(string(normGolden), string(normActual), 30))
+			e2eGoldenDiff(string(golden), string(actual), 30))
 	}
 	return nil
 }

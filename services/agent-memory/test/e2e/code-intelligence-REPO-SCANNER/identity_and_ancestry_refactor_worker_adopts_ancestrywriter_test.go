@@ -135,7 +135,7 @@ func (w *runFullRecordingWriter) InsertNode(_ context.Context, in graphwriter.No
 		Kind:               in.Kind,
 		CanonicalSignature: in.CanonicalSignature,
 		ParentNodeID:       in.ParentNodeID,
-		FingerprintHex:     fmt.Sprintf("%x", fp),
+		FingerprintHex:     fp.Hex(),
 	})
 	return rec, nil
 }
@@ -150,7 +150,6 @@ func (w *runFullRecordingWriter) InsertEdge(_ context.Context, in graphwriter.Ed
 	}
 	w.edgeSeq++
 
-	// Compute edge fingerprint from src/dst node fingerprints.
 	srcFP := w.fpByNodeID[in.SrcNodeID]
 	dstFP := w.fpByNodeID[in.DstNodeID]
 	edgeFP, err := fingerprint.EdgeFingerprint(in.RepoID, in.Kind, srcFP, dstFP, in.FromSHA)
@@ -170,25 +169,25 @@ func (w *runFullRecordingWriter) InsertEdge(_ context.Context, in graphwriter.Ed
 		Kind:           in.Kind,
 		SrcNodeID:      in.SrcNodeID,
 		DstNodeID:      in.DstNodeID,
-		FingerprintHex: fmt.Sprintf("%x", edgeFP),
+		FingerprintHex: edgeFP.Hex(),
 	})
 	return rec, nil
 }
 
 // ---------------------------------------------------------------------------
-// Golden fixture: the exact (kind, canonical_signature, parent,
-// fingerprint) tuples the pre-refactor worker.runFull produced for
-// the 3-file fixture. The refactored worker path through
-// AncestryWriter MUST reproduce these byte-for-byte.
+// COMMITTED GOLDEN SNAPSHOT
 //
-// Fixture files: README.md, pkg/foo.go, pkg/sub/bar.go
-// Repo URL: https://example.test/golden-repo
-// SHA (toSHA): deadbeef1234
-// ParentSHA (fromSHA): aaa111
-// CurrentHeadSHA: bbb222
+// These are the pre-refactor node/edge tuples for the 3-file
+// fixture (README.md, pkg/foo.go, pkg/sub/bar.go) with:
+//   Repo URL:  https://example.test/golden-repo
+//   SHA:       deadbeef1234
+//   Spy RepoID: [0x01, 0…, 0xAA]
 //
-// The spy writer assigns a deterministic RepoID
-// (0x01,0,…,0,0xAA) so fingerprints are reproducible.
+// Fingerprints were computed from the fingerprint package's
+// NodeFingerprint / EdgeFingerprint functions and frozen here.
+// Any drift in the canonical-signature helpers, the fingerprint
+// pre-image format, or the AncestryWriter call sequence shifts
+// these values and fails the test — which is exactly the point.
 // ---------------------------------------------------------------------------
 
 const (
@@ -204,68 +203,68 @@ var goldenFixtureFiles = []string{
 	"pkg/sub/bar.go",
 }
 
-// goldenExpectedNodes is the ordered node sequence AncestryWriter
-// produces. The spy's deterministic RepoID (id[0]=1, id[15]=0xAA)
-// means we can pre-compute fingerprints with the same function.
-type goldenExpectedNode struct {
+type committedNodeSnapshot struct {
 	Kind               string
 	CanonicalSignature string
-	ParentIndex        int // -1 = no parent, else index into this slice
+	ParentIndex        int    // -1 = no parent
+	FingerprintHex     string // frozen SHA-256 hex
 }
 
-var goldenExpectedNodes = []goldenExpectedNode{
-	{Kind: "repo", CanonicalSignature: "https://example.test/golden-repo", ParentIndex: -1},
-	{Kind: "package", CanonicalSignature: "https://example.test/golden-repo::pkg::", ParentIndex: 0},
-	{Kind: "file", CanonicalSignature: "https://example.test/golden-repo::file::README.md", ParentIndex: 1},
-	{Kind: "package", CanonicalSignature: "https://example.test/golden-repo::pkg::pkg", ParentIndex: 0},
-	{Kind: "file", CanonicalSignature: "https://example.test/golden-repo::file::pkg/foo.go", ParentIndex: 3},
-	{Kind: "package", CanonicalSignature: "https://example.test/golden-repo::pkg::pkg/sub", ParentIndex: 0},
-	{Kind: "file", CanonicalSignature: "https://example.test/golden-repo::file::pkg/sub/bar.go", ParentIndex: 5},
+// goldenCommittedNodes — frozen pre-refactor output.
+var goldenCommittedNodes = []committedNodeSnapshot{
+	{Kind: "repo", CanonicalSignature: "https://example.test/golden-repo", ParentIndex: -1,
+		FingerprintHex: "5e74a9a8c2fd3aadf5e3f3a7ed8dfa35dcc25619a53234ea5f271a99dd088883"},
+	{Kind: "package", CanonicalSignature: "https://example.test/golden-repo::pkg::", ParentIndex: 0,
+		FingerprintHex: "e327e045f494be70327274403aac97ecc79ef56509536c6a9cefa3d6fee8d0a2"},
+	{Kind: "file", CanonicalSignature: "https://example.test/golden-repo::file::README.md", ParentIndex: 1,
+		FingerprintHex: "bf1336ecd5db45448c4e972a4a0751d5fff86fe6d1ec8e7dc40c0c29bd5d1c9a"},
+	{Kind: "package", CanonicalSignature: "https://example.test/golden-repo::pkg::pkg", ParentIndex: 0,
+		FingerprintHex: "f5a0ea1eb3fb433d3f5a5e6364ef5ff310200885f6098e983579267131d34593"},
+	{Kind: "file", CanonicalSignature: "https://example.test/golden-repo::file::pkg/foo.go", ParentIndex: 3,
+		FingerprintHex: "0fb9f2b224f163a70f119c1ab4e49830a0b797dfce784c3af8bbb344ba91c451"},
+	{Kind: "package", CanonicalSignature: "https://example.test/golden-repo::pkg::pkg/sub", ParentIndex: 0,
+		FingerprintHex: "d8f94bc0e0ef3fba4eb11a6d81eced6ee860e18abb5e563164e601ffa33088a9"},
+	{Kind: "file", CanonicalSignature: "https://example.test/golden-repo::file::pkg/sub/bar.go", ParentIndex: 5,
+		FingerprintHex: "9bdd64c723f19fae527b72ff5ae54dd0a724a546afcb11f9cb25b88a960adc9e"},
 }
 
-// goldenExpectedEdges is the ordered edge sequence.
-type goldenExpectedEdge struct {
-	Kind     string
-	SrcIndex int // index into goldenExpectedNodes
-	DstIndex int // index into goldenExpectedNodes
+type committedEdgeSnapshot struct {
+	Kind           string
+	SrcIndex       int    // index into goldenCommittedNodes
+	DstIndex       int    // index into goldenCommittedNodes
+	FingerprintHex string // frozen SHA-256 hex
 }
 
-var goldenExpectedEdges = []goldenExpectedEdge{
-	{Kind: "contains", SrcIndex: 0, DstIndex: 1}, // repo → root-package
-	{Kind: "contains", SrcIndex: 1, DstIndex: 2}, // root-package → README.md
-	{Kind: "contains", SrcIndex: 0, DstIndex: 3}, // repo → pkg-package
-	{Kind: "contains", SrcIndex: 3, DstIndex: 4}, // pkg-package → pkg/foo.go
-	{Kind: "contains", SrcIndex: 0, DstIndex: 5}, // repo → pkg/sub-package
-	{Kind: "contains", SrcIndex: 5, DstIndex: 6}, // pkg/sub-package → pkg/sub/bar.go
+// goldenCommittedEdges — frozen pre-refactor output.
+var goldenCommittedEdges = []committedEdgeSnapshot{
+	{Kind: "contains", SrcIndex: 0, DstIndex: 1,
+		FingerprintHex: "f991d1a6af588a2c18c0959efddb836f2effe0e0dee2d2d6884029da59cc4a16"},
+	{Kind: "contains", SrcIndex: 1, DstIndex: 2,
+		FingerprintHex: "d5977778e085eeb8c04c73533d363c7b5af249f0e869903f4e5661e00939e76e"},
+	{Kind: "contains", SrcIndex: 0, DstIndex: 3,
+		FingerprintHex: "edd66cccb5806477937fac4f7f1900bbb713e65222ed2584c8dd578129fdba21"},
+	{Kind: "contains", SrcIndex: 3, DstIndex: 4,
+		FingerprintHex: "274c2ab5ea5909e9edd4750a18b030d9f029be9076c218e1d869258479e8034e"},
+	{Kind: "contains", SrcIndex: 0, DstIndex: 5,
+		FingerprintHex: "30984649d8bab2dcb1808d88baffde051d19b3c57641dfa5c0e1e6e3f25f50a2"},
+	{Kind: "contains", SrcIndex: 5, DstIndex: 6,
+		FingerprintHex: "3465213828afdcf49ce5fbb35a4a1089f970ae454ac197c79d5b0c4545301349"},
 }
 
-// computeGoldenFingerprints builds the expected fingerprint hex
-// strings using the same deterministic spy RepoID.
-func computeGoldenFingerprints() (nodeFPs []string, edgeFPs []string, err error) {
-	repoID := fingerprint.RepoID{}
-	repoID[0] = 1
-	repoID[15] = 0xAA
+// ---------------------------------------------------------------------------
+// worker.runFull wiring tokens — the source-level call sites that
+// prove runFull delegates to AncestryWriter. The structural check
+// reads worker.go and asserts all five tokens are present in the
+// runFull method body, catching any future drift that would
+// de-wire the AncestryWriter delegation.
+// ---------------------------------------------------------------------------
 
-	nfps := make([]fingerprint.Sum, len(goldenExpectedNodes))
-	nodeFPs = make([]string, len(goldenExpectedNodes))
-	for i, n := range goldenExpectedNodes {
-		fp, fErr := fingerprint.NodeFingerprint(repoID, n.Kind, n.CanonicalSignature, goldenSHA)
-		if fErr != nil {
-			return nil, nil, fErr
-		}
-		nfps[i] = fp
-		nodeFPs[i] = fmt.Sprintf("%x", fp)
-	}
-
-	edgeFPs = make([]string, len(goldenExpectedEdges))
-	for i, e := range goldenExpectedEdges {
-		fp, fErr := fingerprint.EdgeFingerprint(repoID, e.Kind, nfps[e.SrcIndex], nfps[e.DstIndex], goldenSHA)
-		if fErr != nil {
-			return nil, nil, fErr
-		}
-		edgeFPs[i] = fmt.Sprintf("%x", fp)
-	}
-	return nodeFPs, edgeFPs, nil
+var runFullWiringTokens = []string{
+	"NewAncestryWriter(",
+	".SetParentSHA(",
+	".SetCurrentHeadSHA(",
+	".EnsureRepoAndCommit(",
+	".EnsureFile(",
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +276,9 @@ type workerAdoptsState struct {
 	files   []string
 	summary workerRunFullSummary
 
+	// worker.go source content for structural check
+	workerSource string
+
 	// worker-integration-still-passes
 	integResult string
 
@@ -284,9 +286,6 @@ type workerAdoptsState struct {
 	grepHits []string
 }
 
-// workerRunFullSummary mirrors repoindexer.FullSummary for the
-// subset the worker.runFull call sequence tracks through
-// AncestryWriter.
 type workerRunFullSummary struct {
 	RepoNodeID            string
 	CommitInserted        bool
@@ -333,26 +332,30 @@ func (s *workerAdoptsState) theRefactoredCodebaseUnder(_ string) error {
 //  2. aw.SetParentSHA(job.FromSHA)
 //  3. aw.SetCurrentHeadSHA(repoHeadSHA)
 //  4. aw.EnsureRepoAndCommit(ctx, repoBranch, repoLang)
-//  5. per-file: aw.EnsureFile(ctx, file)
-//  6. per-file: track FullSummary counters (PackagesEnsured,
-//     FilesEnsured, etc.) identically to the worker
+//  5. per-file: aw.EnsureFile(ctx, file) + FullSummary tracking
 //
-// Steps that only affect non-ancestry concerns (clock pin,
-// DB query, Materializer, EmitFile) are simulated with
-// equivalent fixture values. The point is to prove the
-// AncestryWriter channel produces the identical node/edge
-// tuples that the pre-refactor inlined worker code did.
+// The structural Then step verifies worker.go contains these
+// exact call sites in runFull, so the e2e test and the production
+// code cannot drift independently.
 func (s *workerAdoptsState) workerRunFullThroughAncestryWriter(parentSHA, headSHA string) error {
+	// Load worker.go source for the structural verification step.
+	_, thisFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..", "..")
+	workerPath := filepath.Join(repoRoot, "internal", "repoindexer", "worker.go")
+	src, err := os.ReadFile(workerPath)
+	if err != nil {
+		return fmt.Errorf("reading worker.go: %w", err)
+	}
+	s.workerSource = string(src)
+
 	ctx := context.Background()
 
-	// Step 1: construct — mirrors worker.go line 1095
+	// Replicate worker.runFull steps 1-3.
 	aw := repoindexer.NewAncestryWriter(s.writer, goldenRepoURL, goldenSHA)
-
-	// Step 2-3: worker-specific overrides — mirrors lines 1097-1098
 	aw.SetParentSHA(parentSHA)
 	aw.SetCurrentHeadSHA(headSHA)
 
-	// Step 4: pre-walk ancestry — mirrors line 1099
+	// Step 4: pre-walk ancestry.
 	ancestry, err := aw.EnsureRepoAndCommit(ctx, "main", []string{"go"})
 	if err != nil {
 		return fmt.Errorf("EnsureRepoAndCommit: %w", err)
@@ -361,8 +364,7 @@ func (s *workerAdoptsState) workerRunFullThroughAncestryWriter(parentSHA, headSH
 	s.summary.RepoNodeID = ancestry.RepoNodeID
 	s.summary.CommitInserted = ancestry.CommitInserted
 
-	// Step 5-6: per-file walk with FullSummary tracking —
-	// mirrors lines 1117-1161
+	// Step 5: per-file walk with FullSummary tracking.
 	pkgDirSeen := make(map[string]struct{})
 	for _, f := range s.files {
 		fa, eErr := aw.EnsureFile(ctx, repoindexer.WalkFile{RelPath: f})
@@ -396,39 +398,29 @@ func (s *workerAdoptsState) theIntegrationSuiteRunsAgainstPG() error {
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..", "..")
 
-	// Always verify the integration test file exists and contains
-	// the expected entry points.
 	integFile := filepath.Join(repoRoot, "internal", "repoindexer", "worker_integration_test.go")
 	content, err := os.ReadFile(integFile)
 	if err != nil {
 		return fmt.Errorf("worker_integration_test.go not found: %w", err)
 	}
-	requiredFuncs := []string{
+	for _, fn := range []string{
 		"TestWorker_fullIngest_buildsRepoPackageFileAncestry",
 		"AGENT_MEMORY_PG_URL",
-	}
-	for _, fn := range requiredFuncs {
+	} {
 		if !strings.Contains(string(content), fn) {
 			return fmt.Errorf("worker_integration_test.go missing %q", fn)
 		}
 	}
 
 	if pgURL == "" {
-		// No Postgres DSN provided — this is expected in the
-		// Forge gate environment. Record the result; the Then
-		// step verifies it.
 		s.integResult = "skipped:no-dsn"
 		return nil
 	}
 
-	// Postgres DSN is available — actually run the integration
-	// tests against it. This matches the scenario: "When the
-	// suite runs against a provided Postgres on CI."
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "go", "test",
-		"-count=1",
-		"-timeout=4m",
+		"-count=1", "-timeout=4m",
 		"-run", "TestWorker",
 		"./internal/repoindexer/",
 	)
@@ -460,8 +452,6 @@ func (s *workerAdoptsState) weSearchForUnexportedHelperNames(nameList string) er
 	return nil
 }
 
-// grepForIdentifier walks Go source files under dir and searches
-// for occurrences of the exact identifier.
 func grepForIdentifier(dir, ident string) ([]string, error) {
 	var hits []string
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
@@ -500,22 +490,50 @@ func grepForIdentifier(dir, ident string) ([]string, error) {
 // Then steps
 // ---------------------------------------------------------------------------
 
-func (s *workerAdoptsState) capturedNodeTuplesMatchGolden() error {
+// workerGoConfirmsWiring structurally verifies that worker.go's
+// runFull method body contains the five AncestryWriter delegation
+// call sites. This catches future edits to worker.runFull that
+// would de-wire the AncestryWriter delegation (e.g. re-inlining
+// the ancestry logic) — the e2e test's replicated call sequence
+// alone cannot detect such drift because it exercises
+// AncestryWriter directly.
+func (s *workerAdoptsState) workerGoConfirmsWiring() error {
+	if s.workerSource == "" {
+		return fmt.Errorf("worker.go source not loaded")
+	}
+
+	// Extract the runFull method body by finding its bounds.
+	startIdx := strings.Index(s.workerSource, "func (w *Worker) runFull(")
+	if startIdx < 0 {
+		return fmt.Errorf("worker.go: runFull method not found")
+	}
+	body := s.workerSource[startIdx:]
+
+	var missing []string
+	for _, token := range runFullWiringTokens {
+		if !strings.Contains(body, token) {
+			missing = append(missing, token)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf(
+			"worker.go runFull is missing AncestryWriter delegation call sites: %s — "+
+				"the refactored worker.runFull must route through AncestryWriter",
+			strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func (s *workerAdoptsState) capturedNodeTuplesMatchCommittedSnapshot() error {
 	s.writer.mu.Lock()
 	defer s.writer.mu.Unlock()
 
-	goldenNodeFPs, _, err := computeGoldenFingerprints()
-	if err != nil {
-		return fmt.Errorf("computing golden fingerprints: %w", err)
-	}
-
-	if len(s.writer.nodeTuples) != len(goldenExpectedNodes) {
-		return fmt.Errorf("node count: got %d, want %d", len(s.writer.nodeTuples), len(goldenExpectedNodes))
+	if len(s.writer.nodeTuples) != len(goldenCommittedNodes) {
+		return fmt.Errorf("node count: got %d, want %d", len(s.writer.nodeTuples), len(goldenCommittedNodes))
 	}
 	for i, got := range s.writer.nodeTuples {
-		want := goldenExpectedNodes[i]
+		want := goldenCommittedNodes[i]
 
-		// Assert (kind, canonical_signature).
 		if got.Kind != want.Kind {
 			return fmt.Errorf("node[%d]: kind got %q, want %q", i, got.Kind, want.Kind)
 		}
@@ -538,33 +556,27 @@ func (s *workerAdoptsState) capturedNodeTuplesMatchGolden() error {
 			}
 		}
 
-		// Assert fingerprint.
-		if got.FingerprintHex != goldenNodeFPs[i] {
-			return fmt.Errorf("node[%d] (%s): fingerprint got %q, want %q",
-				i, got.CanonicalSignature, got.FingerprintHex, goldenNodeFPs[i])
+		// Assert committed fingerprint.
+		if got.FingerprintHex != want.FingerprintHex {
+			return fmt.Errorf("node[%d] (%s): fingerprint got %q, want committed %q",
+				i, got.CanonicalSignature, got.FingerprintHex, want.FingerprintHex)
 		}
 	}
 	return nil
 }
 
-func (s *workerAdoptsState) capturedEdgeTuplesMatchGolden() error {
+func (s *workerAdoptsState) capturedEdgeTuplesMatchCommittedSnapshot() error {
 	s.writer.mu.Lock()
 	defer s.writer.mu.Unlock()
 
-	_, goldenEdgeFPs, err := computeGoldenFingerprints()
-	if err != nil {
-		return fmt.Errorf("computing golden fingerprints: %w", err)
-	}
-
-	if len(s.writer.edgeTuples) != len(goldenExpectedEdges) {
-		return fmt.Errorf("edge count: got %d, want %d", len(s.writer.edgeTuples), len(goldenExpectedEdges))
+	if len(s.writer.edgeTuples) != len(goldenCommittedEdges) {
+		return fmt.Errorf("edge count: got %d, want %d", len(s.writer.edgeTuples), len(goldenCommittedEdges))
 	}
 	for i, got := range s.writer.edgeTuples {
-		want := goldenExpectedEdges[i]
+		want := goldenCommittedEdges[i]
 		wantSrc := fmt.Sprintf("node-%04d", want.SrcIndex+1)
 		wantDst := fmt.Sprintf("node-%04d", want.DstIndex+1)
 
-		// Assert (kind, src, dst).
 		if got.Kind != want.Kind {
 			return fmt.Errorf("edge[%d]: kind got %q, want %q", i, got.Kind, want.Kind)
 		}
@@ -574,24 +586,15 @@ func (s *workerAdoptsState) capturedEdgeTuplesMatchGolden() error {
 		if got.DstNodeID != wantDst {
 			return fmt.Errorf("edge[%d]: dst got %q, want %q", i, got.DstNodeID, wantDst)
 		}
-
-		// Assert fingerprint.
-		if got.FingerprintHex != goldenEdgeFPs[i] {
-			return fmt.Errorf("edge[%d] (%s %s→%s): fingerprint got %q, want %q",
-				i, got.Kind, got.SrcNodeID, got.DstNodeID, got.FingerprintHex, goldenEdgeFPs[i])
+		if got.FingerprintHex != want.FingerprintHex {
+			return fmt.Errorf("edge[%d] (%s %s→%s): fingerprint got %q, want committed %q",
+				i, got.Kind, got.SrcNodeID, got.DstNodeID, got.FingerprintHex, want.FingerprintHex)
 		}
 	}
 	return nil
 }
 
 func (s *workerAdoptsState) fullSummaryCountersMatch() error {
-	// Expected FullSummary for the 3-file fixture with 3 distinct
-	// packages ("", "pkg", "pkg/sub"):
-	//   PackagesEnsured = 3
-	//   PackagesInserted = 3
-	//   FilesEnsured = 3
-	//   FilesInserted = 3
-	//   ContainsEdgesInserted = 6 (3 repo→pkg + 3 pkg→file)
 	checks := []struct {
 		name string
 		got  int
@@ -622,8 +625,6 @@ func (s *workerAdoptsState) fullSummaryCountersMatch() error {
 }
 
 func (s *workerAdoptsState) fingerprintsStableAcrossSecondRun() error {
-	// Re-run the exact same worker.runFull sequence with a fresh
-	// writer and verify every fingerprint is byte-identical.
 	w2 := newRunFullRecordingWriter()
 	ctx := context.Background()
 	aw2 := repoindexer.NewAncestryWriter(w2, goldenRepoURL, goldenSHA)
@@ -673,12 +674,6 @@ func (s *workerAdoptsState) theSuiteResultIsRecorded() error {
 	case s.integResult == "passed":
 		return nil
 	case s.integResult == "skipped:no-dsn":
-		// The scenario is explicitly "not a gate-required scenario"
-		// per the implementation plan. When AGENT_MEMORY_PG_URL is
-		// not provided, we verified the test file exists and
-		// contains the expected entry points (done in the When step).
-		// This is the correct behavior on the Forge gate host which
-		// has no Postgres.
 		return nil
 	case strings.HasPrefix(s.integResult, "failed:"):
 		return fmt.Errorf("integration suite failed: %s", s.integResult)
@@ -717,10 +712,12 @@ func InitializeScenario_identity_and_ancestry_refactor_worker_adopts_ancestrywri
 	ctx.When(`^we search for unexported helper names "([^"]*)"$`, s.weSearchForUnexportedHelperNames)
 
 	// Then
-	ctx.Then(`^the captured node tuples with canonical_signature kind parent_node_id and fingerprint match the golden fixture$`,
-		s.capturedNodeTuplesMatchGolden)
-	ctx.Then(`^the captured edge tuples with kind src dst and fingerprint match the golden fixture$`,
-		s.capturedEdgeTuplesMatchGolden)
+	ctx.Then(`^worker\.go source confirms runFull calls NewAncestryWriter and SetParentSHA and SetCurrentHeadSHA and EnsureRepoAndCommit and EnsureFile$`,
+		s.workerGoConfirmsWiring)
+	ctx.Then(`^the captured node tuples match the committed golden snapshot$`,
+		s.capturedNodeTuplesMatchCommittedSnapshot)
+	ctx.Then(`^the captured edge tuples match the committed golden snapshot$`,
+		s.capturedEdgeTuplesMatchCommittedSnapshot)
 	ctx.Then(`^the FullSummary counters match the expected values$`,
 		s.fullSummaryCountersMatch)
 	ctx.Then(`^fingerprints are stable across a second identical run$`,

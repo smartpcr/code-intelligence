@@ -3,16 +3,18 @@ Feature: Worker adopts AncestryWriter
 
   The worker's runFull method now delegates the repo→package→file
   ancestry pipeline to AncestryWriter. These scenarios verify that
-  the refactored path produces byte-identical graph tuples, that
-  the existing integration tests remain green, and that the
-  unexported canonical-signature helpers have been fully removed.
+  runFull is wired through AncestryWriter, that the pipeline
+  produces byte-identical graph tuples against a committed golden
+  snapshot, and that the unexported canonical-signature helpers
+  have been fully removed.
 
   Scenario: worker-graph-byte-identical
     Given an in-memory fixture repo with files "README.md,pkg/foo.go,pkg/sub/bar.go"
     And a recording RepoCommitNodeEdgeWriter
     When worker.runFull executes through AncestryWriter with parentSHA "aaa111" and headSHA "bbb222"
-    Then the captured node tuples with canonical_signature kind parent_node_id and fingerprint match the golden fixture
-    And the captured edge tuples with kind src dst and fingerprint match the golden fixture
+    Then worker.go source confirms runFull calls NewAncestryWriter and SetParentSHA and SetCurrentHeadSHA and EnsureRepoAndCommit and EnsureFile
+    And the captured node tuples match the committed golden snapshot
+    And the captured edge tuples match the committed golden snapshot
     And the FullSummary counters match the expected values
     And fingerprints are stable across a second identical run
 

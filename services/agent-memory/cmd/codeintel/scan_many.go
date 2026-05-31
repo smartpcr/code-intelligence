@@ -144,18 +144,33 @@ func runScanMany(ctx context.Context, root *rootFlags, flags *scanManyFlags, man
 	}
 
 	agg := newManyAggregate()
-	usedSlugs := make(map[string]int) // slug -> next disambiguator
+	// usedSlugs tracks the full set of ASSIGNED slugs (both
+	// natural and disambiguated). The int value is the next
+	// disambiguator suffix to try for the base slug. Tracking
+	// assigned disambiguated slugs is what prevents a collision
+	// like {foo, foo-2, foo}: without it the second `foo` would
+	// re-disambiguate to `foo-2` and clobber the natural `foo-2`
+	// entry's .db, violating the one-.db-per-repo contract
+	// (architecture S9.4).
+	usedSlugs := make(map[string]int)
 	for _, e := range entries {
-		slug := slugForEntry(e)
+		base := slugForEntry(e)
+		slug := base
 		// Disambiguate same-basename entries so they don't share
 		// a single .db file (architecture S9.4 mandates one .db
-		// per repo).
-		if n, ok := usedSlugs[slug]; ok {
-			usedSlugs[slug] = n + 1
-			slug = fmt.Sprintf("%s-%d", slug, n+1)
-		} else {
-			usedSlugs[slug] = 1
+		// per repo). Probe until the candidate slug is unique
+		// across both natural and previously-disambiguated slugs.
+		if _, ok := usedSlugs[slug]; ok {
+			for {
+				n := usedSlugs[base]
+				usedSlugs[base] = n + 1
+				slug = fmt.Sprintf("%s-%d", base, n+1)
+				if _, taken := usedSlugs[slug]; !taken {
+					break
+				}
+			}
 		}
+		usedSlugs[slug] = 1
 		outPath := filepath.Join(flags.outDir, slug+".db")
 
 		// Per evaluator iter-1 feedback item 3: scan-many's

@@ -379,11 +379,22 @@ func (s *scanSubcommandState) summaryHasSkippedNoParser() error {
 }
 
 func (s *scanSubcommandState) stderrHasExtSkip(ext string) error {
-	// Verify stderr contains a skip entry mentioning the extension.
-	if !strings.Contains(s.stderr, ext) {
-		return fmt.Errorf("stderr missing extension %q:\n%s", ext, s.stderr)
+	// Count stderr lines that are ast.dispatch.skip entries for
+	// files with the given extension. Each skip emits a slog line
+	// like: level=INFO msg=ast.dispatch.skip reason=no_parser file=hello.c
+	// The per-extension count is the number of such lines.
+	skipCount := 0
+	for _, line := range strings.Split(s.stderr, "\n") {
+		if strings.Contains(line, "ast.dispatch.skip") && strings.Contains(line, ext) {
+			skipCount++
+		}
 	}
-	// Verify stdout's per-extension count shows >= 1 for this extension.
+	if skipCount < 1 {
+		return fmt.Errorf("expected >= 1 skip entries for %q in stderr, got %d\nstderr:\n%s",
+			ext, skipCount, s.stderr)
+	}
+
+	// Cross-check: stdout's per-extension summary must agree.
 	byExtLine := extractSummaryLine(s.stdout, "skipped.no_parser_by_ext:")
 	if byExtLine == "" {
 		return fmt.Errorf("stdout missing skipped.no_parser_by_ext line:\n%s", s.stdout)
@@ -395,6 +406,10 @@ func (s *scanSubcommandState) stderrHasExtSkip(ext string) error {
 	if n < 1 {
 		return fmt.Errorf("expected per-extension count for %q >= 1, got %d\nline: %s",
 			ext, n, byExtLine)
+	}
+	if n != skipCount {
+		return fmt.Errorf("stderr skip count (%d) != stdout summary count (%d) for %q",
+			skipCount, n, ext)
 	}
 	return nil
 }

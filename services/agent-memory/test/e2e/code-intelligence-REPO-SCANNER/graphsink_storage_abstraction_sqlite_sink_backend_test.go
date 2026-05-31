@@ -145,13 +145,6 @@ func (st *sqliteSinkState) sqliteMasterListsTheTables(tableList string) error {
 		}
 	}
 
-	if st.sink != nil {
-		_ = st.sink.Close()
-		st.sink = nil
-	}
-	if st.dbPath != "" {
-		_ = os.RemoveAll(filepath.Dir(st.dbPath))
-	}
 	return nil
 }
 
@@ -240,13 +233,6 @@ func (st *sqliteSinkState) noNewRowIsCreatedAndTheExistingRowsNodeIdIsReturned()
 		return fmt.Errorf("node_id drift: first=%q second=%q", st.firstNodeID, st.secondNodeID)
 	}
 
-	if st.sink != nil {
-		_ = st.sink.Close()
-		st.sink = nil
-	}
-	if st.dbPath != "" {
-		_ = os.RemoveAll(filepath.Dir(st.dbPath))
-	}
 	return nil
 }
 
@@ -321,13 +307,6 @@ func (st *sqliteSinkState) aCheckConstraintErrorIsReturnedAndNoRowIsInserted() e
 		return fmt.Errorf("expected 0 rows in node table, got %d", count)
 	}
 
-	if st.sink != nil {
-		_ = st.sink.Close()
-		st.sink = nil
-	}
-	if st.dbPath != "" {
-		_ = os.RemoveAll(filepath.Dir(st.dbPath))
-	}
 	return nil
 }
 
@@ -375,13 +354,6 @@ func (st *sqliteSinkState) aConstructionTimeErrorIsReturned() error {
 		)
 	}
 
-	if st.sink != nil {
-		_ = st.sink.Close()
-		st.sink = nil
-	}
-	if st.dbPath != "" {
-		_ = os.RemoveAll(filepath.Dir(st.dbPath))
-	}
 	return nil
 }
 
@@ -436,6 +408,20 @@ func (st *sqliteSinkState) thePackageFailsToCompileWithACgoTagError() error {
 
 func InitializeScenario_graphsink_storage_abstraction_sqlite_sink_backend(ctx *godog.ScenarioContext) {
 	st := &sqliteSinkState{}
+
+	// Unconditional cleanup: close the sink and remove the temp directory
+	// regardless of step outcome, preventing leaked .db files on failure.
+	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
+		if st.sink != nil {
+			_ = st.sink.Close()
+			st.sink = nil
+		}
+		if st.dbPath != "" {
+			_ = os.RemoveAll(filepath.Dir(st.dbPath))
+			st.dbPath = ""
+		}
+		return ctx, nil
+	})
 
 	// Scenario: sqlite-bootstraps-on-open
 	ctx.Given(`^a fresh "\.db" file path$`, st.aFreshDbFilePath)

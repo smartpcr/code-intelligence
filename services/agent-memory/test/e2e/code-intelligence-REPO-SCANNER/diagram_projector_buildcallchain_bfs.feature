@@ -3,9 +3,11 @@ Feature: BuildCallChain BFS
 
   The BuildCallChain projector performs a bounded BFS over
   static_calls / observed_calls edges starting from a resolved seed
-  node. These scenarios pin the node/edge counts, depth bounding,
-  direction filtering, and error handling documented in the
-  implementation plan Stage 6.3.
+  node. Each scenario populates an ephemeral SQLite database via the
+  graphsink.Sink write path (EnsureRepo, InsertNode, InsertEdge) and
+  then exercises BuildCallChain against the same *sqlite.Sink acting
+  as the graphsink.Reader — proving the full local-fixture integration
+  path documented in the implementation plan Stage 6.3.
 
   Scenario: bfs-callees-only
     Given a method M with 2 callees and 3 callers

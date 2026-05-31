@@ -7,134 +7,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/cucumber/godog"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/diagram"
-	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphreader"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphsink/sqlite"
+	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
 )
 
 // ---------------------------------------------------------------------------
-// Fake graphsink.Reader for BuildCallChain BFS E2E scenarios
-// ---------------------------------------------------------------------------
-
-type bfsSigKey struct {
-	repoID string
-	kind   string
-	sig    string
-}
-
-type bfsFakeReader struct {
-	repos    []graphreader.RepoSummary
-	nodes    map[string]graphreader.Node
-	bySig    map[bfsSigKey]string
-	outEdges map[string][]graphreader.Edge
-	inEdges  map[string][]graphreader.Edge
-}
-
-func newBFSFakeReader() *bfsFakeReader {
-	return &bfsFakeReader{
-		nodes:    map[string]graphreader.Node{},
-		bySig:    map[bfsSigKey]string{},
-		outEdges: map[string][]graphreader.Edge{},
-		inEdges:  map[string][]graphreader.Edge{},
-	}
-}
-
-func (f *bfsFakeReader) addRepo(s graphreader.RepoSummary) {
-	f.repos = append(f.repos, s)
-}
-
-func (f *bfsFakeReader) addNode(n graphreader.Node) {
-	f.nodes[n.NodeID] = n
-	f.bySig[bfsSigKey{repoID: n.RepoID, kind: n.Kind, sig: n.CanonicalSignature}] = n.NodeID
-}
-
-func (f *bfsFakeReader) addEdge(e graphreader.Edge) {
-	f.outEdges[e.SrcNodeID] = append(f.outEdges[e.SrcNodeID], e)
-	f.inEdges[e.DstNodeID] = append(f.inEdges[e.DstNodeID], e)
-}
-
-func (f *bfsFakeReader) ListRepos(
-	_ context.Context, _ graphreader.ReaderOptions,
-) ([]graphreader.RepoSummary, error) {
-	out := make([]graphreader.RepoSummary, len(f.repos))
-	copy(out, f.repos)
-	return out, nil
-}
-
-func (f *bfsFakeReader) ListNodes(
-	_ context.Context, _ fingerprint.RepoID, _ []string,
-	_ graphreader.ListNodesFilter, _ graphreader.ReaderOptions,
-) ([]graphreader.Node, error) {
-	out := make([]graphreader.Node, 0, len(f.nodes))
-	for _, n := range f.nodes {
-		out = append(out, n)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
-	return out, nil
-}
-
-func (f *bfsFakeReader) ListEdgesFrom(
-	_ context.Context, srcNodeID string, kinds []string,
-	_ graphreader.ReaderOptions,
-) ([]graphreader.Edge, error) {
-	return bfsFilterEdges(f.outEdges[srcNodeID], kinds), nil
-}
-
-func (f *bfsFakeReader) ListEdgesTo(
-	_ context.Context, dstNodeID string, kinds []string,
-	_ graphreader.ReaderOptions,
-) ([]graphreader.Edge, error) {
-	return bfsFilterEdges(f.inEdges[dstNodeID], kinds), nil
-}
-
-func (f *bfsFakeReader) GetNode(
-	_ context.Context, nodeID string, _ graphreader.ReaderOptions,
-) (graphreader.Node, error) {
-	n, ok := f.nodes[nodeID]
-	if !ok {
-		return graphreader.Node{}, graphreader.ErrNotFound
-	}
-	return n, nil
-}
-
-func (f *bfsFakeReader) LookupBySignature(
-	_ context.Context, repoID fingerprint.RepoID, kind, sig string,
-	_ graphreader.ReaderOptions,
-) (graphreader.Node, error) {
-	id, ok := f.bySig[bfsSigKey{repoID: repoID.String(), kind: kind, sig: sig}]
-	if !ok {
-		return graphreader.Node{}, graphreader.ErrNotFound
-	}
-	return f.nodes[id], nil
-}
-
-func bfsFilterEdges(in []graphreader.Edge, kinds []string) []graphreader.Edge {
-	if len(kinds) == 0 {
-		out := make([]graphreader.Edge, len(in))
-		copy(out, in)
-		return out
-	}
-	allowed := map[string]struct{}{}
-	for _, k := range kinds {
-		allowed[k] = struct{}{}
-	}
-	out := make([]graphreader.Edge, 0, len(in))
-	for _, e := range in {
-		if _, ok := allowed[e.Kind]; ok {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
-// ---------------------------------------------------------------------------
-// Fixture builders
+// Constants
 // ---------------------------------------------------------------------------
 
 const bfsFixtureRepoURL = "https://github.com/example/bfs-target"
@@ -143,37 +30,137 @@ func bfsFixtureRepoID() (fingerprint.RepoID, error) {
 	return fingerprint.RepoIDFromURL(bfsFixtureRepoURL)
 }
 
-func bfsMethodNode(repoID fingerprint.RepoID, nodeID, sig string) graphreader.Node {
-	return graphreader.Node{
-		NodeID:             nodeID,
-		RepoID:             repoID.String(),
-		Kind:               "method",
-		CanonicalSignature: sig,
-		ParentNodeID:       "file-1",
-		FromSHA:            "deadbeef",
-		AttrsJSON:          json.RawMessage(`{"language":"go"}`),
-	}
-}
-
-func bfsStaticCall(repoID fingerprint.RepoID, src, dst string) graphreader.Edge {
-	return graphreader.Edge{
-		EdgeID:    "e-" + src + "-" + dst,
-		RepoID:    repoID.String(),
-		Kind:      "static_calls",
-		SrcNodeID: src,
-		DstNodeID: dst,
-		FromSHA:   "deadbeef",
-	}
-}
+const bfsFixtureSHA = "deadbeefdeadbeefdeadbeefdeadbeef12345678"
 
 // ---------------------------------------------------------------------------
-// Scenario state
+// Scenario state — backed by an ephemeral SQLite database
 // ---------------------------------------------------------------------------
 
 type buildCallChainBFSCtx struct {
-	reader *bfsFakeReader
-	diag   diagram.Diagram
-	err    error
+	sink    *sqlite.Sink
+	dbDir   string
+	repoID  fingerprint.RepoID
+	nodeIDs map[string]string // canonical signature -> nodeID
+	diag    diagram.Diagram
+	err     error
+}
+
+func (c *buildCallChainBFSCtx) cleanup() {
+	if c.sink != nil {
+		_ = c.sink.Close()
+		c.sink = nil
+	}
+	if c.dbDir != "" {
+		_ = os.RemoveAll(c.dbDir)
+		c.dbDir = ""
+	}
+}
+
+// openSink creates a fresh ephemeral SQLite DB and ensures the repo row.
+func (c *buildCallChainBFSCtx) openSink() error {
+	rid, err := bfsFixtureRepoID()
+	if err != nil {
+		return fmt.Errorf("bfsFixtureRepoID: %w", err)
+	}
+	c.repoID = rid
+	c.nodeIDs = map[string]string{}
+
+	dir, err := os.MkdirTemp("", "bfs-e2e-*")
+	if err != nil {
+		return fmt.Errorf("MkdirTemp: %w", err)
+	}
+	c.dbDir = dir
+
+	sink, err := sqlite.Open(context.Background(), filepath.Join(dir, "graph.db"))
+	if err != nil {
+		return fmt.Errorf("sqlite.Open: %w", err)
+	}
+	c.sink = sink
+
+	if _, err := sink.EnsureRepo(context.Background(), graphwriter.RepoInput{
+		URL:            bfsFixtureRepoURL,
+		DefaultBranch:  "main",
+		CurrentHeadSHA: bfsFixtureSHA,
+		RepoID:         rid,
+	}); err != nil {
+		return fmt.Errorf("EnsureRepo: %w", err)
+	}
+	return nil
+}
+
+// insertMethod inserts a method node with the given canonical signature
+// and records its generated nodeID.
+func (c *buildCallChainBFSCtx) insertMethod(sig string) error {
+	// Use a parent file node shared across the fixture. Create it
+	// idempotently (only the first call inserts).
+	const fileSig = "file://bfs_fixture.go"
+	if _, exists := c.nodeIDs[fileSig]; !exists {
+		// Insert a repo node as the file's parent.
+		const repoSig = "repo://bfs-target"
+		if _, exists := c.nodeIDs[repoSig]; !exists {
+			rec, err := c.sink.InsertNode(context.Background(), graphwriter.NodeInput{
+				RepoID:             c.repoID,
+				Kind:               "repo",
+				CanonicalSignature: repoSig,
+				FromSHA:            bfsFixtureSHA,
+				AttrsJSON:          json.RawMessage(`{}`),
+			})
+			if err != nil {
+				return fmt.Errorf("InsertNode repo: %w", err)
+			}
+			c.nodeIDs[repoSig] = rec.NodeID
+		}
+		rec, err := c.sink.InsertNode(context.Background(), graphwriter.NodeInput{
+			RepoID:             c.repoID,
+			Kind:               "file",
+			CanonicalSignature: fileSig,
+			ParentNodeID:       c.nodeIDs["repo://bfs-target"],
+			FromSHA:            bfsFixtureSHA,
+			AttrsJSON:          json.RawMessage(`{"language":"go"}`),
+		})
+		if err != nil {
+			return fmt.Errorf("InsertNode file: %w", err)
+		}
+		c.nodeIDs[fileSig] = rec.NodeID
+	}
+
+	rec, err := c.sink.InsertNode(context.Background(), graphwriter.NodeInput{
+		RepoID:             c.repoID,
+		Kind:               "method",
+		CanonicalSignature: sig,
+		ParentNodeID:       c.nodeIDs[fileSig],
+		FromSHA:            bfsFixtureSHA,
+		AttrsJSON:          json.RawMessage(`{"language":"go"}`),
+	})
+	if err != nil {
+		return fmt.Errorf("InsertNode method %q: %w", sig, err)
+	}
+	c.nodeIDs[sig] = rec.NodeID
+	return nil
+}
+
+// insertStaticCall inserts a static_calls edge between two already-
+// inserted nodes identified by their canonical signatures.
+func (c *buildCallChainBFSCtx) insertStaticCall(srcSig, dstSig string) error {
+	srcID, ok := c.nodeIDs[srcSig]
+	if !ok {
+		return fmt.Errorf("source node %q not found", srcSig)
+	}
+	dstID, ok := c.nodeIDs[dstSig]
+	if !ok {
+		return fmt.Errorf("dest node %q not found", dstSig)
+	}
+	if _, err := c.sink.InsertEdge(context.Background(), graphwriter.EdgeInput{
+		RepoID:    c.repoID,
+		Kind:      "static_calls",
+		SrcNodeID: srcID,
+		DstNodeID: dstID,
+		FromSHA:   bfsFixtureSHA,
+		AttrsJSON: json.RawMessage(`{}`),
+	}); err != nil {
+		return fmt.Errorf("InsertEdge %s->%s: %w", srcSig, dstSig, err)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -181,45 +168,46 @@ type buildCallChainBFSCtx struct {
 // ---------------------------------------------------------------------------
 
 func (c *buildCallChainBFSCtx) aMethodMWith2CalleesAnd3Callers() error {
-	rid, err := bfsFixtureRepoID()
-	if err != nil {
-		return fmt.Errorf("fixture repo id: %w", err)
+	c.cleanup()
+	if err := c.openSink(); err != nil {
+		return err
 	}
-	c.reader = newBFSFakeReader()
-	c.reader.addRepo(graphreader.RepoSummary{
-		RepoID: rid.String(),
-		URL:    bfsFixtureRepoURL,
-		SHA:    "deadbeef",
-	})
-	c.reader.addNode(bfsMethodNode(rid, "M", "M"))
+	// Insert seed + callees + callers
+	for _, sig := range []string{"M", "C1", "C2", "P1", "P2", "P3"} {
+		if err := c.insertMethod(sig); err != nil {
+			return err
+		}
+	}
+	// M -> C1, M -> C2
 	for _, callee := range []string{"C1", "C2"} {
-		c.reader.addNode(bfsMethodNode(rid, callee, callee))
-		c.reader.addEdge(bfsStaticCall(rid, "M", callee))
+		if err := c.insertStaticCall("M", callee); err != nil {
+			return err
+		}
 	}
+	// P1 -> M, P2 -> M, P3 -> M
 	for _, caller := range []string{"P1", "P2", "P3"} {
-		c.reader.addNode(bfsMethodNode(rid, caller, caller))
-		c.reader.addEdge(bfsStaticCall(rid, caller, "M"))
+		if err := c.insertStaticCall(caller, "M"); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func (c *buildCallChainBFSCtx) aChainABCD() error {
-	rid, err := bfsFixtureRepoID()
-	if err != nil {
-		return fmt.Errorf("fixture repo id: %w", err)
+	c.cleanup()
+	if err := c.openSink(); err != nil {
+		return err
 	}
-	c.reader = newBFSFakeReader()
-	c.reader.addRepo(graphreader.RepoSummary{
-		RepoID: rid.String(),
-		URL:    bfsFixtureRepoURL,
-		SHA:    "deadbeef",
-	})
-	for _, n := range []string{"A", "B", "C", "D"} {
-		c.reader.addNode(bfsMethodNode(rid, n, n))
+	for _, sig := range []string{"A", "B", "C", "D"} {
+		if err := c.insertMethod(sig); err != nil {
+			return err
+		}
 	}
-	c.reader.addEdge(bfsStaticCall(rid, "A", "B"))
-	c.reader.addEdge(bfsStaticCall(rid, "B", "C"))
-	c.reader.addEdge(bfsStaticCall(rid, "C", "D"))
+	for _, pair := range [][2]string{{"A", "B"}, {"B", "C"}, {"C", "D"}} {
+		if err := c.insertStaticCall(pair[0], pair[1]); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -228,8 +216,11 @@ func (c *buildCallChainBFSCtx) aChainABCD() error {
 // ---------------------------------------------------------------------------
 
 func (c *buildCallChainBFSCtx) buildCallChainRunsWithSeedDepthDirection(seed string, depth int, direction string) error {
+	// The sink (*sqlite.Sink) satisfies graphsink.Reader, so we pass
+	// it directly to BuildCallChain — exercising the full SQLite
+	// read path (LookupBySignature, ListEdgesFrom/To, GetNode).
 	c.diag, c.err = diagram.BuildCallChain(
-		context.Background(), c.reader, seed, depth, direction,
+		context.Background(), c.sink, seed, depth, direction,
 	)
 	return nil
 }
@@ -261,18 +252,23 @@ func (c *buildCallChainBFSCtx) theDiagramContainsNodesAndNot(present, absent str
 	if c.err != nil {
 		return fmt.Errorf("unexpected error: %w", c.err)
 	}
-	nodeIDs := map[string]bool{}
+	// Build a map of canonical signatures present in the diagram.
+	// The SQLite backend generates opaque node IDs (fingerprint
+	// hashes), so we match on the label the projector derives from
+	// the canonical signature (single-segment sigs like "A" map
+	// 1:1 to labels).
+	nodeSigs := map[string]bool{}
 	for _, n := range c.diag.Nodes {
-		nodeIDs[n.ID] = true
+		nodeSigs[n.Label] = true
 	}
 	for _, want := range strings.Split(present, ",") {
-		if !nodeIDs[want] {
-			return fmt.Errorf("expected node %q present, got ids=%v", want, nodeIDs)
+		if !nodeSigs[want] {
+			return fmt.Errorf("expected node with label %q present, got labels=%v", want, nodeSigs)
 		}
 	}
 	for _, notWant := range strings.Split(absent, ",") {
-		if nodeIDs[notWant] {
-			return fmt.Errorf("node %q must NOT appear, got ids=%v", notWant, nodeIDs)
+		if nodeSigs[notWant] {
+			return fmt.Errorf("node with label %q must NOT appear, got labels=%v", notWant, nodeSigs)
 		}
 	}
 	return nil
@@ -319,6 +315,12 @@ func (c *buildCallChainBFSCtx) itReturnsAnErrorWithCodeAndZeroValueDiagram(code 
 
 func InitializeScenario_diagram_projector_buildcallchain_bfs(ctx *godog.ScenarioContext) {
 	c := &buildCallChainBFSCtx{}
+
+	// Clean up the ephemeral DB after each scenario.
+	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
+		c.cleanup()
+		return ctx, nil
+	})
 
 	ctx.Step(`^a method M with 2 callees and 3 callers$`, c.aMethodMWith2CalleesAnd3Callers)
 	ctx.Step(`^a chain A -> B -> C -> D$`, c.aChainABCD)

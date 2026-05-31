@@ -11,7 +11,6 @@ package e2e
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -564,9 +563,3 @@ func TestE2E_p0_reports_and_delivery_p0_fixture_corpus_and_golden_snapshots(t *t
 		t.Fatal("non-zero status returned, failed to run feature tests")
 	}
 }
-
-// Compile-time checks: ensure imports are used.
-var (
-	_ = json.Marshal
-	_ = sort.Slice
-)

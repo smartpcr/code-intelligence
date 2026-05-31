@@ -368,7 +368,17 @@ func collectFromReader(
 			t.Fatalf("reader.ListEdgesFrom(%s): %v", n.NodeID, err)
 		}
 		for _, e := range edges {
-			srcFP := nodeFP[e.SrcNodeID]
+			srcFP, ok := nodeFP[e.SrcNodeID]
+			if !ok {
+				// Defensive: ListEdgesFrom was rooted at a node
+				// we just listed, so the src must also be inside
+				// the repo. A miss means a backend returned an
+				// edge whose SrcNodeID differs from the queried
+				// node -- surface that explicitly instead of
+				// silently zeroing the fingerprint.
+				t.Fatalf("collectFromReader: edge %s -> %s references an unlisted source node",
+					e.SrcNodeID, e.DstNodeID)
+			}
 			dstFP, ok := nodeFP[e.DstNodeID]
 			if !ok {
 				// Defensive: ListEdgesFrom is rooted at a node

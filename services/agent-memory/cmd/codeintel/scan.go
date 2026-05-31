@@ -132,16 +132,26 @@ func newScanCmdImpl(root *rootFlags) *cobra.Command {
 // tests substitute the sink opener / materializers and capture
 // stdout without going through cobra.
 func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input string, runner scanRunner) error {
+	_, err := runScanWithSummary(ctx, root, flags, input, runner)
+	return err
+}
+
+// runScanWithSummary is the scan-loop body that ALSO returns the
+// rendered summary so callers (notably `scan-many`) can aggregate
+// across many invocations without re-parsing JSON. It writes the
+// per-repo summary to `runner.stdout` exactly as runScan does.
+func runScanWithSummary(ctx context.Context, root *rootFlags, flags *scanFlags, input string, runner scanRunner) (scanSummary, error) {
+	var zero scanSummary
 	if root == nil {
-		return errors.New("scan: nil root flags")
+		return zero, errors.New("scan: nil root flags")
 	}
 	if input = strings.TrimSpace(input); input == "" {
-		return errors.New("scan: empty <path|git-url> argument")
+		return zero, errors.New("scan: empty <path|git-url> argument")
 	}
 	if root.withEmbeddings {
 		// Stage 5.5 wires this; until then opt-in is rejected so
 		// the operator does not silently get a no-op publisher.
-		return errors.New("scan: --with-embeddings is not implemented yet (Stage 5.5)")
+		return zero, errors.New("scan: --with-embeddings is not implemented yet (Stage 5.5)")
 	}
 
 	stdout := runner.stdout
@@ -168,7 +178,7 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 		}
 		matArg = input
 		if shaArg == "" {
-			return errors.New("scan: --sha is required when the input is a git URL")
+			return zero, errors.New("scan: --sha is required when the input is a git URL")
 		}
 	case inputKindFileURL, inputKindLocalPath:
 		if runner.newLocalMat != nil {
@@ -178,7 +188,7 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 		}
 		matArg = input
 	default:
-		return fmt.Errorf("scan: cannot classify input %q (use file://, an absolute path, or a git URL)", input)
+		return zero, fmt.Errorf("scan: cannot classify input %q (use file://, an absolute path, or a git URL)", input)
 	}
 
 	// 2. Open the sink BEFORE materializing so an unwritable
@@ -202,7 +212,7 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 	}
 	sink, sinkClose, err := opener(ctx, root.store, dbOrOut)
 	if err != nil {
-		return fmt.Errorf("scan: open store %q: %w", root.store, err)
+		return zero, fmt.Errorf("scan: open store %q: %w", root.store, err)
 	}
 	// sinkCloseErr captures a deferred export/close failure so
 	// it can be surfaced as the scan's overall result. The happy
@@ -231,7 +241,7 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 	// 3. Materialize -- with a CLI cancel-safe context.
 	ws, err := mat.Materialize(ctx, matArg, shaArg)
 	if err != nil {
-		return fmt.Errorf("scan: materialize: %w", err)
+		return zero, fmt.Errorf("scan: materialize: %w", err)
 	}
 	defer func() {
 		if cerr := ws.Close(); cerr != nil {
@@ -252,7 +262,7 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 	aw := repoindexer.NewAncestryWriter(counter, ws.URL(), ws.SHA())
 	ancestry, err := aw.EnsureRepoAndCommit(ctx, "" /* default_branch */, flags.langHints)
 	if err != nil {
-		return fmt.Errorf("scan: ancestry pre-walk: %w", err)
+		return zero, fmt.Errorf("scan: ancestry pre-walk: %w", err)
 	}
 
 	// 6. Dispatcher wiring. Attach a skip-aware logger so the
@@ -324,14 +334,14 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 		return nil
 	})
 	if walkErr != nil {
-		return fmt.Errorf("scan: walk: %w", walkErr)
+		return zero, fmt.Errorf("scan: walk: %w", walkErr)
 	}
 
 	// 8. Flush buffered writes (SQLite is inline; memory writes
 	// the JSON export on Close, which runs in the deferred
 	// closer above).
 	if ferr := sink.Flush(ctx); ferr != nil {
-		return fmt.Errorf("scan: flush: %w", ferr)
+		return zero, fmt.Errorf("scan: flush: %w", ferr)
 	}
 
 	// Close the sink BEFORE writing the summary so its export
@@ -357,15 +367,15 @@ func runScan(ctx context.Context, root *rootFlags, flags *scanFlags, input strin
 	sum.Nodes = counter.snapshotNodes()
 	sum.Edges = counter.snapshotEdges()
 	if err := writeScanSummary(stdout, root.logFormat, sum); err != nil {
-		return err
+		return zero, err
 	}
 	if sinkCloseErr != nil {
 		// Propagate a failed --out / sink.Close so an
 		// unwritable export does not look like a clean scan
 		// (per evaluator iter-1 feedback item 6 / iter-3 item 1).
-		return fmt.Errorf("scan: sink close: %w", sinkCloseErr)
+		return zero, fmt.Errorf("scan: sink close: %w", sinkCloseErr)
 	}
-	return nil
+	return sum, nil
 }
 
 // ----- input-kind detection --------------------------------------

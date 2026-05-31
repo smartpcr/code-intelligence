@@ -132,6 +132,36 @@ Both the `parsers=` and `rule-packs=` CSV values are
 asserted as sets (not strings) by the test suite so additions
 do NOT have to be appended at the end.
 
+## 5.1 Dev-mode banner (architecture Sec 7.2, constraint C10)
+
+When the binary runs with `--dev-mode=true` (the default on
+`make build`), the dispatcher writes a single LOUD warning line to
+**stderr** before the first analyze artifact, exactly:
+
+```
+WARNING: dev-mode policy is unsigned. Do NOT use cleanc output as the source of truth for a production gate.
+```
+
+The banner is followed by a single `\n`. The byte-for-byte content is
+pinned in [`internal/cli/devpolicy/bypass.go`](../../services/clean-code/internal/cli/devpolicy/bypass.go)
+(`BannerText` constant) and asserted by
+`TestEmitBanner_PinsByteForByteContent`; any rewording is a
+breaking change to the operator-facing contract.
+
+Behaviour summary:
+
+| Build               | `--dev-mode` default | Banner emitted? | Unsigned policy bundle accepted? |
+| ------------------- | -------------------- | --------------- | -------------------------------- |
+| `make build`        | `true`               | Yes (stderr)    | Yes (`devpolicy` YAML loader)    |
+| `make build-prod`   | `false`              | No              | No (`ErrDevModeUnavailable`)     |
+
+The prod binary literally does not link the YAML decoder (the
+`unsigned_dev.go` build-tag-paired file is excluded via
+`//go:build !prod`), so passing `--dev-mode=true` on the prod build
+also fails closed at startup with
+`devpolicy: dev-mode policy bypass not available in prod build`
+and exit code 64.
+
 ## 6. Example invocations
 
 ```powershell
@@ -210,6 +240,102 @@ non-deterministic insertion order doesn't bleed into the diff.
 `diag.json` carries no UUIDs and no timestamps -- only
 dark-metric counts and the effort-source tag -- so it is
 byte-matched as-is.
+
+## 6.2 P0 walkthrough -- `analyze` + report
+
+P0 is the minimum-viable analyze loop: walk a repo, evaluate the
+embedded rule packs, write a markdown report + a `findings.json`
+JSON sidecar. No AI-coder hand-off, no patch generation.
+
+```bash
+# 1. Build the dev binary (no build tag, --dev-mode default true).
+cd services/clean-code
+make build
+
+# 2. Analyze a local repo. The dev-mode banner lands on stderr
+#    immediately; the markdown report lands on --out (or stdout
+#    when --out is empty).
+bin/cleanc analyze /path/to/repo \
+    --out report.md \
+    --findings findings.json \
+    --diagnostics diag.json \
+    --exit-on warn
+
+# 3. Re-render the markdown report from the JSON sidecar without
+#    re-running the walker + engine + planner pipeline.
+bin/cleanc report --findings findings.json --out report.md
+```
+
+The artifacts:
+
+| File              | Format    | Contents                                                                                       |
+| ----------------- | --------- | ---------------------------------------------------------------------------------------------- |
+| `report.md`       | markdown  | Operator-facing summary: findings table, hot-spot table, categorical refactor task list.       |
+| `findings.json`   | JSON      | Stable machine-readable run artifact (`report.RunArtifact`); the canonical re-render source.   |
+| `diag.json`       | JSON      | Per-`(metric_kind, language)` dark-metric inventory + effort-source tag (`ml` vs `fallback`).  |
+
+Exit codes follow §3 above: `0` on a clean run, `1` when the maximum
+finding severity meets or exceeds `--exit-on`, `2` on walker failure,
+`64` on usage error, `70` on internal engine failure.
+
+## 6.3 P1 walkthrough -- `--emit-prompts` workflow with an AI coder
+
+P1 adds the L7 Option A structured-prompt emitter: one JSONL record
+per `RefactorTask`, ready to be piped into an AI coder (Copilot Chat,
+Claude, etc.) for patch synthesis. The wire shape is documented in
+[`PROMPT-FORMAT.md`](PROMPT-FORMAT.md) and pinned by
+[`internal/cli/suggest/record.go`](../../services/clean-code/internal/cli/suggest/record.go).
+
+```bash
+# 1. Run analyze with --emit-prompts. The JSONL sidecar lands
+#    AFTER the markdown report and findings.json so the operator
+#    can pipe it into a separate tool without re-running analysis.
+bin/cleanc analyze . \
+    --out report.md \
+    --findings findings.json \
+    --emit-prompts prompts.jsonl
+
+# 2. Inspect one record at a time (JSONL == one JSON object per line).
+head -n 1 prompts.jsonl | jq .
+
+# 3. Hand a single record off to an AI coder. The exact framing
+#    depends on the tool; the canonical pattern is:
+#
+#      "Here is a structured refactor request emitted by cleanc.
+#       Synthesise a unified diff that implements the
+#       prose_suggestion against the source_snippet, preserving
+#       the scope's signature and respecting the metric_evidence
+#       thresholds. Reply with the diff only."
+#
+#    Then paste the JSON object as the message body.
+jq -c '.' prompts.jsonl | head -n 1 | \
+    pbcopy   # or: xclip -selection clipboard, clip.exe, etc.
+```
+
+The emitter is **strictly downstream** of the planner: it never
+rewrites source bytes (per CLEAN-CODE architecture Sec 1.2 "no
+auto-fix" clause) and the JSONL sidecar is the AI coder's only
+hand-off surface today. The `apply` verb -- which would land
+mechanical patches -- is reserved at exit code 64 pending operator
+pin `cli-l7-authority` (architecture Sec 6.3).
+
+## 6.4 Build-tag matrix recap
+
+| Build               | Build tag | `--dev-mode` default | Unsigned policy YAML loader | Banner |
+| ------------------- | --------- | -------------------- | --------------------------- | ------ |
+| `make build`        | (none)    | `true`               | linked (`unsigned_dev.go`)  | yes    |
+| `make build-prod`   | `prod`    | `false`              | excluded (`unsigned_prod.go` sentinel returns `ErrDevModeUnavailable`) | no |
+
+The mutual-exclusion is compile-time fused -- the prod binary
+literally does not link the YAML decoder, so the unsigned-policy
+bypass cannot be smuggled in via a runtime flag, environment
+variable, or hidden subcommand. The `build-prod` job in
+`.github/workflows/clean-code-ci.yml` enforces both halves: it runs
+`make build-prod` (proving the prod binary compiles) and then
+`go test -tags prod -run TestProdBuildExcludesDevBypass
+./internal/cli/devpolicy/...` (proving the sentinel ships in place
+of the loader). See architecture Sec 7.2 / tech-spec Sec 8.9 for
+the normative pins.
 
 ## 7. Cross-references
 

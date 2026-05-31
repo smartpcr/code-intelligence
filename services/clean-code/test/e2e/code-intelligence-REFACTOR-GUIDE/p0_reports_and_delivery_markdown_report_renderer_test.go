@@ -207,15 +207,18 @@ func (s *markdownRendererState) theOutputContains(expected string) error {
 	return nil
 }
 
-func (s *markdownRendererState) theOutputContainsNonEmptyDiagnosticsBlock() error {
+func (s *markdownRendererState) theOutputContainsDarkMetricsCountLine() error {
 	if s.renderErr != nil {
 		return fmt.Errorf("Render returned error: %w", s.renderErr)
 	}
 	if len(s.output) == 0 {
-		return fmt.Errorf("output is empty; want non-empty diagnostics block")
+		return fmt.Errorf("output is empty; want dark-metrics count line")
 	}
-	if !strings.Contains(s.output, "Dark metrics:") {
-		return fmt.Errorf("output missing diagnostics row 'Dark metrics:'\n---output---\n%s\n---", s.output)
+	// Match the bolded summary count line (e.g. "**Dark metrics:** 0"),
+	// not a detail-level diagnostics block which would only appear when
+	// the artifact actually contains dark metrics.
+	if !strings.Contains(s.output, "**Dark metrics:**") {
+		return fmt.Errorf("output missing dark-metrics count line '**Dark metrics:**'\n---output---\n%s\n---", s.output)
 	}
 	return nil
 }
@@ -298,7 +301,7 @@ func InitializeScenario_p0_reports_and_delivery_markdown_report_renderer(ctx *go
 
 	// Then
 	ctx.Step(`^the output contains "([^"]*)"$`, s.theOutputContains)
-	ctx.Step(`^the output contains a non-empty diagnostics block$`, s.theOutputContainsNonEmptyDiagnosticsBlock)
+	ctx.Step(`^the output contains a Dark metrics count$`, s.theOutputContainsDarkMetricsCountLine)
 	ctx.Step(`^the two outputs are byte-identical$`, s.theTwoOutputsAreByteIdentical)
 	ctx.Step(`^the rendered output contains the literal tag "([^"]*)"$`, s.theRenderedOutputContainsLiteralTag)
 	ctx.Step(`^the rendered output finding row contains the excerpt "([^"]*)"$`, s.theRenderedOutputFindingRowContainsExcerpt)

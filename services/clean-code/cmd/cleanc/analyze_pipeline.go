@@ -79,6 +79,7 @@ func buildRepoContext(absPath string) repocontext.RepoContext {
 	// Used by e2e golden tests to produce machine-independent
 	// report.md that can byte-match a committed golden file.
 	if override := os.Getenv("CLEANC_DISPLAY_ROOT"); override != "" {
+		fmt.Fprintln(os.Stderr, "warn: CLEANC_DISPLAY_ROOT is set — report paths are overridden")
 		rootPath = override
 	}
 	return repocontext.RepoContext{

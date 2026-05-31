@@ -465,8 +465,10 @@ return fmt.Errorf("spy store not configured")
 if len(s.spy.calls) != callCount {
 return fmt.Errorf("InsertSamples called %d times, want %d", len(s.spy.calls), callCount)
 }
+if callCount > 0 {
 if s.spy.calls[0].batchSize != sampleCount {
-return fmt.Errorf("InsertSamples batch size = %d, want %d", s.spy.calls[0].batchSize, sampleCount)
+	return fmt.Errorf("InsertSamples batch size = %d, want %d", s.spy.calls[0].batchSize, sampleCount)
+}
 }
 return nil
 }

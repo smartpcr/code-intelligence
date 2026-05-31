@@ -2,13 +2,19 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"io"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/flags"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/report"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/repocontext"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/version"
 )
 
 // versionLineRegex is the strict line-level regex e2e-scenarios.md
@@ -100,6 +106,186 @@ func TestVersionContainsNoAnsiEscape(t *testing.T) {
 	if strings.ContainsRune(stdout, '\x1b') {
 		t.Errorf("version stdout contains a 0x1b ANSI escape; want plain text\nstdout=%q", stdout)
 	}
+}
+
+// TestVersionFormatExact pins the literal first-line format
+// `"cleanc <semver> (build-tag=<tag>) (parsers=<csv>) (rule-packs=<csv>)"`
+// pinned by implementation-plan.md Stage 3.4 line 328. The
+// existing regex test (TestVersionFormatMatchesE2ERegex)
+// proves the line MATCHES the e2e regex, but a regex match
+// permits any whitespace / ordering drift the regex happens
+// to tolerate. This test reconstructs the expected line
+// byte-for-byte from the same constants the dispatcher reads
+// (semverPrefix(version.Version), buildTag, skeletonParsers,
+// skeletonRulePacks) and asserts equality, so any future
+// tweak to the format string (e.g. dropping a parenthesis,
+// reordering segments) trips this guard on the next test
+// run.
+func TestVersionFormatExact(t *testing.T) {
+	t.Parallel()
+
+	stdout, stderr, code := captureRun("version")
+	if code != flags.ExitOK {
+		t.Fatalf("cleanc version exit code = %d, want %d; stderr=%q",
+			code, flags.ExitOK, stderr)
+	}
+	firstLine, _, _ := strings.Cut(stdout, "\n")
+	want := versionFirstLineExpected()
+	if firstLine != want {
+		t.Errorf("first line mismatch:\n got: %q\nwant: %q", firstLine, want)
+	}
+}
+
+// TestVersionContainsBuildTagSegment asserts the
+// `(build-tag=<tag>)` segment appears verbatim in stdout
+// regardless of build tag. Dev builds carry an empty value
+// (`(build-tag=)`); prod builds carry `(build-tag=prod)`.
+// Both cases are pinned by the e2e regex alternation
+// `(|prod)`.
+func TestVersionContainsBuildTagSegment(t *testing.T) {
+	t.Parallel()
+
+	stdout, _, _ := captureRun("version")
+	want := "(build-tag=" + buildTag + ")"
+	if !strings.Contains(stdout, want) {
+		t.Errorf("stdout missing %q\nstdout=%s", want, stdout)
+	}
+}
+
+// TestReportRendersFromFindingsArtifact verifies the
+// Stage 3.4 happy path: a `findings.json` previously
+// written by [report.JSON.Render] is re-rendered into
+// markdown by `cleanc report <path> --out <path>` without
+// re-running the pipeline. The test stages a minimal
+// RunArtifact, renders it via the JSON renderer, invokes
+// the dispatcher, and asserts the markdown contains the
+// expected header tokens (RootPath, Verdict).
+func TestReportRendersFromFindingsArtifact(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	findingsPath := dir + "/findings.json"
+	mdPath := dir + "/replay.md"
+
+	if err := writeMinimalFindings(findingsPath); err != nil {
+		t.Fatalf("stage findings.json: %v", err)
+	}
+
+	_, stderr, code := captureRun("report", findingsPath, "--out", mdPath)
+	if code != flags.ExitOK {
+		t.Fatalf("exit code = %d, want %d; stderr=%s", code, flags.ExitOK, stderr)
+	}
+
+	mdBytes, err := os.ReadFile(mdPath)
+	if err != nil {
+		t.Fatalf("read replay.md: %v", err)
+	}
+	md := string(mdBytes)
+	for _, want := range []string{"/repos/example", "Verdict:"} {
+		if !strings.Contains(md, want) {
+			t.Errorf("replay.md missing %q\n---\n%s", want, md)
+		}
+	}
+}
+
+// TestReportRendersToStdoutWhenOutEmpty verifies the
+// stdout-default behaviour: omitting `--out` writes the
+// markdown to the process's stdout instead of a file.
+func TestReportRendersToStdoutWhenOutEmpty(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	findingsPath := dir + "/findings.json"
+	if err := writeMinimalFindings(findingsPath); err != nil {
+		t.Fatalf("stage findings.json: %v", err)
+	}
+
+	stdout, stderr, code := captureRun("report", findingsPath)
+	if code != flags.ExitOK {
+		t.Fatalf("exit code = %d, want %d; stderr=%s", code, flags.ExitOK, stderr)
+	}
+	if !strings.Contains(stdout, "Verdict:") {
+		t.Errorf("stdout missing %q\n%s", "Verdict:", stdout)
+	}
+}
+
+// TestReportRejectsSchemaVersionMismatch verifies the
+// Stage 3.4 "schema mismatch refused" scenario: a
+// findings.json whose `schemaVersion` does not match the
+// current binary's constant exits with [flags.ExitUsage]
+// (64) and stderr names BOTH versions verbatim so the
+// operator can correlate artifact-vs-binary skew without
+// re-reading either file.
+func TestReportRejectsSchemaVersionMismatch(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	findingsPath := dir + "/findings.json"
+	const staleVersion = "v0.0.0"
+	body := `{"schemaVersion":"` + staleVersion + `","Context":{"RootPath":"/x"}}` + "\n"
+	if err := os.WriteFile(findingsPath, []byte(body), 0o644); err != nil {
+		t.Fatalf("stage stale findings.json: %v", err)
+	}
+
+	_, stderr, code := captureRun("report", findingsPath)
+	if code != flags.ExitUsage {
+		t.Fatalf("exit code = %d, want %d (schema mismatch); stderr=%s",
+			code, flags.ExitUsage, stderr)
+	}
+	// Brief: "exit 64 with a clear message naming both
+	// versions" -- assert both the stale and the binary's
+	// current schema versions appear verbatim in stderr.
+	for _, want := range []string{staleVersion, report.SchemaVersionCurrent} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr missing version %q\nstderr=%s", want, stderr)
+		}
+	}
+}
+
+// TestReportRejectsMissingFindingsFile asserts the report
+// sub-command exits with an I/O failure code when the
+// supplied positional path does not exist on disk.
+func TestReportRejectsMissingFindingsFile(t *testing.T) {
+	t.Parallel()
+
+	_, stderr, code := captureRun("report", t.TempDir()+"/no-such.json")
+	if code != flags.ExitInternalError {
+		t.Errorf("exit code = %d, want %d; stderr=%s",
+			code, flags.ExitInternalError, stderr)
+	}
+}
+
+// writeMinimalFindings stages a `findings.json` that
+// satisfies the current schemaVersion + the markdown
+// renderer's header requirements (a non-empty RootPath
+// keeps the renderer's header block from looking blank).
+func writeMinimalFindings(path string) error {
+	art := report.RunArtifact{
+		SchemaVersion: report.SchemaVersionCurrent,
+		Context: repocontext.RepoContext{
+			RootPath: "/repos/example",
+			HeadSHA:  "deadbeef",
+		},
+		Verdict: rule_engine.EvaluationVerdict{
+			Verdict: rule_engine.VerdictPass,
+		},
+	}
+	var buf bytes.Buffer
+	if err := (report.JSON{}).Render(context.Background(), art, &buf); err != nil {
+		return err
+	}
+	return os.WriteFile(path, buf.Bytes(), 0o644)
+}
+
+// versionFirstLineExpected reconstructs the version line
+// from the same constants the dispatcher reads, returning
+// the exact string the binary should print as the first
+// line of `cleanc version` stdout.
+func versionFirstLineExpected() string {
+	return "cleanc " + semverPrefix(version.Version) +
+		" (build-tag=" + buildTag + ")" +
+		" (parsers=" + strings.Join(skeletonParsers, ",") + ")" +
+		" (rule-packs=" + strings.Join(skeletonRulePacks, ",") + ")"
 }
 
 // TestUnknownSubcommandExitsUsage validates the rejection

@@ -124,3 +124,95 @@ func (JSON) Render(ctx context.Context, art RunArtifact, w io.Writer) error {
 	}
 	return nil
 }
+
+// SchemaVersionMismatchError is the typed error
+// [JSON.RenderFromBytes] returns when the unmarshalled
+// `findings.json` carries a `schemaVersion` that does not
+// match the current binary's [SchemaVersionCurrent]
+// constant. The composition root in `cmd/cleanc/main.go`
+// uses [errors.As] to detect this case and exits with
+// [flags.ExitUsage] (64) so an operator running a stale
+// CLI against a newer artifact (or vice versa) gets a
+// clear, actionable error naming both versions rather
+// than a partial / corrupt markdown render.
+//
+// The error message itself includes both `Got` and `Want`
+// verbatim so log lines and crash dumps surface the
+// mismatch even if the dispatcher's stderr line is lost.
+type SchemaVersionMismatchError struct {
+	// Got is the `schemaVersion` value read from the
+	// supplied findings.json bytes (may be empty if the
+	// document predates schema stamping).
+	Got string
+	// Want is the binary's pinned [SchemaVersionCurrent].
+	Want string
+}
+
+// Error implements the error interface. The phrasing
+// deliberately names BOTH versions so the operator can
+// correlate the artifact against the binary without
+// re-reading either file.
+func (e *SchemaVersionMismatchError) Error() string {
+	return fmt.Sprintf("report: findings.json schemaVersion %q does not match this binary's %q",
+		e.Got, e.Want)
+}
+
+// RenderFromBytes unmarshals a previously-written
+// `findings.json` artifact into a [RunArtifact] and
+// re-renders the human-readable markdown report into `w`
+// WITHOUT re-running the analyze pipeline. This is the
+// helper `cleanc report <findings.json>` (implementation-
+// plan.md Stage 3.4) dispatches through so CI consumers
+// that already have the JSON sidecar from an upstream
+// `cleanc analyze` run do not have to walk the source
+// tree a second time just to regenerate the markdown.
+//
+// # Schema-version refusal contract
+//
+// If the unmarshalled artifact's [RunArtifact.SchemaVersion]
+// does not match [SchemaVersionCurrent], the helper returns
+// a [*SchemaVersionMismatchError] WITHOUT writing any bytes
+// to `w`. The composition root maps this typed error to
+// [flags.ExitUsage] (64) so a stale CLI invoked against a
+// newer artifact fails loudly with both versions named in
+// the diagnostic, rather than producing a partial render.
+//
+// An empty `SchemaVersion` is also treated as a mismatch:
+// every artifact emitted by [JSON.Render] auto-stamps the
+// current version (see [JSON.Render] doc comment), so a
+// missing tag necessarily means the bytes did not come from
+// any released `cleanc` build.
+//
+// # Unmarshal failures
+//
+// JSON parse failures surface verbatim (wrapped with a
+// `report: unmarshal previous findings:` prefix) so the
+// composition root's stderr line points at the offending
+// path. The helper does NOT attempt to recover a partially
+// valid document.
+//
+// # Render writer
+//
+// `w` MUST be non-nil; a nil writer returns a clear error
+// before any unmarshal work happens. The internal markdown
+// renderer is invoked with [context.Background] because
+// the only context-bound work is a pre-flight cancellation
+// check and `cleanc report` is a synchronous CLI surface
+// with no separate cancel signal beyond the process
+// lifetime.
+func (j JSON) RenderFromBytes(prevFindings []byte, w io.Writer) error {
+	if w == nil {
+		return fmt.Errorf("report: render-from-bytes requires a non-nil writer")
+	}
+	var art RunArtifact
+	if err := json.Unmarshal(prevFindings, &art); err != nil {
+		return fmt.Errorf("report: unmarshal previous findings: %w", err)
+	}
+	if art.SchemaVersion != SchemaVersionCurrent {
+		return &SchemaVersionMismatchError{
+			Got:  art.SchemaVersion,
+			Want: SchemaVersionCurrent,
+		}
+	}
+	return Markdown{}.Render(context.Background(), art, w)
+}

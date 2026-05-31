@@ -50,6 +50,7 @@ import (
 	"strings"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/flags"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/report"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/version"
 )
 
@@ -324,11 +325,48 @@ func runReport(stdout, stderr io.Writer, args []string) int {
 		return flags.ExitUsage
 	}
 
-	_ = g
-	_ = stdout
+	// Stage 3.4: re-render markdown from the supplied
+	// findings.json artifact without re-running the
+	// pipeline. The helper [report.JSON.RenderFromBytes]
+	// is the single re-render seam (implementation-plan.md
+	// Stage 3.2 line 285); a schemaVersion mismatch
+	// short-circuits to ExitUsage (64) with both versions
+	// named so a stale CLI invoked against a newer artifact
+	// fails loudly rather than producing a partial render.
+	findingsPath := positionals[0]
+	data, err := os.ReadFile(findingsPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "cleanc report: read %s: %v\n", findingsPath, err)
+		return flags.ExitInternalError
+	}
 
-	fmt.Fprintln(stderr, "cleanc report: re-render not yet wired in the Stage 1.1 skeleton; the report renderer lands in Stage 4.1.")
-	return flags.ExitInternalError
+	var out io.Writer = stdout
+	if g.Out != nil && *g.Out != "" {
+		f, ferr := os.Create(*g.Out)
+		if ferr != nil {
+			fmt.Fprintf(stderr, "cleanc report: create %s: %v\n", *g.Out, ferr)
+			return flags.ExitInternalError
+		}
+		defer func() { _ = f.Close() }()
+		out = f
+	}
+
+	if err := (report.JSON{}).RenderFromBytes(data, out); err != nil {
+		var smErr *report.SchemaVersionMismatchError
+		if errors.As(err, &smErr) {
+			// Both versions are named verbatim so the operator
+			// can pin the artifact-vs-binary skew without
+			// re-reading either file. Stage 3.4 brief: "exit
+			// 64 with a clear message naming both versions".
+			fmt.Fprintf(stderr,
+				"cleanc report: refusing to read %s: schemaVersion %q does not match this binary's %q (rebuild or re-run analyze with a matching cleanc version)\n",
+				findingsPath, smErr.Got, smErr.Want)
+			return flags.ExitUsage
+		}
+		fmt.Fprintf(stderr, "cleanc report: render failed: %v\n", err)
+		return flags.ExitInternalError
+	}
+	return flags.ExitOK
 }
 
 // parseInterleavedFlags runs the supplied flag-set against

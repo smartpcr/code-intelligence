@@ -44,26 +44,38 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/devpolicy"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/flags"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/orchestrator"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/report"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/walk"
+	"github.com/smartpcr/code-intelligence/services/clean-code/internal/refactor"
+	rule_engine "github.com/smartpcr/code-intelligence/services/clean-code/internal/rule_engine"
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/version"
 )
 
-// skeletonParsers is the hard-coded list of language tags
-// the dispatcher emits in the `cleanc version` output's
-// `(parsers=<csv>)` segment. The order matters: the CSV
-// is byte-stable across builds and the
-// `TestVersionContainsImplPlanSubstrings` test pins the
-// literal substring `(parsers=go,python,typescript,java)`,
-// so reordering requires updating the test too.
+// runtimeStack proxies [runtime.Stack] so the panic-recover
+// dispatcher in [runWithRecover] can capture a stack trace
+// without dragging the `runtime` import into a per-function
+// scope where it would be unused on the happy path.
+func runtimeStack(buf []byte, all bool) int { return runtime.Stack(buf, all) }
+
+// skeletonParsers is the hard-coded list of language tags the
+// skeleton emits in the `cleanc version` output. The order
+// matters: implementation-plan.md Stage 1.1 line 41 pins the
+// literal substring `parsers=[go,python,typescript,java]`, so
+// changing the order requires updating the impl-plan check too.
 //
 // Stage 1.4 replaces this with a dynamic lookup against
 // `parser.DefaultRegistry().Languages()` once the policy
@@ -83,8 +95,51 @@ var skeletonParsers = []string{"go", "python", "typescript", "java"}
 var skeletonRulePacks = []string{"decoupling", "solid"}
 
 func main() {
-	code := run(os.Args[1:], os.Stdout, os.Stderr)
+	code := runWithRecover(os.Args[1:], os.Stdout, os.Stderr)
 	os.Exit(code)
+}
+
+// runWithRecover wraps the dispatcher in a `recover()`
+// frame so an unexpected panic anywhere inside the analyze
+// pipeline (or any other sub-command) surfaces as a
+// canonical exit code 70 with the panic value + Go stack
+// trace written to stderr (implementation-plan Stage 3.3
+// line 304 / tech-spec Sec 8.6 C9 panic contract). Without
+// the wrapper, a panic would bypass the OS exit-code mapping
+// the operator's CI relies on (`go run` exits 2 by default
+// for an uncaught panic, which would conflate "panic" with
+// "walker failure").
+//
+// The wrapper is deliberately the SINGLE recover frame in
+// the binary so each sub-command body can stay panic-free
+// without per-verb recover scaffolding; any panic raised
+// below this line surfaces here.
+func runWithRecover(args []string, stdout, stderr io.Writer) int {
+	return recoverDispatch(func() int {
+		return run(args, stdout, stderr)
+	}, stderr)
+}
+
+// recoverDispatch wraps an arbitrary `func() int`
+// dispatcher in a `recover()` frame so any panic raised
+// below surfaces as the canonical [flags.ExitInternalError]
+// exit code with the panic value + Go stack trace written
+// to `stderr`. Extracted as a closure-taking helper so the
+// recovery contract can be unit-tested directly with a
+// panicking closure rather than having to make a real
+// sub-command panic (iter-2 evaluator item 4).
+func recoverDispatch(fn func() int, stderr io.Writer) (code int) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(stderr, "cleanc: panic: %v\n", r)
+			stack := make([]byte, 8<<10)
+			n := runtimeStack(stack, false)
+			_, _ = stderr.Write(stack[:n])
+			fmt.Fprintln(stderr)
+			code = flags.ExitInternalError
+		}
+	}()
+	return fn()
 }
 
 // run is the testable dispatcher. Each sub-command body is a
@@ -186,19 +241,15 @@ func runVersion(stdout, stderr io.Writer, args []string) int {
 }
 
 // runAnalyze handles `cleanc analyze <repo-path> [flags]`.
-// Stage 1.1 wires the flag-set per tech-spec Sec 8.1 but does
-// NOT yet execute the pipeline -- the walker / parser / engine
-// / planner / report renderer land in Phase 2+ stages. To keep
-// the skeleton from claiming success for unimplemented work,
-// the body returns `ExitInternalError` (70, EX_SOFTWARE) with
-// an explicit "not yet wired" stderr line once flag validation
-// succeeds.
+// The body validates the global flag surface (tech-spec
+// Sec 8.1), rejects reserved / unknown flag values, then
+// dispatches to [runAnalyzePipeline] which performs the
+// Stage 3.3 end-to-end composition.
 //
 // The reserved-flag and invalid-value rejections (`--telemetry-otlp`,
-// `--with-churn`, `--exit-on banana`) ARE wired in Stage 1.1
-// because the workstream brief lists them as global-flag
-// requirements; the same checks satisfy the corresponding
-// Stage 3.3 / Stage 4.4 e2e assertions verbatim.
+// `--with-churn`, `--exit-on banana`) live here so they fire
+// before the pipeline starts; they share the same checks
+// the corresponding Stage 3.3 / Stage 4.4 e2e assertions pin.
 func runAnalyze(stdout, stderr io.Writer, args []string) int {
 	// Reserved-flag pre-scan: `--snippet-cap-lines` is NOT
 	// registered on the analyze flag-set (it is reserved for
@@ -260,20 +311,238 @@ func runAnalyze(stdout, stderr io.Writer, args []string) int {
 		return flags.ExitUsage
 	}
 
-	// Suppress unused-variable warnings: the Globals struct
-	// owns every flag pointer; the skeleton body doesn't
-	// consume the values yet but the flag-set really
-	// accepts them (the test suite asserts the surface and
-	// `-h` lists them), so downstream stages will read
-	// `g.Out`, `g.Findings`, etc. directly.
-	_ = g
+	// --dev-mode=false guard (resolves iter-1 evaluator
+	// item 4). The CLI's policy-loader surface is the
+	// dev-mode unsigned bypass (architecture Sec 3.8). A
+	// signed-policy loader is a separate workstream that
+	// has not landed yet, so an operator who explicitly
+	// opted OUT of dev mode cannot proceed -- refuse the
+	// run with `ExitUsage` (BSD EX_USAGE 64) so the
+	// operator sees a usage diagnostic rather than a
+	// confusing "loader returned ErrDevModeUnavailable"
+	// internal error.
+	if g.DevMode != nil && !*g.DevMode {
+		fmt.Fprintln(stderr, "cleanc analyze: --dev-mode=false requires a signed-policy loader, which is not available in this build; pass --dev-mode (or omit the flag) to proceed with the unsigned dev policy bundle.")
+		return flags.ExitUsage
+	}
 
-	// Surface stdout writer so unused-import warnings don't
-	// drop the import in tests that don't read stdout.
-	_ = stdout
+	return runAnalyzePipeline(context.Background(), stdout, stderr, g, positionals[0])
+}
 
-	fmt.Fprintln(stderr, "cleanc analyze: pipeline not yet wired in the Stage 1.1 skeleton; the walker, parser, engine, planner, and report renderer land in Phase 2+ stages.")
-	return flags.ExitInternalError
+// runAnalyzePipeline is the end-to-end wiring of the `cleanc
+// analyze <repo-path>` happy path. It is split from
+// [runAnalyze] so the dispatcher arm stays focused on flag
+// parsing and validation; the pipeline body is a single linear
+// composition of the L1 - L6 packages plus the report renderers.
+//
+// Stage ordering follows the workstream brief
+// (tech-spec.md Sec 8.6 / C9):
+//
+//  1. Emit the dev banner to stderr (dev build only -- the
+//     `buildTag` constant is the empty string in dev / no-tag
+//     builds and `"prod"` in `-tags prod` builds; the prod
+//     build short-circuits the banner entirely).
+//  2. Construct the [repocontext.RepoContext] (`repo_id`,
+//     `head_sha`, `module_path`).
+//  3. Load the dev-mode policy bundle via
+//     [devpolicy.NewLoader].Load -- the loader picks between
+//     the embedded `embed.FS` and the operator's `--policy
+//     <path>` directory.
+//  4. Run the [orchestrator.Orchestrator] -- walker + parser
+//     + recipe + scope-binding pipeline.
+//  5. Build the rule-engine sample corpus and seed the
+//     [rule_engine.InMemoryStore].
+//  6. Construct the engine and call
+//     [rule_engine.Engine.RunBatch] -- emits one
+//     EvaluationRun + EvaluationVerdict + N Finding rows.
+//  7. Run the [refactor.Planner] for hot-spot scoring, then
+//     the [refactor.TaskPlanner.PlanFromSnapshot] for the
+//     refactor plan + per-finding tasks (race-safe
+//     bypass: the snapshot Stage 8.1 produced is reused so
+//     Stage 8.2 cannot drift to a different
+//     `policy_version_id`).
+//  8. Assemble the [report.RunArtifact] from the orchestrator,
+//     engine, and planner outputs.
+//  9. Dispatch the artifact to the requested renderers --
+//     `--out` markdown (default stdout), `--findings` JSON,
+//     `--diagnostics` JSON.
+// 10. Translate the verdict + `--exit-on` threshold into the
+//     process exit code.
+func runAnalyzePipeline(ctx context.Context, stdout, stderr io.Writer, g *flags.Globals, rootPath string) int {
+	// Stage 1: dev-build banner. The constant `buildTag` is
+	// the empty string in `!prod` builds and `"prod"` in
+	// `prod` builds (per `buildtag_default.go` /
+	// `buildtag_prod.go`). EmitBanner writes the C10
+	// pinned warning + a single newline to stderr; the
+	// caller cannot suppress the banner -- a dev build
+	// always announces the unsigned policy bypass.
+	if buildTag != "prod" {
+		_, _ = devpolicy.EmitBanner(stderr)
+	}
+
+	// Stage 2: RepoContext. The walker, parser, recipes,
+	// rule engine, and refactor planner all consume this
+	// frozen value; minting it ONCE at the composition root
+	// is the architecture G2 invariant (Sec 4.1).
+	absPath, err := filepath.Abs(rootPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "cleanc analyze: resolve repo path %q: %v\n", rootPath, err)
+		return flags.ExitInternalError
+	}
+	repoCtx := buildRepoContext(absPath)
+
+	// Stage 3: policy load. Pick between the embedded
+	// rule-pack `embed.FS` (default) and the operator's
+	// `--policy <path>` override directory. The dev-build
+	// loader synthesises an unsigned [steward.PolicyVersion]
+	// per architecture Sec 3.8 STRUCTURAL bypass; the prod
+	// loader (under `-tags prod`) returns
+	// [devpolicy.ErrDevModeUnavailable] so the bypass cannot
+	// be smuggled into a release binary.
+	loader := devpolicy.NewLoader()
+	src := devpolicy.LoaderSource{UseEmbedded: *g.Policy == "", DirPath: *g.Policy}
+	bundle, err := loader.Load(ctx, src)
+	if err != nil {
+		switch {
+		case errors.Is(err, devpolicy.ErrDevModeUnavailable):
+			fmt.Fprintf(stderr, "cleanc analyze: %v\n", err)
+		default:
+			fmt.Fprintf(stderr, "cleanc analyze: load policy bundle: %v\n", err)
+		}
+		return flags.ExitInternalError
+	}
+
+	// Stage 4: orchestrator. The walker is wired with the
+	// stderr-backed slog handler so per-file parse errors /
+	// panics / scope-binding errors surface as warning lines
+	// the operator sees inline. The dispatcher relies on
+	// `New(Options{})` to fill every nil hook with the
+	// production default; passing only the logger keeps the
+	// composition root narrow and lets future workstreams
+	// override hooks without touching this call site.
+	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	orch := orchestrator.New(orchestrator.Options{Logger: logger})
+	result, err := orch.Run(ctx, repoCtx, absPath)
+	if err != nil {
+		if errors.Is(err, walk.ErrRootNotFound) {
+			fmt.Fprintf(stderr, "cleanc analyze: repo path not found: %s\n", rootPath)
+			return flags.ExitWalkerError
+		}
+		fmt.Fprintf(stderr, "cleanc analyze: walker/orchestrator failed: %v\n", err)
+		return flags.ExitWalkerError
+	}
+
+	// Stage 5: rule-engine sample corpus + store seed.
+	// BuildSamples is the canonical CLI-side rewrite of
+	// MetricSampleDraft -> rule_engine.Sample; the scope-id
+	// resolution and binding-signature stamping are pinned
+	// inside it so this composition root cannot drift.
+	samples := orchestrator.BuildSamples(repoCtx, result.Drafts, orch.ScopeBindings(), result.ScopeIDs)
+	store, err := orchestrator.LoadStore(bundle, samples, repoCtx)
+	if err != nil {
+		fmt.Fprintf(stderr, "cleanc analyze: load store: %v\n", err)
+		return flags.ExitInternalError
+	}
+
+	// Stage 6: engine. The engine writes one
+	// EvaluationRun + EvaluationVerdict + N Finding rows on
+	// each call; the dispatcher reads those rows back through
+	// the store's snapshot helpers (Runs / Verdicts /
+	// Findings) so the report artifact can serialise the
+	// canonical row shapes verbatim.
+	engine, err := rule_engine.New(rule_engine.Config{Store: store})
+	if err != nil {
+		fmt.Fprintf(stderr, "cleanc analyze: rule engine init: %v\n", err)
+		return flags.ExitInternalError
+	}
+	runRes, err := engine.RunBatch(ctx, repoCtx.RepoID, repoCtx.HeadSHA, bundle.PolicyVersion.PolicyVersionID)
+	if err != nil {
+		fmt.Fprintf(stderr, "cleanc analyze: rule engine run: %v\n", err)
+		return flags.ExitInternalError
+	}
+	evalRun, verdict := lookupRunAndVerdict(store, runRes)
+	findings := store.Findings()
+
+	// Stage 7: refactor planner + task planner. The CLI
+	// policy reader projects the dev-mode bundle onto the
+	// planner's [refactor.PolicySnapshot] contract (no
+	// SQL steward). The Stage 8.2 pass reuses the
+	// Stage 8.1 snapshot via PlanFromSnapshot to avoid the
+	// concurrent-activate race the rubber-duck design
+	// review pinned (planner.go ~Sec 8.1 docstring).
+	policyR := orchestrator.NewCLIPolicyReader(bundle)
+	metricsR := orchestrator.BuildMetricSampleReader(samples)
+	findingsR := orchestrator.BuildFindingReader(findings)
+	hotSpotWriter := refactor.NewInMemoryHotSpotWriter()
+	planner, err := refactor.NewPlanner(policyR, metricsR, findingsR, hotSpotWriter)
+	if err != nil {
+		fmt.Fprintf(stderr, "cleanc analyze: planner init: %v\n", err)
+		return flags.ExitInternalError
+	}
+	planRes, err := planner.Plan(ctx, repoCtx.RepoID, repoCtx.HeadSHA)
+	if err != nil && !errors.Is(err, refactor.ErrNoActivePolicy) {
+		fmt.Fprintf(stderr, "cleanc analyze: planner run: %v\n", err)
+		return flags.ExitInternalError
+	}
+
+	plans, tasks, err := runTaskPlanner(ctx, stderr, bundle, planRes, findings, repoCtx)
+	if err != nil {
+		return flags.ExitInternalError
+	}
+	var refactorPlan refactor.RefactorPlan
+	if len(plans) > 0 {
+		refactorPlan = plans[0]
+	}
+
+	// Stage 8: assemble the RunArtifact every renderer
+	// consumes. Field order mirrors architecture Sec 4.7
+	// verbatim (see report/runartifact.go).
+	art := report.RunArtifact{
+		SchemaVersion: report.SchemaVersionCurrent,
+		Context:       repoCtx,
+		Policy:        bundle.PolicyVersion,
+		Files:         buildFileSummaries(result),
+		Skips:         result.Skips,
+		DarkMetrics:   result.Diagnostics.DarkMetrics,
+		Samples:       samples,
+		Run:           evalRun,
+		Verdict:       verdict,
+		Findings:      findings,
+		HotSpots:      planRes.HotSpots,
+		Plan:          refactorPlan,
+		Tasks:         tasks,
+		Diagnostics:   result.Diagnostics,
+	}
+
+	// Stage 9: dispatch to renderers. `--out` defaults to
+	// stdout when empty (tech-spec Sec 8.1 row 1); the JSON
+	// sidecars are only emitted when their flag carries a
+	// non-empty path. Every file writer uses the `os.Create`
+	// + `defer w.Close()` pattern pinned by the workstream
+	// brief so a partial write leaves the destination file
+	// at the OS truncation boundary rather than silently
+	// retaining stale bytes from a prior run.
+	if err := dispatchMarkdown(ctx, stdout, stderr, *g.Out, art); err != nil {
+		return flags.ExitInternalError
+	}
+	if err := dispatchJSONFile(ctx, stderr, *g.Findings, "--findings", report.JSON{}.Render, art); err != nil {
+		return flags.ExitInternalError
+	}
+	if err := dispatchDiagnostics(stderr, *g.Diagnostics, art.Diagnostics); err != nil {
+		return flags.ExitInternalError
+	}
+
+	// Stage 10: exit code. The verdict + per-finding
+	// severities + `--exit-on` threshold collapse into a
+	// single 0/1 decision. The engine collapses info-only
+	// findings to `VerdictPass`, so a verdict-only check
+	// would miss the `--exit-on=info` case (resolves
+	// iter-1 evaluator item 3); we therefore consult the
+	// individual finding severities as well.
+	if findingsTriggerExit(verdict.Verdict, findings, *g.ExitOn) {
+		return flags.ExitFindingTriggered
+	}
+	return flags.ExitOK
 }
 
 // runReport handles `cleanc report <findings.json> [--out report.md]`.
@@ -358,71 +627,8 @@ func runReport(stdout, stderr io.Writer, args []string) int {
 		return flags.ExitInternalError
 	}
 
-	var buf bytes.Buffer
-	if err := (report.JSON{}).RenderFromBytes(data, &buf); err != nil {
-		var smErr *report.SchemaVersionMismatchError
-		if errors.As(err, &smErr) {
-			// Both versions are named verbatim so the operator
-			// can pin the artifact-vs-binary skew without
-			// re-reading either file. Stage 3.4 brief: "exit
-			// 64 with a clear message naming both versions".
-			fmt.Fprintf(stderr,
-				"cleanc report: refusing to read %s: schemaVersion %q does not match this binary's %q (rebuild or re-run analyze with a matching cleanc version)\n",
-				findingsPath, smErr.Got, smErr.Want)
-			return flags.ExitUsage
-		}
-		fmt.Fprintf(stderr, "cleanc report: render failed: %v\n", err)
-		return flags.ExitInternalError
-	}
-
-	// Render succeeded -- now stage the bytes to the
-	// destination. Empty `--out` writes to stdout; any
-	// non-empty value opens / truncates the named file.
-	if g.Out != nil && *g.Out != "" {
-		// Iter-2 evaluator item 3: surface Close failures.
-		// A delayed flush failure on the file handle MUST
-		// not be silently swallowed -- otherwise a "render
-		// succeeded" report can still arrive truncated /
-		// missing on disk. Both the Write and Close paths
-		// map to ExitInternalError (70).
-		if err := writeOutputFile(*g.Out, buf.Bytes()); err != nil {
-			fmt.Fprintf(stderr, "cleanc report: write %s: %v\n", *g.Out, err)
-			return flags.ExitInternalError
-		}
-		return flags.ExitOK
-	}
-
-	if _, err := stdout.Write(buf.Bytes()); err != nil {
-		fmt.Fprintf(stderr, "cleanc report: write stdout: %v\n", err)
-		return flags.ExitInternalError
-	}
-	return flags.ExitOK
-}
-
-// writeOutputFile creates (or truncates) `path`, writes
-// `data` to it, and explicitly surfaces a Close failure.
-// Iter-2 evaluator item 3: a deferred `_ = f.Close()` would
-// silently swallow a delayed flush / network-FS failure
-// after Write succeeded; the dispatcher MUST surface that
-// case with ExitInternalError so the operator does not see
-// "success" while the report on disk is truncated.
-//
-// The helper deliberately does NOT use `defer f.Close()`:
-// when Write returns an error we close eagerly to release
-// the handle but return the Write error (the more
-// actionable cause); when Write succeeds we return Close's
-// error verbatim so a flush failure is visible to the
-// caller.
-func writeOutputFile(path string, data []byte) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	if _, werr := f.Write(data); werr != nil {
-		_ = f.Close()
-		return werr
-	}
-	return f.Close()
+	fmt.Fprintln(stderr, "cleanc report: re-render is a follow-up stage; the report renderer lands in Stage 4.1.")
+	return flags.ExitInternalError
 }
 
 // parseInterleavedFlags runs the supplied flag-set against

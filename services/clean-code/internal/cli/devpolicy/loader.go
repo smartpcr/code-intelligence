@@ -15,41 +15,37 @@ import (
 // canonical `steward.*` row shapes the rule engine's
 // `InMemoryStore` consumes (architecture Sec 3.8, Sec 5.8).
 //
-// This file declares the contract ONLY; no concrete
-// implementation ships in this iteration. A follow-up
-// workstream (implementation-plan Stage 1.4 items 97-102) will
-// add two build-tag-gated synthesiser files in this same
-// `devpolicy` package:
+// Two build-tag-gated implementations live alongside this
+// contract in the same `devpolicy` package:
 //
-//   - `unsigned_dev.go` (`//go:build !prod`) -- will construct
-//     an unsigned `steward.PolicyVersion` per architecture
-//     Sec 3.8's "STRUCTURAL signature bypass".
-//   - `unsigned_prod.go` (`//go:build prod`) -- will return an
-//     `ErrDevModeUnavailable` sentinel (introduced by the same
-//     follow-up) without producing any `PolicyVersion`, so the
-//     bypass cannot be smuggled into a production binary at
-//     compile time.
+//   - `unsigned_dev.go` (`//go:build !prod`) constructs an
+//     unsigned [steward.PolicyVersion] per architecture Sec 3.8's
+//     "STRUCTURAL signature bypass" by walking the YAML source
+//     (embedded `embed.FS` or `--policy <dir>` override) and
+//     decoding each file with `gopkg.in/yaml.v3` strict mode.
+//   - `unsigned_prod.go` (`//go:build prod`) returns the
+//     [ErrDevModeUnavailable] sentinel without reading any bytes
+//     so the bypass cannot be smuggled into a production binary
+//     at compile time.
 //
-// Declaring the interface up front lets the future CLI
-// orchestrator and its tests program against the canonical
-// shape regardless of which file is in the active build.
+// Declaring the interface here lets the CLI orchestrator and its
+// tests program against the canonical shape regardless of which
+// file is in the active build.
 type Loader interface {
 	// Load reads YAML rule pack files from the source described
 	// by src and returns a fully-populated [Bundle]. The
-	// concrete implementation is added by a follow-up workstream
-	// (implementation-plan Stage 1.4 items 97-102); the
-	// contract declared here will be honoured as follows:
+	// contract is:
 	//
-	//   - YAML decode / validation errors will surface unchanged
+	//   - YAML decode / validation errors surface unchanged
 	//     from the underlying decoder so the operator sees the
 	//     offending filename and line.
 	//   - When the active build does not permit the unsigned
-	//     bypass (a `-tags prod` build), Load will return an
-	//     `ErrDevModeUnavailable` sentinel (to be introduced by
-	//     the same follow-up) without reading any bytes.
+	//     bypass (a `-tags prod` build), Load returns the
+	//     [ErrDevModeUnavailable] sentinel without reading any
+	//     bytes.
 	//
-	// The returned `Bundle.PolicyVersion.Signature` will always
-	// be nil in the dev build (architecture Sec 3.8 / tech-spec
+	// The returned `Bundle.PolicyVersion.Signature` is always
+	// nil in the dev build (architecture Sec 3.8 / tech-spec
 	// C6); the rule engine's InMemoryStore accepts the unsigned
 	// row without invoking the Steward verifier.
 	Load(ctx context.Context, src LoaderSource) (Bundle, error)
@@ -63,10 +59,10 @@ type Loader interface {
 // `services/clean-code/policy/rulepacks/embedded_fs.go`. When
 // UseEmbedded is false, the Loader walks `os.DirFS(DirPath)` --
 // this is the `--policy <path>` override path; it is permitted
-// in the no-tag dev build and will be FORBIDDEN in a `-tags
-// prod` build (the prod synthesiser added by the Stage 1.4
-// follow-up will return its `ErrDevModeUnavailable` sentinel
-// before any filesystem access). See architecture Sec 7.2 and
+// in the no-tag dev build and is FORBIDDEN in a `-tags
+// prod` build (the prod synthesiser in `unsigned_prod.go`
+// returns its `ErrDevModeUnavailable` sentinel before any
+// filesystem access). See architecture Sec 7.2 and
 // tech-spec Sec 8.4 for the override-vs-embed precedence rules.
 type LoaderSource struct {
 	// UseEmbedded selects the embedded rule pack `embed.FS`.
@@ -112,6 +108,23 @@ type Bundle struct {
 	// returned (mirrors the per-family loaders in
 	// `services/clean-code/policy/rulepacks/{solid,decoupling}`).
 	RulePacks []steward.RulePack
+
+	// Thresholds is the set of [steward.Threshold] rows the
+	// dev-mode loader seeds so any rule whose `predicate_dsl`
+	// uses the `threshold('<uuid>')` atom can compile cleanly
+	// at engine `RunBatch` time. Without this, the dev loader
+	// would silently break the `decoupling.*` rule pack family
+	// (every decoupling predicate references a threshold UUID
+	// per `policy/rulepacks/decoupling/coupling.yaml`); the
+	// engine's predicate compiler rejects unknown threshold
+	// ids with `ErrPredicateCompile` (engine.go:407-410).
+	//
+	// The slice is the canonical
+	// [decoupling.ListCanonicalThresholds] set in dev builds;
+	// the SOLID family ships zero threshold dependencies (its
+	// predicates use literal numeric cut-offs) so this slice
+	// is only populated when the decoupling family is loaded.
+	Thresholds []steward.Threshold
 }
 
 // ErrMissingPolicyDir is returned by [LoaderSource.FS] when the
@@ -128,10 +141,9 @@ var ErrMissingPolicyDir = errors.New("devpolicy: LoaderSource.DirPath must be no
 // `os.DirFS(s.DirPath)` -- the `--policy <path>` override.
 //
 // This is the SINGLE choice point between the embedded and
-// filesystem sources, so the future build-tag-gated synthesisers
-// (`unsigned_dev.go` / `unsigned_prod.go`, to be added by the
-// Stage 1.4 follow-up workstream) will stay decoupled from the
-// source-kind switch: they will call `src.FS()` and walk the
+// filesystem sources, so the build-tag-gated synthesisers
+// (`unsigned_dev.go` / `unsigned_prod.go`) stay decoupled from
+// the source-kind switch: they call `src.FS()` and walk the
 // returned FS uniformly.
 //
 // For the filesystem source, FS eagerly stats s.DirPath and

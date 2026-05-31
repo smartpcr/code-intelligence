@@ -3,10 +3,9 @@ Feature: Backend parity golden test — E2E
 
   The three graphsink backends (memory, SQLite, Postgres) must
   produce byte-identical Node and Edge tuples when driven over the
-  same fixture. This feature proves that invariant via golden
-  snapshot comparison: each backend's output is compared against a
-  committed golden fixture that represents the canonical output all
-  backends agree on.
+  same fixture. Each scenario runs the AST dispatcher against all
+  three backends in turn, reads persisted state back, and asserts
+  sorted tuple equality.
 
   Scenario: parity-three-backends
     Given the fixture repo "testdata/polyglot/"

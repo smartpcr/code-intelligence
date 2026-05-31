@@ -32,12 +32,14 @@ var localDirDefaultExcludeDirs = []string{
 // ---------------------------------------------------------------------------
 
 type localDirMaterializerState struct {
-	root         string
-	workspace    repoindexer.Workspace
-	operatorSHA  string
-	walkFiles    []string
-	gitHeadSHA   string
+	root           string
+	workspace      repoindexer.Workspace
+	operatorSHA    string
+	walkFiles      []string
+	gitHeadSHA     string
 	materializeErr error
+	fileURL        string // file:// URL for the root directory
+	gitBinary      string // override GitBinary; empty means default
 }
 
 func (s *localDirMaterializerState) writeFile(rel, content string) error {
@@ -68,6 +70,18 @@ func gitExe() string {
 		}
 	}
 	return "git"
+}
+
+// toFileURL replicates the unexported synthesizeFileURL logic from
+// materialize.go so the e2e test passes a file:// URL to Materialize
+// exactly as the acceptance scenario requires.
+func toFileURL(abs string) string {
+	slashed := filepath.ToSlash(abs)
+	if runtime.GOOS == "windows" && len(slashed) >= 2 && slashed[1] == ':' {
+		slashed = strings.ToLower(slashed[:2]) + slashed[2:]
+		return "file:///" + slashed
+	}
+	return "file://" + slashed
 }
 
 func runGit(dir string, args ...string) (string, error) {
@@ -139,6 +153,11 @@ func (s *localDirMaterializerState) anOperatorSuppliedSHA(sha string) error {
 	return nil
 }
 
+func (s *localDirMaterializerState) gitBinarySetToNonexistent() error {
+	s.gitBinary = "/nonexistent-git-binary-e2e-proof-no-rev-parse"
+	return nil
+}
+
 func (s *localDirMaterializerState) aTempDirWithExcludedDirs() error {
 	s.root = filepath.Join(os.TempDir(), fmt.Sprintf("ldm-walk-%d", time.Now().UnixNano()))
 	if err := os.MkdirAll(s.root, 0o755); err != nil {
@@ -163,6 +182,21 @@ func (s *localDirMaterializerState) aTempDirWithExcludedDirs() error {
 // When steps
 // ---------------------------------------------------------------------------
 
+func (s *localDirMaterializerState) materializeWithFileURLAndEmptySHA() error {
+	absRoot, err := filepath.Abs(s.root)
+	if err != nil {
+		return fmt.Errorf("abs: %w", err)
+	}
+	s.fileURL = toFileURL(absRoot)
+	m := &repoindexer.LocalDirMaterializer{}
+	ws, err := m.Materialize(context.Background(), s.fileURL, "")
+	if err != nil {
+		return fmt.Errorf("Materialize(file://): %w", err)
+	}
+	s.workspace = ws
+	return nil
+}
+
 func (s *localDirMaterializerState) materializeWithEmptySHA() error {
 	m := &repoindexer.LocalDirMaterializer{}
 	ws, err := m.Materialize(context.Background(), s.root, "")
@@ -174,7 +208,7 @@ func (s *localDirMaterializerState) materializeWithEmptySHA() error {
 }
 
 func (s *localDirMaterializerState) materializeWithOperatorSHA() error {
-	m := &repoindexer.LocalDirMaterializer{}
+	m := &repoindexer.LocalDirMaterializer{GitBinary: s.gitBinary}
 	ws, err := m.Materialize(context.Background(), s.root, s.operatorSHA)
 	if err != nil {
 		return fmt.Errorf("Materialize: %w", err)
@@ -264,9 +298,11 @@ func InitializeScenario_local_materializer_and_sha_synthesis_localdirmaterialize
 	ctx.Given(`^a temporary directory without "\.git/"$`, s.aTempDirWithoutGit)
 	ctx.Given(`^a temporary directory that is a git checkout with at least one commit$`, s.aTempDirThatIsGitCheckout)
 	ctx.Given(`^an operator-supplied sha "([^"]*)"$`, s.anOperatorSuppliedSHA)
+	ctx.Given(`^GitBinary is set to a nonexistent path so any git invocation would fail$`, s.gitBinarySetToNonexistent)
 	ctx.Given(`^a temporary directory containing "node_modules/" and "\.git/" with files inside$`, s.aTempDirWithExcludedDirs)
 
 	// When
+	ctx.When(`^Materialize runs with a "file://" URL and an empty sha$`, s.materializeWithFileURLAndEmptySHA)
 	ctx.When(`^Materialize runs with an empty sha$`, s.materializeWithEmptySHA)
 	ctx.When(`^Materialize runs with the operator-supplied sha$`, s.materializeWithOperatorSHA)
 	ctx.When(`^Workspace\.Walk runs on the materialized workspace$`, s.walkRunsOnWorkspace)

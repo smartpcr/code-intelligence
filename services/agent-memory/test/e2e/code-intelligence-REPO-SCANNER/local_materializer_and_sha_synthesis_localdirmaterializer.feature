@@ -11,7 +11,7 @@ Feature: LocalDirMaterializer SHA synthesis and walk excludes
 
   Scenario: local-non-git-sha
     Given a temporary directory without ".git/"
-    When Materialize runs with an empty sha
+    When Materialize runs with a "file://" URL and an empty sha
     Then Workspace.SHA equals MTimeTreeSHA of the directory with defaultExcludeDirs
 
   Scenario: local-git-sha
@@ -22,6 +22,7 @@ Feature: LocalDirMaterializer SHA synthesis and walk excludes
   Scenario: operator-sha-override
     Given a temporary directory that is a git checkout with at least one commit
     And an operator-supplied sha "feedfacecafebabefeedfacecafebabe"
+    And GitBinary is set to a nonexistent path so any git invocation would fail
     When Materialize runs with the operator-supplied sha
     Then Workspace.SHA equals the operator-supplied sha
 

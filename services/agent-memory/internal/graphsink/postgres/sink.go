@@ -29,6 +29,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphsink"
 	"github.com/smartpcr/code-intelligence/services/agent-memory/internal/graphwriter"
@@ -37,8 +38,10 @@ import (
 // Sink wraps `*graphwriter.Writer` and exposes it as a
 // `graphsink.Sink`. The wrapped writer is owned by the caller
 // (typically constructed once at process startup against a
-// `*sql.DB` pool) so this adapter does not close it on
-// `Sink.Close`.
+// `*sql.DB` pool) so this adapter does not close the underlying
+// pool on `Sink.Close`; it only flips its own `closed` gate so
+// the post-Close lifecycle contract (every other method must
+// return an error -- see `graphsink/sink.go:121`) holds.
 //
 // Construct one via `NewSink(writer)`. The constructor panics
 // on a nil writer because a nil dependency is unambiguously a
@@ -46,6 +49,13 @@ import (
 // dereference on the first scan write.
 type Sink struct {
 	writer *graphwriter.Writer
+
+	// mu guards `closed`. Sink callers in the production wiring
+	// are sequential per-scan but the contract permits
+	// concurrent `Flush` / `Close`, so a mutex is the cheapest
+	// safe gate.
+	mu     sync.Mutex
+	closed bool
 }
 
 // NewSink wraps the supplied `*graphwriter.Writer` as a
@@ -75,6 +85,9 @@ var _ graphsink.Sink = (*Sink)(nil)
 // (non-scanner) call sites that have not adopted the
 // precomputed PK.
 func (s *Sink) EnsureRepo(ctx context.Context, in graphwriter.RepoInput) (graphwriter.RepoRecord, error) {
+	if err := s.checkOpen(); err != nil {
+		return graphwriter.RepoRecord{}, err
+	}
 	if in.RepoID.IsZero() {
 		return s.writer.EnsureRepo(ctx, in)
 	}
@@ -84,18 +97,34 @@ func (s *Sink) EnsureRepo(ctx context.Context, in graphwriter.RepoInput) (graphw
 // EnsureCommit forwards 1:1 to
 // `*graphwriter.Writer.EnsureCommit`.
 func (s *Sink) EnsureCommit(ctx context.Context, in graphwriter.CommitInput) (graphwriter.CommitRecord, error) {
+	if err := s.checkOpen(); err != nil {
+		return graphwriter.CommitRecord{}, err
+	}
 	return s.writer.EnsureCommit(ctx, in)
 }
 
 // InsertNode forwards 1:1 to
-// `*graphwriter.Writer.InsertNode`.
+// `*graphwriter.Writer.InsertNode`. Errors from the wrapped
+// writer -- including the typed
+// `*graphwriter.WriteContractViolation` returned for SQLSTATE
+// 42501 (insufficient privilege) -- propagate verbatim so
+// callers can `errors.As(err, &wcv)` without any unwrapping by
+// this adapter layer.
 func (s *Sink) InsertNode(ctx context.Context, in graphwriter.NodeInput) (graphwriter.NodeRecord, error) {
+	if err := s.checkOpen(); err != nil {
+		return graphwriter.NodeRecord{}, err
+	}
 	return s.writer.InsertNode(ctx, in)
 }
 
 // InsertEdge forwards 1:1 to
-// `*graphwriter.Writer.InsertEdge`.
+// `*graphwriter.Writer.InsertEdge`. Same verbatim-propagation
+// contract for `*graphwriter.WriteContractViolation` as
+// `InsertNode`.
 func (s *Sink) InsertEdge(ctx context.Context, in graphwriter.EdgeInput) (graphwriter.EdgeRecord, error) {
+	if err := s.checkOpen(); err != nil {
+		return graphwriter.EdgeRecord{}, err
+	}
 	return s.writer.InsertEdge(ctx, in)
 }
 
@@ -106,31 +135,52 @@ func (s *Sink) InsertEdge(ctx context.Context, in graphwriter.EdgeInput) (graphw
 // contract uniform across backends -- callers can `Flush` after
 // every iteration of an ingest job without a backend-specific
 // branch.
+//
+// Flush after Close returns `ErrSinkClosed` per the
+// `graphsink.Sink` lifecycle contract (`internal/graphsink/sink.go`:
+// "After Close returns, calls to any other method on the Sink
+// yield an error").
 func (s *Sink) Flush(_ context.Context) error {
+	return s.checkOpen()
+}
+
+// ErrSinkClosed is returned by every non-Close method on a
+// Sink whose `Close` has already returned. It is the
+// adapter-side sentinel the
+// `graphsink.Sink` interface documentation refers to
+// ("backends choose the sentinel ..."). Pattern-match with
+// `errors.Is(err, postgres.ErrSinkClosed)`.
+var ErrSinkClosed = errors.New("graphsink/postgres: Sink closed")
+
+// checkOpen returns ErrSinkClosed if `Close` has already been
+// called. The mutex is held only for the read of `closed` so
+// production write paths -- which never call Close concurrently
+// with InsertNode/InsertEdge -- pay only one uncontended lock
+// per call.
+func (s *Sink) checkOpen() error {
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return ErrSinkClosed
+	}
 	return nil
 }
 
-// errClosed is the sentinel reserved for post-Close calls on a
-// future evolution of this adapter that owns its underlying
-// resources. Today the Postgres adapter borrows the writer from
-// its caller so Close is a no-op; the sentinel is exported in
-// shape via `errors.Is` for callers that already pattern-match
-// for it on other backends.
-var errClosed = errors.New("graphsink/postgres: Sink closed")
-
-// Close is a no-op for the Postgres adapter: the wrapped
-// writer is borrowed (the caller owns the underlying
-// `*sql.DB` pool and is responsible for closing it). Close is
-// idempotent -- the second and subsequent calls return nil per
-// the Sink contract.
+// Close marks the Sink closed. The wrapped writer is borrowed
+// (the caller owns the underlying `*sql.DB` pool and is
+// responsible for closing it) so this method does NOT close
+// the pool. It flips the adapter's `closed` gate so subsequent
+// calls to any other method return `ErrSinkClosed`, satisfying
+// the lifecycle contract in `internal/graphsink/sink.go` which
+// requires "calls to any other method on the Sink yield an
+// error" after `Close` returns.
 //
-// We do not flip an internal `closed` flag because the wrapped
-// writer is stateless and there is no resource for this layer
-// to release. A future evolution that takes ownership of the
-// pool (e.g. an embedded SQLite implementation that internally
-// instantiates a writer) would gate subsequent method calls on
-// the flag and return `errClosed`.
+// Idempotent: the second and subsequent calls return nil per
+// the Sink contract.
 func (s *Sink) Close() error {
-	_ = errClosed // reserved for the future owned-pool evolution
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
 	return nil
 }

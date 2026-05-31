@@ -268,8 +268,9 @@ func (s *emitPromptsWiringState) eachPromptsJSONLLineIsValid() error {
 	}
 	lines := nonEmptyLines(data)
 	for i, line := range lines {
-		if !json.Valid([]byte(line)) {
-			return fmt.Errorf("prompts.jsonl line %d is not valid JSON: %s", i+1, line)
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(line), &obj); err != nil {
+			return fmt.Errorf("prompts.jsonl line %d is not a valid JSON object: %s", i+1, line)
 		}
 	}
 	return nil

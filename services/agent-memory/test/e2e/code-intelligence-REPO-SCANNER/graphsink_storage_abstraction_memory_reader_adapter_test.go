@@ -329,18 +329,22 @@ func (s *memReaderParityState) whenBothReadersQuery(ctx context.Context) error {
 	return nil
 }
 
-func (s *memReaderParityState) thenSlicesMatch(ctx context.Context) error {
-	defer func() {
+func (s *memReaderParityState) cleanup() {
+	if s.memSink != nil {
 		_ = s.memSink.Close()
+	}
+	if s.sqlSink != nil {
 		_ = s.sqlSink.Close()
-		if s.sqlDB != nil {
-			_ = s.sqlDB.Close()
-		}
-		if s.dbDir != "" {
-			_ = os.RemoveAll(s.dbDir)
-		}
-	}()
+	}
+	if s.sqlDB != nil {
+		_ = s.sqlDB.Close()
+	}
+	if s.dbDir != "" {
+		_ = os.RemoveAll(s.dbDir)
+	}
+}
 
+func (s *memReaderParityState) thenSlicesMatch(ctx context.Context) error {
 	// --- ListNodes parity: memory Reader vs SQLite SQL ---
 	memNodeProj := make([]nodeProjection, len(s.memNodes))
 	for i, n := range s.memNodes {
@@ -456,8 +460,13 @@ func (s *memLookupFastPathState) whenLookupBySignatureRuns(ctx context.Context) 
 	return nil
 }
 
+func (s *memLookupFastPathState) cleanup() {
+	if s.sink != nil {
+		_ = s.sink.Close()
+	}
+}
+
 func (s *memLookupFastPathState) thenNodeReturnedInO1(ctx context.Context) error {
-	defer func() { _ = s.sink.Close() }()
 
 	if s.lookupErr != nil {
 		return fmt.Errorf("LookupBySignature failed: %w", s.lookupErr)
@@ -561,11 +570,19 @@ func InitializeScenario_graphsink_storage_abstraction_memory_reader_adapter(ctx 
 	ctx.Step(`^the same fixture graph inserted into the memory sink and the SQLite sink$`, parity.givenFixtureGraphInserted)
 	ctx.Step(`^both readers run the same ListNodes, ListEdgesFrom, and ListEdgesTo queries$`, parity.whenBothReadersQuery)
 	ctx.Step(`^the returned slices have identical lengths and identical kind and canonical_signature projections$`, parity.thenSlicesMatch)
+	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
+		parity.cleanup()
+		return ctx, nil
+	})
 
 	fastPath := &memLookupFastPathState{}
 	ctx.Step(`^a Node inserted with signature S into the memory sink$`, fastPath.givenNodeInserted)
 	ctx.Step(`^LookupBySignature with kind method and signature S runs$`, fastPath.whenLookupBySignatureRuns)
 	ctx.Step(`^it returns the Node in O\(1\) via the sigIndex map$`, fastPath.thenNodeReturnedInO1)
+	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
+		fastPath.cleanup()
+		return ctx, nil
+	})
 }
 
 func TestE2E_graphsink_storage_abstraction_memory_reader_adapter(t *testing.T) {

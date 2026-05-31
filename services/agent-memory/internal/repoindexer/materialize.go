@@ -6,12 +6,16 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
 )
 
 // Materializer materialises a repo at a specific SHA into a
@@ -37,6 +41,25 @@ type Workspace interface {
 	// `os` calls -- callers must use `Walk` to enumerate
 	// files.
 	Root() string
+	// URL is the repo identity URL the materializer assigned
+	// to this workspace -- for `GitMaterializer` it's the
+	// remote URL the caller passed in, for
+	// `LocalDirMaterializer` it's the synthesised
+	// `file://<abs-path>` (lower-cased drive on Windows,
+	// forward slashes), and for `InMemoryMaterializer` it's
+	// whatever the test handed in. The downstream
+	// canonical-signature pipeline embeds this string in node
+	// fingerprints, so it MUST be stable across re-scans of
+	// the same logical repo.
+	URL() string
+	// SHA is the content-address the materializer assigned to
+	// this workspace: the operator-supplied SHA when non-empty,
+	// otherwise the materializer-synthesised one (`git rev-parse
+	// HEAD` for git checkouts, `fingerprint.MTimeTreeSHA` for
+	// non-git local trees, the caller's value verbatim for
+	// `GitMaterializer` / `InMemoryMaterializer`). Like URL it
+	// is load-bearing for re-scan idempotence.
+	SHA() string
 	// Walk visits every source file in the workspace in a
 	// stable, lexicographic order. Implementations skip VCS
 	// directories (`.git`, `.hg`) and other configured
@@ -198,7 +221,7 @@ func (g *GitMaterializer) Materialize(ctx context.Context, repoURL, sha string) 
 	for _, d := range excludes {
 		excludeSet[d] = struct{}{}
 	}
-	return &gitWorkspace{root: dir, excludeDirs: excludeSet}, nil
+	return &gitWorkspace{root: dir, excludeDirs: excludeSet, url: repoURL, sha: sha}, nil
 }
 
 // runRealCmd is the production exec hook. Captures combined
@@ -221,10 +244,14 @@ func runRealCmd(ctx context.Context, dir, bin string, args ...string) error {
 type gitWorkspace struct {
 	root        string
 	excludeDirs map[string]struct{}
+	url         string
+	sha         string
 	closed      bool
 }
 
 func (w *gitWorkspace) Root() string { return w.root }
+func (w *gitWorkspace) URL() string  { return w.url }
+func (w *gitWorkspace) SHA() string  { return w.sha }
 
 func (w *gitWorkspace) Walk(fn WalkFn) error {
 	if fn == nil {
@@ -290,6 +317,237 @@ func (w *gitWorkspace) Close() error {
 	}
 	w.closed = true
 	return os.RemoveAll(w.root)
+}
+
+// ----- LocalDirMaterializer --------------------------------------
+
+// LocalDirMaterializer materialises a repo from an existing
+// on-disk directory rather than fetching it via the `git` CLI.
+// It is the workhorse for the `codeintel scan <path>` CLI flow:
+// the operator already has the source tree checked out and just
+// wants the AST dispatcher pointed at it.
+//
+// Unlike `GitMaterializer`, this materializer:
+//   - does NOT shell out to fetch anything; the tree is used
+//     in-place,
+//   - does NOT delete the directory on `Close` (it's the user's
+//     working copy -- removing it would be catastrophic),
+//   - synthesises a stable `file://<abs-path>` URL from the
+//     directory path so the downstream canonical-signature
+//     pipeline has a deterministic repo identity for the scan,
+//   - synthesises a SHA via `git rev-parse HEAD` (when a `.git/`
+//     directory is present) or `fingerprint.MTimeTreeSHA`
+//     otherwise, so re-scanning an unchanged tree produces the
+//     same SHA across runs.
+//
+// The operator MAY override the synthesised SHA by passing a
+// non-empty `sha` argument to `Materialize`; this is how the CLI
+// `--sha` flag is plumbed through. An empty `sha` triggers
+// synthesis.
+type LocalDirMaterializer struct {
+	// ExcludeDirs is the set of directory names skipped during
+	// Walk. Defaults to `defaultExcludeDirs` when nil. Mirrors
+	// `GitMaterializer.ExcludeDirs` so the two materializers
+	// surface the same file set for the same tree.
+	ExcludeDirs []string
+	// GitBinary is the `git` binary used for `git rev-parse
+	// HEAD` when synthesising the SHA from a checked-out repo.
+	// Empty means "git" (resolved from PATH at runtime).
+	GitBinary string
+
+	// runGitCmd is the underlying exec hook for `git rev-parse
+	// HEAD`. Tests override it to inject a canned SHA without
+	// requiring a real git binary; production passes nil so the
+	// default `runRealGitCmdOutput` is used.
+	runGitCmd func(ctx context.Context, dir, bin string, args ...string) (string, error)
+}
+
+// Materialize prepares a Workspace rooted at `rootDir` (passed
+// via the `repoURL` argument so the materializer satisfies the
+// existing `Materializer` interface; for local scans the "repo
+// URL" IS the directory path).
+//
+// `rootDir` may be either a plain filesystem path
+// (`/foo/bar`, `C:\code\repo`) or a `file://` URL
+// (`file:///foo/bar`, `file:///c:/code/repo`). The CLI accepts
+// either shape per implementation-plan.md S4.2 stage scenario
+// `local-non-git-sha`, so the materializer decodes the URL form
+// here rather than forcing the caller to strip the scheme.
+//
+// SHA resolution precedence:
+//  1. operator-supplied `sha` (non-empty) wins,
+//  2. else `git rev-parse HEAD` when `<rootDir>/.git` exists
+//     (either as a directory -- a normal checkout -- or as a
+//     file -- a linked worktree / submodule gitlink),
+//  3. else `fingerprint.MTimeTreeSHA(rootDir, defaultExcludeDirs)`.
+//
+// The returned `Workspace` exposes the synthesised URL and SHA
+// via the `Workspace.URL()` / `Workspace.SHA()` accessors so the
+// CLI / mgmt-api layer can plumb them into the ingest job
+// without re-deriving.
+func (l *LocalDirMaterializer) Materialize(ctx context.Context, rootDir, sha string) (Workspace, error) {
+	if rootDir == "" {
+		return nil, errors.New("repoindexer: LocalDirMaterializer.Materialize: empty rootDir")
+	}
+	decoded, err := decodeFileURL(rootDir)
+	if err != nil {
+		return nil, fmt.Errorf("repoindexer: LocalDirMaterializer: %w", err)
+	}
+	abs, err := filepath.Abs(decoded)
+	if err != nil {
+		return nil, fmt.Errorf("repoindexer: LocalDirMaterializer: abs %s: %w", decoded, err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return nil, fmt.Errorf("repoindexer: LocalDirMaterializer: stat %s: %w", abs, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("repoindexer: LocalDirMaterializer: %s is not a directory", abs)
+	}
+
+	excludes := l.ExcludeDirs
+	if excludes == nil {
+		excludes = defaultExcludeDirs
+	}
+
+	url := synthesizeFileURL(abs)
+
+	resolvedSHA := sha
+	if resolvedSHA == "" {
+		// `.git` may be a directory (normal checkout) OR a regular
+		// file (a `gitdir:` pointer for linked worktrees and
+		// submodules). Either form qualifies as a git checkout for
+		// our purposes -- `git rev-parse HEAD` understands both.
+		if _, gerr := os.Stat(filepath.Join(abs, ".git")); gerr == nil {
+			bin := l.GitBinary
+			if bin == "" {
+				bin = "git"
+			}
+			runner := l.runGitCmd
+			if runner == nil {
+				runner = runRealGitCmdOutput
+			}
+			out, runErr := runner(ctx, abs, bin, "rev-parse", "HEAD")
+			if runErr != nil {
+				return nil, fmt.Errorf("repoindexer: LocalDirMaterializer: git rev-parse HEAD: %w", runErr)
+			}
+			trimmed := strings.TrimSpace(out)
+			if trimmed == "" {
+				return nil, errors.New("repoindexer: LocalDirMaterializer: git rev-parse HEAD returned empty output")
+			}
+			resolvedSHA = trimmed
+		} else {
+			// Use defaultExcludeDirs (not user-overridden ExcludeDirs)
+			// so the synthesised SHA is stable across CLI invocations
+			// that vary --exclude flags. The brief pins this: SHA
+			// synthesis uses `defaultExcludeDirs` even when the
+			// materializer's own Walk exclusion set is customised.
+			h, ferr := fingerprint.MTimeTreeSHA(abs, defaultExcludeDirs)
+			if ferr != nil {
+				return nil, fmt.Errorf("repoindexer: LocalDirMaterializer: mtime sha: %w", ferr)
+			}
+			resolvedSHA = h
+		}
+	}
+
+	excludeSet := make(map[string]struct{}, len(excludes))
+	for _, d := range excludes {
+		excludeSet[d] = struct{}{}
+	}
+	return &localDirWorkspace{
+		gitWorkspace: gitWorkspace{
+			root:        abs,
+			excludeDirs: excludeSet,
+			url:         url,
+			sha:         resolvedSHA,
+		},
+	}, nil
+}
+
+// localDirWorkspace embeds gitWorkspace to inherit Root, Walk,
+// URL, and SHA (the on-disk walk logic is identical and the
+// URL/SHA accessors just read embedded fields). It ONLY
+// overrides Close so the user's source directory is NOT deleted.
+type localDirWorkspace struct {
+	gitWorkspace
+}
+
+// Close marks the workspace closed but does NOT delete the
+// underlying directory -- it's the operator's working copy.
+// Safe to call multiple times.
+func (w *localDirWorkspace) Close() error {
+	w.gitWorkspace.closed = true
+	return nil
+}
+
+// synthesizeFileURL renders an absolute filesystem path as a
+// `file://` URL with cross-platform-stable casing. On Windows
+// the drive letter is lower-cased and the path uses forward
+// slashes (so `C:\Users\Foo` -> `file:///c:/Users/Foo`). On
+// POSIX the path is forward-slash by construction and is
+// emitted as `file://<abs-path>`.
+func synthesizeFileURL(abs string) string {
+	slashed := filepath.ToSlash(abs)
+	if runtime.GOOS == "windows" && len(slashed) >= 2 && slashed[1] == ':' {
+		slashed = strings.ToLower(slashed[:2]) + slashed[2:]
+		return "file:///" + slashed
+	}
+	return "file://" + slashed
+}
+
+// decodeFileURL converts a `file://` URL back to a host
+// filesystem path. Inputs that don't start with `file://` are
+// returned unchanged so plain paths (`/foo/bar`, `C:\code\repo`,
+// `./rel`) pass through this helper unmodified.
+//
+// Windows quirk: `net/url.Parse("file:///c:/foo")` yields
+// `Path="/c:/foo"`; we strip the leading slash so we get
+// `c:/foo` ready for `filepath.Abs`. Percent-encoded bytes in
+// the URL are decoded by `url.Parse` for us.
+func decodeFileURL(input string) (string, error) {
+	if !strings.HasPrefix(input, "file://") {
+		return input, nil
+	}
+	u, err := url.Parse(input)
+	if err != nil {
+		return "", fmt.Errorf("parse file URL %q: %w", input, err)
+	}
+	if u.Host != "" && u.Host != "localhost" {
+		// `file://host/path` with a non-local host is not a
+		// local filesystem path -- refuse rather than silently
+		// scanning the wrong tree.
+		return "", fmt.Errorf("file URL %q has non-local host %q", input, u.Host)
+	}
+	p := u.Path
+	if p == "" {
+		// Opaque form `file:relative` is not well-defined for
+		// filesystem paths; reject.
+		return "", fmt.Errorf("file URL %q has empty path", input)
+	}
+	// On Windows a `file:///c:/foo` parse yields `Path="/c:/foo"`.
+	// Strip the leading slash so subsequent filepath.Abs sees a
+	// well-formed drive-letter path.
+	if runtime.GOOS == "windows" && len(p) >= 3 && p[0] == '/' && p[2] == ':' {
+		p = p[1:]
+	}
+	return p, nil
+}
+
+// runRealGitCmdOutput is the production exec hook for commands
+// whose stdout the caller needs (e.g. `git rev-parse HEAD`).
+// stderr is folded into the error so failures land in logs with
+// enough context to triage.
+func runRealGitCmdOutput(ctx context.Context, dir, bin string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Dir = dir
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("%s %s: %w (stderr: %s)",
+			bin, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return string(out), nil
 }
 
 // ----- InMemoryMaterializer --------------------------------------
@@ -363,6 +621,9 @@ func (w *inMemoryWorkspace) Root() string {
 	// the wrong API.
 	return "<in-memory>"
 }
+
+func (w *inMemoryWorkspace) URL() string { return w.repoURL }
+func (w *inMemoryWorkspace) SHA() string { return w.sha }
 
 func (w *inMemoryWorkspace) Walk(fn WalkFn) error {
 	if fn == nil {

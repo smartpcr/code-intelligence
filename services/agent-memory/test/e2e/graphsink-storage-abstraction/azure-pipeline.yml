@@ -19,10 +19,16 @@ variables:
 steps:
   - checkout: self
 
+  - script: |
+      GO_VERSION=$(grep '^go ' services/agent-memory/go.mod | awk '{print $2}')
+      echo "Detected Go version from go.mod: $GO_VERSION"
+      echo "##vso[task.setvariable variable=GO_VERSION]$GO_VERSION"
+    displayName: "Read Go version from go.mod"
+
   - task: GoTool@0
     displayName: "Set up Go"
     inputs:
-      version: "1.25"
+      version: "$(GO_VERSION)"
 
   - script: |
       docker compose -f $(COMPOSE_FILE) up -d

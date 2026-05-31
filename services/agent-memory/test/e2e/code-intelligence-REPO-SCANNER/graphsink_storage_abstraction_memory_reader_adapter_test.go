@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/cucumber/godog"
 	_ "github.com/mattn/go-sqlite3" // register sqlite3 driver for direct SQL queries

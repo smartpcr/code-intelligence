@@ -40,9 +40,14 @@ const MaxListLimit = 10_000
 // Repo identifies the repository the diagram was projected from.
 // `id` is the repo's UUID (or a synthetic id for the memory/JSON
 // backend, hashed from `(url, sha)`). `url` is the canonical git
-// URL or `file://<abs-path>` for local scans. `sha` is the
-// 40-char commit SHA or the sentinel "local" for local-dir scans
-// without a working git tree (architecture S3.3).
+// URL or `file://<abs-path>` (lower-cased drive letters on
+// Windows, forward slashes) for local scans. `sha` is the 40-char
+// commit SHA for git scans, OR for non-git local-directory scans
+// it is the 32-char lowercase hex of `fingerprint.MTimeTreeSHA`
+// (the deterministic mtime-tree hash pinned by architecture S4.3 /
+// S9.1; the literal "local" sentinel was considered and REJECTED
+// because every non-git scan would collide under the same
+// `(repo_id, sha)` key and break re-scan dedupe).
 type Repo struct {
 	ID  string `json:"id"`
 	URL string `json:"url"`
@@ -106,10 +111,13 @@ type Stats struct {
 // to satisfy the golden-test invariant in envelope_marshal_test.go
 // and the UI's single-parser contract (architecture S4.4).
 //
-// `Nodes` and `Edges` are non-omitempty: an empty diagram MUST emit
-// `[]` rather than `null` (the UI maps them straight to NVL arrays).
-// `Truncated` is non-omitempty: its absence is meaningful (architecture
-// S6 -- truncation MUST be visible).
+// The explicit MarshalJSON below normalises nil collections to
+// their empty counterparts (`[]` / `{}` rather than `null`) so a
+// zero-value `Diagram{}` produced by direct struct construction
+// (not via NewEmpty) STILL satisfies the UI's single-parser
+// contract. Architecture S6 (Truncation MUST be visible) forbids
+// silent absence -- `truncated` and `stats.skipped` must always
+// render as concrete values.
 type Diagram struct {
 	Diagram     DiagramKind `json:"diagram"`
 	Repo        Repo        `json:"repo"`
@@ -119,6 +127,38 @@ type Diagram struct {
 	Edges       []Edge      `json:"edges"`
 	Truncated   bool        `json:"truncated"`
 	Stats       Stats       `json:"stats"`
+}
+
+// MarshalJSON renders the envelope with nil-safe collections so a
+// directly-constructed `Diagram{}` matches the UI contract. Uses a
+// type alias to delegate the actual field-by-field encoding to the
+// default reflection-based encoder (preserving the pinned key
+// order), but first swaps any nil Nodes/Edges for empty slices.
+// Stats.Skipped is normalised by Stats.MarshalJSON.
+func (d Diagram) MarshalJSON() ([]byte, error) {
+	type alias Diagram
+	a := alias(d)
+	if a.Nodes == nil {
+		a.Nodes = []Node{}
+	}
+	if a.Edges == nil {
+		a.Edges = []Edge{}
+	}
+	return json.Marshal(a)
+}
+
+// MarshalJSON renders Stats with `skipped` always present as `{}`
+// rather than `null`, even for direct struct construction. The UI
+// banner-rendering logic at the diagram-envelope layer assumes the
+// map is iterable (architecture S7.3 / S4.4 -- "skipped is always
+// emitted, even when every counter is zero").
+func (s Stats) MarshalJSON() ([]byte, error) {
+	type alias Stats
+	a := alias(s)
+	if a.Skipped == nil {
+		a.Skipped = map[string]int{}
+	}
+	return json.Marshal(a)
 }
 
 // NewEmpty returns a zero-valued envelope with non-nil slices and a

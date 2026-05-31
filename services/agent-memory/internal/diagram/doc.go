@@ -30,6 +30,14 @@
 //     and the error envelope shape that wraps this Diagram on serve
 //     endpoints.
 //
+//   - REPO-SCANNER architecture S4.3 / S9.1 pin the `Repo.SHA`
+//     identity for non-git local scans: a 32-char lowercase hex
+//     `fingerprint.MTimeTreeSHA` computed before any
+//     `Materializer.Materialize` call. The literal "local" sentinel
+//     was considered and REJECTED -- every non-git scan would
+//     collide under the same `(repo_id, sha)` key and break re-scan
+//     dedupe. Git scans continue to use the 40-char commit SHA.
+//
 //   - REPO-SCANNER architecture S6 (Truncation MUST be visible) and
 //     S7.3 explain why `truncated` and `stats.skipped` are mandatory
 //     fields rather than omit-empty: the UI uses their presence to

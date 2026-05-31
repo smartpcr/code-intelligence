@@ -3,7 +3,7 @@
   "repo": {
     "id": "11111111-2222-3333-4444-555555555555",
     "url": "file:///tmp/example-repo",
-    "sha": "local"
+    "sha": "9d1a2c47b3e95f80a162b08c5d3f4e71"
   },
   "generatedAt": "2026-05-30T12:00:00Z",
   "layoutHint": "hierarchical-top-down",

@@ -38,7 +38,7 @@ func TestEnvelopeMarshalKeyOrder(t *testing.T) {
 		Repo: Repo{
 			ID:  "00000000-0000-0000-0000-000000000000",
 			URL: "file:///tmp/x",
-			SHA: "local",
+			SHA: "9d1a2c47b3e95f80a162b08c5d3f4e71",
 		},
 		GeneratedAt: time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC),
 		LayoutHint:  LayoutHierarchicalTopDown,
@@ -82,7 +82,7 @@ func TestEnvelopeMarshalGolden(t *testing.T) {
 		Repo: Repo{
 			ID:  "11111111-2222-3333-4444-555555555555",
 			URL: "file:///tmp/example-repo",
-			SHA: "local",
+			SHA: "9d1a2c47b3e95f80a162b08c5d3f4e71",
 		},
 		GeneratedAt: time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC),
 		LayoutHint:  LayoutHierarchicalTopDown,
@@ -163,7 +163,7 @@ func TestEnvelopeMarshalGolden(t *testing.T) {
 func TestNewEmptyShape(t *testing.T) {
 	t.Parallel()
 
-	repo := Repo{ID: "r", URL: "file:///x", SHA: "local"}
+	repo := Repo{ID: "r", URL: "file:///x", SHA: "9d1a2c47b3e95f80a162b08c5d3f4e71"}
 	ts := time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)
 	d := NewEmpty(KindCallChain, LayoutHierarchicalLeftRight, repo, ts)
 
@@ -184,6 +184,66 @@ func TestNewEmptyShape(t *testing.T) {
 	}
 	if !bytes.Contains(buf, []byte(`"skipped":{}`)) {
 		t.Fatalf("empty envelope must render skipped {} not null: %s", string(buf))
+	}
+}
+
+// TestDirectStructConstructionNilSafe pins the resolution to prior
+// evaluator item #2: a directly-constructed `Diagram{}` (without
+// the NewEmpty helper, with nil Nodes/Edges/Stats.Skipped) MUST
+// still marshal those collections as `[]` / `{}` so the UI
+// single-parser contract holds even when a caller bypasses
+// NewEmpty (e.g. a projector that builds the envelope field by
+// field, or a test fixture). Without the custom MarshalJSON
+// methods on Diagram and Stats this test would fail with `null`
+// in three places.
+func TestDirectStructConstructionNilSafe(t *testing.T) {
+	t.Parallel()
+
+	// Intentionally zero-value: Nodes, Edges, Stats.Skipped are nil.
+	d := Diagram{
+		Diagram: KindModule,
+		Repo: Repo{
+			ID:  "r",
+			URL: "file:///x",
+			SHA: "9d1a2c47b3e95f80a162b08c5d3f4e71",
+		},
+		GeneratedAt: time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC),
+		LayoutHint:  LayoutHierarchicalTopDown,
+	}
+
+	if d.Nodes != nil || d.Edges != nil || d.Stats.Skipped != nil {
+		t.Fatalf("precondition: this test asserts nil-collection behaviour; got non-nil")
+	}
+
+	buf, err := json.Marshal(d)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := string(buf)
+
+	for _, want := range []string{
+		`"nodes":[]`,
+		`"edges":[]`,
+		`"skipped":{}`,
+	} {
+		if !bytes.Contains(buf, []byte(want)) {
+			t.Fatalf("direct-struct construction must emit %s (not null), got: %s", want, got)
+		}
+	}
+	for _, forbidden := range []string{
+		`"nodes":null`,
+		`"edges":null`,
+		`"skipped":null`,
+	} {
+		if bytes.Contains(buf, []byte(forbidden)) {
+			t.Fatalf("direct-struct construction emitted forbidden %s in: %s", forbidden, got)
+		}
+	}
+
+	// Key order MUST still hold even with the custom MarshalJSON.
+	if keys := topLevelKeys(t, buf); !reflect.DeepEqual(keys, expectedKeyOrder) {
+		t.Fatalf("custom MarshalJSON must preserve envelope key order: want %v got %v",
+			expectedKeyOrder, keys)
 	}
 }
 

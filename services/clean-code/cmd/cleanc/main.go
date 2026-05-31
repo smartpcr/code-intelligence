@@ -53,6 +53,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/smartpcr/code-intelligence/services/clean-code/internal/cli/devpolicy"
@@ -501,6 +502,21 @@ func runAnalyzePipeline(ctx context.Context, stdout, stderr io.Writer, g *flags.
 	}
 	evalRun, verdict := lookupRunAndVerdict(store, runRes)
 	findings := store.Findings()
+	// Sort findings by (RuleID, ScopeID, Severity) so the
+	// rendered report is deterministic across runs. Without
+	// this the engine orders findings by random FindingID
+	// (uuid.NewV4), making golden byte-comparison impossible.
+	sort.Slice(findings, func(i, j int) bool {
+		a, b := findings[i], findings[j]
+		if a.RuleID != b.RuleID {
+			return a.RuleID < b.RuleID
+		}
+		as, bs := a.ScopeID.String(), b.ScopeID.String()
+		if as != bs {
+			return as < bs
+		}
+		return string(a.Severity) < string(b.Severity)
+	})
 
 	// Stage 7: refactor planner + task planner. The CLI
 	// policy reader projects the dev-mode bundle onto the

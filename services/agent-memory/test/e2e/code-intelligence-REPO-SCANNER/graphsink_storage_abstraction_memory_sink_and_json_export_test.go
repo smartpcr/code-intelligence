@@ -247,7 +247,7 @@ func (st *roundtripState) aMemorySinkScanWrittenToDisk() error {
 	if err != nil {
 		return fmt.Errorf("InsertNode pkg: %w", err)
 	}
-	_, err = src.InsertNode(ctx, graphwriter.NodeInput{
+	fileNode, err := src.InsertNode(ctx, graphwriter.NodeInput{
 		RepoID:             repoID,
 		Kind:               "file",
 		CanonicalSignature: "file://example/foo.go",
@@ -267,7 +267,7 @@ func (st *roundtripState) aMemorySinkScanWrittenToDisk() error {
 	}
 	_, err = src.InsertEdge(ctx, graphwriter.EdgeInput{
 		RepoID: repoID, Kind: "contains",
-		SrcNodeID: pkgNode.NodeID, DstNodeID: "n-0000000003",
+		SrcNodeID: pkgNode.NodeID, DstNodeID: fileNode.NodeID,
 		FromSHA: "deadbeef",
 	})
 	if err != nil {

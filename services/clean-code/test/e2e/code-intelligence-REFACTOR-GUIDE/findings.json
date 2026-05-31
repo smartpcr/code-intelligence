@@ -1,8 +1,8 @@
 {
   "schemaVersion": "v1.2026.05",
   "Context": {
-    "RootPath": "C:/Users/xiaodoli/AppData/Local/Temp/cleanc-e2e-zero-tasks-2931372199",
-    "RepoID": "03245f11-c3cc-534b-bd88-f63acd0cc109",
+    "RootPath": "C:/Users/xiaodoli/AppData/Local/Temp/cleanc-e2e-zero-tasks-1025254640",
+    "RepoID": "425d583e-f9d1-50ed-a713-dfac0b473c1f",
     "HeadSHA": "working-copy",
     "ModulePath": "example.com/zero-tasks",
     "IsGitRepo": false
@@ -96,7 +96,7 @@
       "top_n": 20
     },
     "signature": null,
-    "created_at": "2026-05-31T09:43:14.0958622Z"
+    "created_at": "2026-05-31T09:44:48.3949313Z"
   },
   "Files": [
     {
@@ -168,10 +168,10 @@
   ],
   "Samples": [
     {
-      "SampleID": "cdcd699e-94e6-552e-866c-9ed406586072",
-      "RepoID": "03245f11-c3cc-534b-bd88-f63acd0cc109",
+      "SampleID": "2eb27f70-31a6-5e6d-b7a1-c1b464b5838a",
+      "RepoID": "425d583e-f9d1-50ed-a713-dfac0b473c1f",
       "SHA": "working-copy",
-      "ScopeID": "d44399ef-e158-50f4-98c0-225d3424792e",
+      "ScopeID": "968cc99e-b7f7-52ae-8b6b-d8294f8daf9c",
       "ScopeKind": "file",
       "MetricKind": "cycle_member",
       "MetricVersion": 1,
@@ -181,13 +181,13 @@
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
-      "ScopeSignature": "clean-code-repo:03245f11-c3cc-534b-bd88-f63acd0cc109::file::main.go"
+      "ScopeSignature": "clean-code-repo:425d583e-f9d1-50ed-a713-dfac0b473c1f::file::main.go"
     },
     {
-      "SampleID": "50dc9c5f-76e1-5597-a01a-e8f1cd11a3e2",
-      "RepoID": "03245f11-c3cc-534b-bd88-f63acd0cc109",
+      "SampleID": "a02ed6d5-d3cc-590f-b0cc-09ba3dd53a2a",
+      "RepoID": "425d583e-f9d1-50ed-a713-dfac0b473c1f",
       "SHA": "working-copy",
-      "ScopeID": "92f25d6f-0072-5b85-9641-2f880d2dc5a8",
+      "ScopeID": "56c631aa-c4ee-5186-9ad9-53518ddd8186",
       "ScopeKind": "package",
       "MetricKind": "cycle_member",
       "MetricVersion": 1,
@@ -197,13 +197,13 @@
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
-      "ScopeSignature": "clean-code-repo:03245f11-c3cc-534b-bd88-f63acd0cc109::pkg::."
+      "ScopeSignature": "clean-code-repo:425d583e-f9d1-50ed-a713-dfac0b473c1f::pkg::."
     },
     {
-      "SampleID": "d8a87d67-0b28-5a1f-982d-a90388dd60d1",
-      "RepoID": "03245f11-c3cc-534b-bd88-f63acd0cc109",
+      "SampleID": "655e1c36-f79a-5166-aec7-a37b914c32ed",
+      "RepoID": "425d583e-f9d1-50ed-a713-dfac0b473c1f",
       "SHA": "working-copy",
-      "ScopeID": "d44399ef-e158-50f4-98c0-225d3424792e",
+      "ScopeID": "968cc99e-b7f7-52ae-8b6b-d8294f8daf9c",
       "ScopeKind": "file",
       "MetricKind": "duplication_ratio",
       "MetricVersion": 1,
@@ -213,13 +213,13 @@
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
-      "ScopeSignature": "clean-code-repo:03245f11-c3cc-534b-bd88-f63acd0cc109::file::main.go"
+      "ScopeSignature": "clean-code-repo:425d583e-f9d1-50ed-a713-dfac0b473c1f::file::main.go"
     },
     {
-      "SampleID": "f93fc096-cf61-5115-8099-67b9e225a305",
-      "RepoID": "03245f11-c3cc-534b-bd88-f63acd0cc109",
+      "SampleID": "e7d4a8b1-01f7-52e8-9ade-795b8d1802e5",
+      "RepoID": "425d583e-f9d1-50ed-a713-dfac0b473c1f",
       "SHA": "working-copy",
-      "ScopeID": "92f25d6f-0072-5b85-9641-2f880d2dc5a8",
+      "ScopeID": "56c631aa-c4ee-5186-9ad9-53518ddd8186",
       "ScopeKind": "package",
       "MetricKind": "duplication_ratio",
       "MetricVersion": 1,
@@ -229,13 +229,13 @@
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
-      "ScopeSignature": "clean-code-repo:03245f11-c3cc-534b-bd88-f63acd0cc109::pkg::."
+      "ScopeSignature": "clean-code-repo:425d583e-f9d1-50ed-a713-dfac0b473c1f::pkg::."
     },
     {
-      "SampleID": "b2ad583d-8ec7-5f63-a0dc-413f8e9b9ebc",
-      "RepoID": "03245f11-c3cc-534b-bd88-f63acd0cc109",
+      "SampleID": "d7be4979-4319-58f3-aab9-428a7136c288",
+      "RepoID": "425d583e-f9d1-50ed-a713-dfac0b473c1f",
       "SHA": "working-copy",
-      "ScopeID": "d44399ef-e158-50f4-98c0-225d3424792e",
+      "ScopeID": "968cc99e-b7f7-52ae-8b6b-d8294f8daf9c",
       "ScopeKind": "file",
       "MetricKind": "loc",
       "MetricVersion": 1,
@@ -245,25 +245,25 @@
       "Source": "computed",
       "Degraded": false,
       "DegradedReason": "",
-      "ScopeSignature": "clean-code-repo:03245f11-c3cc-534b-bd88-f63acd0cc109::file::main.go"
+      "ScopeSignature": "clean-code-repo:425d583e-f9d1-50ed-a713-dfac0b473c1f::file::main.go"
     }
   ],
   "Run": {
-    "EvaluationRunID": "815d47eb-c3bf-4fd8-914a-60daa36cd2a5",
-    "RepoID": "03245f11-c3cc-534b-bd88-f63acd0cc109",
+    "EvaluationRunID": "7fdad665-6388-48c8-91f3-9e4727699d02",
+    "RepoID": "425d583e-f9d1-50ed-a713-dfac0b473c1f",
     "SHA": "working-copy",
     "PolicyVersionID": "2b8b672e-2c5c-5891-ad9a-394921e95273",
     "Caller": "batch_refresh",
     "ScopeID": null,
-    "CreatedAt": "2026-05-31T09:43:14.0968908Z"
+    "CreatedAt": "2026-05-31T09:44:48.3965002Z"
   },
   "Verdict": {
-    "VerdictID": "b6e3ab3d-bcb6-464f-95a1-8a2cfc900dde",
-    "EvaluationRunID": "815d47eb-c3bf-4fd8-914a-60daa36cd2a5",
+    "VerdictID": "4c062dd5-dd6a-4f11-a898-e4a6301ea7e9",
+    "EvaluationRunID": "7fdad665-6388-48c8-91f3-9e4727699d02",
     "Verdict": "pass",
     "Degraded": false,
     "DegradedReason": "",
-    "CreatedAt": "2026-05-31T09:43:14.0968908Z"
+    "CreatedAt": "2026-05-31T09:44:48.3965002Z"
   },
   "Findings": [],
   "HotSpots": null,
@@ -327,6 +327,6 @@
     ],
     "effort_source": "fallback",
     "prompt_count": 0,
-    "prompt_dest": "C:\\Users\\xiaodoli\\AppData\\Local\\Temp\\cleanc-e2e-emit-prompts-4294012245\\prompts.jsonl"
+    "prompt_dest": "C:\\Users\\xiaodoli\\AppData\\Local\\Temp\\cleanc-e2e-emit-prompts-3687758659\\prompts.jsonl"
   }
 }

@@ -449,7 +449,7 @@ func TestScanRescanIdempotentReportsSameGraph(t *testing.T) {
 		flags := &scanFlags{sha: "1234567890123456789012345678901234567890"}
 		var buf bytes.Buffer
 		runner := scanRunner{
-			stdout:    &buf,
+			stdout: &buf,
 			newGitMat: func() repoindexer.Materializer {
 				return &repoindexer.InMemoryMaterializer{Files: files}
 			},

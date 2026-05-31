@@ -158,18 +158,27 @@ func runScanMany(ctx context.Context, root *rootFlags, flags *scanManyFlags, man
 		}
 		outPath := filepath.Join(flags.outDir, slug+".db")
 
+		// Per evaluator iter-1 feedback item 3: scan-many's
+		// per-repo .db contract (architecture S9.4) is sqlite-only.
+		// Pin --store=sqlite for the per-entry run regardless of
+		// the operator's root --store choice; the memory/postgres
+		// backends would (mis)treat the .db path as a JSON-export
+		// path or as a Postgres DSN respectively.
+		perRoot := *root
+		perRoot.store = "sqlite"
+		perRoot.db = "" // each entry's --out is the source of truth
+
 		perFlags := &scanFlags{
 			sha: e.SHA,
 			out: outPath,
 		}
-		// Each entry gets its own runner with a buffered stdout
-		// so the per-repo summary is captured (for aggregation)
-		// before being relayed to the outer stdout.
-		// We don't override openSink / materializers -- the inner
-		// runScanWithSummary uses production wiring unless tests
-		// substituted `exec`.
-		perRunner := scanRunner{}
-		sum, err := exec(ctx, root, perFlags, e.Input, perRunner)
+		// Per evaluator iter-1 feedback item 1: route the per-repo
+		// summary directly to the outer stdout. The previous
+		// (nil-stdout) wiring sent the summary to os.Stdout AND
+		// we then re-wrote it via writeScanSummary, duplicating
+		// every successful entry's block.
+		perRunner := scanRunner{stdout: stdout}
+		sum, err := exec(ctx, &perRoot, perFlags, e.Input, perRunner)
 		if err != nil {
 			agg.failed++
 			agg.failures = append(agg.failures, manyFailure{
@@ -178,16 +187,24 @@ func runScanMany(ctx context.Context, root *rootFlags, flags *scanManyFlags, man
 				SHA:    e.SHA,
 				Reason: err.Error(),
 			})
+			// Per evaluator iter-1 feedback item 2: clean up the
+			// (possibly empty) .db that the SQLite sink may have
+			// created before the materialize / walk failed. The
+			// brief mandates one .db per *succeeded* repo; a
+			// failure must NOT leave an artifact behind.
+			if rmErr := os.Remove(outPath); rmErr != nil && !os.IsNotExist(rmErr) {
+				slog.Warn("scan-many.cleanup_failed_artifact_failed",
+					"path", outPath,
+					"error", rmErr.Error())
+			}
 			writeManyFailureLine(stdout, e, err, root.logFormat)
 			continue
 		}
 		agg.succeeded++
 		agg.add(sum)
-		// Relay the per-repo summary so the operator sees one
-		// summary block per repo, then the aggregate at the end.
-		if err := writeScanSummary(stdout, root.logFormat, sum); err != nil {
-			return fmt.Errorf("scan-many: write per-repo summary: %w", err)
-		}
+		// Per-repo summary is already written by runScanWithSummary
+		// through perRunner.stdout (== stdout). Do NOT re-render
+		// it here (evaluator iter-1 feedback item 1).
 	}
 
 	if err := writeManyAggregate(stdout, agg, root.logFormat); err != nil {

@@ -285,9 +285,114 @@ func TestScanManySlugCollisionDisambiguated(t *testing.T) {
 	}
 }
 
-// writeFixtureRepoNamed builds a minimal Go fixture repo under
-// a parent dir whose basename matches `name`, so per-repo
-// slugs differ in scan-many tests.
+// TestScanManyFailedEntryDoesNotLeaveDB asserts the per-entry
+// .db artifact is removed when an entry fails AFTER the sink
+// has opened (evaluator iter-1 feedback item 2). The injected
+// exec function creates the file to mimic the SQLite sink, then
+// returns an error.
+func TestScanManyFailedEntryDoesNotLeaveDB(t *testing.T) {
+	manifest := writeManifest(t, "/ok", "/boom", "/ok2")
+	outDir := t.TempDir()
+	root := defaultRootFlags()
+	root.store = "sqlite"
+	flags := &scanManyFlags{outDir: outDir}
+	var buf bytes.Buffer
+	runner := scanManyRunner{
+		stdout: &buf,
+		runScan: func(ctx context.Context, _ *rootFlags, sf *scanFlags, input string, _ scanRunner) (scanSummary, error) {
+			// Simulate the sink-opened-then-walk-failed path:
+			// touch the .db file (so the artifact exists when
+			// the error returns), then fail.
+			if err := os.WriteFile(sf.out, []byte("partial sqlite header"), 0o644); err != nil {
+				t.Fatalf("touch: %v", err)
+			}
+			if input == "/boom" {
+				return scanSummary{}, errors.New("simulated post-sink-open failure")
+			}
+			return scanSummary{Walked: 1, Parsed: 1,
+				Nodes: map[string]int{"repo": 1},
+				Edges: map[string]int{},
+			}, nil
+		},
+	}
+	if err := runScanMany(context.Background(), &root, flags, manifest, runner); err == nil {
+		t.Fatalf("expected partial-failure error, got nil")
+	}
+	dbs, err := filepath.Glob(filepath.Join(outDir, "*.db"))
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	if len(dbs) != 2 {
+		t.Fatalf("expected exactly 2 .db files (failure cleaned up), got %d: %v", len(dbs), dbs)
+	}
+	for _, p := range dbs {
+		if strings.Contains(filepath.Base(p), "boom") {
+			t.Errorf("failed entry's .db artifact was not removed: %s", p)
+		}
+	}
+}
+
+// TestScanManyPinsSqliteStore asserts scan-many runs each entry
+// under --store=sqlite regardless of the operator's root --store
+// (evaluator iter-1 feedback item 3). The injected exec captures
+// the per-entry root flags.
+func TestScanManyPinsSqliteStore(t *testing.T) {
+	manifest := writeManifest(t, "/a", "/b")
+	root := defaultRootFlags()
+	root.store = "memory" // would otherwise be propagated to per-entry runs
+	flags := &scanManyFlags{outDir: t.TempDir()}
+	var seenStores []string
+	runner := scanManyRunner{
+		stdout: &bytes.Buffer{},
+		runScan: func(ctx context.Context, r *rootFlags, sf *scanFlags, input string, _ scanRunner) (scanSummary, error) {
+			seenStores = append(seenStores, r.store)
+			return scanSummary{Nodes: map[string]int{}, Edges: map[string]int{}}, nil
+		},
+	}
+	if err := runScanMany(context.Background(), &root, flags, manifest, runner); err != nil {
+		t.Fatalf("runScanMany: %v", err)
+	}
+	if len(seenStores) != 2 {
+		t.Fatalf("expected 2 per-entry calls, got %d", len(seenStores))
+	}
+	for i, s := range seenStores {
+		if s != "sqlite" {
+			t.Errorf("entry %d: per-entry root.store = %q, want sqlite", i, s)
+		}
+	}
+	// And the operator's outer root must NOT have been mutated.
+	if root.store != "memory" {
+		t.Errorf("scan-many mutated outer root.store to %q, must remain %q", root.store, "memory")
+	}
+}
+
+// TestScanManySuccessSummaryNotDuplicated asserts each successful
+// per-repo summary appears exactly once in the combined stdout
+// (evaluator iter-1 feedback item 1).
+func TestScanManySuccessSummaryNotDuplicated(t *testing.T) {
+	r1 := writeFixtureRepoNamed(t, "uniqalpha")
+	r2 := writeFixtureRepoNamed(t, "uniqbeta")
+	manifest := writeManifest(t, r1, r2)
+	outDir := t.TempDir()
+	stdout, _, err := execute(t,
+		"--store", "sqlite",
+		"scan-many", manifest,
+		"--out-dir", outDir,
+	)
+	if err != nil {
+		t.Fatalf("scan-many: %v", err)
+	}
+	// Each per-repo summary contains a unique "repo:" line whose
+	// URL embeds the basename. It MUST appear exactly once per
+	// successful repo.
+	for _, name := range []string{"uniqalpha", "uniqbeta"} {
+		n := strings.Count(stdout, "/"+name+" @")
+		if n != 1 {
+			t.Errorf("expected per-repo summary for %q exactly once, got %d occurrences\nstdout=%s",
+				name, n, stdout)
+		}
+	}
+}
 func writeFixtureRepoNamed(t *testing.T, name string) string {
 	t.Helper()
 	parent := t.TempDir()

@@ -165,9 +165,9 @@ func runScanWithSummary(ctx context.Context, root *rootFlags, flags *scanFlags, 
 	kind := detectInputKind(input)
 
 	var (
-		mat     repoindexer.Materializer
-		matArg  string
-		shaArg  = flags.sha
+		mat    repoindexer.Materializer
+		matArg string
+		shaArg = flags.sha
 	)
 	switch kind {
 	case inputKindGitURL:

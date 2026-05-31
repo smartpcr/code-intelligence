@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -693,6 +694,7 @@ func (s *workerAdoptsState) weSearchForUnexportedHelperNames(nameList string) er
 }
 
 func grepForIdentifier(dir, ident string) ([]string, error) {
+	re := regexp.MustCompile(`\b` + regexp.QuoteMeta(ident) + `\b`)
 	var hits []string
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -714,8 +716,12 @@ func grepForIdentifier(dir, ident string) ([]string, error) {
 		for scanner.Scan() {
 			lineNo++
 			line := scanner.Text()
-			if strings.Contains(line, ident) {
-				hits = append(hits, fmt.Sprintf("%s:%d: %s", path, lineNo, strings.TrimSpace(line)))
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "//") {
+				continue
+			}
+			if re.MatchString(line) {
+				hits = append(hits, fmt.Sprintf("%s:%d: %s", path, lineNo, trimmed))
 			}
 		}
 		return scanner.Err()

@@ -186,7 +186,10 @@ func (s *goldenSnapshotState) runPipeline(row fixtureRow) (report.RunArtifact, [
 		return report.RunArtifact{}, nil, nil, fmt.Errorf("planner run: %w", err)
 	}
 
-	plans, tasks := goldenRunTaskPlanner(ctx, bundle, planRes, findings, repoCtx, row.syntheticRepoPath)
+	plans, tasks, err := goldenRunTaskPlanner(ctx, bundle, planRes, findings, repoCtx, row.syntheticRepoPath)
+	if err != nil {
+		return report.RunArtifact{}, nil, nil, fmt.Errorf("task planner: %w", err)
+	}
 	var refactorPlan refactor.RefactorPlan
 	if len(plans) > 0 {
 		refactorPlan = plans[0]
@@ -257,9 +260,9 @@ func goldenLookupRunAndVerdict(store *rule_engine.InMemoryStore, res rule_engine
 	return run, verdict
 }
 
-func goldenRunTaskPlanner(ctx context.Context, bundle devpolicy.Bundle, planRes refactor.PlanResult, findings []rule_engine.Finding, repoCtx repocontext.RepoContext, syntheticRepoPath string) ([]refactor.RefactorPlan, []refactor.RefactorTask) {
+func goldenRunTaskPlanner(ctx context.Context, bundle devpolicy.Bundle, planRes refactor.PlanResult, findings []rule_engine.Finding, repoCtx repocontext.RepoContext, syntheticRepoPath string) ([]refactor.RefactorPlan, []refactor.RefactorTask, error) {
 	if planRes.Snapshot.PolicyVersionID.String() == "00000000-0000-0000-0000-000000000000" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	tp, writer, err := orchestrator.NewTaskPlannerWiring(bundle, planRes.HotSpots, findings,
 		refactor.WithTaskIDFactory(goldenUUIDFactory("golden/task/"+syntheticRepoPath)),
@@ -272,12 +275,12 @@ func goldenRunTaskPlanner(ctx context.Context, bundle devpolicy.Bundle, planRes 
 		}),
 	)
 	if err != nil {
-		return nil, nil
+		return nil, nil, fmt.Errorf("NewTaskPlannerWiring: %w", err)
 	}
 	if _, err := tp.PlanFromSnapshot(ctx, repoCtx.RepoID, repoCtx.HeadSHA, planRes.Snapshot); err != nil {
-		return nil, nil
+		return nil, nil, fmt.Errorf("PlanFromSnapshot: %w", err)
 	}
-	return writer.Plans(), writer.Tasks()
+	return writer.Plans(), writer.Tasks(), nil
 }
 
 func goldenBuildFileSummaries(result *orchestrator.Result) []report.WalkedFileSummary {

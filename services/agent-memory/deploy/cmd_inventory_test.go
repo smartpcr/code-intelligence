@@ -140,6 +140,21 @@ func goBinaryExpectations() map[string]binaryExpectations {
 			},
 			tracerAnchors: common,
 		},
+		"codeintel": {
+			mainPath: "codeintel/main.go",
+			// codeintel is the developer-facing scan CLI added in
+			// stage 5.1 (cobra scaffolding). It exposes the
+			// `/metrics` path as a package constant (`metricsPath`)
+			// in anticipation of the `serve` subcommand wiring the
+			// handler in stage 5.5; OTel tracer setup is also a
+			// stage-5.5 follow-up (`serve`-only, since `scan` /
+			// `scan-many` / `diagram` are one-shot CLIs that don't
+			// run a tracer). Both anchors are waived here with
+			// explicit follow-up ownership, matching the
+			// partition-maintainer precedent above.
+			metricsAnchors:     []string{`"/metrics"`},
+			allowMissingTracer: true,
+		},
 	}
 }
 

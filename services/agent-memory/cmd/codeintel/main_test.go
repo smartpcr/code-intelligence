@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -20,14 +22,14 @@ func TestRootHelpListsSubcommands(t *testing.T) {
 	if err != nil {
 		t.Fatalf("--help returned error: %v", err)
 	}
-	for _, name := range []string{"scan", "scan-many", "diagram", "serve"} {
+	for _, name := range []string{"scan", "scan-many", "diagram", "serve", "version"} {
 		if !strings.Contains(out, name) {
 			t.Errorf("help output missing subcommand %q: %s", name, out)
 		}
 	}
 }
 
-func TestSubcommandsReturnNotImplemented(t *testing.T) {
+func TestSubcommandsReturnErrNotImplemented(t *testing.T) {
 	cases := [][]string{
 		{"scan"},
 		{"scan-many"},
@@ -39,11 +41,11 @@ func TestSubcommandsReturnNotImplemented(t *testing.T) {
 		c := c
 		t.Run(strings.Join(c, " "), func(t *testing.T) {
 			_, _, err := execute(t, c...)
-			if err == nil {
-				t.Fatalf("expected error from %v", c)
+			if !errors.Is(err, errNotImplemented) {
+				t.Fatalf("expected errNotImplemented from %v, got %v", c, err)
 			}
-			if !strings.Contains(err.Error(), "not implemented") {
-				t.Fatalf("expected 'not implemented' from %v, got %v", c, err)
+			if err == nil || err.Error() != "not implemented" {
+				t.Fatalf("expected error string exactly %q, got %q", "not implemented", err)
 			}
 		})
 	}
@@ -83,11 +85,66 @@ func TestTextLogHandlerDefault(t *testing.T) {
 	}
 }
 
+// TestSubcommandJSONLogIsValidJSON exercises stage-5.1 scenario
+// `log-flag-respected`: when --log=json is set, the log line a
+// scaffolded subcommand emits must be parseable by
+// encoding/json. We capture stderr (where slog writes) and feed
+// it to json.Unmarshal.
+func TestSubcommandJSONLogIsValidJSON(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := newRootCmd(&out, &errOut)
+	root.SetArgs([]string{"--log", "json", "scan"})
+	_ = root.Execute() // scan returns errNotImplemented; that's expected.
+
+	line := strings.TrimSpace(errOut.String())
+	if line == "" {
+		t.Fatalf("expected a JSON log line on stderr, got empty output")
+	}
+	// Subcommand emits exactly one line in the scaffold; tolerate
+	// trailing newlines by taking the first non-empty line.
+	firstLine := line
+	if i := strings.Index(line, "\n"); i >= 0 {
+		firstLine = line[:i]
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(firstLine), &decoded); err != nil {
+		t.Fatalf("emitted log line is not valid JSON: %v\nline: %q", err, firstLine)
+	}
+	if decoded["msg"] != "codeintel subcommand invoked" {
+		t.Errorf("expected msg field present, got %v", decoded["msg"])
+	}
+	if decoded["subcommand"] != "scan" {
+		t.Errorf("expected subcommand=scan, got %v", decoded["subcommand"])
+	}
+}
+
 func TestPersistentFlagsRegistered(t *testing.T) {
 	root := newRootCmd(&bytes.Buffer{}, &bytes.Buffer{})
 	for _, name := range []string{"store", "db", "log", "with-embeddings"} {
 		if root.PersistentFlags().Lookup(name) == nil {
 			t.Errorf("persistent flag %q not registered", name)
 		}
+	}
+}
+
+func TestVersionSubcommandPrintsBuildMetadata(t *testing.T) {
+	out, _, err := execute(t, "version")
+	if err != nil {
+		t.Fatalf("version returned error: %v", err)
+	}
+	for _, want := range []string{"codeintel", version, commit, buildDate} {
+		if !strings.Contains(out, want) {
+			t.Errorf("version output missing %q: %s", want, out)
+		}
+	}
+}
+
+func TestUnknownSubcommandFails(t *testing.T) {
+	_, _, err := execute(t, "bogus")
+	if err == nil {
+		t.Fatalf("expected error for unknown subcommand, got nil")
+	}
+	if !strings.Contains(err.Error(), "bogus") {
+		t.Fatalf("expected error to name the offending subcommand, got %v", err)
 	}
 }

@@ -94,6 +94,15 @@ func newScanCmdImpl(root *rootFlags) *cobra.Command {
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) != 1 {
+				// Emit through slog so the e2e log-flag-respected
+				// scenario sees a JSON line on stderr when
+				// --log=json is set. Cobra's plain error print
+				// alone would violate that contract.
+				slog.Error("scan.invalid_args",
+					"subcommand", "scan",
+					"want_args", 1,
+					"got_args", len(args),
+				)
 				return fmt.Errorf("scan: requires exactly 1 argument <path|git-url>, got %d", len(args))
 			}
 			slog.Info("codeintel subcommand invoked", "subcommand", "scan")

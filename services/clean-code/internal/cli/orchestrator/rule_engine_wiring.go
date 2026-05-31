@@ -164,23 +164,30 @@ var ErrLoadStoreNilSamples = fmt.Errorf("orchestrator: LoadStore: samples slice 
 type StoreSeeder interface {
 	InsertPolicyVersion(steward.PolicyVersion)
 	InsertRule(steward.Rule)
+	InsertThreshold(steward.Threshold)
 	InsertSamples(uuid.UUID, string, []rule_engine.Sample)
 }
 
 // SeedStore populates store with the policy version, rules,
-// and metric samples from bundle. It is the seeding logic
-// extracted from [LoadStore], exported to allow test doubles
-// that verify the InsertSamples calling pattern (exactly one
-// batch call, never per-row).
+// thresholds, and metric samples from bundle. It is the
+// seeding logic extracted from [LoadStore], exported to allow
+// test doubles that verify the InsertSamples calling pattern
+// (exactly one batch call, never per-row).
 //
-// The seed sequence follows architecture Sec 3.4 steps 1-3:
+// The seed sequence follows architecture Sec 3.4 steps 1-3
+// plus the dev-mode threshold catalogue:
 //  1. One [StoreSeeder.InsertPolicyVersion] call.
 //  2. One [StoreSeeder.InsertRule] per bundle rule.
-//  3. One [StoreSeeder.InsertSamples] with the full batch.
+//  3. One [StoreSeeder.InsertThreshold] per bundle threshold
+//     (so `threshold('<uuid>')` predicates compile cleanly).
+//  4. One [StoreSeeder.InsertSamples] with the full batch.
 func SeedStore(store StoreSeeder, bundle devpolicy.Bundle, samples []rule_engine.Sample, repoCtx repocontext.RepoContext) {
 	store.InsertPolicyVersion(bundle.PolicyVersion)
 	for _, r := range bundle.Rules {
 		store.InsertRule(r)
+	}
+	for _, t := range bundle.Thresholds {
+		store.InsertThreshold(t)
 	}
 	store.InsertSamples(repoCtx.RepoID, repoCtx.HeadSHA, samples)
 }

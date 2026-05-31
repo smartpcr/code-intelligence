@@ -69,15 +69,18 @@ const SampleIDNamespacePrefix = "cleanc.local-sample/"
 // The returned slice preserves the input draft order; the
 // orchestrator's Stage 2.2 sort already pinned it
 // deterministically.
+//
+// BuildSamples ALWAYS returns a non-nil slice -- a clean
+// repo or a partial parser run that emits zero drafts
+// yields a length-0 (but non-nil) result so the downstream
+// [LoadStore] nil-samples precondition treats "no findings"
+// as a valid empty batch rather than a wiring bug.
 func BuildSamples(
 	repoCtx repocontext.RepoContext,
 	drafts []recipes.MetricSampleDraft,
 	bindings *scopebinding.Table,
 	scopeIDs map[ScopeBindingKey]uuid.UUID,
 ) []rule_engine.Sample {
-	if len(drafts) == 0 {
-		return nil
-	}
 	out := make([]rule_engine.Sample, 0, len(drafts))
 	for _, d := range drafts {
 		key := ScopeBindingKey{Path: d.Scope.Path, LocalID: d.Scope.LocalID}
@@ -152,10 +155,58 @@ func MintSampleID(repoID uuid.UUID, headSHA string, scopeID uuid.UUID, metricKin
 // pipeline cannot discover the wiring bug after the fact.
 var ErrLoadStoreNilSamples = fmt.Errorf("orchestrator: LoadStore: samples slice is nil (wiring bug); cleanc exits 70 before engine invocation")
 
+// loadStore is the brief-shape helper the workstream pins:
+//
+//	loadStore(bundle devpolicy.Bundle, samples []rule_engine.Sample) *rule_engine.InMemoryStore
+//
+// It seeds a fresh [rule_engine.InMemoryStore] with
+// `architecture.md` Sec 3.4 steps 1 and 2 -- one
+// [rule_engine.InMemoryStore.InsertPolicyVersion] call for
+// `bundle.PolicyVersion` and one
+// [rule_engine.InMemoryStore.InsertRule] per entry in
+// `bundle.Rules`. It returns the store unconditionally
+// (the underlying constructor and Insert* methods are void;
+// they cannot fail).
+//
+// Step 3 (`store.InsertSamples(repoID, sha, samples)`)
+// requires a [repocontext.RepoContext] for the
+// `(repoID, sha)` coordinates and so cannot be performed
+// inside this signature -- callers either invoke
+// [LoadStore] (which wraps `loadStore` and adds step 3 with
+// the nil-samples precondition guard) or invoke
+// `store.InsertSamples` themselves. The `samples` argument
+// is accepted here to honor the brief literally; the
+// returned store does NOT yet contain those samples.
+//
+// A nil `samples` argument is accepted by this helper
+// (callers that want the wiring-bug guard MUST go through
+// [LoadStore] instead). An empty (zero-length) slice is
+// also valid and reflects a clean repo with no metric
+// drafts -- the policy and rules are still seeded so the
+// engine can `RunBatch` and emit zero findings.
+func loadStore(bundle devpolicy.Bundle, samples []rule_engine.Sample) *rule_engine.InMemoryStore {
+	_ = samples // accepted for brief-contract parity; see godoc.
+
+	store := rule_engine.NewInMemoryStore()
+
+	// Sec 3.4 step 1: register the policy version.
+	store.InsertPolicyVersion(bundle.PolicyVersion)
+
+	// Sec 3.4 step 2: register every rule the bundle's
+	// YAML loader emitted. One InsertRule call per entry
+	// per the workstream brief.
+	for _, r := range bundle.Rules {
+		store.InsertRule(r)
+	}
+
+	return store
+}
+
 // LoadStore builds a [rule_engine.InMemoryStore] seeded
 // with the dev-mode policy version and rule rows from
-// [bundle] (architecture Sec 3.4 steps 1-2) plus the
-// [samples] slice from [BuildSamples] (Sec 3.4 step 3).
+// [bundle] (architecture Sec 3.4 steps 1-2, via the
+// brief-shape [loadStore] helper) plus the [samples] slice
+// from [BuildSamples] (Sec 3.4 step 3).
 //
 // The store returned is ready to be passed into
 // [rule_engine.New] as `Config.Store`; the CLI then calls
@@ -167,18 +218,19 @@ var ErrLoadStoreNilSamples = fmt.Errorf("orchestrator: LoadStore: samples slice 
 // function is the void-API precondition gate ONLY.
 //
 // `samples` MUST NOT be nil. A nil slice signals an
-// upstream wiring bug ([BuildSamples] returns a non-nil
-// empty slice when there are zero drafts) and triggers
-// [ErrLoadStoreNilSamples]. An empty (but non-nil) slice
-// is valid: the policy + rules are still seeded so the
-// engine can RunBatch without samples and emit zero
+// upstream wiring bug ([BuildSamples] always returns a
+// non-nil slice, including a length-0 slice for a clean
+// repo) and triggers [ErrLoadStoreNilSamples]. An empty
+// (but non-nil) slice is the canonical "no findings"
+// signal: the policy + rules are still seeded so the
+// engine can `RunBatch` without samples and emit zero
 // findings.
 func LoadStore(bundle devpolicy.Bundle, samples []rule_engine.Sample, repoCtx repocontext.RepoContext) (*rule_engine.InMemoryStore, error) {
 	if samples == nil {
 		return nil, ErrLoadStoreNilSamples
 	}
 
-	store := rule_engine.NewInMemoryStore()
+	store := loadStore(bundle, samples)
 	if store == nil {
 		// Defensive: NewInMemoryStore is documented as
 		// always returning a non-nil value, but the
@@ -187,16 +239,6 @@ func LoadStore(bundle devpolicy.Bundle, samples []rule_engine.Sample, repoCtx re
 		// regression here surfaces as exit 70 rather than
 		// a nil-pointer panic deep in the engine.
 		return nil, fmt.Errorf("orchestrator: LoadStore: rule_engine.NewInMemoryStore returned nil")
-	}
-
-	// Sec 3.4 step 1: register the policy version.
-	store.InsertPolicyVersion(bundle.PolicyVersion)
-
-	// Sec 3.4 step 2: register every rule the bundle's
-	// YAML loader emitted. One InsertRule call per entry
-	// per the workstream brief.
-	for _, r := range bundle.Rules {
-		store.InsertRule(r)
 	}
 
 	// Sec 3.4 step 3: seed the measurement mirror with the

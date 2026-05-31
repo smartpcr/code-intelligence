@@ -299,3 +299,71 @@ func TestLoadStore_SeededSamplesListThrough(t *testing.T) {
 		t.Errorf("SampleID round-trip: got %v, want %v", rows[0].SampleID, samples[0].SampleID)
 	}
 }
+
+// TestBuildSamplesEmpty_FlowsThroughLoadStore covers the
+// "clean repo / zero metric drafts" path end-to-end:
+// BuildSamples must return a non-nil empty slice so the
+// downstream LoadStore precondition treats the run as a
+// valid no-findings batch (seeded policy + rules, zero
+// samples) rather than tripping ErrLoadStoreNilSamples.
+// Regression guard for the iter-1 bug where BuildSamples
+// returned nil on zero drafts and exit-70'd a clean repo.
+func TestBuildSamplesEmpty_FlowsThroughLoadStore(t *testing.T) {
+	t.Parallel()
+	rc := fixedRepoContext(t)
+	table := scopebinding.NewTable()
+	scopeIDs := map[orchestrator.ScopeBindingKey]uuid.UUID{}
+
+	// Zero drafts -- the realistic clean-repo signal.
+	samples := orchestrator.BuildSamples(rc, nil, table, scopeIDs)
+	if samples == nil {
+		t.Fatalf("BuildSamples(nil drafts) = nil; want non-nil empty slice so LoadStore does not exit 70 on a clean repo")
+	}
+	if len(samples) != 0 {
+		t.Fatalf("BuildSamples(nil drafts) len = %d, want 0", len(samples))
+	}
+
+	// And the empty-but-non-nil drafts case.
+	samples2 := orchestrator.BuildSamples(rc, []recipes.MetricSampleDraft{}, table, scopeIDs)
+	if samples2 == nil {
+		t.Fatalf("BuildSamples([]) = nil; want non-nil empty slice")
+	}
+
+	pvID := uuid.Must(uuid.FromString("dddddddd-dddd-4ddd-8ddd-dddddddddddd"))
+	bundle := devpolicy.Bundle{
+		PolicyVersion: steward.PolicyVersion{
+			PolicyVersionID: pvID,
+			Name:            "cleanc-dev-policy",
+			CreatedAt:       time.Date(2026, 5, 30, 0, 0, 0, 0, time.UTC),
+		},
+		Rules: []steward.Rule{
+			{RuleID: "loc.long_method", Version: 1, PackID: "base", PredicateDSL: "metric_kind == 'loc' AND value >= 5", SeverityDefault: steward.SeverityWarn},
+		},
+	}
+
+	store, err := orchestrator.LoadStore(bundle, samples, rc)
+	if err != nil {
+		t.Fatalf("LoadStore(zero-draft samples): err=%v, want nil (clean repo is not a wiring bug)", err)
+	}
+	if store == nil {
+		t.Fatalf("LoadStore(zero-draft samples): store=nil")
+	}
+
+	// Policy + rule still seeded so engine.RunBatch can
+	// execute and produce zero findings.
+	if _, err := store.GetPolicyVersion(t.Context(), pvID); err != nil {
+		t.Errorf("GetPolicyVersion after empty-samples LoadStore: %v", err)
+	}
+	if _, err := store.GetRule(t.Context(), "loc.long_method", 1); err != nil {
+		t.Errorf("GetRule after empty-samples LoadStore: %v", err)
+	}
+
+	// And no samples were inserted.
+	rows, err := store.ListMetricSamples(t.Context(), rc.RepoID, rc.HeadSHA, nil)
+	if err != nil {
+		t.Fatalf("ListMetricSamples: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("ListMetricSamples len = %d, want 0 for zero-draft run", len(rows))
+	}
+}

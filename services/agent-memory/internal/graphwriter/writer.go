@@ -252,6 +252,21 @@ type RepoInput struct {
 	DefaultBranch  string
 	CurrentHeadSHA string
 	LanguageHints  []string
+	// RepoID optionally pre-computes the `repo_id` primary key the
+	// caller wants the row to take on a fresh insert. The zero
+	// value (all-zero UUID) means "let the schema default
+	// (`gen_random_uuid()`) pick" — the original Stage 2.1
+	// EnsureRepo behaviour. Only `EnsureRepoWithID` honours this
+	// field; `EnsureRepo` ignores it so existing call sites are
+	// behaviour-preserving.
+	//
+	// The motivating use case (Stage 3.2 Repo Indexer + Stage
+	// graphsink storage abstraction) is the deterministic
+	// `fingerprint.RepoIDFromURL` derivation: the scanner CLI
+	// computes the RepoID up-front from the repo URL so the
+	// in-memory / SQLite sinks and the Postgres sink share node
+	// identities for the same repo. See architecture S3.4.
+	RepoID fingerprint.RepoID
 }
 
 // RepoRecord is the post-upsert state of a Repo row.
@@ -324,6 +339,104 @@ func (w *Writer) EnsureRepo(ctx context.Context, in RepoInput) (rec RepoRecord, 
 
 	fields.RepoID = idStr
 	fields.Extras = append(fields.Extras, slog.Bool("inserted", rec.Inserted))
+	return rec, nil
+}
+
+// EnsureRepoWithID is the precomputed-PK variant of EnsureRepo.
+// It writes the supplied `RepoInput.RepoID` as the row's
+// `repo_id` primary key on a fresh insert, instead of falling
+// through to the schema's `gen_random_uuid()` default. This is
+// the contract the Stage 3.2 graphsink abstraction needs: the
+// in-memory / SQLite / Postgres backends must agree on node
+// identity for the same repo, and `fingerprint.RepoIDFromURL`
+// gives every backend the same deterministic UUID without a
+// round-trip to Postgres first.
+//
+// Behaviour matrix (architecture S3.4 / S6.5):
+//
+//   - Fresh insert (no row with this URL exists): RETURNING
+//     yields the supplied RepoID and `inserted = true`.
+//   - URL collision with a row whose `repo_id` differs from the
+//     supplied value: this is the documented LEGACY-COLLISION
+//     caveat. The ON CONFLICT (url) DO UPDATE path does NOT
+//     overwrite `repo_id` (the PK), so RETURNING yields the
+//     PRE-EXISTING `repo_id` and `inserted = false`. Callers
+//     that depend on identity parity across sinks must detect
+//     this divergence and either:
+//     (a) reconcile by mapping their precomputed RepoID to the
+//     server-assigned one for the lifetime of the scan, or
+//     (b) refuse to proceed if strict identity is required.
+//     `RepoRecord.Inserted == false` together with
+//     `RepoRecord.ID != in.RepoID` is the signal.
+//
+// Like EnsureRepo, the row's mutable columns (default_branch,
+// current_head_sha, language_hints) are overwritten on
+// conflict; this preserves the upsert semantics tests pin on.
+//
+// A zero-value `in.RepoID` is rejected with an explicit error
+// — call EnsureRepo instead when you want the schema default.
+func (w *Writer) EnsureRepoWithID(ctx context.Context, in RepoInput) (rec RepoRecord, err error) {
+	fields := auditFields{
+		SHA: in.CurrentHeadSHA,
+		Extras: []slog.Attr{
+			slog.String("url", in.URL),
+		},
+	}
+	defer w.auditDefer("ensure_repo_with_id", &fields, &err)()
+
+	if in.URL == "" {
+		return RepoRecord{}, errors.New("graphwriter: EnsureRepoWithID: empty url")
+	}
+	if in.RepoID.IsZero() {
+		return RepoRecord{}, errors.New(
+			"graphwriter: EnsureRepoWithID: zero repo_id (use EnsureRepo for schema-default UUID)",
+		)
+	}
+
+	hints := in.LanguageHints
+	if hints == nil {
+		hints = []string{}
+	}
+
+	// We pass repo_id explicitly so a fresh insert lands on the
+	// caller-supplied UUID. The ON CONFLICT (url) DO UPDATE
+	// branch deliberately omits `repo_id` from the SET list:
+	// `repo_id` is the surrogate PK and architecture S3.4 forbids
+	// re-keying an existing row. RETURNING `repo_id::text` will
+	// therefore return the PRE-EXISTING `repo_id` on a URL
+	// collision — this is the legacy-collision caveat documented
+	// on the method.
+	const q = `
+		INSERT INTO repo (repo_id, url, default_branch, current_head_sha, language_hints)
+		VALUES ($1::uuid, $2, $3, $4, $5)
+		ON CONFLICT (url) DO UPDATE SET
+		    default_branch   = EXCLUDED.default_branch,
+		    current_head_sha = EXCLUDED.current_head_sha,
+		    language_hints   = EXCLUDED.language_hints
+		RETURNING repo_id::text, (xmax = 0) AS inserted
+	`
+	var idStr string
+	err = w.runInTx(ctx, "EnsureRepoWithID", func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, q,
+			in.RepoID.String(), in.URL, in.DefaultBranch, in.CurrentHeadSHA, pq.Array(hints),
+		).Scan(&idStr, &rec.Inserted)
+	})
+	if err != nil {
+		return RepoRecord{}, err
+	}
+	repoID, err := fingerprint.ParseRepoID(idStr)
+	if err != nil {
+		return RepoRecord{}, fmt.Errorf("graphwriter: EnsureRepoWithID parse repo_id: %w", err)
+	}
+	rec.RepoID = idStr
+	rec.ID = repoID
+
+	fields.RepoID = idStr
+	fields.Extras = append(fields.Extras,
+		slog.Bool("inserted", rec.Inserted),
+		slog.String("supplied_repo_id", in.RepoID.String()),
+		slog.Bool("legacy_collision", !rec.Inserted && rec.ID != in.RepoID),
+	)
 	return rec, nil
 }
 

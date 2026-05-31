@@ -44,6 +44,7 @@ func TestBuildTagAnalyzer_Fixtures(t *testing.T) {
 	cases := []string{
 		"example.com/internal/cli/devpolicy/buildtag_bad_missing_tag",
 		"example.com/internal/cli/devpolicy/buildtag_bad_aliased",
+		"example.com/internal/cli/devpolicy/buildtag_bad_local_alias",
 		"example.com/internal/cli/devpolicy/buildtag_good_not_prod",
 		"example.com/internal/cli/devpolicy/buildtag_good_signed",
 	}

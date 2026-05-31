@@ -198,44 +198,73 @@ func findEnclosingFile(pass *analysis.Pass, n ast.Node) *ast.File {
 
 // isUnsignedStewardPolicyVersion returns true when the
 // composite literal `cl` constructs a
-// `steward.PolicyVersion` (or an aliased equivalent) AND
-// the constructed value is unsigned (Signature is omitted
-// or set to nil).
+// `steward.PolicyVersion` (or any locally-aliased
+// equivalent) AND the constructed value is unsigned
+// (Signature is omitted or set to nil).
 //
-// Resolution path:
+// Resolution uses the type system rather than the
+// literal's syntactic spelling, so all of the following
+// forms are caught:
 //
-//  1. The literal's type expression must be a selector
-//     (`pkg.PolicyVersion`) whose `Sel.Name` matches
-//     `stewardPolicyVersionTypeName`. Non-selector or
-//     selector-with-wrong-name literals are skipped.
-//  2. We pull the *types.TypeName from `pass.TypesInfo`
-//     and check that its package's import path ends with
-//     `stewardPackagePathSuffix`. This is the alias-proof
-//     check that supersedes iter 1's name-only match.
-//  3. We walk the literal's element list: if any element
-//     is `Signature: <non-nil>`, the literal is signed
-//     and we return false. Otherwise we return true
-//     (nil or absent Signature is unsigned).
+//   - `steward.PolicyVersion{...}`              -- direct selector
+//   - `stewardv1.PolicyVersion{...}`            -- aliased import
+//   - `type PV = steward.PolicyVersion; PV{...}` -- local type alias
+//   - `type PV steward.PolicyVersion; PV{...}`  -- named wrapper (caught only
+//     when wrapper layout preserves Signature; otherwise treated as a
+//     distinct type and skipped, since signing semantics no longer apply)
+//
+// We resolve the literal's type via `pass.TypesInfo.TypeOf(cl)`,
+// strip pointer/alias indirection, and assert the underlying
+// *types.Named's TypeName lives in a package whose import path
+// ends with `stewardPackagePathSuffix` and whose name matches
+// `stewardPolicyVersionTypeName`.
 func isUnsignedStewardPolicyVersion(pass *analysis.Pass, cl *ast.CompositeLit) bool {
-	sel, ok := cl.Type.(*ast.SelectorExpr)
-	if !ok || sel.Sel == nil || sel.Sel.Name != stewardPolicyVersionTypeName {
+	if cl.Type == nil {
+		// Elided composite literal (e.g. `[]PolicyVersion{{...}}`);
+		// the outer literal carries the type for our purposes.
 		return false
 	}
-	// `pass.TypesInfo.Uses[sel.Sel]` returns the *types.TypeName
-	// referenced by the selector. Its `Pkg()` is the steward
-	// package regardless of the local import alias.
-	obj := pass.TypesInfo.Uses[sel.Sel]
-	if obj == nil {
+	t := pass.TypesInfo.TypeOf(cl)
+	if t == nil {
 		return false
 	}
-	tn, ok := obj.(*types.TypeName)
-	if !ok || tn.Pkg() == nil {
+	named := namedFromType(t)
+	if named == nil {
 		return false
 	}
-	if !strings.HasSuffix(tn.Pkg().Path(), stewardPackagePathSuffix) {
+	obj := named.Obj()
+	if obj == nil || obj.Pkg() == nil {
+		return false
+	}
+	if obj.Name() != stewardPolicyVersionTypeName {
+		return false
+	}
+	if !strings.HasSuffix(obj.Pkg().Path(), stewardPackagePathSuffix) {
 		return false
 	}
 	return compositeIsUnsigned(cl)
+}
+
+// namedFromType returns the underlying *types.Named that a
+// composite-literal type ultimately resolves to, peeling off
+// pointer indirection and `type X = Y` aliases (`*types.Alias`,
+// introduced in Go 1.22). Named wrappers (`type Foo pkg.Bar`)
+// deliberately return their own *types.Named, which lives in
+// the local package and will therefore fail the
+// `stewardPackagePathSuffix` check above (correct: the wrapper
+// is a distinct type with its own signing semantics).
+func namedFromType(t types.Type) *types.Named {
+	for {
+		t = types.Unalias(t)
+		switch v := t.(type) {
+		case *types.Named:
+			return v
+		case *types.Pointer:
+			t = v.Elem()
+		default:
+			return nil
+		}
+	}
 }
 
 // compositeIsUnsigned inspects the keyed element list of a

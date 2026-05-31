@@ -22,16 +22,18 @@ import (
 // ---------------------------------------------------------------------------
 
 type envelopeTypesCtx struct {
-	envelope    diagram.Diagram
-	goldenBytes []byte
-	marshalled  []byte
+	envelope     diagram.Diagram
+	goldenBytes  []byte
+	marshalled   []byte
 	remarshalled []byte
 }
 
-// goldenFilePath returns the absolute path to the golden fixture.
-func goldenFilePath() string {
+// envelopeMarshalGoldenPath returns the absolute path to the compact
+// golden fixture produced by json.Marshal (no indentation, no trailing
+// newline).
+func envelopeMarshalGoldenPath() string {
 	_, thisFile, _, _ := runtime.Caller(0)
-	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "internal", "diagram", "testdata", "envelope_module_golden.json")
+	return filepath.Join(filepath.Dir(thisFile), "testdata", "envelope_marshal_golden.json")
 }
 
 // ---------------------------------------------------------------------------
@@ -39,11 +41,7 @@ func goldenFilePath() string {
 // ---------------------------------------------------------------------------
 
 func (e *envelopeTypesCtx) anEnvelopeValueMatchingTheGoldenFixture() error {
-	attrs := json.RawMessage(`{
-        "decl_kind": "package",
-        "start_line": 1,
-        "end_line": 1
-      }`)
+	attrs := json.RawMessage(`{"decl_kind":"package","start_line":1,"end_line":1}`)
 
 	e.envelope = diagram.Diagram{
 		Diagram: diagram.KindModule,
@@ -55,57 +53,31 @@ func (e *envelopeTypesCtx) anEnvelopeValueMatchingTheGoldenFixture() error {
 		GeneratedAt: time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC),
 		LayoutHint:  diagram.LayoutHierarchicalTopDown,
 		Nodes: []diagram.Node{
-			{
-				ID:       "pkg:github.com/example/app/cmd",
-				Label:    "cmd",
-				Kind:     "package",
-				Language: "go",
-				Group:    "github.com/example/app",
-				Attrs:    attrs,
-			},
-			{
-				ID:       "pkg:github.com/example/app/internal/svc",
-				Label:    "svc",
-				Kind:     "package",
-				Language: "go",
-				Group:    "github.com/example/app",
-				Attrs:    attrs,
-			},
+			{ID: "pkg:github.com/example/app/cmd", Label: "cmd", Kind: "package", Language: "go", Group: "github.com/example/app", Attrs: attrs},
+			{ID: "pkg:github.com/example/app/internal/svc", Label: "svc", Kind: "package", Language: "go", Group: "github.com/example/app", Attrs: attrs},
 		},
 		Edges: []diagram.Edge{
-			{
-				ID:     "edge-imports-cmd-svc",
-				From:   "pkg:github.com/example/app/cmd",
-				To:     "pkg:github.com/example/app/internal/svc",
-				Kind:   "imports",
-				Weight: 3,
-				Label:  "imports",
-			},
+			{ID: "edge-imports-cmd-svc", From: "pkg:github.com/example/app/cmd", To: "pkg:github.com/example/app/internal/svc", Kind: "imports", Weight: 3, Label: "imports"},
 		},
 		Truncated: false,
 		Stats: diagram.Stats{
 			NodeCount: 2,
 			EdgeCount: 1,
 			CappedAt:  diagram.MaxListLimit,
-			Skipped: map[string]int{
-				"no_parser":          0,
-				"pwsh_not_available": 0,
-			},
+			Skipped:   map[string]int{"no_parser": 0, "pwsh_not_available": 0},
 		},
 	}
 	return nil
 }
 
 func (e *envelopeTypesCtx) encodingJSONMarshalRuns() error {
-	buf, err := json.MarshalIndent(e.envelope, "", "  ")
+	buf, err := json.Marshal(e.envelope)
 	if err != nil {
 		return err
 	}
-	// json.MarshalIndent omits a trailing newline; the golden file
-	// includes one, so append it to produce the canonical form.
-	e.marshalled = append(buf, '\n')
+	e.marshalled = buf
 
-	golden, err := os.ReadFile(goldenFilePath())
+	golden, err := os.ReadFile(envelopeMarshalGoldenPath())
 	if err != nil {
 		return err
 	}
@@ -126,7 +98,7 @@ func (e *envelopeTypesCtx) theResultingBytesMatchTheStoredGoldenFileByteForByte(
 // ---------------------------------------------------------------------------
 
 func (e *envelopeTypesCtx) marshalledBytesFromTheGoldenFile() error {
-	golden, err := os.ReadFile(goldenFilePath())
+	golden, err := os.ReadFile(envelopeMarshalGoldenPath())
 	if err != nil {
 		return err
 	}
@@ -140,11 +112,11 @@ func (e *envelopeTypesCtx) unmarshalledBackIntoTheStructAndReMarshalled() error 
 		return fmt.Errorf("unmarshal: %w", err)
 	}
 
-	buf, err := json.MarshalIndent(d, "", "  ")
+	buf, err := json.Marshal(d)
 	if err != nil {
 		return fmt.Errorf("re-marshal: %w", err)
 	}
-	e.remarshalled = append(buf, '\n')
+	e.remarshalled = buf
 	return nil
 }
 

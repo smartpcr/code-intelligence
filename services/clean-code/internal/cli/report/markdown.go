@@ -93,7 +93,13 @@ func (m Markdown) Render(ctx context.Context, art RunArtifact, w io.Writer) erro
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("report: Markdown.Render: %w", err)
 	}
+	if err := m.renderDarkMetricDetails(art, bw); err != nil {
+		return err
+	}
 	if err := m.renderVerdict(art, bw); err != nil {
+		return err
+	}
+	if err := m.renderFindings(art, bw); err != nil {
 		return err
 	}
 	if err := bw.Flush(); err != nil {
@@ -284,6 +290,94 @@ func headerValue(v string) string {
 // in its `--out <path>` diagnostic).
 func wrapWrite(err error) error {
 	return fmt.Errorf("report: Markdown.Render: write: %w", err)
+}
+
+// renderDarkMetricDetails emits a `## Dark Metrics` section
+// with one bullet per [DarkMetric] row so the operator can see
+// WHICH metrics stayed dark and why. The section heading makes
+// the report structure self-describing and lets downstream
+// tooling locate the block reliably.
+//
+// Each line uses the literal `metric dark: <kind>` tag so
+// downstream tooling (and acceptance tests) can grep for a
+// specific metric kind unambiguously. The format is:
+//
+//	- metric dark: cyclo (go) — missing: decision_blocks
+//
+// Skipped entirely when `len(art.DarkMetrics) == 0`.
+// The slice is iterated in order — the orchestrator's
+// [darkMetricAccumulator.finalize] guarantees stable
+// `(MetricKind, Language)` sort (tech-spec D9).
+func (m Markdown) renderDarkMetricDetails(art RunArtifact, w *bufio.Writer) error {
+	if len(art.DarkMetrics) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintln(w, "## Dark Metrics"); err != nil {
+		return wrapWrite(err)
+	}
+	if _, err := fmt.Fprintln(w); err != nil {
+		return wrapWrite(err)
+	}
+	for _, dm := range art.DarkMetrics {
+		missing := strings.Join(dm.MissingAttrs, ", ")
+		if _, err := fmt.Fprintf(w, "- metric dark: %s (%s) — missing: %s\n",
+			dm.MetricKind, dm.Language, missing); err != nil {
+			return wrapWrite(err)
+		}
+	}
+	if _, err := fmt.Fprintln(w); err != nil {
+		return wrapWrite(err)
+	}
+	return nil
+}
+
+// renderFindings emits a minimal findings section when the
+// artifact carries one or more [rule_engine.Finding] rows.
+// Each finding is rendered as a bullet with the rule ID,
+// severity, and an optional "Suggested refactor:" excerpt
+// extracted from [Finding.ExplanationMD] (which the engine
+// populates from [steward.Rule.DescriptionMD]).
+//
+// Skipped entirely when `len(art.Findings) == 0`.
+func (m Markdown) renderFindings(art RunArtifact, w *bufio.Writer) error {
+	if len(art.Findings) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintln(w, "## Findings"); err != nil {
+		return wrapWrite(err)
+	}
+	if _, err := fmt.Fprintln(w); err != nil {
+		return wrapWrite(err)
+	}
+	for _, f := range art.Findings {
+		line := fmt.Sprintf("- %s [%s]", f.RuleID, string(f.Severity))
+		if excerpt := extractSuggestedRefactor(f.ExplanationMD); excerpt != "" {
+			line += " — " + excerpt
+		}
+		if _, err := fmt.Fprintln(w, line); err != nil {
+			return wrapWrite(err)
+		}
+	}
+	if _, err := fmt.Fprintln(w); err != nil {
+		return wrapWrite(err)
+	}
+	return nil
+}
+
+// extractSuggestedRefactor scans `md` for the literal marker
+// `Suggested refactor:` and returns the text following it,
+// trimmed and collapsed to a single line. Returns the empty
+// string when the marker is absent.
+func extractSuggestedRefactor(md string) string {
+	const marker = "Suggested refactor:"
+	idx := strings.Index(md, marker)
+	if idx < 0 {
+		return ""
+	}
+	excerpt := strings.TrimSpace(md[idx+len(marker):])
+	// Collapse internal whitespace/newlines to spaces.
+	excerpt = strings.Join(strings.Fields(excerpt), " ")
+	return excerpt
 }
 
 const (

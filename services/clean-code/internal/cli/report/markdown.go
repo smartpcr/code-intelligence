@@ -27,17 +27,23 @@ import (
 // [parser.DefaultRegistry] -- exposing a registry override
 // would let a caller render a non-canonical fleet, which the
 // iter-1 evaluator flagged. The package-level
-// [DefaultRegistry] indirection below is the single seam tests
+// [defaultRegistry] indirection below is the single seam tests
 // use to inject a deterministic fleet without mutating
 // `Markdown` itself.
 type Markdown struct{}
 
-// DefaultRegistry is the package-level indirection through
+// defaultRegistry is the package-level indirection through
 // which [Markdown.Render] resolves the active parser fleet.
-// In production it returns [parser.DefaultRegistry]; tests
-// MAY swap it via [SetDefaultRegistryForTest] to assert
+// In production it returns [parser.DefaultRegistry]; tests in
+// this package MAY swap it directly (e.g.
+// `defaultRegistry = func() *parser.Registry { return fake }`
+// with a `t.Cleanup` that restores the original) to assert
 // against a known language set without racing the global
-// registry.
+// registry. There is intentionally no exported
+// `SetDefaultRegistryForTest` helper -- the seam is
+// package-private on purpose so external callers cannot
+// substitute a non-canonical fleet (the iter-1 evaluator
+// flagged any exported override as a contract drift).
 //
 // The variable is unexported as a function value (rather than
 // a registry pointer) so a future "registry constructor"

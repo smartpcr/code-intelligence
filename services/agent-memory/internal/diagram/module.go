@@ -486,9 +486,32 @@ func repoLabel(url, sig string) string {
 	return tailSegment(sig)
 }
 
-// extractLanguage is defined in callchain.go; both files share the
-// same helper and the callchain version is the canonical one
-// (also recognises the `lang` key alias per its unit tests).
+// extractLanguage reads the `language` or `lang` key from a
+// Node's `attrs_json` blob. Returns the empty string when both
+// keys are missing, the blob is empty, or the JSON is malformed
+// -- the envelope's per-Node `language` field is best-effort
+// metadata the UI uses for coloring, not a structural invariant.
+// Shared by both the module-diagram and call-chain projectors.
+func extractLanguage(attrs json.RawMessage) string {
+	if len(attrs) == 0 {
+		return ""
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(attrs, &m); err != nil {
+		return ""
+	}
+	for _, k := range []string{"language", "lang"} {
+		raw, ok := m[k]
+		if !ok {
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(raw, &s); err == nil && s != "" {
+			return s
+		}
+	}
+	return ""
+}
 
 // nonEmptyAttrs returns the supplied attrs verbatim when non-
 // empty, and `nil` otherwise so Node.MarshalJSON's nil-guard

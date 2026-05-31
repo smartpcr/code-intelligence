@@ -103,7 +103,7 @@ func newRootCmd(out, errOut io.Writer) *cobra.Command {
 	cmd.AddCommand(
 		newScanCmdImpl(&flags),
 		newScanManyCmd(&flags),
-		newDiagramCmd(&flags),
+		newDiagramCmdReal(&flags),
 		newServeCmd(&flags),
 		newVersionCmd(),
 	)
@@ -145,33 +145,6 @@ func newScanManyCmd(_ *rootFlags) *cobra.Command {
 			return notImplemented("scan-many")
 		},
 	}
-}
-
-func newDiagramCmd(_ *rootFlags) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "diagram",
-		Short: "Project diagrams from a previously-scanned store",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return notImplemented("diagram")
-		},
-	}
-	cmd.AddCommand(
-		&cobra.Command{
-			Use:   "module",
-			Short: "Build the top-down module/component diagram",
-			RunE: func(cmd *cobra.Command, args []string) error {
-				return notImplemented("diagram module")
-			},
-		},
-		&cobra.Command{
-			Use:   "calls",
-			Short: "Build the left-right call-chain diagram from a seed",
-			RunE: func(cmd *cobra.Command, args []string) error {
-				return notImplemented("diagram calls")
-			},
-		},
-	)
-	return cmd
 }
 
 func newServeCmd(_ *rootFlags) *cobra.Command {

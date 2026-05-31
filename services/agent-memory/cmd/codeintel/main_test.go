@@ -30,9 +30,10 @@ func TestRootHelpListsSubcommands(t *testing.T) {
 }
 
 func TestSubcommandsReturnErrNotImplemented(t *testing.T) {
+	// diagram module is implemented in diagram.go;
+	// scan is implemented in scan.go.
 	cases := [][]string{
 		{"scan-many"},
-		{"diagram", "module"},
 		{"diagram", "calls"},
 		{"serve"},
 	}
@@ -47,6 +48,16 @@ func TestSubcommandsReturnErrNotImplemented(t *testing.T) {
 				t.Fatalf("expected error string exactly %q, got %q", "not implemented", err)
 			}
 		})
+	}
+}
+
+func TestDiagramModuleRequiresDB(t *testing.T) {
+	_, _, err := execute(t, "diagram", "module")
+	if err == nil {
+		t.Fatalf("expected error when diagram module called without --db")
+	}
+	if !strings.Contains(err.Error(), "--db is required") {
+		t.Fatalf("expected --db required error, got %v", err)
 	}
 }
 

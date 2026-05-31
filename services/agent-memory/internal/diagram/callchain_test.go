@@ -12,49 +12,49 @@ import (
 	"github.com/smartpcr/code-intelligence/services/agent-memory/pkg/fingerprint"
 )
 
-// fakeReader is a hand-rolled graphsink.Reader satisfying the
+// ccFakeReader is a hand-rolled graphsink.Reader satisfying the
 // surface BuildCallChain consumes. It is deliberately
 // independent of the SQLite / memory / Postgres backends so the
 // BFS-shape tests pin the projector's behaviour without coupling
 // to a backend's idempotency / fingerprinting details.
-type fakeReader struct {
+type ccFakeReader struct {
 	repos    []graphreader.RepoSummary
 	nodes    map[string]graphreader.Node
-	bySig    map[sigKey]string // (repoID, kind, sig) -> nodeID
+	bySig    map[ccSigKey]string // (repoID, kind, sig) -> nodeID
 	outEdges map[string][]graphreader.Edge
 	inEdges  map[string][]graphreader.Edge
 }
 
-type sigKey struct {
+type ccSigKey struct {
 	repoID string
 	kind   string
 	sig    string
 }
 
-func newFakeReader() *fakeReader {
-	return &fakeReader{
+func newCCFakeReader() *ccFakeReader {
+	return &ccFakeReader{
 		nodes:    map[string]graphreader.Node{},
-		bySig:    map[sigKey]string{},
+		bySig:    map[ccSigKey]string{},
 		outEdges: map[string][]graphreader.Edge{},
 		inEdges:  map[string][]graphreader.Edge{},
 	}
 }
 
-func (f *fakeReader) addRepo(s graphreader.RepoSummary) {
+func (f *ccFakeReader) addRepo(s graphreader.RepoSummary) {
 	f.repos = append(f.repos, s)
 }
 
-func (f *fakeReader) addNode(n graphreader.Node) {
+func (f *ccFakeReader) addNode(n graphreader.Node) {
 	f.nodes[n.NodeID] = n
-	f.bySig[sigKey{repoID: n.RepoID, kind: n.Kind, sig: n.CanonicalSignature}] = n.NodeID
+	f.bySig[ccSigKey{repoID: n.RepoID, kind: n.Kind, sig: n.CanonicalSignature}] = n.NodeID
 }
 
-func (f *fakeReader) addEdge(e graphreader.Edge) {
+func (f *ccFakeReader) addEdge(e graphreader.Edge) {
 	f.outEdges[e.SrcNodeID] = append(f.outEdges[e.SrcNodeID], e)
 	f.inEdges[e.DstNodeID] = append(f.inEdges[e.DstNodeID], e)
 }
 
-func (f *fakeReader) ListRepos(
+func (f *ccFakeReader) ListRepos(
 	_ context.Context, _ graphreader.ReaderOptions,
 ) ([]graphreader.RepoSummary, error) {
 	out := make([]graphreader.RepoSummary, len(f.repos))
@@ -62,7 +62,7 @@ func (f *fakeReader) ListRepos(
 	return out, nil
 }
 
-func (f *fakeReader) ListNodes(
+func (f *ccFakeReader) ListNodes(
 	_ context.Context, _ fingerprint.RepoID, _ []string,
 	_ graphreader.ListNodesFilter, _ graphreader.ReaderOptions,
 ) ([]graphreader.Node, error) {
@@ -74,21 +74,21 @@ func (f *fakeReader) ListNodes(
 	return out, nil
 }
 
-func (f *fakeReader) ListEdgesFrom(
+func (f *ccFakeReader) ListEdgesFrom(
 	_ context.Context, srcNodeID string, kinds []string,
 	_ graphreader.ReaderOptions,
 ) ([]graphreader.Edge, error) {
-	return filterEdges(f.outEdges[srcNodeID], kinds), nil
+	return ccFilterEdges(f.outEdges[srcNodeID], kinds), nil
 }
 
-func (f *fakeReader) ListEdgesTo(
+func (f *ccFakeReader) ListEdgesTo(
 	_ context.Context, dstNodeID string, kinds []string,
 	_ graphreader.ReaderOptions,
 ) ([]graphreader.Edge, error) {
-	return filterEdges(f.inEdges[dstNodeID], kinds), nil
+	return ccFilterEdges(f.inEdges[dstNodeID], kinds), nil
 }
 
-func (f *fakeReader) GetNode(
+func (f *ccFakeReader) GetNode(
 	_ context.Context, nodeID string, _ graphreader.ReaderOptions,
 ) (graphreader.Node, error) {
 	n, ok := f.nodes[nodeID]
@@ -98,18 +98,18 @@ func (f *fakeReader) GetNode(
 	return n, nil
 }
 
-func (f *fakeReader) LookupBySignature(
+func (f *ccFakeReader) LookupBySignature(
 	_ context.Context, repoID fingerprint.RepoID, kind, sig string,
 	_ graphreader.ReaderOptions,
 ) (graphreader.Node, error) {
-	id, ok := f.bySig[sigKey{repoID: repoID.String(), kind: kind, sig: sig}]
+	id, ok := f.bySig[ccSigKey{repoID: repoID.String(), kind: kind, sig: sig}]
 	if !ok {
 		return graphreader.Node{}, graphreader.ErrNotFound
 	}
 	return f.nodes[id], nil
 }
 
-func filterEdges(in []graphreader.Edge, kinds []string) []graphreader.Edge {
+func ccFilterEdges(in []graphreader.Edge, kinds []string) []graphreader.Edge {
 	if len(kinds) == 0 {
 		out := make([]graphreader.Edge, len(in))
 		copy(out, in)
@@ -130,11 +130,11 @@ func filterEdges(in []graphreader.Edge, kinds []string) []graphreader.Edge {
 
 // --- Fixture helpers ---
 
-const fixtureRepoURL = "https://github.com/example/scan-target"
+const ccFixtureRepoURL = "https://github.com/example/scan-target"
 
-func fixtureRepoID(t *testing.T) fingerprint.RepoID {
+func ccFixtureRepoID(t *testing.T) fingerprint.RepoID {
 	t.Helper()
-	rid, err := fingerprint.RepoIDFromURL(fixtureRepoURL)
+	rid, err := fingerprint.RepoIDFromURL(ccFixtureRepoURL)
 	if err != nil {
 		t.Fatalf("RepoIDFromURL: %v", err)
 	}
@@ -188,13 +188,13 @@ func observedCall(repoID fingerprint.RepoID, src, dst string) graphreader.Edge {
 
 // fixtureMWithCallees builds the canonical "M has 2 callees and
 // 3 callers" graph the impl-plan Stage 6.3 scenarios pin.
-func fixtureMWithCallees(t *testing.T) (*fakeReader, fingerprint.RepoID) {
+func fixtureMWithCallees(t *testing.T) (*ccFakeReader, fingerprint.RepoID) {
 	t.Helper()
-	rid := fixtureRepoID(t)
-	r := newFakeReader()
+	rid := ccFixtureRepoID(t)
+	r := newCCFakeReader()
 	r.addRepo(graphreader.RepoSummary{
 		RepoID: rid.String(),
-		URL:    fixtureRepoURL,
+		URL:    ccFixtureRepoURL,
 		SHA:    "deadbeef",
 	})
 	r.addNode(methodNode(rid, "M", "M"))
@@ -211,13 +211,13 @@ func fixtureMWithCallees(t *testing.T) (*fakeReader, fingerprint.RepoID) {
 
 // fixtureChainABCD builds the chain `A -> B -> C -> D` the
 // depth-bounded BFS scenario pins.
-func fixtureChainABCD(t *testing.T) (*fakeReader, fingerprint.RepoID) {
+func fixtureChainABCD(t *testing.T) (*ccFakeReader, fingerprint.RepoID) {
 	t.Helper()
-	rid := fixtureRepoID(t)
-	r := newFakeReader()
+	rid := ccFixtureRepoID(t)
+	r := newCCFakeReader()
 	r.addRepo(graphreader.RepoSummary{
 		RepoID: rid.String(),
-		URL:    fixtureRepoURL,
+		URL:    ccFixtureRepoURL,
 		SHA:    "deadbeef",
 	})
 	for _, n := range []string{"A", "B", "C", "D"} {
@@ -414,11 +414,11 @@ func TestBuildCallChain_seedEncodedSignature(t *testing.T) {
 // This is the form architecture S5.6 and the `--seed <sig-or-id>`
 // CLI flag pass when the user does not know the node id.
 func TestBuildCallChain_seedBareSignature(t *testing.T) {
-	rid := fixtureRepoID(t)
-	r := newFakeReader()
+	rid := ccFixtureRepoID(t)
+	r := newCCFakeReader()
 	r.addRepo(graphreader.RepoSummary{
 		RepoID: rid.String(),
-		URL:    fixtureRepoURL,
+		URL:    ccFixtureRepoURL,
 		SHA:    "deadbeef",
 	})
 	// Use a realistic Java-shaped canonical signature so the
@@ -468,11 +468,11 @@ func TestBuildCallChain_seedBareSignature(t *testing.T) {
 // `"does-not-exist"` is not a UUID and resolves to
 // ErrSeedNotFound without a GetNode call).
 func TestBuildCallChain_seedUUIDFallback(t *testing.T) {
-	rid := fixtureRepoID(t)
-	r := newFakeReader()
+	rid := ccFixtureRepoID(t)
+	r := newCCFakeReader()
 	r.addRepo(graphreader.RepoSummary{
 		RepoID: rid.String(),
-		URL:    fixtureRepoURL,
+		URL:    ccFixtureRepoURL,
 		SHA:    "deadbeef",
 	})
 	const uuidID = "11111111-2222-3333-4444-555555555555"
@@ -503,14 +503,14 @@ func TestBuildCallChain_seedUUIDFallback(t *testing.T) {
 // which is neither an encoded triple, nor a known canonical
 // signature, nor a canonical UUID, returns ErrSeedNotFound
 // WITHOUT having reached GetNode (impl-plan Stage 6.3 brief:
-// "GetNode only if it parses as a UUID"). The fakeReader's
+// "GetNode only if it parses as a UUID"). The ccFakeReader's
 // GetNode would return a found Node for `"M"` (a stored node
 // id in the fixture); if the gate were missing, that lookup
 // would succeed and the test would fail.
 func TestBuildCallChain_seedNonUUIDNoGetNode(t *testing.T) {
-	rid := fixtureRepoID(t)
-	r := newFakeReader()
-	r.addRepo(graphreader.RepoSummary{RepoID: rid.String(), URL: fixtureRepoURL})
+	rid := ccFixtureRepoID(t)
+	r := newCCFakeReader()
+	r.addRepo(graphreader.RepoSummary{RepoID: rid.String(), URL: ccFixtureRepoURL})
 	// Store a node whose NodeID is `"some-id"` and whose
 	// canonical signature differs from the seed string we
 	// will pass below. If the resolver wrongly called GetNode
@@ -541,9 +541,9 @@ func TestBuildCallChain_seedNonUUIDNoGetNode(t *testing.T) {
 // BEFORE appending the edge so the envelope never carries an
 // orphan reference (architecture S4.4 single-parser invariant).
 func TestBuildCallChain_danglingEdgeDropped(t *testing.T) {
-	rid := fixtureRepoID(t)
-	r := newFakeReader()
-	r.addRepo(graphreader.RepoSummary{RepoID: rid.String(), URL: fixtureRepoURL})
+	rid := ccFixtureRepoID(t)
+	r := newCCFakeReader()
+	r.addRepo(graphreader.RepoSummary{RepoID: rid.String(), URL: ccFixtureRepoURL})
 	r.addNode(methodNode(rid, "M", "M"))
 	r.addNode(methodNode(rid, "OK", "OK"))
 	// Two outbound edges from M: one resolves, one points at
@@ -580,9 +580,9 @@ func TestBuildCallChain_danglingEdgeDropped(t *testing.T) {
 // edge kinds are walked and tagged correctly so the UI styling
 // rule (architecture S4.4.1) sees them as distinct.
 func TestBuildCallChain_observedAndStaticMixed(t *testing.T) {
-	rid := fixtureRepoID(t)
-	r := newFakeReader()
-	r.addRepo(graphreader.RepoSummary{RepoID: rid.String(), URL: fixtureRepoURL})
+	rid := ccFixtureRepoID(t)
+	r := newCCFakeReader()
+	r.addRepo(graphreader.RepoSummary{RepoID: rid.String(), URL: ccFixtureRepoURL})
 	r.addNode(methodNode(rid, "M", "M"))
 	r.addNode(methodNode(rid, "S", "S"))
 	r.addNode(methodNode(rid, "O", "O"))
@@ -604,9 +604,9 @@ func TestBuildCallChain_observedAndStaticMixed(t *testing.T) {
 
 // TestBuildCallChain_cycleTerminates: A -> B -> A must not loop.
 func TestBuildCallChain_cycleTerminates(t *testing.T) {
-	rid := fixtureRepoID(t)
-	r := newFakeReader()
-	r.addRepo(graphreader.RepoSummary{RepoID: rid.String(), URL: fixtureRepoURL})
+	rid := ccFixtureRepoID(t)
+	r := newCCFakeReader()
+	r.addRepo(graphreader.RepoSummary{RepoID: rid.String(), URL: ccFixtureRepoURL})
 	r.addNode(methodNode(rid, "A", "A"))
 	r.addNode(methodNode(rid, "B", "B"))
 	r.addEdge(staticCall(rid, "A", "B"))
@@ -654,8 +654,8 @@ func TestBuildCallChain_repoMetadataPopulated(t *testing.T) {
 	if d.Repo.ID != rid.String() {
 		t.Errorf("repo.id = %q, want %q", d.Repo.ID, rid.String())
 	}
-	if d.Repo.URL != fixtureRepoURL {
-		t.Errorf("repo.url = %q, want %q", d.Repo.URL, fixtureRepoURL)
+	if d.Repo.URL != ccFixtureRepoURL {
+		t.Errorf("repo.url = %q, want %q", d.Repo.URL, ccFixtureRepoURL)
 	}
 }
 

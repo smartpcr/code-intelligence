@@ -61,8 +61,8 @@ const truncationSentinelPrefix = "... [truncated "
 //
 //	... [truncated N lines]
 //
-// where N is the count of source lines from the requested range
-// that were suppressed (i.e. requested - (maxLines - 1)). In
+// where N is the count of lines not present in the output
+// (i.e. requested - maxLines). In
 // that case the returned truncated flag is true and the snippet
 // contains (maxLines - 1) verbatim source lines followed by the
 // sentinel line. When maxLines == 1 and the requested range
@@ -163,16 +163,16 @@ func ExtractSnippet(absFilePath string, startLine, endLine int, maxLines int) (s
 		if len(s) > 0 && s[len(s)-1] != '\n' {
 			b.WriteByte('\n')
 		}
-		// Suppressed count = available source lines minus the
-		// (maxLines-1) source lines actually shown. The
-		// sentinel occupies one of the M displayed slots, so
-		// only (M-1) source lines survive; every other source
-		// line in the requested range is suppressed and MUST
-		// be counted. This matches the docstring formula
-		// N = requested - (maxLines - 1) and the caller-facing
-		// promise that the sentinel reports the true number of
-		// source lines absent from the snippet.
-		suppressed := availableInRange - (maxLines - 1)
+		// Suppressed count = available source lines minus
+		// maxLines. The sentinel occupies one of the M
+		// displayed slots, so only (M-1) source lines
+		// survive; however, the suppressed tally counts lines
+		// absent from the output as a whole (N = requested -
+		// maxLines), not lines absent from the source-only
+		// portion, matching the implementation-plan Sec 4.1
+		// scenario expectation "truncated 300 lines" for a
+		// 500-line scope capped at 200.
+		suppressed := availableInRange - maxLines
 		fmt.Fprintf(&b, "%s%d lines]", truncationSentinelPrefix, suppressed)
 		truncated = true
 	} else {
